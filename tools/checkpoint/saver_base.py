@@ -6,7 +6,14 @@ from importlib.metadata import version
 
 import torch
 from packaging.version import Version as PkgVersion
-from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
+from utils import (
+    build_checkpoint_converter_process_groups,
+    chunk_bias,
+    chunk_weight,
+    initialize_checkpoint_converter_distributed,
+    register_checkpoint_converter_process_groups,
+    set_checkpoint_converter_model_ranks,
+)
 
 
 class MegatronCheckpointSaverBase:
@@ -28,6 +35,7 @@ class MegatronCheckpointSaverBase:
 
         self.models = None
         self.model_provider = None   # model_provider function either from pretrain_gpt or pretrain_bert
+        self.pg_collection = None    # Fake process groups the models are built on
 
     def _maybe_parse_additional_megatron_args(self, margs):
         """
@@ -169,28 +177,14 @@ class MegatronCheckpointSaverBase:
 
         self.import_model_provider()
 
-        # Initialize torch.distributed with a minimal single-process backend so that
-        # process-group size queries (get_pg_size / get_tensor_model_parallel_group_if_none)
-        # return the fake groups below rather than falling back to world_size=1.
-        if not torch.distributed.is_initialized():
-            os.environ.setdefault('MASTER_ADDR', 'localhost')
-            os.environ.setdefault('MASTER_PORT', '12356')
-            torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1)
-
-        # fake initializing distributed
-        mpu.set_tensor_model_parallel_world_size(self.args.target_tensor_parallel_size)
-        mpu.set_pipeline_model_parallel_world_size(self.args.target_pipeline_parallel_size)
-        mpu.set_expert_model_parallel_world_size(self.args.target_expert_parallel_size)
-        mpu.set_tensor_model_parallel_rank(0)
-        mpu.set_pipeline_model_parallel_rank(0)
-        mpu.set_expert_model_parallel_rank(0)
-        
-        initialize_checkpoint_converter_fake_process_groups(
-            mpu,
+        initialize_checkpoint_converter_distributed()
+        self.pg_collection = build_checkpoint_converter_process_groups(
             self.args.target_tensor_parallel_size,
             self.args.target_pipeline_parallel_size,
             self.args.target_expert_parallel_size,
         )
+        # Code that reads the global groups instead of a collection sees the same groups.
+        register_checkpoint_converter_process_groups(mpu, self.pg_collection)
         
         try:
             import torch_llm_debug_tools
@@ -317,9 +311,14 @@ class MegatronCheckpointSaverBase:
         Get the local model for a certain (pp,ep,tp).
         """
         if self.models[pp_rank][ep_rank][tp_rank] is None:
+            set_checkpoint_converter_model_ranks(
+                self.pg_collection, pipeline_rank=pp_rank, tensor_rank=tp_rank, expert_rank=ep_rank
+            )
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
-            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype)
+            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(
+                pre_process, post_process, pg_collection=self.pg_collection
+            ).to(self.md.params_dtype)
         return self.models[pp_rank][ep_rank][tp_rank]
 
     def save(self):
@@ -347,7 +346,6 @@ class MegatronCheckpointSaverBase:
         Save local models in self.models to a megatron checkpoint.
         """
         try:
-            from megatron.core import mpu
             from megatron.training import get_train_state
             from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
@@ -355,16 +353,24 @@ class MegatronCheckpointSaverBase:
             sys.exit(1)
 
         train_state = get_train_state()
+        pg_collection = self.pg_collection
         for pp_rank in range(self.args.target_pipeline_parallel_size):
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(train_state.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                    model = self.get_local_model(pp_rank, ep_rank, tp_rank)
+                    set_checkpoint_converter_model_ranks(
+                        pg_collection,
+                        pipeline_rank=pp_rank,
+                        tensor_rank=tp_rank,
+                        expert_rank=ep_rank,
+                    )
+                    save_checkpoint(train_state.iteration, [model], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank)
+                        tensor_rank=tp_rank,
+                        pg_collection=pg_collection)
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 
@@ -373,7 +379,6 @@ class MegatronCheckpointSaverBase:
         Receive LM model parameters over queue and save them in self.models
         """
         try:
-            from megatron.core import mpu
             from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
@@ -438,7 +443,6 @@ class MegatronCheckpointSaverBase:
         # ------------------
         total_layer_num = 0
         for pp_rank in range(self.args.target_pipeline_parallel_size):
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])):

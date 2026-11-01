@@ -24,6 +24,8 @@ from .optimizer import (
     MegatronOptimizer,
     _get_param_grad_norm_group,
     _validate_grad_norm_group,
+    _warn_grad_stats_reduced_over_world,
+    set_duplicate_filter_groups,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import (
@@ -593,6 +595,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+        if self.grad_stats_parallel_group is None:
+            # The gradient-norm and zero-count reductions of this class read the attribute
+            # directly, so the fallback to WORLD is reported here, once.
+            _warn_grad_stats_reduced_over_world(type(self).__name__)
 
         # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
         # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
@@ -695,22 +701,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ):
                     wrapper = GraphedGradCopyFloat16Optimizer
                 optimizers[i] = wrapper(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt,
+                    config,
+                    None,
+                    init_state_fn_list[i] if init_state_fn_list else None,
+                    pg_collection=self.pg_collection,
                 )
 
-        self.tp_group = self.pg_collection.tp
-        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
-        # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
+        # The module's own TP and GTP axes: a MIMO module's grid carries these, and MPU has no
         # globals to fall back on there (see param_is_not_gtp_duplicate).
-        self.gtp_group = getattr(self.pg_collection, 'gtp_remat', None)
-        self.expert_gtp_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
+        set_duplicate_filter_groups(self, self.pg_collection)
         for optimizer in optimizers:
             # Child optimizers perform duplicate filtering and gradient-stat reductions.
             optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
-            optimizer.tp_group = self.tp_group
-            optimizer.expert_tp_group = self.expert_tp_group
-            optimizer.gtp_group = self.gtp_group
-            optimizer.expert_gtp_group = self.expert_gtp_group
+            set_duplicate_filter_groups(optimizer, self.pg_collection)
 
         super().__init__(optimizers)
 
@@ -1158,6 +1162,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             expert_tp_group=self.expert_tp_group,
             gtp_group=self.gtp_group,
             expert_gtp_group=self.expert_gtp_group,
+            use_global_fallback=False,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

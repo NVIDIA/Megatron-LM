@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from megatron.core import mpu
 from megatron.core.dist_checkpointing.serialization import load, load_common_state_dict, save
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -60,7 +59,6 @@ def save_modelopt_state(model: list[torch.nn.Module], state_dict: dict[str, Any]
         state_dict["modelopt_state"] = mto.modelopt_state(model[0])
     else:
         for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             state_dict[f"modelopt_state_{i}"] = mto.modelopt_state(model[i])
 
 

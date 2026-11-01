@@ -40,6 +40,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
@@ -440,6 +441,7 @@ class TestTEWrappers:
                     bias=False,
                     skip_bias_add=False,
                     is_expert=True,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .train()
@@ -460,7 +462,7 @@ class TestTEWrappers:
             x[row] = target
             x.requires_grad_(True)
             splits = torch.tensor(sizes, device="cuda", dtype=torch.int64)
-            with get_fp8_context(config, 0):
+            with get_fp8_context(config, 0, pg_collection=global_amax_groups()):
                 output, _ = fn(x, splits)
                 actual = output[row].detach().clone()
                 output[row].float().sum().backward()
@@ -480,7 +482,7 @@ class TestTEWrappers:
             check(module, [1024, 2048, 256, 0], 17)
             sample = torch.randn(2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             splits = torch.tensor([512, 512, 512, 512], device="cuda", dtype=torch.int64)
-            with get_fp8_context(config, 0):
+            with get_fp8_context(config, 0, pg_collection=global_amax_groups()):
                 assert_module_replays_bit_exact(
                     module,
                     (sample, splits),
@@ -603,6 +605,7 @@ class TestTEWrappers:
             bias=False,
             skip_bias_add=False,
             is_expert=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
         x = torch.randn(
@@ -709,6 +712,7 @@ class TestTEWrappers:
                     skip_bias_add=False,
                     is_expert=True,
                     name=name,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
 
         edge = build(0)
@@ -922,8 +926,12 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
             t = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
 
+        cp_group = parallel_state.get_context_parallel_group()
+
         def fn(t):
-            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+            return rope_utils.apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group
+            )
 
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:

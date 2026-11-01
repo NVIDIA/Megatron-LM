@@ -13,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -62,6 +63,7 @@ def initialize_gpt_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     with torch.no_grad():
@@ -123,6 +125,7 @@ def initialize_quantized_gpt_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     with torch.no_grad():
         for p in model.parameters():
@@ -175,6 +178,7 @@ def initialize_moe_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     model.bfloat16()
@@ -367,7 +371,9 @@ def setup_model_and_optimizer(
     elif optimizer_type == 'lion':
         config.lr = 1e-4
     config.finalize_optimizer_config()
-    optimizer = get_megatron_optimizer(config, model)
+    optimizer = get_megatron_optimizer(
+        config, model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
@@ -504,7 +510,9 @@ def setup_moe_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
     config.finalize_optimizer_config()
-    optimizer = get_megatron_optimizer(config, model)
+    optimizer = get_megatron_optimizer(
+        config, model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)

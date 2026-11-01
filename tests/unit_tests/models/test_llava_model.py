@@ -16,6 +16,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -81,6 +82,7 @@ class TestLLaVAModel:
             img_h=336,
             img_w=336,
             patch_dim=14,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return model
 
@@ -94,6 +96,13 @@ class TestLLaVAModel:
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1488736
+
+    @pytest.mark.internal
+    def test_vision_projection_uses_the_model_collection(self):
+        projection = self.model.vision_projection
+        assert projection.pg_collection is self.model.pg_collection
+        assert projection.encoder.linear_fc1._pg_collection is self.model.pg_collection
+        assert projection.encoder.linear_fc2._pg_collection is self.model.pg_collection
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -754,6 +763,7 @@ def setup_and_teardown_llava_model(request):
         img_h=336,
         img_w=336,
         patch_dim=14,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     yield model, vision_model_type
@@ -863,6 +873,7 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         return model
