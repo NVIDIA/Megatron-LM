@@ -15,7 +15,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
@@ -66,11 +65,19 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if configured_prompt_contract is not None:
             self.multimodal_prompt_config = configured_prompt_contract
 
-        # Get the inference pg_collection from the config if it exists; otherwise the training
-        # pg_collection might be used during RL
-        if (pg_collection := self.inference_context.config.pg_collection) is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Resolved once at the inference-config boundary; during RL this may be the training
+        # collection rather than an inference-specific one. A config without a collection takes
+        # the one the model was built with.
+        pg_collection = self.inference_context.config.resolve_pg_collection(self.model)
 
+        # An unset group reads as None, which torch.distributed takes as the world group and the
+        # pipeline-stage helpers as the global pipeline stage.
+        missing = [name for name in ("tp", "pp") if vars(pg_collection).get(name) is None]
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__} needs the {', '.join(missing)} process group(s); set "
+                "them in InferenceConfig.pg_collection"
+            )
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)

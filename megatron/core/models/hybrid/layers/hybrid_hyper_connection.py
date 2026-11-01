@@ -40,6 +40,9 @@ class HyperConnectionHybridLayer(MegatronModule):
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+            # The mHC weights are replicated across the wrapped layer's tensor-parallel group,
+            # which sets their checkpoint replica ids.
+            self.hyper_connection.tp_group = layer.tp_group
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""

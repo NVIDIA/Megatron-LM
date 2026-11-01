@@ -29,7 +29,10 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -159,6 +162,7 @@ class AbsorbedMLASelfAttention(Attention):
         is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         super().__init__(
@@ -300,6 +304,7 @@ class AbsorbedMLASelfAttention(Attention):
                     skip_bias_add=False,
                     is_expert=False,
                     tp_comm_buffer_name='q_proj',
+                    tp_group=pg_collection.tp,
                     name=(name + ".linear_q_proj") if name is not None else None,
                 )
         else:
@@ -511,9 +516,13 @@ class AbsorbedMLASelfAttention(Attention):
             #   2. Scatter sequence back to s / TP if sequence-parallel since it was
             #      gathered by ColumnParallelLinear.
             if q_compressed.size(-1) != self.config.q_lora_rank:
-                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                q_compressed = gather_from_tensor_model_parallel_region(
+                    q_compressed, group=self.tp_group
+                )
                 if self.config.sequence_parallel:
-                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+                    q_compressed = scatter_to_sequence_parallel_region(
+                        q_compressed, group=self.tp_group
+                    )
         else:
             q_compressed = hidden_states
 
@@ -528,14 +537,16 @@ class AbsorbedMLASelfAttention(Attention):
             kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined, group=self.tp_group)
             # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
             if self.config.sequence_parallel:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+                kv_compressed = scatter_to_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
         else:
             # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
