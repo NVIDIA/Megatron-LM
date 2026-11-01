@@ -51,6 +51,7 @@ REQUEST_FIELD_POLICY = {
     "block_size_tokens": "checkpoint:preserve / merge:first",
     "enable_prefix_caching": "checkpoint:preserve / merge:first",
     "num_cached_tokens": "checkpoint:reset / merge:first-observation",
+    "cached_prompt_log_probs": "checkpoint:reset / merge:reset / wire:drop",
     "num_matched_prefix_blocks": "checkpoint:reset / merge:reset",
     "mtp_private_suffix_start": "checkpoint:reset / merge:reset",
     "block_hash_salt": "checkpoint:preserve / merge:first",
