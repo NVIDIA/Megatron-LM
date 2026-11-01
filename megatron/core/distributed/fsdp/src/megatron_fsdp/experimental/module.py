@@ -40,8 +40,8 @@ from .parameter_group import (
     get_containing_parameter_group,
 )
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic
-from .schedule import SchedulePolicy
+from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .schedule_policy import SchedulePolicy
 
 
 def _is_in_backward() -> bool:
@@ -57,10 +57,6 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
-    # Events covering each compute phase's materialized parameters. An absent key
-    # needs materialization. Phases share an event when one unshard satisfies both
-    # (e.g. BF16 weights).
-    _unshard_events: dict[Phase, torch.cuda.Event]
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -78,17 +74,15 @@ class FsdpModule:
         grad_scale: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
-        register_hooks: bool = True,
-        grad_accumulation_count: int | None = None,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
-            grad_accumulation_count: Total parameter-gradient callbacks per reduction
-                window. Defaults to one per owned trainable parameter.
+            shard_layout: Padded or unpadded rank segments for every parameter group.
+                See ``fully_shard``.
         """
         self._context = context
-        self._unshard_events = {}
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -114,20 +108,21 @@ class FsdpModule:
                     grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
+                    shard_layout=shard_layout,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            grad_accumulation_count
-            if grad_accumulation_count is not None
+            schedule_policy.grad_accumulation_count
+            if schedule_policy.grad_accumulation_count is not None
             else sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
-        # required to keep loading a state dict safe when ``register_hooks`` is
+        # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
         # together with the auto-execution hooks below.
         self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if register_hooks:
+        if schedule_policy.register_hooks:
             self._register_hooks()
         context.register_module(cast(nn.Module, self))
 
@@ -309,13 +304,13 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            compute_stream = self.context.current_stream()
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
-            phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
-            # Wait in a fixed phase order, skipping an event shared by both phases.
-            for event in dict.fromkeys(self._unshard_events[p] for p in phases):
-                self.context.current_stream().wait_event(event)
+            with torch.cuda.stream(compute_stream):
+                for group in self._parameter_groups:
+                    group.wait_for_unshard(phase)
 
             if not prefetch:
                 return
@@ -360,47 +355,20 @@ class FsdpModule:
             next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
-        """Unshard parameter groups for compute in ``phase`` on the all-gather stream.
-
-        Reuse a phase's event when its parameters were already materialized, so
-        compute does not wait for later prefetches. After materializing missing
-        weights, publish the new event for the requested phases.
-        """
+        """Ask each group to gather missing weights on the all-gather stream."""
         if phase not in (Phase.FORWARD, Phase.BACKWARD, None):
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
-        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
-        if all(requested_phase in self._unshard_events for requested_phase in requested_phases):
-            return
-
-        # Each group reports the phases it can now serve, e.g. both for BF16 weights.
-        ready_phases = {Phase.FORWARD, Phase.BACKWARD}
-        allgather_stream = self.context.allgather_stream
-        with torch.cuda.stream(allgather_stream):
+        with torch.cuda.stream(self.context.allgather_stream):
             for group in self._parameter_groups:
-                ready_phases &= group.unshard_parameters(phase)
-            event = allgather_stream.record_event()
-        assert ready_phases.issuperset(requested_phases)
-        for ready_phase in ready_phases:
-            # Keep earlier events so compute does not wait for this materialization.
-            self._unshard_events.setdefault(ready_phase, event)
+                group.unshard_parameters(phase)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
-            # Backward reuses BF16 weights and any gathered MXFP8 columnwise planes,
-            # but no longer needs the MXFP8 rowwise planes used for recomputation.
-            if groups_to_release := [
-                group for group in self._parameter_groups if group.has_forward_only_planes
-            ]:
-                allgather_stream = self.context.allgather_stream
-                allgather_stream.wait_stream(self.context.current_stream())
-                with torch.cuda.stream(allgather_stream):
-                    for group in groups_to_release:
-                        group.release_unsharded_storage(rowwise_only=True)
-                self._unshard_events.pop(Phase.FORWARD, None)
+            self._release_unsharded_storage(rowwise_only=True)
         else:
             self.reshard()
         if self.phase is Phase.FORWARD:
@@ -413,22 +381,28 @@ class FsdpModule:
             self._reshard_parameter_groups()
 
     def _reshard_parameter_groups(self) -> None:
-        """Reshard parameter groups and release unsharded storage after compute.
-
-        This method clears ``_unshard_events`` after queuing the release, so
-        future users enqueue a fresh all-gather.
-        """
+        """Reshard parameter groups and release unsharded storage after compute."""
         for group in self._parameter_groups:
             group.reshard_parameters()
+        self._release_unsharded_storage()
 
+    def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
+        """Select and release gathered storage after the current compute finishes."""
+        if rowwise_only:
+            groups_to_release = tuple(
+                group for group in self._parameter_groups if group.is_rowwise_unsharded
+            )
+        else:
+            groups_to_release = self._parameter_groups
+        if not groups_to_release:
+            return
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
         # so no record_stream() call is required for the storage.
         with torch.cuda.stream(allgather_stream):
-            for group in self._parameter_groups:
-                group.release_unsharded_storage()
-            self._unshard_events.clear()
+            for group in groups_to_release:
+                group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
