@@ -596,7 +596,11 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
     monkeypatch.setattr(
         arguments,
         "core_transformer_config_from_args",
-        lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
+        lambda args: SimpleNamespace(
+            pipeline_model_parallel_layout="layout",
+            mtp_num_layers=None,
+            virtual_pipeline_model_parallel_size=None,
+        ),
     )
     monkeypatch.setattr(
         providers,
@@ -611,6 +615,8 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
                 "sequence_packing_scheduler": None,
                 "pipeline_model_parallel_layout": "layout",
                 "mtp_num_layers": None,
+                # Without a virtual pipeline the predicate passes a size of 1, not None.
+                "vp_size": 1,
             },
         )
     ]
