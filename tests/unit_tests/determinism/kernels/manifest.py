@@ -969,6 +969,46 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
+    # -- padding-aware kernels for packed sequences (live-row bounded GEMMs / norms / cross entropy).
+    KernelEntry(
+        name="padding_aware_gemm",
+        sources=("megatron/core/transformer/padding_aware_gemm.py",),
+        tests=(K + "test_padding_aware_kernels.py", K + "test_te_wrappers.py"),
+        kind="triton",
+        notes="Live-row bound from the padding mask (Triton), tail zero-fill kernel, and the one-group "
+        "grouped GEMM dispatch (TE GroupedTensor with strided leading_dim) behind the padding-aware "
+        "TE linears and LM head; replayed standalone and through TELinear.",
+    ),
+    KernelEntry(
+        name="fused_padding_aware_cross_entropy",
+        sources=("megatron/core/fusions/fused_padding_aware_cross_entropy.py",),
+        tests=(K + "test_padding_aware_kernels.py", K + "test_tensor_parallel_kernels.py"),
+        kind="triton",
+        notes="One-program-per-row online-softmax cross entropy over bf16/fp32 logits with all-gathered "
+        "tensor-parallel statistics; forward and recomputing backward, bounded and all-rows.",
+    ),
+    KernelEntry(
+        name="fused_padding_aware_norm",
+        sources=("megatron/core/fusions/fused_padding_aware_norm.py",),
+        tests=(K + "test_padding_aware_kernels.py", K + "test_te_wrappers.py"),
+        kind="triton",
+        notes="Tiled row-bounded RMSNorm forward/backward (weighted, weightless, zero-centered) also "
+        "replayed through TENorm's PaddingAwareTERMSNorm wrapper.",
+    ),
+    KernelEntry(
+        name="fused_padding_aware_elementwise",
+        sources=("megatron/core/fusions/fused_padding_aware_elementwise.py",),
+        tests=(K + "test_padding_aware_kernels.py", K + "test_dev_sync_kernels.py"),
+        kind="triton",
+        notes="Row-bounded three-way add (hyper-connection gradient combine) and row arg-max (MTP "
+        "acceptance counting).",
+    ),
+    KernelEntry(
+        name="padding_aware_switches",
+        sources=("megatron/core/fusions/padding_aware_switches.py",),
+        kind="dispatch",
+        exempt_reason="Parses the MCORE_PADDING_AWARE_SKIP kill-switch (default off-set); no kernel.",
+    ),
 )
 
 

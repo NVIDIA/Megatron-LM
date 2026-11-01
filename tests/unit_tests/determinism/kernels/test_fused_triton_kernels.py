@@ -29,6 +29,7 @@ from megatron.core.fusions.fused_indices_converter import fused_indices_to_multi
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.transformer import padding_aware_gemm as pag
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
@@ -296,6 +297,33 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
 # Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the
 # autotuned ``BLOCK_H=8`` leaves a final program covering four head rows that do not exist; 32 --
 # the only count these tests used -- never leaves one while more than one program is launched.
+@pytest.mark.skipif(fused_mla_rope_inplace is None, reason="fused MLA RoPE unavailable")
+@pytest.mark.parametrize("heads", [32, 12])
+def test_fused_mla_rope_inplace_padding_aware_replays_fwd_bwd(heads):
+    """THD in-place RoPE under a live-row bound: rows at and beyond the bound are left untouched."""
+    seeded()
+    nope_dim, emb_dim = 128, 64
+    dtype = torch.bfloat16
+    bounds = [0, 1000, 1500, 2048, 4096]  # the last segment is the padding tail
+    live_rows = 2048
+    seqlen = max(b - a for a, b in zip(bounds, bounds[1:]))
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    t = torch.randn(bounds[-1], heads, nope_dim + emb_dim, device="cuda", dtype=dtype)
+    cos, sin = _yarn_cos_sin(emb_dim, seqlen, dtype)
+    t.requires_grad_(True)
+    bound = torch.tensor([live_rows], device="cuda", dtype=torch.int64)
+
+    def run(t):
+        with pag.padding_aware_live_rows(bound, bounds[-1]):
+            return fused_mla_rope_inplace(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+
+    outputs, _ = assert_replays_bit_exact(
+        run, (t,), replays=3, contention=True, what="fused_mla_rope_inplace padding-aware[thd]"
+    )
+    # Tail rows (padding) are not rotated: they still hold the input values.
+    assert torch.equal(outputs["out"][live_rows:], t.detach()[live_rows:])
+
+
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("heads", [32, 12])
@@ -477,6 +505,93 @@ def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
 
     assert_replays_bit_exact(
         run, (h_res, orig, h_post, x, bias), replays=3, what=f"mhc h_post_bda[{backend}]"
+    )
+
+
+_MHC_LIVE_ROWS = 2688  # live-row bound over the S * B = 4096 rows (a multiple of 128)
+
+
+def _mhc_bound():
+    return torch.tensor([_MHC_LIVE_ROWS], device="cuda", dtype=torch.int64)
+
+
+@pytest.mark.parametrize("backend", [b for b in _MHC_BACKENDS if b != "native"])
+def test_mhc_h_aggregate_padding_aware_replays_fwd_bwd(backend):
+    """h_aggregate under a published live-row bound (Triton: tail rows zero; cuTile: forward
+    unbounded, bounded backward)."""
+    if backend == "triton" and not fused_mhc_kernels.is_triton_available():
+        pytest.skip("Triton mHC backend unavailable")
+    seeded()
+    x = _mhc_rand(S, B, N, C)
+    h_pre = _mhc_rand(S, B, N)
+    bound = _mhc_bound()
+
+    def run(x, h):
+        with pag.padding_aware_live_rows(bound, S * B):
+            return fused_mhc_kernels.fused_h_aggregate(x, h, backend=backend)
+
+    # In the model the upstream gradient of the padding rows is zero (every downstream kernel
+    # zero-fills its tail); the Triton backward relies on that rather than re-bounding.
+    grad_out = torch.ones(S, B, C, device="cuda", dtype=torch.bfloat16)
+    grad_out.view(S * B, C)[_MHC_LIVE_ROWS:] = 0
+    outputs, grads = assert_replays_bit_exact(
+        run,
+        (x, h_pre),
+        replays=3,
+        contention=True,
+        grad_outputs={"out": grad_out},
+        what=f"mhc h_aggregate padding-aware[{backend}]",
+    )
+    tail = outputs["out"].reshape(S * B, -1)[_MHC_LIVE_ROWS:]
+    if backend == "triton":
+        assert not tail.any()  # the Triton forward skips the tail and zero-fills it
+    else:
+        assert torch.isfinite(tail).all()  # the cuTile forward is unbounded (finite aggregate)
+    assert not grads["in[0]"].reshape(S * B, -1)[_MHC_LIVE_ROWS:].any()
+
+
+@pytest.mark.parametrize("backend", [b for b in _MHC_BACKENDS if b != "native"])
+@pytest.mark.parametrize("with_bias", [True, False])
+def test_mhc_h_post_bda_padding_aware_replays_fwd_bwd(backend, with_bias):
+    """h_post_bda under a live-row bound: the tail passes the original residual streams through."""
+    if backend == "triton" and not fused_mhc_kernels.is_triton_available():
+        pytest.skip("Triton mHC backend unavailable")
+    seeded()
+    h_res = _mhc_rand(S, B, N, N)
+    orig = _mhc_rand(S, B, N, C)
+    h_post = _mhc_rand(S, B, N)
+    x = _mhc_rand(S, B, C)
+    bias = _mhc_rand(C) if with_bias else None
+    bound = _mhc_bound()
+
+    def run(h_res, orig, h_post, x, bias):
+        with pag.padding_aware_live_rows(bound, S * B):
+            return fused_mhc_kernels.fused_h_post_bda(h_res, orig, h_post, x, bias, backend=backend)
+
+    assert_replays_bit_exact(
+        run,
+        (h_res, orig, h_post, x, bias),
+        replays=3,
+        contention=True,
+        what=f"mhc h_post_bda padding-aware[{backend}]",
+    )
+
+
+@pytest.mark.skipif(
+    not fused_mhc_kernels.is_triton_available(), reason="Triton mHC backend unavailable"
+)
+def test_mhc_sinkhorn_padding_aware_replays_fwd_bwd():
+    """Sinkhorn under a live-row bound (Triton forward and backward skip the tail rows)."""
+    seeded()
+    logits = _mhc_rand(S, B, N, N)
+    bound = _mhc_bound()
+
+    def run(l):
+        with pag.padding_aware_live_rows(bound, S * B):
+            return fused_mhc_kernels.fused_sinkhorn(l, 20, 1e-6, backend="triton")
+
+    assert_replays_bit_exact(
+        run, (logits,), replays=3, contention=True, what="mhc sinkhorn padding-aware[triton]"
     )
 
 

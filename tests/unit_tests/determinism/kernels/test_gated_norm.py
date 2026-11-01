@@ -18,12 +18,27 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is u
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("strided_gate", [False, True])
 @pytest.mark.parametrize(
-    "batch,length,heads,dim,cp", [(1, 1027, 16, 128, 1), (2, 37, 8, 64, 2), (3, 13, 4, 256, 4)]
+    "batch,length,heads,dim,cp,padding_aware_norm",
+    [
+        (1, 1027, 16, 128, 1, False),
+        (2, 37, 8, 64, 2, False),
+        (3, 13, 4, 256, 4, False),
+        # TENorm under ``padding_aware_dense_linear`` builds an RMSNorm subclass; the fusion
+        # reads only its weight, eps and zero_centered_gamma and must replay the same way.
+        (1, 1027, 16, 128, 1, True),
+    ],
 )
-def test_output_norm_replays(zero_centered, strided_gate, batch, length, heads, dim, cp):
+def test_output_norm_replays(
+    zero_centered, strided_gate, batch, length, heads, dim, cp, padding_aware_norm
+):
     te = pytest.importorskip("transformer_engine.pytorch")
     seeded()
-    norm = te.RMSNorm(
+    norm_cls = te.RMSNorm
+    if padding_aware_norm:
+        from megatron.core.extensions.transformer_engine import PaddingAwareTERMSNorm
+
+        norm_cls = PaddingAwareTERMSNorm
+    norm = norm_cls(
         dim, eps=1e-6, params_dtype=torch.bfloat16, zero_centered_gamma=zero_centered, device="cuda"
     )
 

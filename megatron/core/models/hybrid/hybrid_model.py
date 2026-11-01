@@ -925,29 +925,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     assert mtp_inputs is not None
                     # For RL (labels is None), process_mtp_loss derives labels from
                     # input_ids to match the SFT label format.
-                    hidden_states = process_mtp_loss(
-                        hidden_states=mtp_hidden_states,
-                        labels=mtp_inputs.labels,
-                        loss_mask=mtp_inputs.loss_mask,
-                        output_layer=self.output_layer,
-                        output_weight=output_weight,
-                        is_training=self.training,
-                        compute_language_model_loss=self.compute_language_model_loss,
-                        config=self.config,
-                        cp_group=mtp_cp_group,
-                        tp_group=self.tp_group,
-                        dp_cp_group=self.pg_collection.dp_cp,
-                        sequence_roll_context=sequence_roll_context,
-                        packed_seq_params=mtp_inputs.packed_seq_params,
-                        scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                        input_ids=mtp_inputs.input_ids,
-                        mtp_input_mask=mtp_inputs.mtp_input_mask,
-                        metric_avg_group=(
-                            getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                            or self.pg_collection.dp_cp
-                        ),
-                        main_hidden_states=hidden_states,
-                    )
+                    # The MTP inputs may live in another CP layout than the decoder output,
+                    # so the live-row bound for the MTP head comes from their own mask.
+                    with padding_aware_lm_head_context(self.config, mtp_inputs.padding_mask):
+                        hidden_states = process_mtp_loss(
+                            hidden_states=mtp_hidden_states,
+                            labels=mtp_inputs.labels,
+                            loss_mask=mtp_inputs.loss_mask,
+                            output_layer=self.output_layer,
+                            output_weight=output_weight,
+                            is_training=self.training,
+                            compute_language_model_loss=self.compute_language_model_loss,
+                            config=self.config,
+                            cp_group=mtp_cp_group,
+                            tp_group=self.tp_group,
+                            dp_cp_group=self.pg_collection.dp_cp,
+                            sequence_roll_context=sequence_roll_context,
+                            packed_seq_params=mtp_inputs.packed_seq_params,
+                            scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                            input_ids=mtp_inputs.input_ids,
+                            mtp_input_mask=mtp_inputs.mtp_input_mask,
+                            metric_avg_group=(
+                                getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                                or self.pg_collection.dp_cp
+                            ),
+                            main_hidden_states=hidden_states,
+                        )
             sequence_parallel_override = False
             if (
                 in_inference_mode
@@ -958,9 +961,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     hidden_states = hidden_states[-1:, :, :]
                 else:
                     if self.output_layer.sequence_parallel:
-                        # Perform the sequence parallel gather here instead of after the output layer
-                        # because we need to slice the last token logits from the full view of the
-                        # packed logits across all requests.
+                        # Perform the sequence parallel gather here instead of after the
+                        # output layer because we need to slice the last token logits from
+                        # the full view of the packed logits across all requests.
                         hidden_states = gather_from_sequence_parallel_region(
                             hidden_states, group=self.pg_collection.tp
                         )
@@ -978,9 +981,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 and self.config.cross_entropy_loss_fusion
                 and self.config.cross_entropy_fusion_impl == "linear"
             ):
-                # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
-                # materialised, so the loss comes straight out of the output layer and muP's output
-                # scaling is applied to the layer input instead (the layer has no bias).
+                # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are
+                # never materialised, so the loss comes straight out of the output layer and muP's
+                # output scaling is applied to the layer input instead (the layer has no bias).
                 return self.output_layer(
                     self._scale_fused_cross_entropy_input(hidden_states),
                     weight=output_weight,

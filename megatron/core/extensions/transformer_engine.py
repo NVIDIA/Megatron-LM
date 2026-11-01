@@ -1211,6 +1211,17 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+def _te_norm_dtype(default: torch.dtype) -> torch.dtype:
+    """The dtype TE's norm ops compute in and return: autocast's when active, else the weight's."""
+    try:
+        if torch.is_autocast_enabled("cuda"):
+            return torch.get_autocast_dtype("cuda")
+    except TypeError:  # pragma: no cover - torch < 2.4
+        if torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return default
+
+
 class PaddingAwareTERMSNorm(te.pytorch.RMSNorm):
     """Transformer Engine RMSNorm that normalises only the live rows of a THD buffer when the
     padding-aware context has published a live-row bound for the input's rows (Triton kernel,
@@ -1221,10 +1232,14 @@ class PaddingAwareTERMSNorm(te.pytorch.RMSNorm):
         if inp.dim() >= 2 and not args and not kwargs:
             rows = inp.numel() // inp.shape[-1]
             bound = current_live_rows_for(rows)
-            if bound is not None and padding_aware_rms_norm_available(inp):
-                return padding_aware_rms_norm(
-                    inp, self.weight, self.eps, bound, self.zero_centered_gamma
-                )
+            if bound is not None:
+                # Like TE, compute and return in the autocast dtype, else the weight's: an fp32
+                # residual stream comes back as bf16 from either kernel.
+                x = inp.to(_te_norm_dtype(self.weight.dtype))
+                if padding_aware_rms_norm_available(x):
+                    return padding_aware_rms_norm(
+                        x, self.weight, self.eps, bound, self.zero_centered_gamma
+                    )
         return super().forward(inp, *args, **kwargs)
 
 
@@ -1271,8 +1286,10 @@ class TENorm:
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
                 norm_module = TEFusedResidualRMSNorm
+            elif getattr(config, "padding_aware_dense_linear", False):
+                norm_module = PaddingAwareTERMSNorm  # row-bounded norm under a live-row bound
             else:
-                norm_module = PaddingAwareTERMSNorm
+                norm_module = te.pytorch.RMSNorm
         else:
             raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
@@ -1502,7 +1519,9 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape.
+        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape
+        # (expert linears are excluded: their rows are routed tokens, not the THD buffer).
+        self.is_expert = is_expert
         self._padding_aware_policy = dense_linear_policy(self, config)
         if getattr(config, "padding_aware_dense_linear", False):
             log_policy_decision(
@@ -1542,6 +1561,20 @@ class TELinear(te.pytorch.Linear):
                 with quant_context:
                     out = te_linear_padding_aware_forward(
                         self, x, live_rows, _is_first_microbatch, policy
+                    )
+                if out is None and not getattr(self, "_padding_aware_fallback_logged", False):
+                    # Static policy said padding-aware, but this call cannot take the grouped
+                    # path (FP8 recipe other than MXFP8, fp32 activations, calibration, CPU
+                    # offload, quantized input/output): say so once instead of silently
+                    # running dense forever.
+                    self._padding_aware_fallback_logged = True
+                    log_policy_decision(
+                        type(self).__name__,
+                        int(self.out_features),
+                        int(self.in_features),
+                        False,
+                        "dense at call time: the grouped path does not support this recipe, "
+                        "activation dtype or execution mode",
                     )
         if out is None:
             with quant_context:
@@ -1910,7 +1943,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
-        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape.
+        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape
+        # (expert linears are excluded: their rows are routed tokens, not the THD buffer).
+        self.is_expert = is_expert
         self._padding_aware_policy = dense_linear_policy(self, config)
         if getattr(config, "padding_aware_dense_linear", False):
             log_policy_decision(
@@ -1957,6 +1992,20 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with quant_context:
                     out = te_layernorm_linear_padding_aware_forward(
                         self, x, live_rows, _is_first_microbatch, policy
+                    )
+                if out is None and not getattr(self, "_padding_aware_fallback_logged", False):
+                    # Static policy said padding-aware, but this call cannot take the grouped
+                    # path (FP8 recipe other than MXFP8, fp32 activations, calibration, CPU
+                    # offload, quantized input/output): say so once instead of silently
+                    # running dense forever.
+                    self._padding_aware_fallback_logged = True
+                    log_policy_decision(
+                        type(self).__name__,
+                        int(self.out_features),
+                        int(self.in_features),
+                        False,
+                        "dense at call time: the grouped path does not support this recipe, "
+                        "activation dtype or execution mode",
                     )
         if out is None:
             with quant_context:

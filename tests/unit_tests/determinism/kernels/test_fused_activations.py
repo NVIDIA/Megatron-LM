@@ -250,6 +250,39 @@ class TestFusedCrossEntropy:
 # --- DeepSeek-V4 hybrid attention: compiled query RMS norm -----------------------------------
 
 
+def test_dsv4_q_rms_norm_padding_aware_replays(monkeypatch):
+    """``_q_rms_norm_padding_aware`` (opt-in ``MCORE_PADDING_AWARE_QNORM=1``): the Triton
+    row-bounded RMSNorm on the ``[tokens * heads, dim]`` view, tail rows (padding tokens) zero."""
+    from types import SimpleNamespace
+
+    try:
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridAttention,
+        )
+    except ImportError as e:  # pragma: no cover - depends on optional dependencies
+        pytest.skip(f"DeepSeek-V4 hybrid attention unavailable: {e}")
+    from megatron.core.fusions.fused_padding_aware_norm import padding_aware_rms_norm_available
+    from megatron.core.transformer import padding_aware_gemm as pag
+
+    monkeypatch.setenv("MCORE_PADDING_AWARE_QNORM", "1")
+    seeded()
+    tokens, heads, dim, live = 4096, 32, 576, 2688
+    q = _act((tokens, 1, heads, dim))
+    if not padding_aware_rms_norm_available(q):
+        pytest.skip("padding-aware RMSNorm kernel unavailable")
+    fake_self = SimpleNamespace(config=SimpleNamespace(layernorm_epsilon=1e-6))
+    bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+
+    def run(q):
+        with pag.padding_aware_live_rows(bound, tokens):
+            return DSv4HybridAttention._q_rms_norm_padding_aware(fake_self, q)
+
+    outputs, grads = assert_replays_bit_exact(
+        run, (q,), replays=3, contention=True, what="_q_rms_norm_padding_aware"
+    )
+    assert not outputs["out"][live:].any() and not grads["in[0]"][live:].any()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
 def test_dsv4_q_rms_norm_replays(dtype, layout):

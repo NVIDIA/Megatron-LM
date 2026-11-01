@@ -253,7 +253,9 @@ def validate_gated_norm(module: torch.nn.Module, x: torch.Tensor, gate: torch.Te
         raise ValueError(prefix + "deterministic_mode=False.")
     if module.activation not in ("silu", "swish"):
         raise ValueError(prefix + "SiLU/Swish activation.")
-    if type(module.out_norm).__name__ != "RMSNorm":
+    # Any RMSNorm class or subclass (e.g. TENorm's padding-aware variant): the fusion reads only
+    # its weight, eps and zero_centered_gamma.
+    if not any(cls.__name__ == "RMSNorm" for cls in type(module.out_norm).__mro__):
         raise ValueError(prefix + "an RMSNorm output normalization module.")
     if not x.is_cuda or x.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(prefix + "CUDA BF16 or FP16 core attention output.")

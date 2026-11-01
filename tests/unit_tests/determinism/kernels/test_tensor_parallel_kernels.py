@@ -22,6 +22,10 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
+from megatron.core.fusions.fused_padding_aware_cross_entropy import (
+    padding_aware_cross_entropy_available,
+    triton_cross_entropy_available,
+)
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.models.backends import get_backend
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -31,6 +35,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import padding_aware_gemm as pag
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -104,6 +109,43 @@ class TestTensorParallelLayers:
             replays=3,
             what="vocab_parallel_cross_entropy",
         )
+
+    @pytest.mark.parametrize("bounded", [True, False], ids=["live-rows", "all-rows"])
+    def test_triton_fusion_target_replays(self, bounded):
+        """The ``cross_entropy_fusion_impl='triton'`` target: every row, or only the live rows of a
+        packed buffer when the padding-aware context publishes a bound."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        rows, vocab, live = 4096, 32768, 2688
+        logits = torch.randn(
+            rows, 1, vocab, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        labels = torch.randint(0, vocab * tp_group.size(), (rows, 1), device="cuda")
+        if not (
+            triton_cross_entropy_available(logits, labels)
+            and padding_aware_cross_entropy_available(logits, labels)
+        ):
+            pytest.skip("Triton cross entropy unavailable")
+        cross_entropy = get_backend(
+            "transformer_engine", cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="triton"
+        ).vocab_parallel_cross_entropy()
+        bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+
+        def run(l, t):
+            if bounded:
+                with pag.padding_aware_live_rows(bound, rows):
+                    return cross_entropy(l, t, tp_group)
+            return cross_entropy(l, t, tp_group)
+
+        outputs, grads = assert_replays_bit_exact(
+            run,
+            (logits, labels),
+            replays=3,
+            contention=True,
+            what=f"triton_fusion_target[{'live rows' if bounded else 'all rows'}]",
+        )
+        if bounded:
+            assert not outputs["out"][live:].any() and not grads["in[0]"][live:].any()
 
     @pytest.mark.parametrize("transformer_impl", ["local", "transformer_engine"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])

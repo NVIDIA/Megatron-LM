@@ -98,6 +98,35 @@ def test_mtp_packed_cp1_roll_replays():
     assert_replays_bit_exact(roll, (value,), contention=True, what="MTP packed CP1 roll")
 
 
+def test_mtp_row_argmax_live_rows_replays(monkeypatch):
+    """MTP acceptance arg-max under a padding-aware live-row bound (Triton row arg-max; -1 tail)."""
+    from megatron.core.fusions.fused_padding_aware_elementwise import (
+        HAVE_TRITON,
+        padding_aware_row_argmax,
+    )
+    from megatron.core.transformer import padding_aware_gemm as pag
+    from megatron.core.transformer.multi_token_prediction import _row_argmax_live_rows
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton unavailable")
+    monkeypatch.setenv("MCORE_PADDING_AWARE_SKIP", "")  # the bounded arg-max is off by default
+    seeded()
+    rows, vocab, live = 4096, 30016, 2688
+    logits = torch.randn(rows, 1, vocab, device="cuda", dtype=torch.bfloat16)
+    bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+
+    def run(l):
+        with pag.padding_aware_live_rows(bound, rows):
+            return _row_argmax_live_rows(l)
+
+    outputs, _ = assert_replays_bit_exact(
+        run, (logits,), replays=3, backward=False, contention=True, what="MTP row argmax live rows"
+    )
+    assert torch.equal(outputs["out"], padding_aware_row_argmax(logits, bound))
+    assert torch.equal(outputs["out"][:live], torch.argmax(logits[:live], dim=-1))
+    assert (outputs["out"][live:] == -1).all()
+
+
 def test_mtp_prefix_replays():
     """Include an exact-zero acceptance in the fused prefix-product backward."""
     from megatron.core.fusions.fused_mtp_prefix import (

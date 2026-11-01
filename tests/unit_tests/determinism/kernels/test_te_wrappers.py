@@ -21,10 +21,12 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fusions.fused_padding_aware_norm import padding_aware_rms_norm_available
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import padding_aware_gemm as pag
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_grouped_gemm,
@@ -55,6 +57,7 @@ if HAVE_TE:
         TEDotProductAttention,
         TEGroupedLinear,
         TELayerNormColumnParallelLinear,
+        TELinear,
         TENorm,
         TERowParallelLinear,
         te_cross_entropy,
@@ -481,6 +484,73 @@ class TestTEWrappers:
             module.load_state_dict(checkpoint)
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
+
+    @pytest.mark.skipif(
+        not pag.HAVE_TE_GROUPED_LEADING_DIM,
+        reason="Transformer Engine without grouped-tensor leading_dim support",
+    )
+    def test_te_linear_padding_aware_replays(self, monkeypatch):
+        """``TELinear`` on the padding-aware (one-group grouped GEMM) path under a live-row bound."""
+        monkeypatch.setenv("MCORE_PADDING_AWARE_FORCE", "1")  # policy from the shape, forced on
+        seeded()
+        rows, live = TOKENS // 2, 2688
+        config = _config(padding_aware_dense_linear=True, max_seqlen_per_dp_cp_rank=rows)
+        linear = TELinear(
+            HIDDEN,
+            FFN,
+            parallel_mode="duplicated",
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+        ).cuda()
+        assert linear._padding_aware_policy.enabled, linear._padding_aware_policy
+        bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+
+        class Bounded(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x):
+                with pag.padding_aware_live_rows(bound, rows):
+                    return self.inner(x)[0]
+
+        x = torch.randn(rows, 1, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        outputs, grads = assert_module_replays_bit_exact(
+            Bounded(linear), (x,), replays=3, contention=True, what="TELinear padding-aware"
+        )
+        assert not outputs["out"][live:].any()
+        assert not grads["in[0]"][live:].any()
+
+    def test_padding_aware_te_rms_norm_replays(self, monkeypatch):
+        """``TENorm`` RMSNorm (``PaddingAwareTERMSNorm``) under a live-row bound: Triton tiled norm."""
+        monkeypatch.setenv("MCORE_PADDING_AWARE_SKIP", "")  # the row-bounded norm is off by default
+        seeded()
+        rows, live = TOKENS // 2, 2688
+        norm = TENorm(
+            _config(normalization="RMSNorm", padding_aware_dense_linear=True), HIDDEN, eps=1e-6
+        ).cuda()
+        x = torch.randn(rows, 1, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if not padding_aware_rms_norm_available(x):
+            pytest.skip("padding-aware RMSNorm kernel unavailable")
+        bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+
+        class Bounded(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x):
+                with pag.padding_aware_live_rows(bound, rows):
+                    return self.inner(x)
+
+        outputs, grads = assert_module_replays_bit_exact(
+            Bounded(norm), (x,), replays=3, contention=True, what="PaddingAwareTERMSNorm"
+        )
+        assert not outputs["out"][live:].any()
+        assert not grads["in[0]"][live:].any()
 
     def test_te_fused_cross_entropy_replays(self):
         seeded()

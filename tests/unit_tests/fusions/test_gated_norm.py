@@ -81,6 +81,18 @@ def test_validate_supported_layout(norm_inputs, contiguous_gate):
     gated_norm.validate_gated_norm(module, x, gate)
 
 
+def test_validate_accepts_rms_norm_subclasses(norm_inputs):
+    """``TENorm`` builds an RMSNorm subclass under ``padding_aware_dense_linear``; the fusion
+    reads only the norm's weight, eps and zero_centered_gamma, so subclasses pass."""
+    from megatron.core.extensions.transformer_engine import PaddingAwareTERMSNorm
+
+    module, x, gate = norm_inputs
+    module.out_norm = PaddingAwareTERMSNorm(
+        128, eps=1e-6, params_dtype=torch.bfloat16, device="cuda"
+    )
+    gated_norm.validate_gated_norm(module, x, gate)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize(

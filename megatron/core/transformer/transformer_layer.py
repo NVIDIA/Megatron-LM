@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import warnings
@@ -41,7 +42,10 @@ from megatron.core.transformer.enums import (
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.padding_aware_gemm import with_padding_aware_dense_linears
+from megatron.core.transformer.padding_aware_gemm import (
+    suspend_padding_aware_bound,
+    with_padding_aware_dense_linears,
+)
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
@@ -777,7 +781,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
     @with_padding_aware_dense_linears
-    @with_padding_aware_dense_linears
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -1342,14 +1345,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         )
 
-        mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output,
-            residual,
-            padding_mask,
-            inference_context,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        # An un-flattened [S, mbs, H] MoE input is per-sample sequence-major: the THD live-row
+        # bound no longer describes its rows, so the bounded kernels run dense inside.
+        with (
+            suspend_padding_aware_bound()
+            if moe_unflatten_mbs is not None
+            else contextlib.nullcontext()
+        ):
+            mlp_output_with_bias = self._run_mlp(
+                pre_mlp_layernorm_output,
+                residual,
+                padding_mask,
+                inference_context,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
 
         if moe_unflatten_mbs is not None:
             mlp_output, mlp_bias = mlp_output_with_bias
@@ -1405,14 +1415,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         )
 
-        mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output,
-            residual,
-            padding_mask,
-            inference_context,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        # An un-flattened [S, mbs, H] MoE input is per-sample sequence-major: the THD live-row
+        # bound no longer describes its rows, so the bounded kernels run dense inside.
+        with (
+            suspend_padding_aware_bound()
+            if moe_unflatten_mbs is not None
+            else contextlib.nullcontext()
+        ):
+            mlp_output_with_bias = self._run_mlp(
+                pre_mlp_layernorm_output,
+                residual,
+                padding_mask,
+                inference_context,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
 
         if moe_unflatten_mbs is not None:
             mlp_output, mlp_bias = mlp_output_with_bias
@@ -2945,7 +2962,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return hidden_states, context
 
     @with_padding_aware_dense_linears
-    @with_padding_aware_dense_linears
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -3057,7 +3073,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return hidden_states, context
 
     @with_padding_aware_dense_linears
-    @with_padding_aware_dense_linears
     def _forward_mlp(
         self,
         hidden_states,
@@ -3112,14 +3127,21 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
             )
         )
-        mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output,
-            residual,
-            padding_mask,
-            inference_context,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-        )
+        # An un-flattened [S, mbs, H] MoE input is per-sample sequence-major: the THD live-row
+        # bound no longer describes its rows, so the bounded kernels run dense inside.
+        with (
+            suspend_padding_aware_bound()
+            if moe_unflatten_mbs is not None
+            else contextlib.nullcontext()
+        ):
+            mlp_output_with_bias = self._run_mlp(
+                pre_mlp_layernorm_output,
+                residual,
+                padding_mask,
+                inference_context,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
         if moe_unflatten_mbs is not None:
             output, bias = mlp_output_with_bias
             output = self._maybe_reflatten_from_moe(output, packed_seq_params, moe_unflatten_mbs)
@@ -4041,7 +4063,6 @@ class MoETransformerLayer(TransformerLayer):
         return self._apply_mlp_bda_step((output, mlp_bias), residual)
 
     @with_padding_aware_dense_linears
-    @with_padding_aware_dense_linears
     def _forward_mlp(
         self,
         hidden_states,
@@ -4103,38 +4124,43 @@ class MoETransformerLayer(TransformerLayer):
                 )
             )
 
-            if self.moe_layer_recompute:
-                if self.config.fp8 or self.config.fp4:
-                    from megatron.core.extensions.transformer_engine import te_checkpoint
+            with (
+                suspend_padding_aware_bound()
+                if moe_unflatten_mbs is not None
+                else contextlib.nullcontext()
+            ):
+                if self.moe_layer_recompute:
+                    if self.config.fp8 or self.config.fp4:
+                        from megatron.core.extensions.transformer_engine import te_checkpoint
 
-                    result = te_checkpoint(
-                        _forward_mlp_partial_cudagraphs,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        self.pg_collection.tp,
+                        result = te_checkpoint(
+                            _forward_mlp_partial_cudagraphs,
+                            False,
+                            tensor_parallel.random.get_cuda_rng_tracker,
+                            self.pg_collection.tp,
+                            hidden_states,
+                            padding_mask=padding_mask,
+                            input_ids=input_ids,
+                            packed_seq_params=packed_seq_params,
+                        )
+                    else:
+                        result = tensor_parallel.checkpoint(
+                            functools.partial(
+                                _forward_mlp_partial_cudagraphs,
+                                padding_mask=padding_mask,
+                                input_ids=input_ids,
+                                packed_seq_params=packed_seq_params,
+                            ),
+                            False,
+                            hidden_states,
+                        )
+                else:
+                    result = _forward_mlp_partial_cudagraphs(
                         hidden_states,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
                         packed_seq_params=packed_seq_params,
                     )
-                else:
-                    result = tensor_parallel.checkpoint(
-                        functools.partial(
-                            _forward_mlp_partial_cudagraphs,
-                            padding_mask=padding_mask,
-                            input_ids=input_ids,
-                            packed_seq_params=packed_seq_params,
-                        ),
-                        False,
-                        hidden_states,
-                    )
-            else:
-                result = _forward_mlp_partial_cudagraphs(
-                    hidden_states,
-                    padding_mask=padding_mask,
-                    input_ids=input_ids,
-                    packed_seq_params=packed_seq_params,
-                )
 
             result = self._maybe_reflatten_from_moe(result, packed_seq_params, moe_unflatten_mbs)
 

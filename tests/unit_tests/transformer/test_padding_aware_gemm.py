@@ -82,14 +82,15 @@ def test_padding_aware_linear_matches_dense_on_live_rows(m_valid, fused_wgrad):
         wgrad_grouped=(fused_wgrad == "grouped"),
     )
     ref = x_ref @ weight_ref.t()
-    assert torch.equal(out[:m_valid], ref[:m_valid])
+    # Grouped and dense cuBLAS kernels may order the K reduction differently: bf16 tolerance.
+    torch.testing.assert_close(out[:m_valid], ref[:m_valid])
     assert not out[m_valid:].any()
 
     grad = torch.randn_like(out)
     grad[m_valid:] = 0
     out.backward(grad)
     ref.backward(grad)
-    assert torch.equal(x_pa.grad[:m_valid], x_ref.grad[:m_valid])
+    torch.testing.assert_close(x_pa.grad[:m_valid], x_ref.grad[:m_valid])
     assert not x_pa.grad[m_valid:].any()
     if fused_wgrad:
         assert weight.grad_added_to_main_grad
@@ -136,7 +137,7 @@ def test_padding_aware_linear_replays_in_a_cuda_graph_with_a_new_bound():
     g.replay()
     torch.cuda.synchronize()
     ref = x @ weight.t()
-    assert torch.equal(out[:256], ref[:256])
+    torch.testing.assert_close(out[:256], ref[:256])
     assert not out[256:].any()
 
 
@@ -170,6 +171,21 @@ def _fake_config(**overrides):
     )
     attrs.update(overrides)
     return SimpleNamespace(**attrs)
+
+
+def test_zero_tail_rows_beyond_int32_offsets():
+    """The tail zero-fill addresses ``row * stride`` in 64 bits: an LM-head logits buffer of
+    16384 rows x 151936 columns has 2.5e9 elements, past the int32 range."""
+    rows, cols, live = 16384, 151936, 2688
+    free, _ = torch.cuda.mem_get_info()
+    if free < 8 * 2**30:
+        pytest.skip("needs ~5 GB of free GPU memory")
+    t = torch.ones(rows, cols, device="cuda", dtype=torch.bfloat16)
+    bound = torch.tensor([live], device="cuda", dtype=torch.int64)
+    pag.zero_tail_rows(t, bound)
+    assert not t[live:].any()
+    assert t[:live].all()
+    del t
 
 
 def test_dense_linear_policy_is_static_from_the_model_shape(monkeypatch):
@@ -222,6 +238,12 @@ def test_dense_linear_policy_is_static_from_the_model_shape(monkeypatch):
     assert not pag.dense_linear_policy(
         _fake_module(4096, 32768, parallel_mode="column", tp_size=2), _fake_config()
     ).enabled
+    # GTP-sharded weights (TE's DistributedWeight protocol) are gathered inside TE's forward.
+    gtp = pag.dense_linear_policy(
+        _fake_module(4096, 32768, weight=SimpleNamespace(is_distributed_weight=True)),
+        _fake_config(),
+    )
+    assert not gtp.eligible and "GTP" in gtp.reason
     assert pag.dense_linear_policy(
         _fake_module(4096, 32768, parallel_mode="column", tp_size=1), _fake_config()
     ).enabled
@@ -791,8 +813,7 @@ def test_fused_mla_rope_inplace_skips_the_padding_tail():
     T, H, nope, emb, m = 4096, 8, 64, 64, 2688
     kw = dict(device="cuda", dtype=torch.bfloat16)
     torch.manual_seed(5)
-    t = torch.randn(T, H, nope + emb, **kw)
-    t[m:] = 0
+    t = torch.randn(T, H, nope + emb, **kw)  # non-zero tail: shows the rows were skipped
     cu_seqlens = torch.tensor([0, 1500, m], device="cuda", dtype=torch.int32)
     pos = torch.arange(T, device="cuda", dtype=torch.float32)[:, None]
     freqs = pos * (10000.0 ** (-torch.arange(0, emb, 2, device="cuda").float() / emb))[None, :]
@@ -807,7 +828,7 @@ def test_fused_mla_rope_inplace_skips_the_padding_tail():
         out = fused_mla_rope_inplace(x_pa, cos, sin, nope, emb, cu_seqlens_q=cu_seqlens)
     out_ref = fused_mla_rope_inplace(x_ref, cos, sin, nope, emb, cu_seqlens_q=cu_seqlens)
     torch.testing.assert_close(out[:m], out_ref[:m])
-    assert not out[m:].any()  # untouched (zeros in)
+    assert torch.equal(out[m:], t[m:])  # the padding rows are left untouched, not rotated
     go = torch.randn(T, H, nope + emb, **kw)
     go[m:] = 0
     # The backward un-rotates its incoming gradient in place: give each call its own copy.
@@ -848,3 +869,52 @@ def test_padding_aware_grouped_projection_matches_einsum_on_live_rows():
     assert not x_pa.grad[m:].any()
     torch.testing.assert_close(x_pa.grad[:m], x_ref.grad, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(w_pa.grad.float(), w_ref.grad.float(), rtol=2e-2, atol=2e-1)
+
+
+# ------------------------------------------------------------------------------------------
+# TENorm under an fp32 residual stream
+# ------------------------------------------------------------------------------------------
+
+
+def test_padding_aware_te_rms_norm_returns_te_dtype_for_fp32_residual(monkeypatch):
+    """TE's RMSNorm computes in and returns the weight dtype (bf16) when the residual stream is
+    fp32; the row-bounded kernel behind ``TENorm`` must do the same (and zero the tail) instead
+    of handing an fp32 tensor to the next linear."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from megatron.core.extensions.transformer_engine import PaddingAwareTERMSNorm, TENorm
+    from megatron.core.fusions.fused_padding_aware_norm import padding_aware_rms_norm_available
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    monkeypatch.setenv("MCORE_PADDING_AWARE_SKIP", "")  # the row-bounded norm is off by default
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        H, T, m = 1024, 4096, 2688
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=H,
+            num_attention_heads=1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            padding_aware_dense_linear=True,
+            max_seqlen_per_dp_cp_rank=T,
+        )
+        norm = TENorm(config, H, eps=1e-6).cuda()
+        assert isinstance(norm, PaddingAwareTERMSNorm)
+        ref = te.RMSNorm(H, eps=1e-6, dtype=torch.bfloat16, device="cuda")
+        with torch.no_grad():
+            norm.weight.copy_(torch.randn_like(norm.weight))
+            ref.weight.copy_(norm.weight)
+        x = torch.randn(T, 1, H, device="cuda", dtype=torch.float32)
+        if not padding_aware_rms_norm_available(x.to(torch.bfloat16)):
+            pytest.skip("padding-aware RMSNorm kernel unavailable")
+        bound = torch.tensor([m], device="cuda", dtype=torch.int64)
+        with pag.padding_aware_live_rows(bound, T):
+            out = norm(x)
+        out_ref = ref(x)
+        assert out.dtype == out_ref.dtype == torch.bfloat16
+        torch.testing.assert_close(out[:m], out_ref[:m])
+        assert not out[m:].any()
+    finally:
+        Utils.destroy_model_parallel()

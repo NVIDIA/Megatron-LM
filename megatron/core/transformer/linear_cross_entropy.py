@@ -54,6 +54,8 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
             and self.bias is None
             and self.embedding_activation_buffer is None
             and not self.explicit_expert_comm
+            and getattr(self, "gtp_remat_size", 1) == 1
+            and getattr(self, "output_dtype", None) in (None, input_.dtype)
         ):
             # Padding-aware LM head: the GEMM covers only the live rows of the THD buffer.
             weight = weight if weight is not None else self.weight

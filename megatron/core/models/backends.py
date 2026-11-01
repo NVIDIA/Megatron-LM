@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import logging
 from abc import abstractmethod
 from functools import partial
 from typing import Callable, Literal, Optional, Protocol, cast
@@ -44,6 +45,8 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchN
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
+logger = logging.getLogger(__name__)
+
 CrossEntropyTarget = Callable[
     [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
 ]
@@ -74,6 +77,9 @@ def require(requirement: str, requested_by: str = "This backend", instead: str =
         raise ImportError(f"{message} {instead}".strip())
 
 
+_TRITON_CE_FALLBACK_LOGGED: list = []
+
+
 def _triton_ce(
     logits: torch.Tensor, labels: torch.Tensor, tp_group: Optional[torch.distributed.ProcessGroup]
 ) -> torch.Tensor:
@@ -83,11 +89,16 @@ def _triton_ce(
     bound, CUDA-graph capturable); ``MCORE_PADDING_AWARE_SKIP=ce`` keeps the kernel on every row.
     """
     if not triton_cross_entropy_available(logits, labels):
-        raise RuntimeError(
-            "cross_entropy_fusion_impl='triton' needs Triton and CUDA bf16/fp32 logits "
-            f"[s, b, V] with unit last stride; got {logits.dtype} {tuple(logits.shape)} on "
-            f"{logits.device}"
-        )
+        if not _TRITON_CE_FALLBACK_LOGGED:
+            _TRITON_CE_FALLBACK_LOGGED.append(True)
+            logger.warning(
+                "cross_entropy_fusion_impl='triton' needs Triton and CUDA bf16/fp32 logits "
+                "[s, b, V] with unit last stride; got %s %s on %s -> native fused cross entropy",
+                logits.dtype,
+                tuple(logits.shape),
+                logits.device,
+            )
+        return _fused_ce(logits, labels, tp_group)
     live_rows = current_live_rows_for(logits.shape[0] * logits.shape[1])
     if live_rows is not None and not padding_aware_cross_entropy_available(logits, labels):
         live_rows = None

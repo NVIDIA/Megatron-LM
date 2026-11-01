@@ -15,6 +15,7 @@ Guides for Megatron Core training and inference features.
 :maxdepth: 2
 
 cuda_graph
+padding_aware_kernels
 fine_grained_activation_offloading
 low_precision_training
 moe

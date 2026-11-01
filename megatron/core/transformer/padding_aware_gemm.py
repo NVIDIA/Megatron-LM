@@ -65,6 +65,54 @@ try:
 except ImportError:  # pragma: no cover - depends on the installed TE
     HAVE_PADDING_AWARE_GEMM = False
 
+# Keyword arguments this module passes to ``_GroupedLinear._forward_grouped_tensor``. The
+# installed Transformer Engine must take exactly these (plus the distributed-weight pair where it
+# exists) and nothing else without a default; otherwise the TE-linear path stays off.
+_TE_GROUPED_FORWARD_KWARGS = frozenset(
+    {
+        "inp",
+        "m_splits",
+        "use_bias",
+        "is_first_microbatch",
+        "fp8",
+        "wgrad_store",
+        "input_quantizers",
+        "weight_quantizers",
+        "grad_input_quantizers",
+        "grad_weight_quantizers",
+        "grad_output_quantizers",
+        "fuse_wgrad_accumulation",
+        "activation_dtype",
+        "is_grad_enabled",
+        "weight_workspaces",
+        "cache_weight",
+        "skip_fp8_weight_update",
+        "save_original_input",
+        "single_grouped_weight",
+        "single_grouped_bias",
+        "weights",
+        "biases",
+    }
+)
+
+
+def _te_grouped_forward_signature_supported(params) -> bool:
+    """True when TE's grouped forward accepts the arguments passed here and requires no other:
+    an older (LTS) or newer release with a different signature falls back to the dense path
+    instead of failing at the first call."""
+    passed = set(_TE_GROUPED_FORWARD_KWARGS)
+    if "origin_weights" in params:
+        passed |= {"origin_weights", "is_dist_weight"}
+    if not passed <= set(params):
+        return False
+    for param in list(params.values())[1:]:  # the first parameter is the autograd ctx
+        if param.name in passed or param.default is not inspect.Parameter.empty:
+            continue
+        if param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
+            return False
+    return True
+
+
 try:
     from transformer_engine.pytorch.constants import TE_DType
     from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
@@ -82,10 +130,16 @@ try:
     HAVE_TE_GROUPED_LINEAR_PATH = HAVE_PADDING_AWARE_GEMM and hasattr(
         _GroupedLinear, "_forward_grouped_tensor"
     )
-    # Newer Transformer Engine (2.21+) takes the distributed-weight arguments explicitly.
-    _TE_GROUPED_FORWARD_HAS_ORIGIN_WEIGHTS = HAVE_TE_GROUPED_LINEAR_PATH and (
-        "origin_weights" in inspect.signature(_GroupedLinear._forward_grouped_tensor).parameters
-    )
+    _TE_GROUPED_FORWARD_HAS_ORIGIN_WEIGHTS = False
+    if HAVE_TE_GROUPED_LINEAR_PATH:
+        _grouped_forward_params = inspect.signature(
+            _GroupedLinear._forward_grouped_tensor
+        ).parameters
+        # Newer Transformer Engine (2.21+) takes the distributed-weight arguments explicitly.
+        _TE_GROUPED_FORWARD_HAS_ORIGIN_WEIGHTS = "origin_weights" in _grouped_forward_params
+        HAVE_TE_GROUPED_LINEAR_PATH = _te_grouped_forward_signature_supported(
+            _grouped_forward_params
+        )
 except ImportError:  # pragma: no cover
     HAVE_TE_GROUPED_LINEAR_PATH = False
     _TE_GROUPED_FORWARD_HAS_ORIGIN_WEIGHTS = False
@@ -178,6 +232,12 @@ class _LiveRows:
 _live_rows: Optional[_LiveRows] = None
 
 
+def _single_sequence_mask(padding_mask: torch.Tensor) -> bool:
+    """Only a ``[1, T]`` / ``[T]`` (packed THD) mask flattens to the buffer's row order; a
+    ``[b > 1, s]`` mask is batch-major while the ``[s, b, h]`` rows are sequence-major."""
+    return padding_mask.dim() == 1 or padding_mask.shape[0] == 1
+
+
 @contextlib.contextmanager
 def padding_aware_live_rows(m_rows: Optional[torch.Tensor], total_rows: Optional[int] = None):
     """Make ``m_rows`` (from ``live_rows_bound``) the live-row bound for GEMMs run inside.
@@ -192,6 +252,11 @@ def padding_aware_live_rows(m_rows: Optional[torch.Tensor], total_rows: Optional
         yield
     finally:
         _live_rows = previous
+
+
+def suspend_padding_aware_bound():
+    """Context in which no live-row bound is published (rows not in the THD buffer order)."""
+    return padding_aware_live_rows(None)
 
 
 def current_live_rows() -> Optional[torch.Tensor]:
@@ -214,6 +279,8 @@ _log_budget = [256]  # MCORE_PADDING_AWARE_LOG=1: print the first bounds seen (d
 def _maybe_log_bound(where: str, bound: torch.Tensor, total_rows: int) -> None:
     if _log_budget[0] <= 0 or os.environ.get("MCORE_PADDING_AWARE_LOG", "0") != "1":
         return
+    if torch.cuda.is_current_stream_capturing():
+        return  # bound.item() would abort the capture
     _log_budget[0] -= 1
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     live = int(bound.item())
@@ -233,6 +300,8 @@ def padding_aware_lm_head_context(config, padding_mask: Optional[torch.Tensor]):
         not getattr(config, "padding_aware_lm_head", False)
         or padding_mask is None
         or not HAVE_PADDING_AWARE_GEMM
+        or not HAVE_TRITON  # the bound and the tail zero-fill are Triton kernels
+        or not _single_sequence_mask(padding_mask)
     ):
         return contextlib.nullcontext()
     bound = live_rows_bound(padding_mask)
@@ -246,6 +315,7 @@ def padding_aware_dense_linear_context(config, padding_mask: Optional[torch.Tens
         not getattr(config, "padding_aware_dense_linear", False)
         or padding_mask is None
         or not HAVE_TE_GROUPED_LINEAR_PATH
+        or not _single_sequence_mask(padding_mask)
     ):
         return contextlib.nullcontext()
     bound = live_rows_bound(padding_mask)
@@ -282,7 +352,7 @@ if HAVE_TRITON:
 
     @triton.jit
     def _zero_tail_rows_kernel(ptr, m_ptr, n_cols, stride, BLOCK: tl.constexpr):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)  # row * stride can exceed 2^31
         if row >= tl.load(m_ptr):
             offs = tl.arange(0, BLOCK)
             for start in range(0, n_cols, BLOCK):
@@ -328,6 +398,7 @@ def _grouped_weight(weight: torch.Tensor):
 
 
 _wgrad_arenas: dict = {}  # (dtype, device) -> flat buffer shared by every weight shape
+_retired_wgrad_arenas: list = []  # superseded arenas kept alive for captured graphs
 _wgrad_scratches: dict = {}  # (shape, dtype, device) -> view into the arena (or own buffer)
 
 
@@ -357,6 +428,9 @@ def _wgrad_scratch(shape, dtype, device) -> torch.Tensor:
             scratch = torch.empty(shape, dtype=dtype, device=device)
             _wgrad_scratches[key] = scratch
             return scratch
+        if arena is not None:
+            # A CUDA graph captured earlier may still address the old arena: keep it alive.
+            _retired_wgrad_arenas.append(arena)
         arena = torch.empty(numel, dtype=dtype, device=device)
         _wgrad_arenas[arena_key] = arena
         # Earlier views pointed into the old arena; rebuild them on the new one.
@@ -375,7 +449,7 @@ def _wgrad_scratch(shape, dtype, device) -> torch.Tensor:
 # Kernel policy: decided once per layer from the model shape, never from the runtime row count
 # --------------------------------------------------------------------------------------------
 #
-# Measurements (GB200, cuBLAS 13.3, doc PADDING_AWARE_GEMM_1008.md sections 6-8):
+# Measurements (GB200, cuBLAS 13.3; see docs/user-guide/features/padding_aware_kernels.md):
 #
 # * Forward / dgrad / wgrad through the single-group grouped GEMM cost about the live-row
 #   fraction of the dense GEMM once the GEMM is big enough (N >= ~1024, capacity >= 8192); for
@@ -415,7 +489,11 @@ FIXED_OVERHEAD_S = 20e-6
 ASSUMED_PADDING = 0.2
 # Margin the predicted saving must beat (calibrated against bench_te_linear_pa.py so that no
 # shape measured as a loss at p = 0.2 is enabled); MCORE_PADDING_AWARE_MARGIN overrides it.
-POLICY_MARGIN = float(os.environ.get("MCORE_PADDING_AWARE_MARGIN", "1.3"))
+try:
+    POLICY_MARGIN = float(os.environ.get("MCORE_PADDING_AWARE_MARGIN", "1.3"))
+except ValueError:  # pragma: no cover
+    logger.warning("MCORE_PADDING_AWARE_MARGIN is not a number; using 1.3")
+    POLICY_MARGIN = 1.3
 
 
 def static_capacity_rows(config) -> Optional[int]:
@@ -509,6 +587,18 @@ def predicted_padding_aware_gain(
     return saving, overhead
 
 
+def _is_distributed_weight(tensor) -> bool:
+    """TE's ``DistributedWeight`` capability marker (e.g. GTP-sharded parameters)."""
+    return bool(getattr(tensor, "is_distributed_weight", False))
+
+
+def _owns_distributed_weight(module) -> bool:
+    """Whether any parameter the module itself owns is a distributed weight."""
+    if isinstance(module, torch.nn.Module):
+        return any(_is_distributed_weight(p) for p in module.parameters(recurse=False))
+    return _is_distributed_weight(getattr(module, "weight", None))
+
+
 def dense_linear_policy(module, config) -> DenseLinearPolicy:
     """Decide once, at construction, whether a TE linear runs padding-aware and how its weight
     gradient is accumulated. Inputs are the layer's weight shape, the configured capacity and
@@ -520,6 +610,12 @@ def dense_linear_policy(module, config) -> DenseLinearPolicy:
     out_features, in_features = int(module.out_features), int(module.in_features)
     if getattr(module, "use_bias", False):
         return DenseLinearPolicy(False, False, "bias")
+    if getattr(module, "is_expert", False):
+        return DenseLinearPolicy(False, False, "expert linear (rows are routed tokens)")
+    if _owns_distributed_weight(module):
+        # GTP-sharded weights are all-gathered inside TE's own forward; the grouped call here
+        # would see the shard.
+        return DenseLinearPolicy(False, False, "GTP-sharded weight")
     if module.parallel_mode is not None and module.tp_size > 1:
         return DenseLinearPolicy(False, False, "tensor-parallel communication inside TE")
     if getattr(module, "symmetric_ar_type", None) is not None:
@@ -820,6 +916,32 @@ def _graph_capture_flags(is_first_microbatch):
     return is_first_microbatch, skip_fp8_weight_update
 
 
+def _activation_dtype_for(inp: torch.Tensor) -> torch.dtype:
+    """The dtype TE's ``set_activation_dtype`` will pick: autocast's, else the input's."""
+    try:
+        if torch.is_autocast_enabled("cuda"):
+            return torch.get_autocast_dtype("cuda")
+    except TypeError:  # pragma: no cover - torch < 2.4
+        if torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return inp.dtype
+
+
+def _te_grouped_path_possible(inp: torch.Tensor) -> bool:
+    """The recipe and dtype conditions of ``_te_grouped_call``, read from the global quantization
+    state *before* ``prepare_forward``: a call that has to fall back must not enter TE's forward
+    bookkeeping twice (delayed-scaling amax registration, activation dtype checks)."""
+    if FP8GlobalStateManager.is_fp8_calibration():
+        return False
+    activation_dtype = _activation_dtype_for(inp)
+    if FP8GlobalStateManager.is_fp8_enabled():
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        if is_module_grouped_tensor_path_supported is not None:
+            return bool(is_module_grouped_tensor_path_supported(recipe, activation_dtype))
+        return bool(recipe.mxfp8() and recipe.backward_override is None)
+    return activation_dtype in (torch.bfloat16, torch.float16)
+
+
 def _te_grouped_call(module, is_first_microbatch, policy, is_grad_enabled, skip_fp8_weight_update):
     """Module-level plumbing shared by ``te.pytorch.Linear.forward`` and
     ``LayerNormLinear.forward`` for the one-group grouped path: recipe check, quantizers,
@@ -840,6 +962,8 @@ def _te_grouped_call(module, is_first_microbatch, policy, is_grad_enabled, skip_
         return None
 
     weight, _ = module._get_weight_and_bias_tensors()  # bias is excluded by the policy
+    if _is_distributed_weight(weight):
+        return None  # GTP-sharded: only TE's own forward gathers it
     input_quantizer, weight_quantizer, output_quantizer, _, _, grad_output_quantizer = (
         module._get_quantizers(False, False, is_grad_enabled)
     )
@@ -895,6 +1019,7 @@ def te_linear_padding_aware_forward(
         isinstance(inp, QuantizedTensorStorage)
         or module.is_debug_iter()
         or is_cpu_offload_enabled()
+        or not _te_grouped_path_possible(inp)
     ):
         return None
     is_grad_enabled = torch.is_grad_enabled()
@@ -1146,6 +1271,7 @@ def te_layernorm_linear_padding_aware_forward(
         or is_cpu_offload_enabled()
         or module.return_layernorm_output
         or module.return_layernorm_output_gathered
+        or not _te_grouped_path_possible(inp)
     ):
         return None
     is_grad_enabled = torch.is_grad_enabled()
