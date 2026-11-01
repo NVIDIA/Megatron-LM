@@ -795,6 +795,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             a constant gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters this optimizer updates. They name the config-logger file; without them
+            the file name falls back, with a warning, to the global parallel state.
     """
 
     def __init__(
@@ -803,9 +806,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         config: OptimizerConfig,
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
@@ -1165,7 +1172,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
-        super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        super().__init__(optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection)
         self.pg_collection = pg_collection
 
         # Handle main parameters.
@@ -1530,13 +1537,23 @@ class FP32Optimizer(MegatronOptimizer):
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters this optimizer updates. They name the config-logger file; without them
+            the file name falls back, with a warning, to the global parallel state.
     """
 
     def __init__(
-        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable
+        self,
+        optimizer: torch.optim.Optimizer,
+        config: OptimizerConfig,
+        init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 

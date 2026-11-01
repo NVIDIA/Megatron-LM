@@ -24,7 +24,7 @@ class _RecordingLinear(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.parallel_mode = None
-        self._tp_group = None
+        self._tp_group = kwargs["tp_group"]
         self.register_parameter("weight", torch.nn.Parameter(torch.empty(1, 1)))
         self.calls.append((args, kwargs))
 
@@ -116,7 +116,7 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
 
     assert len(_RecordingLinear.calls) == 2
     assert all(kwargs["parallel_mode"] == "duplicated" for _, kwargs in _RecordingLinear.calls)
-    assert all("tp_group" not in kwargs for _, kwargs in _RecordingLinear.calls)
+    assert all(kwargs["tp_group"] is tp_group for _, kwargs in _RecordingLinear.calls)
     assert all(kwargs["gtp_remat_group"] is gtp_remat_group for _, kwargs in _RecordingLinear.calls)
     assert all(
         kwargs["gtp_replica_group"] is gtp_replica_group for _, kwargs in _RecordingLinear.calls
@@ -147,6 +147,7 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     MoELayer(config, submodules, pg_collection=pg_collection)
 
     assert len(_RecordingInferenceLinear.calls) == 2
+    assert all(kwargs["tp_group"] is tp_group for _, kwargs in _RecordingInferenceLinear.calls)
     assert all(
         kwargs["pg_collection"] is pg_collection for _, kwargs in _RecordingInferenceLinear.calls
     )
