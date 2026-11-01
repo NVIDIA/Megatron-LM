@@ -2,6 +2,7 @@
 from contextlib import nullcontext
 from typing import List, Optional, Set, Tuple, Union
 
+import torch
 from torch import Tensor
 
 from megatron.core.context_parallel import ContextParallelLayoutState
@@ -12,7 +13,11 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import (
+    first_local_layer_index,
+    precision_aware_checkpoint,
+    resolve_gradient_boundary,
+)
 
 
 def checkpointed_forward(
@@ -51,6 +56,10 @@ def checkpointed_forward(
     """
     if extract_layer_indices is None:
         extract_layer_indices = set()
+    resolved = getattr(self, "_gradient_boundary_resolved", None)
+    _, gradient_boundary_layer = (
+        resolved if resolved is not None else resolve_gradient_boundary(self, hidden_states)
+    )
     intermediate_hidden_states: List[Tensor] = []
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
@@ -160,7 +169,35 @@ def checkpointed_forward(
 
         return custom_forward
 
-    def chunk_runner(start: int, end: int, use_checkpoint: bool):
+    # Count from this stage's first layer rather than ``layer_offset``: HybridStack does not
+    # pass an offset, and its layers carry global layer numbers on every pipeline stage.
+    first_local_layer = first_local_layer_index(self.layers)
+    boundary_local = (
+        None
+        if gradient_boundary_layer is None or first_local_layer is None
+        else gradient_boundary_layer - first_local_layer
+    )
+    # A boundary before this stage means trainable layers upstream: keep the input's graph.
+    boundary_applied = boundary_local is None or boundary_local < 0
+    # The block recompute window counts trainable layers, starting at the boundary.
+    first_trainable_local = 0 if boundary_local is None else max(boundary_local, 0)
+
+    def apply_gradient_boundary():
+        nonlocal hidden_states, context, boundary_applied
+        if boundary_applied:
+            return
+        hidden_states = hidden_states.detach()
+        if torch.is_grad_enabled():
+            # Reentrant checkpoints (tensor_parallel and TE) only produce outputs that
+            # require grad when an input does. Nothing before the boundary is trainable,
+            # so make the boundary activation a grad leaf; otherwise the trainable layers
+            # after it would receive no gradient.
+            hidden_states.requires_grad_(True)
+        if isinstance(context, Tensor):
+            context = context.detach()
+        boundary_applied = True
+
+    def chunk_runner(start: int, end: int, use_checkpoint: bool, use_grad: bool = True):
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
@@ -173,18 +210,20 @@ def checkpointed_forward(
             padding_mask,
             input_ids,
         )
-        if use_checkpoint:
-            hidden_states, context = precision_aware_checkpoint(
-                cf,
-                self.config,
-                self.pg_collection.tp,
-                *args,
-                distribute_saved_activations=self.config.distribute_saved_activations,
-            )
+        if use_grad:
+            if use_checkpoint:
+                hidden_states, context = precision_aware_checkpoint(
+                    cf,
+                    self.config,
+                    self.pg_collection.tp,
+                    *args,
+                    distribute_saved_activations=self.config.distribute_saved_activations,
+                )
+            else:
+                hidden_states, context = cf(*args)
         else:
-            # Note: original block-branch no-checkpoint path omitted padding_mask
-            # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+            with torch.no_grad():
+                hidden_states, context = cf(*args)
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:
@@ -201,8 +240,14 @@ def checkpointed_forward(
             chunk_end = min(
                 layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
             )
-            chunk_runner(layer_idx, chunk_end, True)
-            layer_idx += self.config.recompute_num_layers
+            if boundary_local is not None and layer_idx < boundary_local:
+                prefix_end = min(chunk_end, boundary_local)
+                chunk_runner(layer_idx, prefix_end, False, use_grad=False)
+                layer_idx = prefix_end
+            else:
+                apply_gradient_boundary()
+                chunk_runner(layer_idx, chunk_end, True)
+                layer_idx = chunk_end
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
         # layers and skip the rest. Need at least one input tensor with
@@ -211,15 +256,24 @@ def checkpointed_forward(
         # is False (these slots get pushed past the recompute window).
         recompute_skip_num_layers = 0
         for layer_idx in range(self.num_layers_per_pipeline_rank):
+            if boundary_local is not None and layer_idx < boundary_local:
+                chunk_runner(layer_idx, layer_idx + 1, False, use_grad=False)
+                continue
+            apply_gradient_boundary()
             if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
+            window_idx = layer_idx - first_trainable_local
             use_checkpoint = (
-                layer_idx >= recompute_skip_num_layers
-                and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                window_idx >= recompute_skip_num_layers
+                and window_idx < self.config.recompute_num_layers + recompute_skip_num_layers
             )
             chunk_runner(layer_idx, layer_idx + 1, use_checkpoint)
     else:
         raise ValueError("Invalid activation recompute method.")
+
+    if not boundary_applied:
+        # Every layer here lies before the boundary; see TransformerBlock.forward.
+        hidden_states = hidden_states.detach()
 
     # Return intermediate hidden states if feature extraction was requested
     if len(extract_layer_indices) > 0:
