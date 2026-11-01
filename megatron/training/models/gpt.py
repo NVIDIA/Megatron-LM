@@ -51,8 +51,17 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 
 
-def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
-    """Determine the most appropriate layer specification based on availability."""
+def default_layer_spec(
+    config: "GPTModelConfig", vp_stage: int, pg_collection: ProcessGroupCollection | None = None
+) -> ModuleSpec:
+    """Determine the most appropriate layer specification based on availability.
+
+    Args:
+        config: GPT model configuration.
+        vp_stage: Virtual pipeline stage of the model chunk.
+        pg_collection: Process groups the model is built on. The ModelOpt spec reads its
+            context-parallel size from them; None reads it from the global parallel state.
+    """
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
@@ -71,13 +80,14 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
 
         # arbitrary attention mask is used for speculative decoding training
         # When context parallel > 1, only causal mask type is supported
-        from megatron.core import parallel_state
+        if config.use_arbitrary_attention_mask is not None:
+            use_arbitrary_attention_mask = config.use_arbitrary_attention_mask
+        elif pg_collection is not None:
+            use_arbitrary_attention_mask = pg_collection.cp.size() == 1
+        else:
+            from megatron.core import parallel_state
 
-        use_arbitrary_attention_mask = (
-            config.use_arbitrary_attention_mask
-            if config.use_arbitrary_attention_mask is not None
-            else parallel_state.get_context_parallel_world_size() == 1
-        )
+            use_arbitrary_attention_mask = parallel_state.get_context_parallel_world_size() == 1
         return get_gpt_modelopt_spec(
             config=config.transformer,
             local_core_attention=False,
@@ -286,7 +296,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
-            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
+            transformer_layer_spec = default_layer_spec(
+                self._model_config, vp_stage, pg_collection=pg_collection
+            )
         elif not isinstance(transformer_layer_spec, ModuleSpec) and callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:
