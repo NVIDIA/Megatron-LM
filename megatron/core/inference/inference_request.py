@@ -798,6 +798,11 @@ class DynamicInferenceRequest(InferenceRequest):
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
     # Prompt tokens whose prefill was skipped via prefix caching; accumulated across chunks.
     num_cached_tokens: int = 0
+    # Cached prompt log-probs for skipped tokens, waiting to be placed in order as
+    # (first source position, selected, top-N values, top-N token IDs). Engine-only.
+    cached_prompt_log_probs: List[Tuple[int, np.ndarray, np.ndarray, np.ndarray]] = field(
+        default_factory=list, repr=False
+    )
     # Length of the leading run of this request's blocks that was obtained by hash
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
@@ -984,6 +989,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("cached_prompt_log_probs", None)
         # Request metadata is input-only. Only the stager's response metadata
         # crosses back to the REST endpoint.
         obj.pop("offload_params", None)

@@ -29,6 +29,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -95,8 +96,14 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    FlashInferCutlassMXFP8Weight,
+    FlashInferRoutedMXFP8Weight,
+    attach_routed_mxfp8_writeback,
+    flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
+    prepare_cutlass_mxfp8_weights,
     prepare_routed_mxfp8_weights,
+    require_flashinfer_cutlass_mxfp8,
     require_flashinfer_routed_mxfp8,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import (
@@ -722,13 +729,6 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
-        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
-        # grouped view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
@@ -833,13 +833,6 @@ class TEGroupedMLP(MegatronModule):
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
         op.wgrad_store = self.linear_fc2.wgrad_store
-        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
-        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
-        # view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_grad = True
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -982,12 +975,14 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
-            # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
-            # reads), whose storage is non-resizable — so skip the force-release in that case.
+            # In case of MXFP8 Dispatch permuted_local_hidden_states is GroupedTensor which does
+            # not have a single backing storage to release. Rely on garbage collection to do its
+            # job.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
-                if fine_grained_activation_offloading and output_buffer is None
+                if fine_grained_activation_offloading
+                and output_buffer is None
+                and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
             with stash_context:
@@ -1407,8 +1402,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
-    - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
-      and per-token NVFP4
+    - Inference + FlashInfer: CUTLASS fused MoE for BF16 and tanh-clamped MXFP8,
+      routed block-scale MoE for other MXFP8 activations and per-token NVFP4
     - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
@@ -1436,17 +1431,37 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
         self._uses_mxfp8_weights: bool | None = None
+        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvfp4_recipe = config.inference_moe_nvfp4_recipe
         self._nvfp4_weights = None
 
-        if HAVE_FLASHINFER:
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            if not HAVE_FLASHINFER:
+                raise RuntimeError(
+                    "flashinfer-python is required when inference_grouped_gemm_backend="
+                    "'flashinfer'."
+                )
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
-        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        # Allocate with the inference weights, after model-wide dtype conversion.
+        # A registered floating-point buffer would be cast by Module.bfloat16(),
+        # violating FlashInfer's FP32 ABI. Keep this graph-stable tensor unregistered.
+        self._flashinfer_clamp_limit = None
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+
+    @torch.inference_mode(False)
+    def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
+        """Allocate the FP32 limit once during inference warmup, before graph capture."""
+        if (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            and self._activation_clamp_scale is not None
+        ):
+            self._flashinfer_clamp_limit = torch.full(
+                (1,), self._activation_clamp_scale, dtype=torch.float32, device=device
+            )
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1463,6 +1478,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
         elif func == F.relu:
             return ActivationType.Relu
         elif func == squared_relu:
+            if self.config.activation_func_tanh_clamp_scale is not None:
+                clamped_relu2 = getattr(ActivationType, "ClampedRelu2", None)
+                if (
+                    clamped_relu2 is None
+                    or "clamped_relu2_limit"
+                    not in inspect.signature(fused_moe.cutlass_fused_moe).parameters
+                ):
+                    raise RuntimeError(
+                        "The installed FlashInfer does not provide "
+                        "ActivationType.ClampedRelu2 with clamped_relu2_limit. "
+                        "Install flashinfer-python>=0.7.2 "
+                        "or select "
+                        "inference_grouped_gemm_backend='torch' or 'vllm'."
+                    )
+                return clamped_relu2
             return ActivationType.Relu2
         raise ValueError(f"No FlashInfer ActivationType mapping for activation_func={func}")
 
@@ -1547,21 +1577,33 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_concatenated_mxfp8_weights(self):
         """Build contiguous expert stacks after checkpoint loading.
 
-        The torch and vLLM backends rebind each per-expert MXFP8Tensor to its stacked view.
-        FlashInfer keeps those canonical tensors for refit and derives a shuffled
-        Major-K stack for its routed-MoE kernel.
+        Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
+        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
+        the canonical tensors write through to it, releasing their storage.
         """
 
-        use_flashinfer_routed = (
+        use_flashinfer = (
             self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
         )
+        use_flashinfer_cutlass = use_flashinfer and self._activation_clamp_scale is not None
         backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
-        if use_flashinfer_routed:
+        if use_flashinfer_cutlass:
+            require_flashinfer_cutlass_mxfp8()
+        elif use_flashinfer:
             require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             linear = getattr(self, linear_name)
             stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
-            if use_flashinfer_routed:
+            if use_flashinfer_cutlass:
+                concatenated_weight = prepare_cutlass_mxfp8_weights(stacked_weight)
+                logger.info(
+                    "Prepared FlashInfer CUTLASS MXFP8 %s weights: experts=%d shape=(%d, %d)",
+                    linear_name,
+                    self.num_local_experts,
+                    concatenated_weight.logical_rows,
+                    concatenated_weight.logical_cols,
+                )
+            elif use_flashinfer:
                 concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
                 logger.info(
                     "Prepared FlashInfer routed MXFP8 %s weights: experts=%d "
@@ -1573,14 +1615,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     concatenated_weight.padded_rows,
                     concatenated_weight.padded_cols,
                 )
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    attach_routed_mxfp8_writeback(weight, concatenated_weight, i)
             else:
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
 
-            # The torch and vLLM paths can redirect per-expert storage into the stacked
-            # representation. FlashInfer keeps the canonical Triton tensors intact
-            # because its shuffled Major-K weights are a derived representation.
-            if not use_flashinfer_routed:
+            # Preserve the wrappers referenced by refit plans; only redirect their
+            # storage. CUTLASS's packed-int32 scales view these same canonical bytes.
+            if not use_flashinfer or use_flashinfer_cutlass:
                 for i in range(self.num_local_experts):
                     w = getattr(linear, f'weight{i}')
                     if isinstance(w, MXFP8Tensor):
@@ -1594,7 +1638,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     @torch.inference_mode(False)
     @torch.no_grad()
     def refresh_flashinfer_mxfp8_weights(self) -> bool:
-        """Refresh routed Major-K expert weights in place after an MXFP8 refit.
+        """Refresh derived FlashInfer expert weights in place after an MXFP8 refit.
 
         Returns whether derived FlashInfer weights were refreshed.
         """
@@ -1604,17 +1648,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ):
             return False
 
-        if not self._uses_mxfp8_weights:
+        if not self._uses_mxfp8_weights or isinstance(
+            self._fc1_weight, FlashInferCutlassMXFP8Weight
+        ):
             # Selective-precision recipes also build BF16 expert weights for
-            # FlashInfer. Those buffers are refit directly and have no derived
-            # routed representation to refresh.
+            # FlashInfer. BF16 and CUTLASS MXFP8 share canonical storage and are
+            # refit directly; routed MXFP8 is written through by refit as well.
             return False
 
-        require_flashinfer_routed_mxfp8()
-        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-            routed_weight = getattr(self, buf_name)
-            canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
-            prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
+        # Refit already wrote through to the routed weights (attach_routed_mxfp8_writeback);
+        # returning True still makes refit synchronize before graphs replay.
         return True
 
     @torch.inference_mode(False)
@@ -1697,26 +1740,47 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
-        assert self._activation_clamp_scale is None, (
-            "activation_func_tanh_clamp_scale is not supported by the FlashInfer MoE kernels, "
-            "whose activations are fixed enum variants with no clamp. Use "
-            "inference_grouped_gemm_backend=vllm or torch."
+        assert self._activation_clamp_scale is None or (
+            self._flashinfer_activation_type == ActivationType.ClampedRelu2
+        ), (
+            "activation_func_tanh_clamp_scale is only supported by FlashInfer with "
+            "squared_relu (ActivationType.ClampedRelu2). Use "
+            "inference_grouped_gemm_backend=vllm or torch for other activations."
         )
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
         if self._uses_mxfp8_weights:
-            output = flashinfer_routed_mxfp8_moe(
-                hidden_states,
-                routing_map,
-                probs,
-                self._fc1_weight,
-                self._fc2_weight,
-                num_experts=self.num_local_experts * self.ep_group.size(),
-                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
-                activation_type=self._flashinfer_activation_type.value,
-                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_mxfp8_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
-            )
+            if not isinstance(
+                self._fc1_weight, (FlashInferCutlassMXFP8Weight, FlashInferRoutedMXFP8Weight)
+            ) or type(self._fc1_weight) is not type(self._fc2_weight):
+                raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
+            out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+            if isinstance(self._fc1_weight, FlashInferCutlassMXFP8Weight):
+                output = flashinfer_cutlass_mxfp8_moe(
+                    hidden_states,
+                    routing_map,
+                    probs,
+                    self._fc1_weight,
+                    self._fc2_weight,
+                    ep_size=self.ep_group.size(),
+                    ep_rank=self.ep_group.rank(),
+                    activation_type=self._flashinfer_activation_type,
+                    out=out,
+                    activation_clamp_limit=self._flashinfer_clamp_limit,
+                )
+            else:
+                output = flashinfer_routed_mxfp8_moe(
+                    hidden_states,
+                    routing_map,
+                    probs,
+                    self._fc1_weight,
+                    self._fc2_weight,
+                    num_experts=self.num_local_experts * self.ep_group.size(),
+                    local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+                    activation_type=self._flashinfer_activation_type.value,
+                    out=out,
+                    token_capacity=self._flashinfer_mxfp8_token_capacity,
+                    use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+                )
             return output, None
         if self._nvfp4_weights is not None:
             output = flashinfer_routed_nvfp4_moe(
@@ -1741,6 +1805,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             hidden_states.dtype,
             quant_scales=None,
             activation_type=self._flashinfer_activation_type,
+            **(
+                {"clamped_relu2_limit": self._flashinfer_clamp_limit}
+                if self._activation_clamp_scale is not None
+                else {}
+            ),
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
             # FlashInfer's BF16 CUTLASS kernel requires a BF16 output, while the
@@ -1798,8 +1867,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Forward pass with backend-selected inference grouped GEMMs:
 
         - Training: delegates to parent TEGroupedMLP.
-        - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
-          is not used in this path; the FlashInfer kernels operate directly on routing_map.
+        - Inference + FlashInfer: fused BF16 or MXFP8 MoE. tokens_per_expert is not
+          used in this path; the FlashInfer kernels operate directly on routing_map.
         - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
         - Inference + vLLM: Triton fused MoE for BF16; MXFP8 layers use MCore's
           scaled grouped-GEMM path because the vLLM kernel is BF16-only.
@@ -1821,6 +1890,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
+            self._build_flashinfer_clamp_limit(permuted_local_hidden_states.device)
             if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
                 self._build_concatenated_mxfp8_weights()
             else:
