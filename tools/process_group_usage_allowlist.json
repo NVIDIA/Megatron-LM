@@ -10,7 +10,7 @@
     "megatron/core/distributed/finalize_model_grads.py": [
       "finalize_model_grads:guarded:resolve_process_groups"
     ],
-    "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py": [
+    "megatron/core/distributed/fsdp/mcore_adapter_v1.py": [
       "FullyShardedDataParallelV1._init_dist_index:guarded:resolve_process_groups"
     ],
     "megatron/core/distributed/torch_fully_sharded_data_parallel.py": [
