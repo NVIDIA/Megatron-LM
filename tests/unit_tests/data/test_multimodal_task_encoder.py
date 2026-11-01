@@ -13,6 +13,23 @@ from examples.multimodal.data_loading.task_encoder import (
 )
 
 
+@pytest.mark.parametrize("consumer", ["tiling", "task_encoder", "legacy_task_encoder"])
+def test_preprocessing_rejects_non_vision_model(monkeypatch, run_config, consumer):
+    from examples.multimodal import dataset_helpers
+    from examples.multimodal.data_loading.image_processing import create_image_tiling_strategy
+
+    args = SimpleNamespace()
+    monkeypatch.setattr(task_encoder, "get_args", lambda: args)
+    monkeypatch.setattr(dataset_helpers, "get_args", lambda: args)
+    calls = {
+        "tiling": lambda: create_image_tiling_strategy(args),
+        "task_encoder": MultiModalTaskEncoder,
+        "legacy_task_encoder": dataset_helpers.TaskEncoder,
+    }
+    with pytest.raises(TypeError, match="Expected cfg.model.*got GPTModelConfig"):
+        calls[consumer]()
+
+
 def _encoder(thread_count=8):
     encoder = object.__new__(MultiModalTaskEncoder)
     encoder.args = SimpleNamespace(video_decode_thread_count=thread_count)

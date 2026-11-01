@@ -15,6 +15,7 @@ from torchvision.transforms import Compose
 from torchvision.transforms.functional import InterpolationMode
 
 from megatron.core.models.multimodal.utils import patchify_image
+from megatron.training.models import LLaVAModelConfig, MimoBuildConfig
 
 from .conversation_sample import ImageMedia, VideoFrameMedia
 
@@ -1778,7 +1779,7 @@ class MaskedTilingDynamicResolutionStrategy(ImageTilingStrategy):
 
 def create_image_tiling_strategy(args):
     """
-    Create an image tiling strategy based on the provided arguments.
+    Create an image tiling strategy from model geometry and preprocessing inputs.
 
     This function encapsulates the logic for creating the appropriate image tiling strategy
     based on the training/evaluation configuration. It can be used by both training (task_encoder)
@@ -1786,10 +1787,7 @@ def create_image_tiling_strategy(args):
 
     Args:
         args: Arguments object with the following relevant attributes:
-            - img_h, img_w: Image height and width
-            - patch_dim: Patch dimension
             - vision_model_type: Vision model type (e.g., 'radio', 'clip', 'siglip')
-            - disable_vision_class_token: Whether to disable vision class token
             - pixel_shuffle: Whether to use pixel shuffle
             - use_tile_tags: Whether to use tile tags
             - max_num_tiles: Maximum number of tiles
@@ -1807,8 +1805,15 @@ def create_image_tiling_strategy(args):
         ImageTilingStrategy: The created image tiling strategy
     """
     from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+    from megatron.training.global_vars import get_run_config
 
-    assert args.img_h == args.img_w, "img_h and img_w must be the same"
+    cfg = get_run_config()
+    if not isinstance(cfg.model, (LLaVAModelConfig, MimoBuildConfig)):
+        raise TypeError(
+            "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
+    assert cfg.model.img_h == cfg.model.img_w, "img_h and img_w must be the same"
 
     match_tiling_dynamic_resolution = args.match_tiling_dynamic_resolution
     masked_tiling_dynamic_resolution = getattr(args, "masked_tiling_dynamic_resolution", False)
@@ -1837,6 +1842,8 @@ def create_image_tiling_strategy(args):
     video_temporal_patch_size = getattr(args, 'video_temporal_patch_size', 1)
 
     if dynamic_resolution:
+        patch_dim = cfg.model.patch_dim
+        drop_vision_class_token = cfg.model.drop_vision_class_token
         # The version of `get_num_image_embeddings()` passed to the tiling strategy is used per-frame
         #   via `process_media()`. To support temporal compression the `compute_params()` method must
         #   aggregate this, and the tiling strategy must handle any temporal patch size adjustments
@@ -1847,9 +1854,9 @@ def create_image_tiling_strategy(args):
             get_num_image_embeddings(
                 img_h=height,
                 img_w=width,
-                patch_dim=args.patch_dim,
+                patch_dim=patch_dim,
                 vision_model_type=args.vision_model_type,
-                disable_vision_class_token=args.disable_vision_class_token,
+                disable_vision_class_token=drop_vision_class_token,
                 class_token_len=1,
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
@@ -1867,11 +1874,11 @@ def create_image_tiling_strategy(args):
                 )
 
             num_image_embeddings_per_tile = get_num_image_embeddings(
-                img_h=args.img_h,
-                img_w=args.img_w,
-                patch_dim=args.patch_dim,
+                img_h=cfg.model.img_h,
+                img_w=cfg.model.img_w,
+                patch_dim=cfg.model.patch_dim,
                 vision_model_type=args.vision_model_type,
-                disable_vision_class_token=args.disable_vision_class_token,
+                disable_vision_class_token=cfg.model.drop_vision_class_token,
                 class_token_len=1,
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
@@ -1880,12 +1887,12 @@ def create_image_tiling_strategy(args):
             )
             image_tiling_strategy = MaskedTilingDynamicResolutionStrategy(
                 vision_model_type=args.vision_model_type,
-                tile_size=args.img_h,
+                tile_size=cfg.model.img_h,
                 use_thumbnail=args.use_thumbnail,
                 min_num_tiles=1,
                 max_num_tiles=args.max_num_tiles,
                 embeddings_per_tile=num_image_embeddings_per_tile,
-                patch_size=args.patch_dim,
+                patch_size=cfg.model.patch_dim,
                 get_num_embeddings=dynamic_get_num_embeddings,
                 find_closest_aspect_ratio_fn=(
                     find_closest_area_weighted_aspect_ratio
@@ -1902,11 +1909,11 @@ def create_image_tiling_strategy(args):
                 )
 
             num_image_embeddings_per_tile = get_num_image_embeddings(
-                img_h=args.img_h,
-                img_w=args.img_w,
-                patch_dim=args.patch_dim,
+                img_h=cfg.model.img_h,
+                img_w=cfg.model.img_w,
+                patch_dim=cfg.model.patch_dim,
                 vision_model_type=args.vision_model_type,
-                disable_vision_class_token=args.disable_vision_class_token,
+                disable_vision_class_token=cfg.model.drop_vision_class_token,
                 class_token_len=1,
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
@@ -1915,12 +1922,12 @@ def create_image_tiling_strategy(args):
             )
             image_tiling_strategy = MatchTilingDynamicResolutionStrategy(
                 vision_model_type=args.vision_model_type,
-                tile_size=args.img_h,
+                tile_size=cfg.model.img_h,
                 use_thumbnail=args.use_thumbnail,
                 min_num_tiles=1,
                 max_num_tiles=args.max_num_tiles,
                 embeddings_per_tile=num_image_embeddings_per_tile,
-                patch_size=args.patch_dim,
+                patch_size=cfg.model.patch_dim,
                 get_num_embeddings=dynamic_get_num_embeddings,
                 find_closest_aspect_ratio_fn=(
                     find_closest_area_weighted_aspect_ratio
@@ -1933,12 +1940,12 @@ def create_image_tiling_strategy(args):
             image_tiling_strategy = DynamicResolutionImageTilingStrategy(
                 vision_model_type=args.vision_model_type,
                 min_num_patches=args.dynamic_resolution_min_patches,
-                patch_size=args.patch_dim,
+                patch_size=cfg.model.patch_dim,
                 get_num_embeddings=dynamic_get_num_embeddings,
                 pixel_shuffle=args.pixel_shuffle,
                 min_side=args.dynamic_resolution_min_side,
                 use_thumbnail=args.use_thumbnail,
-                thumbnail_size=args.img_h,
+                thumbnail_size=cfg.model.img_h,
                 thumbnail_area_threshold=args.thumbnail_area_threshold,
                 max_num_patches=args.dynamic_resolution_max_patches,
                 apply_data_augment=args.apply_data_augment,
@@ -1955,11 +1962,11 @@ def create_image_tiling_strategy(args):
             )
 
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            img_h=args.img_h,
-            img_w=args.img_w,
-            patch_dim=args.patch_dim,
+            img_h=cfg.model.img_h,
+            img_w=cfg.model.img_w,
+            patch_dim=cfg.model.patch_dim,
             vision_model_type=args.vision_model_type,
-            disable_vision_class_token=args.disable_vision_class_token,
+            disable_vision_class_token=cfg.model.drop_vision_class_token,
             class_token_len=1,
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
@@ -1969,7 +1976,7 @@ def create_image_tiling_strategy(args):
         if use_tiling:
             image_strategy = ImageTilingStrategyV1(
                 vision_model_type=args.vision_model_type,
-                tile_size=args.img_h,
+                tile_size=cfg.model.img_h,
                 use_thumbnail=args.use_thumbnail,
                 min_num_tiles=1,
                 max_num_tiles=args.max_num_tiles,
@@ -1984,16 +1991,16 @@ def create_image_tiling_strategy(args):
             image_strategy = NoTilingStrategy(
                 vision_model_type=args.vision_model_type,
                 embeddings_per_image=num_image_embeddings_per_tile,
-                target_width=args.img_w,
-                target_height=args.img_h,
+                target_width=cfg.model.img_w,
+                target_height=cfg.model.img_h,
             )
         image_tiling_strategy = TileDegradationStrategy(
             image_strategy=image_strategy,
             video_frame_strategy=NoTilingStrategy(
                 vision_model_type=args.vision_model_type,
                 embeddings_per_image=num_image_embeddings_per_tile,
-                target_width=args.img_w,
-                target_height=args.img_h,
+                target_width=cfg.model.img_w,
+                target_height=cfg.model.img_h,
             ),
             embeddings_per_tile=num_image_embeddings_per_tile,
             max_num_tiles=args.max_num_tiles,

@@ -986,7 +986,38 @@ def test_model_precision_is_derived_centrally(monkeypatch, run_config, fp8_recip
     )
 
 
-def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals, run_config):
+@pytest.mark.parametrize("missing_model", [False, True])
+@pytest.mark.parametrize(
+    "consumer", ["model", "dataset", "batch", "data_inputs", "mimo_data", "radio"]
+)
+def test_vlm_consumers_reject_incompatible_model_config(
+    monkeypatch, run_config, consumer, missing_model
+):
+    import pretrain_vlm
+    from examples.mimo.model_providers.radio_encoder import radio_vision_encoder_spec
+    from examples.mimo.training.data import build_train_valid_test_data_loaders
+
+    if missing_model:
+        run_config.model = None
+    # The default fixture supplies GPTModelConfig: valid for training, not vision consumers.
+    args = Namespace()
+    monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
+    calls = {
+        "model": lambda: pretrain_vlm.model_provider(),
+        "dataset": lambda: pretrain_vlm.train_valid_test_datasets_provider([]),
+        "batch": lambda: pretrain_vlm.get_batch(None),
+        "data_inputs": lambda: pretrain_vlm.set_vlm_sequence_lengths(args, run_config.model),
+        "mimo_data": lambda: build_train_valid_test_data_loaders(args, None),
+        "radio": lambda: radio_vision_encoder_spec(args, None, None),
+    }
+    with pytest.raises(TypeError, match="Expected .*Config.*got (GPTModelConfig|NoneType)"):
+        calls[consumer]()
+
+
+@pytest.mark.parametrize("cp_size,qkv_format", [(1, "sbhd"), (2, "sbhd"), (2, "thd")])
+def test_llava_callback_consumes_its_model_config(
+    monkeypatch, isolated_globals, run_config, cp_size, qkv_format
+):
     import pretrain_vlm
 
     parser = ArgumentParser()
@@ -997,12 +1028,17 @@ def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals,
     args.encoder_num_layers = 1
     args.max_position_embeddings, args.padded_vocab_size = 64, 128
     args.seq_length, args.decoder_seq_length = 16, 32
+    args.context_parallel_size, args.micro_batch_size = cp_size, 2
     args.params_dtype = torch.float32
     args.ckpt_format = "torch"
     cfg = run_config
     cfg.model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     cfg.model.rotary_base = 12345
     cfg.model.rope_scaling = True
+    cfg.model.img_h, cfg.model.img_w, cfg.model.patch_dim = 32, 48, 8
+    cfg.model.drop_vision_class_token = True
+    cfg.model.freeze_language_model = True
+    cfg.model.freeze_vision_model = True
     monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
@@ -1015,6 +1051,18 @@ def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals,
     args.use_rope_scaling = False
     args.padded_vocab_size = 999
 
+    pretrain_vlm.set_vlm_sequence_lengths(args, cfg.model)
+    args.use_packed_sequence = qkv_format == "thd"
+    for name in (
+        "img_h",
+        "img_w",
+        "patch_dim",
+        "disable_vision_class_token",
+        "freeze_LM",
+        "freeze_ViT",
+        "decoder_tp_comm_overlap",
+    ):
+        delattr(args, name)
     pretrain_vlm.model_provider()
 
     assert build.call_args.kwargs["language_vocab_size"] == 128
@@ -1023,6 +1071,88 @@ def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals,
     assert build.call_args.kwargs["language_transformer_config"].hidden_size == 32
     assert build.call_args.kwargs["vision_transformer_config"].num_layers == 1
     assert cfg.model.transformer.num_layers == 2
+    assert build.call_args.kwargs["img_h"] == 32
+    assert build.call_args.kwargs["img_w"] == 48
+    assert build.call_args.kwargs["patch_dim"] == 8
+    assert build.call_args.kwargs["drop_vision_class_token"] is True
+    assert build.call_args.kwargs["language_max_sequence_length"] == (
+        40 if cp_size > 1 and qkv_format == "thd" else 20
+    )
+    build.return_value.freeze.assert_called_once_with(
+        freeze_language_model=True, freeze_vision_model=True, freeze_vision_projection=False
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("objective", ["classify", "inpaint", "dino"])
+def test_vision_objective_preserves_cli_master_switch(enabled, objective):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    flags = ["--vision-pretraining-type", objective]
+    if enabled:
+        flags.append("--vision-pretraining")
+    args = parser.parse_args(flags)
+    args.main_grads_dtype = args.main_params_dtype = torch.float32
+    args.params_dtype = torch.float32
+    args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
+    model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+    )
+    cfg = pretrain_cfg_container_from_args(args, model)
+    assert cfg.train.vision_pretraining_type == (objective if enabled else None)
+
+
+@pytest.mark.parametrize(
+    "global_overlap,decoder_overlap,decoder_length,expected",
+    [
+        (True, False, None, 2048),
+        (True, False, 4096, 2048),
+        (False, True, 4096, 4096),
+        (True, True, 4096, 4096),
+        (False, False, None, 2048),
+    ],
+)
+@pytest.mark.parametrize("explicit_text_length", [False, True])
+def test_mock_vlm_resolves_legacy_padding_before_startup(
+    global_overlap, decoder_overlap, decoder_length, expected, explicit_text_length
+):
+    import pretrain_vlm
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    pretrain_vlm.add_vlm_extra_args(parser)
+    args = parser.parse_args(
+        [
+            "--img-h",
+            "256",
+            "--img-w",
+            "256",
+            "--patch-dim",
+            "16",
+            "--disable-vision-class-token",
+            "--dataloader-seq-length",
+            "1792",
+            "--seq-length",
+            "2048",
+            "--tensor-model-parallel-size",
+            "2",
+            "--sequence-parallel",
+        ]
+    )
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
+    args.max_position_embeddings, args.params_dtype = 4096, torch.float32
+    args.tp_comm_overlap, args.decoder_tp_comm_overlap = global_overlap, decoder_overlap
+    args.decoder_seq_length = decoder_length
+    if not explicit_text_length:
+        # The inference caller does not register the mock-training data-length flag.
+        del args.dataloader_seq_length
+        args.seq_length = 1792
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    pretrain_vlm.set_vlm_sequence_lengths(args, model)
+    assert model.transformer.tp_comm_overlap == (global_overlap or decoder_overlap)
+    assert args.dataloader_seq_length == 1792
+    assert args.decoder_seq_length == expected
 
 
 @pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
