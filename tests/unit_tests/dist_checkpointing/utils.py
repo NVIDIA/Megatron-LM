@@ -371,7 +371,9 @@ def setup_model_and_optimizer(
     elif optimizer_type == 'lion':
         config.lr = 1e-4
     config.finalize_optimizer_config()
-    optimizer = get_megatron_optimizer(config, model)
+    optimizer = get_megatron_optimizer(
+        config, model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
@@ -508,7 +510,9 @@ def setup_moe_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
     config.finalize_optimizer_config()
-    optimizer = get_megatron_optimizer(config, model)
+    optimizer = get_megatron_optimizer(
+        config, model, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)

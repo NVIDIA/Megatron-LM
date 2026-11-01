@@ -633,7 +633,10 @@ class TestLayerWiseOptimizer:
             muon_tp_mode="duplicated",
         )
         muon_optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Extract a Float16-wrapped chained optimizer
