@@ -43,7 +43,6 @@ from examples.inference.utils import (
 )
 from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
@@ -52,7 +51,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import get_tokenizer, set_run_config
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
@@ -270,7 +269,6 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
     initialize_megatron()
     _validate_high_level_api_args(args)
 
@@ -281,7 +279,7 @@ def main():
     logging.basicConfig(level=level, force=True)
     configure_nvtx_profiling(True)
 
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
     torch.cuda.reset_peak_memory_stats()
 
     sampling_params = SamplingParams(

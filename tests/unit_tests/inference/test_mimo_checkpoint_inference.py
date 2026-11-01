@@ -36,7 +36,7 @@ _PREFIX_MAP = {
 def checkpoint_keys(monkeypatch):
     """Serve the given keys as the tensor keys of the loaded checkpoint."""
     keys = [_LANGUAGE_KEY]
-    monkeypatch.setattr(vlm, '_checkpoint_tensor_keys', lambda args: keys)
+    monkeypatch.setattr(vlm, '_checkpoint_tensor_keys', lambda args, checkpoint_dir=None: keys)
     return keys
 
 
@@ -59,6 +59,44 @@ def test_checkpoint_detection(checkpoint_keys):
     checkpoint_keys += [f'{_MODALITY}encoders.other_encoder.patch_embed.weight']
     with pytest.raises(ValueError, match='one vision encoder'):
         vlm._mimo_checkpoint_prefix_map(args)
+
+
+@pytest.mark.parametrize("vision", [False, True], ids=["text", "vision"])
+def test_checkpoint_without_saved_args_uses_cli_vision_args(tmp_path, monkeypatch, vision):
+    """Without saved args (e.g. Megatron-Bridge), --vision-model-type selects the VLM."""
+    (tmp_path / 'latest_checkpointed_iteration.txt').write_text('1')
+    args = SimpleNamespace(
+        model_provider='gpt', vision_model_type='pixtral-vit-large', load=str(tmp_path)
+    )
+    monkeypatch.setattr(vlm, 'load_args_from_checkpoint', lambda _: args)
+    passed = {'vision_model_type'} if vision else set()
+
+    assert vlm._detect_vlm_from_checkpoint(args, passed) is vision
+    if vision:
+        # LLaVAModel's own key names, each loaded from itself.
+        assert args.mimo_checkpoint_prefix_map == {
+            'language_model.': 'language_model.',
+            'vision_model.': 'vision_model.',
+            'vision_projection.': 'vision_projection.',
+        }
+        assert args.img_h == 1540  # from the encoder registry
+    else:
+        assert not hasattr(args, 'mimo_checkpoint_prefix_map')
+
+
+@pytest.mark.parametrize("load", [None, 'missing'])
+def test_missing_checkpoint_with_cli_vision_args_fails_early(tmp_path, monkeypatch, load):
+    """A bad --load is reported before any model is built, not treated as a VLM checkpoint."""
+    args = SimpleNamespace(
+        model_provider='gpt',
+        vision_model_type='pixtral-vit-large',
+        load=load and str(tmp_path / load),
+    )
+    monkeypatch.setattr(vlm, 'load_args_from_checkpoint', lambda _: args)
+
+    with pytest.raises(ValueError, match='No checkpoint found'):
+        vlm._detect_vlm_from_checkpoint(args, {'vision_model_type'})
+    assert not hasattr(args, 'mimo_checkpoint_prefix_map')
 
 
 def test_sharded_state_dict_uses_checkpoint_keys(monkeypatch):
@@ -116,6 +154,7 @@ def test_resolve_mimo_vision_args(tmp_path):
 def test_check_mimo_checkpoint_fully_loaded(monkeypatch, checkpoint_keys):
     monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 1)
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+    monkeypatch.setattr(vlm, '_loaded_checkpoint_dir', lambda args: '/checkpoint/iter_0000001')
     monkeypatch.setattr(
         torch.distributed, 'all_gather_object', lambda out, obj: out.__setitem__(0, obj)
     )
@@ -192,3 +231,24 @@ def test_dynamic_image_rows(break_id, end_id, expanded, mask):
     assert wrapper.expand_image_tokens(
         [[5, 18, 7]], imgs_sizes=torch.tensor([[56, 84]]), image_token_id=18
     ) == ([expanded], [mask])
+
+
+def test_every_rank_resolves_the_checkpoint_dir(monkeypatch, checkpoint_keys):
+    """Resolving the iteration from the tracker all-reduces, so a non-zero rank must join it."""
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 1)
+    monkeypatch.setattr(torch.distributed, 'all_gather_object', lambda out, obj: None)
+    monkeypatch.setattr(torch.distributed, 'broadcast_object_list', lambda objs, src: None)
+    resolved = []
+    monkeypatch.setattr(vlm, '_loaded_checkpoint_dir', lambda args: resolved.append(args))
+    read = []
+    monkeypatch.setattr(
+        vlm, '_checkpoint_tensor_keys', lambda args, checkpoint_dir=None: read.append(args)
+    )
+    args = SimpleNamespace(mimo_checkpoint_prefix_map=_PREFIX_MAP)
+    model = SimpleNamespace(sharded_checkpoint_keys={_LANGUAGE_KEY})
+
+    vlm._check_mimo_checkpoint_fully_loaded(args, model)
+
+    assert resolved == [args]
+    assert read == []  # Only rank 0 reads the checkpoint metadata.
