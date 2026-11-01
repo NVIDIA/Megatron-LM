@@ -20,46 +20,37 @@ def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
 
 
 class _LeftBoundaryExchange(torch.autograd.Function):
-    """Exchange one neighbor's fixed halo and return its gradients to the owner."""
+    """Exchange one neighbor's fixed halo and return its gradients to the owner.
+
+    Both directions use one group-wide all-gather rather than a directed
+    point-to-point ring. With the ring each rank waits on one neighbour, which can
+    deadlock with the MoE dispatcher's host-side split synchronisation when CP spans
+    nodes. The all-gather moves the same values while every rank waits on the same
+    collective.
+    """
 
     @staticmethod
     def forward(ctx, hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup) -> Tensor:
-        """Exchange the local tail with the next rank and receive the left halo."""
+        """Return the previous rank's tail as this rank's left halo (zeros on rank 0)."""
         if hidden.shape[0] < halo_rows:
             raise ValueError("CSA2 CP local rows must cover the attention halo")
         rank, size = cp_group.rank(), cp_group.size()
         ctx.cp_group = cp_group
         ctx.halo_rows = halo_rows
         ctx.input_shape = hidden.shape
-        boundary = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
-        ops = []
-        if rank > 0:
-            ops.append(
-                dist.P2POp(dist.irecv, boundary, dist.get_global_rank(cp_group, rank - 1), cp_group)
-            )
-        if rank + 1 < size:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    hidden[-halo_rows:].contiguous(),
-                    dist.get_global_rank(cp_group, rank + 1),
-                    cp_group,
-                )
-            )
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
-        return boundary
+        tail = hidden[-halo_rows:].contiguous()
+        if size == 1:
+            return torch.zeros_like(tail)
+        gathered = tail.new_empty((size,) + tuple(tail.shape))
+        dist.all_gather_into_tensor(gathered, tail, group=cp_group)
+        if rank == 0:
+            return torch.zeros_like(tail)
+        # Copy out so the returned halo does not keep every rank's tail alive.
+        return gathered[rank - 1].clone()
 
     @staticmethod
     def backward(ctx, grad_boundary: Tensor):
-        """Return halo gradients to the rank that owns the exchanged rows.
-
-        Rank ``r``'s halo gradient belongs to rank ``r - 1``. A directed
-        point-to-point ring makes each rank wait on one neighbour, which can deadlock
-        with the MoE dispatcher's host-side split synchronisation when CP spans nodes.
-        A group-wide all-gather moves the same values while every rank waits on the
-        same collective.
-        """
+        """Return halo gradients to the rank that owns the exchanged rows."""
         group = ctx.cp_group
         rank, size = group.rank(), group.size()
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
@@ -76,7 +67,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 def exchange_csa2_boundary_hidden(
     hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup
 ) -> Tensor:
-    """Fetch the previous contiguous rank's tail using neighbor-only traffic."""
+    """Fetch the previous contiguous rank's tail as this rank's left halo."""
     return _LeftBoundaryExchange.apply(hidden, halo_rows, cp_group)
 
 
