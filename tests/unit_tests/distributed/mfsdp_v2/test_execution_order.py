@@ -9,6 +9,7 @@ from weakref import ref
 import pytest
 from torch import nn
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import PrefetchOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
     ExecutionOrder,
@@ -27,6 +28,7 @@ def test_prefetch_reuses_adjacent_shared_calls(budget, expected, phase):
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
+        module.context = Mock(prefetch_order=PrefetchOrder.REGISTRATION)
         module.phase = phase
         # Prefetch passes the successor's compute phase; record only which module it targets.
         module._unshard_parameter_groups.side_effect = (
@@ -61,6 +63,7 @@ def test_iteration_and_weak_references():
     with pytest.raises(RuntimeError, match="destroyed"):
         order[order.position]
     order.reset_cursor()
+    first.context = Mock(prefetch_order=PrefetchOrder.REGISTRATION)
     first.phase = Phase.FORWARD
     with pytest.raises(RuntimeError, match="destroyed"):
         FsdpModule._prefetch_parameter_groups(first, order, None)

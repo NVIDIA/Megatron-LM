@@ -140,6 +140,27 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
+def test_recorded_execution_order_replays_repeated_root(distributed_setup):
+    """Repeated root calls retain their recorded occurrences through replay."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    for _ in range(3):
+        model.zero_grad(set_to_none=True)
+        (model(inputs) + model(inputs)).sum().backward()
+        assert not context.is_recording_execution_order
+        assert list(context.execution_order)[:2] == [
+            ExecutionEvent(model, Phase.FORWARD),
+            ExecutionEvent(model, Phase.FORWARD),
+        ]
+
+
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
 def test_context_defaults_to_current_cuda_device(distributed_setup, overlap_allgather_reduction):
     """The policy controls stream sharing without changing the default device."""

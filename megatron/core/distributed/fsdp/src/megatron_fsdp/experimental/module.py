@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext
+from .context import FsdpContext, PrefetchOrder
 from .countdown import Countdown
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
@@ -279,7 +279,15 @@ class FsdpModule:
         if self.is_root():
             order = context.execution_order
             # Later roots continue the shared order rather than starting a new pass.
-            if not is_recomputing and order and order[0].module is self:
+            if (
+                not is_recomputing
+                and order
+                and order[0].module is self
+                and (
+                    context.prefetch_order is PrefetchOrder.REGISTRATION
+                    or order.position == len(order)
+                )
+            ):
                 order.reset_cursor()
             context.allgather_stream.wait_stream(context.current_stream())
 
@@ -343,10 +351,9 @@ class FsdpModule:
         last_event = None if order.position == 0 else order[order.position - 1]
         event = ExecutionEvent(module=cast(nn.Module, self), phase=self.phase)
 
-        # NOTE: This 'event != last_event' guard skips consecutive duplicate execution
-        # events emitted by MTP. It is a temporary workaround and should be removed
-        # once execution capture is implemented and enabled for MTP.
-        if event != last_event:
+        # Preset orders skip consecutive duplicate events emitted by MTP. Recorded
+        # orders include those occurrences and must consume each one.
+        if self.context.prefetch_order is PrefetchOrder.RECORDED or event != last_event:
             if order.position >= len(order) or order[order.position] != event:
                 raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
             order.advance()

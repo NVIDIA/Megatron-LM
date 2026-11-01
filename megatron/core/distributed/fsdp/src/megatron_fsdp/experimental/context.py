@@ -93,6 +93,7 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = prefetch_order
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
