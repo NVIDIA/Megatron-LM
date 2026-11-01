@@ -77,16 +77,15 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
             model, mesh=mesh, placements=_default_placements(), mixed_precision_policy=policy
         )
 
-    # Observe the dtype of the partial-grad buffer FSDP allocates during backward.
+    # Observe the dtype of the partial-grad buffer FSDP packs gradients into during backward.
     allocated_dtypes: list[torch.dtype] = []
-    original = FsdpParameterGroup.allocate_partial_grad_buffer
+    original = FsdpParameterGroup.copy_gradients_to_partial_buffer
 
-    def spy(self: FsdpParameterGroup):
-        buffer = original(self)
-        allocated_dtypes.append(buffer.dtype)
-        return buffer
+    def spy(self: FsdpParameterGroup, partial_grad):
+        allocated_dtypes.append(partial_grad.dtype)
+        return original(self, partial_grad)
 
-    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", spy)
+    monkeypatch.setattr(FsdpParameterGroup, "copy_gradients_to_partial_buffer", spy)
 
     x = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
     model(x).float().sum().backward()
@@ -140,14 +139,13 @@ def test_mxfp8_partial_grad_buffer_follows_grad_comm_dtype(
         assert group.main_grad.dtype == (main_grads_dtype or torch.bfloat16)
 
     allocated_dtypes: list[torch.dtype] = []
-    original = FsdpParameterGroup.allocate_partial_grad_buffer
+    original = FsdpParameterGroup.copy_gradients_to_partial_buffer
 
-    def spy(self: FsdpParameterGroup):
-        buffer = original(self)
-        allocated_dtypes.append(buffer.dtype)
-        return buffer
+    def spy(self: FsdpParameterGroup, partial_grad):
+        allocated_dtypes.append(partial_grad.dtype)
+        return original(self, partial_grad)
 
-    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", spy)
+    monkeypatch.setattr(FsdpParameterGroup, "copy_gradients_to_partial_buffer", spy)
 
     # FP8 GEMMs need the token count divisible by 8 and the feature dim by 16.
     x = torch.randn(32, 64, device=device, dtype=torch.bfloat16)

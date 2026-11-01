@@ -308,3 +308,107 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
         not any(event_groups_overlap(allgather, gemm) for gemm in gemm_groups)
         for allgather in allgather_groups
     ), "All-gathers overlapped GEMM compute despite zero prefetch budgets."
+
+
+def _shard_multi_child_model(device, mesh, placements, num_slots, *, num_children=4, dim=64):
+    torch.manual_seed(1234)
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device)
+    context = FsdpContext(
+        device=device,
+        runtime_policy=RuntimePolicy(partial_grad_buffers=num_slots, caller_managed_grad_sync=True),
+    )
+    with fully_shard_context(context):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
+    return model, context
+
+
+@pytest.mark.parametrize("num_slots", [0, 1, 2, 3])
+def test_partial_grad_slots_wait_only_for_the_reduction_that_last_used_them(
+    distributed_setup, monkeypatch, num_slots
+):
+    """Packing gradients waits for one earlier reduction instead of the whole stream."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model, context = _shard_multi_child_model(device, mesh, _default_placements(), num_slots)
+    assert len(context.partial_grad_slots) == num_slots
+    reduce_scatter_stream = context.reduce_scatter_stream
+    current_stream = context.current_stream()
+
+    whole_stream_waits = 0
+    waited_events = []
+    reduction_events = []
+    wait_stream, wait_event, record_event = (
+        torch.cuda.Stream.wait_stream,
+        torch.cuda.Stream.wait_event,
+        torch.cuda.Stream.record_event,
+    )
+
+    def recording_wait_stream(stream, other):
+        nonlocal whole_stream_waits
+        if stream == current_stream and other == reduce_scatter_stream:
+            whole_stream_waits += 1
+        return wait_stream(stream, other)
+
+    def recording_wait_event(stream, event):
+        if stream == current_stream:
+            waited_events.append(event)
+        return wait_event(stream, event)
+
+    def recording_record_event(stream, event=None):
+        event = record_event(stream, event)
+        if stream == reduce_scatter_stream:
+            reduction_events.append(event)
+        return event
+
+    monkeypatch.setattr(torch.cuda.Stream, "wait_stream", recording_wait_stream)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", recording_wait_event)
+    monkeypatch.setattr(torch.cuda.Stream, "record_event", recording_record_event)
+    model(torch.randn(8, 64, device=device)).sum().backward()
+    monkeypatch.undo()
+
+    num_reductions = len(model.layers) + 1
+    if num_slots == 0:
+        assert whole_stream_waits == num_reductions
+    else:
+        assert whole_stream_waits == 0
+        assert len(reduction_events) == num_reductions
+        slot_waits = [event for event in waited_events if any(event is e for e in reduction_events)]
+        # Reduction i reuses the slot of reduction i - num_slots and waits only for it.
+        expected = reduction_events[: max(num_reductions - num_slots, 0)]
+        assert len(slot_waits) == len(expected)
+        assert all(actual is wanted for actual, wanted in zip(slot_waits, expected))
+
+    context.finish_grad_sync()
+    assert all(slot.reduce_done is None for slot in context.partial_grad_slots)
+
+
+@pytest.mark.parametrize(
+    "placements_factory",
+    [pytest.param(_default_placements, id="zero3"), pytest.param(_zero2_placements, id="zero2")],
+)
+def test_partial_grad_slots_match_per_reduction_buffers(distributed_setup, placements_factory):
+    """Training with persistent partial-gradient slots matches per-reduction buffers exactly."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(4321 + distributed_setup.rank)
+    inputs = torch.randn(3, 2, 8, 64, device=device)
+
+    def train(num_slots):
+        model, context = _shard_multi_child_model(device, mesh, placements_factory(), num_slots)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
+        fully_shard_optimizer(optimizer)
+        for step_inputs in inputs:
+            optimizer.zero_grad(set_to_none=True)
+            for index, x in enumerate(step_inputs):
+                with microbatch(context, is_last=index == len(step_inputs) - 1):
+                    model(x).square().mean().backward()
+            context.finish_grad_sync()
+            optimizer.step()
+        return [parameter.full_tensor().clone() for parameter in model.parameters()]
+
+    reference = train(0)
+    for num_slots in (1, 2, 3):
+        for actual, expected in zip(train(num_slots), reference):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

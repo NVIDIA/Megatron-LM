@@ -616,23 +616,53 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate the unreduced reduce-scatter input buffer."""
-        assert self.main_grad is not None
+    @property
+    def _partial_grad_placements(self) -> tuple[Partial, ...]:
+        return (Partial("avg"),) * self.mesh.ndim
 
-        grads: list[torch.Tensor] = []
+    @property
+    def partial_grad_nbytes(self) -> int:
+        """Size in bytes of this group's unreduced reduce-scatter input buffer."""
+        numel = self.main_weight.layout.get_local_range(
+            self.mesh, self._partial_grad_placements
+        ).numel
+        return numel * torch.empty((), dtype=self.grad_comm_dtype).element_size()
+
+    def _check_gradients(self) -> torch.device:
+        """Require every parameter's full local gradient; return their device."""
+        assert self.main_grad is not None
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+        return self.fsdp_parameters[0].unsharded.grad.device
+
+    def allocate_partial_grad_buffer(self) -> DBuffer:
+        """Allocate the unreduced reduce-scatter input buffer."""
+        device = self._check_gradients()
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial("avg")] * self.mesh.ndim,
+                placements=self._partial_grad_placements,
                 layout=self.main_weight.layout,
                 dtype=self.grad_comm_dtype,
-                device=grads[0].device,
+                device=device,
             )
+
+    def partial_grad_buffer_in(self, storage: torch.Tensor) -> DBuffer:
+        """View persistent byte storage as this group's reduce-scatter input buffer."""
+        self._check_gradients()
+        nbytes = self.partial_grad_nbytes
+        if storage.dtype != torch.uint8 or storage.numel() < nbytes:
+            raise ValueError(
+                f"Expected uint8 storage of at least {nbytes} bytes, got "
+                f"{storage.numel()} {storage.dtype} elements."
+            )
+        return DBuffer.from_local(
+            storage[:nbytes].view(self.grad_comm_dtype),
+            self.mesh,
+            self._partial_grad_placements,
+            self.main_weight.layout,
+        )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""

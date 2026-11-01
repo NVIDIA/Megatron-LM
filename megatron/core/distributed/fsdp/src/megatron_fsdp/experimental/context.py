@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import dataclasses
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -22,6 +23,16 @@ from torch import nn
 
 from .execution_order import ExecutionOrder
 from .runtime_policy import RuntimePolicy
+
+
+@dataclasses.dataclass
+class PartialGradSlot:
+    """A persistent reduce-scatter input buffer and the reduction last reading it."""
+
+    storage: torch.Tensor
+    # Recorded on the reduce-scatter stream after the reduction that read this
+    # buffer; None when no reduction since the last finish_grad_sync() used it.
+    reduce_done: torch.cuda.Event | None = None
 
 
 class FsdpContext:
@@ -49,6 +60,9 @@ class FsdpContext:
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
     _post_backward_hook_registered: bool
+    # Persistent reduce-scatter inputs, allocated at finalization and reused
+    # round-robin; empty when partial-gradient buffers are allocated per reduction.
+    partial_grad_slots: tuple[PartialGradSlot, ...]
 
     def __init__(
         self,
@@ -78,6 +92,12 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        # Symmetric-memory buffers are allocated from their own pool per reduction.
+        self._num_partial_grad_slots = (
+            0 if self.use_symmetric_memory else runtime_policy.partial_grad_buffers
+        )
+        self.partial_grad_slots = ()
+        self._next_partial_grad_slot = 0
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
@@ -134,6 +154,32 @@ class FsdpContext:
         for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.backward_order)
 
+        if self._num_partial_grad_slots > 0:
+            # Allocate before training (and before any CUDA-graph capture), so every
+            # reduction reuses fixed storage. Each slot is raw bytes viewed with the
+            # reducing group's dtype and layout. Roots reduce last in backward, with
+            # no later backward compute to overlap, yet often own the largest groups
+            # (embeddings and output layers), so slots are sized for the other
+            # modules and larger groups are allocated per reduction.
+            sized_modules = [
+                module for module in self._registered_modules if module not in self._roots
+            ] or self._registered_modules
+            slot_nbytes = max(
+                (
+                    group.partial_grad_nbytes
+                    for module in sized_modules
+                    for group in module.parameter_groups
+                    if group.requires_grad
+                ),
+                default=0,
+            )
+            if slot_nbytes > 0:
+                device = self.allgather_stream.device
+                self.partial_grad_slots = tuple(
+                    PartialGradSlot(torch.empty(slot_nbytes, dtype=torch.uint8, device=device))
+                    for _ in range(self._num_partial_grad_slots)
+                )
+
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
@@ -178,6 +224,28 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        # Every reduction reading a slot is now ordered before later current-stream
+        # work, so the next backward needs no per-slot waits. Dropping the events also
+        # keeps a CUDA-graph capture from waiting on events recorded before it.
+        for slot in self.partial_grad_slots:
+            slot.reduce_done = None
+
+    def acquire_partial_grad_slot(self, nbytes: int) -> PartialGradSlot | None:
+        """Return the next persistent reduce-scatter input buffer of at least ``nbytes``.
+
+        Returns None if slots are disabled or smaller than ``nbytes``.
+
+        The caller must make the current stream wait for ``slot.reduce_done`` (if set)
+        before writing the slot, and record ``slot.reduce_done`` on the reduce-scatter
+        stream after the reduction that reads it.
+        """
+        if not self.partial_grad_slots or nbytes > self.partial_grad_slots[0].storage.numel():
+            return None
+        slot = self.partial_grad_slots[self._next_partial_grad_slot]
+        self._next_partial_grad_slot = (self._next_partial_grad_slot + 1) % len(
+            self.partial_grad_slots
+        )
+        return slot
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
