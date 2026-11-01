@@ -154,9 +154,13 @@ class ExtendedRMSNorm(RMSNormGated):
     RMSNormGated with sharded state dict.
     """
 
+    # Set by the owning mixer, like ``tp_group``: the DP x CP group replica ids span when
+    # ``sharded_state_dict`` gets no metadata. None uses the global default.
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        metadata = ensure_metadata_has_dp_cp_group(metadata, self.dp_cp_group)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
@@ -477,6 +481,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             )
             self.norm.weight.is_rmsnorm_weight = True
             self.norm.tp_group = self.pg_collection.tp
+            self.norm.dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
             setattr(self.norm.weight, 'tensor_model_parallel', True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
@@ -1479,8 +1484,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: replica ids span the mixer's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
         # Parameters
