@@ -36,7 +36,7 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin, steps_from_zero_state
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -598,6 +598,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             if inference_context.seqlen_offset > 0:
                 # The states are updated in place.
                 return self._static_decode(hidden_states, conv_state, ssm_state)
+        elif steps_from_zero_state(packed_seq_params):
+            # [t, 1, proj_dim] is also the decode layout of t requests with one token each:
+            # decode them without state caches, so each starts from a zero state.
+            assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
+            zVKQba, _ = self.in_proj(hidden_states)
+            return self.out_proj(self.ssm_decode(zVKQba, conv_state=None, ssm_state=None))
 
         y = self._gdp_chunk_forward(
             hidden_states,
@@ -917,18 +923,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 # If we just take x[:, :, -self.d_conv :], it errors if seqlen < d_conv.
                 # Instead F.pad pads with zeros if seqlen < d_conv, and truncates otherwise.
                 conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # state (B D W)
-            if causal_conv1d_fn is None:
-                seqlen = x.size(2)
-                x = self.act(self.cp.conv1d(x)[..., :seqlen])
-            else:
-                # causal_conv1d uses seq_idx to reset the convolution boundaries
-                x = causal_conv1d_fn(
-                    x=x,
-                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    bias=self.cp.get_conv1d_bias(),
-                    activation=self.activation,
-                    seq_idx=seq_idx,
-                )
+            x = self._causal_conv(x, seq_idx=seq_idx)
             x = rearrange(x, "b d l ->  b l d")
 
         value, key, query = torch.split(
@@ -979,6 +974,23 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
 
         return query, key, value
 
+    def _causal_conv(self, x, seq_idx=None):
+        """Run the short causal conv over ``x`` (b, d, l) from an empty window.
+
+        ``seq_idx`` restarts the window at packed-sequence boundaries.
+        """
+        if causal_conv1d_fn is None:
+            seqlen = x.size(2)
+            return self.act(self.cp.conv1d(x)[..., :seqlen])
+        # causal_conv1d uses seq_idx to reset the convolution boundaries
+        return causal_conv1d_fn(
+            x=x,
+            weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            bias=self.cp.get_conv1d_bias(),
+            activation=self.activation,
+            seq_idx=seq_idx,
+        )
+
     def _decode_conv(self, x, conv_state, conv_state_indices, intermediate_conv_state=None):
         """Step the cached short conv over this step's tokens per request, in place.
 
@@ -992,8 +1004,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         ``intermediate_conv_state`` is the speculative-decoding snapshot buffer: the
         kernel writes the conv state after each of those tokens so that verification
         can roll back to an accepted prefix.
+
+        Without a ``conv_state`` every request starts from an empty window, so the conv
+        sees only the request's own tokens and no cache is read or written.
         """
         assert self.cp is not None
+        if conv_state is None:
+            assert conv_state_indices is None and intermediate_conv_state is None
+            # A copy with standard strides: contiguous() would keep a single request's
+            # [1, d, 1] slice of the projection, which reads as channels-last with the
+            # projection's stride.
+            x = rearrange(x, "b l d -> b d l").clone(memory_format=torch.contiguous_format)
+            return rearrange(self._causal_conv(x), "b d l -> b l d").contiguous()
         return causal_conv1d_update(
             x,
             conv_state,
@@ -1134,8 +1156,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
     def ssm_decode(
         self,
         zVKQba: torch.Tensor,
-        conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
+        conv_state: Optional[torch.Tensor],
+        ssm_state: Optional[torch.Tensor],
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
@@ -1146,7 +1168,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         are read/written in place at the slots named by ``batch_indices``
         (``-1`` marks padding slots, whose outputs are zeroed);
         ``batch_indices=None`` means static batching, where the caches are
-        already in request order.
+        already in request order. Without caches (``conv_state`` and ``ssm_state``
+        both ``None``) every request starts from a zero state and no state is read
+        or stored.
 
         Under speculative decoding the two ``intermediate_*`` buffers receive
         the conv and SSM state after each draft token, so that verification can
@@ -1174,7 +1198,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         # padding, zeroing that row's output without touching the cache, which is
         # what makes a replayed CUDA graph with a partially filled batch match an
         # eager run. `batch_indices=None` is static batching, where the cache is
-        # already in request order.
+        # already in request order. Without a cache, the training path's conv runs
+        # each request from an empty window instead.
         x_conv = self._decode_conv(VKQ, conv_state, batch_indices, intermediate_conv_state)
 
         # Everything between the conv and the recurrence is one kernel: the
