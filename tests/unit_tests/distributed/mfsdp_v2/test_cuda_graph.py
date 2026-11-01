@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     RuntimePolicy,
     fully_shard,
@@ -85,7 +86,9 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
 
     placements = _default_placements()
     with fully_shard_context(
-        device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+        )
     ):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements)

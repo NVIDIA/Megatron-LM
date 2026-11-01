@@ -1528,11 +1528,69 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
+        for group_index, (current_group, saved_group) in enumerate(
+            zip(self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key])
         ):
-            for current_param, saved_param in zip(current_group, saved_group):
-                current_param.data.copy_(saved_param.data)
+            if len(saved_group) == len(current_group):
+                for current_param, saved_param in zip(current_group, saved_group):
+                    current_param.data.copy_(saved_param.data)
+            else:
+                self._load_main_params_saved_before_fp32_marking(group_index, saved_group)
+
+    def _load_main_params_saved_before_fp32_marking(self, group_index, saved_group):
+        """Restore main params saved while some of today's native FP32 params were float16.
+
+        Checkpoints store one main param per float16 param of a group, in group order.
+        When a parameter is later kept in FP32 (see ``mark_keep_in_fp32``), its saved main
+        param is still in that list, so positional matching would shift every later entry
+        onto the wrong parameter. This walks the group in order and assigns each surplus
+        saved main param to the native FP32 parameter it was saved for. That parameter was
+        just loaded from the float16 model weights, so it must match the saved main param
+        in shape and after rounding to the float16 dtype.
+        """
+        float16_dtype = torch.float16 if self.config.fp16 else torch.bfloat16
+        main_param_ids = {id(param) for param in self.fp32_from_float16_groups[group_index]}
+        # Main params are detached copies that never require grad, so keep them by identity.
+        trainable_params = [
+            param
+            for param in self.optimizer.param_groups[group_index]['params']
+            if id(param) in main_param_ids or param.requires_grad
+        ]
+        surplus = len(saved_group) - sum(id(param) in main_param_ids for param in trainable_params)
+        saved_index = 0
+        for param in trainable_params:
+            if saved_index == len(saved_group):
+                break
+            saved_param = saved_group[saved_index]
+            if id(param) in main_param_ids:
+                if saved_param.shape != param.shape:
+                    break
+                param.data.copy_(saved_param.data)
+                saved_index += 1
+            elif (
+                surplus > 0
+                and saved_param.shape == param.shape
+                and torch.equal(
+                    saved_param.data.to(device=param.device, dtype=float16_dtype),
+                    param.data.to(float16_dtype),
+                )
+            ):
+                param.data.copy_(saved_param.data)
+                saved_index += 1
+                surplus -= 1
+        if saved_index != len(saved_group) or surplus != 0:
+            raise RuntimeError(
+                f'Cannot match the {len(saved_group)} saved main params of optimizer param '
+                f'group {group_index} to its {len(self.fp32_from_float16_groups[group_index])} '
+                'float16 params. The checkpoint was saved with different parameter dtypes; '
+                'load it without optimizer state or with a sharded checkpoint format.'
+            )
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'Optimizer param group {group_index}: restored {len(saved_group)} main params '
+            'saved before some float16 params were kept in FP32.',
+        )
 
 
 class FP32Optimizer(MegatronOptimizer):
