@@ -128,8 +128,9 @@ class TestT5Model:
         pass
 
 
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
 @pytest.mark.parametrize("explicit_pg_collection", [False, True])
-def test_constructor_process_groups(mocker, explicit_pg_collection):
+def test_constructor_process_groups(mocker, explicit_pg_collection, position_embedding_type):
     """T5 and LanguageModule must agree on the caller's process-group collection."""
     clear_nvte_env_vars()
     mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
@@ -146,7 +147,9 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     if explicit_pg_collection:
         global_groups.side_effect = AssertionError("Explicit groups must not read the global grid")
 
-    config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+    config = TransformerConfig(
+        num_layers=2, hidden_size=16, num_attention_heads=4, use_cpu_initialization=True
+    )
     # An empty pipeline stage exercises both constructors without constructing GPU layers.
     t5_kwargs = dict(
         config=config,
@@ -159,6 +162,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         post_process=False,
         add_encoder=False,
         add_decoder=False,
+        position_embedding_type=position_embedding_type,
         pg_collection=pg_collection if explicit_pg_collection else None,
     )
     if explicit_pg_collection:
@@ -172,6 +176,10 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     assert model.cp_group is pg_collection.cp
     assert model.pp_group is pg_collection.pp
     assert model.embd_group is pg_collection.embd
+    if position_embedding_type == "rope":
+        # The rotary embedding is built on the collection LanguageModule resolved, not on the
+        # omitted argument.
+        assert model.rotary_pos_emb.cp_group is pg_collection.cp
     if explicit_pg_collection:
         global_groups.assert_not_called()
     else:
@@ -191,7 +199,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         (2, True, True, True, 'none', False),
         (2, False, True, True, 'none', False),
         (2, True, False, True, 'nonmember', False),
-        (2, False, False, True, 'nonmember', True),
+        (2, False, False, True, 'nonmember', False),
     ],
 )
 def test_constructor_embedding_group_contract(

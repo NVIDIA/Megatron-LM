@@ -20,6 +20,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    enable_strict_process_group_fallbacks,
     warn_global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import (
@@ -122,6 +123,11 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if args.strict_process_group_fallbacks:
+        # Ahead of distributed initialization, seeding and model construction, so that any
+        # fallback to the global process groups from here on raises on the rank that reaches it.
+        enable_strict_process_group_fallbacks()
 
     if training and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
