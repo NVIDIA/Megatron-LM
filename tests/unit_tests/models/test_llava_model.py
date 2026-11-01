@@ -98,6 +98,13 @@ class TestLLaVAModel:
         assert num_weights == 1488736
 
     @pytest.mark.internal
+    def test_vision_projection_uses_the_model_collection(self):
+        projection = self.model.vision_projection
+        assert projection.pg_collection is self.model.pg_collection
+        assert projection.encoder.linear_fc1._pg_collection is self.model.pg_collection
+        assert projection.encoder.linear_fc2._pg_collection is self.model.pg_collection
+
+    @pytest.mark.internal
     def test_set_input_tensor(self):
         expected_shape = (1, 2, 3, 4)
         input_tensor = torch.zeros(expected_shape)

@@ -371,7 +371,8 @@ class TestGlobalProcessGroupFallbacks:
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
         global_dp_group = parallel_state.get_data_parallel_group()
         if not test_mode:
-            # Only run_realtime_tests reads dp, so building must not need an initialized DP group.
+            # The data-parallel groups are resolved only in test_mode, so building must not
+            # need an initialized DP group.
             def forbid_dp_group(*args, **kwargs):
                 raise AssertionError("SelfAttention resolved the DP group outside test_mode")
 

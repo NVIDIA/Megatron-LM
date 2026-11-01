@@ -340,6 +340,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                pg_collection=pg_collection,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
@@ -359,6 +360,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                pg_collection=pg_collection,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
