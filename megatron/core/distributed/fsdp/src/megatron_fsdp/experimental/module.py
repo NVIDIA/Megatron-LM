@@ -460,10 +460,21 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
-
-                current_stream.wait_stream(reduce_scatter_stream)
+                slot = context.acquire_partial_grad_slot(group.partial_grad_nbytes)
+                if slot is None:
+                    # Allocating on the reduce-scatter stream may reuse memory that an
+                    # earlier reduction still reads, so packing waits for every
+                    # reduction queued there.
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        partial_grad = group.allocate_partial_grad_buffer()
+                    current_stream.wait_stream(reduce_scatter_stream)
+                else:
+                    # A persistent slot is read only by the reduction that last used
+                    # it, so packing waits for that one; more recent reductions keep
+                    # overlapping with compute.
+                    if slot.reduce_done is not None:
+                        current_stream.wait_event(slot.reduce_done)
+                    partial_grad = group.partial_grad_buffer_in(slot.storage)
                 group.copy_gradients_to_partial_buffer(partial_grad)
 
                 reduce_scatter_stream.wait_stream(current_stream)
@@ -471,6 +482,8 @@ class FsdpModule:
                     group.reduce_partial_gradients(
                         partial_grad, is_last_microbatch=self.context.is_last_microbatch
                     )
+                    if slot is not None:
+                        slot.reduce_done = reduce_scatter_stream.record_event()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
