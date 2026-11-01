@@ -1105,7 +1105,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
         patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
-        patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
+        patch.object(
+            pretrain_hybrid, "mtp_on_this_rank_func", return_value=True
+        ) as mtp_on_this_rank,
         patch.object(
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
@@ -1118,6 +1120,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert cp_batch is scheduler_batch
     assert fetch_batch.call_args.kwargs["return_context_parallel_batch"]
     assert fetch_batch.call_args.kwargs["pg_collection"] is pg_collection
+    # get_batch passes the collection's pipeline group, so mtp_on_this_rank does not fall back
+    # to the global grid.
+    assert mtp_on_this_rank.call_args.kwargs["pp_group"] is pg_collection.pp
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
@@ -1676,7 +1681,12 @@ def test_packed_sequence_dataset_built_on_rank(
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
     args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
-    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=vp_size,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
     vp_stages = [None] if vp_size is None else range(vp_size)
     # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
     # the arguments and the transformer config at call time from these two modules.
@@ -1686,7 +1696,9 @@ def test_packed_sequence_dataset_built_on_rank(
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(
-                vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+                vp_stage=vp_stage,
+                is_packed_sequence=is_packed_sequence,
+                pg_collection=pg_collection,
             )
             assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 

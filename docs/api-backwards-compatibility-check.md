@@ -130,6 +130,93 @@ def old_function(x):
 2. **Version N+1** - Keep function with deprecation warnings
 3. **Version N+2** - Remove function (users have been warned)
 
+### Deprecated `parallel_state` Accessors
+
+The functions of `megatron.core.parallel_state` that read the global parallel grid, and
+`ProcessGroupCollection.use_mpu_process_groups()`, which builds a collection from them, are
+deprecated in Megatron Core 0.21 and removed in 0.23. The global grid belongs to a single model;
+code that needs process groups takes them from the `ProcessGroupCollection` that its caller
+passes. Called from outside Megatron Core, each function emits a
+`ParallelStateDeprecationWarning`, a `FutureWarning`, once per call site. The warning names the
+replacement:
+
+| Deprecated functions | Replacement |
+|---|---|
+| Group accessors, such as `get_tensor_model_parallel_group()`, including the Gloo and dynamic context-parallel ones | The matching field of the model's `ProcessGroupCollection`, such as `pg_collection.tp` |
+| Rank, size and global-rank accessors, such as `get_tensor_model_parallel_rank()` and `get_pipeline_model_parallel_first_rank()` | `rank()` or `size()` of that field, `torch.distributed.get_global_rank(group, 0)`, or the `get_pp_*_rank(pp_group)` helpers in `megatron.core.pipeline_parallel.utils` |
+| Stage predicates: `is_pipeline_first_stage()`, `is_pipeline_last_stage()`, `is_rank_in_embedding_group()`, `is_rank_in_position_embedding_group()` | `is_pp_first_stage(pp_group)`, `is_pp_last_stage(pp_group)`, `is_vp_first_stage()` and `is_vp_last_stage()` in `megatron.core.pipeline_parallel.utils`; membership in `pg_collection.embd` or `pg_collection.pos_embd` |
+| Virtual-pipeline rank and size getters and setters | The `vp_stage` of the model chunk, passed explicitly, and the `virtual_pipeline_model_parallel_size` of the model's configuration |
+| Rank and size overrides, such as `set_tensor_model_parallel_rank()` | A `ProcessGroupCollection` whose groups have that rank and size, passed to the code that needs it or registered with `register_process_groups()` |
+| `get_global_memory_buffer()`, `destroy_global_memory_buffer()`, `_set_global_memory_buffer()` | `get_global_memory_buffer()` and `destroy_global_memory_buffer()` in `megatron.core.utils`. `get_global_memory_buffer()` creates the buffer on first use, so `_set_global_memory_buffer()` needs no replacement |
+| `ProcessGroupCollection.use_mpu_process_groups()` | The `ProcessGroupCollection` that the caller passes, or `parallel_state.get_registered_process_groups()` for the groups that `initialize_model_parallel()` or `register_process_groups()` registered for the run. It returns the registered collection itself, not a new one, so set a field such as `dp_cp_ag` on a `copy.copy()` of it: `copy.deepcopy()` returns the same collection, and `dataclasses.replace()` returns one without groups |
+
+Bootstrap, teardown and the registry are not deprecated: `initialize_model_parallel()`,
+`destroy_model_parallel()`, `is_initialized()`, `model_parallel_is_initialized()`,
+`register_process_groups()`, `get_registered_process_groups()` and
+`build_process_group_collection()`.
+
+- **Megatron Core's own calls do not warn.** Its compatibility fallbacks emit a
+  `ProcessGroupFallbackWarning` for the caller that omitted its groups instead.
+  `tools/check_process_group_usage.py` ratchets Megatron Core's calls of every deprecated
+  function outside `parallel_state.py` and `process_groups_config.py`: the group, rank and size
+  accessors, the stage predicates, the rank and size overrides, the virtual-pipeline getters and
+  setters, `get_all_ranks()`, the dynamic context-parallel group maps, the memory-buffer
+  aliases and `use_mpu_process_groups()`. It also counts `get_registered_process_groups()`,
+  which is not deprecated but returns the same global groups: Megatron Core takes its groups
+  from its caller. It counts the calls of the fallbacks of `process_groups_config.py`, which
+  read the grid when the caller omits its groups, as guarded: `resolve_process_groups()`,
+  `resolve_gtp_remat_group()`, and `ProcessGroupCollection.setup_process_groups_for_ddp()` and
+  `setup_process_groups_for_optimizer()`. A new call of any of them makes the check exit with
+  an error. Its allowlist of the existing calls records which ones are warned: preceded, in the
+  same function, by a `warn_global_process_group_fallback()` call in their block or in a block
+  that contains it, or inside a `with global_process_group_fallback(...)` block. A warned call
+  that loses its warning is an error too.
+- **A fallback outside Megatron Core** reads the grid inside
+  `with global_process_group_fallback(owner, argument, deprecated_in=..., removed_in=...):`
+  from `megatron.core.process_groups_config`. It emits one `ProcessGroupFallbackWarning` for the
+  fallback, and the accessors and `use_mpu_process_groups()` it calls do not warn again.
+  `tests/unit_tests/test_parallel_state_accessor_uses.py` checks that the code of this
+  repository outside Megatron Core and its tests calls them only in such a block or in
+  bootstrap code that ignores `ParallelStateDeprecationWarning`.
+- **In CI**, the *Process group usage check* workflow
+  (`.github/workflows/process-group-usage-check.yml`) runs on pull requests and in the merge
+  queue. Its job fails when the tests of the checker,
+  `tests/unit_tests/test_check_process_group_usage.py`, fail; they also check that each call in
+  the allowlist is warned or guarded, apart from two that the test lists, and that the checker
+  counts every helper of `process_groups_config.py` that reads the grid. It also fails when
+  `tests/unit_tests/test_removal_versions.py` fails (see *Removal*). The job then runs
+  `tools/check_process_group_usage.py` and `tests/unit_tests/test_parallel_state_accessor_uses.py`
+  as report-only steps (`continue-on-error`): a new call in Megatron Core, a call that lost its
+  warning, or a deprecated call outside Megatron Core is listed in the step's log, and the job
+  still passes. Whether that should block a pull request is still to be decided, see
+  [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307). The unit-test jobs run these
+  three test files in the `tests/unit_tests/**/*.py` bucket, where a failure of any of them
+  fails the job; nothing there runs the checker on the repository's code. A pull request that
+  runs selective (Testmon) unit tests may skip them, because Testmon selects tests by the code
+  they execute and they read the files they check as text; the merge queue runs every test.
+- **Removal** is due when the version in `megatron/core/package_info.py` reaches the
+  `removed_in` version of a fallback, the default of that argument, or a `*_REMOVED_IN`
+  constant such as `_ACCESSOR_REMOVED_IN` in `parallel_state.py`.
+  `tests/unit_tests/test_removal_versions.py` then fails and lists that code. It fails the
+  *Process group usage check* job, which runs it on every pull request that changes code,
+  including the one that bumps the version, and the unit-test jobs.
+- **Strict mode** (`--strict-process-group-fallbacks`, `enable_strict_process_group_fallbacks()`)
+  turns `ProcessGroupFallbackWarning` into an error. It does not affect
+  `ParallelStateDeprecationWarning`.
+- **Unit tests** set up the global grid on purpose, so `pyproject.toml` ignores
+  `ParallelStateDeprecationWarning` when a test calls a deprecated function. When the caller is
+  a module of this repository outside the tests, imported under its package name, such as
+  `megatron.training.*` or `examples.*`, or a top-level script such as `pretrain_gpt`, it turns
+  the warning into an error, so the first test that reaches such a call site fails. Inside
+  `pytest.warns()` or another filter the warning is recorded or ignored instead, and the call
+  site, which warns only once per process, then stays silent for the later tests. A module that
+  a test imports under another name, through `sys.path` or a file location, such as the
+  converters of `tools/checkpoint`, and the `megatron.*` packages of other projects, such as
+  `megatron.energon`, stay ignored; `tests/unit_tests/test_parallel_state_accessor_uses.py`
+  still checks the calls of the former in their source. A test that checks the warning uses
+  `pytest.warns(ParallelStateDeprecationWarning)` on a call site that has not warned yet in the
+  same process.
+
 ### Handling CI Failures
 
 If the compatibility check fails on your PR:

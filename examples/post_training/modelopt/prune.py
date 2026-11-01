@@ -36,10 +36,7 @@ except ImportError:
     _HAS_SHARED_CALIB = False
 from utils import get_hf_tokenizer
 
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    get_tensor_model_parallel_group,
-)
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -158,14 +155,11 @@ def check_arguments(args):
 
 
 def get_params(model):
+    """Return the number of parameters of the model summed over its pipeline and TP ranks."""
     params = sum(p.numel() for p in model.parameters())
     reduced_params = torch.Tensor([params]).to(device=next(model.parameters()).device)
-    torch.distributed.all_reduce(
-        reduced_params, group=get_pipeline_model_parallel_group()
-    )
-    torch.distributed.all_reduce(
-        reduced_params, group=get_tensor_model_parallel_group()
-    )
+    torch.distributed.all_reduce(reduced_params, group=model.pg_collection.pp)
+    torch.distributed.all_reduce(reduced_params, group=model.pg_collection.tp)
     return reduced_params.item()
 
 
@@ -194,9 +188,11 @@ if __name__ == "__main__":
     prune_builder = functools.partial(
         modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
     )
+    # Build the model on the groups that initialize_megatron() registered.
     model = get_model(
         functools.partial(model_provider, prune_builder),
         wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
     )
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")

@@ -2,16 +2,22 @@
 
 """Behavioral coverage for RNG policy after legacy argument construction."""
 
+import random
 from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, fields
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.training import arguments, checkpointing, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.config.common_config import RNGConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 def _args_without_rng():
@@ -209,6 +215,295 @@ def test_parallel_seed_offsets_are_unchanged(monkeypatch, dp_random):
     initialize._set_random_seed(101, dp_random, pp_group=pp, dp_group=dp)
     for seeded in (python_seed, numpy_seed, torch_seed):
         seeded.assert_called_once_with(301 + (30 if dp_random else 0))
+
+
+def _forbid_global_process_groups(monkeypatch):
+    """Make every global group, rank and world-size accessor raise, including by-name imports."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the global parallel state was read")
+
+    for name in dir(parallel_state):
+        if name.startswith("get_") and name.endswith(
+            ("_rank", "_ranks", "_world_size", "_group", "_groups")
+        ):
+            monkeypatch.setattr(parallel_state, name, forbidden)
+            if hasattr(tensor_parallel_random, name):
+                monkeypatch.setattr(tensor_parallel_random, name, forbidden)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbidden)
+
+
+@pytest.mark.parametrize("dp_random", [False, True])
+def test_collection_seed_offsets_use_full_data_parallel_group(monkeypatch, dp_random):
+    """With a collection, the offsets come from its pp and dp_gtp_remat groups, not the globals."""
+    pp, dp, dp_gtp_remat = object(), object(), object()
+    ranks = {pp: 2, dp: 5, dp_gtp_remat: 3}
+    monkeypatch.setattr(initialize, "get_pg_rank", lambda group: ranks[group])
+    _forbid_global_process_groups(monkeypatch)
+    python_seed, numpy_seed, torch_seed, cuda_seed = Mock(), Mock(), Mock(), Mock()
+    monkeypatch.setattr(initialize.random, "seed", python_seed)
+    monkeypatch.setattr(initialize.np.random, "seed", numpy_seed)
+    monkeypatch.setattr(initialize.torch, "manual_seed", torch_seed)
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(initialize.tensor_parallel, "model_parallel_cuda_manual_seed", cuda_seed)
+    pg_collection = ProcessGroupCollection(pp=pp, dp=dp, dp_gtp_remat=dp_gtp_remat)
+    initialize._set_random_seed(101, dp_random, pg_collection=pg_collection)
+    expected_seed = 301 + (30 if dp_random else 0)
+    for seeded in (python_seed, numpy_seed, torch_seed):
+        seeded.assert_called_once_with(expected_seed)
+    assert cuda_seed.call_args.args[0] == expected_seed
+    assert cuda_seed.call_args.kwargs["pg_collection"] is pg_collection
+    for rank_or_size in (
+        "tp_rank",
+        "ep_rank",
+        "etp_rank",
+        "gtp_remat_rank",
+        "egtp_remat_rank",
+        "gtp_remat_world_size",
+        "egtp_remat_world_size",
+    ):
+        assert cuda_seed.call_args.kwargs[rank_or_size] is None
+
+
+@pytest.mark.parametrize(
+    "groups, dp_random",
+    [({"dp_gtp_remat": object()}, False), ({"pp": object(), "dp": object()}, True)],
+)
+def test_collection_seed_requires_its_offset_groups(monkeypatch, groups, dp_random):
+    """A collection without pp, or without dp_gtp_remat for DP-random init, is an error."""
+    _forbid_global_process_groups(monkeypatch)
+    with pytest.raises(ValueError, match="pg_collection must set pp"):
+        initialize._set_random_seed(101, dp_random, pg_collection=ProcessGroupCollection(**groups))
+
+
+def test_initialization_seeds_from_the_model_collection(monkeypatch, run_config):
+    args = _args_without_rng()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    cfg.dist.lazy_mpu_init = False
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    for name in (
+        "initialize_runtime_services",
+        "setup_logging",
+        "initialize_rerun_state_machine",
+        "_initialize_distributed",
+        "_init_autoresume",
+        "set_default_log_ranks",
+        "print_rank_0",
+    ):
+        monkeypatch.setattr(initialize, name, Mock())
+    seed = Mock()
+    monkeypatch.setattr(initialize, "_set_random_seed", seed)
+    pg_collection = ProcessGroupCollection()
+    initialize.initialize_megatron(
+        allow_no_cuda=True, skip_dependency_compilation=True, seed_pg_collection=pg_collection
+    )
+    assert seed.call_args.kwargs["pg_collection"] is pg_collection
+
+
+@pytest.mark.parametrize("source", ["grid", "model", "none"])
+@pytest.mark.parametrize("lazy", [False, True])
+def test_initialization_seeds_from_the_grid_it_builds(monkeypatch, run_config, source, lazy):
+    """Without the model's collection, the seeds come from the collection of the built grid.
+
+    Only when initialization builds no grid do they come from the global parallel state.
+    """
+    args = _args_without_rng()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    cfg.dist.lazy_mpu_init = lazy
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    for name in (
+        "initialize_runtime_services",
+        "setup_logging",
+        "initialize_rerun_state_machine",
+        "_init_autoresume",
+        "set_default_log_ranks",
+        "print_rank_0",
+    ):
+        monkeypatch.setattr(initialize, name, Mock())
+    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_world_size", Mock())
+    monkeypatch.setattr(initialize.mpu, "set_tensor_model_parallel_rank", Mock())
+    grid, model = ProcessGroupCollection(), ProcessGroupCollection()
+    monkeypatch.setattr(
+        initialize, "_initialize_distributed", Mock(return_value=None if source == "none" else grid)
+    )
+    seed = Mock()
+    monkeypatch.setattr(initialize, "_set_random_seed", seed)
+
+    finish = initialize.initialize_megatron(
+        allow_no_cuda=True,
+        skip_dependency_compilation=True,
+        seed_pg_collection=model if source == "model" else None,
+    )
+    if lazy:
+        seed.assert_not_called()
+        finish()
+
+    expected = {"grid": grid, "model": model, "none": None}[source]
+    assert seed.call_args.kwargs["pg_collection"] is expected
+
+
+@pytest.mark.parametrize("tp, pp, gtp", [(1, 2, 2), (2, 1, 2), (1, 1, 1)])
+@pytest.mark.parametrize("dp_random", [False, True])
+def test_collection_seeds_match_the_global_grid(monkeypatch, tp, pp, gtp, dp_random):
+    """Seeding from the global grid's collection reproduces the seeds of the global path."""
+    if Utils.world_size < 4 or Utils.world_size % (tp * pp * gtp):
+        pytest.skip("needs a world size of at least 4 that the grid divides")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, gtp_remat_size=gtp
+    )
+    try:
+        tensor_parallel_random.initialize_rng_tracker(force_reset=True)
+
+        def tracker_states():
+            tracker = tensor_parallel_random.get_cuda_rng_tracker()
+            return {name: state.clone() for name, state in tracker.get_states().items()}
+
+        initialize._set_random_seed(1234, dp_random)
+        expected = tracker_states()
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=[
+                "pp",
+                "dp",
+                "dp_gtp_remat",
+                "tp",
+                "ep",
+                "expt_tp",
+                "gtp_remat",
+                "expt_gtp_remat",
+            ]
+        )
+        # Under GTP-remat the replicate DP group leaves out the GTP peers, so a DP offset taken
+        # from it would differ from the global path.
+        assert pg_collection.dp_gtp_remat.size() == gtp * pg_collection.dp.size()
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            initialize._set_random_seed(1234, dp_random, pg_collection=pg_collection)
+        actual = tracker_states()
+
+        assert actual.keys() == expected.keys()
+        for name, state in expected.items():
+            assert torch.equal(actual[name], state), name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _seeded_rng_states():
+    """The CPU, CUDA and tracker states, and the Python state, that seeding sets."""
+    tracker = tensor_parallel_random.get_cuda_rng_tracker()
+    states = {name: state.clone() for name, state in tracker.get_states().items()}
+    states["torch_cpu"] = torch.get_rng_state()
+    states["torch_cuda"] = torch.cuda.get_rng_state()
+    return states, random.getstate()
+
+
+def _same_groups(value, expected):
+    """Whether two collection fields hold the same group objects; dicts are compared per key."""
+    if isinstance(expected, dict):
+        return sorted(value) == sorted(expected) and all(
+            value[key] is group for key, group in expected.items()
+        )
+    return value is expected
+
+
+@pytest.mark.parametrize(
+    "grid",
+    [
+        dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2),
+        dict(
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ),
+        dict(tensor_model_parallel_size=2, gtp_remat_size=2),
+    ],
+    ids=["tp2_pp2", "tp2_ep2_etp1", "tp2_gtp_remat2"],
+)
+@pytest.mark.parametrize("dp_random", [False, True])
+def test_stock_initialization_seeds_from_its_grid_without_global_reads(
+    monkeypatch, run_config, grid, dp_random
+):
+    """initialize_megatron without a collection seeds from the grid that it builds.
+
+    Every global group, rank and size accessor fails once the grid exists. The seeds match those
+    of the global parallel state, and the collection that pretrain() builds afterwards holds the
+    same groups as the one the seeds came from.
+    """
+    if Utils.world_size < 4 or Utils.world_size % 4:
+        pytest.skip("needs a world size that is a multiple of 4")
+
+    # The seeds that the global parallel state gives for this grid.
+    Utils.initialize_model_parallel(**grid)
+    try:
+        tensor_parallel_random.initialize_rng_tracker(force_reset=True)
+        initialize._set_random_seed(1234, dp_random)
+        expected_states, expected_python_state = _seeded_rng_states()
+    finally:
+        Utils.destroy_model_parallel()
+
+    from megatron.core.tensor_parallel import gtp_api
+    from megatron.training import training
+
+    args = _args_without_rng()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.rng = RNGConfig(seed=1234, data_parallel_random_init=dp_random)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    # validate_args resolves these topology values.
+    args.tensor_model_parallel_size = grid["tensor_model_parallel_size"]
+    args.pipeline_model_parallel_size = grid.get("pipeline_model_parallel_size", 1)
+    args.virtual_pipeline_model_parallel_size = None
+    args.expert_model_parallel_size = grid.get("expert_model_parallel_size", 1)
+    args.expert_tensor_parallel_size = grid.get("expert_tensor_parallel_size")
+    args.gtp_weight_remat_size = grid.get("gtp_remat_size", 1)
+    args.expert_gtp_weight_remat_size = 1
+    args.gtp_remat_num_sequence_shards = 1
+    for name in ("initialize_runtime_services", "setup_logging", "set_default_log_ranks"):
+        monkeypatch.setattr(initialize, name, Mock())
+    monkeypatch.setattr(initialize.tuning, "install", Mock())
+    # Building the GTP-remat grid and seeding its trackers need no GTP kernels.
+    monkeypatch.setattr(gtp_api, "HAVE_GTP", True)
+
+    initialize_model_parallel = parallel_state.initialize_model_parallel
+    set_random_seed = initialize._set_random_seed
+    built, seeded_from = [], []
+    Utils.initialize_distributed()
+    try:
+        with monkeypatch.context() as patch:
+
+            def initialize_then_forbid_global_reads(*positional, **keywords):
+                built.append(initialize_model_parallel(*positional, **keywords))
+                _forbid_global_process_groups(patch)
+                return built[-1]
+
+            def record_seed_collection(*positional, **keywords):
+                seeded_from.append(keywords["pg_collection"])
+                return set_random_seed(*positional, **keywords)
+
+            patch.setattr(
+                parallel_state, "initialize_model_parallel", initialize_then_forbid_global_reads
+            )
+            patch.setattr(initialize, "_set_random_seed", record_seed_collection)
+            tensor_parallel_random.initialize_rng_tracker(force_reset=True)
+            initialize.initialize_megatron(allow_no_cuda=True, skip_dependency_compilation=True)
+        actual_states, actual_python_state = _seeded_rng_states()
+
+        assert len(built) == 1 and len(seeded_from) == 1
+        assert seeded_from[0] is built[0]
+        assert actual_states.keys() == expected_states.keys()
+        for name, state in expected_states.items():
+            assert torch.equal(actual_states[name], state), name
+        assert actual_python_state == expected_python_state
+
+        pretrain_collection = training._build_pg_collection_from_parallel_state(args)
+        for field in fields(ProcessGroupCollection):
+            assert _same_groups(
+                getattr(pretrain_collection, field.name), getattr(built[0], field.name)
+            ), field.name
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("seed", [None, 0, -1])

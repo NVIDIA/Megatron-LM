@@ -9,6 +9,7 @@ from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
 import megatron.core.parallel_state as ps
+from megatron.core import process_groups_config
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
@@ -20,7 +21,7 @@ from megatron.core.models.T5.t5_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
 class TestT5Model:
@@ -65,7 +66,7 @@ class TestT5Model:
             add_encoder=add_encoder,
             add_decoder=add_decoder,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'pp']
+                required_pgs=['tp', 'cp', 'pp', 'embd']
             ),
         )
 
@@ -125,6 +126,179 @@ class TestT5Model:
 
     def test_load_state_dict(self):
         pass
+
+
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+@pytest.mark.parametrize("explicit_pg_collection", [False, True])
+def test_constructor_process_groups(mocker, explicit_pg_collection, position_embedding_type):
+    """T5 and LanguageModule must agree on the caller's process-group collection."""
+    clear_nvte_env_vars()
+    mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    mocker.patch("torch.distributed.is_initialized", return_value=True)
+    pg_collection = ProcessGroupCollection(
+        tp=mocker.sentinel.tp,
+        cp=mocker.sentinel.cp,
+        pp=mocker.sentinel.pp,
+        embd=mocker.sentinel.embd,
+    )
+    global_groups = mocker.patch.object(
+        ProcessGroupCollection, "use_mpu_process_groups", return_value=pg_collection
+    )
+    if explicit_pg_collection:
+        global_groups.side_effect = AssertionError("Explicit groups must not read the global grid")
+
+    config = TransformerConfig(
+        num_layers=2, hidden_size=16, num_attention_heads=4, use_cpu_initialization=True
+    )
+    # An empty pipeline stage exercises both constructors without constructing GPU layers.
+    t5_kwargs = dict(
+        config=config,
+        encoder_config=config,
+        transformer_encoder_layer_spec=None,
+        transformer_decoder_layer_spec=None,
+        vocab_size=32,
+        max_sequence_length=4,
+        pre_process=False,
+        post_process=False,
+        add_encoder=False,
+        add_decoder=False,
+        position_embedding_type=position_embedding_type,
+        pg_collection=pg_collection if explicit_pg_collection else None,
+    )
+    if explicit_pg_collection:
+        model = T5Model(**t5_kwargs)
+    else:
+        with pytest.warns(FutureWarning, match="T5Model was called without `pg_collection`"):
+            model = T5Model(**t5_kwargs)
+
+    assert model.pg_collection is pg_collection
+    assert model.tp_group is pg_collection.tp
+    assert model.cp_group is pg_collection.cp
+    assert model.pp_group is pg_collection.pp
+    assert model.embd_group is pg_collection.embd
+    if position_embedding_type == "rope":
+        # The rotary embedding is built on the collection LanguageModule resolved, not on the
+        # omitted argument.
+        assert model.rotary_pos_emb.cp_group is pg_collection.cp
+    if explicit_pg_collection:
+        global_groups.assert_not_called()
+    else:
+        global_groups.assert_called()
+
+
+@pytest.mark.parametrize(
+    'pp_size, pre_process, post_process, tied, embedding_state, valid',
+    [
+        (1, False, False, False, 'omitted', False),
+        (2, False, True, True, 'omitted', False),
+        (1, True, True, True, 'none', True),
+        (2, False, False, True, 'none', True),
+        (2, True, False, False, 'none', True),
+        (2, False, True, False, 'none', True),
+        (2, True, False, True, 'none', False),
+        (2, True, True, True, 'none', False),
+        (2, False, True, True, 'none', False),
+        (2, True, False, True, 'nonmember', False),
+        (2, False, False, True, 'nonmember', False),
+    ],
+)
+def test_constructor_embedding_group_contract(
+    mocker, pp_size, pre_process, post_process, tied, embedding_state, valid
+):
+    """An explicit collection cannot silently disable tied pipeline embedding synchronization."""
+    clear_nvte_env_vars()
+    mocker.patch('torch.distributed.is_initialized', return_value=True)
+    mocker.patch('megatron.core.models.T5.t5_model.LanguageModelEmbedding')
+    mocker.patch('megatron.core.models.T5.t5_model.T5LMHead')
+    mocker.patch.object(T5Model, 'setup_embeddings_and_output_layer')
+    global_groups = mocker.patch.object(
+        ProcessGroupCollection,
+        'use_mpu_process_groups',
+        side_effect=AssertionError('explicit collection must not resolve global groups'),
+    )
+    pg_collection = ProcessGroupCollection(
+        tp=mocker.sentinel.tp, cp=mocker.sentinel.cp, pp=mocker.sentinel.pp
+    )
+    if embedding_state != 'omitted':
+        pg_collection.embd = (
+            None if embedding_state == 'none' else torch.distributed.GroupMember.NON_GROUP_MEMBER
+        )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=pp_size,
+        pipeline_dtype=torch.float32,
+    )
+    kwargs = dict(
+        config=config,
+        encoder_config=config,
+        transformer_encoder_layer_spec=None,
+        transformer_decoder_layer_spec=None,
+        vocab_size=32,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        add_encoder=False,
+        add_decoder=False,
+        share_embeddings_and_output_weights=tied,
+        pg_collection=pg_collection,
+    )
+    if valid:
+        model = T5Model(**kwargs)
+        assert model.embd_group is pg_collection.embd
+    else:
+        with pytest.raises(ValueError, match='embd'):
+            T5Model(**kwargs)
+    global_groups.assert_not_called()
+
+
+def test_pipeline_tied_embeddings_use_supplied_group(mocker):
+    """Real PP endpoints synchronize nonzero embedding weights through the supplied group."""
+    clear_nvte_env_vars()
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip('requires a world size divisible by two')
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'pp', 'embd', 'gtp_remat']
+        )
+        mocker.patch.object(
+            ProcessGroupCollection,
+            'use_mpu_process_groups',
+            side_effect=AssertionError('explicit collection must not resolve global groups'),
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+            use_cpu_initialization=True,
+        )
+        model = T5Model(
+            config=config,
+            encoder_config=config,
+            transformer_encoder_layer_spec=None,
+            transformer_decoder_layer_spec=None,
+            vocab_size=32,
+            max_sequence_length=4,
+            pre_process=pg_collection.pp.rank() == 0,
+            post_process=pg_collection.pp.rank() == 1,
+            add_encoder=False,
+            add_decoder=False,
+            share_embeddings_and_output_weights=True,
+            pg_collection=pg_collection,
+        )
+        weight = model.shared_embedding_or_output_weight().detach()
+        assert torch.count_nonzero(weight).item() > 0
+        endpoint_weights = [torch.empty_like(weight) for _ in range(pg_collection.embd.size())]
+        torch.distributed.all_gather(endpoint_weights, weight, group=pg_collection.embd)
+        for endpoint_weight in endpoint_weights:
+            torch.testing.assert_close(endpoint_weight, weight, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestT5ModelAttentionDimensions:
@@ -238,3 +412,36 @@ class TestT5ModelAttentionDimensions:
             "engine version < 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0"
             "or upgrade transformer engine >= 1.7"
         )
+
+
+class TestT5ModelDefaultProcessGroups:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("tp_only_amax_red", [False, True])
+    def test_default_collection_carries_the_amax_reduction_groups(self, tp_only_amax_red):
+        """FP8/FP4 layers of a T5 model built without a collection reduce over the global groups."""
+        from megatron.core.process_groups_config import amax_reduction_group
+
+        config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = T5Model(
+            config=config,
+            encoder_config=deepcopy(config),
+            transformer_encoder_layer_spec=get_t5_encoder_with_local_block_spec(2),
+            transformer_decoder_layer_spec=get_t5_decoder_with_local_block_spec(2),
+            vocab_size=128,
+            max_sequence_length=8,
+        )
+        expected = ps.get_amax_reduction_group(
+            with_context_parallel=True, tp_only_amax_red=tp_only_amax_red
+        )
+
+        for block in (model.encoder, model.decoder):
+            assert amax_reduction_group(block.pg_collection, tp_only_amax_red) is expected
