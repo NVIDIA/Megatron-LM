@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Replay seeded CUDA draws under changing batch layouts."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from megatron.core.inference.sampling.request_seed_noise import (
     _request_seed_noise_kernel,
     fill_request_seed_noise,
 )
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
@@ -50,3 +53,38 @@ def test_request_noise_replays_and_preserves_logical_coordinates():
     fill_request_seed_noise(changed, [0, 0, 0, None, 123], [19] * 5)
     for row in (0, 1, 2):
         assert not torch.equal(full[row], changed[row])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_uniform_greedy_rows_ignore_request_seeds():
+    """An all-greedy batch takes per-row argmax, seeded or not, and never draws from the RNG."""
+    count = 4
+    context = SimpleNamespace(
+        total_request_count=count,
+        paused_request_count=0,
+        config=SimpleNamespace(num_speculative_tokens=0),
+        active_request_metadata={
+            "seed": torch.tensor([7, -1, (1 << 63) - 1, 0], dtype=torch.int64),
+            "temperature": torch.tensor([0.5, 1.0, 2.0, 1.0]),
+            "top_k": torch.ones(count, dtype=torch.int32),
+            "top_p": torch.zeros(count),
+        },
+        get_active_sequence_lengths=lambda: torch.tensor([3, 5, 8, 13]),
+    )
+    sampling = TorchSampling(torch.Generator(device="cuda").manual_seed(3), 4099)
+    logits = torch.randn(
+        6, 4099, device="cuda", generator=torch.Generator(device="cuda").manual_seed(1)
+    )
+    gather = torch.tensor([5, 0, 3, 1], device="cuda")
+    rng_before = sampling._rng.get_state().clone()
+
+    def sample(logits, gather):
+        return sampling.sample_kernel(
+            logits, count, context, no_top_k=False, no_top_p=True, gather_indices=gather
+        )
+
+    reference, _ = assert_replays_bit_exact(
+        sample, (logits, gather), backward=False, contention=True, what="uniform_greedy_sampling"
+    )
+    assert torch.equal(reference["out"], logits[gather].argmax(dim=-1))
+    assert torch.equal(rng_before, sampling._rng.get_state())
