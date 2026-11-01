@@ -7,17 +7,39 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m torch.distributed.run \
 '''
 
 import os
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    forbid_global_process_groups,
+    new_group_with_same_ranks,
+)
+
+
+@pytest.fixture
+def fresh_warning_registry(monkeypatch):
+    """The test observes the first fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+def _global_groups(**groups):
+    """Stand in for the global grid that the deprecated fallback reads."""
+    return patch.object(
+        ProcessGroupCollection,
+        "use_mpu_process_groups",
+        return_value=ProcessGroupCollection(**groups),
+    )
 
 
 @pytest.mark.experimental
@@ -78,22 +100,23 @@ class TestPartitionConfig:
         assert cfg.tp_group is mock_tp_group
         assert cfg.tp_cp_group is mock_tp_cp_group
 
-    def test_from_mp_config_auto_fetch_cp_group(self):
+    def test_from_mp_config_auto_fetch_cp_group(self, fresh_warning_registry):
         mock_group = MagicMock()
         mp = TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, context_parallel_size=2
         )
         with (
-            patch(
-                'megatron.core.models.mimo.partition.utils.get_context_parallel_group',
-                return_value=mock_group,
-            ),
+            _global_groups(cp=mock_group) as global_groups,
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
+            pytest.warns(
+                ProcessGroupFallbackWarning, match="from_mp_config was called without `cp_group`"
+            ),
         ):
             cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512)
+        global_groups.assert_called_once_with(required_pgs=['cp'])
         assert cfg.cp_group is mock_group
 
-    def test_from_mp_config_auto_fetch_tp_group(self):
+    def test_from_mp_config_auto_fetch_tp_group(self, fresh_warning_registry):
         mock_group = MagicMock()
         mp = TransformerConfig(
             num_layers=1,
@@ -103,14 +126,26 @@ class TestPartitionConfig:
             sequence_parallel=True,
         )
         with (
-            patch(
-                'megatron.core.models.mimo.partition.utils.get_tensor_model_parallel_group',
-                return_value=mock_group,
-            ),
+            _global_groups(tp=mock_group) as global_groups,
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=1),
+            pytest.warns(
+                ProcessGroupFallbackWarning, match="from_mp_config was called without `tp_group`"
+            ),
         ):
             cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512)
+        global_groups.assert_called_once_with(required_pgs=['tp'])
         assert cfg.tp_group is mock_group
+
+    def test_from_mp_config_without_any_group_raises(self, fresh_warning_registry):
+        mp = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=4, context_parallel_size=2
+        )
+        with (
+            _global_groups(cp=None),
+            pytest.warns(ProcessGroupFallbackWarning),
+            pytest.raises(ValueError, match="cp_group"),
+        ):
+            PartitionConfig.from_mp_config(mp, max_seq_len=512)
 
 
 @pytest.mark.experimental
@@ -539,3 +574,60 @@ class TestPartitionAdapterRealDistributed:
         torch.testing.assert_close(
             out_loss_mask, _expected_cp_zigzag_shard(loss_mask, cp_size, cp_rank)
         )
+
+
+@pytest.mark.experimental
+@pytest.mark.skipif(
+    Utils.world_size < 4 or Utils.world_size % 4, reason="needs a multiple of 4 ranks"
+)
+class TestPartitionConfigGroups:
+    """from_mp_config uses the language model's groups, or warns and uses the global ones."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _config():
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=True,
+        )
+
+    def test_given_groups_are_used_without_global_reads(self):
+        cp_group = new_group_with_same_ranks(parallel_state.get_context_parallel_group())
+        tp_group = new_group_with_same_ranks(parallel_state.get_tensor_model_parallel_group())
+
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            cfg = PartitionConfig.from_mp_config(
+                self._config(), max_seq_len=64, cp_group=cp_group, tp_group=tp_group
+            )
+
+        assert cfg.use_cp
+        assert cfg.cp_group is cp_group
+        assert cfg.tp_group is tp_group
+        torch.distributed.destroy_process_group(cp_group)
+        torch.distributed.destroy_process_group(tp_group)
+
+    def test_omitted_groups_warn_and_use_the_global_groups(self, fresh_warning_registry):
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            cfg = PartitionConfig.from_mp_config(self._config(), max_seq_len=64)
+
+        messages = [
+            str(w.message) for w in record if issubclass(w.category, ProcessGroupFallbackWarning)
+        ]
+        for argument in ("cp_group", "tp_group"):
+            assert any(
+                f"PartitionConfig.from_mp_config was called without `{argument}`" in message
+                for message in messages
+            )
+        assert cfg.use_cp
+        assert cfg.cp_group is parallel_state.get_context_parallel_group()
+        assert cfg.tp_group is parallel_state.get_tensor_model_parallel_group()

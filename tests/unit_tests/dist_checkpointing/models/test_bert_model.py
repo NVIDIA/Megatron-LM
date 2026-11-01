@@ -11,6 +11,7 @@ from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -49,6 +50,7 @@ def initialize_bert_model(
         pre_process=pre_process,
         post_process=post_process,
         num_tokentypes=0,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     with torch.no_grad():
