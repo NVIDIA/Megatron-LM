@@ -13,7 +13,7 @@ orphan: true
 following:
 
 - Validates the determinism environment variables and fills canonical defaults
-- Rejects features that have no deterministic path (cross-entropy fusion and
+- Rejects features that have no deterministic path (Transformer Engine cross-entropy fusion and
   tensor parallelism (TP) communication overlap)
 - Enables `torch.use_deterministic_algorithms(True)`
 
