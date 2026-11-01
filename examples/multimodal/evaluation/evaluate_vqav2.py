@@ -1,9 +1,12 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import argparse
 import json
 from typing import List
 
-from .evaluate_mmmu import get_input_output_paths
 from open_flamingo.eval.vqa_metric import VQAEval
+
+from .evaluate_mmmu import get_input_output_paths
+
 
 # ANLS score calculation based on https://github.com/shunk031/ANLS/blob/6472e1d71e84d6cee28e3c6d2e18564bafaa312d/anls/metrics/dist.py#L1
 # and https://github.com/shunk031/ANLS/blob/6472e1d71e84d6cee28e3c6d2e18564bafaa312d/anls/metrics/score.py#L6
@@ -77,7 +80,7 @@ def merge_input_files(input_path):
     results = list(results.values())
 
     with open(output_file_path, "w") as output_file:
-        json.dump(results, output_file, indent=4, sort_keys=True)
+        json.dump(results, output_file)
 
     return output_file_path
 
@@ -133,7 +136,7 @@ def compute_vqa_accuracy(result_file, task):
         elif task in ("SPDocVQA", "InfoVQA"):
             acc = anls_score(prediction=pred, gold_labels=gt, threshold=0.5)
             all_acc.append(acc)
-        elif task in ("AI2D", "RealworldQA", "MotionBench"):
+        elif task == "AI2D":
             assert len(gt) == 1, f"Expected exactly 1 GT, got {gt}"
             acc = pred == gt[0]
             all_acc.append(acc)
