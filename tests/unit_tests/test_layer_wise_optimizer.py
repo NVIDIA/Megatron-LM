@@ -1436,3 +1436,78 @@ class TestLayerWiseOptimizer:
                 atol=0,
                 msg="Params incorrect after start_param_sync with autograd enabled",
             )
+
+
+@pytest.mark.parametrize("num_instances", [1, 2, 4])
+@pytest.mark.parametrize("overlap_param_gather", [False, True])
+def test_muon_multiple_optimizer_instances(num_instances, overlap_param_gather):
+    """Compare real Muon + scalar fallbacks with a full-DP reference on CUDA.
+
+    Run with four or eight ranks to cover single-rank and multi-rank optimizer instances.
+    """
+    if Utils.world_size < num_instances or Utils.world_size % num_instances:
+        pytest.skip("World size must be divisible by the number of optimizer instances")
+    from megatron.training.training import wrap_model_chunks_with_ddp
+
+    Utils.initialize_model_parallel(num_distributed_optimizer_instances=num_instances)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+        model = SimpleModel().bfloat16().cuda()
+        reference = SimpleModel().bfloat16().cuda()
+        reference.load_state_dict(model.state_dict())
+        ddp_config = DistributedDataParallelConfig(
+            num_distributed_optimizer_instances=num_instances,
+            overlap_param_gather=overlap_param_gather,
+            grad_reduce_in_fp32=True,
+        )
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            transformer_config,
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            pg_collection=groups,
+        )[0]
+        model.broadcast_params()
+        reference.load_state_dict(model.module.state_dict())
+        reference = DistributedDataParallel(
+            transformer_config,
+            DistributedDataParallelConfig(grad_reduce_in_fp32=True),
+            reference,
+            pg_collection=groups,
+        )
+        config_kwargs = dict(
+            optimizer="muon", lr=0.01, bf16=True, clip_grad=1.0, muon_tp_mode="duplicated"
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(**config_kwargs, use_layer_wise_distributed_optimizer=True),
+            [model],
+            pg_collection=groups,
+            use_gloo_process_groups=False,
+        )
+        reference_optimizer = get_megatron_optimizer(
+            OptimizerConfig(**config_kwargs),
+            [reference],
+            pg_collection=groups,
+            use_gloo_process_groups=False,
+        )
+        for step in range(3):
+            model.zero_grad_buffer()
+            reference.zero_grad_buffer()
+            for index, (param, ref_param) in enumerate(
+                zip(model.parameters(), reference.parameters())
+            ):
+                value = (Utils.rank + 1) * (index + 1 + step) / 128
+                param.main_grad.fill_(value)
+                ref_param.main_grad.fill_(value)
+            model.finish_grad_sync()
+            reference.finish_grad_sync()
+            success, grad_norm, _ = optimizer.step()
+            ref_success, ref_grad_norm, _ = reference_optimizer.step()
+            assert success and ref_success
+            assert float(grad_norm) == pytest.approx(float(ref_grad_norm), rel=1e-5)
+            model.start_param_sync(force_sync=True)
+            for param, ref_param in zip(model.parameters(), reference.parameters()):
+                torch.testing.assert_close(param, ref_param, rtol=1e-3, atol=1e-3)
+    finally:
+        Utils.destroy_model_parallel()

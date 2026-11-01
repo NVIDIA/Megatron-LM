@@ -89,12 +89,22 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
+def _get_layerwise_data_parallel_group(pg_collection, is_expert=False):
+    """Resolve the optimizer's ownership and parameter-gather domain.
+
+    Multiple optimizer instances replicate the optimizer over the inter-instance
+    axis and shard it only within each instance. Older callers may supply only
+    the full data-parallel groups, which remain the single-instance fallback.
+    """
+    group_name = "expt_dp" if is_expert else "dp_cp"
+    intra_group = getattr(pg_collection, f"intra_{group_name}", None)
+    return intra_group if intra_group is not None else getattr(pg_collection, group_name, None)
+
+
 def _all_gather_param_group_metadata(param_group, pg_collection):
     """Gather optimizer-group metadata within the group that owns the parameters."""
-    process_group = (
-        pg_collection.expt_dp
-        if param_group.get('is_expert_parallel', False)
-        else pg_collection.dp_cp
+    process_group = _get_layerwise_data_parallel_group(
+        pg_collection, param_group.get("is_expert_parallel", False)
     )
     assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
     all_rank_groups = [None for _ in range(get_pg_size(process_group))]
@@ -157,11 +167,13 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     return gtp_fold
 
 
-def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
+def _fold_replica_id(
+    replica_id, key, gtp_fold: Dict[str, Tuple[int, int]], optimizer_instance_id: int = 0
+):
     """Compute a ShardedTensor's writer-disambiguating replica_id for fixed-DP checkpointing.
 
-    Base reset: keep (PP, TP), zero DP -- every DP rank holds the same shard, so one writer
-    remains. Correct for normal params.
+    Keep (PP, TP) and replace DP with the optimizer-instance ID. Whole parameters
+    have one owner per instance; only instance zero writes each replicated shard.
 
     For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
     fold the peer gtp_remat rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
@@ -169,7 +181,7 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
     writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
     layer index too, so it matches per-layer and already-collapsed keys.
     """
-    rid = (*replica_id[:2], 0)
+    rid = (*replica_id[:2], optimizer_instance_id)
     if not gtp_fold:
         return rid
     key = re.sub(r'\.layers\.\d+\.', '.layers.', key or '')
@@ -203,17 +215,15 @@ class GraphedGradCopyFloat16Optimizer(Float16OptimizerWithFloat16Params):
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
-    Experimental distributed optimizer wrapper that distributes weight to DP ranks by layer.
-    Implemented as ChainedOptimizer to support multiple optimizers (e.g. muon + adamW)
-    When using, keep all megatron distributed-optimizer related options OFF.
+    Assigns whole parameters to ranks within an optimizer instance and chains
+    optimizers such as Muon and AdamW. Shard-aligned DDP buffers reduce-scatter
+    gradients within the instance and all-reduce corresponding shards across
+    instances before updating complete matrices. Updated parameters are then
+    all-gathered within the instance. Gradient statistics exclude duplicate
+    optimizer instances.
 
-    How LayerWiseDistributedOptimizer work:
-    1. weights are splited into lists and each rank only keep its shard in its optimizer
-    2. Megatron DDP handle allreduce grad, note that each rank have full model and grad
-    3. optimizer is already modified so only param belong to this DP rank is updated
-    4. grad_norm and zero counting will reduce metrics globally in step function
-    5. Do regular update with chained optimizers, modified optimizer only update shard
-    6. allgather updated params to every rank
+    Without a shard-aligned layout, the legacy single-instance path uses full
+    gradient all-reduces and variable-size parameter gathers.
     """
 
     @staticmethod
@@ -602,26 +612,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
                 raise ValueError("LayerWise optimizer model chunks must share one DDP config")
 
-        # The data-parallel groups this optimizer shards parameters over. Cached here so the
-        # sharding, all-gather and broadcast paths read one attribute instead of reaching back
-        # into pg_collection at every use.
-        self.dp_cp = getattr(pg_collection, 'dp_cp', None) if pg_collection is not None else None
-        self.expt_dp = (
-            getattr(pg_collection, 'expt_dp', None) if pg_collection is not None else None
+        # Ownership and parameter gathers must use the same intra-instance groups as
+        # DDP's reduce-scatter. Corresponding owners in the other instances receive
+        # the same globally reduced gradient through DDP's inter-instance all-reduce.
+        self.dp_cp = _get_layerwise_data_parallel_group(pg_collection)
+        self.expt_dp = _get_layerwise_data_parallel_group(pg_collection, is_expert=True)
+        self.distributed_optimizer_instance_id = 0
+        num_instances = (
+            self.ddp_config.num_distributed_optimizer_instances
+            if self.ddp_config is not None
+            else 1
         )
-
-        # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
-        # that same group, so it has no notion of optimizer instances. With more than one
-        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
-        # rank would be asked to update params whose gradients it does not hold. Reject the
-        # combination instead of silently training on partial gradients.
-        intra_dp_cp = (
-            getattr(pg_collection, 'intra_dp_cp', None) if pg_collection is not None else None
-        )
-        assert intra_dp_cp is None or get_pg_size(intra_dp_cp) == get_pg_size(self.dp_cp), (
-            "LayerWiseDistributedOptimizer does not support "
-            "num_distributed_optimizer_instances > 1."
-        )
+        if num_instances > 1:
+            inter_group = getattr(pg_collection, "inter_dist_opt", None)
+            if inter_group is None or get_pg_size(inter_group) != num_instances:
+                raise ValueError("LayerWise optimizer requires the inter-instance process group")
+            if not self.ddp_config.use_distributed_optimizer:
+                raise ValueError("Multiple LayerWise instances require distributed-optimizer DDP")
+            self.distributed_optimizer_instance_id = get_pg_rank(inter_group)
+        for group_name, local_group in (("dp_cp", self.dp_cp), ("expt_dp", self.expt_dp)):
+            full_group = getattr(pg_collection, group_name, None)
+            if full_group is not None and get_pg_size(full_group) != (
+                num_instances * get_pg_size(local_group)
+            ):
+                raise ValueError(
+                    f"LayerWise {group_name} ownership group must be the intra-instance group "
+                    f"for {num_instances} optimizer instances"
+                )
 
         full_param_layouts = None
         if model_chunks is not None:
@@ -630,6 +647,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
+        if num_instances > 1 and full_param_layouts is None:
+            raise ValueError("Multiple LayerWise instances require shard-aligned parameter layouts")
         self.shard_params(optimizers, full_param_layouts)
 
         # When a full_param_layout is available, ddp_config.use_distributed_optimizer
@@ -726,13 +745,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # dense and expert params are sharded over *different* domains, so the domain is
         # resolved per param group inside the helper.
         self._wire_layer_sharding_ns_homes(optimizers, pg_collection)
-
-        # TODO(kunlun, deyuf): potential future perf optimization
-        # since allreduce is unchanged and handled by megatron DDP, they're already in
-        # contiguous gbuf. So instead of shard param by layer randomly, we can shard by
-        # buf range but keep some "extras" to keep boundary weight not sharded.
-        # This way each rank do some duplicated work but allgather_v is no longer needed
-        # All current distopt optimization can also be potentially applied
 
     def _wire_layer_sharding_ns_homes(self, optimizers, pg_collection) -> None:
         """Wire up NS home assignments for any LayerShardedMuon inner optimizers.
@@ -841,17 +853,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # Simplify when dp_cp group size is 1.
         dp_cp_size = get_pg_size(self.dp_cp)
-        if dp_cp_size == 1:
-            self.dp_cp_params_list = None
-            self.expt_dp_params_list = None
-            return
-
         expt_dp_size = get_pg_size(self.expt_dp)
-
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
+        elif dp_cp_size == 1 and expt_dp_size == 1:
+            self.dp_cp_params_list = None
+            self.expt_dp_params_list = None
         else:
             self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
 
@@ -872,6 +880,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
                     continue
+                expected_shards = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
+                if layout.num_optimizer_shards != expected_shards:
+                    raise ValueError(
+                        f"LayerWise layout has {layout.num_optimizer_shards} optimizer shards, "
+                        f"but its intra-instance ownership group has {expected_shards} ranks"
+                    )
                 for param, (
                     param_start_index,
                     param_end_index,
@@ -1229,7 +1243,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     ):
         """
         Sharded state dict for torch_dist format checkpointing.
-        For fixed DP usage only, set replica_id to 0 for all ShardedTensor.
+        For fixed intra-instance ownership; one instance writes each replicated shard.
         """
         sharded_state_dict = super().sharded_state_dict(
             model_sharded_state_dict, is_loading, **kwargs
@@ -1245,10 +1259,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
                 ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
                 if isinstance(sh_base.replica_id, int):
-                    sh_base.replica_id = 0
+                    sh_base.replica_id = self.distributed_optimizer_instance_id
                     continue
                 sh_base.replica_id = _fold_replica_id(
-                    sh_base.replica_id, getattr(sh_base, 'key', ''), gtp_fold
+                    sh_base.replica_id,
+                    getattr(sh_base, 'key', ''),
+                    gtp_fold,
+                    self.distributed_optimizer_instance_id,
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one

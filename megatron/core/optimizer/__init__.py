@@ -854,38 +854,27 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
-    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
+    # Whole-matrix optimizers handle expert ownership internally. Scalar fallbacks
+    # use separate dense and expert DistributedOptimizers with their own buffers.
+    ddp_uses_distributed_optimizer = (
+        bool(getattr(model_chunks[0], "ddp_config", None))
+        and model_chunks[0].ddp_config.use_distributed_optimizer
+    )
+    use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
     all_param_groups = _get_param_groups(
         model_chunks, config, config_overrides, param_group_process_group
     )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
-        opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
+        opt_name = group.get("optimizer", eopt_name)
+        is_expert = group["is_expert_parallel"] and (
+            not use_layer_wise or (use_separate_distributed_optimizer and opt_name != eopt_name)
+        )
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
-    # Set up DistOpt process groups + filtered buffers once, only if we'll
-    # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
-    # The DistOpt-vs-LayerWise buffer split only happens when DDP was wrapped
-    # with ``use_distributed_optimizer=True`` (i.e. the layout-based path); in
-    # legacy ping-pong mode all params share one unpadded DDP buffer that
-    # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
-    ddp_uses_distributed_optimizer = (
-        bool(getattr(model_chunks[0], 'ddp_config', None))
-        and model_chunks[0].ddp_config.use_distributed_optimizer
-    )
     distopt_process_groups = None
-    distopt_per_model_buffers = None
-    use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
-        )
+    distopt_per_model_buffers = {}
+    distributed_optimizer_instance_id = 0
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
@@ -900,21 +889,22 @@ def _get_megatron_emerging_optimizer(
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
         )
-        # DistOpt should only manage non-LayerWise buffers (those holding
-        # embeddings, biases, layernorm, etc.). Filter out the LayerWise
-        # shard-aligned buffers that the LayerWiseDistributedOptimizer owns.
-        distopt_per_model_buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+        inter_group = distopt_process_groups["inter_dist_opt_group"]
+        if inter_group is not None:
+            distributed_optimizer_instance_id = get_pg_rank(inter_group)
+        # Keep fallback buffers separated by their dense/expert communication domain.
+        for is_expert, buffer_name in ((False, "buffers"), (True, "expert_parallel_buffers")):
+            per_model_buffers = {}
+            for model_chunk_idx, model_chunk in enumerate(model_chunks):
+                fallback_buffers = [
+                    buffer
+                    for buffer in getattr(model_chunk, buffer_name, [])
+                    if buffer.params
+                    and not getattr(buffer.params[0], "is_managed_by_layer_wise_optimizer", False)
+                ]
+                if fallback_buffers:
+                    per_model_buffers[model_chunk_idx] = fallback_buffers
+            distopt_per_model_buffers[is_expert] = per_model_buffers
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
@@ -958,29 +948,23 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
-                # (byte-level sharding) instead of stuffing them inside LayerWise.
-                for group in groups:
-                    assert not group['is_expert_parallel'], (
-                        "Non-emerging expert-parallel param groups are not yet "
-                        "supported on the layer-wise + DistributedOptimizer "
-                        "path: they need a separate DistOpt instance with the "
-                        "expert-DP process group, which is not wired up yet. "
-                        "Disable use_layer_wise_param_layout to fall back to "
-                        "the legacy LayerWise ping-pong path for MoE models."
-                    )
+                # Scalar fallbacks share the same optimizer-instance topology as the
+                # whole-matrix optimizer, including the instance ID used by checkpoints.
                 fallback_config.use_distributed_optimizer = True
+                dp_prefix = "intra_expt_dp" if is_expert else "intra_dp_cp"
+                mp_key = "expt_tp_pp_with_egtp_remat_group" if is_expert else "mp_group"
+                fallback_mp_group = distopt_process_groups[mp_key]
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,
                     param_groups=groups,
-                    per_model_buffers=distopt_per_model_buffers,
-                    model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                    data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
+                    per_model_buffers=distopt_per_model_buffers[is_expert],
+                    model_parallel_group=fallback_mp_group,
+                    data_parallel_group=distopt_process_groups[f"{dp_prefix}_group"],
+                    data_parallel_group_gloo=distopt_process_groups[f"{dp_prefix}_group_gloo"],
+                    data_parallel_group_idx=get_pg_rank(fallback_mp_group),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                    distributed_optimizer_instance_id=0,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,
                 )
