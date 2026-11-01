@@ -22,7 +22,10 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -51,8 +54,23 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 
 
-def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
-    """Determine the most appropriate layer specification based on availability."""
+def default_layer_spec(
+    config: "GPTModelConfig",
+    vp_stage: int,
+    pp_rank: int | None = None,
+    pg_collection: ProcessGroupCollection | None = None,
+) -> ModuleSpec:
+    """Determine the most appropriate layer specification based on availability.
+
+    Args:
+        config: GPT model configuration.
+        vp_stage: Virtual pipeline stage of the model chunk.
+        pp_rank: pipeline rank from the model process group. Block specs keep only the
+            layers of this stage; if None, they use the global pipeline rank.
+        pg_collection: Process groups the model is built on. The ModelOpt spec reads its
+            context-parallel size from them. Omitting it is deprecated: the size is then read
+            from the global parallel state, with a ProcessGroupFallbackWarning.
+    """
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
@@ -71,13 +89,17 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
 
         # arbitrary attention mask is used for speculative decoding training
         # When context parallel > 1, only causal mask type is supported
-        from megatron.core import parallel_state
+        if config.use_arbitrary_attention_mask is not None:
+            use_arbitrary_attention_mask = config.use_arbitrary_attention_mask
+        elif pg_collection is not None:
+            use_arbitrary_attention_mask = pg_collection.cp.size() == 1
+        else:
+            from megatron.core import parallel_state
 
-        use_arbitrary_attention_mask = (
-            config.use_arbitrary_attention_mask
-            if config.use_arbitrary_attention_mask is not None
-            else parallel_state.get_context_parallel_world_size() == 1
-        )
+            warn_global_process_group_fallback(
+                "default_layer_spec", deprecated_in="0.21", removed_in="0.23"
+            )
+            use_arbitrary_attention_mask = parallel_state.get_context_parallel_world_size() == 1
         return get_gpt_modelopt_spec(
             config=config.transformer,
             local_core_attention=False,
@@ -86,7 +108,9 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             use_arbitrary_attention_mask=use_arbitrary_attention_mask,
         )
     elif transformer_cfg.experimental_attention_variant is not None:
-        return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
+        return get_transformer_block_with_experimental_attention_variant_spec(
+            config=transformer_cfg, vp_stage=vp_stage, pp_rank=pp_rank
+        )
     elif transformer_cfg.num_moe_experts is not None:
         return get_gpt_decoder_block_spec(
             transformer_cfg,
@@ -94,9 +118,10 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             normalization=transformer_cfg.normalization,
             qk_l2_norm=transformer_cfg.qk_l2_norm,
             vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
     elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
-        return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
+        return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te, vp_stage=vp_stage, pp_rank=pp_rank)
     else:
         return _te_or_local_layer_spec(config, vp_stage)
 
@@ -284,9 +309,12 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         Returns:
             The constructed model
         """
+        pp_rank = pg_collection.pp.rank()
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
-            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
+            transformer_layer_spec = default_layer_spec(
+                self._model_config, vp_stage, pp_rank, pg_collection=pg_collection
+            )
         elif not isinstance(transformer_layer_spec, ModuleSpec) and callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:
@@ -308,7 +336,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             self._model_config,
             transformer_layer_spec,
             vp_stage=vp_stage,
-            pp_rank=pg_collection.pp.rank(),
+            pp_rank=pp_rank,
         )
 
         # override spec with local backend if configured
