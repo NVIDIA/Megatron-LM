@@ -75,6 +75,7 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
+    cfg = get_run_config()
     vision_model_type = "clip"
 
     assert (
@@ -214,7 +215,7 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=cfg.tokenizer.padded_vocab_size,
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
