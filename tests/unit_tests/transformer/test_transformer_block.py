@@ -915,9 +915,10 @@ class TestPipelineParallelLayoutTransformerBlock:
             )
             total_build_layers = 0
             for i in range(pp_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 for j in range(vpp_size):
-                    total_build_layers += get_num_layers_to_build(transformer_config, vp_stage=j)
+                    total_build_layers += get_num_layers_to_build(
+                        transformer_config, vp_stage=j, pp_rank=i
+                    )
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
@@ -981,6 +982,7 @@ class TestPipelineParallelLayoutTransformerBlock:
                 pre_process=pre_process,
                 post_process=post_process,
                 vp_stage=i,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             this_model.model_type = ModelType.encoder_or_decoder
             gpt_model.append(this_model)

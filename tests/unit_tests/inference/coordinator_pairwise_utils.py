@@ -21,6 +21,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
@@ -360,6 +361,7 @@ def batch_invariant_engine(config):
             vocab_size=config.vocab_size,
             max_sequence_length=config.max_sequence_length,
             position_embedding_type="rope",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         .cuda()
         .eval()

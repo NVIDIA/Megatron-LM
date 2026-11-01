@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -61,6 +62,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         max_sequence_length=1024,
         pre_process=parallel_state.is_pipeline_first_stage(),
         post_process=parallel_state.is_pipeline_last_stage(),
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     if mamba:
         model = HybridModel(
