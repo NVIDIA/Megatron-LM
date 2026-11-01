@@ -100,8 +100,6 @@ from megatron.core.parallel_state import (
     create_all_gather_groups,
     destroy_global_memory_buffer,
     destroy_model_parallel,
-    get_context_parallel_group,
-    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -771,8 +769,15 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
     _seqlen_stats_are_global = True
 
 
-def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+def consume_seqlen_stats_in_iteration(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> Tuple[Optional[float], Optional[float]]:
     """Read, reset and globally reduce the per-iteration packed-sequence stats.
+
+    Args:
+        pg_collection: Process groups of the grid that every rank trains on. Their
+            TP, CP and PP sizes give the deduplication factor. None reads them from
+            the global parallel state.
 
     Returns:
         ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
@@ -804,6 +809,9 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     t = _seqlen_stats_in_iteration
     if _seqlen_stats_are_global:
         dedup = 1
+    elif pg_collection is not None:
+        torch.distributed.all_reduce(t)
+        dedup = pg_collection.tp.size() * pg_collection.cp.size() * pg_collection.pp.size()
     elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
@@ -1618,12 +1626,14 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def _get_train_full_dataset_sample_count(args, dataset_provider):
+def _get_train_full_dataset_sample_count(args, dataset_provider, pg_collection=None):
     """Measure the training horizon without restoring a temporary dataloader.
 
     Opt-in providers must accept ``restore_dataloader_state=False`` and expose
     the finite loader through ``_dataloader`` on ranks that own training data.
     Actual restoration happens after model setup resolves the checkpoint iteration.
+    The sample counts are reduced over the groups of ``pg_collection``, or over
+    the global parallel state when it is None.
     """
     cfg = get_run_config()
     if not getattr(dataset_provider, 'supports_train_full_dataset', False):
@@ -1648,7 +1658,9 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
             with_context_parallel=getattr(
                 args, 'deduplicate_dataloader_across_context_parallel', False
             ),
-        )
+            pg_collection=pg_collection,
+        ),
+        group=pg_collection.mp if pg_collection is not None else None,
     )
     if total_num_samples is None:
         raise ValueError("--train-full-dataset resolved to an empty training dataset")
@@ -1770,11 +1782,7 @@ def pretrain(
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
         skip_random_seed=skip_random_seed,
-        seed_pp_group=getattr(pg_collection, "pp", None),
-        seed_dp_group=getattr(pg_collection, "dp", None),
-        seed_tp_group=getattr(pg_collection, "tp", None),
-        seed_ep_group=getattr(pg_collection, "ep", None),
-        seed_etp_group=getattr(pg_collection, "expt_tp", None),
+        seed_pg_collection=None if skip_random_seed else pg_collection,
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -2039,8 +2047,13 @@ def pretrain(
 
     if args.train_full_dataset:
         # The scheduler must know the training horizon before model and optimizer setup.
+        # A multi-module collection leaves the probe on the global parallel state.
         cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
-            args, train_valid_test_dataset_provider
+            args,
+            train_valid_test_dataset_provider,
+            pg_collection=(
+                pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
+            ),
         )
 
     # Model, optimizer, and learning rate.
@@ -2073,6 +2086,11 @@ def pretrain(
     # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+    # A MIMO collection holds one collection per module, and MIMO data providers build their
+    # own loaders, so the data pipeline keeps its global defaults there.
+    data_pg_collection = (
+        pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
+    )
     if next_train_iterator is None or train_valid_test_dataset_provider is not None:
         with _otel_managed_span(
             'data_loading', 'megatron.startup.dataloader', is_goodput_span=True
@@ -2094,6 +2112,7 @@ def pretrain(
                         vp_stage_train_valid_test_dataset_provider.is_distributed = True
                     iterators = build_train_valid_test_data_iterators(
                         vp_stage_train_valid_test_dataset_provider,
+                        pg_collection=data_pg_collection,
                         build_train_dataloader=build_train,
                     )
                     train_data_iterator.append(iterators[0])
@@ -2102,7 +2121,9 @@ def pretrain(
             else:
                 train_data_iterator, valid_data_iterator, test_data_iterator = (
                     build_train_valid_test_data_iterators(
-                        train_valid_test_dataset_provider, build_train_dataloader=build_train
+                        train_valid_test_dataset_provider,
+                        pg_collection=data_pg_collection,
+                        build_train_dataloader=build_train,
                     )
                 )
             if not build_train:
@@ -2610,8 +2631,23 @@ def _build_pg_collection_from_parallel_state(args):
     return pg_collection
 
 
+def _get_model_pg_collection(model, pg_collection):
+    """Return the process groups that this rank's model chunks run on.
+
+    A model built on a collection carries it; under a multi-module collection it holds the
+    groups of this rank's module. A model without one runs on ``pg_collection`` when that is a
+    single-grid collection. Only a caller that passes neither reads the global parallel state.
+    """
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if model_pg_collection is not None:
+        return model_pg_collection
+    if isinstance(pg_collection, ProcessGroupCollection):
+        return pg_collection
+    return ProcessGroupCollection.use_mpu_process_groups()
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using the supplied DDP config or the finalized run config."""
+    """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2833,16 +2869,26 @@ def get_optimizer_param_scheduler(optimizer):
 
 
 def _reduce_sum_across_data_parallel_group(
-    stat: float | None, with_context_parallel: bool = False
+    stat: float | None,
+    with_context_parallel: bool = False,
+    pg_collection: ProcessGroupCollection | None = None,
 ) -> float | None:
-    """Sum an optional scalar across the data-parallel group, optionally including CP."""
+    """Sum an optional scalar across the data-parallel group, optionally including CP.
+
+    The group spans the GTP weight-remat axis and comes from ``pg_collection``, or from the
+    global parallel state when it is None.
+    """
+    if pg_collection is None:
+        group = mpu.get_data_parallel_group(with_context_parallel=with_context_parallel)
+    else:
+        group = (
+            pg_collection.dp_cp_gtp_remat if with_context_parallel else pg_collection.dp_gtp_remat
+        )
+        if group is None:
+            raise ValueError("pg_collection must define dp_gtp_remat and dp_cp_gtp_remat")
     value = 0.0 if stat is None else stat
     value = torch.tensor([value], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        value,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=with_context_parallel),
-    )
+    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM, group=group)
     return None if value.item() == 0.0 else value.item()
 
 
@@ -2915,10 +2961,14 @@ def setup_model_and_optimizer(
 
     cfg = cfg_container if cfg_container is not None else get_run_config()
 
-    build_optimizer = not cfg.validation.skip_train and not (
-        run_train_loop_without_updates and not cfg.checkpoint.load_optim
-    )
-    wrap_with_ddp = build_optimizer
+    # Typically, --skip-train is the only thing needed to disable the optimizer.
+    has_normal_optimizer = not cfg.validation.skip_train
+    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
+    # RL is only reachable through pretrain(), which passes the container: no container, no RL step.
+    perform_rl_step = cfg_container is not None and cfg_container.rl.perform_rl_step
+    has_rl_optimizer = perform_rl_step and not args.no_load_optim
+    skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
+    wrap_with_ddp = not skip_optimizer
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
@@ -3003,7 +3053,9 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_save_dir is not None and is_pp_last_stage(
+        _get_model_pg_collection(model, pg_collection).pp
+    ):
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -3012,10 +3064,13 @@ def setup_model_and_optimizer(
             p=args.logits_save_top_p,
             min_k=args.logits_save_top_p_min_k,
             save_dtype=args.logits_save_dtype,
+            pg_collection=unwrapped_model[-1].pg_collection,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_load_dir is not None and is_pp_last_stage(
+        _get_model_pg_collection(model, pg_collection).pp
+    ):
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -3174,18 +3229,16 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = (
-        mpu.get_data_parallel_world_size()
-        if mpu.model_parallel_is_initialized()
-        else get_batch_parallel_size(args)
-    )
-    assert num_microbatches is not None and num_microbatches >= 1, (
-        f'current global batch size ({current_global_batch_size}) is too small for '
-        f'micro_batch_size ({cfg.train.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
-        f'{cfg.train.micro_batch_size * data_parallel_size}. The world size cannot accommodate the '
-        f'batch size. This can happen when resuming with more GPUs than the current batch size '
-        f'schedule entry supports.'
-    )
+    if num_microbatches is None or num_microbatches < 1:
+        # The microbatch calculator splits the global batch over the batch-parallel ranks.
+        data_parallel_size = get_batch_parallel_size(args)
+        raise ValueError(
+            f'current global batch size ({current_global_batch_size}) is too small for '
+            f'micro_batch_size ({cfg.train.micro_batch_size}) * data_parallel_size '
+            f'({data_parallel_size}) = {cfg.train.micro_batch_size * data_parallel_size}. The '
+            f'world size cannot accommodate the batch size. This can happen when resuming with '
+            f'more GPUs than the current batch size schedule entry supports.'
+        )
 
     # get model without FP16 and/or DDP wrappers
     if (
@@ -3223,11 +3276,22 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
-def dummy_train_step(data_iterator):
-    """Single dummy training step."""
+def dummy_train_step(data_iterator, pg_collection: ProcessGroupCollection | None = None):
+    """Single dummy training step.
+
+    Args:
+        data_iterator: Training data iterator to advance by one iteration.
+        pg_collection: Process groups of the model the batches are read for. None reads
+            them from the global parallel state.
+    """
     cfg = get_run_config()
     args = get_args()
-    tp_rank = mpu.get_tensor_model_parallel_rank()
+    if pg_collection is None:
+        # Compatibility for callers that pass no collection.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "pp", "cp", "dynamic_cp"]
+        )
+    tp_rank = pg_collection.tp.rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
     dynamic_cp = args.dynamic_context_parallel
 
@@ -3249,8 +3313,8 @@ def dummy_train_step(data_iterator):
                     batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
             batch = get_batch_on_this_tp_rank(
                 batch,
-                broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
-                broadcast_group=mpu.get_tensor_model_parallel_group(),
+                broadcast_src_rank=torch.distributed.get_process_group_ranks(pg_collection.tp)[0],
+                broadcast_group=pg_collection.tp,
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
@@ -3260,14 +3324,14 @@ def dummy_train_step(data_iterator):
                 seq_length=args.seq_length,
                 mtp_on_this_rank=False,
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-                is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-                is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+                is_pipeline_first_stage=is_pp_first_stage(pg_collection.pp),
+                is_pipeline_last_stage=is_pp_last_stage(pg_collection.pp),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
                 dynamic_cp=dynamic_cp,
-                cp_group=get_context_parallel_group(),
-                dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
+                cp_group=pg_collection.cp,
+                dynamic_cp_group_func=lambda group_size: pg_collection.dynamic_cp[group_size],
             )
 
 
@@ -3294,13 +3358,15 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     is_last_stage = is_pp_last_stage(pg_collection.pp)
 
     if is_last_stage and local_samples_seen is not None:
+        # The ranks that read distinct samples, which spans the GTP weight-remat axis.
+        sample_group = pg_collection.dp_gtp_remat
+        if sample_group is None:
+            raise ValueError("pg_collection must define dp_gtp_remat to count samples")
         samples_seen = (
             torch.as_tensor(local_samples_seen).detach().to(dtype=torch.int64).view(1)
         )
         torch.distributed.all_reduce(
-            samples_seen,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group(with_context_parallel=False),
+            samples_seen, op=torch.distributed.ReduceOp.SUM, group=sample_group
         )
     else:
         samples_seen = torch.tensor([-1], dtype=torch.int64, device=torch.cuda.current_device())
@@ -3328,17 +3394,29 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
 
 def _get_model_pg_collection(
     model_chunk,
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    *,
+    owner="the training loop",
 ) -> ProcessGroupCollection | MultiModuleProcessGroupCollection:
-    """Return a model's process groups, falling back to the MPU compatibility collection."""
-    while not hasattr(model_chunk, "pg_collection"):
-        model_chunk = getattr(model_chunk, "module", None)
-        if model_chunk is None:
-            return ProcessGroupCollection.use_mpu_process_groups()
+    """Return the process groups that a model chunk runs on.
 
-    pg_collection = model_chunk.pg_collection
-    if pg_collection is None:
-        return ProcessGroupCollection.use_mpu_process_groups()
-    return pg_collection
+    A model built on a collection carries it, possibly under wrappers; under a multi-module
+    collection it holds the groups of this rank's module. A model without one runs on
+    ``pg_collection`` when that is a single-grid collection. When there is neither, the global
+    parallel state is used with a ProcessGroupFallbackWarning that names ``owner``, the function
+    whose caller omitted the collection; this fallback is deprecated.
+    """
+    try:
+        model_pg_collection = get_attr_wrapped_model(model_chunk, "pg_collection")
+    except RuntimeError:
+        # No wrapper level defines a collection.
+        model_pg_collection = None
+    if model_pg_collection is not None:
+        return model_pg_collection
+    if isinstance(pg_collection, ProcessGroupCollection):
+        return pg_collection
+    warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
+    return ProcessGroupCollection.use_mpu_process_groups()
 
 
 def train_step(
@@ -3360,7 +3438,8 @@ def train_step(
 
     pg_collection: process groups forwarded to the schedule: the model's collection, or a
         multi-module collection for the cross-grid case. None makes the schedule use the global
-        parallel state. Reductions source per-rank groups from the model.
+        parallel state. Reductions source per-rank groups from the model, or from a single-grid
+        pg_collection when the model carries none.
     p2p_communicator: pipeline communicator forwarded to the schedule; the pipelined schedules
         take it together with pg_collection.
     tensor_metric_observer: optional callback invoked after backward and immediately before the
@@ -3490,7 +3569,9 @@ def train_step(
             tensor_metric_observer, "observe_forward_backward", None
         )
         if observe_forward_backward is not None:
-            metric_pg_collection = _get_model_pg_collection(model[0])
+            metric_pg_collection = _get_model_pg_collection(
+                model[0], pg_collection, owner="train_step"
+            )
             tensor_metric_context = observe_forward_backward(
                 model=model,
                 iteration=iteration,
@@ -3561,15 +3642,15 @@ def train_step(
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if model_pg_collection is None:
-        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_pg_collection = _get_model_pg_collection(model, pg_collection)
     samples_seen_in_iteration = _get_samples_seen_in_iteration(
         losses_reduced, args, model_pg_collection
     )
 
     if tensor_metric_observer is not None:
-        metric_pg_collection = _get_model_pg_collection(model[0])
+        metric_pg_collection = _get_model_pg_collection(
+            model[0], pg_collection, owner="train_step"
+        )
         tensor_metric_observer(
             model=model,
             optimizer=optimizer,
@@ -3595,7 +3676,14 @@ def train_step(
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
     if args.qk_clip or config.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+        # Every rank holding these weights must apply the same clipping, so reduce over the
+        # gtp_remat-inclusive DP x CP group, as the global default does.
+        log_max_attention_logit = clip_qk(
+            model,
+            log_max_only=not args.qk_clip,
+            dp_cp_group=getattr(model_pg_collection, 'dp_cp_gtp_remat', None)
+            or model_pg_collection.dp_cp,
+        )
 
     timers('optimizer').stop()
 
@@ -3604,7 +3692,7 @@ def train_step(
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    pg_collection = _get_model_pg_collection(model[0])
+    pg_collection = model_pg_collection
     for _required in ("mp", "pp", "dp_cp"):
         assert getattr(pg_collection, _required, None) is not None, (
             f"model pg_collection used by train_step must define {_required}"
@@ -4474,8 +4562,35 @@ def save_checkpoint_and_time(
             _exposed_save_span.end()
 
 
-def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
-    from megatron.core.process_groups_config import ProcessGroupCollection
+def _check_gpu_sniff_test_pg_collection(
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection],
+    gpu_sniff_test_interval: Optional[int],
+) -> None:
+    """Reject the GPU sniff test for a multi-module collection.
+
+    The sniff test gathers every metric over all ranks, and how many metrics a rank reports
+    depends on the sizes of its EP, DP and TP groups. Each module of a multi-module run sizes
+    these groups on its own, so ranks of different modules would issue different numbers of
+    gathers. Passing no collection instead tests the global grid, whose groups are not the
+    modules' groups and which heterogeneous MiMo does not build.
+
+    Raises:
+        ValueError: if the sniff test is enabled and ``pg_collection`` is multi-module.
+    """
+    if gpu_sniff_test_interval is not None and isinstance(
+        pg_collection, MultiModuleProcessGroupCollection
+    ):
+        raise ValueError(
+            "--gpu-sniff-test-interval is not supported with a multi-module process-group "
+            "collection: the sniff test needs groups of the same size on every rank"
+        )
+
+
+def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test', pg_collection=None):
+    """Run the GPU sniff test over the EP, DP and TP groups of ``pg_collection``.
+
+    None tests the groups of the global parallel state.
+    """
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
     # Two call sites with distinct span names (span_name): the once-at-start
@@ -4483,9 +4598,6 @@ def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
     # --gpu-sniff-test-interval 'megatron.train.sniff_test' runs in the step
     # loop. The tag attribute additionally records which invocation this is.
     with _otel_managed_span('job', span_name, is_goodput_span=True, **{'megatron.sniff_test.tag': tag}):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['ep', 'dp', 'tp'],
-        )
         print_datetime(f'running GPU sniff test ({tag})')
         timers = get_timers()
         timers('gpu-sniff-test', log_level=0).start(barrier=True)
@@ -4493,6 +4605,23 @@ def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
         timers('gpu-sniff-test').stop(barrier=True)
     timers.log(['gpu-sniff-test'])
     print_datetime(f'finished GPU sniff test ({tag})')
+
+
+def _param_hashes_match_across_dp_replicas(model):
+    """Return whether every data-parallel replica of the model holds the same parameters.
+
+    The replicas are those of the model's process-group collection; a model without one is
+    checked across the replicas of the global parallel state.
+    """
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if model_pg_collection is None:
+        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    return check_param_hashes_across_dp_replicas(
+        model,
+        cross_check=True,
+        dp_group=model_pg_collection.dp,
+        expt_dp_group=model_pg_collection.expt_dp,
+    )
 
 
 def post_training_step_callbacks(
@@ -4503,8 +4632,13 @@ def post_training_step_callbacks(
     prof,
     num_floating_point_operations_since_last_log_event,
     nsys_nvtx_context = None,
+    pg_collection: ProcessGroupCollection | None = None,
 ):
-    """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
+    """Run all post-training-step functions (e.g., FT heartbeats, GC).
+
+    pg_collection: process groups of the run's single grid, which the periodic GPU sniff test
+        exercises. None tests the groups of the global parallel state.
+    """
     args = get_args()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
@@ -4527,8 +4661,8 @@ def post_training_step_callbacks(
     ):
         if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model, optimizer=optimizer)
-        assert check_param_hashes_across_dp_replicas(
-            model, cross_check=True
+        assert _param_hashes_match_across_dp_replicas(
+            model
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -4564,7 +4698,7 @@ def post_training_step_callbacks(
         cfg.train.gpu_sniff_test_interval is not None
         and iteration % cfg.train.gpu_sniff_test_interval == 0
     ):
-        _run_gpu_sniff_test(f'iteration {iteration:7d}')
+        _run_gpu_sniff_test(f'iteration {iteration:7d}', pg_collection=pg_collection)
 
     # Manual garbage collection. With --manual-gc the interpreter's automatic
     # collector is off; this synchronous full collection is the only GC. With
@@ -4701,6 +4835,26 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _get_data_parallel_world_size(pg_collection, args):
+    """Return the number of ranks that read distinct sequences.
+
+    This independent-sequence degree spans the GTP weight-remat axis, so it can differ from the
+    number of weight replicas. It comes from the ``dp_gtp_remat`` group of ``pg_collection``, or
+    from the global parallel state when ``pg_collection`` is None.
+    """
+    if pg_collection is not None:
+        sample_group = pg_collection.dp_gtp_remat
+        if sample_group is None:
+            if getattr(args, "gtp_remat_num_sequence_shards", 1) == 1:
+                return pg_collection.dp.size() * args.gtp_weight_remat_size
+            raise ValueError("The training process groups must include dp_gtp_remat")
+        return sample_group.size()
+    if mpu.model_parallel_is_initialized():
+        return mpu.get_data_parallel_world_size()
+    # Bootstrap fallback before process groups are initialized.
+    return get_batch_parallel_size(args)
+
+
 def _get_forward_backward_func(pg_collection, config):
     """Select the schedule for the process groups the training loop runs on.
 
@@ -4760,11 +4914,12 @@ def train(
         take it together with pg_collection.
     pg_collection: process groups that select the schedule and are forwarded to it: the model's
         collection, or a multi-module collection for the cross-grid case. None selects and runs
-        the schedule on the global parallel state.
-    tensor_metric_observer: optional callback forwarded to each training step.
-    run_train_loop_without_updates: take no optimizer steps.
-    suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop microbatch
-        changes (for data sources that reconfigure microbatches every iteration).
+        the schedule on the global parallel state. A single-grid collection also sizes the
+        batch accounting and runs the sequence statistics, the skipped-iteration batches and
+        the GPU sniff test. A multi-module collection rejects the GPU sniff test.
+
+    Raises:
+        ValueError: if ``--gpu-sniff-test-interval`` is set with a multi-module collection.
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
@@ -4797,26 +4952,19 @@ def train(
         if should_setup_fault_injection_at_start(fault_injector_config):
             setup_fault_injection(fault_injector_config)
 
-    lang_pgc = (
-        pg_collection.get_language_model_collection()
-        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
-        and pg_collection.has_language_model()
-        else None
-    )
-
-    def _dp_world_size():
-        # Independent-sequence degree, which can differ from the weight-replica degree.
-        if lang_pgc is not None:
-            sample_group = getattr(lang_pgc, "dp_gtp_remat", None)
-            if sample_group is None:
-                if getattr(args, "gtp_remat_num_sequence_shards", 1) == 1:
-                    return lang_pgc.dp.size() * args.gtp_weight_remat_size
-                raise ValueError("Language process groups must include dp_gtp_remat")
-            return sample_group.size()
-        if mpu.model_parallel_is_initialized():
-            return mpu.get_data_parallel_world_size()
-        # Bootstrap fallback before process groups are initialized.
-        return get_batch_parallel_size(args)
+    # A single-grid run keeps its batch accounting, statistics and diagnostics on its own
+    # collection. A multi-module run counts samples on its language model's groups and leaves
+    # the rest on the global parallel state, except for the GPU sniff test, which it rejects.
+    _check_gpu_sniff_test_pg_collection(pg_collection, cfg.train.gpu_sniff_test_interval)
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        grid_pg_collection = None
+        sample_pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else None
+        )
+    else:
+        grid_pg_collection = sample_pg_collection = pg_collection
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
@@ -4913,7 +5061,11 @@ def train(
 
     # GPU sniff test at start of training.
     if cfg.train.gpu_sniff_test_interval is not None:
-        _run_gpu_sniff_test('before training', span_name='megatron.startup.sniff_test')
+        _run_gpu_sniff_test(
+            'before training',
+            span_name='megatron.startup.sniff_test',
+            pg_collection=grid_pg_collection,
+        )
 
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
@@ -5062,8 +5214,8 @@ def train(
     # span (parented to megatron.startup, still open here).
     if cfg.train.check_weight_hash_across_dp_replicas_interval is not None:
         with _otel_managed_span('job', 'megatron.startup.weight_hash_check', is_goodput_span=True):
-            assert check_param_hashes_across_dp_replicas(
-                model, cross_check=True
+            assert _param_hashes_match_across_dp_replicas(
+                model
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
@@ -5212,13 +5364,15 @@ def train(
                 getattr(config, "sequence_packing_scheduler", None) is None
             ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
-            dummy_train_step(train_data_iterator)
+            dummy_train_step(train_data_iterator, pg_collection=grid_pg_collection)
             if iteration == start_iteration:
                 start_iteration = iteration + 1
             train_state.iteration += 1
             iteration = train_state.iteration
             batch_size = (
-                _dp_world_size() * cfg.train.micro_batch_size * get_num_microbatches()
+                _get_data_parallel_world_size(sample_pg_collection, args)
+                * cfg.train.micro_batch_size
+                * get_num_microbatches()
             )
             train_state.consumed_train_samples += batch_size
             train_state.skipped_train_samples += batch_size
@@ -5380,7 +5534,9 @@ def train(
             iteration_sequences = samples_seen_in_iteration
         else:
             batch_size = (
-                _dp_world_size() * cfg.train.micro_batch_size * get_num_microbatches()
+                _get_data_parallel_world_size(sample_pg_collection, args)
+                * cfg.train.micro_batch_size
+                * get_num_microbatches()
             )
             iteration_sequences = batch_size
 
@@ -5403,8 +5559,8 @@ def train(
         # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
         # runs (no collective issued), letting ``num_floating_point_operations``
         # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
+        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = consume_seqlen_stats_in_iteration(
+            pg_collection=grid_pg_collection
         )
         packed_sequence_stats = None
         if getattr(args, 'log_packed_sequence_stats', False):
@@ -5536,6 +5692,7 @@ def train(
             prof,
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
+            pg_collection=grid_pg_collection,
         )
 
         # Detect a dead/broken cached-logits-saver async worker promptly: its
@@ -5697,9 +5854,7 @@ def evaluate(
     )
     forward_backward_func = _get_forward_backward_func(pg_collection, config)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
-    if eval_pgc is None:
-        eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
+    eval_pgc = _get_model_pg_collection(model, pg_collection)
     # gtp_remat-inclusive, mirroring train_step: gtp_remat peers hold distinct micro-batches, so
     # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
@@ -5918,7 +6073,7 @@ def evaluate_and_print_results(
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
-        if mpu.get_tensor_model_parallel_rank() == 0:
+        if _get_model_pg_collection(model, pg_collection).tp.rank() == 0:
             eval_iters = torch.tensor(cfg.validation.eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
@@ -6072,9 +6227,20 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
 
 
 def build_train_valid_test_data_loaders(
-    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+    build_train_valid_test_datasets_provider, pg_collection=None, *, build_train_dataloader=True
 ):
-    """Build pretraining data loaders."""
+    """Build pretraining data loaders.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets.
+        pg_collection: Process groups of the run. Unless the provider is distributed-aware,
+            the first rank of its tensor-parallel group builds the data pipeline, and the
+            loaders shard samples over its data-parallel group. None uses the global
+            parallel state.
+        build_train_dataloader: Whether to build the training data loader. False leaves the
+            training data to a caller-provided iterator.
+    """
 
     args = get_args()
     train_state = get_train_state()
@@ -6099,7 +6265,13 @@ def build_train_valid_test_data_loaders(
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
     # Construct the data pipeline
-    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+    if is_distributed:
+        build_data_pipeline = True
+    elif pg_collection is None:
+        build_data_pipeline = mpu.get_tensor_model_parallel_rank() == 0
+    else:
+        build_data_pipeline = get_pg_rank(pg_collection.tp) == 0
+    if build_data_pipeline:
 
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
@@ -6107,20 +6279,28 @@ def build_train_valid_test_data_loaders(
         if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
         else:
-            train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+            train_dataloader = build_pretraining_data_loader(
+                train_ds, consumed_train_samples_in_current_phase, pg_collection=pg_collection
+            )
         valid_dataloaders = []
         for valid_d in valid_ds:
             if cfg.validation.skip_train or cfg.validation.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                valid_dataloaders.append(
+                    build_pretraining_data_loader(valid_d, 0, pg_collection=pg_collection)
+                )
             else:
                 if cfg.validation.multiple_validation_sets:
                     # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                     # correct and needs to be calculated/set per validation set
                     raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, train_state.consumed_valid_samples))
+                valid_dataloaders.append(
+                    build_pretraining_data_loader(
+                        valid_d, train_state.consumed_valid_samples, pg_collection=pg_collection
+                    )
+                )
         if not cfg.validation.multiple_validation_sets:
             assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0, pg_collection=pg_collection)
         if build_train_dataloader:
             do_train = train_dataloader is not None and (
                 cfg.validation.skip_train or cfg.train.train_iters > 0
@@ -6171,17 +6351,44 @@ def broadcast_data_flags(*, do_train, do_valid, do_test):
     train_state.do_test = train_state.do_test or flags[2].item()
 
 
+def _data_parallel_group_with_cp(pg_collection):
+    """Return the data-parallel group with context-parallel ranks of ``pg_collection``.
+
+    The group includes the GTP weight-remat axis, like the global
+    ``get_data_parallel_group(with_context_parallel=True)``. Collections that predate the GTP
+    weight-remat fields carry only the replicate group. None reads the global parallel state.
+    """
+    if pg_collection is None:
+        return mpu.get_data_parallel_group(with_context_parallel=True)
+    group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    if group is None:
+        raise ValueError("pg_collection requires dp_cp_gtp_remat or dp_cp")
+    return group
+
+
 def build_train_valid_test_data_iterators(
-    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+    build_train_valid_test_datasets_provider, pg_collection=None, *, build_train_dataloader=True
 ):
-    """Build pretraining data iterators."""
+    """Build pretraining data iterators.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets.
+        pg_collection: Process groups of the run, used to build the data loaders and to agree
+            on the number of full-validation iterations across its data-parallel ranks. None
+            uses the global parallel state.
+        build_train_dataloader: Whether to build the training data loader. False leaves the
+            training data to a caller-provided iterator.
+    """
 
     cfg = get_run_config()
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider, build_train_dataloader=build_train_dataloader
+        build_train_valid_test_datasets_provider,
+        pg_collection=pg_collection,
+        build_train_dataloader=build_train_dataloader,
     )
 
     # Build iterators.
@@ -6221,7 +6428,7 @@ def build_train_valid_test_data_iterators(
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        group=_data_parallel_group_with_cp(pg_collection),
                     )
                     cfg.validation.eval_iters = eval_iters_tensor.tolist()
             else:
@@ -6230,7 +6437,7 @@ def build_train_valid_test_data_iterators(
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    group=_data_parallel_group_with_cp(pg_collection),
                 )
                 cfg.validation.eval_iters = eval_iters_tensor.item()
 
