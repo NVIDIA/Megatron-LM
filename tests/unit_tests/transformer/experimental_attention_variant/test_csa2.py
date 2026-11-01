@@ -749,8 +749,8 @@ def test_causal_mask_and_unsupported_packing(pg_collection):
     mask[..., 3, 0] = True
     with pytest.raises(NotImplementedError, match="ordinary causal"):
         layer(x, mask)
-    with pytest.raises(NotImplementedError, match="unpacked"):
-        layer(x, None, packed_seq_params=object())
+    with pytest.raises(NotImplementedError, match="requires V4.1 THD"):
+        layer(x, None, packed_seq_params=SimpleNamespace(qkv_format="bshd"))
 
 
 def _layers(pg_collection, dtype=torch.float32, candidates=True):

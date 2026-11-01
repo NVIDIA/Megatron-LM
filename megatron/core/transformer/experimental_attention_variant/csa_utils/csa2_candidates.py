@@ -77,11 +77,14 @@ def candidate_blocks_from_scores(
         flat_scores = block_scores.reshape(-1, block_scores.shape[-1])
         max_sort_elements = 1 << 24
         rows_per_chunk = max(1, max_sort_elements // flat_scores.shape[-1])
+        # Clone each top-k slice: the slice is a view that would keep the chunk's
+        # full-width int64 argsort output alive until this function returns.
         chunks = [
-            block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+            block.argsort(dim=-1, descending=True, stable=True)[..., :topk].clone()
             for block in flat_scores.split(rows_per_chunk, dim=0)
         ]
         ids = torch.cat(chunks, dim=0).reshape(*block_scores.shape[:-1], topk)
+        del chunks
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max
     ids = ids.masked_fill(~valid, sentinel).sort(-1).values

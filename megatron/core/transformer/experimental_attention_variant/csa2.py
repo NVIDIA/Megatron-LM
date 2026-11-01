@@ -609,11 +609,14 @@ class CSA2Indexer(MegatronModule):
         else:
             flat_scores = scores.reshape(-1, scores.shape[-1])
             rows_per_chunk = max(1, _SELECT_ROW_CHUNK_ELEMENTS // flat_scores.shape[-1])
+            # Clone each top-k slice: the slice is a view that would keep the chunk's
+            # full-width int64 argsort output alive until this function returns.
             chunks = [
-                block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+                block.argsort(dim=-1, descending=True, stable=True)[..., :topk].clone()
                 for block in flat_scores.split(rows_per_chunk, dim=0)
             ]
             indices = torch.cat(chunks, dim=0).reshape(*scores.shape[:-1], topk)
+            del chunks
         indices = indices.sort(dim=-1).values
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 

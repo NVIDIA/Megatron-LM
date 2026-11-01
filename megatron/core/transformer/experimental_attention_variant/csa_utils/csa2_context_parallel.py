@@ -52,29 +52,24 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_boundary: Tensor):
-        """Return halo gradients to the rank that owns the exchanged rows."""
+        """Return halo gradients to the rank that owns the exchanged rows.
+
+        Rank ``r``'s halo gradient belongs to rank ``r - 1``. A directed
+        point-to-point ring makes each rank wait on one neighbour, which can deadlock
+        with the MoE dispatcher's host-side split synchronisation when CP spans nodes.
+        A group-wide all-gather moves the same values while every rank waits on the
+        same collective.
+        """
         group = ctx.cp_group
         rank, size = group.rank(), group.size()
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
-        ops = []
-        if rank > 0:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    grad_boundary.contiguous(),
-                    dist.get_global_rank(group, rank - 1),
-                    group,
-                )
-            )
+        if size == 1:
+            return grad_input, None, None
+        halo = grad_boundary.contiguous()
+        gathered = halo.new_empty((size,) + tuple(halo.shape))
+        dist.all_gather_into_tensor(gathered, halo, group=group)
         if rank + 1 < size:
-            received = grad_boundary.new_empty(grad_boundary.shape)
-            ops.append(
-                dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
-            )
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
-        if rank + 1 < size:
-            grad_input[-ctx.halo_rows :] = received
+            grad_input[-ctx.halo_rows :] = gathered[rank + 1]
         return grad_input, None, None
 
 
