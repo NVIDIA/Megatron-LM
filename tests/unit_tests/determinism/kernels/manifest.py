@@ -367,8 +367,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "router gating GEMM, TE fused permutation/router kernels (sparse and dense top-k "
+        "output), global-batch quantile histogram accumulation and bias updates.",
     ),
     KernelEntry(
         name="mok_route_adapter",

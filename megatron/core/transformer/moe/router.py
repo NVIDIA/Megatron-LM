@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -1413,6 +1414,13 @@ class InferenceTopKRouter(TopKRouter):
             is_mtp_layer=is_mtp_layer,
             hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
+        if config.moe_router_fusion and not fused_topk_with_score_function_supports_topk_indices:
+            # Message text is constant so the default warning filter shows it once.
+            warnings.warn(
+                "InferenceTopKRouter routes unfused: moe_router_fusion needs a Transformer Engine "
+                "fused router that writes dense top-k indices. Upgrade Transformer Engine to fuse "
+                "inference routing."
+            )
 
     @staticmethod
     @torch.compile
@@ -1480,18 +1488,14 @@ class InferenceTopKRouter(TopKRouter):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
     ):
-        logits = self.gating(input)
+        logits = self.gating(input).view(-1, self.config.num_moe_experts)
 
         if self.is_hash_layer:
-            logits = logits.view(-1, self.config.num_moe_experts)
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing. Pass token IDs through "
                 "the model, transformer block, and transformer layer."
             )
             return self._hash_routing(logits, input_ids, dense_output=True)
-
-        # Preserve the compiled inference router's established single-batch layout.
-        logits = logits.squeeze(1)  # [num_tokens, num_experts]
 
         # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
         # fixed additive bias through the normal score-function route.
@@ -1525,7 +1529,7 @@ class InferenceTopKRouter(TopKRouter):
             dense_output=True,
             precomputed_indices=precomputed_indices,
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        return probs, top_indices
 
     def forward(
         self,

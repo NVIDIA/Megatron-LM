@@ -710,6 +710,36 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("case", sorted(ROUTING_CASES))
+@pytest.mark.parametrize(
+    "fused",
+    [
+        False,
+        pytest.param(True, marks=pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed")),
+    ],
+)
+def test_dense_topk_routing_replays(case, fused):
+    """Dense [num_tokens, topk] routing (the inference router); the fused path gathers the
+    probs at TE's dense indices, or routes unfused when TE has no dense index output."""
+    seeded()
+    kwargs = dict(ROUTING_CASES[case])
+    logits = torch.randn(8192, 256, device="cuda", dtype=torch.float32, requires_grad=True)
+    expert_bias = (
+        torch.randn(256, device="cuda") * 0.01
+        if kwargs.get("score_function") == "sigmoid"
+        else None
+    )
+
+    def fn(logits):
+        return moe_utils.topk_routing_with_score_function(
+            logits, fused=fused, expert_bias=expert_bias, dense_output=True, **kwargs
+        )
+
+    assert_replays_bit_exact(
+        fn, (logits,), replays=3, what=f"dense topk routing[{case}, fused={fused}]"
+    )
+
+
 @pytest.mark.parametrize("det_algos", [True, False])
 def test_quantile_balancing_histogram_and_bias_replay(det_algos):
     """Replay accumulated integer histograms, routing gradients, and the batch update."""
