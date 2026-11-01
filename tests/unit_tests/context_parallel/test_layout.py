@@ -177,6 +177,11 @@ def test_prebuilt_packed_layout_state_is_reused():
     assert state.contiguous_packed_seq_params is contiguous_params
     assert state.zigzag_packed_seq_params is zigzag_params
 
+    contiguous_mask = torch.tensor([False, True])
+    zigzag_mask = torch.tensor([True, False])
+    masks_by_layout = {"contiguous": contiguous_mask, "zigzag": zigzag_mask}
+    assert state.get_layer_padding_mask(0, contiguous_mask, masks_by_layout) is zigzag_mask
+
 
 @pytest.mark.parametrize(
     ("cp_global_ranks", "tp_global_ranks", "current_global_rank", "expected"),
