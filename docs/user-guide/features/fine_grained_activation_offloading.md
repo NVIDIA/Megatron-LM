@@ -68,6 +68,10 @@ replay-owned forward so that replay and offloading do not release the same activ
 # Required as a non-None non-negative integer when fine-grained activation offloading is used with
 # local full-iteration CUDA graphs (full_iteration in cuda_graph_scope); see prose below.
 --fine-grained-offloading-max-inflight-offloads <N>
+
+# Optional: pack all offloaded activations on a rank into one fixed pinned buffer of this
+# many GiB instead of allocating pinned host memory per offload. Default: 0 (disabled).
+--fine-grained-offloading-buffer-size-gib <GiB>
 ```
 
 `TransformerConfig.fine_grained_offloading_max_inflight_offloads` caps, per offload group (for example `moe_act`, `qkv_linear`), how many D2H copies may be in flight before a main-stream `wait_event`. `0` waits after each offload; larger values allow more overlap; `None` skips these joins.
@@ -93,6 +97,35 @@ The fraction is applied after other eligibility filters such as `min_offloaded_t
 last-group margin used to avoid backward reload stalls, and
 `delta_offload_bytes_across_pp_ranks`. Therefore N% is computed over the remaining eligible groups
 from all configured offload modules after those filters.
+
+### Fixed Pinned Buffer
+
+By default, fixed-shape groups reuse pinned tensors cached by shape and dtype, while the
+variable-shape MoE groups (`expert_fc1`, `moe_act`, `fused_group_mlp`) allocate from the
+PyTorch pinned host allocator. That allocator rounds each request up to a power of two and
+keeps freed blocks for reuse, so as routing varies its cache keeps growing and new sizes pin
+more host memory during the step. `--fine-grained-offloading-buffer-size-gib`
+(`TransformerConfig.fine_grained_offloading_buffer_size_gib`) instead packs all backups on a
+rank into one pinned buffer:
+
+- The buffer is pinned with `cudaHostAlloc` from cuda-python at the requested size, rounded up
+  only to whole pages. The size must be a positive multiple of 256 bytes, so the GiB value must be a
+  multiple of 2<sup>-22</sup>, for example `152` or `152.5`.
+- It is allocated once per rank, on the first forward pass with offloading, and never grows.
+  Running out raises an error that reports the request and the capacity.
+- Space is reused only after every backup in the buffer has been reloaded. Size the buffer
+  for everything offloaded between such points, with each tensor aligned to 256 bytes: one
+  microbatch when each backward finishes before the next forward starts (PP=1, or the last
+  pipeline stage without virtual pipeline stages, and no `--overlap-moe-expert-parallel-comm`),
+  otherwise everything the rank offloads in an iteration, across all microbatches and model
+  chunks.
+- Captured addresses stay reserved for the lifetime of the buffer, including after
+  `reset()` or `clear()`. Each capture gets a separate range; it can reuse that range
+  within the same capture after all its backups are reloaded. Eager offloads use the
+  remaining tail, so size mixed-mode buffers for both graph reservations and eager
+  backups. `get_pool_status()` reports `graph_reserved_bytes` separately from live bytes.
+  To reclaim graph reservations, destroy the graphs and their buffer together.
+- The size bounds this buffer only, not other host allocations.
 
 ### CUDA Graph Integration
 
@@ -196,6 +229,7 @@ The first training iteration serves as a **warmup phase** where the manager reco
 ### CPU Tensor Pool
 
 A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(shape, dtype)`. This avoids repeated `cudaMallocHost` / `cudaFreeHost` calls and reduces D2H latency after the first iteration.
+With `--fine-grained-offloading-buffer-size-gib`, the pool instead hands out views of one fixed pinned buffer (see [Fixed Pinned Buffer](#fixed-pinned-buffer)).
 
 ### CUDA Graph Support
 
