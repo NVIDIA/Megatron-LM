@@ -196,6 +196,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     if invalid_policy == "ddp_offload":
         run_config.ddp.fp8_param_gather = True
         run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
         error, message = ValueError, "parameters share the gradient-buffer storage"
     else:
         # Native recipes can edit model layout before startup; validate it before RNG derivation.
@@ -220,6 +221,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     # A rejected configuration remains editable and can be finalized after correction.
     if invalid_policy == "ddp_offload":
         run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+        run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     else:
         transformer.virtual_pipeline_model_parallel_size = 2
     run_config.finalize()

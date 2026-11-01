@@ -838,6 +838,10 @@ class TestColocatedGradientScalingCorrectness:
         Utils.initialize_distributed()
         cls.world_size = dist.get_world_size()
 
+    @pytest.fixture(autouse=True)
+    def configure_wrapper(self, run_config):
+        run_config.ddp.overlap_grad_reduce = True
+
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
