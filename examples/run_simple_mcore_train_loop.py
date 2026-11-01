@@ -2,7 +2,6 @@
 
 import os
 import torch
-from torch.optim import Adam
 from torch.utils.data import DataLoader
 from functools import partial
 from pathlib import Path
@@ -22,6 +21,7 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.tokenizers import MegatronTokenizer
 
 _SEQUENCE_LENGTH: int = 64
@@ -166,6 +166,70 @@ def forward_step_func(
     return output_tensor, partial(loss_func, loss_mask)
 
 
+def get_optimizer(gpt_model: DistributedDataParallel) -> MegatronOptimizer:
+    """
+    Build an Adam optimizer that steps on the gradients DDP accumulates.
+
+    Megatron-Core's DistributedDataParallel adds every gradient into ``param.main_grad`` and
+    sets ``param.grad`` to None, so a plain ``torch.optim.Adam`` would skip every parameter.
+    The Megatron optimizer reads ``main_grad`` instead.
+
+    Args:
+        gpt_model (DistributedDataParallel): The DDP-wrapped GPT model.
+
+    Returns:
+        MegatronOptimizer: An Adam optimizer over the model's parameters.
+    """
+    optimizer_config: OptimizerConfig = OptimizerConfig(optimizer="adam", lr=1e-3)
+    # Gloo groups serve only the distributed optimizer, which this example does not use.
+    return get_megatron_optimizer(optimizer_config, [gpt_model], use_gloo_process_groups=False)
+
+
+def train_step(
+    gpt_model: DistributedDataParallel,
+    optim: MegatronOptimizer,
+    forward_backward_func: Callable[..., Dict[str, Any]],
+    data_iterator: Iterator,
+) -> Dict[str, Any]:
+    """
+    Run one training iteration and update the model's weights.
+
+    Args:
+        gpt_model (DistributedDataParallel): The DDP-wrapped GPT model.
+        optim (MegatronOptimizer): The optimizer returned by get_optimizer().
+        forward_backward_func (Callable[..., Dict[str, Any]]): The schedule returned by
+            get_forward_backward_func().
+        data_iterator (Iterator): Iterator yielding training batches.
+
+    Returns:
+        Dict[str, Any]: The losses reduced over the microbatches.
+    """
+    # DDP keeps accumulating into param.main_grad until it is zeroed, and the last optimizer
+    # step left param.grad pointing at it. Clear both before the backward pass.
+    gpt_model.zero_grad_buffer()
+    optim.zero_grad()
+
+    losses_reduced: Dict[str, Any] = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=gpt_model,
+        num_microbatches=1,
+        seq_length=_SEQUENCE_LENGTH,
+        micro_batch_size=8,
+        decoder_seq_length=_SEQUENCE_LENGTH,
+        forward_only=False,
+    )
+
+    # Finalize model gradients: all-reduce across DP and TP groups.
+    # This synchronizes gradients for non-tensor-parallel parameters (e.g., LayerNorm)
+    # across tensor parallel ranks and all gradients across data parallel ranks.
+    finalize_model_grads([gpt_model])
+
+    optim.step()
+
+    return losses_reduced
+
+
 def save_distributed_checkpoint(
     checkpoint_path: str, gpt_model: torch.nn.Module
 ) -> None:
@@ -240,7 +304,7 @@ if __name__ == "__main__":
         module=gpt_model,
     )
 
-    optim: Adam = Adam(gpt_model.parameters())
+    optim: MegatronOptimizer = get_optimizer(gpt_model)
 
     train_iterator: Iterator = get_train_data_iterator()
 
@@ -248,25 +312,9 @@ if __name__ == "__main__":
 
     # Running the model for 5 iterations
     for iteration in range(5):
-        optim.zero_grad()
-
-        losses_reduced: Dict[str, Any] = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=train_iterator,
-            model=gpt_model,
-            num_microbatches=1,
-            seq_length=_SEQUENCE_LENGTH,
-            micro_batch_size=8,
-            decoder_seq_length=_SEQUENCE_LENGTH,
-            forward_only=False,
+        losses_reduced: Dict[str, Any] = train_step(
+            gpt_model, optim, forward_backward_func, train_iterator
         )
-
-        # Finalize model gradients: all-reduce across DP and TP groups.
-        # This synchronizes gradients for non-tensor-parallel parameters (e.g., LayerNorm)
-        # across tensor parallel ranks and all gradients across data parallel ranks.
-        finalize_model_grads([gpt_model])
-
-        optim.step()
 
         print(f"Iteration {iteration}: Losses reduced: {losses_reduced}")
 
