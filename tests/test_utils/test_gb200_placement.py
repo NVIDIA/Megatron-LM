@@ -49,6 +49,33 @@ def test_complete_bucket_manifest_matches_approved_jobs():
     assert len(placement.NEW_GB200_BUCKETS) == len(set(placement.NEW_GB200_BUCKETS)) == 18
 
 
+def test_host_launcher_loads_placement_without_torch():
+    # A fresh interpreter catches package __init__ imports hidden by the test
+    # process's module cache. The host launcher runs before the GPU container.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json
+import sys
+
+sys.modules["torch"] = None
+from tests.test_utils.python_scripts import launch_nemo_run_workload
+
+assert "tests.unit_tests" not in sys.modules
+print(json.dumps(launch_nemo_run_workload.NEW_GB200_BUCKETS))
+""",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == list(placement.NEW_GB200_BUCKETS)
+
+
 def test_candidate_manifest_matches_source_files_and_is_independent_of_cwd(tmp_path, monkeypatch):
     expected = placement.candidate_files()
     assert expected

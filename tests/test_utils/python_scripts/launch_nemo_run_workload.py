@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import pathlib
+import runpy
 import sys
 import threading
 from typing import Optional
@@ -12,7 +13,12 @@ import click
 import nemo_run as run
 
 from tests.test_utils.python_scripts import recipe_parser
-from tests.unit_tests.gb200_placement import NEW_GB200_BUCKETS
+
+# The host launcher runs outside the GPU container. Load the metadata without
+# executing tests.unit_tests.__init__, which imports Torch.
+NEW_GB200_BUCKETS = runpy.run_path(
+    str(pathlib.Path(__file__).resolve().parents[2] / "unit_tests/gb200_placement.py")
+)["NEW_GB200_BUCKETS"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
