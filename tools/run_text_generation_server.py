@@ -4,6 +4,7 @@
 import os
 import sys
 import warnings
+from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -150,9 +151,9 @@ def main(model_type: str = "gpt"):
         if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
             # ModelOpt path keeps the legacy callable-based builder because the
             # modelopt hooks have not been ported to the new ``ModelBuilder``
-            # API yet. ``get_model`` also handles the modelopt-checkpoint
-            # auto-detection side effect.
-            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+            # API yet. ``get_model`` calls the provider with keyword arguments
+            # only, so bind ``args``.
+            model = get_model(partial(modelopt_gpt_hybrid_builder, args), wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, cfg.tokenizer, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
