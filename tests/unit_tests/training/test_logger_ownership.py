@@ -402,3 +402,48 @@ def test_attention_metric_logging_reads_model_config(
     assert len(logged) == int(enabled)
     if enabled:
         assert logged[0].args == ('max_attention_logit', 7.0, 1)
+
+
+@pytest.mark.parametrize(
+    ('load_balancing_type', 'expected'),
+    [
+        ('aux_loss', ['load_balancing_loss']),
+        ('seq_aux_loss', ['seq_load_balancing_loss']),
+        ('global_aux_loss', ['global_load_balancing_loss']),
+        (['seq_aux_loss', 'aux_loss'], ['load_balancing_loss', 'seq_load_balancing_loss']),
+    ],
+)
+def test_moe_metric_names_match_load_balancing_type(
+    monkeypatch, load_balancing_type, expected, run_config
+):
+    from megatron.training import training
+    from megatron.training.state import TrainState
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args(['--micro-batch-size', '1', '--num-layers', '2', '--num-experts', '4'])
+    args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
+    args.dsa_indexer_loss_coeff = None
+    # validate_args stores a single load balancing type as a string.
+    args.moe_router_load_balancing_type = load_balancing_type
+    run_config.logger = LoggerConfig(log_interval=100)
+    run_config.train.micro_batch_size = 1
+    tracker = Mock()
+    tracker.report.return_value = ""
+    monkeypatch.setattr(training, 'get_moe_metrics_tracker', lambda: tracker)
+    monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_train_state', lambda: TrainState())
+    monkeypatch.setattr(training, 'get_timers', Mock())
+    monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
+    monkeypatch.setattr(training, 'one_logger_utils', Mock())
+    monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
+    for getter in (
+        'get_tensorboard_writer',
+        'get_wandb_writer',
+        'get_one_logger',
+        'get_energy_monitor',
+        'get_telemetry',
+    ):
+        monkeypatch.setattr(training, getter, lambda: None)
+    training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, None)
+    assert tracker.report.call_args.kwargs['track_names'] == expected
