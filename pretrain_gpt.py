@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -7,7 +7,6 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
-import json
 
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
@@ -17,25 +16,20 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
-)
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
@@ -57,17 +51,17 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
-from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
+from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
+    core_gpt_dataset_config_from_args,
+    gpt_config_from_args,
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
 )
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.global_vars import set_run_config
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
 try:
@@ -98,13 +92,39 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+# The args object and the transformer config built from it, reused until the args object
+# is replaced.
+_transformer_config_cache = None
+
+
+def _get_transformer_config(args):
+    """Return the transformer config for args, building it only when args is a new object.
+
+    get_batch runs every microbatch, and rebuilding the config there re-runs
+    TransformerConfig.__post_init__, which repeats its validation warnings in the log.
+    """
+    global _transformer_config_cache
+    if _transformer_config_cache is None or _transformer_config_cache[0] is not args:
+        _transformer_config_cache = (args, core_transformer_config_from_args(args))
+    return _transformer_config_cache[1]
+
+
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = _get_transformer_config(args)
 
     if args.sequence_packing_scheduler is not None:
+        if pg_collection is None:
+            # Compatibility for direct entrypoint callers; Core receives explicit groups.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
@@ -113,8 +133,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 mtp_num_layers=config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
+                pp_group=pg_collection.pp,
+                vp_size=config.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
+            pg_collection=pg_collection,
+            config=config,
         )
 
     cp_size = args.context_parallel_size
@@ -128,7 +153,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    # Dynamic CP always uses the sequence-packing path above.
+    assert not args.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -152,7 +178,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -183,9 +209,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = get_batch_on_this_cp_rank(
         batch,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
 
@@ -204,7 +229,12 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir,
+    decode_threads,
+    msc_prefetch_depth,
+    kd_loss_alpha,
+    ignore_errors,
+    ignore_hash,
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -216,10 +246,10 @@ def _build_cached_logits_loss_func(
     return LossFuncCallable(
         logprobs_dir=logprobs_dir,
         decode_threads=decode_threads,
-        prefetch_factor=prefetch_factor,
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -246,10 +276,10 @@ def loss_func(
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
             decode_threads=args.logits_load_decode_threads,
-            prefetch_factor=args.logits_load_prefetch_factor,
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -311,7 +341,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        batch = get_batch(data_iterator, vp_stage)
+        batch = get_batch(
+            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+        )
+
+        # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
+        # stays None for the 6-/7-tuple (unpacked) batch shapes.
+        cu_seqlens = None
+        cu_seqlens_padded = None
 
         if len(batch) == 7:
             (
@@ -367,6 +404,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens_per_sample=args.seq_length,
                 )
 
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            saver.set_current_cu_seqlens(
+                cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            )
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -399,141 +448,16 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
-    """Whether the dataset should be built on the current rank."""
-    args = get_args()
-    config = core_transformer_config_from_args(args)
-    if mpu.get_tensor_model_parallel_rank() != 0:
-        return False
-    elif is_packed_sequence:
-        return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
-        ignore_virtual=False,
-        vp_stage=vp_stage,
-    )
-
-
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
-    """Build the GPT (or FIM) dataset config from parsed CLI args."""
-    cfg = get_run_config()
-    tokenizer = build_tokenizer(args)
-
-    # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    sequences_per_dataset = None
-    if args.per_dataset_sequences_path is not None:
-        with open(args.per_dataset_sequences_path, "r") as f:
-            sequences_per_dataset = json.load(f)
-
-    data_args = {
-        "random_seed": cfg.rng.seed,
-        "sequence_length": args.seq_length,
-        "blend": blend,
-        "blend_per_split": blend_per_split,
-        "split": args.split,
-        "multiple_validation_sets": cfg.validation.multiple_validation_sets,
-        "full_validation": cfg.validation.full_validation,
-        "num_dataset_builder_threads": args.num_dataset_builder_threads,
-        "path_to_cache": args.data_cache_path,
-        "mmap_bin_files": args.mmap_bin_files,
-        "tokenizer": tokenizer,
-        "reset_position_ids": args.reset_position_ids,
-        "reset_attention_mask": args.reset_attention_mask,
-        "eod_mask_loss": args.eod_mask_loss,
-        "create_attention_mask": args.create_attention_mask_in_dataloader,
-        "object_storage_cache_path": args.object_storage_cache_path,
-        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
-        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        "fast_cache_load": args.dataloader_fast_cache_load,
-        "sequences_per_dataset": sequences_per_dataset,
-        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
-        "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
-        "inter_document_masking": args.dataloader_inter_document_masking,
-        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
-        "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
-        "varlen_sbhd_validation": args.varlen_sbhd_validation,
-    }
-
-    # add FIM args to the config
-    if args.fim_data:
-        extra_tokens = {
-            "prefix": args.fim_prefix_token,
-            "middle": args.fim_middle_token,
-            "suffix": args.fim_suffix_token,
-            "pad": args.fim_pad_token,
-            "eod": args.fim_eod_token,
-        }
-        data_args.update(
-            {
-                "fim_rate": args.fim_rate,
-                "fim_spm_rate": args.fim_spm_rate,
-                "fim_extra_tokens": extra_tokens,
-                "fim_split_sample": args.fim_split_sample,
-                "fim_fragment_rate": args.fim_fragment_rate,
-                "fim_no_prefix": args.fim_no_prefix,
-            }
-        )
-        return GPTFIMDatasetConfig(**data_args)
-
-    return GPTDatasetConfig(**data_args)
-
-
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
-    """Build the train test and validation datasets.
+    """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
-    Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
+    ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
+    predicate.
     """
-    args = get_args()
-
-    config = core_gpt_dataset_config_from_args(args)
-
-    is_packed_sequence = False
-    if args.sft:
-        if args.mock_data:
-            dataset_type = MockSFTDataset
-        else:
-            dataset_type = SFTDataset
-        is_packed_sequence = True  # SFT always uses packed sequence
-    elif args.use_varlen_dataset:
-        # Variable-length packed (THD) dataset, independent of --sft.
-        # Reuses SFTDataset's THD packing internally but is gated
-        # by its own top-level flag.
-        if args.mock_data:
-            dataset_type = MockVarlenDataset
-        else:
-            dataset_type = VarlenDataset
-        # SBHD validation mode runs the non-packed pipeline; THD mode
-        # is the packed-sequence path.
-        is_packed_sequence = not args.varlen_sbhd_validation
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        elif args.fim_data:
-            dataset_type = GPTFIMDataset
-        else:
-            dataset_type = GPTDataset
-
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
-
-    is_dataset_built = partial(
-        is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+    return build_gpt_datasets(
+        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, is_dataset_built, config
-    ).build()
-
-    print_rank_0("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
 
 
 def get_embedding_ranks(pp_ranks: List[int]):
@@ -580,7 +504,9 @@ if __name__ == "__main__":
         )
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
-    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    full_config = pretrain_cfg_container_from_args(
+        args, model_cfg, data_cfg=gpt_data_config_from_args(args)
+    )
     set_run_config(full_config)
     pretrain(
         full_config,

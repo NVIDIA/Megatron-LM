@@ -51,6 +51,8 @@ class _InnerLayerWrapper(torch.nn.Module, BaseTransformerLayer):
     """Wraps a TransformerLayer under ``inner_layer`` with a fixed forward signature,
     like HybridStack's mHC wrapper. It does not accept extra layer kwargs."""
 
+    supports_hybrid_recompute_kwargs = True
+
     def __init__(self, config, layer_number, **kwargs):
         super().__init__()
         self.config = config
@@ -268,7 +270,7 @@ class TestUnsupportedExtraLayerKwargs:
         block = TransformerBlock(
             self.config, ModuleSpec(module=_InnerLayerWrapper), post_process=False
         ).cuda()
-        assert all(isinstance(layer.inner_layer, TransformerLayer) for layer in block.layers)
+        assert all(layer.supports_hybrid_recompute_kwargs for layer in block.layers)
         assert not any(isinstance(layer, TransformerLayer) for layer in block.layers)
         with pytest.raises(TypeError, match="condition_emb"):
             self._run_block(block, "uniform")

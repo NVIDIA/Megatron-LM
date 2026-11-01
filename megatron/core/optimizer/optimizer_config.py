@@ -163,6 +163,15 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    rmsnorm_weight_decay_mult: Optional[float] = None
+    """Multiplier on scheduled global weight decay for RMSNorm gamma parameters.
+
+    ``None`` preserves the default weight-decay policy. Set to 1.0 for full decay,
+    0.5 for half decay, or 0.0 to disable decay on RMSNorm gamma. Must be finite and
+    nonnegative. When set, takes precedence over ``apply_wd_to_qk_layernorm`` for
+    RMSNorm gamma only; other parameters retain their existing policy.
+    """
+
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
@@ -303,13 +312,15 @@ class OptimizerConfig:
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded'. MoE assigns hundreds of identically shaped expert weights
-    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
-    transient stack of this many matrices for far fewer launches. The value is an upper
-    bound per same-shape bucket, so oversizing it is harmless. Batches of more than one use
-    baddbmm instead of addmm and differ from the per-matrix path by kernel-level rounding,
-    so bitwise parity with duplicated mode is lost; the default of 1 keeps the bit-exact
-    path. Values > 1 require emerging-optimizers >= 0.3.0."""
+    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
+    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
+    the per-matrix loop is kernel-launch bound; batching trades transient memory for
+    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
+    value is an upper bound per same-shape bucket, so a value above the matrix count
+    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
+    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
+    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
+    emerging-optimizers >= 0.3.0."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -424,6 +435,12 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.rmsnorm_weight_decay_mult is not None and (
+            not math.isfinite(self.rmsnorm_weight_decay_mult)
+            or self.rmsnorm_weight_decay_mult < 0.0
+        ):
+            raise ValueError("rmsnorm_weight_decay_mult must be a finite nonnegative value")
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

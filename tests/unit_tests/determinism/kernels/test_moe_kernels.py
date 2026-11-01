@@ -9,7 +9,8 @@ the router gating GEMM, and virtual-expert planning against a CPU oracle in eage
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available).
+``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
+``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
 import pytest
@@ -17,17 +18,23 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+    PipelineOffloadManager,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -35,8 +42,11 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
-from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
+from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import (
+    _NCCLEPManager,
+    _VirtualExpertHybridEPManager,
+)
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
     plan_virtual_expert_routes,
@@ -47,6 +57,7 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     count_differing_replays,
     deterministic_algorithms,
     seeded,
@@ -510,6 +521,49 @@ def test_virtual_expert_routing_adapter_replay(dtype, compiled):
     )
 
 
+@pytest.mark.parametrize("routing", ["bool", "indices"])
+def test_ncclep_padding_mask_metadata_replays(routing):
+    """NCCL EP routing metadata under a padding mask: padded rows become -1 routes with zero
+    weight (the kernels skip them and combine writes zeros back), valid rows keep their ids and
+    weights, and the packed-sequence flag is recorded; bit-exact on replay."""
+    Utils.initialize_distributed()
+    seeded()
+    num_tokens, num_experts, topk = 258, 64, 8
+    routing_map, full_probs = _routing(num_tokens=num_tokens, num_experts=num_experts, topk=topk)
+    expected_ids = full_probs.topk(topk, dim=1).indices
+    if routing == "indices":
+        routing_map = expected_ids.to(torch.int32)
+    padding_mask = torch.zeros((2, 129), dtype=torch.bool, device="cuda")
+    padding_mask[0, 3::7] = True
+    flat_padding = padding_mask.t().reshape(-1)
+    manager = object.__new__(_NCCLEPManager)
+    manager.router_topk = topk
+
+    def adapt(probs):
+        manager.setup_metadata(
+            routing_map,
+            probs,
+            padding_mask=padding_mask,
+            packed_seq_params=PackedSeqParams(qkv_format="thd"),
+        )
+        return manager.token_indices, manager.token_probs
+
+    indices, selected_probs = adapt(full_probs)
+    assert manager._is_thd and manager.num_local_tokens == num_tokens
+    expected_ids = expected_ids.masked_fill(flat_padding[:, None], -1)
+    torch.testing.assert_close(indices, expected_ids, rtol=0, atol=0)
+    expected_probs = full_probs.gather(1, expected_ids.clamp_min(0))
+    expected_probs = expected_probs.masked_fill(flat_padding[:, None], 0)
+    torch.testing.assert_close(selected_probs, expected_probs, rtol=0, atol=0)
+    assert_replays_bit_exact(
+        adapt,
+        (full_probs,),
+        replays=3,
+        contention=True,
+        what=f"ncclep padding-mask metadata[{routing=}]",
+    )
+
+
 # --- permute / unpermute --------------------------------------------------------------------
 
 
@@ -654,6 +708,56 @@ def test_topk_routing_replays(case, fused, det_algos):
         assert_replays_bit_exact(
             fn, (logits,), replays=3, what=f"topk routing[{case}, fused={fused}]"
         )
+
+
+@pytest.mark.parametrize("det_algos", [True, False])
+def test_quantile_balancing_histogram_and_bias_replay(det_algos):
+    """Replay accumulated integer histograms, routing gradients, and the batch update."""
+    seeded()
+    num_tokens, num_experts, num_bins = 8192, 64, 128
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        # The harness clones the caller-owned histogram before every replay.
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                moe_utils.topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        probs = torch.cat([output[0] for output in outputs])
+        routing_map = torch.cat([output[1] for output in outputs])
+        updated_bias, updated_bounds = moe_utils.get_updated_expert_bias_with_quantile(
+            histogram, bounds, bias, topk=8
+        )
+        return probs, routing_map, histogram, updated_bias, updated_bounds
+
+    with deterministic_algorithms(det_algos):
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits, histogram),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what="global-batch QB histogram and bias update",
+        )
+    assert torch.equal(
+        outputs["out[2]"].sum(dim=-1),
+        torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
+    )
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert torch.isfinite(outputs["out[3]"]).all()
+    assert torch.isfinite(outputs["out[4]"]).all()
+    assert grads["in[0]"].abs().sum() > 0
 
 
 def test_group_limited_topk_replays():
@@ -852,17 +956,27 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,per_token_loss",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, False),
+            ("seq_aux_loss", "sigmoid", True, False, False),
+            ("sinkhorn", "softmax", False, False, False),
+            ("none", "sigmoid", False, True, False),
+            ("none", "softmax", False, True, False),
+            ("seq_aux_loss", "softmax", False, False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "seq_aux_loss+per_token_loss",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(
+        self, balancing, score, expert_bias, hash_routing, per_token_loss, monkeypatch
+    ):
         self._init()
         seeded()
         config = _moe_config(
@@ -875,11 +989,19 @@ class TestMoEModules:
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
+            calculate_per_token_loss=per_token_loss,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
+        if per_token_loss:
+            # Without a padding mask, seq aux loss uses the Python-int token-count branch.
+            monkeypatch.setattr(
+                moe_utils.MoEAuxLossAutoScaler,
+                "main_loss_backward_scale",
+                torch.ones((), device="cuda"),
+            )
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
@@ -935,6 +1057,48 @@ class TestMoEModules:
         torch.cuda.synchronize()
         moe_utils.get_moe_metrics_tracker().clear()
 
+    @pytest.mark.parametrize(
+        "num_experts,topk,scaling_factor",
+        [(128, 6, 2.5), (512, 22, 5.0)],
+        ids=["nano", "super-ultra"],
+    )
+    @pytest.mark.parametrize("num_tokens", [2, 512])
+    def test_inference_topk_router_replays(self, num_experts, topk, scaling_factor, num_tokens):
+        """Inference router replay through the fused sigmoid top-k kernel."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_topk_scaling_factor=scaling_factor,
+            inference_moe_router_backend="triton",
+        )
+        router = InferenceTopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        with torch.no_grad():
+            router.expert_bias.uniform_(-0.05, 0.05)
+        hidden = torch.randn(num_tokens, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.inference_mode():
+            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None)
+
+        def route(h):
+            with InferenceMode.active(), torch.inference_mode():
+                return router(h)
+
+        assert_replays_bit_exact(
+            route,
+            (hidden,),
+            replays=3,
+            backward=False,
+            what=f"InferenceTopKRouter[sigmoid+bias, experts={num_experts}, topk={topk}]",
+        )
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",
@@ -970,11 +1134,64 @@ class TestMoEModules:
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
 
-    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_grouped_mlp_replays_on_uneven_experts(self):
+    @pytest.mark.parametrize("accumulate", [True, False])
+    def test_global_batch_quantile_router_replays(self, accumulate):
+        """Include the router's nonpersistent histogram in the replay comparison."""
         self._init()
         seeded()
-        config = _moe_config(hidden_size=2048, ffn_hidden_size=4096)
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.train(accumulate)
+        with torch.no_grad():
+            router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
+        logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
+
+        def fn(logits):
+            router.qb_histogram.zero_()
+            probs, routing_map = router.quantile_balancing(logits)
+            return probs, routing_map, router.qb_histogram.clone()
+
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what=f"global-batch TopKRouter[accumulate={accumulate}]",
+        )
+        assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
+        assert grads["in[0]"].abs().sum() > 0
+
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize(
+        "use_grouped_tensor",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not te_ext._TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+                    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+                ),
+            ),
+        ],
+        ids=["multi-stream", "device-initiated"],
+    )
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_grouped_tensor):
+        self._init()
+        seeded()
+        config = _moe_config(
+            hidden_size=2048, ffn_hidden_size=4096, moe_use_grouped_tensor=use_grouped_tensor
+        )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
             num_local_experts=8,
@@ -992,31 +1209,196 @@ class TestMoEModules:
             (hidden, tokens_per_expert, probs),
             replays=3,
             contention=True,
-            what="TEGroupedMLP",
+            what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
+
+    @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+    def test_inference_nvfp4_moe_layer_replays(self, gated):
+        """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=F.silu if gated else squared_relu,
+            gated_linear_unit=gated,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_nvfp4_recipe="per_token",
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                _InInferenceMode(layer),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[inference, flashinfer per-token NVFP4]",
+            )
+        assert layer.experts._nvfp4_weights is not None
+
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize(
+        "offload_modules,offloaded_group",
+        [
+            (["expert_fc1", "moe_act"], "fused_group_mlp"),
+            (["expert_fc1"], "expert_fc1"),
+            (["moe_act"], "moe_act"),
+        ],
+        ids=["fc1+act->one_group", "fc1", "act"],
+    )
+    def test_te_grouped_mlp_replays_under_fine_grained_offloading(
+        self, offload_modules, offloaded_group
+    ):
+        """Unfused ``TEGroupedMLP`` with its activations really offloaded to CPU and reloaded.
+
+        Two experts modules run back to back because the offload manager always keeps the
+        last group of each name resident; the first module's group is the one that travels.
+        With both unfused knobs set, fc1 input and activation input go as ONE group named like
+        the fused path's (``fused_group_mlp``); a single knob keeps its own group.
+        """
+        self._init()
+        seeded()
+        PipelineOffloadManager.reset_instance()
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+
+        def build():
+            experts = get_submodules(spec.submodules.mlp).experts(
+                num_local_experts=8,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+            assert isinstance(experts, TEGroupedMLP)
+            assert not experts._with_fused_impl
+            return experts.cuda()
+
+        stack = torch.nn.ModuleList([build(), build()])
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(rows, device="cuda")
+
+        def run():
+            FineGrainedActivationOffloadingInterface.init_chunk_handler(
+                pp_rank=0,
+                vp_size=None,
+                vp_stage=None,
+                min_offloaded_tensor_size=1024,
+                delta_offload_bytes_across_pp_ranks=0,
+                activation_offload_fraction=1.0,
+            )
+            for p in stack.parameters():
+                p.grad = None
+            h = hidden.clone().requires_grad_(True)
+            pr = probs.clone().requires_grad_(True)
+            out, _ = stack[0](h, tokens_per_expert, pr)
+            out, _ = stack[1](out, tokens_per_expert, pr)
+            out.backward(torch.ones_like(out))
+            torch.cuda.synchronize()
+            FineGrainedActivationOffloadingInterface.reset()
+            return [out.detach().clone(), h.grad.clone(), pr.grad.clone()] + [
+                p.grad.detach().clone() for p in stack.parameters()
+            ]
+
+        try:
+            # The warmup iteration records the groups; the extra reset applies the
+            # post-warmup offload decisions.
+            run()
+            FineGrainedActivationOffloadingInterface.reset()
+            offloaded = PipelineOffloadManager.get_instance().offload_summary_bytes
+            assert (
+                offloaded.get(offloaded_group, 0) > 0
+            ), f"nothing offloaded under group {offloaded_group!r}; summary: {dict(offloaded)}"
+            assert set(offloaded) == {offloaded_group}, dict(offloaded)
+            names = ["out", "grad_hidden", "grad_probs"] + [
+                f"grad[{n}]" for n, _ in stack.named_parameters()
+            ]
+            ref = run()
+            for i in range(1, 4):
+                for name, a, b in zip(names, ref, run()):
+                    assert bytes_equal(a, b), f"TEGroupedMLP[offload] replay {i}: {name} differs"
+        finally:
+            PipelineOffloadManager.reset_instance()
 
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",
     )
-    def test_vllm_mxfp8_weight_stacking_replays(self):
-        """The mixed-precision vLLM path builds canonical expert stacks bit-exactly."""
+    @pytest.mark.parametrize("backend", ["vllm", "flashinfer_cutlass", "flashinfer_routed"])
+    def test_mxfp8_expert_weight_build_replays(self, backend):
+        """Canonical, CUTLASS and write-through routed expert stacks build bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            HAVE_FLASHINFER_CUTLASS_MXFP8,
+            HAVE_FLASHINFER_ROUTED_MXFP8,
+        )
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        if backend == "flashinfer_cutlass" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
+            pytest.skip("requires FlashInfer CUTLASS MXFP8")
+        if backend == "flashinfer_routed" and not HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("requires FlashInfer routed MXFP8")
 
         class GroupedMLPStub:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
         seeded()
-        weights = tuple(torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+        weights = tuple(
+            torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+        )
 
         def build_stacks(*bf16_weights):
             grouped = GroupedMLPStub()
             grouped.num_local_experts = 2
-            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.VLLM
+            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                backend.split("_")[0]
+            )
+            # A clamp selects FlashInfer CUTLASS; without one FlashInfer uses the routed kernel.
+            grouped._activation_clamp_scale = None if backend == "flashinfer_routed" else 16.0
             grouped.linear_fc1 = SimpleNamespace()
             grouped.linear_fc2 = SimpleNamespace()
             for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
@@ -1035,7 +1417,7 @@ class TestMoEModules:
             )
 
         assert_replays_bit_exact(
-            build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
+            build_stacks, weights, backward=False, what=f"{backend} MXFP8 expert-weight build"
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
@@ -1116,6 +1498,12 @@ class TestMoEModules:
             pytest.param(
                 "alltoall",
                 1,
+                {"moe_shared_expert_intermediate_size": 2048},
+                id="alltoall-native-shared-expert",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
                 {
                     "moe_num_hash_layers": 1,
                     "hash_moe_vocab_size": 128,
@@ -1189,3 +1577,64 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+
+    def test_alltoall_dispatcher_releases_router_probs_after_forward(self):
+        """combine_preprocess drops ``self.probs`` so it does not pin the recompute graph.
+
+        The all-to-all dispatcher sets ``self.probs`` during dispatch and clears it at the end
+        of ``combine_preprocess`` (the last consumer of router probs). After a forward pass the
+        reference must be gone, otherwise the recomputed MoE forward graph is retained until the
+        next iteration.
+        """
+        self._init(ep=1)
+        seeded()
+        config = _moe_config(moe_token_dispatcher_type="alltoall", expert_model_parallel_size=1)
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer.set_layer_number(0)
+        hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16)
+        with deterministic_algorithms(True):
+            layer(hidden)
+        assert layer.token_dispatcher.probs is None
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
+    """The fused batch-invariant unpermute (``probs=None``) and its backward replay bit-exactly."""
+    if not batch_invariant.HAVE_TRITON:
+        pytest.skip("requires Triton")
+    seeded()
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
+    num_tokens, hidden = 4096, 520
+    rows = torch.randn(2 * num_tokens, hidden, device="cuda", dtype=dtype, requires_grad=True)
+    # Two experts on two EP ranks, one slot each: every token sums one row per rank.
+    inverse_map = torch.stack(
+        (
+            torch.arange(2 * num_tokens, device="cuda").view(2, num_tokens).T,
+            torch.tensor([0, 1], device="cuda").expand(num_tokens, 2),
+        )
+    )
+    grad = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+    grad.view(-1)[::7] = -0.0
+
+    def combine(x):
+        return batch_invariant.unpermute(
+            x, torch.Size((num_tokens, hidden)), probs=None, num_experts=2, inverse_map=inverse_map
+        )
+
+    assert_replays_bit_exact(
+        combine,
+        (rows,),
+        replays=3,
+        contention=True,
+        grad_outputs={"out": grad},
+        what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )

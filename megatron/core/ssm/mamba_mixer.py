@@ -434,6 +434,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.weight.is_rmsnorm_weight = True
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
             self.norm.tp_group = self.pg_collection.tp
@@ -1032,14 +1033,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         tensor_masked_update(ssm_state, batch_indices, cache_states)
         if self.config.batch_invariant_mode:
             self._get_batch_invariant_decoder().seed(
-                x,
-                z.squeeze(0),
-                dt,
-                B,
-                C,
-                cu_seqlens,
-                batch_indices,
-                max_requests=ssm_state.shape[0],
+                x, dt, B, C, cu_seqlens, batch_indices, max_requests=ssm_state.shape[0]
             )
 
         if extract_intermediates:

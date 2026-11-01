@@ -49,7 +49,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
-from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import (
     get_pg_rank,
@@ -1274,19 +1274,26 @@ def save_checkpoint(
             else:
                 logits_finalize_fns = []
             # Record run progress AFTER the logits tar is confirmed written, so a resumed job
-            # never skips or replays a window. Written by a single rank -- the last rank, which
-            # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
-            # is None on earlier stages, including global rank 0 when PP > 1).
+            # never skips or replays a window. Written by the TP0/CP0/DP0 owner on the last
+            # pipeline stage -- deliberately *not* is_last_rank(), which has no guaranteed
+            # relationship to TP/CP ownership (tp_rank == tp_size - 1 there, by default, when
+            # tp_size > 1) and would attach this to a rank whose take_pending_data() is always
+            # empty, defeating the "AFTER the write" guarantee whenever tp_size > 1.
             if skip_weight_ckpt and (
-                not torch.distributed.is_initialized() or is_last_rank()
+                not torch.distributed.is_initialized()
+                or (
+                    logits_saver.tp_rank == 0
+                    and logits_saver.cp_rank == 0
+                    and logits_saver.dp_rank == 0
+                )
             ):
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_last(f"  recorded logits-dump progress: iteration "
-                                    f"{iteration} to {tracker_filename}")
+                    print(f"  recorded logits-dump progress: iteration "
+                          f"{iteration} to {tracker_filename}", flush=True)
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_logits_request = AsyncRequest(
@@ -2448,6 +2455,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
+    _set_arg('moe_router_load_balancing_type', force=True)
+    _set_arg('moe_aux_loss_coeff', force=True)
+    _set_arg('moe_router_quantile_balancing_estimation_scope', force=True)
+    _set_arg('moe_router_qb_num_bins', force=True)
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
@@ -2926,11 +2937,19 @@ def load_checkpoint(
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
-            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
+            saved_rerun_state = state_dict["rerun_state_machine"]
+            restore_rerun_state = rerun_state_machine.validate_state_dict(saved_rerun_state)
+            idle_rerun_state = (
+                isinstance(saved_rerun_state, dict)
+                and saved_rerun_state.get("state") == RerunState.NOT_RUNNING_YET
+            )
+            # Idle checkpoints still contain a rerun shard for cached save plans.
+            # Include it in strict load requests without resuming a rerun.
+            if restore_rerun_state or idle_rerun_state:
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
                 )
-                ignore_rerun_state = False
+                ignore_rerun_state = not restore_rerun_state
         if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
             print_rank_0('Job sharding has changed: Rerun state will be ignored')
 
@@ -3325,7 +3344,7 @@ def load_checkpoint(
             # Optimizer state dict can overwrite per-group max_lr/min_lr values.
             # If scheduler override is requested, re-apply runtime lr bounds from
             # args so scheduler math does not stay pinned to checkpoint lr settings.
-            if getattr(args, "override_opt_param_scheduler", False):
+            if getattr(cfg.scheduler, "override_opt_param_scheduler", False):
                 if (
                     optimizer is None
                     or getattr(optimizer, "is_stub_optimizer", False)

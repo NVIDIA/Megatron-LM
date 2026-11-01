@@ -18,9 +18,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
+from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -229,6 +230,21 @@ class TestTEWrappers:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_mark_grouped_tensor_is_numerically_transparent(self):
+        """The paged-stash marker must not change activation values or gradients."""
+        if te_ext._te_mark_grouped_tensor is None:
+            pytest.skip("Transformer Engine does not provide mark_grouped_tensor")
+
+        seeded()
+        x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(x):
+            mark_grouped_tensor(x)
+            assert x.grouped_tensor_scale_inv is False
+            return x.square()
+
+        assert_replays_bit_exact(fn, (x,), replays=3, what="mark_grouped_tensor")
 
     def test_te_column_parallel_linear_replays(self):
         seeded()
@@ -530,6 +546,11 @@ class TestTEWrappers:
             skip_bias_add=False,
             is_expert=False,
         ).cuda()
+        assert getattr(module.layer_norm_weight, "is_rmsnorm_weight", False) == (
+            normalization == "RMSNorm"
+        )
+        assert not getattr(module.weight, "is_rmsnorm_weight", False)
+        assert not getattr(module.bias, "is_rmsnorm_weight", False)
         # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
@@ -544,6 +565,7 @@ class TestTEWrappers:
     def test_te_norm_replays(self, normalization):
         seeded()
         module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
+        assert getattr(module.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
@@ -801,6 +823,78 @@ class TestTEWrappers:
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
             raise
 
+    @pytest.mark.parametrize("backend", ["fused", "flash"])
+    def test_te_dot_product_attention_softmax_scale_replays(self, backend, monkeypatch):
+        """The config-derived scale MLA hands to its core attention replays bit-exactly."""
+        seeded()
+        # conftest forces both TE attention backends off per test; pick one explicitly.
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches its backend choice per AttentionParams and only re-selects when the params
+        # change, so an env flip alone would replay the previously chosen backend.
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            dot_product_attention as te_dpa,
+        )
+
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+
+        def build(softmax_scale):
+            return TEDotProductAttention(
+                _config(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+                softmax_scale=softmax_scale,
+            ).cuda()
+
+        s, b, h, hkv, d = 512, 2, 16, 4, 128
+        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(module):
+
+            def run(q, k, v):
+                return module(q, k, v, None, AttnMaskType.causal)
+
+            return run
+
+        try:
+            default = assert_replays_bit_exact(
+                fn(build(None)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, default softmax_scale]",
+            )
+            scaled = assert_replays_bit_exact(
+                fn(build(0.25)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, config softmax_scale]",
+            )
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+        assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
+        assert not bytes_equal(default[0]["out"], scaled[0]["out"])
+
 
 # --- fused RoPE --------------------------------------------------------------------------------
 
@@ -872,6 +966,56 @@ def test_te_fused_mla_kv_rope_mxfp8_replays():
         contention=True,
         what="TE fused MLA key/value RoPE + MXFP8",
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_te_quantile_balancing_histogram_replays(dtype):
+    """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function_supports_qb,
+    )
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+
+    if not fused_topk_with_score_function_supports_qb:
+        pytest.skip("requires the Transformer Engine QB fused-router API")
+    seeded()
+    num_tokens, num_experts = 8192, 64
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=dtype, requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, 128, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    fused=True,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        return (
+            torch.cat([output[0] for output in outputs]),
+            torch.cat([output[1] for output in outputs]),
+            histogram,
+        )
+
+    outputs, grads = assert_replays_bit_exact(
+        fn,
+        (logits, histogram),
+        grad_outputs={"out[0]": torch.randn(num_tokens, num_experts, device="cuda")},
+        replays=3,
+        contention=True,
+        what=f"TE quantile balancing[{dtype}]",
+    )
+    assert torch.all(outputs["out[2]"].sum(dim=-1) == num_tokens)
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert grads["in[0]"].abs().sum() > 0
 
 
 # --- fused top-k router with dense indices ------------------------------------------------------

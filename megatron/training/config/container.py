@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import os
 from dataclasses import dataclass, field
@@ -13,10 +13,17 @@ try:
 except ImportError:
     HAVE_YAML = False
 
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -34,7 +41,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -76,7 +83,7 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
-    
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -278,7 +285,10 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    # dataset: GPTDatasetConfig # TODO (@maanug): add support
+    data: DataConfig = field(default_factory=DataConfig)
+    """The dataset config, the loader settings and the dataset class. The GPT entry points build
+    their datasets from it (``gpt_data_config_from_args``); every other entry point carries the
+    loader settings only (``data.dataset is None``). See ``megatron.training.config.dataset_config``."""
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -341,12 +351,50 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
+    def _resolve_scheduler_step_fields(self):
+        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
+
+        # Without a training horizon there is nothing to resolve; building the optimizer param
+        # scheduler (get_optimizer_param_scheduler) is what requires one.
+        if self.train.train_iters is None and self.train.train_samples is None:
+            return
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
+        self._validate_data_section()
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -356,16 +404,144 @@ class PretrainConfigContainer(ConfigContainerBase):
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
             global_batch_size=global_batch_size,
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
+            # The rollout deployment (inference shards, model CP) is not a pretrain section;
+            # validate_args checks that rule from the launch arguments.
+            separate_inference_model=None,
         )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
+
+    def get_data_parallel_size(self, world_size: int) -> int | None:
+        """The data-parallel size of this run's model layout, or ``None`` without a model config.
+
+        The same quotient as ``validate_args``: ``world_size // (tp * pp * cp * weight-remat)`` with
+        the *configured* context-parallel size. The model config stores the resolved one (configured
+        CP times the GTP sequence shards), so the shards are divided out first; ``GTPParallelLayout``
+        checks the divisions.
+        """
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is None:
+            return None
+        shards = getattr(transformer, "gtp_remat_num_sequence_shards", 1) or 1
+        resolved_cp = transformer.context_parallel_size
+        if resolved_cp % shards:
+            raise ValueError(
+                f"context_parallel_size ({resolved_cp}) must be a multiple of the GTP sequence "
+                f"shards ({shards})."
+            )
+        layout = GTPParallelLayout(
+            world_size=world_size,
+            tp=transformer.tensor_model_parallel_size,
+            pp=transformer.pipeline_model_parallel_size,
+            cp=resolved_cp // shards,
+            weight_size=getattr(transformer, "gtp_weight_remat_size", 1) or 1,
+            num_sequence_shards=shards,
+        )
+        return layout.dp
+
+    def _validate_data_section(self) -> None:
+        """Cross-section checks for ``data.dataset``, one per field.
+
+        The model capacity covers the sample length. A value given on the dataset config for one
+        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
+        section: the container writes these fields at ``finalize()``, the arguments and the saved
+        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
+        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
+        """
+        dataset = self.data.dataset
+        if dataset is None:
+            return
+        capacity = getattr(self.model, "seq_length", None)
+        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+            if capacity < dataset.sequence_length:
+                raise ValueError(
+                    f"model.seq_length ({capacity}, the position-embedding capacity, "
+                    "--max-position-embeddings) must be greater than or equal to "
+                    f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
+                )
+        validation = self.validation
+        if (
+            dataset.full_validation is not None
+            and dataset.full_validation != validation.full_validation
+        ):
+            raise ValueError(
+                f"data.dataset.full_validation={dataset.full_validation} disagrees with "
+                f"validation.full_validation={validation.full_validation}; the container writes "
+                "this field at finalize(), leave it unset."
+            )
+        if (
+            dataset.multiple_validation_sets is not None
+            and dataset.multiple_validation_sets != validation.multiple_validation_sets
+        ):
+            raise ValueError(
+                f"data.dataset.multiple_validation_sets={dataset.multiple_validation_sets} "
+                "disagrees with "
+                f"validation.multiple_validation_sets={validation.multiple_validation_sets}; the "
+                "container writes this field at finalize(), leave it unset."
+            )
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is None:
+            return  # no model config (pretrain_hybrid_flex.py): the layout fields have no owner
+        if (
+            dataset.context_parallel_size is not None
+            and dataset.context_parallel_size != transformer.context_parallel_size
+        ):
+            raise ValueError(
+                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                "with model.transformer.context_parallel_size="
+                f"{transformer.context_parallel_size}; the container writes this field at "
+                "finalize(), leave it unset."
+            )
+        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+            bool(transformer.sequence_parallel)
+        )
+        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+            raise ValueError(
+                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                "it unset."
+            )
+        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+        # The deprecated hybrid_context_parallel alias counts as the canonical flag here (Core
+        # warns about it in validate_without_tokenizer()); finalize() folds it and clears it.
+        if (
+            dataset.dynamic_context_parallel or dataset.hybrid_context_parallel
+        ) and not dynamic_context_parallel:
+            raise ValueError(
+                "data.dataset.dynamic_context_parallel=True disagrees with "
+                "model.transformer.dynamic_context_parallel=False; the container writes this field "
+                "at finalize(), leave it unset."
+            )
 
     def _finalize(self) -> None:
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
         from megatron.training import get_args
 
+        dataset = self.data.dataset
+        transformer = getattr(self.model, "transformer", None)
+        data_parallel_size = None
+        if dataset is not None and transformer is not None:
+            # The world size is known here: data_parallel_size gets the agreement check the other
+            # fields got at validation, before anything is written.
+            data_parallel_size = self.get_data_parallel_size(safe_get_world_size())
+            if dataset.data_parallel_size not in (1, data_parallel_size):
+                raise ValueError(
+                    f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
+                    "the model layout and the world size "
+                    f"(data_parallel_size={data_parallel_size}); the container writes this field "
+                    "at finalize(), leave it unset."
+                )
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
@@ -376,8 +552,54 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         super()._finalize()
+        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        self._resolve_scheduler_step_fields()
+        if dataset is not None:
+            # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the model config when there is one (the
+            # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
+            dataset.full_validation = self.validation.full_validation
+            dataset.multiple_validation_sets = self.validation.multiple_validation_sets
+            if transformer is not None:
+                dataset.data_parallel_size = data_parallel_size
+                dataset.context_parallel_size = transformer.context_parallel_size
+                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                    bool(transformer.sequence_parallel)
+                )
+                dataset.dynamic_context_parallel = bool(
+                    getattr(transformer, "dynamic_context_parallel", False)
+                )
+                dataset.hybrid_context_parallel = False
+        self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
+    # Imported lazily: megatron.training.utils imports megatron.training.config.
+    from megatron.training.utils import print_rank_0
+
+    # For iteration-based training, we don't need to do anything
+    if train.train_iters:
+        return
+
+    if train.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < train.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        train.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        train.train_iters = train.train_samples // train.global_batch_size
+
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 @dataclass(kw_only=True)
