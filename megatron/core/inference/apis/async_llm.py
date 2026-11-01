@@ -230,6 +230,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
+                block_size_tokens=(
+                    self._context.block_size_tokens if self._context.enable_prefix_caching else None
+                ),
+                prefix_caching_coordinator_policy=(
+                    self._context.config.prefix_caching_coordinator_policy
+                ),
             )
             self._serve_started = True
 
