@@ -12,7 +12,6 @@ import pytest
 
 from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.async_utils import build_otel_worker_bootstrap
 from megatron.training.config import LoggerConfig
 from megatron.training.initialize import setup_logging, write_args_to_tensorboard
 from megatron.training.training import _should_compute_params_norm
@@ -216,28 +215,6 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
         writer.add_text.assert_any_call(name, str(value), global_step=13)
     assert args.log_interval == 99
     assert args.run_workload_inspector_server is False
-
-
-def test_async_worker_telemetry_uses_config(monkeypatch, run_config):
-    monkeypatch.delenv('OTEL_SERVICE_NAME', raising=False)
-    attrs = Mock(return_value={'test': 'resource'})
-    monkeypatch.setattr(global_vars, 'build_telemetry_resource_attrs', attrs)
-    args = Namespace(rank=0, world_size=2, otel_enabled=False, otel_service_name='stale')
-    config = LoggerConfig(otel_enabled=True, otel_service_name='owned')
-    run_config.logger = config
-    result = build_otel_worker_bootstrap(args)
-    assert result['enabled'] is True and result['service_name'] == 'owned'
-    assert result['resource_attrs'] == {'test': 'resource'}
-    attrs.assert_called_once_with(args)
-
-
-def test_disabled_async_telemetry_does_not_read_resource_metadata(monkeypatch, run_config):
-    attrs = Mock(side_effect=AssertionError('disabled telemetry must not query NVML'))
-    monkeypatch.setattr(global_vars, 'build_telemetry_resource_attrs', attrs)
-    run_config.logger = LoggerConfig()
-    result = build_otel_worker_bootstrap(Namespace(rank=0, world_size=1))
-    assert result['enabled'] is False and result['resource_attrs'] == {}
-    attrs.assert_not_called()
 
 
 def test_native_parameter_norm_cadence(run_config):

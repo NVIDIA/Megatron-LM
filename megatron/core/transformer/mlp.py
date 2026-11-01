@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
-from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing import ShardedTensor, quantized_tensors
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
     ShardedStateDict,
@@ -509,7 +509,7 @@ def apply_swiglu_sharded_factory(
             w_key = key
             v_key = key
 
-        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        tensor_w, tensor_v = quantized_tensors.chunk(t, 2, dim=swiglu_shard_axis)
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,

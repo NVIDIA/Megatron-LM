@@ -65,6 +65,15 @@ def experimental(request):
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
 
 
+@pytest.fixture(autouse=True)
+def spin_down_native_checkpointing():
+    """Gives each test fresh native checkpoint daemons."""
+    yield
+    from megatron.training.ckpt import native
+
+    native.spin_down()
+
+
 @pytest.fixture
 def run_config(monkeypatch):
     """Provide a config owner for isolated training-runtime consumers."""

@@ -4,7 +4,6 @@
 
 import contextlib
 import copy
-import inspect
 import os
 import random
 import re
@@ -33,15 +32,13 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing.quantized_tensors import keep_quantized_tensors
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
-    FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-from megatron.core.dist_checkpointing.strategies.torch import (
-    TorchDistLoadShardedStrategy,
-    TorchDistSaveShardedStrategy,
-)
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.validation import save_integrity_manifest
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
@@ -69,7 +66,8 @@ from megatron.training.utils.checkpoint_utils import (
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration
-from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
+from .async_utils import AsyncRequest, is_empty_async_queue, run_in_background, schedule_async_save
+from .ckpt import native as native_ckpt
 from .ckpt.glu_checkpointing import (
     prepare_glu_checkpoint_for_load,
     prepare_glu_checkpoint_for_save,
@@ -716,26 +714,19 @@ def save_checkpoint(
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
     save_dir = args.save
     if non_persistent_ckpt:
-        if args.non_persistent_ckpt_type == 'global':
-            ckpt_type = CheckpointType.GLOBAL
-            save_dir = (
-                args.non_persistent_global_ckpt_dir
-                if args.non_persistent_global_ckpt_dir
-                else os.path.join(save_dir, _NON_PERSISTENT_CKPT_SUBDIR)
-            )
-            # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
-            cleanup_old_non_persistent_checkpoint(
-                save_dir, leave_ckpt_num=1, do_async=args.async_save
-            )
-        elif args.non_persistent_ckpt_type == 'local':
-            ckpt_type = CheckpointType.LOCAL
-            save_dir = checkpointing_context['local_checkpoint_manager'].local_ckpt_dir
-        else:
-            raise NotImplementedError(
-                f'Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})'
-            )
+        ckpt_type = CheckpointType.GLOBAL
+        save_dir = (
+            args.non_persistent_global_ckpt_dir
+            if args.non_persistent_global_ckpt_dir
+            else os.path.join(save_dir, _NON_PERSISTENT_CKPT_SUBDIR)
+        )
+        # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
+        cleanup_old_non_persistent_checkpoint(
+            save_dir, leave_ckpt_num=1, do_async=args.async_save
+        )
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    native_save = ckpt_type == CheckpointType.GLOBAL and ckpt_format != 'torch'
     print_rank_0(
         f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving checkpoint '
         f'at iteration {iteration:7d} to {save_dir} in {ckpt_format} format'
@@ -853,7 +844,9 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+        with _otel_managed_span(
+            'checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True
+        ), keep_quantized_tensors(native_save):
             state_dict = generate_state_dict(
                 args,
                 model,
@@ -869,209 +862,44 @@ def save_checkpoint(
         validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
         state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
-        if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
+        if native_save:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
-            if checkpointing_context is not None and 'save_strategy' in checkpointing_context:
-                save_strategy = checkpointing_context['save_strategy']
-                # Already saved once before - don't need to rerun sharding validation
-                validate_sharding_integrity = not args.ckpt_assume_constant_structure
-            else:
-                validate_sharding_integrity = True
-                save_strategy = TorchDistSaveShardedStrategy(
-                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False)
-                )
-                if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
-                    save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
-                    if args.async_save:
-                        save_strategy.thread_count = args.dist_ckpt_workers
-                    else:
-                        # We don't allow per-rank parallel save for sync save
-                        logger.warning(
-                            'Per-rank parallel save is not supported for sync save. '
-                            'Setting args.dist_ckpt_workers to 1'
-                        )
-                        save_strategy.thread_count = 1
-                    if (
-                        checkpointing_context is not None
-                        and 'load_strategy' in checkpointing_context
-                    ):
-                        cached_global_metadata = getattr(
-                            checkpointing_context['load_strategy'], 'cached_global_metadata', None
-                        )
-                        if cached_global_metadata is not None:
-                            logger.debug('Plugging in the read metadata from the load strategy...')
-                            save_strategy.cached_global_metadata = cached_global_metadata
-                        else:
-                            logger.debug(
-                                'Failed to plug in the read metadata from the load strategy...'
-                            )
-
-                if args.ckpt_fully_parallel_save:
-                    if args.ckpt_fully_parallel_save_process_group == 'dp':
-                        process_group = (
-                            dp_cp_group
-                            if dp_cp_group is not None
-                            else mpu.get_data_parallel_group(with_context_parallel=True)
-                        )
-                    elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
-                        process_group = (
-                            expt_dp_group
-                            if expt_dp_group is not None
-                            else mpu.get_expert_data_parallel_group()
-                        )
-                    save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy,
-                        process_group,
-                        args.ckpt_assume_constant_structure,
-                        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
-                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
-                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
-                    )
-            # Allow opting out of save-side sharding validation entirely (even on
-            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
-            # skips the world-wide determine_global_metadata all_gather_object.
-            if not args.ckpt_load_validate_sharding_integrity:
-                validate_sharding_integrity = False
-            # Store save strategy for future checkpoint saves
-            if checkpointing_context is not None:
-                checkpointing_context['save_strategy'] = save_strategy
+            if ckpt_format == 'fsdp_dtensor':
+                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
             end_ckpt = time()
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
-                async_save_request = dist_checkpointing.save(
+                wait_until_durable = native_ckpt.save(
                     state_dict,
                     checkpoint_name,
-                    save_strategy,
-                    async_sharded_save=args.async_save,
-                    validate_access_integrity=validate_sharding_integrity,
+                    validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
                     preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                     content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                    verify_integrity=args.verify_integrity,
                 )
+                if args.async_save:
+                    async_save_request = AsyncRequest([run_in_background(wait_until_durable)])
+                else:
+                    wait_until_durable()
             # [ModelOpt]: save sharded modelopt_state
-            if has_nvidia_modelopt:
+            if has_nvidia_modelopt and ckpt_format == 'torch_dist':
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
-        elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                # TODO Handle non-empty directories (e.g., after a crash during saving).
-                ensure_directory_exists(checkpoint_name, check_parent=False)
-
-            if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
-
-            if args.async_save:
-                from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
-                    FileSystemWriterAsync,
-                )
-                from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-                    save_state_dict_async_plan,
-                )
-
-                planner = torch.distributed.checkpoint.DefaultSavePlanner()
-                coordinator_rank = 0
-                _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
-                _writer_kwargs = {}
-                if _cpu_shm:
-                    if (
-                        'use_cpu_shm_for_gpu_tensors'
-                        in inspect.signature(FileSystemWriterAsync.__init__).parameters
-                    ):
-                        _writer_kwargs['use_cpu_shm_for_gpu_tensors'] = True
-                    else:
-                        raise AssertionError(
-                            'Installed nvidia-resiliency-ext does not support '
-                            'use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext '
-                            'to use --async-ckpt-use-cpu-shm.'
-                        )
-                fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name,
-                    thread_count=args.dist_ckpt_workers,
-                    use_msc=args.enable_msc,
-                    **_writer_kwargs,
-                )
-
-                save_state_dict_ret = save_state_dict_async_plan(
-                    state_dict,
-                    fs_storage_writer,
-                    None,
-                    coordinator_rank,
-                    planner=planner,
-                    enable_cache=args.ckpt_assume_constant_structure,
-                )
-                async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret
-                )
-            else:
-                fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-                torch.distributed.checkpoint.save(
-                    state_dict=state_dict, storage_writer=fs_storage_writer
-                )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
-                if ckpt_type == CheckpointType.LOCAL:
-                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-                else:
-                    save_modelopt_state(model, state_dict)
+                save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            if ckpt_type == CheckpointType.LOCAL:
-                # Local checkpoints have no YAML sidecar; persist the full run config here.
-                cfg = get_run_config()
-                state_dict['run_config'] = cfg.to_dict()
-                try:
-                    from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
-                        MCoreTensorAwareStateDict,
-                    )
-                except ModuleNotFoundError:
-                    raise RuntimeError(
-                        "The 'nvidia_resiliency_ext' module is required for local "
-                        'checkpointing but was not found. Please ensure it is installed.'
-                    )
-                if (sharded_sd_metadata or {}).get('distrib_optim_sharding_type') in [
-                    'fully_reshardable',
-                    'dp_zero_gather_scatter',
-                ]:
-                    # Note: Currently full reshardabilty is not supported when local checkpoints are used.
-                    raise RuntimeError(
-                        f"Local checkpointing does not support optimizer sharding type '{sharded_sd_metadata['distrib_optim_sharding_type']}'. "
-                        "Don't use '--dist-ckpt-optim-fully-reshardable' when saving local checkpoints."
-                    )
-                if train_state_dict is not None:
-                    state_dict['train_state_metadata'] = train_state_dict
-                algo = args.non_persistent_local_ckpt_algo
-                cached_metadata = None
-                if (
-                    args.ckpt_assume_constant_structure
-                    and 'local_checkpoint_cache' in checkpointing_context
-                ):
-                    cached_metadata = checkpointing_context['local_checkpoint_cache']
-                state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
-                    state_dict,
-                    algo=algo,
-                    cached_metadata=cached_metadata,
-                    parallelization_group=(
-                        dp_cp_group
-                        if dp_cp_group is not None
-                        else mpu.get_data_parallel_group(with_context_parallel=True)
-                    ),
-                )
-                async_save_request = checkpointing_context['local_checkpoint_manager'].save(
-                    state_dict_for_save, iteration, is_async=bool(args.async_save)
-                )
-                checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
-            else:
-                assert ckpt_type == CheckpointType.LEGACY
-                # Save.
-                ensure_directory_exists(checkpoint_name)
-                torch.save(state_dict, checkpoint_name)
+            assert ckpt_type == CheckpointType.LEGACY
+            # Save.
+            ensure_directory_exists(checkpoint_name)
+            torch.save(state_dict, checkpoint_name)
 
     # Save dataloader state if the external dataloader supports it. This runs after the
     # checkpoint write: the dataloader state lands in the same iteration directory, and
@@ -1090,12 +918,11 @@ def save_checkpoint(
     )
 
     start_misc = time()
-    if ckpt_type != CheckpointType.LOCAL:
-        if not args.async_save:
-            assert async_save_request is None
-            # Wait so everyone is done (necessary)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+    if not args.async_save:
+        assert async_save_request is None
+        # Wait so everyone is done (necessary)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # And update the latest iteration
     if not skip_weight_ckpt and (
@@ -1104,141 +931,126 @@ def save_checkpoint(
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
-        if ckpt_type == CheckpointType.LOCAL:
-
-            def iter_finalize_fn():
-                cfg = get_run_config()
-                print_rank_0(
-                    f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully '
-                    f'saved local checkpoint from iteration {iteration:7d}'
-                )
-                if cfg.logger.log_progress and args.async_save:
-                    append_to_progress_log(
-                        args.save,
-                        f'Saved async local checkpoint\tIteration: {iteration}',
-                        barrier=False,
-                    )
-
-        else:
-
-            def _rank_and_size(explicit_rank, group, mpu_rank_fn, mpu_size_fn):
-                rank = (
-                    explicit_rank
-                    if explicit_rank is not None
-                    else get_pg_rank(group) if group is not None else mpu_rank_fn()
-                )
-                size = get_pg_size(group) if group is not None else mpu_size_fn()
-                return rank + 1, size
-
-            tensor_mp_rank, tp_size_to_print = _rank_and_size(
-                tensor_rank,
-                tp_group,
-                mpu.get_tensor_model_parallel_rank,
-                mpu.get_tensor_model_parallel_world_size,
+        def _rank_and_size(explicit_rank, group, mpu_rank_fn, mpu_size_fn):
+            rank = (
+                explicit_rank
+                if explicit_rank is not None
+                else get_pg_rank(group) if group is not None else mpu_rank_fn()
             )
-            pipeline_mp_rank, pp_size_to_print = _rank_and_size(
-                pipeline_rank,
-                pp_group,
-                mpu.get_pipeline_model_parallel_rank,
-                mpu.get_pipeline_model_parallel_world_size,
+            size = get_pg_size(group) if group is not None else mpu_size_fn()
+            return rank + 1, size
+
+        tensor_mp_rank, tp_size_to_print = _rank_and_size(
+            tensor_rank,
+            tp_group,
+            mpu.get_tensor_model_parallel_rank,
+            mpu.get_tensor_model_parallel_world_size,
+        )
+        pipeline_mp_rank, pp_size_to_print = _rank_and_size(
+            pipeline_rank,
+            pp_group,
+            mpu.get_pipeline_model_parallel_rank,
+            mpu.get_pipeline_model_parallel_world_size,
+        )
+        gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
+        gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
+
+        def iter_finalize_fn():
+            cfg = get_run_config()
+            prev_iteration = 0
+            save_retain_interval = getattr(
+                args, 'save_retain_interval', None
+            )  # For backwards compatibility of tests.
+            if save_retain_interval is not None:
+                if maybe_msc.os.path.exists(tracker_filename):
+                    with maybe_msc.open(tracker_filename, 'r') as f:
+                        prev_iteration = int(f.read().strip())
+            # Save run_config.yaml
+            checkpoint_name = get_checkpoint_name(
+                save_dir,
+                release=release,
+                iteration=iteration,
+                return_base_dir=True,
             )
-            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
-            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
+            if args.verify_integrity:
+                save_integrity_manifest(checkpoint_name)
+            from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
-            def iter_finalize_fn():
-                cfg = get_run_config()
-                prev_iteration = 0
-                save_retain_interval = getattr(
-                    args, 'save_retain_interval', None
-                )  # For backwards compatibility of tests.
-                if save_retain_interval is not None:
-                    if maybe_msc.os.path.exists(tracker_filename):
-                        with maybe_msc.open(tracker_filename, 'r') as f:
-                            prev_iteration = int(f.read().strip())
-                # Save run_config.yaml
-                checkpoint_name = get_checkpoint_name(
-                    save_dir,
-                    release=release,
-                    iteration=iteration,
-                    return_base_dir=True,
-                )
-                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+            run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
-                run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+            # NOTE(@maanug-nv): this try-except is a temporary safeguard for
+            # unit tests that do not create a config container.
+            # in the future, run_config.to_yaml() should always run.
+            try:
+                run_config = get_run_config()
+            except AssertionError as e:
+                if str(e) != 'run config is not initialized.':
+                    raise
+                warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+            else:
+                run_config.to_yaml(run_config_filename)
 
-                # NOTE(@maanug-nv): this try-except is a temporary safeguard for
-                # unit tests that do not create a config container.
-                # in the future, run_config.to_yaml() should always run.
-                try:
-                    run_config = get_run_config()
-                except AssertionError as e:
-                    if str(e) != 'run config is not initialized.':
-                        raise
-                    warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+            train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
+            train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
+
+            if train_state_dict is not None:
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.torch.save(train_state_dict, train_state_local_filename)
                 else:
-                    run_config.to_yaml(run_config_filename)
+                    torch.save(train_state_dict, train_state_local_filename)
 
-                train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
-                train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
-
-                if train_state_dict is not None:
-                    if MultiStorageClientFeature.is_enabled():
-                        msc = MultiStorageClientFeature.import_package()
-                        msc.torch.save(train_state_dict, train_state_local_filename)
-                    else:
-                        torch.save(train_state_dict, train_state_local_filename)
-
-                if (
-                    args.save_tokenizer_assets
-                    and args.ckpt_format == 'torch_dist'
-                    and iteration > 0
-                ):
-                    config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if cfg.logger.log_progress and args.async_save:
-                    append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
-                    )
-
-                if train_state_dict is not None:
-                    if MultiStorageClientFeature.is_enabled():
-                        msc = MultiStorageClientFeature.import_package()
-                        msc.torch.save(train_state_dict, train_state_global_filename)
-                    else:
-                        shutil.copy(train_state_local_filename, train_state_global_filename)
-
-                with maybe_msc.open(tracker_filename, 'w') as f:
-                    f.write('release' if release else str(iteration))
-
-                print_rank_0(
-                    f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
-                    f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
-                    f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
-                    f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
+            if (
+                args.save_tokenizer_assets
+                and args.ckpt_format == 'torch_dist'
+                and iteration > 0
+            ):
+                config = _default_config_from_args(TokenizerConfig, args)
+                save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+            if cfg.logger.log_progress and args.async_save:
+                append_to_progress_log(
+                    args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                 )
 
-                if save_retain_interval is not None:
-                    if _should_delete_previous_checkpoint(
-                        prev_iteration, iteration, save_retain_interval
-                    ):
-                        checkpoint_name = get_checkpoint_name(
-                            args.save, iteration=prev_iteration, return_base_dir=True
+            if train_state_dict is not None:
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.torch.save(train_state_dict, train_state_global_filename)
+                else:
+                    shutil.copy(train_state_local_filename, train_state_global_filename)
+
+            with maybe_msc.open(tracker_filename, 'w') as f:
+                f.write('release' if release else str(iteration))
+
+            print_rank_0(
+                f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
+                f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
+                f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
+                f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
+            )
+
+            if save_retain_interval is not None:
+                if _should_delete_previous_checkpoint(
+                    prev_iteration, iteration, save_retain_interval
+                ):
+                    checkpoint_name = get_checkpoint_name(
+                        args.save, iteration=prev_iteration, return_base_dir=True
+                    )
+                    # Don't delete if `checkpoint_name` is a symbolic link.
+                    if os.path.islink(
+                        checkpoint_name
+                    ):  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(
+                            f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
+                            f'at {args.save} since it is a symbolic link'
                         )
-                        # Don't delete if `checkpoint_name` is a symbolic link.
-                        if os.path.islink(
-                            checkpoint_name
-                        ):  # TODO: Make this work with MSC remote paths?
-                            print_rank_0(
-                                f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {args.save} since it is a symbolic link'
-                            )
-                        else:
-                            th = threading.Thread(
-                                target=_async_delete_checkpoint_impl,
-                                args=(args.save, prev_iteration, cfg.logger.log_progress),
-                            )
-                            th.start()
+                    else:
+                        th = threading.Thread(
+                            target=_async_delete_checkpoint_impl,
+                            args=(args.save, prev_iteration, cfg.logger.log_progress),
+                        )
+                        th.start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -1266,8 +1078,6 @@ def save_checkpoint(
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
-
         from megatron.training.distillation import get_logits_saver
 
         logits_saver = get_logits_saver()
@@ -1303,8 +1113,11 @@ def save_checkpoint(
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_logits_request = AsyncRequest(
-                async_fn=logits_saver._write_batched_tar,
-                async_fn_args=logits_saver.take_pending_data(),
+                futures=[
+                    run_in_background(
+                        logits_saver._write_batched_tar, *logits_saver.take_pending_data()
+                    )
+                ],
                 finalize_fns=logits_finalize_fns,
             )
 
@@ -1942,7 +1755,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
 def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing_context=None):
     if args.non_persistent_ckpt_type is None:
         return -1
-    elif args.non_persistent_ckpt_type == 'global':
+    else:
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
         if maybe_msc.os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
@@ -1953,12 +1766,6 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
             print_rank_0('WARNING: could not find the metadata file {}'.format(tracker_filename))
             print_rank_0('    will not load any non-persistent checkpoint')
         return iteration
-    elif args.non_persistent_ckpt_type == 'local':
-        return checkpointing_context['local_checkpoint_manager'].find_latest()
-    else:
-        assert (
-            False
-        ), f'Please use local or global non-persistent checkpoints(got: {args.non_persistent_ckpt_type})'
 
 
 def _load_non_persistent_base_checkpoint(
@@ -1977,42 +1784,23 @@ def _load_non_persistent_base_checkpoint(
     Depending on the non_persistent_ckpt_type, different logic may be required.
     """
     assert args.non_persistent_ckpt_type is not None
-    if args.non_persistent_ckpt_type == 'global':
-        if not rank0:
-            print_rank_0(
-                f'Loading from a non-persistent checkpoint (non-persistent iter {non_persistent_iteration})'
-            )
-        return _load_global_dist_base_checkpoint(
-            non_persistent_global_dir,
-            args,
-            rank0,
-            sharded_state_dict,
-            non_persistent_iteration,
-            False,
-            checkpointing_context=checkpointing_context,
-            dp_cp_group=dp_cp_group,
-            expt_dp_group=expt_dp_group,
-            checkpoint_group=checkpoint_group,
-            gtp_pad_for_alignment=gtp_pad_for_alignment,
+    if not rank0:
+        print_rank_0(
+            f'Loading from a non-persistent checkpoint (non-persistent iter {non_persistent_iteration})'
         )
-    elif args.non_persistent_ckpt_type == 'local':
-        intermediate_state_dict, checkpoint_name = checkpointing_context[
-            'local_checkpoint_manager'
-        ].load()
-        state_dict = intermediate_state_dict.to_state_dict(
-            sharded_state_dict,
-            algo=args.non_persistent_local_ckpt_algo,
-            parallelization_group=(
-                dp_cp_group
-                if dp_cp_group is not None
-                else mpu.get_data_parallel_group(with_context_parallel=True)
-            ),
-        )
-        return state_dict, checkpoint_name, False, CheckpointType.LOCAL
-    else:
-        raise NotImplementedError(
-            f'Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})'
-        )
+    return _load_global_dist_base_checkpoint(
+        non_persistent_global_dir,
+        args,
+        rank0,
+        sharded_state_dict,
+        non_persistent_iteration,
+        False,
+        checkpointing_context=checkpointing_context,
+        dp_cp_group=dp_cp_group,
+        expt_dp_group=expt_dp_group,
+        checkpoint_group=checkpoint_group,
+        gtp_pad_for_alignment=gtp_pad_for_alignment,
+    )
 
 
 def _gtp_pad_for_alignment_from_args(args):
@@ -2054,7 +1842,6 @@ def _load_global_dist_base_checkpoint(
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     load_strategy = TorchDistLoadShardedStrategy(
-        cache_metadata=args.ckpt_assume_constant_structure,
         stream_ckpt_dequant=getattr(args, 'stream_ckpt_dequant', False),
     )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.

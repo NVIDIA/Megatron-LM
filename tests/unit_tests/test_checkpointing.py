@@ -766,6 +766,7 @@ def test_save_checkpoint(
 
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    args.ckpt_load_validate_sharding_integrity = True
 
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)

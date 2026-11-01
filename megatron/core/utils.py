@@ -1126,6 +1126,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
     if HAVE_GTP:
+        from megatron.core.dist_checkpointing.quantized_tensors import keeps_packed
         from megatron.core.fp8_utils import is_float8tensor
         from megatron.core.tensor_parallel.gtp_api import (
             dequantize_gtp_native_fp8,
@@ -1156,7 +1157,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
             # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
             # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
-            if is_float8tensor(tensor):
+            if is_float8tensor(tensor) and not keeps_packed(tensor):
                 fp8_param = tensor
                 tensor = dequantize_gtp_native_fp8(tensor)
                 # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
