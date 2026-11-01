@@ -783,14 +783,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            K + "test_runtime_cp_attention.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
-        "GEMM path and mxfp8_quantize_only are not replayed.",
+        "softmax_scale MultiLatentAttention hands to its core attention. The sink offset it hands "
+        "to the dynamic-inference flash_decode_and_prefill is replayed on the FA2 prefill path in "
+        "test_runtime_cp_attention.py; the FlashMLA decode branch (SM90 only) is not. In "
+        "batch-invariant mode decode-only steps skip FlashMLA for the unabsorbed varlen kernel "
+        "with one KV split; TestMLALatentCacheDecode in "
+        "tests/unit_tests/transformer/test_multi_latent_attention.py checks that path bitwise "
+        "across co-batches and against a prefill. The TE FusedMLAQUpProj GEMM path and "
+        "mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
