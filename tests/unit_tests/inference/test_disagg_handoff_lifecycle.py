@@ -4,14 +4,19 @@
 
 import asyncio
 from collections import deque
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
 import msgpack
 import pytest
 import torch
+import torch.distributed as dist
+import zmq
 
+from megatron.core import parallel_state
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -34,7 +39,11 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -44,6 +53,7 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from tests.unit_tests.test_utilities import Utils
 
 
 class _PendingHandle:
@@ -163,7 +173,11 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             kv_block_allocator=_KvAllocator(),
             mamba_slot_allocator=None,
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
-            memory_buffer=torch.empty(1),
+            memory_buffer=torch.full((2, 1, 256, 4, 1, 1), 7.0),
+            cache_mla_latent=False,
+        )
+        self.context._initialize_mha_value_pages = partial(
+            DynamicInferenceContext._initialize_mha_value_pages, self.context
         )
         self._kv_transfer_agent = _TransferAgent()
         if hybrid:
@@ -784,6 +798,7 @@ def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
     engine._can_schedule_chunked_prefill = mock.Mock(return_value=True)
     engine._cg_admission_gating_active = mock.Mock(return_value=False)
     context._compute_prefix_match = mock.Mock(return_value=SimpleNamespace(prefix_skip_tokens=0))
+    context.check_availability = mock.Mock(return_value=(True, True, True))
     context.add_request = mock.Mock(
         side_effect=lambda _: allocator.retain_memory_blocks(
             [allocator.kv_hash_to_block_id[block_hash]]
@@ -1365,6 +1380,70 @@ def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
     assert 8 not in tracker._reports
 
 
+@pytest.mark.parametrize("late_failed", [False, True])
+def test_cancel_waits_for_staggered_mp_reports(handoff_loop, late_failed):
+    """ABORT keeps transfer ownership until every MP rank reports safe storage."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    group = parallel_state.get_model_parallel_group()
+    context = zmq.Context()
+    tracker = HandoffCompletionTracker(context, group)
+    try:
+        engine = _HandoffHarness(handoff_loop)
+        engine._handoff_completion_tracker = tracker
+        allocator = engine.context.kv_block_allocator
+        block = int(allocator.allocate_memory_blocks(1)[0])
+        pending = _pending_import(engine, 7, block, 107)
+        pending.handle = mock.Mock(
+            poll=mock.Mock(return_value=tracker.is_coordinator), storage_safe=tracker.is_coordinator
+        )
+        engine._pending_kv_imports.append(pending)
+        engine._report_completed_kv_imports()
+        assert engine._drain_handoff_completion_notifications() == []
+        if tracker.is_coordinator:
+            assert tracker._reports == {7: {0: (False, True)}}
+        dist.barrier(group=group)
+        assert engine.abort_kv_handoff(7)
+        assert engine.abort_kv_handoff(7)
+        assert pending.cancel_requested and not pending.future.done()
+        assert list(engine._pending_kv_imports) == [pending]
+        assert allocator.block_ref_counts[block] == 1
+        assert engine._admit_pending_kv_imports() == 0
+        assert not allocator.releases
+        dist.barrier(group=group)
+        if not tracker.is_coordinator:
+            pending.handle.poll.return_value = True
+            pending.handle.storage_safe = True
+            if late_failed:
+                pending.local_error = RuntimeError("late transfer failure")
+            engine._report_completed_kv_imports()
+        else:
+            assert tracker._socket.poll(5000)
+        decisions = [engine._drain_handoff_completion_notifications()]
+        dist.broadcast_object_list(
+            decisions, src=dist.get_process_group_ranks(group)[0], group=group
+        )
+        assert decisions[0] == [(7, late_failed, True)]
+        for request_id, failed, source_safe in decisions[0]:
+            engine._record_handoff_completion_notification(request_id, failed, source_safe)
+        assert engine._admit_pending_kv_imports() == 0
+        if late_failed:
+            assert isinstance(pending.future.exception(), RuntimeError)
+        else:
+            assert pending.future.cancelled()
+        assert not tracker._reports and not tracker._failure_notified
+        assert not engine._pending_kv_imports and not engine._quarantined_kv_imports
+        assert not engine._handoff_completion_notifications
+        assert not engine.requests and not engine.waiting_request_ids
+        assert allocator.block_ref_counts[block] == 0
+        assert allocator.releases == [[block]]
+        assert engine._drain_handoff_completion_notifications() == []
+    finally:
+        for socket in tracker.sockets:
+            socket.close(linger=0)
+        context.term()
+        Utils.destroy_model_parallel()
+
+
 def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch):
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
@@ -1533,6 +1612,9 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine._kv_transfer_agent.calls == [(kv_meta, [102], [12])]
     assert pending.local_blocks == [10, 11, 12]
     assert pending.cached_prefix_block_count == 2
+    values = engine.context.memory_buffer[1, :, pending.continuation_blocks]
+    assert pending.continuation_blocks == [13] and torch.count_nonzero(values) == 0
+    assert torch.count_nonzero(engine.context.memory_buffer != 7) == values.numel()
     with mock.patch(
         "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
     ) as admit:
@@ -1944,3 +2026,96 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         is not requests[1].disaggregated_params["kv_meta"]
     )
     assert all("ssm" not in meta for meta in engine._kv_peer_metas)
+
+
+class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
+    """Prefill engine shell that drives the real coordinator loop on scripted work."""
+
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward) -> None:
+        self._initialize_disaggregation_state()
+        self._kv_transfer_role = "prefill"
+        self.state = EngineState.RUNNING
+        self.rank = 0
+        self.tp_ep_world_size = ep_world_size
+        self.ep_consensus_interval = 20
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus = (0, False)
+        self.use_synchronous_zmq_collectives = False
+        self.waiting_request_ids = deque([7])
+        self.context = SimpleNamespace(
+            step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
+        )
+        self.controller = SimpleNamespace(dummy_forward=dummy_forward)
+        self.step_start_event = mock.Mock()
+        self.step_end_event = mock.Mock()
+        self.step_calls = 0
+        self.all_reduce_inputs = []
+        self._peer_work = peer_work
+        self._iterations_left = iterations
+        if ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = SimpleNamespace(
+                all_reduce_max=self._all_reduce_max
+            )
+
+    async def _all_reduce_max(self, local_work, consensus, async_op):
+        self.all_reduce_inputs.append(local_work)
+        return max(local_work, self._peer_work), consensus
+
+    def schedule_requests(self):
+        self._iterations_left -= 1
+        if self._iterations_left < 0:
+            self.state = EngineState.STOPPING
+        return 0
+
+    async def async_step(self, *, verbose=False):
+        # The prompt finishes prefill in one step and leaves the batch; its detached
+        # recurrent-state slot stays pinned until decode releases the handoff.
+        self.step_calls += 1
+        self.waiting_request_ids.clear()
+        await asyncio.sleep(0)
+
+    async def shutdown(self):
+        return None
+
+
+def _run_coordinator_loop(engine, loop):
+    run = DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__
+    loop.run_until_complete(asyncio.wait_for(run(engine, loop=loop), timeout=30))
+
+
+def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loop):
+    """A drained EP=1 engine must not act on a cached EP consensus.
+
+    Pending handoffs may hold every request-owned recurrent-state slot, and EP=1 reserves no
+    dummy slot, so a dummy forward here fails to allocate a slot and kills the engine.
+    """
+    dummy_forward = mock.Mock(
+        side_effect=AssertionError(
+            "No free recurrent-state slots for 1 expert-parallel dummy request(s)"
+        )
+    )
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=1, peer_work=0, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.step_calls == 1
+    dummy_forward.assert_not_called()
+    assert engine.context.step_count == 0
+    assert engine._last_ep_consensus == (0, False)
+
+
+def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
+    """EP>1 ranks still reuse consensus within the interval and join busy peers."""
+    dummy_forward = mock.Mock()
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.all_reduce_inputs == [1]
+    assert engine.step_calls == 1
+    assert dummy_forward.call_count == 3
+    assert engine.context.step_count == 3
