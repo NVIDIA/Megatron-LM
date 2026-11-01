@@ -261,6 +261,7 @@ class TestFP4Param:
                 seq_length=self.seq_length,
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         for i in range(200):

@@ -3121,9 +3121,17 @@ def setup_model_and_optimizer(
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=False, owner="setup_model_and_optimizer"
+                )
+            )
         if getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=True, owner="setup_model_and_optimizer"
+                )
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -5348,6 +5356,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff

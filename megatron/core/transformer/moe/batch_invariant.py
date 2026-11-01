@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
@@ -267,6 +267,7 @@ def unpermute(
     probs: Optional[torch.Tensor],
     num_experts: int,
     inverse_map: torch.Tensor,
+    ep_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Batch-invariant MoE unpermute.
 
@@ -274,8 +275,28 @@ def unpermute(
     shapes and adds contributions by EP rank then top-k slot, matching the
     inference NVLS rank-ordered combine. Without ``probs`` the tree runs as one
     Triton kernel; with ``probs`` it runs as a loop over EP ranks and top-k slots.
+    ``ep_size`` is the expert-parallel size of the caller's token dispatcher, which
+    splits the experts into ``ep_size`` contiguous per-rank shards. Omitting it is
+    deprecated: the size of the global expert-parallel group is used, with a
+    ``ProcessGroupFallbackWarning``.
     """
-    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+    if ep_size is None:
+        # Deprecated fallback for callers that do not pass their dispatcher's EP size.
+        ep_group = resolve_process_groups(
+            None,
+            owner="unpermute",
+            required=("ep",),
+            argument="ep_size",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        ).ep
+        if ep_group is None and torch.distributed.is_initialized():
+            raise ValueError(
+                "unpermute needs ep_size, and parallel_state has no expert-parallel group. "
+                "Pass the expert-parallel size of the token dispatcher."
+            )
+        # A single process without torch.distributed has one EP rank.
+        ep_size = 1 if ep_group is None else ep_group.size()
     assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
     if probs is None and HAVE_TRITON and permuted_tokens.is_cuda:
         out = _RankTreeUnpermute.apply(

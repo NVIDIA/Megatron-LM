@@ -22,6 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -278,6 +279,14 @@ def test_nvtx_decorator():
     assert all(execution_tracker.values())
 
 
+def _global_dp_groups():
+    """Return the replicate data-parallel groups of the global grid as keyword arguments."""
+    return dict(
+        dp_group=parallel_state.get_data_parallel_group(with_gtp_remat=False),
+        expt_dp_group=parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+    )
+
+
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_check_param_hashes_across_dp_replicas():
@@ -291,12 +300,12 @@ def test_check_param_hashes_across_dp_replicas():
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
-    assert util.check_param_hashes_across_dp_replicas([model])
+    assert util.check_param_hashes_across_dp_replicas([model], **_global_dp_groups())
 
     # Now check case where replica 0 disagrees with all other replicas.
     if rank == 0:
         model.weight.data.fill_(0.0)
-    param_hashes_match = util.check_param_hashes_across_dp_replicas([model])
+    param_hashes_match = util.check_param_hashes_across_dp_replicas([model], **_global_dp_groups())
     expected_param_hashes_match = rank == 0
     assert param_hashes_match == expected_param_hashes_match
 
@@ -317,12 +326,12 @@ def test_cross_check_param_hashes_across_dp_replicas():
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
-    assert util.check_param_hashes_across_dp_replicas([model], True)
+    assert util.check_param_hashes_across_dp_replicas([model], True, **_global_dp_groups())
 
     # Now check case where replica 0 disagrees with all other replicas.
     if rank == 0:
         model.weight.data.fill_(0.0)
-    assert not util.check_param_hashes_across_dp_replicas([model], True)
+    assert not util.check_param_hashes_across_dp_replicas([model], True, **_global_dp_groups())
 
     # Teardown.
     _deinit_distributed()
@@ -394,9 +403,10 @@ class TestCheckParamHashesWithModelGroups:
             assert util.check_param_hashes_across_dp_replicas(
                 [model], cross_check, dp_group=self.dp_group, expt_dp_group=self.expt_dp_group
             )
-        # Without groups, the check compares across the global groups, which span ranks whose
-        # parameters differ.
-        assert not util.check_param_hashes_across_dp_replicas([model], cross_check=True)
+        # The global groups span ranks whose parameters differ.
+        assert not util.check_param_hashes_across_dp_replicas(
+            [model], cross_check=True, **_global_dp_groups()
+        )
 
     @pytest.mark.parametrize("cross_check", [False, True])
     def test_detects_a_mismatch_within_the_given_groups(self, cross_check):
@@ -476,7 +486,9 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
         optimizer_config = OptimizerConfig(
             bf16=True, use_distributed_optimizer=use_distributed_optimizer
         )
-        _ = get_megatron_optimizer(optimizer_config, [model])
+        _ = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
         for param in model.parameters():
             assert hasattr(param, 'main_param')
             if use_distributed_optimizer:
@@ -542,7 +554,9 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         optimizer_config = OptimizerConfig(
             bf16=True, use_distributed_optimizer=use_distributed_optimizer
         )
-        _ = get_megatron_optimizer(optimizer_config, [model])
+        _ = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
         for param in model.parameters():
             # Only bf16/fp16 parameters get main_param attribute.
             # Router weights are always fp32, so they won't have main_param.

@@ -14,7 +14,11 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -531,6 +535,7 @@ def unpermute(
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
     batch_invariant_inverse_map: Optional[torch.Tensor] = None,
+    ep_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -559,6 +564,10 @@ def unpermute(
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by batch-invariant CUDA graph paths.
+        ep_size (int, optional): Expert-parallel size of the calling token dispatcher. The
+            batch-invariant path combines the experts of each EP rank in rank order. Omitting
+            it there is deprecated: the size of the global expert-parallel group is used, with
+            a ``ProcessGroupFallbackWarning``.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -593,6 +602,7 @@ def unpermute(
             probs=probs,
             num_experts=routing_map.size(1),
             inverse_map=batch_invariant_inverse_map,
+            ep_size=ep_size,
         )
 
     _, hidden = restore_shape
@@ -1323,14 +1333,17 @@ def get_updated_expert_bias(
         expert_bias (torch.Tensor): The bias for each expert.
         expert_bias_udpate_rate (float): The update rate for the expert bias.
         tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
-            data, and context parallel ranks that share the router expert-bias update.
+            data, and context parallel ranks that share the router expert-bias update. If None,
+            the global group from ``parallel_state`` is used; this fallback is deprecated.
 
     Returns:
         torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
         if tp_dp_cp_group is None:
-            # TODO(Hepteract): delete the usage of the global parallel_state.
+            warn_global_process_group_fallback(
+                "get_updated_expert_bias", "tp_dp_cp_group", deprecated_in="0.21", removed_in="0.23"
+            )
             tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
                 with_context_parallel=True
             )
@@ -1684,28 +1697,43 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
     return False
 
 
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Initialize process groups with the global parallel_state.
-def get_default_pg_collection() -> ProcessGroupCollection:
-    """Get the default process groups for MoE.
+# Process groups that MoELayer, its router and its token dispatchers read from the collection.
+MOE_LAYER_PROCESS_GROUPS = ("ep", "tp", "cp", "expt_tp", "tp_ep", "tp_cp", "tp_dp_cp")
+
+
+def get_default_pg_collection(
+    *, owner: str = "get_default_pg_collection"
+) -> ProcessGroupCollection:
+    """Get the default process groups for MoE from the global grid in ``parallel_state``.
+
+    This is the deprecated fallback for callers that do not pass the owning model's collection.
+    It emits a ``ProcessGroupFallbackWarning`` that names ``owner``, once per process. It sets
+    the fields in ``MOE_LAYER_PROCESS_GROUPS`` and the experts' data-parallel groups ``expt_dp``
+    and ``expt_dp_gtp_remat``; every other field stays unset.
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``pg_collection``.
 
     Returns:
         ProcessGroupCollection: The default process groups for MoE.
+
+    Raises:
+        RuntimeError: ``parallel_state`` has not created one of these groups.
     """
-    pg_collection = ProcessGroupCollection()
-    pg_collection.ep = parallel_state.get_expert_model_parallel_group()
-    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
-    pg_collection.cp = parallel_state.get_context_parallel_group()
-    pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
-    pg_collection.expt_dp_gtp_remat = parallel_state.get_expert_data_parallel_group(
-        check_initialized=False
+    pg_collection = resolve_process_groups(
+        None,
+        owner=owner,
+        required=MOE_LAYER_PROCESS_GROUPS + ("expt_dp", "expt_dp_gtp_remat"),
+        deprecated_in="0.21",
+        removed_in="0.23",
     )
-    pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
-    pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
-    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-        with_context_parallel=True
-    )
+    # The shim returns None for a group that parallel_state has not created.
+    missing = [name for name, group in vars(pg_collection).items() if group is None]
+    if missing:
+        raise RuntimeError(
+            f"{owner} was called without pg_collection, and parallel_state has not created the "
+            f"{', '.join(missing)} groups. Pass the owning model's process groups."
+        )
     return pg_collection
 
 

@@ -897,7 +897,11 @@ def test_precision_aware_optimizer(
         exp_avg_dtype=torch.float32,
         exp_avg_sq_dtype=torch.float32,
     )
-    baseline_optim = get_megatron_optimizer(baseline_optimizer_config, [baseline_model])
+    baseline_optim = get_megatron_optimizer(
+        baseline_optimizer_config,
+        [baseline_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
 
     # Create test model with specified dtypes for optimizer states
     test_model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
@@ -919,7 +923,11 @@ def test_precision_aware_optimizer(
         exp_avg_dtype=moment_dtype,
         exp_avg_sq_dtype=moment_dtype,
     )
-    test_optim = get_megatron_optimizer(test_optimizer_config, [test_model])
+    test_optim = get_megatron_optimizer(
+        test_optimizer_config,
+        [test_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
 
     # Use same input for both models
     input = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
@@ -1013,7 +1021,9 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
         exp_avg_dtype=torch.float32,
         exp_avg_sq_dtype=torch.float32,
     )
-    optim = get_megatron_optimizer(optimizer_config, [model])
+    optim = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     # Run a training step to populate optimizer state
     input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
@@ -1117,7 +1127,9 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
             fp16=False,
             use_distributed_optimizer=use_distributed_optimizer,
         )
-    optim = get_megatron_optimizer(optimizer_config, [model])
+    optim = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     model_sharded_state_dict = model.sharded_state_dict()
     metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
@@ -1150,7 +1162,9 @@ def test_optimizer_reload_model_params():
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
     optimizer_config = OptimizerConfig(optimizer='adam', bf16=True, use_distributed_optimizer=True)
-    optim = get_megatron_optimizer(optimizer_config, [model])
+    optim = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     # Set all model params to 2.
     for param in model.parameters():
@@ -1294,7 +1308,9 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
         optimizer_config = OptimizerConfig(
             optimizer='adam', bf16=True, use_distributed_optimizer=True
         )
-        optim = get_megatron_optimizer(optimizer_config, [model])
+        optim = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
 
         # Checkpoint-style state dict: canonical keys from sharded_state_dict, all values 3.
         sharded_state_dict = layer.sharded_state_dict(prefix="decoder.layers.0.")
@@ -1455,9 +1471,11 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
 
     # Test 4: Compare with default process groups optimizer (if world_size allows)
     if world_size == 1:  # Only test on single GPU to avoid complex setup
-        # Create optimizer with default process groups
+        # Create optimizer with the default (global) process groups
         default_optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=model_chunks
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Both optimizers should have the same structure

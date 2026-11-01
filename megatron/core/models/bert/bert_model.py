@@ -84,7 +84,9 @@ class BertModel(LanguageModule):
         super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=self.pg_collection
+            )
 
         if return_embeddings:
             assert self.post_process and self.add_binary_head
