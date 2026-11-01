@@ -495,7 +495,8 @@ class MultimodalPromptConfig:
 # The process groups that inference reads from `InferenceConfig.pg_collection`: the model wrapper
 # (tp, pp), the text generation controller (pp, dp), the dynamic context (tp, pp, ep), the dynamic
 # engine (tp, pp, dp, mp, ep), the disaggregated coordinator setup (tp, pp, dp, ep, cp, expt_tp)
-# and the Dynamo engine service (dp, expt_dp).
+# and the Dynamo engine service (dp, expt_dp). The dynamic context and engine also read tp_ep, which
+# a configured collection may omit; see `InferenceConfig.resolve_pg_collection`.
 _INFERENCE_PROCESS_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
 
 # The groups that inference passes to torch.distributed collectives, or whose ranks decide which
@@ -904,12 +905,13 @@ class InferenceConfig:
         config construction.
 
         If `pg_collection` is unset, the collection that `model` was built with is used when it
-        sets every group that inference reads (tp, pp, dp, mp, ep, cp, expt_tp and expt_dp).
-        Otherwise the groups come from `megatron.core.parallel_state`; that fallback is deprecated
-        and warns.
+        sets every group that inference reads (tp, pp, dp, mp, ep, cp, expt_tp, expt_dp and
+        tp_ep). Otherwise the groups come from `megatron.core.parallel_state`; that fallback is
+        deprecated and warns.
 
-        The collection, configured or not, must set every one of these groups, and tp, pp, dp and
-        mp must be process groups rather than None, because inference runs collectives on them.
+        The collection, configured or not, must set every one of these groups except tp_ep, and
+        tp, pp, dp and mp must be process groups rather than None, because inference runs
+        collectives on them.
 
         See ``docs/developer/parallel-state-deprecation.md``.
 
@@ -920,26 +922,30 @@ class InferenceConfig:
             The collection, which is also stored in `pg_collection`.
 
         Raises:
-            ValueError: The collection lacks a group that inference reads, or sets tp, pp, dp or
-                mp to None.
+            ValueError: The collection lacks a group that inference reads other than tp_ep, or
+                sets tp, pp, dp or mp to None.
             TypeError: The collection is a `MultiModuleProcessGroupCollection`.
         """
         pg_collection = self.pg_collection
         if pg_collection is None:
+            # The dynamic context and engine also read tp_ep, the group that the MoE dispatchers
+            # span. An unset field reads as None, which sizes the group to 1, so the model's
+            # collection must set tp_ep and the fallback builds it. A configured one may omit it.
+            required = (*_INFERENCE_PROCESS_GROUPS, "tp_ep")
             model_pg_collection = None
             if model is not None:
                 model_pg_collection = getattr(unwrap_model(model), "pg_collection", None)
             # A model built on a partial collection, for example one from
             # use_mpu_process_groups(required_pgs=[...]), lacks groups that inference reads.
             if model_pg_collection is not None and all(
-                name in vars(model_pg_collection) for name in _INFERENCE_PROCESS_GROUPS
+                name in vars(model_pg_collection) for name in required
             ):
                 pg_collection = model_pg_collection
             else:
                 pg_collection = resolve_process_groups(
                     None,
                     owner=type(self).__name__,
-                    required=_INFERENCE_PROCESS_GROUPS,
+                    required=required,
                     deprecated_in="0.21",
                     removed_in="0.23",
                 )
