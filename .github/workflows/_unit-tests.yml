@@ -39,7 +39,8 @@ permissions:
 jobs:
   select:
     name: unit tests selection
-    if: inputs.unit_testmon_mode == 'enforce'
+    # Only main has a supported Testmon baseline. Other targets run full buckets.
+    if: inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -131,8 +132,8 @@ jobs:
     name: ${{ matrix.bucket }}
     needs: select
     # CPU failures stop GPU dispatch; empty selections never allocate a GPU.
-    # Explicit full-suite requests bypass selective planning.
-    if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
+    # Full-suite requests and unsupported target branches bypass selective planning.
+    if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || inputs.unit_testmon_target_branch != 'main' || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
