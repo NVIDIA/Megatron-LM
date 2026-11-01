@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, PrefetchOrder
+from .context import FsdpContext
 from .countdown import Countdown
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
@@ -277,18 +277,6 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
-            order = context.execution_order
-            # Later roots continue the shared order rather than starting a new pass.
-            if (
-                not is_recomputing
-                and order
-                and order[0].module is self
-                and (
-                    context.prefetch_order is PrefetchOrder.REGISTRATION
-                    or order.position == len(order)
-                )
-            ):
-                order.reset_cursor()
             context.allgather_stream.wait_stream(context.current_stream())
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
@@ -341,36 +329,23 @@ class FsdpModule:
                     )
 
     def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
-        """Prefetch successors from ``order`` according to this module's budget.
-
-        Successors are unsharded for this module's phase, which is the compute they
-        run next in ``order``.
-        """
-        if not order:
-            return
-        last_event = None if order.position == 0 else order[order.position - 1]
-        event = ExecutionEvent(module=cast(nn.Module, self), phase=self.phase)
-
-        # Preset orders skip consecutive duplicate events emitted by MTP. Recorded
-        # orders include those occurrences and must consume each one.
-        if self.context.prefetch_order is PrefetchOrder.RECORDED or event != last_event:
-            if order.position >= len(order) or order[order.position] != event:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            order.advance()
-
-        if prefetch_size == 0:
-            return
+        """Validate the current event, prefetch successors, and advance once."""
+        event = ExecutionEvent(cast(nn.Module, self), self.phase)
+        if order.peek() != event:
+            raise RuntimeError(
+                "FSDP module calls diverged from the expected execution order "
+                f"at position {order.position}: expected {order.peek()}, got {event}."
+            )
         prefetched_size = 0
-        for index in range(order.position, len(order)):
-            event = order[index]
-            # Forward and backward retain their separate prefetch boundaries.
-            if event.phase is not self.phase:
+        for next_event in order.successors():
+            if prefetch_size is not None and prefetched_size >= prefetch_size:
                 break
-            fsdp_module = cast(FsdpModule, event.module)
-            fsdp_module._unshard_parameter_groups(self.phase)
+            fsdp_module = cast(FsdpModule, next_event.module)
+            fsdp_module._unshard_parameter_groups(next_event.phase)
+            if prefetch_size is None:
+                break
             prefetched_size += fsdp_module.num_parameter_elements
-            if prefetch_size is None or prefetched_size >= prefetch_size:
-                break
+        order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Ask each group to gather missing weights on the all-gather stream."""

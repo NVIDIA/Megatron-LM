@@ -1,97 +1,65 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Coverage for occurrence-based FSDP prefetch and weak module ownership."""
+"""Coverage for one cursor over registration or recorded execution sequences."""
 
 import gc
-from unittest.mock import Mock
 from weakref import ref
 
 import pytest
 from torch import nn
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import PrefetchOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
-@pytest.mark.parametrize(
-    'budget, expected',
-    [(None, [[1], [2], [2], []]), (0, [[], [], [], []]), (2, [[1, 2], [2], [2], []])],
-)
-@pytest.mark.parametrize("phase", [Phase.FORWARD, Phase.BACKWARD])
-def test_prefetch_reuses_adjacent_shared_calls(budget, expected, phase):
-    """Construction-order prefetch reuses a shared MTP block's cursor and successors."""
-    modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
-    prefetched = []
-    for module in modules:
-        module.context = Mock(prefetch_order=PrefetchOrder.REGISTRATION)
-        module.phase = phase
-        # Prefetch passes the successor's compute phase; record only which module it targets.
-        module._unshard_parameter_groups.side_effect = (
-            lambda _phase, target=module: prefetched.append(target)
-        )
-    sequence = [modules[index] for index in (0, 1, 1, 2)]
-    order = ExecutionOrder(ExecutionEvent(module=module, phase=phase) for module in modules)
-    # Root entry starts a new pass through the construction order.
+def test_cursor_wraps_across_phases():
+    """One cursor follows the complete trace, including adjacent repeated calls."""
+    first, second = nn.Module(), nn.Module()
+    events = [
+        ExecutionEvent(first, Phase.FORWARD),
+        ExecutionEvent(first, Phase.FORWARD),
+        ExecutionEvent(second, Phase.FORWARD),
+        ExecutionEvent(first, Phase.BACKWARD),
+        ExecutionEvent(second, Phase.BACKWARD),
+        ExecutionEvent(first, Phase.BACKWARD),
+    ]
+    order = ExecutionOrder(events)
     for _ in range(2):
-        order.reset_cursor()
-        for module, targets, position in zip(sequence, expected, (1, 2, 2, 3)):
-            prefetched.clear()
-            FsdpModule._prefetch_parameter_groups(module, order, budget)
-            assert prefetched == [modules[index] for index in targets]
-            assert order.position == position
+        for index, event in enumerate(events):
+            assert order.peek() == event
+            assert list(order.successors()) == events[index + 1 :]
+            assert order.peek() == event
+            order.advance()
+        assert order.position == 0
 
 
-def test_iteration_and_weak_references():
-    """Traversal preserves repeated occurrences without retaining deleted modules."""
+def test_empty_order_can_be_populated():
+    """Recording does not move the cursor, so replay starts at the first event."""
+    order = ExecutionOrder()
+    assert order.peek() is None
+    with pytest.raises(RuntimeError, match="empty"):
+        order.advance()
+    event = ExecutionEvent(nn.Module(), Phase.FORWARD)
+    order.append(event)
+    assert order.peek() == event
+    for _ in range(2):
+        assert list(order.successors()) == []
+        order.advance()
+        assert order.peek() == event
+
+
+def test_order_does_not_keep_modules_alive():
+    """The sequence holds weak references and iteration skips dead modules."""
     first, second = nn.Module(), nn.Module()
     order = ExecutionOrder(
-        ExecutionEvent(module=module, phase=Phase.FORWARD)
-        for module in [first, second, first, second]
+        [ExecutionEvent(first, Phase.FORWARD), ExecutionEvent(second, Phase.FORWARD)]
     )
-    assert [event.module for event in order] == [first, second, first, second]
-
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    order.advance()
-    with pytest.raises(RuntimeError, match="destroyed"):
-        order[order.position]
-    order.reset_cursor()
-    first.context = Mock(prefetch_order=PrefetchOrder.REGISTRATION)
-    first.phase = Phase.FORWARD
-    with pytest.raises(RuntimeError, match="destroyed"):
-        FsdpModule._prefetch_parameter_groups(first, order, None)
-    assert order.position == 1
-
-
-def test_explicit_reset_and_exhaustion():
-    """Sequential traversal requires reset before replay."""
-    module = nn.Module()
-    a = ExecutionEvent(module=module, phase=Phase.FORWARD)
-    b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
-    order = ExecutionOrder([a, b, a, a])
-    for _ in range(2):
-        order.reset_cursor()
-        assert order.advance() == a
-        assert order[order.position] == b
-        assert order.position == 1
-        assert list(order) == [a, b, a, a]
-        assert order.advance() == b
-        assert order.advance() == a
-        assert order.advance() == a
-        assert list(order)[order.position :] == []
-        with pytest.raises(RuntimeError, match='exceeded'):
-            order.advance()
-    order.reset_cursor()
-    assert order.advance() == a
-    assert order.advance() == b
-    empty = ExecutionOrder()
-    assert list(empty) == []
-    with pytest.raises(RuntimeError, match='exceeded'):
-        empty.advance()
+    assert list(order) == [ExecutionEvent(first, Phase.FORWARD)]
+    assert list(order.successors()) == []

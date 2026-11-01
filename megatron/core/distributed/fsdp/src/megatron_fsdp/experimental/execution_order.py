@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weakly held construction or recorded module execution sequences."""
+"""Weak, phase-tagged execution sequences with a sequential cursor."""
 
 from collections.abc import Iterable, Iterator
 from typing import NamedTuple
@@ -31,49 +31,49 @@ class ExecutionEvent(NamedTuple):
 
 
 class ExecutionOrder:
-    """An ordered sequence of module/phase occurrences."""
+    """Store an execution trace with one sequential cursor across all phases."""
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
-        """Create an execution sequence, preserving repeated occurrences."""
+        """Create a weak sequence, preserving every repeated occurrence."""
         self._items: list[tuple[ref[nn.Module], Phase]] = []
         self._position = 0
         for item in items:
             self.append(item)
 
-    def append(self, item: ExecutionEvent) -> None:
-        """Append an occurrence."""
-        key = (ref(item.module), item.phase)
-        self._items.append(key)
-
-    def __iter__(self) -> Iterator[ExecutionEvent]:
-        """Iterate over occurrences in execution order."""
-        for index in range(len(self)):
-            yield self[index]
-
-    def reset_cursor(self) -> None:
-        """Reset traversal without changing the recorded sequence."""
-        self._position = 0
-
-    def __len__(self) -> int:
-        return len(self._items)
-
     @property
     def position(self) -> int:
-        """Index of the next occurrence; len(order) means traversal is exhausted."""
+        """Index of the next event to consume."""
         return self._position
 
-    def __getitem__(self, index: int) -> ExecutionEvent:
-        """Read an occurrence without advancing the cursor."""
+    def append(self, item: ExecutionEvent) -> None:
+        """Append an event without consuming it."""
+        self._items.append((ref(item.module), item.phase))
+
+    def __iter__(self) -> Iterator[ExecutionEvent]:
+        """Iterate over live occurrences without retaining their modules."""
+        for module_ref, phase in self._items:
+            module = module_ref()
+            if module is not None:
+                yield ExecutionEvent(module, phase)
+
+    def peek(self, offset: int = 0) -> ExecutionEvent | None:
+        """Read an event relative to the cursor without wrapping or advancing."""
+        index = self._position + offset
+        if not 0 <= index < len(self._items):
+            return None
         module_ref, phase = self._items[index]
         module = module_ref()
-        if module is None:
-            raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        return ExecutionEvent(module=module, phase=phase)
+        return None if module is None else ExecutionEvent(module, phase)
 
-    def advance(self) -> ExecutionEvent:
-        """Consume the next occurrence."""
-        if self._position >= len(self._items):
-            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
-        result = self[self._position]
-        self._position += 1
-        return result
+    def successors(self) -> Iterator[ExecutionEvent]:
+        """Look ahead from the current occurrence without wrapping or advancing."""
+        offset = 1
+        while (event := self.peek(offset)) is not None:
+            yield event
+            offset += 1
+
+    def advance(self) -> None:
+        """Consume one occurrence and automatically wrap at the end of the trace."""
+        if not self._items:
+            raise RuntimeError("Cannot advance an empty FSDP execution order.")
+        self._position = (self._position + 1) % len(self._items)

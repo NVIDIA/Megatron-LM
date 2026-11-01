@@ -6,7 +6,7 @@ Test prefetch-order construction here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 from weakref import ref
 
 import pytest
@@ -28,7 +28,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
@@ -120,13 +119,8 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
-        ExecutionEvent(model, Phase.FORWARD),
-        ExecutionEvent(model.first, Phase.FORWARD),
-        ExecutionEvent(model.second, Phase.FORWARD),
-        ExecutionEvent(model, Phase.BACKWARD),
-        ExecutionEvent(model.second, Phase.BACKWARD),
-        ExecutionEvent(model.first, Phase.BACKWARD),
-    ]
+        ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
+    ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
 
     def check_prefetched(layer, _args):
         storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
@@ -140,25 +134,28 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
-def test_recorded_execution_order_replays_repeated_root(distributed_setup):
-    """Repeated root calls retain their recorded occurrences through replay."""
+def test_registration_order_rejects_reordered_execution(distributed_setup):
+    """Execution must follow registration order when recording is disabled."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(4, 4, bias=False)
+            self.second = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.first(self.second(x))
+
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
-    with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
-    ) as context:
+    model = Model().to(device)
+    with fully_shard_context(FsdpContext(device=device)):
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
-    inputs = torch.ones(2, 4, device=device)
-    for _ in range(3):
-        model.zero_grad(set_to_none=True)
-        (model(inputs) + model(inputs)).sum().backward()
-        assert not context.is_recording_execution_order
-        assert list(context.execution_order)[:2] == [
-            ExecutionEvent(model, Phase.FORWARD),
-            ExecutionEvent(model, Phase.FORWARD),
-        ]
+    with pytest.raises(RuntimeError, match="diverged from the expected execution order"):
+        model(torch.ones(2, 4, device=device))
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
@@ -217,8 +214,7 @@ def test_context_does_not_keep_modules_alive(distributed_setup):
 
     assert model_ref() is None
     assert child_ref() is None
-    with pytest.raises(RuntimeError, match="destroyed"):
-        list(context.execution_order)
+    assert list(context.execution_order) == []
 
 
 def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
@@ -240,19 +236,16 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
     assert model.layers[1].context is model.context
 
 
-def test_sibling_roots_share_context_without_prefetch(distributed_setup):
+def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
+    """Independent roots should share streams and follow construction order."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    shard_kwargs = dict(
-        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
-    )
-
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model.layers[0], **shard_kwargs)
-        fully_shard(model.layers[1], **shard_kwargs)
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
@@ -261,7 +254,9 @@ def test_sibling_roots_share_context_without_prefetch(distributed_setup):
     assert model.layers[1].context is context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
-    assert not context.execution_order
+    assert list(context.execution_order) == [
+        ExecutionEvent(module, Phase.FORWARD) for module in [model.layers[0], model.layers[1]]
+    ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model.layers[1], model.layers[0]]]
 
 
 @pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
@@ -297,51 +292,6 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync.assert_called_once_with()
 
 
-def test_forward_backward_prefetch_stays_in_phase(distributed_setup):
-    """Forward/backward prefetch follows its phase's construction order."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = MultiChildModel(dim=4, num_children=2).to(device)
-    first_layer, second_layer = model.layers
-    with fully_shard_context(FsdpContext(device=device)) as context:
-        fully_shard(first_layer, mesh=mesh, placements=_default_placements())
-        fully_shard(second_layer, mesh=mesh, placements=_default_placements())
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    prefetch_calls = []
-    original_prefetch = FsdpModule._prefetch_parameter_groups
-
-    def capture_prefetch(module, order, prefetch_size):
-        with patch.object(
-            FsdpModule,
-            "_unshard_parameter_groups",
-            autospec=True,
-            side_effect=FsdpModule._unshard_parameter_groups,
-        ) as unshard:
-            original_prefetch(module, order, prefetch_size)
-        prefetch_calls.append(
-            (module, module.phase, [call.args[0] for call in unshard.call_args_list])
-        )
-
-    with patch.object(
-        FsdpModule, "_prefetch_parameter_groups", autospec=True, side_effect=capture_prefetch
-    ):
-        output = model(torch.ones(2, 4, device=device, requires_grad=True))
-        _, next_phase = context.execution_order[context.execution_order.position]
-        assert next_phase is Phase.BACKWARD
-        output.sum().backward()
-
-    assert prefetch_calls == [
-        (model, Phase.FORWARD, [first_layer]),
-        (first_layer, Phase.FORWARD, [second_layer]),
-        (second_layer, Phase.FORWARD, []),
-        (model, Phase.BACKWARD, [second_layer]),
-        (second_layer, Phase.BACKWARD, [first_layer]),
-        (first_layer, Phase.BACKWARD, []),
-    ]
-    assert context.execution_order.position == len(context.execution_order)
-
-
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
@@ -360,10 +310,10 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
 
     context = model.context
     assert list(context.execution_order) == [
-        ExecutionEvent(module=module, phase=Phase.FORWARD)
+        ExecutionEvent(module, Phase.FORWARD)
         for module in [model, model.left, model.left.inner, model.right]
     ] + [
-        ExecutionEvent(module=module, phase=Phase.BACKWARD)
+        ExecutionEvent(module, Phase.BACKWARD)
         for module in [model, model.right, model.left, model.left.inner]
     ]
 
@@ -389,25 +339,28 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     assert callback_modules == [model]
 
 
-def test_nested_and_sibling_roots_respect_prefetch_policy(distributed_setup):
+def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
+    """Context orders should concatenate nested roots at construction boundaries."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
-    shard_kwargs = dict(
-        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
-    )
-
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model.left.inner, **shard_kwargs)
-        fully_shard(model.left, **shard_kwargs)
-        fully_shard(model.right, **shard_kwargs)
+        fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
+        fully_shard(model.left, mesh=mesh, placements=_default_placements())
+        fully_shard(model.right, mesh=mesh, placements=_default_placements())
 
     context = model.left.context
     assert model.left.is_root()
     assert model.right.is_root()
     assert not model.left.inner.is_root()
-    assert not context.execution_order
+    assert list(context.execution_order) == [
+        ExecutionEvent(module, Phase.FORWARD)
+        for module in [model.left, model.left.inner, model.right]
+    ] + [
+        ExecutionEvent(module, Phase.BACKWARD)
+        for module in [model.right, model.left, model.left.inner]
+    ]
 
 
 def test_fully_shard_requires_context(distributed_setup):
