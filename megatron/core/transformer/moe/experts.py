@@ -36,6 +36,7 @@ from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_r
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.moe.weighted_activation import apply_router_probs, apply_weighted_activation
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -1065,9 +1066,9 @@ class TEGroupedMLP(MegatronModule):
                     )
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
-                    original_dtype = intermediate_parallel.dtype
-                    intermediate_parallel = intermediate_parallel * permuted_probs
-                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+                    intermediate_parallel = apply_router_probs(
+                        intermediate_parallel, permuted_probs
+                    )
             elif self.config.bias_activation_fusion and not with_glu_interleaving:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -1129,6 +1130,10 @@ class TEGroupedMLP(MegatronModule):
                                 x_linear + self.config.glu_linear_offset
                             )
 
+                        if self.activation_func in (F.silu, F.gelu, quick_gelu, squared_relu):
+                            return apply_weighted_activation(
+                                glu, intermediate_parallel, permuted_probs
+                            )
                         intermediate_parallel = glu(intermediate_parallel)
                 else:
                     if tanh_clamp_scale is not None:
@@ -1136,9 +1141,7 @@ class TEGroupedMLP(MegatronModule):
                             intermediate_parallel, tanh_clamp_scale
                         )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
+                intermediate_parallel = apply_router_probs(intermediate_parallel, permuted_probs)
             return intermediate_parallel
 
         # Only set up the checkpoint when a backward pass will actually follow.
