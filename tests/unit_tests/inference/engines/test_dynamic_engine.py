@@ -8,7 +8,7 @@ import os
 import random
 import threading
 import types
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -1386,6 +1386,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     top_n_logprobs: int = 0
     logprobs_mode: str = "raw_logprobs"
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
@@ -1622,6 +1623,7 @@ class DynamicInferenceEngineTestBase:
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
+                request_metadata_types=test_config.request_metadata_types,
             ),
         )
 
@@ -8235,36 +8237,51 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             model_provider="gpt",
         )
         env = self._build_test_env(test_config)
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
-        hidden_size = unwrapped_model.config.hidden_size
+        runtime = Counter()
+        real_forward = unwrapped_model.forward
+        real_mtp = unwrapped_model.compute_mtp_single_step
+        real_rewind = env.engine.controller._rewind_kv_cache
 
-        def mock_deterministic_forward(*args, **kwargs):
+        def deterministic_forward(*args, **kwargs):
             tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
-            b, s = tokens.shape
-            base_logits = torch.zeros(
-                b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
-            )
+            base_logits = real_forward(*args, **kwargs)
+            runtime["model-forward"] += 1
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+            base_logits.zero_()
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
-                s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
-            )
             return base_logits
 
-        def mock_compute_mtp_wrong(
+        def deterministic_mtp_rejection(
             hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
         ):
-            n = hidden_states.size(0)
-            wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
-            logits = torch.zeros(
-                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            hidden_states, logits = real_mtp(
+                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
             )
+            runtime[("mtp-depth", depth)] += 1
+            wrong_toks = (next_token_ids + 5).clamp(max=test_config.vocab_size - 1)
+            logits.zero_()
             logits.scatter_(2, wrong_toks.transpose(0, 1).unsqueeze(-1), 100.0)
             return hidden_states, logits
 
-        unwrapped_model.forward = mock_deterministic_forward
-        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_wrong
+        def traced_rewind(accepted_counts_cpu=None):
+            decode_count = env.engine.context.num_decode_requests
+            counts = (
+                accepted_counts_cpu
+                if accepted_counts_cpu is not None
+                else env.engine.controller._accepted_token_counts_per_request[:decode_count].cpu()
+            )
+            runtime["rewinds"] += 1
+            runtime["rejected-decode-steps"] += int(
+                (counts[:decode_count] < test_config.num_speculative_tokens).sum()
+            )
+            return real_rewind(accepted_counts_cpu)
+
+        unwrapped_model.forward = deterministic_forward
+        unwrapped_model.compute_mtp_single_step = deterministic_mtp_rejection
+        env.engine.controller._rewind_kv_cache = traced_rewind
 
         prompt_length = 4
         env.engine.add_request(
@@ -8276,6 +8293,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 return_log_probs=True,
                 skip_prompt_log_probs=False,
                 top_k=1,
+                top_n_logprobs=2,
             ),
         )
 
@@ -8307,6 +8325,23 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert len(req.prompt_log_probs) == prompt_length - 1, (
             f"Expected {prompt_length - 1} prompt log probs, " f"got {len(req.prompt_log_probs)}"
         )
+        assert len(req.generated_top_n_logprobs) == len(req.generated_tokens)
+        for token, logprob, top_n in zip(
+            req.generated_tokens, req.generated_log_probs, req.generated_top_n_logprobs
+        ):
+            token_text = env.engine.controller.tokenizer.detokenize([token])
+            assert token_text in top_n
+            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.01)
+
+        assert runtime["model-forward"] > 0
+        assert all(runtime[("mtp-depth", depth)] > 0 for depth in range(2))
+        assert runtime["rewinds"] > 0
+        assert runtime["rejected-decode-steps"] > 0
+        assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+        assert int(env.engine._spec_tokens_accepted_per_pos.sum()) == 0
+        assert req.acceptance_step_lengths
+        assert set(req.acceptance_step_lengths) == {1}
+        assert sum(req.acceptance_step_lengths) == len(req.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
