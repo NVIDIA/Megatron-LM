@@ -84,7 +84,7 @@ class TestModelCollection:
         with _record_fallbacks() as record:
             assert (
                 training._get_model_pg_collection(
-                    [SimpleNamespace(pg_collection=model_pg_collection)],
+                    SimpleNamespace(pg_collection=model_pg_collection),
                     run_pg_collection,
                     owner="owner",
                 )
@@ -92,7 +92,7 @@ class TestModelCollection:
             )
             assert (
                 training._get_model_pg_collection(
-                    [SimpleNamespace(pg_collection=None)], run_pg_collection, owner="owner"
+                    SimpleNamespace(pg_collection=None), run_pg_collection, owner="owner"
                 )
                 is run_pg_collection
             )
@@ -105,7 +105,7 @@ class TestModelCollection:
         _assert_warns_then_reads_global(
             "evaluate",
             lambda: training._get_model_pg_collection(
-                [SimpleNamespace(pg_collection=None)], None, owner="evaluate"
+                SimpleNamespace(pg_collection=None), None, owner="evaluate"
             ),
         )
 

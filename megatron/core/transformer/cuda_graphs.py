@@ -9,6 +9,7 @@ import os
 import time
 import weakref
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
@@ -17,6 +18,7 @@ from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
+from weakref import WeakKeyDictionary, WeakSet
 
 import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
@@ -33,7 +35,13 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -594,10 +602,20 @@ class _CudagraphGlobalRecord:
     _saved_tensors_observer = None
     _te_capture_started = False
 
-    # Every live runner. 'create_cudagraphs' clears 'cudagraph_record' after capture,
-    # so 'release_all_cuda_graphs' finds created graphs through this set. Weak
+    # Every live runner, including runners that are neither recorded nor in
+    # 'captured_runners', so that 'release_all_cuda_graphs' can reset them all. Weak
     # references, so the set does not extend runner lifetimes.
     all_runners: "weakref.WeakSet" = weakref.WeakSet()
+
+    # Owners are local/full-iteration graphs or TE graph callables.
+    # Weak keys avoid extending their lifetimes merely to retain their constants.
+    capture_constants: WeakKeyDictionary[torch.cuda.CUDAGraph, dict[int, torch.Tensor]] = (
+        WeakKeyDictionary()
+    )
+    active_capture_constants: dict[int, torch.Tensor] | None = None
+    # Without a graph owner these references cannot be released safely before process exit.
+    unowned_capture_constants: dict[int, torch.Tensor] = {}
+    captured_runners: WeakSet["_CudaGraphRunner"] = WeakSet()
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -812,8 +830,53 @@ def create_cudagraphs():
     return _CudagraphGlobalRecord.create_cudagraphs()
 
 
+@contextmanager
+def capture_constants(owner_graph: torch.cuda.CUDAGraph) -> Iterator[None]:
+    """Retain constants for a graph owner until teardown or owner destruction.
+
+    Wrap the capture context, not replay. For APIs that capture several graphs at
+    once (TE), the owner must outlive every graph and release its constants only
+    after destroying all of them. Failed captures discard their registrations.
+    """
+    previous = _CudagraphGlobalRecord.active_capture_constants
+    constants = {}
+    _CudagraphGlobalRecord.active_capture_constants = constants
+    try:
+        yield
+        _CudagraphGlobalRecord.capture_constants[owner_graph] = constants
+    finally:
+        _CudagraphGlobalRecord.active_capture_constants = previous
+
+
+def register_capture_constant(tensor: torch.Tensor) -> None:
+    """Retain a capture constant for its graph, or process lifetime when no owner is known."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
+    constants = _CudagraphGlobalRecord.active_capture_constants
+    if constants is None:
+        constants = _CudagraphGlobalRecord.unowned_capture_constants
+        if not constants:
+            logger.warning(
+                "CUDA graph captured outside capture_constants(); cached positional "
+                "embeddings it reads are retained for the process lifetime."
+            )
+    constants[id(tensor)] = tensor
+
+
+def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
+    """Release an owner's constants after all of its graphs have been destroyed."""
+    _CudagraphGlobalRecord.capture_constants.pop(owner_graph, None)
+
+
 def _reset_cuda_graph_runner(runner):
     """Drop a runner's graphs and capture state so that it records and captures again."""
+    # Some callers (e.g., test_cuda_graphs.py) delete graph attributes
+    # before the global teardown runs.
+    for graph in (getattr(runner, "fwd_graph", None), getattr(runner, "bwd_graph", None)):
+        if graph is not None:
+            graph.reset()
+            release_capture_constants(graph)
     runner.cudagraph_created = False
     runner.fwd_graph_recorded = False
     runner.bwd_graph_recorded = False
@@ -824,21 +887,26 @@ def _reset_cuda_graph_runner(runner):
 
 
 def delete_cuda_graphs():
-    """Delete the graphs of recorded runners and reset the global capture state.
+    """Delete the graphs of recorded and captured runners and reset the global capture state.
 
-    Runners whose graphs 'create_cudagraphs' already created are not in the record
-    and keep their graphs; for example, training graphs survive an inference engine's
-    suspend. 'release_all_cuda_graphs' releases those as well.
+    This includes every runner that started a capture since the last call, so the
+    training graphs that 'create_cudagraphs' created are deleted too; for example, an
+    inference engine's suspend releases them.
     """
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
     # Reset runners.
+    runners = set(_CudagraphGlobalRecord.captured_runners)
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
         *_CudagraphGlobalRecord.cudagraph_inference_record,
     ]:
-        runner = record[0]
+        runners.add(record[0])
+    if runners:
+        # Replay can still be using external constants when graph destruction is requested.
+        torch.cuda.synchronize()
+    for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
         _reset_cuda_graph_runner(runner)
 
@@ -846,6 +914,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.captured_runners.clear()
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
@@ -858,11 +927,11 @@ def delete_cuda_graphs():
 def release_all_cuda_graphs():
     """Release the graphs of every live runner and reset the global capture state.
 
-    Unlike 'delete_cuda_graphs', this includes graphs that were already created,
-    including partial captures that never reached the record. A captured graph keeps
-    the communicators of its collectives alive, and destroying such a communicator
-    waits for the graph, so model-parallel teardown must release every graph first.
-    Does nothing if no runner is alive and no graph memory pool exists.
+    Unlike 'delete_cuda_graphs', this also resets live runners that are neither
+    recorded nor in 'captured_runners'. A captured graph keeps the communicators of its
+    collectives alive, and destroying such a communicator waits for the graph, so
+    model-parallel teardown must release every graph first. Does nothing if no runner
+    is alive and no graph memory pool exists.
     """
     runners = list(_CudagraphGlobalRecord.all_runners)
     if not runners and CudaGraphManager.global_mempool is None:
@@ -1330,6 +1399,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 cached_aux_losses[name] = entry.values.clone()
 
         self.fwd_graph = torch.cuda.CUDAGraph()
+        _CudagraphGlobalRecord.captured_runners.add(self)
 
         # For cases with multiple active RNG states, e.g. TP.
         rng_states = get_all_rng_states()
@@ -1472,6 +1542,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
                 with (
                     capture_comm_context as capture_comms,
+                    capture_constants(self.fwd_graph),
                     torch.cuda.graph(
                         self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                     ),
@@ -1611,6 +1682,7 @@ class _CudaGraphRunner(torch.nn.Module):
         with (
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
+            capture_constants(self.bwd_graph),
             torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
 
@@ -1664,6 +1736,11 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.
                 self.bwd_completion_event.record()
+
+        # Backward reads saved forward constants without calling the embedding again.
+        _CudagraphGlobalRecord.capture_constants[self.bwd_graph].update(
+            _CudagraphGlobalRecord.capture_constants.get(self.fwd_graph, {})
+        )
 
         # Unfreeze GC.
         if FREEZE_GC:
@@ -2035,19 +2112,27 @@ class CudaGraphManager(torch.nn.Module):
         # Decided on the first call; see _resolve_reuse_cudagraphs.
         self.reuse_cudagraphs = None
         if CudaGraphManager.global_mempool is None:
-            CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
-            # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
-            # storage directly into it (created before the first graphed forward).
-            if HAVE_GTP:
-                set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
+            self._initialize_mempool()
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
-            torch.cuda.set_stream(torch.cuda.Stream())
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(stream)
 
         # Enable one hook for the eager recording phase. Repeated manager construction is
         # idempotent, and graph creation removes the hook before capture begins.
         if need_backward:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    @staticmethod
+    def _initialize_mempool() -> None:
+        """Create and register the graph pool without changing the current CUDA stream."""
+        if CudaGraphManager.global_mempool is None:
+            CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
+            # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
+            # storage directly into it (created before the first graphed forward).
+            if HAVE_GTP:
+                set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
 
     def _resolve_reuse_cudagraphs(self, megatron_module):
         """Return whether cudagraphs are reused across microbatches, deciding it on the first call.
@@ -2098,6 +2183,11 @@ class CudaGraphManager(torch.nn.Module):
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
+
+        self._initialize_mempool()
+        if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:
+            _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
@@ -2156,6 +2246,8 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
+        if runner.mempool is None:
+            runner.mempool = CudaGraphManager.global_mempool
         return runner
 
     def __call__(self, megatron_module, args, kwargs, cache_key=None):
@@ -2541,10 +2633,15 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not self.config.multi_latent_attention
-                ):
+                uses_mla = self.config.multi_latent_attention
+                if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
+                    # Config types select the layer implementation; copied flags may differ.
+                    config_type = type(layer.config)
+                    if config_type is AttentionLayerConfig:
+                        uses_mla = False
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                        uses_mla = True
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
@@ -2954,10 +3051,16 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            with rng_context, capture_constants(self):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
+
+            # The returned callables can outlive this helper. Share the capture's
+            # constants with those actual graph owners instead of retaining them here.
+            constants = _CudagraphGlobalRecord.capture_constants.pop(self)
+            for graph in graphs:
+                _CudagraphGlobalRecord.capture_constants[graph] = constants
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0
@@ -2998,6 +3101,8 @@ class TECudaGraphHelper:
         """
         assert self._graphs_created, "No CUDA Graphs were created to delete."
 
+        torch.cuda.synchronize()
+
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
         for layers in self.callables_per_chunk:
@@ -3005,6 +3110,7 @@ class TECudaGraphHelper:
                 for graph in layer.cuda_graphs:
                     if graph_resettable:
                         graph.reset()
+                        release_capture_constants(graph)
                         graphs_reset += 1
                     else:
                         graphs_not_reset += 1

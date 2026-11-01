@@ -1149,7 +1149,6 @@ class TestWaitAsyncCommsFallback:
         p.main_grad = torch.full((8, 4), main_grad_fill, dtype=dtype, device="cuda")
         p._prefetch_handle = None  # _wait_param_gather is no-op
         p._wgrad_rs_handle = None  # _wait_reduce_scatter is no-op → fallback fires
-        p._cached_ag_stream = None
         p._cached_rs_stream = None
         p.ag_event = torch.cuda.Event(external=True)
         p.rs_event = torch.cuda.Event(external=True)

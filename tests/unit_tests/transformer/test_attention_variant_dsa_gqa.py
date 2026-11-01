@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import subprocess
+import sys
+import textwrap
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +37,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     unfused_grouped_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+    dsa_gqa_indexer_spec,
     dsa_stack_spec,
     gdp_dsa_stack_spec,
 )
@@ -162,7 +167,7 @@ def test_dsa_stack_spec_uses_dsa_grouped_self_attention():
 
 
 def test_dsa_stack_spec_does_not_mutate_upstream_hybrid_spec():
-    """The spec is derived by deep copy; upstream's shared spec must be untouched."""
+    """Deriving the attention spec must leave upstream's shared spec untouched."""
     upstream_module = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module
     assert upstream_module is not DSGroupedSelfAttention
 
@@ -175,8 +180,8 @@ def test_gdp_dsa_stack_spec_uses_dsa_grouped_self_attention():
 def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
     """gated_delta_product_stack_spec shares hybrid_stack_spec's attention_layer object.
 
-    Deriving either DSA stack therefore has to deep copy first, or swapping the module on one
-    would swap it on the other and on upstream's spec as well.
+    Deriving either DSA stack must replace the attention spec nodes, or swapping the module
+    on one would swap it on the other and on upstream's spec as well.
     """
     upstream = gated_delta_product_stack_spec.submodules.attention_layer
     assert upstream.submodules.self_attention.module is not DSGroupedSelfAttention
@@ -185,6 +190,59 @@ def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
 def test_the_two_dsa_stacks_keep_their_own_mamba_mixers():
     """Only the attention layer is DSA's to change; the mixers are what distinguish the stacks."""
     assert gdp_dsa_stack_spec.submodules.mamba_layer != dsa_stack_spec.submodules.mamba_layer
+
+
+@pytest.mark.parametrize(
+    "derived, upstream",
+    [(dsa_stack_spec, hybrid_stack_spec), (gdp_dsa_stack_spec, gated_delta_product_stack_spec)],
+)
+def test_dsa_stack_spec_preserves_dense_attention(derived, upstream):
+    derived_attention = derived.submodules.attention_layer.submodules.self_attention
+    upstream_attention = upstream.submodules.attention_layer.submodules.self_attention
+    assert derived_attention is not upstream_attention
+    assert derived_attention.submodules is not upstream_attention.submodules
+    core_attention = derived_attention.submodules.core_attention
+    assert core_attention.module is DSGQACoreAttention
+    assert (
+        core_attention.submodules.dense_core_attention
+        is upstream_attention.submodules.core_attention
+    )
+
+
+def test_dsa_stacks_have_independent_indexer_specs():
+    indexers = [
+        spec.submodules.attention_layer.submodules.self_attention.submodules.core_attention.submodules.indexer
+        for spec in (dsa_stack_spec, gdp_dsa_stack_spec)
+    ]
+    indexers.append(dsa_gqa_indexer_spec)
+    assert len({id(indexer) for indexer in indexers}) == 3
+    assert len({id(indexer.submodules) for indexer in indexers}) == 3
+    for projection in ("linear_q", "linear_k"):
+        assert len({id(getattr(indexer.submodules, projection)) for indexer in indexers}) == 3
+
+
+def test_dsa_layer_specs_import_without_transformer_engine():
+    """A basic installation must import specs even when optional TE/Apex are absent."""
+    code = textwrap.dedent("""
+        import sys
+
+        sys.modules["transformer_engine"] = None
+        sys.modules["apex"] = None
+
+        from megatron.core.extensions.transformer_engine import HAVE_TE
+        from megatron.core.transformer.experimental_attention_variant import dsa_layer_specs
+
+        assert not HAVE_TE
+        for spec in (dsa_layer_specs.dsa_stack_spec, dsa_layer_specs.gdp_dsa_stack_spec):
+            attention = spec.submodules.attention_layer.submodules.self_attention
+            assert attention.module is dsa_layer_specs.DSGroupedSelfAttention
+        """)
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[3],
+        check=True,
+        timeout=120,
+    )
 
 
 def _causal_mask(seqlen: int, device: torch.device):

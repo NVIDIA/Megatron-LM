@@ -2809,6 +2809,10 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 def get_dynamic_data_context_parallel_group_map() -> Dict[int, torch.distributed.ProcessGroup]:
     """Snapshot local runtime CP groups keyed by CP size.
 
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.dynamic_cp
+    map. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+
     The map includes the full DPxCP domain and, when initialized, the singleton
     CP-off group. It is empty before initialization and when dynamic CP is disabled.
     """
@@ -2820,6 +2824,10 @@ def get_dynamic_tensor_data_context_parallel_group_map() -> (
     Dict[int, torch.distributed.ProcessGroup]
 ):
     """Snapshot TP x runtime-CP groups, keyed by the runtime CP size.
+
+    Deprecated: reads the global parallel state. Use the caller-provided
+    pg_collection.dynamic_tp_cp map. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
 
     With TP1 these are the runtime CP groups themselves. The returned maps keep
     the original process-group handles without exposing the global dictionaries.
@@ -2865,6 +2873,10 @@ def get_dynamic_tensor_data_context_parallel_group(
     check_initialized: bool = True, group_size: Optional[int] = None
 ) -> torch.distributed.ProcessGroup:
     """Get the TP x runtime-DPxCP group containing the caller rank.
+
+    Deprecated: reads the global parallel state. Use pg_collection.dynamic_tp_cp[group_size] from
+    the caller-provided collection. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
 
     ``group_size`` is the runtime CP size; the returned process group has
     ``tensor_model_parallel_size * group_size`` ranks. With TP1 the dynamic

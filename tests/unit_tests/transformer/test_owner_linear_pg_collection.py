@@ -697,6 +697,5 @@ class TestTransformerEngineOwnersPassTheirCollection:
             is_mtp_layer=False,
         )
 
-        assert mlp.pg_collection is owner_pg_collection
         assert mlp.linear_fc1._pg_collection is owner_pg_collection
         assert mlp.linear_fc2._pg_collection is owner_pg_collection

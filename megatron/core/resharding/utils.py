@@ -625,9 +625,10 @@ def _round_robin_dp(src_meta_list: list[ParameterMetadata], dst_rank: int) -> Pa
         dp_group = tuple(meta.data_parallel_group_ranks or [])
         grouped_by_dp.setdefault(dp_group, []).append(meta)
 
-    # Fast path: only one DP group present; no balancing necessary.
-    if len(grouped_by_dp) == 1:
-        return src_meta_list[0]
+    # A single DP group still needs balancing: with TP=1 (and PP=1) every source
+    # replica belongs to the same DP group, so returning its first entry would
+    # make every destination read from one replica. With one group the code
+    # below reduces to src_meta_list[dst_rank % len(src_meta_list)].
 
     # Round-robin selection across source DP groups based on destination global rank.
     # This ensures even distribution: if we have 4 src DP groups and 128 dst ranks,
