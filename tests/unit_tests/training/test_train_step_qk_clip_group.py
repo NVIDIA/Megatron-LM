@@ -11,6 +11,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import training as training_mod
 
 
+@pytest.fixture(autouse=True)
+def training_config(run_config):
+    run_config.train.micro_batch_size = 1
+
+
 class _StopAfterClip(Exception):
     """Ends train_step once clip_qk has been called."""
 
