@@ -142,21 +142,45 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
+    This is used to calculate the number and length of sub-samples assigned to
     each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
-    """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
-    each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    max_seq_length_per_sample: Optional[int] = None
+    """Maximum sequence length of one sample, or of one packed (THD) sequence: the training
+    sequence length (--seq-length). Communication backends that size their buffers once
+    (NCCL EP) derive the per-rank token bound from it when max_seqlen_per_dp_cp_rank is not
+    set. This is not the position-embedding capacity: GPTModelConfig.seq_length and
+    HybridModelConfig.seq_length hold that (GPTModel.max_sequence_length, filled from
+    --max-position-embeddings by the launcher) and are never read by core modules.
     """
 
-    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    dynamic_context_parallel: bool = False
     """
-    Scheduler for sequence packing and hybrid context parallel.
+    If true, enables dynamic context parallel. This is used to balance the workload of
+    each CP rank when using packed samples with variable sequence lengths. Dynamic CP
+    forms variable-sized CP groups from the DPxCP ranks.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size used by dynamic context parallelism."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Packing-aware scheduler with per-microbatch CP group sizes.
+    """
+
+    pad_packed_seq_alignment: int | Literal['max'] | None = None
+    """Pad packed THD inputs to a CP-local multiple, or to max_seqlen_per_dp_cp_rank.
+
+    Applies before sequence-parallel sharding. MXFP8 also requires a multiple of
+    32 after SP sharding; that requirement is combined with this alignment.
+    Padding is represented as a masked dummy sequence.
     """
 
     expert_model_parallel_size: int = 1
@@ -287,7 +311,8 @@ class ModelParallelConfig:
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
-       must turn off gradient accumulation fusion.
+       must turn off gradient accumulation fusion. VocabParallelEmbedding then also adds its weight
+       gradient into main_grad in its backward.
     """
 
     use_te_rng_tracker: bool = field(
@@ -544,6 +569,52 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    "Dynamic context parallelism requires "
+                    "sequence_packing_scheduler='default_dynamic_cp'"
+                )
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError("min_dynamic_context_parallel_size must be at least 1")
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
+        elif self.sequence_packing_scheduler == 'default_dynamic_cp':
+            raise ValueError(
+                "sequence_packing_scheduler='default_dynamic_cp' requires "
+                "dynamic_context_parallel=True"
+            )
+
+        if self.pad_packed_seq_alignment is not None:
+            if self.pad_packed_seq_alignment != 'max':
+                try:
+                    self.pad_packed_seq_alignment = int(self.pad_packed_seq_alignment)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer"
+                    ) from exc
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError("pad_packed_seq_alignment must be 'max' or a positive integer")
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")
@@ -614,7 +685,7 @@ class ModelParallelConfig:
             raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
 
         if self.sequence_packing_scheduler is not None:
-            supported_schedulers = ['dp_balanced']
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if self.sequence_packing_scheduler not in supported_schedulers:
                 raise ValueError(
                     f"Unsupported scheduler: {self.sequence_packing_scheduler}. "

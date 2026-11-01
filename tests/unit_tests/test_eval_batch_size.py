@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import ArgumentGroupFactory, _default_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.config import ValidationConfig
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_train_valid_test_num_samples
 from tests.unit_tests.test_utilities import Utils
@@ -278,7 +278,7 @@ class TestGetTrainValidTestNumSamples:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_num_samples_uses_eval_gbs(self):
+    def test_num_samples_uses_eval_gbs(self, run_config):
         """eval/test sample counts should use eval_global_batch_size, not global_batch_size."""
         args = create_test_args(
             global_batch_size=32,
@@ -288,13 +288,15 @@ class TestGetTrainValidTestNumSamples:
             eval_iters=5,
         )
         set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
         train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
         # eval_samples = ((100 // 10) + 1) * 5 * 16 = 11 * 5 * 16 = 880
         assert eval_samples == 880
         # test_samples = 5 * 16 = 80
         assert test_samples == 80
 
-    def test_num_samples_default_matches_training(self):
+    def test_num_samples_default_matches_training(self, run_config):
         """When eval_global_batch_size == global_batch_size, results should match old behavior."""
         args = create_test_args(
             global_batch_size=32,
@@ -304,6 +306,8 @@ class TestGetTrainValidTestNumSamples:
             eval_iters=5,
         )
         set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
         train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
         # eval_samples = 11 * 5 * 32 = 1760
         assert eval_samples == 1760
@@ -312,14 +316,46 @@ class TestGetTrainValidTestNumSamples:
         # train_samples = 100 * 32 = 3200
         assert train_samples == 3200
 
-    def test_num_samples_with_skip_train(self):
+    def test_num_samples_with_skip_train(self, run_config):
         """With skip_train, eval_iters used directly (no multiplier from train_iters/eval_interval)."""
         args = create_test_args(
             global_batch_size=32, eval_global_batch_size=8, skip_train=True, eval_iters=10
         )
         set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
         train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
         # eval_samples = 10 * 8 = 80
         assert eval_samples == 80
         # test_samples = 10 * 8 = 80
         assert test_samples == 80
+
+    def test_num_samples_without_eval_interval(self, run_config):
+        """Without eval_interval, only the validation run after training needs samples."""
+        args = create_test_args(
+            global_batch_size=32,
+            eval_global_batch_size=16,
+            train_iters=100,
+            eval_interval=None,
+            eval_iters=5,
+        )
+        set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
+        train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
+        # eval_samples = 1 * 5 * 16 = 80
+        assert eval_samples == 80
+        # test_samples = 5 * 16 = 80
+        assert test_samples == 80
+        # train_samples = 100 * 32 = 3200
+        assert train_samples == 3200
+
+    def test_num_samples_without_eval_interval_or_eval_iters(self, run_config):
+        """Train-only runs without eval_interval and with eval_iters=0 need no eval samples."""
+        args = create_test_args(train_iters=100, eval_interval=None, eval_iters=0)
+        set_args(args)
+        run_config.train = _default_config_from_args(TrainingConfig, args)
+        run_config.validation = _default_config_from_args(ValidationConfig, args)
+        train_samples, eval_samples, test_samples = get_train_valid_test_num_samples()
+        assert eval_samples == 0
+        assert test_samples == 0

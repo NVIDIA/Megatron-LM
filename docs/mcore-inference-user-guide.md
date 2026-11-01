@@ -456,9 +456,18 @@ sp = SamplingParams(
 
 `InferenceConfig.logprobs_mode` controls *which* log-probs you get:
 `'raw_logprobs'` (default) returns the unmodified model log-probs, while
-`'processed_logprobs'` returns log-probs after temperature, top-k, and top-p have
-been applied. `'processed_logprobs'` is not yet supported with speculative
-decoding.
+`'processed_logprobs'` returns log-probs of sampled tokens after temperature,
+top-k, and top-p have been applied. The mode applies to both the selected-token
+log-probs and the top-N log-probs (`top_n_logprobs`). Prompt log-probs, including
+prompt top-N log-probs, are always raw in both modes, because prompt tokens were
+not sampled from the processed distribution.
+`'processed_logprobs'` is not yet supported with speculative decoding.
+
+With prefix caching, prompt log-probs are cached on the KV blocks of the
+tokens that produced them, so a request that returns prompt log-probs can
+still skip a cached prefix. It skips only the blocks whose cached rows cover
+its `top_n_logprobs`, and computes the rest. Requests with `top_n_logprobs`
+above 100 share cached KV but compute every prompt token.
 
 ### Engine Configuration
 
@@ -489,7 +498,7 @@ used fields:
 | `offset_sampling_seed_by_dp_rank` | Give each DP rank a distinct sampling seed (default `True`), so the same prompt routed to different replicas produces different samples |
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
-| `disable_ep_consensus`, `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
+| `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
 | `track_paused_request_events`, `track_generated_token_events`, `metrics_writer`, `logging_step_interval` | Observability |
 
 ```python
@@ -508,8 +517,20 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
-`window_size` for sliding-window attention.
+`torch` / `flashinfer`), `inference_moe_router_backend` (`triton` by default, or
+`torch`), `quant_recipe`, `moe_enable_routing_replay`, and `window_size` for
+sliding-window attention.
+
+#### Tanh-clamped squared ReLU with FlashInfer
+
+On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) / L)) ** 2` with
+`inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
+`activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
+and `add_bias_linear=False`. 
+
+Requires FlashInfer >= 0.7.2, with `ActivationType.ClampedRelu2` and
+`clamped_relu2_limit` support. This path does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`.
 
 ### Reading Results
 
@@ -813,27 +834,82 @@ yet covered — notably video, audio, and pipeline parallelism.
 
 ## Disaggregated Prefill and Decode
 
-The building blocks for splitting prefill and decode across separate engines are
-in tree. A prefill engine pins its KV blocks and publishes handoff metadata when
-a request sets `SamplingParams.do_kv_handoff=True`; a decode engine imports that
-state and continues generation. `DisaggDynamicInferenceEngine` is the engine
-subclass for both roles, and `setup_kv_transfer(role, backend)` — with `role` of
-`"prefill"` or `"decode"` and a `nixl` or `nccl` backend — wires up the
-transport. It must be called collectively by every model-parallel rank.
+The native HTTP server can run prefill and decode on separate GPUs; no Dynamo
+deployment or client-side handoff is needed. Enable it with role-tagged
+`--inference-shards` and prefix caching on
+`examples/inference/launch_inference_server.py`.
 
-KV state is resharded across mismatched TP and PP layouts between the two pools,
-and hybrid models additionally hand off their recurrent conv and SSM state.
-`--inference-shards` describes the partitioning, for example
-`"tp=2,role=prefill+tp=1,dp=2,role=decode"`.
+Starting from a working server launch, keep your model, checkpoint, tokenizer,
+and cache-sizing arguments (`MODEL_ARGS` below), and use two GPUs for one
+prefill engine and one decode engine:
 
-Two prerequisites: **prefix caching must be enabled on both the prefill and the
-decode engine**, and a hybrid decode engine must not set
-`prefix_caching_mamba_gb`.
+```bash
+torchrun --standalone --nproc-per-node=2 \
+    examples/inference/launch_inference_server.py \
+    "${MODEL_ARGS[@]}" \
+    --inference-shards 'tp=1,role=prefill+tp=1,role=decode' \
+    --inference-dynamic-batching-enable-prefix-caching \
+    --disagg-kv-transport-backend nccl \
+    --port 5000
+```
 
-> This is transfer plumbing plus a shard-layout spec, driven today by an external
-> control plane (for example Dynamo). Megatron-LM does not yet ship a launcher
-> that stands up a disaggregated deployment end to end, and handoff does not
-> support log-probs.
+`MODEL_ARGS` is your existing shell array of model-specific arguments, not a
+Megatron option. Each engine must have enough memory for its model and cache.
+The shard sizes must cover the entire torchrun world. For example, four GPUs
+can use `tp=2,role=prefill+tp=1,dp=2,role=decode` for one TP=2 prefill engine
+and two TP=1 decode engines. NCCL works within this shared launch; alternatively,
+select `nixl` (the default) with NIXL installed on every engine rank.
+
+Send requests to the same frontend as usual:
+
+```bash
+curl http://localhost:5000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"EMPTY","prompt":"Hello","max_tokens":32,"temperature":0}'
+```
+
+There is no disaggregation flag in the HTTP request. The native coordinator
+routes prefill, reserves a decode engine, transfers KV state (plus conv/SSM
+state for hybrid models), and returns the response through the same frontend.
+Ordinary clients use `SUBMIT_REQUEST`; the runtime sends
+`SUBMIT_REQUEST_WITH_KV` directly to the selected decode engine.
+
+Prefix caching must remain enabled on both roles. For hybrid models, leave
+`--inference-dynamic-batching-prefix-caching-mamba-gb` unset on the shared launch:
+decode imports recurrent state into live slots, not the prefix-cache state buffer. Native disaggregation
+currently accepts text/token prompts, not multimodal inputs. Generated-token
+log-probs are supported with `skip_prompt_log_probs=True`; prompt and top-N
+log-probs are not.
+
+Use the default `persist` KV-cache management mode. Disaggregated transfers
+currently reject `offload` and `recompute` because suspend/resume can invalidate
+the registered KV/SSM buffers. Under memory pressure, evicted decode requests
+recover through the engine's local recomputation path; new requests still
+route to prefill.
+Keep `--inference-cuda-graph-all-prefills` enabled for prefill workers when desired;
+it gates both full and chunked prefill admissions on compatible captured graphs.
+Shared launches can pass this flag unchanged: decode workers automatically disable
+the admission gate so eviction recovery can prefill without a matching graph.
+This does not disable CUDA-graph replay on decode workers.
+
+For RL, only the final decode completion writes to the request metadata ledger
+or payload stager. Handoffs preserve the request UID, policy/KV epoch history,
+and prefill eviction history. MoE routing replay is not supported: transfer
+setup rejects it because handoffs do not transfer the prompt's routing buffers.
+
+Shard models require a distributed checkpoint format such as `torch_dist`; legacy `torch`
+checkpoints are rejected. For native RL, configure parallelism in
+`--inference-shards`, not the global `--rl-inference-*-model-parallel-size`
+overrides. Disaggregated RL currently rejects `--rl-verify-model-weights-swap`;
+the existing verifier does not support the different shard layouts. NIXL weight
+refit also rejects multiple destination pools because it binds a single receiver
+map; use a supported refit backend such as NCCL. This is separate from NIXL
+KV/SSM handoff, which remains supported.
+
+RL generation-lag autotuning and HTTP concurrency limits still use local shard
+capacity rather than aggregate decode capacity. Set `--rl-generation-lag`
+explicitly for partial rollouts; capacity aggregation and the remaining
+limitations are tracked in [#8200](https://github.com/NVIDIA/Megatron-LM/issues/8200).
 
 ---
 
@@ -1041,8 +1117,9 @@ is the opposite of the `MegatronLLM` constructor default.
   and a TE build exposing that constructor argument.
 - **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
   BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
-- **Disaggregated handoff does not support log-probs** (`return_log_probs` or
-  `top_n_logprobs > 0` raises).
+- **Disaggregated handoff supports generated-token log-probs only.** Set
+  `skip_prompt_log_probs=True` when requesting them; prompt log-probs and
+  `top_n_logprobs > 0` are not supported.
 
 **Engine and serving**
 
@@ -1087,9 +1164,6 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Models and performance:**
 
-- **Turnkey disaggregated inference** — a launcher and control plane on top of
-  the KV and SSM handoff primitives that exist today, plus log-prob support
-  across a handoff.
 - **FlashInfer integration** for attention and Mamba kernels (sampling, fused
   RoPE, and MoE grouped GEMM are already integrated).
 - **All2Allv-based token dispatcher** for MoE.

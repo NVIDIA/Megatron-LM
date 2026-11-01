@@ -68,10 +68,9 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     args.modules_to_filter = ['module']
     args.log_interval = 7
     monkeypatch.setattr(
-        training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
-    )
-    monkeypatch.setattr(
-        training, 'get_megatron_ddp_config', lambda args: DistributedDataParallelConfig()
+        training,
+        'get_megatron_ddp_config',
+        lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),
     )
     if inference:
         cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
@@ -125,7 +124,13 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
         wandb_save_dir=str(tmp_path),
         log_interval=17,
     )
-    args = Namespace(rank=0, world_size=1, log_interval=99, run_workload_inspector_server=False)
+    args = Namespace(
+        rank=0,
+        world_size=1,
+        log_interval=99,
+        run_workload_inspector_server=False,
+        _runtime_state=object(),
+    )
     before = vars(args).copy()
     run_config.logger = config
     run_config.profiling.run_workload_inspector_server = True
@@ -133,8 +138,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
-    assert kwargs['config'] is vars(args)
-    assert kwargs['config'] == before
+    assert kwargs['config'] == {k: v for k, v in before.items() if not k.startswith('_')}
     assert vars(args) == before
 
 
@@ -165,16 +169,19 @@ def test_timers_use_owned_settings(monkeypatch, run_config):
 def test_finetune_reuses_registered_config(monkeypatch, run_config):
     import torch
 
+    from megatron.training.state import TrainState
     from tasks import finetune_utils
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    args.epochs, args.iteration = 0, 1
+    args.epochs = 0
+    train_state = TrainState(iteration=1)
     args.main_grads_dtype = args.main_params_dtype = torch.float32
     args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     timers = Mock()
     monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TRAIN_STATE', train_state)
     monkeypatch.setattr(global_vars, '_GLOBAL_TIMERS', None)
     monkeypatch.setattr(global_vars, 'Timers', Mock(return_value=timers))
     global_vars._set_timers(args)
@@ -194,10 +201,13 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
 
 def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     from megatron.training import initialize
+    from megatron.training.state import TrainState
 
-    args = Namespace(iteration=13, log_interval=99, run_workload_inspector_server=False)
+    args = Namespace(log_interval=99, run_workload_inspector_server=False)
+    train_state = TrainState(iteration=13)
     writer = Mock()
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
+    monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
     write_args_to_tensorboard()
@@ -278,7 +288,6 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     import torch
 
     from megatron.training.argument_utils import core_transformer_config_from_args
-    from megatron.training.training import get_megatron_optimizer_config
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -295,11 +304,8 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     args.main_grads_dtype = args.main_params_dtype = torch.float32
     args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     transformer = core_transformer_config_from_args(args)
-    optimizer, _ = get_megatron_optimizer_config(args)
     assert transformer.log_max_attention_logit is enabled
     assert transformer.barrier_with_L1_time is (not enabled)
-    assert optimizer.log_num_zeros_in_grad is enabled
-    assert optimizer.barrier_with_L1_time is (not enabled)
     names = {item.name for item in fields(LoggerConfig)}
     assert not names & {'log_max_attention_logit', 'log_num_zeros_in_grad', 'barrier_with_L1_time'}
 
@@ -354,12 +360,13 @@ def test_attention_metric_logging_reads_model_config(
     from megatron.core.transformer import TransformerConfig
     from megatron.training import training
     from megatron.training.models import GPTModelConfig
+    from megatron.training.state import TrainState
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args(['--micro-batch-size', '1'])
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
-    args.consumed_train_samples = args.skipped_train_samples = 0
+    train_state = TrainState()
     args.dsa_indexer_loss_coeff = None
     args.log_max_attention_logit = not enabled
     transformer = TransformerConfig(
@@ -367,8 +374,10 @@ def test_attention_metric_logging_reads_model_config(
     )
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.logger = LoggerConfig(log_interval=100, tensorboard_log_interval=1)
+    run_config.train.micro_batch_size = 1
     writer = Mock()
     monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(training, 'get_timers', Mock())
     monkeypatch.setattr(training, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)

@@ -86,7 +86,8 @@ def _squared_relu_with_probs_kernel(
     if pid >= n_used:
         return
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             row_i64 = row.to(tl.int64)
             if tl.load(permutation_map_ptr + row_i64) >= 0:
@@ -137,7 +138,8 @@ def _swiglu_with_probs_kernel(
         return
     two_n = 2 * ffn_size
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             row_i64 = row.to(tl.int64)
             if tl.load(permutation_map_ptr + row_i64) >= 0:
@@ -461,25 +463,29 @@ def _unpermute_tokens_in_expert_order_kernel(
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens
     output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer
     hidden_dim,
+    num_tokens,
     num_local_experts: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     """Token-local batch-invariant unpermute.
 
-    Each program owns one output token and one hidden tile. Contributions are
-    accumulated by increasing local expert id, avoiding atomic-add order, in fp64
+    Each program owns a strided set of output tokens and one hidden tile. Contributions
+    are accumulated by increasing local expert id, avoiding atomic-add order, in fp64
     and rounded once to the fp32 rank partial, as training's batch-invariant
     unpermute does. An fp32 accumulator drops small contributions next to a large one.
+    The fixed grid walks only the valid tokens (read on device), so the work scales with
+    the live tokens rather than the worst-case buffer while staying CUDA-graph safe.
     """
-    tok = tl.program_id(0)
+    pid = tl.program_id(0)
     block_h = tl.program_id(1)
     valid_tokens = tl.load(valid_tokens_ptr)
     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offsets < hidden_dim
 
-    acc = tl.zeros([BLOCK_H], dtype=tl.float64)
-    if tok < valid_tokens:
+    for tok in tl.range(pid, tl.minimum(valid_tokens, num_tokens), NUM_PROGRAMS):
         tok_i64 = tok.to(tl.int64)
+        acc = tl.zeros([BLOCK_H], dtype=tl.float64)
         for lid in tl.range(0, num_local_experts):
             pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
             if pos >= 0:
@@ -515,14 +521,17 @@ def unpermute_tokens_in_expert_order(
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))
+    num_programs = max(1, min(num_tokens, 1024))
+    grid = (num_programs, triton.cdiv(hidden_dim, BLOCK_H))
     _unpermute_tokens_in_expert_order_kernel[grid](
         expert_output,
         inverse_map,
         valid_tokens,
         out,
         hidden_dim,
+        num_tokens,
         num_local_experts,
         BLOCK_H=BLOCK_H,
+        NUM_PROGRAMS=num_programs,
     )
     return out

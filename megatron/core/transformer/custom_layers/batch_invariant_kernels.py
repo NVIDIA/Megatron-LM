@@ -542,11 +542,25 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             f"The DeepGEMM batch-invariant backend requires bf16 inputs "
             f"(got {a.dtype}); use backend='triton' for fp16/fp32."
         )
+    # TMA descriptors require 16-byte outer strides, not padded logical shapes.
+    stride_alignment = 16 // a.element_size()
+
+    def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:
+        if t.stride(0) % stride_alignment == 0:
+            return t
+        outer_stride = (t.shape[1] + stride_alignment - 1) // stride_alignment * stride_alignment
+        aligned = t.new_empty_strided(t.shape, (outer_stride, 1))
+        aligned.copy_(t)
+        return aligned
+
+    a = _align_outer_stride(a)
+    b = _align_outer_stride(b)
     M = a.shape[0]
     N = b.shape[1]
-    d = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
+    d = a.new_empty_strided((M, N), (output_stride, 1))
     deep_gemm.bf16_gemm_nn(a, b, d)
-    return d
+    return d.contiguous()
 
 
 def mm_batch_invariant(a, b):
@@ -582,6 +596,9 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    # A full reduction (`x.mean()`, `torch.mean(x)`) arrives with an empty dim list.
+    if dim is None or len(dim) == 0:
+        dim = list(range(input.ndim))
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
@@ -1113,7 +1130,14 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
 
-        opA = A.transpose(0, 1).contiguous() if transa else A.contiguous()  # [K, O] or [I, O]
+        opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
+        # Triton's persistent GEMM consumes the operand strides directly. A
+        # contiguous copy here materializes large TE projection weights on
+        # every forward, including each CUDA-graph replay. DeepGEMM still
+        # requires contiguous operands, and non-transposed layouts retain
+        # their existing behavior.
+        if not (transa and _BATCH_INVARIANT_BACKEND == "triton"):
+            opA = opA.contiguous()
         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
 
         # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
@@ -1669,7 +1693,7 @@ def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
     """Whether TE device-metadata GEMM has been validated on this GPU/library pair.
 
     This path cannot use workspace starvation. Keep the numerical validation
-    boundary explicit; 256-row expert padding alone does not guarantee invariance.
+    boundary explicit; aligned expert padding alone does not guarantee invariance.
     """
     import transformer_engine_torch as tex
 

@@ -43,7 +43,7 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -78,8 +78,13 @@ def test_wide_residual_spec_preserves_unmodified_stack_submodules():
     ("layer_pattern", "expected_spec_names"),
     [
         (
-            Symbols.MAMBA + Symbols.GDN + Symbols.ATTENTION + Symbols.MLP + Symbols.MOE,
-            ["mamba_layer", "gdn_layer", "attention_layer", "mlp_layer", "moe_layer"],
+            Symbols.MAMBA
+            + Symbols.GDN
+            + Symbols.KDA
+            + Symbols.ATTENTION
+            + Symbols.MLP
+            + Symbols.MOE,
+            ["mamba_layer", "gdn_layer", "kda_layer", "attention_layer", "mlp_layer", "moe_layer"],
         ),
         (Symbols.DS_ATTENTION + Symbols.MLA, ["dsa_layer", "mla_layer"]),
     ],
@@ -158,13 +163,13 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     )
 
     config = MLATransformerConfig(
-        num_layers=7,
+        num_layers=8,
         hidden_size=64,
         num_attention_heads=4,
         linear_cp_layout="contiguous",
         attention_cp_layout="zigzag",
     )
-    layer_config_list = validate_segment_layers("MG*-E", config) + validate_segment_layers(
+    layer_config_list = validate_segment_layers("MGK*-E", config) + validate_segment_layers(
         "D+", config
     )
 
@@ -181,6 +186,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     )
 
     assert layout_manager_kwargs["layer_layouts"] == (
+        "contiguous",
         "contiguous",
         "contiguous",
         "zigzag",
@@ -643,10 +649,9 @@ def test_attention_shortcut_wide_residual_ep2_serial_overlap_parity(
 
         def record_residual_writes(model, mode):
             def hook(_module, _args, kwargs, output):
-                if kwargs.get("operation") == "write":
-                    residual_write_dtypes[mode].append(output.dtype)
+                residual_write_dtypes[mode].append(output.dtype)
 
-            model.layers[0].moe_layer.residual_connection_mlp.register_forward_hook(
+            model.layers[0].moe_layer.residual_write_mlp.register_forward_hook(
                 hook, with_kwargs=True
             )
 
@@ -757,7 +762,9 @@ class TestHybridBlock:
                 vocab_size=128,
                 max_sequence_length=8,
                 hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
-                pg_collection=self.get_pg_collection(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=["tp", "pp", "cp", "dp_cp"]
+                ),
             )
 
     def get_hybrid_block(self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs):
@@ -1271,13 +1278,13 @@ class TestHybridBlock:
         recomputed_output, recomputed_gradients = run(recomputed, recomputed_input)
 
         shortcut = recomputed.layers[0]
-        compute_read = getattr(shortcut.compute_layer, "residual_connection", None)
+        compute_read = getattr(shortcut.compute_layer, "residual_read", None)
         if compute_read is None:
-            compute_read = shortcut.compute_layer.residual_connection_self_attn
+            compute_read = shortcut.compute_layer.residual_read_self_attn
         independent_reads = (
             shortcut.shortcut_residual_read,
             compute_read,
-            shortcut.moe_layer.residual_connection_mlp,
+            shortcut.moe_layer.residual_read_mlp,
         )
         assert all(residual_read is not None for residual_read in independent_reads)
         assert len({id(read.read_map.logit) for read in independent_reads}) == 3

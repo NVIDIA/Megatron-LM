@@ -48,8 +48,10 @@ from megatron.core.transformer.hyper_connection import (
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
     build_residual_stream_recompute_plan,
-    residual_stream_recompute_enabled,
+    finalize_recompute_block,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -58,9 +60,10 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
+    wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -75,6 +78,7 @@ class HybridStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     gdn2_layer: ModuleSpec | None = None
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     csa_layer: ModuleSpec | type | None = None
@@ -190,7 +194,7 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        self._mhc_block_end_plan: Optional[List[bool]] = None
+        self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
@@ -347,6 +351,18 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif type(layer_config) is layer_utils.KDALayerConfig:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 else:
                     raise ValueError(
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
@@ -389,14 +405,15 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.mhc_learned_output_contract:
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -500,20 +517,9 @@ class HybridStack(MegatronModule):
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
-    def _compute_mhc_block_end_plan(self) -> List[bool]:
+    def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
-        num_layers = len(self.layers)
-        block_ends: List[bool] = [False] * num_layers
-        if num_layers == 0:
-            return block_ends
-
-        layers_per_block = self.config.mhc_recompute_layer_num
-        for layer_idx in range(num_layers):
-            is_last_in_stack = layer_idx == num_layers - 1
-            block_ends[layer_idx] = is_last_in_stack or (
-                layers_per_block is not None and (layer_idx + 1) % layers_per_block == 0
-            )
-        return block_ends
+        return build_recompute_block_end_plan(len(self.layers), self.config.mhc_recompute_layer_num)
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
@@ -527,21 +533,14 @@ class HybridStack(MegatronModule):
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         block_ends = self._mhc_block_end_plan
 
-        layer_managers: List[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
-        manager = CheckpointWithoutOutputManager()
-        for layer_idx in range(num_layers):
-            layer_managers[layer_idx] = manager
-            if block_ends[layer_idx] and layer_idx != num_layers - 1:
-                manager = CheckpointWithoutOutputManager()
-        return layer_managers, block_ends
+        return build_recompute_layer_managers(block_ends), list(block_ends)
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
         manager: Optional[CheckpointWithoutOutputManager], hidden_states: Tensor, is_block_end: bool
     ) -> None:
         """Finalize the current mHC recompute block when its last layer finishes."""
-        if manager is not None and is_block_end:
-            manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(manager, hidden_states, is_block_end)
 
     def forward(
         self,
@@ -553,6 +552,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
@@ -578,11 +578,6 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
-            raise NotImplementedError(
-                "Hybrid chunkwise context parallelism does not support padding masks."
-            )
 
         cp_layout_state = None
         if self._cp_layout_manager is not None:
@@ -675,7 +670,7 @@ class HybridStack(MegatronModule):
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
         use_residual_stream_recompute = (
             self.uses_wide_residual_stream
-            and residual_stream_recompute_enabled(self.config, self.training)
+            and wide_residual_recompute_enabled(self.config, self.training)
         )
         residual_stream_recompute_plan = (
             build_residual_stream_recompute_plan(
@@ -700,6 +695,7 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
+                    padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
@@ -746,6 +742,7 @@ class HybridStack(MegatronModule):
                             packed_sequence_cp_metadata=layer_cp_metadata,
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
+                            padding_mask_by_layout=padding_mask_by_layout,
                         )
                         residual_stream_recompute_context = moe_recompute_context
                     else:
@@ -755,6 +752,11 @@ class HybridStack(MegatronModule):
                             )
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
+                        layer_padding_mask = padding_mask
+                        if cp_layout_state is not None:
+                            layer_padding_mask = cp_layout_state.get_layer_padding_mask(
+                                physical_layer_idx, padding_mask, padding_mask_by_layout
+                            )
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -768,7 +770,7 @@ class HybridStack(MegatronModule):
                                     rotary_pos_emb=rotary_pos_emb,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=padding_mask,
+                                    padding_mask=layer_padding_mask,
                                 )
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
@@ -843,14 +845,23 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                n = self.config.mhc_num_residual_streams
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

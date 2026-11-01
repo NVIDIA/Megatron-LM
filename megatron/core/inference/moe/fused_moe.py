@@ -21,8 +21,11 @@ from megatron.core.inference.moe.permute import (
     permute_tokens,
     unpermute_tokens,
 )
-from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_SCALE_ROW_BLOCK,
+    mxfp8_quantize_rows,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 
 from . import batch_invariant
 
@@ -106,6 +109,23 @@ def _get_activation_func(
         return padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
+
+
+def _quantize_mxfp8_used_rows(x: torch.Tensor, n_used: Optional[torch.Tensor]) -> MXFP8Tensor:
+    """MXFP8-quantize the expert-grouped buffer, only its first ``n_used`` rows if given.
+
+    The permuted buffers are sized for the worst case (max_tokens x EP x topk rows) so
+    that CUDA graphs see static shapes, but only rows ``[0, n_used)`` (``n_used`` =
+    inclusive_expert_offsets[-1], read on device) feed the grouped GEMMs. Quantizing the
+    whole buffer made the batch-invariant MXFP8 path cost O(max_tokens) per step. The
+    quantized rows are bitwise identical to ``MXFP8Tensor.from_bf16``.
+    """
+    if n_used is None:
+        return MXFP8Tensor.from_bf16(x, backend="triton")
+    data, scale = mxfp8_quantize_rows(x, n_used)
+    return MXFP8Tensor(
+        data=data, scale=ensure_mxfp8_scale_dtype(scale), backend="triton", dtype=x.dtype
+    )
 
 
 def mcore_fused_moe(
@@ -239,7 +259,9 @@ def mcore_fused_moe(
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
     # produces MXFP8Tensor directly).
     if use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
-        hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
+        hidden_states = _quantize_mxfp8_used_rows(
+            hidden_states, offs[-1:] if batch_invariant_mode else None
+        )
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
@@ -269,7 +291,9 @@ def mcore_fused_moe(
         activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
-        activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
+        activation_out = _quantize_mxfp8_used_rows(
+            activation_out, n_used if batch_invariant_mode else None
+        )
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---

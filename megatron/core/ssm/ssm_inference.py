@@ -73,7 +73,7 @@ class SSMChunking(NamedTuple):
     """The chunk length the dynamic-inference prefill kernels actually run at."""
 
     num_householder: int
-    """Householder copies for Gated Delta Product layers; 0 for other mixers."""
+    """Householder copies for GDP, 1 for GDN, and 0 for other mixers."""
 
 
 def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMChunking]:
@@ -118,8 +118,8 @@ def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMCh
             # kernels chunk at a fixed 64. Falls back to chunk_size for any
             # mixer predating the property.
             inference_chunk_size=getattr(mixer, 'ssm_inference_chunk_size', mixer.chunk_size),
-            # Gated Delta Product layers register as Mamba layers but carry a
-            # Householder count, which sizes their (separate) chunk descriptors.
+            # GDP and GDN (one Householder update) share the persistent chunk
+            # descriptors consumed by the inference prefill kernels.
             num_householder=getattr(mixer, 'num_householder', 0) or 0,
         )
         if chunking is None:
@@ -245,9 +245,8 @@ class SSMDynamicInferenceMixin:
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
             )
-            # Flatten back to [N*S, 1, d] to match the merge logic. reshape, not view: with
-            # speculative decoding, some kernels (e.g. GatedDeltaProduct) return a
-            # non-contiguous [N, S, d].
+            # Flatten back to [N*S, 1, d] to match the merge logic. reshape, not view: a
+            # decode kernel may return a non-contiguous [N, S, d].
             y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
@@ -300,6 +299,6 @@ class SSMDynamicInferenceMixin:
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):
-            y[context.padding_slice] = 0.0
+            context.zero_padding_tokens(y)
 
         return self.out_proj(y)
