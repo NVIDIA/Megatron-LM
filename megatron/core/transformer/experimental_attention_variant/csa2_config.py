@@ -13,8 +13,10 @@ def validate_csa2_config(config) -> None:
         raise ValueError("CSA2 requires MLA and learned query/KV RMS normalization")
     if config.normalization != "RMSNorm" or config.layernorm_zero_centered_gamma:
         raise ValueError("CSA2 requires ordinary RMSNorm weights")
-    if config.tensor_model_parallel_size != 1 or config.context_parallel_size != 1:
-        raise NotImplementedError("CSA2 currently requires TP=CP=1")
+    if config.tensor_model_parallel_size != 1:
+        raise NotImplementedError("CSA2 currently requires TP=1")
+    if config.context_parallel_size > 1 and (config.dsa_indexer_loss_coeff or 0) > 0:
+        raise NotImplementedError("CSA2 CP indexer loss is not yet supported")
     if config.fp16 or config.params_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("CSA2 supports FP32 or BF16 parameters")
     if config.dsa_kernel_backend not in ("none", "cudnn"):
@@ -38,8 +40,34 @@ def validate_csa2_config(config) -> None:
         raise NotImplementedError("CSA2 does not yet support shortcut MoE")
     if config.pipeline_model_parallel_size != 1 or config.virtual_pipeline_model_parallel_size:
         raise NotImplementedError("CSA2 currently requires PP=1 and no VPP")
-    if config.recompute_granularity is not None or config.cuda_graph_impl != "none":
+    if config.cuda_graph_impl != "none":
         raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
+    _CSA2_ATTN_RECOMPUTE_MODULES = {
+        "core_attn",
+        "gdn_norm_out",
+        "gdp_qkv",
+        "gdp_in_proj",
+        "shortcut_pre_mlp_layernorm",
+    }
+    if config.recompute_granularity is not None:
+        if config.recompute_granularity == "full":
+            if (config.dsa_indexer_loss_coeff or 0) > 0:
+                raise NotImplementedError(
+                    "CSA2 full recompute does not yet support indexer-loss tracking"
+                )
+            if config.recompute_method != "uniform" or config.recompute_num_layers != 1:
+                raise NotImplementedError(
+                    "CSA2 full recompute currently checkpoints one layer per region"
+                )
+        elif config.recompute_granularity == "selective":
+            _attn_in_recompute = set(config.recompute_modules or []) & _CSA2_ATTN_RECOMPUTE_MODULES
+            if _attn_in_recompute:
+                raise NotImplementedError(
+                    f"CSA2 cross-layer state requires eager attention; cannot "
+                    f"recompute attention modules {sorted(_attn_in_recompute)}"
+                )
+        else:
+            raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
     if (
         config.overlap_moe_expert_parallel_comm
         or config.delay_wgrad_compute
