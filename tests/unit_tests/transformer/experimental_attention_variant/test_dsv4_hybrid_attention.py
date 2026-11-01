@@ -155,6 +155,25 @@ def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
     assert config.attention_latent_norm_epsilon == pytest.approx(3e-6)
 
 
+def test_config_rejects_dynamic_context_parallel():
+    """DSv4 has no dynamic context parallelism path without the balanced indexer."""
+    # NOTE(nightly-sync 26_10_2026): dev rejects dsv4_hybrid under
+    # cp_partition_mode='zigzag' (the default) earlier in __post_init__ than main's
+    # dynamic-CP guard, so without an explicit contiguous layout this test never reached
+    # the rejection it was written to pin and failed on the layout message instead. Dev
+    # implements DSv4 dynamic CP for the balanced zigzag indexer, so main's guard is scoped
+    # to the unbalanced path; satisfying the layout prerequisite here keeps this test
+    # asserting main's limitation for the configurations main wrote it for. The supported
+    # path is covered by test_cp_balanced_indexer_layout.py::
+    # test_balanced_config_accepts_dynamic_context_parallelism.
+    with pytest.raises(ValueError, match="DSv4 dynamic context parallelism is not supported"):
+        _make_config(
+            dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=4096,
+            cp_partition_mode="contiguous",
+        )
+
+
 def test_attention_latent_norm_epsilon_accepts_override():
     """DSv4 latent norms can use the model recipe's dedicated epsilon."""
     config = _make_config(layernorm_epsilon=3e-6, attention_latent_norm_epsilon=1e-5)

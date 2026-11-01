@@ -39,7 +39,12 @@ def finalize_packed_seq_params(
     from megatron.core.packed_seq_params import resolve_cp_group
     from megatron.core.parallel_state import get_context_parallel_group
 
-    cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
+    # Query MPU's global CP group only when the metadata carries no runtime or caller-owned
+    # group: callers that own their process groups may leave the global group uninitialized.
+    static_cp_group = None
+    if packed_seq_params.local_cp_size is None and packed_seq_params.cp_group is None:
+        static_cp_group = get_context_parallel_group()
+    cp_group = resolve_cp_group(static_cp_group, packed_seq_params)
     if packed_seq_params.local_cp_size == 1:
         packed_seq_params.cp_singleton_group = cp_group
         packed_seq_params.cp_group = None

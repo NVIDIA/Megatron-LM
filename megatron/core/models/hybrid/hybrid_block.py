@@ -586,6 +586,7 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
         input_ids: Optional[Tensor] = None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
     ):
@@ -612,11 +613,6 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         packed_seq_params = self._stage_te_cuda_graph_route_metadata(packed_seq_params)
 
-        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
-            raise NotImplementedError(
-                "Hybrid chunkwise context parallelism does not support padding masks."
-            )
-
         cp_layout_state = None
         if self._cp_layout_manager is not None:
             cp_layout_state = self._cp_layout_manager.build_forward_state(
@@ -626,7 +622,6 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
             )
 
         input_ids_by_layout = None
-        padding_mask_by_layout = None
         if cp_layout_state is not None:
             layouts = set(cp_layout_state.manager.layer_layouts)
             if input_ids is not None:
@@ -634,7 +629,10 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
                     layout: cp_layout_state.convert_sequence_metadata(input_ids, layout)
                     for layout in layouts
                 }
-            if padding_mask is not None:
+            if padding_mask_by_layout is None and padding_mask is not None:
+                # HybridModel supplies per-layout masks when it has a dynamic-CP batch,
+                # where each layout can carry its own padded length. Otherwise derive
+                # them from the contiguous mask.
                 padding_mask_by_layout = {
                     layout: cp_layout_state.convert_sequence_metadata(padding_mask, layout)
                     for layout in layouts
@@ -817,6 +815,11 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
                             )
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
+                        layer_padding_mask = padding_mask
+                        if cp_layout_state is not None:
+                            layer_padding_mask = cp_layout_state.get_layer_padding_mask(
+                                physical_layer_idx, padding_mask, padding_mask_by_layout
+                            )
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -830,15 +833,7 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
                                     rotary_pos_emb=rotary_pos_emb,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=(
-                                        padding_mask_by_layout[
-                                            cp_layout_state.manager.layer_layouts[
-                                                physical_layer_idx
-                                            ]
-                                        ]
-                                        if padding_mask_by_layout is not None
-                                        else padding_mask
-                                    ),
+                                    padding_mask=layer_padding_mask,
                                 )
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = (

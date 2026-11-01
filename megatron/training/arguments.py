@@ -525,7 +525,7 @@ def validate_args(args, defaults={}):
             getattr(args, "gtp_weight_remat_size", 1),
         )
     )
-    (args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards) = (
+    args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards = (
         resolve_tensor_parallel_sequence_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_sequence_shards,
@@ -1536,10 +1536,17 @@ def validate_args(args, defaults={}):
             )
 
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        assert args.min_dynamic_context_parallel_size <= dp_cp_size, (
-            f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
-            f'must be <= dp_size * cp_size ({dp_cp_size})'
-        )
+        # main (ea99fdfce) tightened this from `min <= dp_cp_size` to exact membership in
+        # the creatable dynamic CP group sizes, matching create_dynamic_dp_cp_groups().
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
+
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
+        if args.min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "--min-dynamic-context-parallel-size="
+                f"{args.min_dynamic_context_parallel_size} is invalid for DPxCP size "
+                f"{dp_cp_size}; expected one of {valid_group_sizes}"
+            )
 
         import warnings
 
@@ -1870,7 +1877,9 @@ def validate_args(args, defaults={}):
             #     earlier in ``validate_args``).
             #   * Otherwise fall back to ``dp_balanced`` (static packing).
             if args.sequence_packing_scheduler is None:
-                args.sequence_packing_scheduler = 'dp_balanced'
+                args.sequence_packing_scheduler = (
+                    'default_dynamic_cp' if args.dynamic_context_parallel else 'dp_balanced'
+                )
 
     # Packed-sequence buffer-size check. Placed after all scheduler auto-select
     # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
@@ -2936,15 +2945,6 @@ def _add_inference_args(parser):
         help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.',
     )
     group.add_argument(
-        '--inference-disable-ep-consensus',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
-        'Pause/unpause take effect as soon as the signal is delivered to a rank. '
-        'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
-    )
-    group.add_argument(
         '--inference-shards',
         type=str,
         default=None,
@@ -3067,7 +3067,10 @@ def _add_network_size_args(parser):
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
         "max_seqlen_per_dp_cp_rank",
+        "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
         "hybrid_context_parallel",
+        "dynamic_context_parallel",
+        "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
@@ -3075,9 +3078,6 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -4527,10 +4527,28 @@ def _add_distributed_args(parser):
         help='Deprecated alias for --dynamic-context-parallel.',
     )
     group.add_argument(
+        '--dynamic-context-parallel',
+        action='store_true',
+        default=False,
+        help='Enable variable-sized CP groups selected per packed microbatch.',
+    )
+    group.add_argument(
+        '--min-dynamic-context-parallel-size',
+        type=int,
+        default=1,
+        help='Minimum runtime CP group size used by dynamic CP.',
+    )
+    group.add_argument(
         '--sequence-packing-scheduler',
         type=str,
         default=None,
         choices=['dp_balanced', 'default_dynamic_cp'],
+    )
+    group.add_argument(
+        '--pad-packed-seq-alignment',
+        default=None,
+        help="Pad packed THD inputs to a CP-local multiple or 'max'. "
+        "MXFP8 additionally aligns to 32 tokens after SP sharding.",
     )
     group.add_argument(
         '--use-layer-wise-param-layout',

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
@@ -428,7 +428,11 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     def forward(
         ctx, input, weights, fp8_input_store, clamp_value, gate_clamp_scale, linear_clamp_scale
     ):
+        # Lazy import avoids the TE extension -> MLP -> fusion import cycle.
+        from megatron.core.extensions.transformer_engine import propagate_te_grouped_tensor_marker
+
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        propagate_te_grouped_tensor_marker(input, input_for_backward)
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
@@ -545,7 +549,10 @@ def weighted_bias_swiglu_impl(
     assert len(ori_shape) in [2, 3]
     assert gate_clamp_scale is not None or linear_clamp_scale is None
     assert gate_clamp_scale is None or clamp_value is None
-    input = input.view(-1, ori_shape[-1])
+    # Lazy import avoids the TE extension -> MLP -> fusion import cycle.
+    from megatron.core.extensions.transformer_engine import propagate_te_grouped_tensor_marker
+
+    input = propagate_te_grouped_tensor_marker(input, input.view(-1, ori_shape[-1]))
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -28,19 +28,29 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
     resolve_thd_tail_padding_policy,
 )
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import (
+    mtp_on_this_rank as mtp_on_this_rank_func,
+)
 from megatron.core.utils import (
     StragglerDetector,
+    flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
-    get_thd_batch_on_this_cp_rank,
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_te_version,
+    get_torch_version,
 )
 from megatron.training import (
     get_args,
@@ -50,22 +60,14 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    pretrain_cfg_container_from_args,
-)
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
     prepare_packed_seq_params,
@@ -87,179 +89,168 @@ except ImportError as error:
 
 stimer = StragglerDetector()
 
+# Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
+# to match the historical ``sorted(batch.keys())`` order that callers unpack into.
+BATCH_KEYS = [
+    "attention_mask",
+    "cu_seqlens",
+    "cu_seqlens_padded",
+    "hybrid_cp_group",
+    "labels",
+    "local_cp_size",
+    "loss_mask",
+    "max_seqlen",
+    # Dev-only varlen SBHD validation field; see needs_padding_mask in get_batch.
+    "padding_mask",
+    "position_ids",
+    "tokens",
+]
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
-    """Generate a batch.
 
-    Packed sequence support (SFT / ``--sft`` flag):
-        When ``args.sft`` is True, the dataset emits THD-format batches where
-        multiple sequences are concatenated into a single flat token tensor.
-        The batch includes ``cu_seqlens`` (cumulative sequence lengths, shape
-        ``[1, S+1]``) and ``max_seqlen`` (shape ``[1]``) that describe the
-        individual sequence boundaries.
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Generate a batch."""
 
-        This function validates and squeezes those fields:
-          - ``cu_seqlens``:  asserted to have shape ``[1, S+1]`` (micro-batch
-            size must be 1 for packing), then squeezed to ``[S+1]``.
-          - ``max_seqlen``:  asserted to be 1-D; kept as a tensor and passed
-            to ``get_thd_batch_on_this_cp_rank`` which performs the final
-            scalar conversion internally.
-
-        Pipeline stage handling:
-          - First/last PP stages: fetch the full batch (tokens + labels) and
-            route through ``get_thd_batch_on_this_cp_rank`` to produce a
-            ``PackedSeqParams`` object that carries ``cu_seqlens`` and
-            ``max_seqlen`` to the attention kernel.
-          - Middle PP stages: only ``cu_seqlens`` and ``max_seqlen`` are
-            needed for attention masking; all other fields are returned as
-            ``None`` with a ``PackedSeqParams`` built directly here.
-          - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
-            regardless of pipeline stage.
-
-        Difference from ``pretrain_hybrid.py``:
-          - Return format: GPT returns a 6-tuple
-            ``(tokens, labels, loss_mask, attention_mask, position_ids,
-            packed_seq_params)`` where ``packed_seq_params`` is a
-            ``PackedSeqParams`` dataclass.  Mamba returns 7 values via
-            ``batch.values()`` with ``cu_seqlens`` and ``max_seqlen`` as
-            separate dict entries (no ``PackedSeqParams`` wrapper).
-          - Middle-stage return: GPT returns ``(None×5, PackedSeqParams)``;
-            Mamba returns an ``empty_batch`` dict with ``cu_seqlens`` and
-            ``max_seqlen`` set.
-          - CP with packed sequences: GPT delegates to
-            ``get_thd_batch_on_this_cp_rank`` (MCore utility); Mamba
-            implements the ``tex.thd_get_partitioned_indices`` CP slicing
-            inline and does not call that helper.
-          - MTP: GPT passes ``mtp_on_this_rank`` to ``get_batch_on_this_tp_rank``
-            and uses it to gate the early-return; Mamba has no MTP support.
-          - ``max_seqlen`` conversion: Mamba converts to a Python int scalar
-            before returning (``int(max_seqlen[0].item())``); GPT keeps it as
-            a tensor and lets ``get_thd_batch_on_this_cp_rank`` convert it,
-            except for the middle-stage ``PackedSeqParams`` where conversion
-            is done inline.
-    """
     args = get_args()
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
-        # and returns a 7-tuple including `padding_mask`.
+        if pg_collection is None:
+            # Compatibility for direct entrypoint callers; Core receives explicit groups.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
         batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
-            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            mtp_on_this_rank=mtp_on_this_rank_func(
+                layout=config.pipeline_model_parallel_layout,
+                mtp_num_layers=config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=vp_stage,
+                pp_group=pg_collection.pp,
+                vp_size=config.virtual_pipeline_model_parallel_size or 1,
+            ),
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
+            pg_collection=pg_collection,
             config=config,
         )
-        prepare_packed_seq_params(batch[5], config)
+        # NOTE(nightly-sync 26_10_2026): restored dev-only frontend hook. Main's DCP V2
+        # rewrite (ea99fdfce) returned the scheduler's tuple directly, dropping this call.
+        # Main has no prepare_packed_seq_params at all, so this is a merge accident, not an
+        # intentional removal: cp_balanced_indexer still raises "The frontend must call
+        # prebuild_balanced_layouts before model forward" without it, and dev's
+        # tests/unit_tests/data/test_get_batch.py::
+        # test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config asserts it
+        # runs off the normalized TransformerConfig rather than raw args.
+        prepare_packed_seq_params(batch[5], config, cp_group=pg_collection.cp)
         return batch
 
-    # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
-    needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
+    cp_size = args.context_parallel_size
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    is_sft = args.sft
+    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
+    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    # NOTE(nightly-sync 26_10_2026): restored dev-only plumbing, the same feature already
+    # restored in pretrain_hybrid.get_batch. Main's DCP V2 rewrite of this function
+    # (ea99fdfce) dropped all three of dev's varlen-SBHD references here, but the callee in
+    # megatron/core/utils.py still takes needs_padding_mask and megatron/core/context_parallel
+    # still partitions "padding_mask" (with fill_value=True), so the caller was the only side
+    # that lost it. Dev's tests/unit_tests/data/test_varlen_dataset.py::
+    # test_sbhd_get_batch_returns_dataset_padding_mask asserts the mask survives this handoff.
+    needs_padding_mask = getattr(args, "use_varlen_dataset", False) and getattr(
+        args, "varlen_sbhd_validation", False
+    )
+    mtp_on_this_rank = mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
+    # Dynamic CP always uses the sequence-packing path above.
+    assert not args.dynamic_context_parallel
+
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
-        and not is_packed_sequence
+        and not mtp_on_this_rank
+        and not has_cu_seqlens
         and not needs_padding_mask
-        and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
-        return None, None, None, None, None, None, None
+        return [None for _ in BATCH_KEYS]
 
-    # get batches based on the TP rank you are on
+    batch = {}
+    if tp_rank == 0:
+        batch = next(data_iterator)
+        for key in BATCH_KEYS:
+            batch[key] = (
+                batch[key].cuda(non_blocking=True)
+                if key in batch and batch[key] is not None
+                else None
+            )
+
     batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        batch,
+        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        has_cu_seqlens=has_cu_seqlens,
+        dynamic_cp=False,
+        create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
+        cp_size=cp_size,
+        tp_rank=tp_rank,
+        micro_batch_size=args.micro_batch_size,
+        seq_length=args.seq_length,
+        mtp_on_this_rank=mtp_on_this_rank,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
         needs_padding_mask=needs_padding_mask,
     )
+    # Non-validation TP receivers do not allocate this optional field.
+    batch.setdefault("padding_mask", None)
 
-    cu_seqlens = batch.pop('cu_seqlens', None)
-    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
-    batch.pop('local_cp_size', None)
+    batch = flatten_batch_for_packed_sequences(batch)
 
-    if cu_seqlens is not None:
-        assert (
-            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        ), "micro-batch-size must be 1 for packing"
-        cu_seqlens = cu_seqlens[0]
-        assert max_seqlen.dim() == 1
+    # NOTE(nightly-sync 26_10_2026): `and not needs_padding_mask` restores dev's gating. Dev
+    # reached this reduced path only when is_packed_sequence was set, which varlen SBHD
+    # validation never sets, so dev's middle stages fell through to the full CP-partitioned
+    # batch -- every stage needs the mask so its local MoE layers exclude physical padding.
+    # Main cannot regress here: with needs_padding_mask set and has_cu_seqlens False, main's
+    # own `assert has_cu_seqlens` below would already fire, so main never ran this config.
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not needs_padding_mask
+    ):
+        assert has_cu_seqlens
+        # NOTE(nightly-sync 26_10_2026): keyed rather than positional. This was a 10-element
+        # tuple hand-aligned to BATCH_KEYS; restoring dev's "padding_mask" entry made that
+        # alignment silently wrong, so build it by key like the full return below does.
+        reduced = {
+            **dict.fromkeys(BATCH_KEYS),
+            'cu_seqlens': batch['cu_seqlens'],
+            'cu_seqlens_padded': batch['cu_seqlens_padded'],
+            'max_seqlen': batch['max_seqlen'],
+        }
+        return [reduced[key] for key in BATCH_KEYS]
 
-    # For middle pipeline stages with packed sequences, only cu_seqlens and
-    # max_seqlen are needed (for attention masking); skip the full batch.
-    if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
-        packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=int(max_seqlen[0].item()),
-            max_seqlen_kv=int(max_seqlen[0].item()),
-            qkv_format='thd',
-        )
-        # Middle stages receive raw boundaries for physically padded hidden states.
-        prepare_packed_seq_params(packed_seq_params, config, capacity=args.seq_length)
-        return (None, None, None, None, None, packed_seq_params, None)
-
-    thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
-    if cu_seqlens is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-        packed_seq_params = None
-    else:  # Packed THD format
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
-        )
-
-    # Pad the already-packed THD tensors at the end when requested. A configured
-    # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
-    # SBHD validation samples carry physical right-padding metadata. CP has
-    # already partitioned it with the other sequence-dimension tensors.
-    padding_mask = batch.pop('padding_mask', None)
-    if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
-        tokens = batch.get('tokens', None)
-        labels = batch.get('labels', None)
-        loss_mask = batch.get('loss_mask', None)
-        position_ids = batch.get('position_ids', None)
-        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
-            config.pad_packed_seq_alignment,
-            config.max_seqlen_per_dp_cp_rank,
-            config.thd_max_packed_sequences,
-            config.cuda_graph_impl != "none",
-        )
-        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
-            pad_sequence_for_thd(
-                tokens,
-                labels,
-                loss_mask,
-                position_ids,
-                packed_seq_params,
-                alignment=alignment,
-                target_len=target_len,
-                max_num_seqs=max_num_seqs,
-                tail_padding_policy=thd_tail_padding_policy,
-                padding_mask=padding_mask,
-            )
-        )
-        if 'tokens' in batch:
-            batch['tokens'] = tokens
-        if 'labels' in batch:
-            batch['labels'] = labels
-        if 'loss_mask' in batch:
-            batch['loss_mask'] = loss_mask
-        if 'position_ids' in batch:
-            batch['position_ids'] = position_ids
-
-    prepare_packed_seq_params(packed_seq_params, config)
-
-    # Unpack explicitly to avoid relying on dict insertion order.
-    return (
-        batch.get('tokens'),
-        batch.get('labels'),
-        batch.get('loss_mask'),
-        batch.get('attention_mask'),
-        batch.get('position_ids'),
-        packed_seq_params,
-        padding_mask,
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        dynamic_cp=False,
+        cp_group=get_context_parallel_group(),
+        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
+
+    # Return values in BATCH_KEYS order so callers can unpack into the fixed
+    # names regardless of any provenance fields wrappers like BlendedDataset
+    # add (e.g. "dataset_id"). The for-loop above already populates every
+    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
+    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
+    # the historical sorted(batch.keys()) order.
+    return [batch[key] for key in BATCH_KEYS]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -333,14 +324,14 @@ def loss_func(
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -353,7 +344,7 @@ def loss_func(
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,  # forward pass calculations are determinisic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=False,
         )
 
@@ -373,31 +364,130 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
-            get_batch(data_iterator, vp_stage)
+        batch = get_batch(
+            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+
+        # Only populated by the has_cu_seqlens (--sft) BATCH_KEYS branch below;
+        # stays None for the 6-/7-tuple (unpacked) batch shapes.
+        cu_seqlens = None
+        cu_seqlens_padded = None
+
+        if len(batch) == 7:
+            (
+                tokens,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                packed_seq_params,
+                padding_mask,
+            ) = batch
+        elif len(batch) == 6:
+            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = batch
+            padding_mask = None
+        else:
+            (
+                attention_mask,
+                cu_seqlens,
+                cu_seqlens_padded,
+                hybrid_cp_group,
+                labels,
+                local_cp_size,
+                loss_mask,
+                max_seqlen,
+                # NOTE(nightly-sync 26_10_2026): restored dev-only BATCH_KEYS entry, so this
+                # branch now binds the mask instead of hardcoding None. This is the consumer
+                # side of needs_padding_mask in get_batch -- varlen SBHD validation needs the
+                # mask on every PP stage for its local MoE layers.
+                padding_mask,
+                position_ids,
+                tokens,
+            ) = batch
+
+            packed_seq_params = None
+            if cu_seqlens is not None:
+                # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
+                # for consistency, but PackedSeqParams and TE expect 1-D.
+                cu_seqlens = cu_seqlens.squeeze(0)
+                if cu_seqlens_padded is not None:
+                    cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+                # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
+                # attention only computes work for real tokens within each chunk.
+                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+                cu_seqlens_for_params = (
+                    cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+                )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+                packed_seq_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens_for_params,
+                    cu_seqlens_kv=cu_seqlens_for_params,
+                    cu_seqlens_q_padded=cu_seqlens_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_padded,
+                    max_seqlen_q=int(max_seqlen.item()),
+                    max_seqlen_kv=int(max_seqlen.item()),
+                    local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
+                    cp_group=hybrid_cp_group,
+                    tokens_per_sample=args.seq_length,
+                )
+                # NOTE(nightly-sync 26_10_2026): restored dev-only post-pack THD padding for the
+                # non-scheduler path. Main's DCP V2 rewrite (ea99fdfce) moved this
+                # PackedSeqParams construction out of get_batch, where dev padded the CP-local
+                # batch. As on dev, middle stages without sequence tensors keep their raw
+                # boundaries and prepare them against the full sequence capacity.
+                model_config = get_attr_wrapped_model(model, "config")
+                model_pg_collection = get_attr_wrapped_model(model, "pg_collection")
+                static_cp_group = getattr(model_pg_collection, "cp", None)
+                raw_metadata = all(tensor is None for tensor in (tokens, labels, padding_mask))
+                if model_config.pad_packed_seq_alignment is not None and not raw_metadata:
+                    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+                        model_config.pad_packed_seq_alignment,
+                        model_config.max_seqlen_per_dp_cp_rank,
+                        model_config.thd_max_packed_sequences,
+                        model_config.cuda_graph_impl != "none",
+                    )
+                    tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+                        pad_sequence_for_thd(
+                            tokens,
+                            labels,
+                            loss_mask,
+                            position_ids,
+                            packed_seq_params,
+                            alignment=alignment,
+                            target_len=target_len,
+                            max_num_seqs=max_num_seqs,
+                            tail_padding_policy=resolve_thd_tail_padding_policy(model_config),
+                            padding_mask=padding_mask,
+                            cp_group=static_cp_group,
+                        )
+                    )
+                # NOTE(nightly-sync 26_10_2026): restored dev-only hook. Dev prepared every
+                # PackedSeqParams it produced, and pretrain_hybrid.forward_step carries the
+                # same call. Main's DCP V2 rewrite (ea99fdfce) moved this construction out of
+                # get_batch, so metadata built here never passes through the scheduler branch
+                # that prepares it, leaving finalize_packed_seq_params to never resolve the
+                # THD CP routes. Scoped to this branch so the scheduler path, already prepared
+                # in get_batch, is not finalized twice.
+                prepare_packed_seq_params(
+                    packed_seq_params,
+                    model_config,
+                    capacity=args.seq_length if raw_metadata else None,
+                    cp_group=static_cp_group,
+                )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the
         # logits _forward_hook is about to capture -- required for
-        # document-aware CP reassembly of packed (--sft) sequences. get_batch
-        # carries them in packed_seq_params (cu_seqlens_q_padded, falling back
-        # to cu_seqlens_q); the sequence-packing scheduler path records None.
+        # document-aware CP reassembly of packed (--sft) sequences.
         from megatron.training.distillation.logits_saver import get_logits_saver
 
         saver = get_logits_saver()
         if saver is not None:
-            cu_seqlens_for_saver = None
-            if args.sequence_packing_scheduler is None and packed_seq_params is not None:
-                cu_seqlens_for_saver = (
-                    packed_seq_params.cu_seqlens_q_padded
-                    if packed_seq_params.cu_seqlens_q_padded is not None
-                    else packed_seq_params.cu_seqlens_q
-                )
-            saver.set_current_cu_seqlens(cu_seqlens_for_saver)
+            saver.set_current_cu_seqlens(
+                cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            )
 
     timers('batch-generator').stop()
 
@@ -432,23 +522,33 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    """Whether the dataset should be built on the current rank."""
     args = get_args()
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif getattr(args, 'sequence_packing_scheduler', None) is not None:
+    elif args.sequence_packing_scheduler is not None:
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
         return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence or (
+        # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
+        # same dropped feature as needs_padding_mask in get_batch above, and the exact mirror
+        # of the restoration in pretrain_hybrid.is_dataset_built_on_rank. Main's DCP V2
+        # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
+        # without a data iterator -- but varlen SBHD validation needs its padding metadata on
+        # every stage, and dev's tests/unit_tests/data/test_varlen_dataset.py::
+        # test_sbhd_dataset_is_built_on_intermediate_pipeline_stage asserts exactly that.
         getattr(args, 'use_varlen_dataset', False)
         and getattr(args, 'varlen_sbhd_validation', False)
     ):
-        # Packed THD and SBHD validation both need padding metadata on every
-        # pipeline stage so each MoE layer excludes physical padding.
+        # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
-        config, ignore_virtual=False, vp_stage=vp_stage
+    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
     )
 
 
@@ -483,7 +583,6 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
-        "inter_document_masking": args.dataloader_inter_document_masking,
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
@@ -494,6 +593,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "dynamic_context_parallel": args.dynamic_context_parallel,
+        "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_sbhd_validation": args.varlen_sbhd_validation,
@@ -592,6 +692,10 @@ if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
 
+    print_rank_0(f'> PyTorch version ................ {get_torch_version()}')
+    print_rank_0(f'> Megatron-Core version .......... {mcore_version}')
+    print_rank_0(f'> Transformer Engine version ... {get_te_version()}')
+
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
@@ -620,7 +724,6 @@ if __name__ == "__main__":
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        model_provider=partial(model_provider, gpt_builder),
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
