@@ -336,7 +336,9 @@ class TestMtpDecodeBookkeeping:
         assert context._using_cuda_graph_this_step is True
         assert context.padded_active_token_count == 4
         mha = context.graph_attn_metadata["mha_metadata"]
-        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == MAX_SEQUENCE_LENGTH
+        # The fixed bound also covers the speculative lookahead past the sequence limit.
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == bound
         assert mha.state_data["max_seqlen_q"] == 1
         # The metadata is sized by the PADDED count so the graph's launch bounds stay stable.
         assert mha.state_data["query_lengths"].shape[0] == 4
@@ -390,7 +392,8 @@ class TestMtpDecodeBookkeeping:
         context._mtp_setup_decode_step()
         bound_at_high_position = mha.state_data["max_seqlen_k"]
 
-        assert bound_at_low_position == bound_at_high_position == MAX_SEQUENCE_LENGTH
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert bound_at_low_position == bound_at_high_position == bound
         # The real per-request lengths still come from the GPU cu_kv tensors.
         assert int(context.gpu_view.mha_kv_seq_lengths[0].item()) == 21
 
@@ -441,6 +444,20 @@ class TestMtpDecodeBookkeeping:
         assert mha.state_data["query_lengths"].shape[0] == 4
         # Every capture row is a real (non-padding) row, so nothing is sentinel-filled.
         assert context.gpu_view.mha_query_lengths[:4].cpu().tolist() == [1, 1, 1, 1]
+
+    def test_eager_scratch_staging_uses_non_graph_metadata(self):
+        """An eager EP dummy stages on scratch too, but launches with the eager metadata."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        dummy = context.kv_block_allocator.dummy_block_idx
+
+        context.mtp_metadata.begin_decode_for_capture(2, graphed=False)
+        context._mtp_setup_decode_step()
+
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        assert context._using_cuda_graph_this_step is False
+        assert (context.gpu_view.token_to_block_idx[:2] == dummy).all()
+        assert context.gpu_view.mha_kv_seq_lengths[:2].cpu().tolist() == [1, 1]
 
     def test_begin_decode_for_capture_touches_only_scratch_kv(self):
         """Capture-time metadata must point every row at the scratch block."""
@@ -523,6 +540,39 @@ class TestMtpMainExecutionState:
         # Leaving the scope must also leave MTP-forward mode, or KV routing stays on the
         # draft plane and `is_decode_only` stays False for the rest of the run.
         assert context.mtp_metadata.forward_active is False
+
+    def test_dummy_staging_preserves_the_step_bookkeeping(self):
+        """The EP dummy stages its draft metadata before the step's own forward reads it back."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        # Stand in for a prepared 64-token prefill step.
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        mha.set_state_data(padded_active_request_count=1, max_seqlen_q=64, max_seqlen_k=64)
+        context.active_attn_metadata = context.non_graph_attn_metadata
+        context.gpu_view._buf.random_(0, 256)
+        bookkeeping = context.gpu_view._buf.clone()
+        state = {
+            name: (m.state_data, m._max_seqlen_q, m._max_seqlen_k)
+            for name, m in (
+                ("graph", context.graph_attn_metadata["mha_metadata"]),
+                ("non_graph", mha),
+            )
+        }
+
+        with context._mtp_forward_phase(preserve_step_bookkeeping=True):
+            context.mtp_metadata.begin_decode_for_capture(4, graphed=False)
+            context._mtp_setup_decode_step()
+            # The dummy's one-token draft geometry overwrote the step's.
+            assert mha.state_data["max_seqlen_q"] == 1
+            assert not torch.equal(context.gpu_view._buf, bookkeeping)
+
+        assert torch.equal(context.gpu_view._buf, bookkeeping)
+        for name, m in (("graph", context.graph_attn_metadata["mha_metadata"]), ("non_graph", mha)):
+            state_data, max_seqlen_q, max_seqlen_k = state[name]
+            # The same views into the (restored) buffer, so their contents are restored too.
+            assert m.state_data is state_data, name
+            assert (m._max_seqlen_q, m._max_seqlen_k) == (max_seqlen_q, max_seqlen_k), name
+        assert mha.state_data["max_seqlen_q"] == 64
 
     def test_state_is_restored_when_a_draft_forward_raises(self):
         """A failed draft must not leave its counts behind for the log-prob code."""
@@ -1233,10 +1283,13 @@ class TestMtpSpareBlockLifecycle:
         with pytest.raises(RuntimeError, match="cannot pause requests"):
             context.prepare_requests()
         torch.testing.assert_close(context.request_kv_length_offsets, before)
+        context.memory_buffer[1, :, held[0]].fill_(float("nan"))
         context.kv_block_allocator.release_memory_blocks(held[:1])
         assert context.can_prepare_requests()
         context.prepare_requests()
         assert context.request_kv_block_counts[0] == 2
+        assert context.request_to_kv_block_ids[0, 1] == held[0]
+        assert torch.count_nonzero(context.memory_buffer[1, :, held[0]]) == 0
         self._assert_main_token_mapping(context)
         context.kv_block_allocator.release_memory_blocks(held[1:])
 
