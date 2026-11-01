@@ -82,6 +82,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             and layer.cuda_graphs
         ):
             layer.set_te_cuda_graph_backward_dw_wrapper()
+            # No per-sample unflatten here: the graphed router routes the flattened packed
+            # batch, as eager TE CUDA graph capture does, and a graphed attention rejects
+            # packed_seq_params outright. moe_combine then has nothing to reflatten.
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay
@@ -129,9 +132,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
+                # Same MoE inputs as the eager TransformerLayer._forward_mlp path: a packed batch
+                # flattened to [mbs*s, 1, h] is restored to [s, mbs, h] so the router computes
+                # its sequence-level aux loss per sample, and the padding mask is consumed by the
+                # router (dropless HybridEP excludes padded tokens). moe_combine flattens the
+                # output back; the micro-batch size travels in layer_state because another
+                # microbatch can run between the two slots.
+                pre_mlp_layernorm_output, padding_mask, _, moe_unflatten_mbs = (
+                    layer._maybe_unflatten_for_moe(
+                        pre_mlp_layernorm_output, padding_mask, None, packed_seq_params
+                    )
+                )
+                node.layer_state.moe_unflatten_mbs = moe_unflatten_mbs
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                # Same routing inputs as the eager MoELayer.forward path: the padding mask is
-                # consumed by the router (dropless HybridEP excludes padded tokens).
                 probs, routing_map = layer.mlp.route(
                     pre_mlp_layernorm_output, padding_mask, packed_seq_params=packed_seq_params
                 )
@@ -230,14 +243,22 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.combine(output)
+        moe_unflatten_mbs = getattr(node.layer_state, 'moe_unflatten_mbs', None)
         # Without dropout, the shared-expert add of `postprocess` and the residual add of
-        # `mlp_bda` run as one kernel that is bit-identical to the two adds.
+        # `mlp_bda` run as one kernel that is bit-identical to the two adds. A packed batch
+        # routed per sample keeps the two adds, as on the eager path: the shared expert joins
+        # in [s, mbs, h] and the sum is flattened back before the residual add.
         fuse_residual_add = (
             shared_expert_output is not None
+            and moe_unflatten_mbs is None
             and layer.mlp_bda is get_bias_dropout_add
             and (layer.hidden_dropout == 0.0 or not layer.training)
         )
         output = layer.mlp.postprocess(output, None if fuse_residual_add else shared_expert_output)
+        output = layer._maybe_reflatten_from_moe(
+            output, node.chunk_state.packed_seq_params, moe_unflatten_mbs
+        )
+        node.layer_state.moe_unflatten_mbs = None
         # Check the kernel's requirements on the postprocessed output: `postprocess` restores the
         # token order and the [s, b, h] shape of the combined tokens.
         should_fuse_residual_add = fuse_residual_add and can_use_fused_moe_residual_add(
