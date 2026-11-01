@@ -867,8 +867,8 @@ class InferenceConfig:
         config construction.
 
         If `pg_collection` is unset, the collection that `model` was built with is used when it
-        sets every group that inference reads (tp, pp, dp, mp and ep). Otherwise the groups come
-        from `megatron.core.parallel_state`; that fallback is deprecated and warns.
+        sets every group that inference reads (tp, pp, dp, mp, ep and tp_ep). Otherwise the groups
+        come from `megatron.core.parallel_state`; that fallback is deprecated and warns.
 
         See ``docs/developer/parallel-state-deprecation.md``.
 
@@ -879,20 +879,24 @@ class InferenceConfig:
             The collection, which is also stored in `pg_collection`.
         """
         if self.pg_collection is None:
+            # The dynamic context and engine also read tp_ep, the group that the MoE dispatchers
+            # span. An unset field reads as None, which sizes the group to 1, so the model's
+            # collection must set tp_ep and the fallback builds it. A configured one may omit it.
+            required = (*_INFERENCE_PROCESS_GROUPS, "tp_ep")
             model_pg_collection = None
             if model is not None:
                 model_pg_collection = getattr(unwrap_model(model), "pg_collection", None)
             # A model built on a partial collection, for example one from
             # use_mpu_process_groups(required_pgs=[...]), lacks groups that inference reads.
             if model_pg_collection is not None and all(
-                name in vars(model_pg_collection) for name in _INFERENCE_PROCESS_GROUPS
+                name in vars(model_pg_collection) for name in required
             ):
                 self.pg_collection = model_pg_collection
             else:
                 self.pg_collection = resolve_process_groups(
                     None,
                     owner=type(self).__name__,
-                    required=_INFERENCE_PROCESS_GROUPS,
+                    required=required,
                     deprecated_in="0.21",
                     removed_in="0.23",
                 )

@@ -165,6 +165,7 @@ class TestConstructorValidation:
             expt_tp=None,
             expt_dp=None,
             ep=_StubGroup(global_ep_size),
+            tp_ep=_StubGroup(global_ep_size),
         )
         monkeypatch.setattr(
             ProcessGroupCollection,
