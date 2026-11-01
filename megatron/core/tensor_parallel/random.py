@@ -712,6 +712,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx: Any,
         run_function: Callable[[Unpack[_Ts]], _R],
         distribute_saved_activations: bool,
+        tp_group: Optional[torch.distributed.ProcessGroup],
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
@@ -719,6 +720,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
+        ctx.tp_group = tp_group
         # Activation recomputation must use the same autocast policy as the original forward.
         # Otherwise it replays under the ambient autocast state.
         ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
@@ -736,7 +738,8 @@ class CheckpointFunction(torch.autograd.Function):
         if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+                args[0],
+                split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True, tp_group=tp_group),
             )
 
         # Store everything.
@@ -761,7 +764,10 @@ class CheckpointFunction(torch.autograd.Function):
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
-                inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+                inputs[0],
+                gather_split_1d_tensor(inputs[0].data, tp_group=ctx.tp_group).view(
+                    ctx.input_0_shape
+                ),
             )
 
         with _fork_rng():
@@ -790,14 +796,21 @@ class CheckpointFunction(torch.autograd.Function):
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
         _unset_checkpointing()
-        return (None, None) + grads
+        return (None, None, None) + grads
 
 
 def checkpoint(
-    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+    function: Callable[[Unpack[_Ts]], _R],
+    distribute_saved_activations: bool,
+    *args: Unpack[_Ts],
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> _R:
     """Checkpoint a model or part of the model.
-    This has been directly copied from torch.utils.checkpoint."""
+    This has been directly copied from torch.utils.checkpoint.
+
+    With ``distribute_saved_activations``, the first input is saved split across ``tp_group``,
+    the tensor-parallel group of the checkpointed module.
+    """
     from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
@@ -805,7 +818,7 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    return CheckpointFunction.apply(function, distribute_saved_activations, tp_group, *args)
 
 
 class _RegionState(enum.Enum):
