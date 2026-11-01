@@ -10,14 +10,8 @@ from dataloader_resume import (
 )
 from dataset_helpers import TaskEncoder
 
-from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.parallel_state import (
-    get_context_parallel_rank,
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
+from megatron.core.process_groups_config import require_process_groups, resolve_process_groups
 from megatron.energon import (
     FileStoreCachePool,
     LimitDataset,
@@ -89,13 +83,28 @@ def datasets_provider(task_encoder, worker_config=None):
     return train_dataset, val_datasets_without_source_datasets, None
 
 
-def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
-    """Check if the current pipeline parallel stage is the first or last stage."""
+def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size, pg_collection=None):
+    """Check if the current pipeline parallel stage is the first or last stage.
+
+    Args:
+        pp_size: Pipeline-parallel size of the model.
+        encoder_pipeline_model_parallel_size: Number of pipeline stages of the vision model.
+        pg_collection: Process groups of the model; the stage is this rank's rank in its
+            pipeline-parallel group. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     if pp_size == 1:  # No pipeline parallelism.
         return True
 
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.multimodal.dataloader_provider.is_first_or_last_stage",
+        required=("pp",),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     is_valid_rank = False
-    pp_rank = get_pipeline_model_parallel_rank()
+    pp_rank = pg_collection.pp.rank()
     if encoder_pipeline_model_parallel_size == 0:
         # No separate pipeline stage for the vision model. Run the dataloader on the first and last pipeline stage.
         is_valid_rank = pp_rank in (0, pp_size - 1)
@@ -111,25 +120,59 @@ def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
 def is_dataloader_rank(
     encoder_pipeline_model_parallel_size,
     deduplicate_across_context_parallel=False,
+    pg_collection=None,
 ):
-    """Check if we should have the dataloader on this tensor and pipeline parallel rank."""
-    # Run dataloader only on the first tensor parallel rank (will be broadcasted to others).
-    is_first_rank = get_tensor_model_parallel_rank() == 0
-    if deduplicate_across_context_parallel:
-        is_first_rank = is_first_rank and get_context_parallel_rank() == 0
+    """Check if we should have the dataloader on this tensor and pipeline parallel rank.
 
-    pp_size = get_pipeline_model_parallel_world_size()
+    Args:
+        encoder_pipeline_model_parallel_size: Number of pipeline stages of the vision model.
+        deduplicate_across_context_parallel: Run the dataloader only on the first rank of each
+            context-parallel group.
+        pg_collection: Process groups of the model, whose tensor-, context- and
+            pipeline-parallel ranks select the dataloader ranks. None falls back to the global
+            parallel state with a ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.multimodal.dataloader_provider.is_dataloader_rank",
+        required=("tp", "cp", "pp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    # Run dataloader only on the first tensor parallel rank (will be broadcasted to others).
+    is_first_rank = pg_collection.tp.rank() == 0
+    if deduplicate_across_context_parallel:
+        is_first_rank = is_first_rank and pg_collection.cp.rank() == 0
+
+    pp_size = pg_collection.pp.size()
     is_first_rank = is_first_rank and is_first_or_last_stage(
-        pp_size, encoder_pipeline_model_parallel_size
+        pp_size, encoder_pipeline_model_parallel_size, pg_collection=pg_collection
     )
 
     return is_first_rank
 
 
 def train_valid_test_dataloaders_provider(
-    train_val_test_num_samples, task_encoder=None, *, restore_dataloader_state=True
+    train_val_test_num_samples,
+    task_encoder=None,
+    *,
+    restore_dataloader_state=True,
+    pg_collection=None,
 ):
-    """Build dataloaders, optionally skipping state restoration for a length-only probe."""
+    """Build dataloaders, optionally skipping state restoration for a length-only probe.
+
+    Args:
+        train_val_test_num_samples: Target sizes of the train, validation and test datasets.
+        task_encoder: Task encoder of the train dataset. None uses the default TaskEncoder.
+        restore_dataloader_state: Restore the train dataloader state saved with the checkpoint.
+        pg_collection: Process groups of the run. Its tensor-, context- and pipeline-parallel
+            ranks select the dataloader ranks, and the loaders shard samples over its
+            data-parallel group including the GTP weight-remat axis (dp_gtp_remat), or over its
+            data-parallel group (dp) when the collection has no dp_gtp_remat. Its
+            pipeline-parallel size picks the checkpoint directory the dataloader state is
+            restored from. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     args = get_args()
 
     dataloader_prefetch_factor = getattr(args, "dataloader_prefetch_factor", 8)
@@ -142,25 +185,40 @@ def train_valid_test_dataloaders_provider(
     if task_encoder is None:
         task_encoder = TaskEncoder()
 
+    owner = "examples.multimodal.dataloader_provider.train_valid_test_dataloaders_provider"
+    if pg_collection is None:
+        pg_collection = resolve_process_groups(
+            None,
+            owner=owner,
+            required=("tp", "cp", "pp", "dp_gtp_remat"),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+    else:
+        require_process_groups(pg_collection, ("tp", "cp", "pp"), owner=owner)
+    # The GTP weight-remat ranks of a data-parallel replica consume distinct samples, as in
+    # build_pretraining_data_loader. Collections that predate the GTP weight-remat fields carry
+    # only the replicate group.
+    data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+    if data_parallel_group is None:
+        raise ValueError(f"{owner} requires pg_collection.dp_gtp_remat or pg_collection.dp")
+
     # Dataloader is only on specific ranks.
     if not is_dataloader_rank(
         getattr(args, "encoder_pipeline_model_parallel_size", 0),
         deduplicate_across_context_parallel=getattr(
             args, "deduplicate_dataloader_across_context_parallel", False
         ),
+        pg_collection=pg_collection,
     ):
         return None, None, None
 
     worker_debug_path = None
     worker_log_level = 0
 
-    rank = parallel_state.get_data_parallel_rank()
-    world_size = parallel_state.get_data_parallel_world_size()
-    data_parallel_group = parallel_state.get_data_parallel_group()
-
     worker_config = WorkerConfig(
-        rank=rank,
-        world_size=world_size,
+        rank=data_parallel_group.rank(),
+        world_size=data_parallel_group.size(),
         num_workers=args.num_workers,
         data_parallel_group=data_parallel_group,
         worker_debug_path=worker_debug_path,
@@ -195,13 +253,18 @@ def train_valid_test_dataloaders_provider(
     if restore_dataloader_state and args.load is not None:
         if getattr(args, "dataloader_save", None):
             iteration = get_train_state().iteration
-            dp_rank = parallel_state.get_data_parallel_rank()
+            dp_rank = data_parallel_group.rank()
             strict_load = should_strictly_load_dataloader_state(args)
+            # Read from the directory maybe_save_dataloader_state writes to: the canonical
+            # TP0/PP0 directory of the model's pipeline layout.
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
                 iteration,
+                pipeline_parallel=pg_collection.pp.size() > 1,
+                tensor_rank=0,
+                pipeline_rank=0,
                 expert_parallel=False,
-                pipeline_rank=0,  # Only the first pipeline parallel rank stores the dataloader checkpoint.
+                expert_rank=0,
                 basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
             if not os.path.exists(data_save_name):

@@ -265,8 +265,9 @@ pre-created groups from `dynamic_cp` and `dynamic_tp_cp`, whose keys are runtime
 (the groups in `dynamic_tp_cp` have `TP size * CP size` ranks). The scheduler only selects
 sizes present in `dynamic_cp`; the static `cp` group remains unchanged. The standard GPT
 and Hybrid forward steps pass their model's collection. Legacy training entrypoints may
-bootstrap a collection with `ProcessGroupCollection.use_mpu_process_groups()` before
-calling Core, while independent parallel grids supply their own groups directly.
+pass the collection that `initialize_model_parallel()` registered,
+`parallel_state.get_registered_process_groups()`, while independent parallel grids supply
+their own groups directly.
 
 ### `data_schedule_utils.py`
 

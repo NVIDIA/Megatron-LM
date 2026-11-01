@@ -38,7 +38,6 @@ def test_selective_log_softmax_batch_invariant():
 
 
 def test_moe_unpermute_batch_invariant_inverse_map_rank_tree():
-    from megatron.core import parallel_state
     from megatron.core.transformer.moe.moe_utils import unpermute
 
     hidden = 4
@@ -49,24 +48,20 @@ def test_moe_unpermute_batch_invariant_inverse_map_rank_tree():
     routing_map = torch.ones(1, 4, device="cuda", dtype=torch.bool)
     inverse_map = torch.tensor([[[0, 1, 2, 3]], [[0, 1, 2, 3]]], device="cuda", dtype=torch.int64)
 
-    parallel_state.set_expert_model_parallel_world_size(2)
-    try:
-        with set_batch_invariant_mode(True):
-            out = unpermute(
-                tokens,
-                sorted_indices,
-                (1, hidden),
-                routing_map=routing_map,
-                batch_invariant_inverse_map=inverse_map,
-            )
-    finally:
-        parallel_state.set_expert_model_parallel_world_size(None)
+    with set_batch_invariant_mode(True):
+        out = unpermute(
+            tokens,
+            sorted_indices,
+            (1, hidden),
+            routing_map=routing_map,
+            batch_invariant_inverse_map=inverse_map,
+            ep_size=2,
+        )
 
     torch.testing.assert_close(out[0], torch.zeros(hidden, device="cuda"), rtol=0.0, atol=0.0)
 
 
 def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
-    from megatron.core import parallel_state
     from megatron.core.transformer.moe.moe_utils import permute, unpermute
 
     torch.manual_seed(123)
@@ -92,24 +87,21 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
             probs=probs,
             routing_map=routing_map,
             batch_invariant_inverse_map=inverse_map,
+            ep_size=2,
         )
 
-    parallel_state.set_expert_model_parallel_world_size(2)
-    try:
-        with torch.no_grad(), set_batch_invariant_mode(True):
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    expected = _run()
-            torch.cuda.current_stream().wait_stream(stream)
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                expected = _run()
+        torch.cuda.current_stream().wait_stream(stream)
 
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                graph_out = _run()
-            graph.replay()
-    finally:
-        parallel_state.set_expert_model_parallel_world_size(None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = _run()
+        graph.replay()
 
     torch.testing.assert_close(graph_out, expected, rtol=0.0, atol=0.0)
     reference = (tokens.float() * probs[:, 0, None] + tokens.float() * probs[:, 2, None]).to(

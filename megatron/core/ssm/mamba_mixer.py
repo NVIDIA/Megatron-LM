@@ -15,14 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core import parallel_state
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
@@ -119,7 +118,15 @@ class ExtendedRMSNorm(RMSNormGated):
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
         if not hasattr(self, 'tp_group'):
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+            # MambaMixer sets its norm's tp_group; a norm built elsewhere falls back.
+            self.tp_group = resolve_process_groups(
+                None,
+                owner="ExtendedRMSNorm.sharded_state_dict",
+                required=("tp",),
+                argument="tp_group",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ).tp
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
@@ -1362,8 +1369,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: replica ids span the mixer's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
         # Parameters

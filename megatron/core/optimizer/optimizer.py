@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -47,6 +47,15 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
+from ..process_groups_config import (
+    _FALLBACK_WARNING_SKIP_PREFIXES,
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    require_process_groups,
+    resolve_gtp_remat_group,
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -184,6 +193,81 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection) -> None:
+    """Set the groups over which ``optimizer`` counts a replicated gradient once.
+
+    Gradient norms and zero counts include a parameter replicated along the tensor-parallel or
+    GTP axis on one rank of that axis only. The groups come from ``pg_collection``, and a field
+    set to ``None`` marks an axis that is off, so no parameter is replicated along it.
+    ``expt_tp`` defaults to ``tp`` when the collection does not set it. An unset ``gtp_remat``
+    or ``expt_gtp_remat`` resolves as the model's layers resolve it
+    (``resolve_gtp_remat_group``), so the filter matches how the weights were sharded.
+
+    An optimizer whose groups are not set this way filters duplicates by the global grid.
+
+    Args:
+        optimizer: The optimizer, or a child optimizer that runs the filters itself.
+        pg_collection: The collection of the model whose parameters ``optimizer`` updates.
+
+    Raises:
+        ValueError: If ``pg_collection`` does not set ``tp``.
+    """
+    groups = vars(pg_collection)
+    if 'tp' not in groups:
+        raise ValueError(
+            "pg_collection must set tp, the tensor-parallel group of the optimizer's "
+            "parameters; set it to None only if tensor parallelism is off"
+        )
+    optimizer.tp_group = groups['tp']
+    optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
+    optimizer.gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=False, owner="get_megatron_optimizer"
+    )
+    optimizer.expert_gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=True, owner="get_megatron_optimizer"
+    )
+    optimizer.duplicate_filter_groups_from_collection = True
+
+
+# Releases in which the grad-stats group fallbacks started to warn and are removed.
+_GRAD_STATS_FALLBACK_DEPRECATED_IN = "0.21"
+_GRAD_STATS_FALLBACK_REMOVED_IN = "0.23"
+
+# Owners that have warned, in this process, that they reduce gradient statistics over WORLD.
+_warned_world_grad_stats_owners: Set[str] = set()
+
+
+def _warn_grad_stats_reduced_over_world(owner: str) -> None:
+    """Warn, once per ``owner``, that its gradient statistics are reduced over WORLD.
+
+    ``torch.distributed`` reads a ``None`` group as the default (WORLD) group. WORLD holds the
+    intended ranks only when they are every rank in the job, as for one model with one
+    distributed-optimizer instance. Otherwise the gradient norm and zero count include gradients
+    replicated across optimizer instances or data-parallel ranks, or mix in other models, and
+    ranks that run no optimizer step leave the reduction waiting.
+
+    As with ``warn_global_process_group_fallback``, the category is
+    ``ProcessGroupFallbackWarning``, and a warning that a filter turns into an error is not
+    recorded, so under an ``error`` filter every fallback raises.
+
+    Args:
+        owner: Name of the optimizer class whose grad-stats group is ``None``.
+    """
+    if owner in _warned_world_grad_stats_owners:
+        return
+    warnings.warn(
+        f"{owner} has no grad_stats_parallel_group, so it reduces the gradient norm, the zero "
+        "count and the found-inf flag over the default (WORLD) process group. This fallback is "
+        f"deprecated since Megatron Core {_GRAD_STATS_FALLBACK_DEPRECATED_IN} and will be "
+        f"removed in {_GRAD_STATS_FALLBACK_REMOVED_IN}; set the group explicitly, for example "
+        "to pg_collection.intra_dist_opt for a distributed optimizer or to pg_collection.mp for "
+        "a non-distributed one.",
+        ProcessGroupFallbackWarning,
+        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+    )
+    _warned_world_grad_stats_owners.add(owner)
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -273,6 +357,7 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
+        use_global_fallback = not getattr(self, 'duplicate_filter_groups_from_collection', False)
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
@@ -300,11 +385,13 @@ class MegatronOptimizer(ABC):
                 param,
                 tp_group=getattr(self, 'tp_group', None),
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(
                 param,
                 gtp_group=getattr(self, 'gtp_group', None),
                 expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
@@ -352,12 +439,18 @@ class MegatronOptimizer(ABC):
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
-    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+    def get_grad_stats_parallel_group(self) -> Optional[torch.distributed.ProcessGroup]:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
         The two most common cases are:
         - Non-distributed optimizer (default): Return the model-parallel group.
-        - Distributed optimizer (overridden in distrib_optimizer.py): Return the entire world.
+        - Distributed optimizer (overridden in distrib_optimizer.py): Return the ranks of one
+          distributed-optimizer instance.
+
+        ``get_megatron_optimizer`` sets ``grad_stats_parallel_group``. An optimizer built without
+        it falls back to the global model-parallel group, and one whose group is ``None``
+        reduces over the default (WORLD) group. Both fallbacks are deprecated and emit a
+        ``ProcessGroupFallbackWarning``.
         """
         if hasattr(self, 'model_parallel_group'):
             warnings.warn(
@@ -367,9 +460,16 @@ class MegatronOptimizer(ABC):
             )
             self.grad_stats_parallel_group = self.model_parallel_group
             delattr(self, "model_parallel_group")
-            return self.grad_stats_parallel_group
         if hasattr(self, 'grad_stats_parallel_group'):
+            if self.grad_stats_parallel_group is None:
+                _warn_grad_stats_reduced_over_world(type(self).__name__)
             return self.grad_stats_parallel_group
+        warn_global_process_group_fallback(
+            type(self).__name__,
+            "grad_stats_parallel_group",
+            deprecated_in=_GRAD_STATS_FALLBACK_DEPRECATED_IN,
+            removed_in=_GRAD_STATS_FALLBACK_REMOVED_IN,
+        )
         return parallel_state.get_model_parallel_group()
 
     @abstractmethod
@@ -470,6 +570,7 @@ class MegatronOptimizer(ABC):
             expert_tp_group=getattr(self, 'expert_tp_group', None),
             gtp_group=getattr(self, 'gtp_group', None),
             expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+            use_global_fallback=not getattr(self, 'duplicate_filter_groups_from_collection', False),
         )
 
     @abstractmethod
@@ -694,6 +795,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             a constant gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters this optimizer updates. They name the config-logger file; without them
+            the file name falls back, with a warning, to the global parallel state.
     """
 
     def __init__(
@@ -702,9 +806,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         config: OptimizerConfig,
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
@@ -892,7 +1000,11 @@ def _strip_module_prefix(name: str) -> str:
 
 
 def _backfill_gtp_sharded_param_map(
-    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+    id_to_sharded_param_map: dict,
+    float16_groups,
+    model_sharded_state_dict=None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> None:
     """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
 
@@ -916,6 +1028,21 @@ def _backfill_gtp_sharded_param_map(
     and is unaffected.
 
     No-op when GTP is unavailable or when every param already matched.
+
+    Args:
+        id_to_sharded_param_map: Map from optimizer param id to model ShardedTensor, completed
+            in place.
+        float16_groups: The optimizer's float16 param groups, in optimizer-state order.
+        model_sharded_state_dict: The model's sharded state dict, whose entries case 1 reuses.
+        pg_collection: Process groups of the model that owns the params. The rebuild in case 2
+            takes the tensor-parallel group ``tp`` and the data- and context-parallel group
+            (``dp_cp_gtp_remat``, or ``dp_cp`` when that is unset) from it, as the model's own
+            checkpoint entries do. Only a rebuild needs the groups. Omitting it is deprecated:
+            a rebuild then warns and uses the global groups in ``parallel_state``.
+
+    Raises:
+        ValueError: If a rebuild is needed and ``pg_collection`` does not set ``tp``, or has no
+            ``dp_cp_gtp_remat`` group and does not set ``dp_cp`` to a group.
     """
     try:
         from megatron.core.tensor_parallel.gtp_api import (
@@ -950,10 +1077,9 @@ def _backfill_gtp_sharded_param_map(
                 # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
                 key_to_entry[key] = None if key in key_to_entry else entry
 
-    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
-    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
-    tp_group = None
-    dp_cp_gtp_remat_group = None
+    # The groups are resolved only when a rebuild needs them, so a model whose GTP params all
+    # match its own entries needs neither them nor the global grid.
+    rebuild_groups = None
     for param_id, p in unmatched:
         # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
         entry = src_id_to_entry.get(id(p))
@@ -979,12 +1105,31 @@ def _backfill_gtp_sharded_param_map(
                 "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
                 "write duplicate shards across expert-parallel groups)."
             )
-        if tp_group is None:
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
-            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True
-            )
+        if rebuild_groups is None:
+            owner = "Float16OptimizerWithFloat16Params"
+            if pg_collection is None:
+                pg_collection = resolve_process_groups(
+                    None,
+                    owner=owner,
+                    required=("tp", "dp_cp", "dp_cp_gtp_remat"),
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
+            (tp_group,) = require_process_groups(pg_collection, ("tp",), owner=owner)
+            # The data- and context-parallel group the model's own entries use: the one with
+            # the GTP-remat peers when the collection sets it, otherwise dp_cp. The helper
+            # requires a group, but a GTP shard elects its writer over the group stamped on the
+            # param instead.
+            dp_cp_name = "dp_cp" if pg_collection.dp_cp_gtp_remat is None else "dp_cp_gtp_remat"
+            (dp_cp_group,) = require_process_groups(pg_collection, (dp_cp_name,), owner=owner)
+            if dp_cp_group is None:
+                raise ValueError(
+                    f"{owner}: rebuilding the checkpoint entry of GTP param "
+                    f"'{getattr(p, '_debug_name', '')}' needs a data- and context-parallel "
+                    "group, but pg_collection sets dp_cp to None and has no dp_cp_gtp_remat."
+                )
+            rebuild_groups = (tp_group, dp_cp_group)
+        tp_group, dp_cp_group = rebuild_groups
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
@@ -993,7 +1138,7 @@ def _backfill_gtp_sharded_param_map(
             prefix='',
             tensor_parallel_layers_axis_map={key: 0},
             tp_group=tp_group,
-            dp_cp_group=dp_cp_gtp_remat_group,
+            dp_cp_group=dp_cp_group,
         )
         id_to_sharded_param_map[param_id] = rebuilt[key]
 
@@ -1010,6 +1155,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             a constant gradient scaler. Also for `bf16 = False`, we
             always require a grad scaler.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters the optimizer updates. ``sharded_state_dict`` describes a GTP_remat
+            shard without a matching model entry with its tensor- and data-parallel groups.
+            Omitting it is deprecated: such a shard then warns and is described with the global
+            groups in ``parallel_state``.
     """
 
     def __init__(
@@ -1018,9 +1168,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
-        super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        super().__init__(optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection)
+        self.pg_collection = pg_collection
 
         # Handle main parameters.
 
@@ -1225,7 +1378,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
 
         _backfill_gtp_sharded_param_map(
-            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
+            id_to_sharded_param_map,
+            self.float16_groups,
+            model_sharded_state_dict,
+            pg_collection=self.pg_collection,
         )
 
         # Convert fp32_from_fp16_params
@@ -1381,13 +1537,23 @@ class FP32Optimizer(MegatronOptimizer):
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
         config (OptimizerConfig): configuration object for optimizer.
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+            parameters this optimizer updates. They name the config-logger file; without them
+            the file name falls back, with a warning, to the global parallel state.
     """
 
     def __init__(
-        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable
+        self,
+        optimizer: torch.optim.Optimizer,
+        config: OptimizerConfig,
+        init_state_fn: Callable,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 
@@ -1967,6 +2133,9 @@ class ChainedOptimizer(MegatronOptimizer):
                 expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
                 gtp_group=getattr(self.chained_optimizers[0], 'gtp_group', None),
                 expert_gtp_group=getattr(self.chained_optimizers[0], 'expert_gtp_group', None),
+                use_global_fallback=not getattr(
+                    self.chained_optimizers[0], 'duplicate_filter_groups_from_collection', False
+                ),
             )
         else:
             num_zeros_in_grad = 0

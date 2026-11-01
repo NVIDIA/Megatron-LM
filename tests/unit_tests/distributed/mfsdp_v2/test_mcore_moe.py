@@ -18,7 +18,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import OptimizerConfig, fully_sharded_optimizer, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -141,8 +141,14 @@ def test_standard_moe_training_and_clipping(
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
     )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    reference_optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [reference_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 
@@ -247,8 +253,14 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
     )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    reference_optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [reference_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
 
@@ -277,6 +289,71 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+
+
+def test_optimizer_names_experts_by_the_model_expert_layout(
+    process_group_collections, distributed_setup, monkeypatch
+):
+    """The optimizer names expert parameters by the expert-parallel layout of the model's groups."""
+    process_group_collection, _ = process_group_collections
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        module=HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=process_group_collection,
+        ).cuda(),
+        pg_collection=process_group_collection,
+    )
+    naming_kwargs = []
+    name_parameter = fully_sharded_optimizer.get_global_unique_param_name
+
+    def record_naming_kwargs(model_chunks, param, **kwargs):
+        naming_kwargs.append(kwargs)
+        return name_parameter(model_chunks, param, **kwargs)
+
+    monkeypatch.setattr(
+        fully_sharded_optimizer, "get_global_unique_param_name", record_naming_kwargs
+    )
+
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False), [model]
+    )
+
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    ep_group = process_group_collection.ep
+    assert naming_kwargs
+    assert all(
+        kwargs == {"ep_rank": ep_group.rank(), "ep_size": ep_group.size()}
+        for kwargs in naming_kwargs
+    )
 
 
 def _sync_model_parameters(reference_model, model):
