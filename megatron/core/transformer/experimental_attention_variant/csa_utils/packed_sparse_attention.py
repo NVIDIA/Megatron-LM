@@ -12,6 +12,10 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.ops.attention.csa.output_rope import (
+    OutputRopeParams,
+    undo_output_rope_for_backward,
+)
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -127,6 +131,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         q_padding_mask: Tensor | None = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         topk_idxs = torch.nn.functional.pad(
@@ -147,6 +152,10 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length = topk_length.clone()
             if q_padding_mask is not None:
                 topk_length.masked_fill_(q_padding_mask, 1)
+        if out_rope is not None:
+            out_rope.apply_(out)
+        ctx.out_rope = out_rope
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
         ctx.q_padding_mask = q_padding_mask
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
@@ -175,6 +184,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         if ctx.q_padding_mask is not None:
             dO = dO.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        out, dO = undo_output_rope_for_backward(ctx.out_rope, out, dO)
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q,
             kv,
@@ -186,7 +196,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
         )
-        return dq, dkv, d_sink, None, None, None, None, None, None
+        return (dq, dkv, d_sink, None, None, None, None, None, None, None)[: ctx.num_forward_inputs]
 
 
 def csa_sparse_attn(
@@ -198,6 +208,7 @@ def csa_sparse_attn(
     topk_length=None,
     kv_reconstruction_parts=None,
     q_padding_mask=None,
+    out_rope=None,
 ):
     """Run fused attention for flat packed Q/KV and physical indices."""
     if query.ndim != 3 or kv.ndim != 2:
@@ -216,6 +227,7 @@ def csa_sparse_attn(
         0,
         kv_reconstruction_parts,
         q_padding_mask,
+        out_rope,
     )
     return out.flatten(1)
 
@@ -303,6 +315,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         compressed_kv_reduce_scatter_state: _DeferredReduceScatterState,
         logical_window_width: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run packed attention with positive indexer loss and deferred CP reductions."""
         if loss_coeff <= 0:
@@ -500,6 +513,10 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.indexer_k_reduce_scatter_state = indexer_k_reduce_scatter_state
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
         ctx.indexer_grad_is_sequence_major = not sparse_loss
+        if out_rope is not None:
+            out_rope.apply_(out_flat)
+        ctx.out_rope = out_rope
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             assert kv_reconstruction_parts is not None
@@ -592,6 +609,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         if ctx.q_padding_mask is not None:
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        out_flat, dO_flat = undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             query,
@@ -679,7 +697,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
             None,
-        )
+            None,
+        )[: ctx.num_forward_inputs]
 
 
 def indexer_topk(

@@ -24,6 +24,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ### GPU-Optimized Building Blocks
 - **Transformer Components**: Attention mechanisms, MLP layers, embeddings
+- **Operations** (`megatron/core/ops`): SSM mixers, sparse attention and other fused operations with their kernels and backend adapters — see the [operations guide](ops/README.md) for adding an operation or a backend kernel
 - **Memory Management**: Activation recomputation
 - **FP8 Precision**: Optimized for NVIDIA Hopper, Ada, and Blackwell GPUs
 
