@@ -21,6 +21,7 @@ from layer_specs import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
@@ -28,8 +29,14 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
-    vp_stage=None, config=None, pg_collection=None,
+    pre_process=True,
+    post_process=True,
+    add_encoder=True,
+    add_decoder=True,
+    parallel_output=True,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -50,6 +57,11 @@ def model_provider(
     """
     args = get_args()
     use_te = args.use_te
+
+    if pg_collection is None:
+        # LLaVAModel requires an explicit process-group collection; this example runs on the
+        # global parallel grid, so resolve that fallback here rather than inside megatron/core.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building a multimodal model ...')
 
@@ -88,10 +100,13 @@ def model_provider(
             log_single_rank(
                 logging.getLogger(__name__),
                 logging.WARNING,
-                f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
+                f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})",
             )
 
-        max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
+        max_num_image_embeddings = (
+            max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames)
+            * num_image_embeddings
+        )
 
     assert (
         args.decoder_seq_length is not None
@@ -125,10 +140,16 @@ def model_provider(
     )
 
     if language_model_type.startswith("hf://"):
-        assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
-        assert args.pipeline_model_parallel_size < 2, "Huggingface models do not support --pipeline-model-parallel-size > 1"
+        assert (
+            args.tensor_model_parallel_size == 1
+        ), "Huggingface models do not support --tensor-model-parallel-size > 1"
+        assert (
+            args.pipeline_model_parallel_size < 2
+        ), "Huggingface models do not support --pipeline-model-parallel-size > 1"
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert (
+            args.context_parallel_size < 2
+        ), "Huggingface models do not support --context-parallel-size > 1"
 
     if language_model_type.startswith("hf://"):
         language_transformer_layer_spec = None
@@ -165,7 +186,9 @@ def model_provider(
     if vision_model_type not in ("pixtral-vit", "pixtral-vit-large"):
         vision_config.add_bias_linear = True
     if vision_model_type.startswith("hf://"):
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert (
+            args.context_parallel_size < 2
+        ), "Huggingface models do not support --context-parallel-size > 1"
 
     if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
@@ -179,17 +202,23 @@ def model_provider(
     elif vision_model_type == "radio-g":
         if use_te:
             from radio.radio_g import get_radio_g_layer_spec_te
-            vision_transformer_layer_spec = get_radio_g_layer_spec_te()  # TENorm detects LayerNorm/RMS automatically.
+
+            vision_transformer_layer_spec = (
+                get_radio_g_layer_spec_te()
+            )  # TENorm detects LayerNorm/RMS automatically.
         else:
             from radio.radio_g import get_radio_g_layer_spec
+
             vision_transformer_layer_spec = get_radio_g_layer_spec(
                 normalization=vision_config.normalization
             )
     elif vision_model_type == "internvit":
         from nvlm.internvit import get_internvit_layer_spec
+
         vision_transformer_layer_spec = get_internvit_layer_spec(use_te=use_te)
     elif vision_model_type == "internvit300M":
         from nvlm.internvit import get_internvit300M_layer_spec
+
         vision_transformer_layer_spec = get_internvit300M_layer_spec(use_te=use_te)
     elif vision_model_type in ("pixtral-vit", "pixtral-vit-large", "qwen-vl", "kimi-vit"):
         if use_te:
@@ -213,7 +242,9 @@ def model_provider(
 
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
     vision_config.pipeline_model_parallel_size = 1
-    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
+    vision_projection_config.pipeline_model_parallel_size = (
+        vision_config.pipeline_model_parallel_size
+    )
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
     vision_config.num_layers_in_first_pipeline_stage = None
@@ -343,16 +374,25 @@ def _get_tile_tags(args, tokenizer):
             thumbnail_tag_text = "<tile_global>"
 
         if args.tokenizer_prompt_format.startswith("nemotron"):
-            tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+            tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [
+                thumbnail_tag_text
+            ]
         else:
-            tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+            tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [
+                thumbnail_tag_text
+            ]
     elif args.max_num_tiles <= 12:
         thumbnail_tag_text = "<tile_global_thumbnail0>"
         if args.tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global0>"
-        elif args.tokenizer_prompt_format.startswith("nemotron") or args.tokenizer_prompt_format == "llama3p1":
+        elif (
+            args.tokenizer_prompt_format.startswith("nemotron")
+            or args.tokenizer_prompt_format == "llama3p1"
+        ):
             thumbnail_tag_text = "<tile_global_thumbnail>"
-        tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+        tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [
+            thumbnail_tag_text
+        ]
     else:
         raise ValueError("We only support max_num_tiles <= 12 when using nvlm image_tag_type")
 

@@ -15,10 +15,22 @@ recent import of its name that precedes it in the same scope, even if the name i
 later; aliases created through assignments (``grid = parallel_state``) or dynamic attribute
 lookup are outside its scope.
 
+Each entry has one of three kinds:
+
+* ``accessor``: a ``parallel_state`` group, rank or size accessor;
+* ``shim``: ``ProcessGroupCollection.use_mpu_process_groups()``, which reads the same globals;
+* ``guarded``: ``resolve_process_groups()``, the warned fallback in ``process_groups_config.py``.
+  It reads the globals only when the caller omits its groups, and warns first.
+
+A guarded call is still a read, so wrapping a fallback in ``resolve_process_groups()`` does not
+remove it from the allowlist. A guarded call that replaces a removed accessor or shim read in
+the same file and scope is a conversion, and ``--update`` swaps the entry. Any other new guarded
+call fails like a new read.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
-    python tools/check_process_group_usage.py --update   # remove stale allowlist entries
+    python tools/check_process_group_usage.py --update   # remove stale entries, record conversions
     python tools/check_process_group_usage.py --stats    # summarize without failing
 """
 
@@ -51,6 +63,10 @@ NOT_DEPRECATED = {
     "get_virtual_pipeline_model_parallel_rank",
     "get_virtual_pipeline_model_parallel_world_size",
 }
+
+# Entry kinds in --stats order. Only "guarded" reads warn before they read the globals.
+KINDS = ("accessor", "shim", "guarded")
+GUARDED = "guarded"
 
 
 def _is_deprecated_accessor(name: str) -> bool:
@@ -215,6 +231,8 @@ def _violations_in(path: pathlib.Path):
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ):
                 identity = "shim:use_mpu_process_groups"
+            elif name == "megatron.core.process_groups_config.resolve_process_groups":
+                identity = "guarded:resolve_process_groups"
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 self.hits.append((node.lineno, f"{scope}:{identity}"))
@@ -262,6 +280,29 @@ def _difference(left, right):
     return diff
 
 
+def _split_conversions(added, removed):
+    """Separate the guarded calls in ``added`` that replace a removed read of the same scope.
+
+    Returns ``(new, converted)``. ``converted`` holds guarded calls matched one for one with
+    removed accessor or shim reads in the same file and scope; ``new`` holds every other call.
+    """
+    new, converted = {}, {}
+    for rel, hits in added.items():
+        replaceable = Counter(
+            scope
+            for scope, kind, _ in (hit.split(":", 2) for hit in removed.get(rel, []))
+            if kind != GUARDED
+        )
+        for hit in hits:
+            scope, kind, _ = hit.split(":", 2)
+            if kind == GUARDED and replaceable[scope]:
+                replaceable[scope] -= 1
+                converted.setdefault(rel, []).append(hit)
+            else:
+                new.setdefault(rel, []).append(hit)
+    return new, converted
+
+
 def main(argv=None) -> int:
     """Check the baseline, or refresh it only after verifying no new calls were introduced."""
     ap = argparse.ArgumentParser(description=__doc__)
@@ -278,14 +319,14 @@ def main(argv=None) -> int:
 
     if args.stats:
         print(f"{total} global process-group read(s) across {len(found)} file(s) in megatron/core")
-        for kind, n in counts.most_common():
-            print(f"  {kind:10} {n}")
+        for kind in KINDS:
+            print(f"  {kind:10} {counts[kind]}")
         return 0
 
     allowed = _load_allowlist()
 
-    added = _difference(found, allowed)
     removed = _difference(allowed, found)
+    added, converted = _split_conversions(_difference(found, allowed), removed)
 
     if added:
         n = sum(len(v) for v in added.values())
@@ -301,6 +342,8 @@ def main(argv=None) -> int:
             "caller and pass it through.\n"
             "Note that ProcessGroupCollection.use_mpu_process_groups() is NOT a valid "
             "replacement -- it reads the same global state.\n"
+            "resolve_process_groups() is counted too: it may only replace a read in the same "
+            "function, for callers that do not pass their groups yet.\n"
             "See https://github.com/NVIDIA/Megatron-LM/issues/6307\n"
         )
         return 1
@@ -339,9 +382,18 @@ def main(argv=None) -> int:
         for rel, hits in sorted(removed.items()):
             for h in hits:
                 print(f"  {rel}  {h}")
+        if converted:
+            n = sum(len(v) for v in converted.values())
+            print(f"\n{n} of them became guarded fallback(s), which --update records:\n")
+            for rel, hits in sorted(converted.items()):
+                for h in hits:
+                    print(f"  {rel}  {h}")
         return 1
 
-    print(f"OK: no new global process-group reads ({total} grandfathered).")
+    print(
+        f"OK: no new global process-group reads ({total} grandfathered, "
+        f"{counts[GUARDED]} of them guarded)."
+    )
     return 0
 
 
