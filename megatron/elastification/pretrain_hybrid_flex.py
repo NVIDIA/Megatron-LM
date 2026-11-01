@@ -1,15 +1,13 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Mamba."""
 
 import os
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -50,14 +48,14 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
+from megatron.training.argument_utils import (
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
 )
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets.providers import build_gpt_datasets
+from megatron.training.global_vars import set_run_config
+from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -468,7 +466,10 @@ def forward_step(data_iterator, model: HybridModel):
 
 
 
-def is_dataset_built_on_rank(vp_stage=None):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    """Whether the dataset should be built on the current rank: the first and last pipeline stages,
+    tensor-parallel rank 0. ``is_packed_sequence`` is the shared provider's call shape and is
+    ignored here: this script builds packed datasets on the same ranks as plain ones, as before."""
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
@@ -478,65 +479,39 @@ def is_dataset_built_on_rank(vp_stage=None):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
+def flex_data_config_from_args(args, *, standalone=False):
+    """``cfg.data`` for this entry point: the shared factory, less the varlen family.
+
+    ``get_batch`` keys the packed-sequence metadata on ``--sft`` and the rank predicate above builds
+    on the first and last stages only, so a varlen dataset cannot be consumed here; the request is
+    an error instead of a silent plain-GPT run (``pretrain_hybrid.py`` supports it)."""
+    if getattr(args, "use_varlen_dataset", False):
+        raise ValueError(
+            "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
+            "varlen packing support); use pretrain_hybrid.py for varlen data."
+        )
+    return gpt_data_config_from_args(args, standalone=standalone)
+
+
 def core_gpt_dataset_config_from_args(args):
-    cfg = get_run_config()
-    tokenizer = get_tokenizer()
-
-    # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    return GPTDatasetConfig(
-        random_seed=cfg.rng.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        inter_document_masking=getattr(args, 'dataloader_inter_document_masking', False),
-    )
+    """The legacy call shape for this entry point: the standalone section of
+    ``flex_data_config_from_args`` (the varlen check included), validated and bound to the run's
+    tokenizer as before (the provider builds from ``cfg.data``)."""
+    data = flex_data_config_from_args(args, standalone=True)
+    data.validate()
+    data.bind_tokenizer(get_tokenizer())
+    return data.dataset
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
-    """Build the train test and validation datasets.
+    """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
-    Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
+    ``pretrain_gpt.py`` and ``pretrain_hybrid.py``; this script passes its own rank predicate.
     """
-    args = get_args()
-
-    config = core_gpt_dataset_config_from_args(args)
-
-    if args.sft:
-        dataset_type = SFTDataset
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        else:
-            dataset_type = GPTDataset
-
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
-
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
-        config
-    ).build()
-
-    print_rank_0("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
+    return build_gpt_datasets(
+        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
+    )
 
 
 def mamba_flex_extra_args_provider(parser):
@@ -563,10 +538,13 @@ if __name__ == "__main__":
     from megatron.core.optimizer.optimizer_config import ParamKey, ParamWithNamePredicate
     from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
-    _orig_get_opt_cfg = _mtt.get_megatron_optimizer_config
+    _orig_get_opt_cfg_overrides = _mtt.get_standard_config_overrides
 
-    def _patched_get_opt_cfg(args):
-        config, config_overrides = _orig_get_opt_cfg(args)
+    def _patched_get_opt_cfg_overrides(config):
+        config_overrides = _orig_get_opt_cfg_overrides(config)
+        args = _mtt.get_args()
+        cfg = _mtt.get_run_config()
+
         lr_mult = getattr(args, 'lr_mult_router', 1.0)
         if lr_mult != 1.0:
             router_key = ParamKey(
@@ -576,13 +554,13 @@ if __name__ == "__main__":
                 )
             )
             router_override = ParamGroupOverride(
-                max_lr=args.lr * lr_mult,
-                min_lr=args.min_lr * lr_mult,
+                max_lr=cfg.optimizer.lr * lr_mult,
+                min_lr=cfg.optimizer.min_lr * lr_mult,
             )
             config_overrides = {**(config_overrides or {}), router_key: router_override}
-        return config, config_overrides
+        return config_overrides
 
-    _mtt.get_megatron_optimizer_config = _patched_get_opt_cfg
+    _mtt.get_standard_config_overrides = _patched_get_opt_cfg_overrides
 
     # `pretrain()` no longer accepts extra_args_provider / args_defaults; parse
     # args up-front instead (see pretrain_mamba.py for the same pattern).
@@ -591,7 +569,9 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
 
-    full_config = pretrain_cfg_container_from_args(args)
+    full_config = pretrain_cfg_container_from_args(
+        args, data_cfg=flex_data_config_from_args(args)
+    )
     set_run_config(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,
