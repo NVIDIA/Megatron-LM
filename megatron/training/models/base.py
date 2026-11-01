@@ -140,13 +140,20 @@ class ModelConfig:
         Includes:
         - _target_: Full class path for deserialization
         - _builder_: Full builder class path (serialized from ClassVar)
-        - All dataclass fields, including nested dataclasses
+        - All dataclass fields, including nested dataclasses and config sequences
         """
 
         def _as_dict(config):
-            result = {
-                "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
-            }
+            if isinstance(config, (list, tuple)):
+                return [_as_dict(value) for value in config]
+            if not is_dataclass(config) or isinstance(config, type):
+                if callable(config):
+                    return _encode_callable(config)
+                if hasattr(config, "as_dict"):
+                    return config.as_dict()
+                return config
+
+            result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
             for f in dataclass_fields(config):
                 if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
                     continue
@@ -160,12 +167,7 @@ class ModelConfig:
                         result[f.name] = encoded
                     continue
 
-                if is_dataclass(value):
-                    result[f.name] = _as_dict(value)  # recurse on nested dataclasses
-                elif hasattr(value, "as_dict"):
-                    result[f.name] = value.as_dict()
-                else:
-                    result[f.name] = value
+                result[f.name] = _as_dict(value)
 
             return result
 
