@@ -124,7 +124,7 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
-    # The calculator is sized by the data-parallel group of the model's process groups.
+    # The inference model's default sizes and the calculator come from the model's groups.
     pg_collection = SimpleNamespace(dp_gtp_remat=SimpleNamespace(size=lambda: 4), dp=None)
     monkeypatch.setattr(
         training_setup,
@@ -134,7 +134,7 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     monkeypatch.setattr(
         training_setup,
         "build_rl_inference_model",
-        lambda *a: calls.append(("inference", a)) or "inference_model",
+        lambda *a, **k: calls.append(("inference", a, k)) or "inference_model",
     )
     monkeypatch.setattr(
         training_setup,
@@ -154,7 +154,13 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     )
 
     loop_runs = not skip_train
-    expected = [("inference", (cfg, args, "config(chunk)", "provider", "type"))]
+    expected = [
+        (
+            "inference",
+            (cfg, args, "config(chunk)", "provider", "type"),
+            {"training_pg_collection": pg_collection},
+        )
+    ]
     if loop_runs:
         expected += [
             ("ref", (["chunk"], {"ckpt": 1}, args), {"rollout_only": rollout_only}),
