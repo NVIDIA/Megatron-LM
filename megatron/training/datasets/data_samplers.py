@@ -11,14 +11,23 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.global_vars import get_run_config
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
-    """Build dataloader given an input dataset."""
+def build_pretraining_data_loader(dataset, consumed_samples, pg_collection=None):
+    """Build dataloader given an input dataset.
+
+    Args:
+        dataset: Dataset to load from.
+        consumed_samples: Number of samples consumed so far, across data-parallel ranks.
+        pg_collection: Process groups of the run. The samplers shard samples over its
+            data-parallel group, including the GTP weight-remat axis whose ranks consume
+            distinct samples. None shards over the global data-parallel group.
+    """
 
     if dataset is None:
         return None
@@ -43,6 +52,20 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         # torch-compatible dataloader and define samplers, if needed.
         return dataset
 
+    if pg_collection is None:
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_size = mpu.get_data_parallel_world_size()
+    else:
+        # Collections that predate the GTP weight-remat fields carry only the replicate group.
+        data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+        if data_parallel_group is None:
+            raise ValueError(
+                "build_pretraining_data_loader requires pg_collection.dp_gtp_remat or "
+                "pg_collection.dp"
+            )
+        data_parallel_rank = get_pg_rank(data_parallel_group)
+        data_parallel_size = get_pg_size(data_parallel_group)
+
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
@@ -50,8 +73,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if split == Split.valid and cfg.validation.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size)
     elif args.dataloader_type == 'single':
         # Packing schedulers consume one microbatch at a time and form
         # global/DCP batches themselves.
@@ -59,16 +82,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size)
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
             data_sharding=args.data_sharding,
         )
     else:
