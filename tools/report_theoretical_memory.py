@@ -11,4 +11,4 @@ if __name__ == "__main__":
     initialize_megatron(allow_no_cuda=True, skip_mpu_initialization=True)
     args = get_args()
 
-    report_theoretical_memory(args, verbose=True)
+    report_theoretical_memory(args, verbose=True, micro_batch_size=args.micro_batch_size)

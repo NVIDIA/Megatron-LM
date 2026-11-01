@@ -84,9 +84,9 @@ class NemoTransformerAudioTokenEstimator:
     """Pure math for NeMo TransformerEncoder expanded-token counts.
 
     Conv-style pre-encoders update lengths with floor division after each
-    strided convolution. The stacking pre-encoder pads the batch tensor to a
-    multiple of ``encoder_time_stride``, then keeps each sample's partial final
-    stack as one output token, so stacking counts are per-sample ceil divisions.
+    strided convolution. The ``stacking`` pre-encoder pads to a multiple of
+    ``encoder_time_stride``, then keeps each sample's partial final stack as
+    one output token, so its counts are per-sample ceil divisions.
 
     ``encoder_time_stride`` is required and has no default: it must be derived
     from the loaded encoder config (``NemoTransformerAudioConfig.encoder_time_stride``,

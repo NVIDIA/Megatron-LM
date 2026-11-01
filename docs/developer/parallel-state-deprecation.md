@@ -29,9 +29,10 @@ it does not read global process-group state and is outside this deprecation.
 
 The helpers in `megatron/core/inference/communication_utils.py` accept an explicit pipeline
 group, but only check physical stages; they do not replace virtual-pipeline-aware predicates.
-Gloo and dynamic (formerly hybrid) data/context groups are still tier-1 group accessors,
-although the collection has no corresponding fields. Pass those groups explicitly when migrating
-a caller.
+Gloo groups are still tier-1 group accessors, although the collection has no corresponding
+fields. Pass those groups explicitly when migrating a caller. The dynamic (formerly hybrid)
+data/context groups map to the `dynamic_cp` and `dynamic_tp_cp` fields, which are keyed by the
+runtime context-parallel size.
 
 ## Select the matching group
 
@@ -43,6 +44,8 @@ expert tensor parallelism uses `expt_tp`, which may differ from the dense `tp` g
 | `get_tensor_model_parallel_group()` | `tp` |
 | `get_pipeline_model_parallel_group()` | `pp` |
 | `get_context_parallel_group()` | `cp` |
+| `get_dynamic_data_context_parallel_group_map()`, `get_dynamic_data_context_parallel_groups(group_size=n)` | `dynamic_cp`, `dynamic_cp[n]` |
+| `get_dynamic_tensor_data_context_parallel_group_map()`, `get_dynamic_tensor_data_context_parallel_group(group_size=n)` | `dynamic_tp_cp`, `dynamic_tp_cp[n]` |
 | `get_expert_model_parallel_group()` | `ep` |
 | `get_expert_tensor_parallel_group()` | `expt_tp` |
 | `get_expert_tensor_and_model_parallel_group()` | `tp_ep` |

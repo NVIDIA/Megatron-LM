@@ -38,6 +38,9 @@ class ProcessGroupCollection:
         embd: Embedding process group
         pos_embd: Position embedding process group
         cp: Context parallel process group
+        dynamic_cp: Runtime CP groups keyed by CP size; the full DPxCP domain and
+            the singleton CP-off group are included when initialized
+        dynamic_tp_cp: TP x runtime-CP groups keyed by CP size (not TP x CP size)
         tp_cp: Tensor and context parallel group
         hcp: Hierarchical context parallel groups
         ep: Expert model parallel group
@@ -49,9 +52,8 @@ class ProcessGroupCollection:
 
         # Data Parallelism Groups
         dp: Data parallel process group
-        dp_gtp_remat: Full data-distribution group without CP, dp x gtp_remat;
-            identical to dp when GTP_remat_size=1
-        dp_cp: Data and context parallel group
+        dp_gtp_remat: Independent sequences, excluding all context partitions
+        dp_cp: Copies of the same dense weight shard, excluding its GTP group
         dp_cp_gtp_remat: Full data-distribution group, dp_cp x gtp_remat;
             identical to dp_cp when GTP_remat_size=1
         expt_dp: Expert data parallel group
@@ -93,6 +95,12 @@ class ProcessGroupCollection:
     # _CONTEXT_PARALLEL_GROUP
     cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Runtime groups are selected per microbatch without changing the static CP group.
+    dynamic_cp: Dict[int, torch.distributed.ProcessGroup] = field(init=False)
+
+    # The map key is the CP size; each group's size is TP size times that key.
+    dynamic_tp_cp: Dict[int, torch.distributed.ProcessGroup] = field(init=False)
+
     # _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     tp_cp: torch.distributed.ProcessGroup = field(init=False)
 
@@ -124,12 +132,15 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP
     dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _DATA_PARALLEL_GROUP_WITH_GTP_REMAT: the full data-distribution group without CP, DP x
-    # gtp_remat. This is the axis a dataloader shards on, so index per-rank dataloader state
-    # with it. Identical to ``dp`` when gtp_remat_size=1.
+    # _DATA_PARALLEL_GROUP_WITH_GTP_REMAT: independent sample owners. When sequences
+    # are partitioned within GTP_remat groups, only the remaining GTP_remat batch
+    # shards x DP distribute samples; all context partitions are excluded.
+    # Dataloaders shard samples and index their per-rank state by this group.
     dp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
-    # _DATA_PARALLEL_GROUP_WITH_CP
+    # _DATA_PARALLEL_GROUP_WITH_CP: dense weight replicas. When sequences are
+    # partitioned within GTP_remat groups, this includes only the CP extent
+    # outside the weight-sharding group.
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT — the full data-distribution group, DP x CP x
@@ -200,6 +211,10 @@ class ProcessGroupCollection:
             elif isinstance(pg, list):
                 sizes = [g.size() for g in pg]
                 active_pgs.append(f"{field_info.name}({sizes})")
+            elif isinstance(pg, dict):
+                if pg:
+                    sizes = {key: group.size() for key, group in sorted(pg.items())}
+                    active_pgs.append(f"{field_info.name}({sizes})")
             else:
                 active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
@@ -252,6 +267,8 @@ class ProcessGroupCollection:
             ),
             'mp': partial(parallel_state.get_model_parallel_group, check_initialized=False),
             'cp': partial(parallel_state.get_context_parallel_group, check_initialized=False),
+            'dynamic_cp': parallel_state.get_dynamic_data_context_parallel_group_map,
+            'dynamic_tp_cp': parallel_state.get_dynamic_tensor_data_context_parallel_group_map,
             'tp_cp': partial(
                 parallel_state.get_tensor_and_context_parallel_group, check_initialized=False
             ),
