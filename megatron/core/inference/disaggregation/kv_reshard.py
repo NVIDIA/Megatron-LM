@@ -17,6 +17,10 @@ class KVShardLayout:
     ``num_layers`` / ``num_heads`` are the *global* attention layer count
     and KV-head count (for GQA, the number of KV heads). ``global_rank``
     is the worker's torch rank (used as the transport peer id).
+
+    When ``tp_size`` exceeds ``num_heads``, each KV head is replicated on
+    ``tp_size // num_heads`` consecutive TP ranks and every rank holds one
+    head, matching how ``Attention`` partitions GQA heads.
     """
 
     num_layers: int
@@ -43,9 +47,12 @@ class KVShardLayout:
     num_local_layers: Optional[int] = None
 
     def __post_init__(self) -> None:
-        # TP must divide heads (the head split is always even).
-        if self.num_heads % self.tp_size != 0:
-            raise ValueError(f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}")
+        # Heads split evenly across TP, or TP ranks replicate whole heads.
+        if self.num_heads % self.tp_size != 0 and self.tp_size % self.num_heads != 0:
+            raise ValueError(
+                f"num_heads={self.num_heads} and tp_size={self.tp_size}: "
+                "one must be a multiple of the other"
+            )
         # layer_start and num_local_layers are an all-or-nothing explicit window:
         # setting only one would silently fall back to the even-split count and
         # defeat the purpose (uneven stage with an even count).
@@ -62,9 +69,17 @@ class KVShardLayout:
             )
 
     def kv_shard_key(self) -> Tuple[int, int]:
-        """The attention shard this rank holds: ``(tp_rank, pp_rank)``.
-        Ranks sharing a key hold identical KV (EP/ETP replicas of it)."""
+        """This rank's attention position: ``(tp_rank, pp_rank)``.
+        Ranks sharing a key are EP/ETP replicas holding identical KV."""
         return (self.tp_rank, self.pp_rank)
+
+    def kv_replicas(self) -> int:
+        """Number of TP ranks holding each of this rank's KV heads."""
+        return max(1, self.tp_size // self.num_heads)
+
+    def kv_replica_index(self) -> int:
+        """This rank's index among the TP ranks replicating its KV heads."""
+        return self.tp_rank % self.kv_replicas()
 
     def layer_range(self) -> Tuple[int, int]:
         """Global attention-layer range ``[lo, hi)`` owned by this rank."""
@@ -76,8 +91,10 @@ class KVShardLayout:
 
     def head_range(self) -> Tuple[int, int]:
         """Global KV-head range ``[lo, hi)`` owned by this rank."""
-        per = self.num_heads // self.tp_size
-        return (self.tp_rank * per, (self.tp_rank + 1) * per)
+        replicas = self.kv_replicas()
+        per = self.num_heads * replicas // self.tp_size
+        lo = (self.tp_rank // replicas) * per
+        return (lo, lo + per)
 
     def local_num_layers(self) -> int:
         """Number of attention layers held locally by this rank."""
@@ -139,10 +156,17 @@ def plan_kv_reshard(
     their own rank (``transfers_for_src`` / ``transfers_for_dst``).
 
     KV is replicated across the EP and ETP dimensions, so each attention
-    shard ``(tp_rank, pp_rank)`` may be held by several source ranks. We
-    source each shard from exactly one of them -- the smallest
+    position ``(tp_rank, pp_rank)`` may be held by several source ranks. We
+    source each position from exactly one of them -- the smallest
     ``global_rank`` -- which avoids duplicate sends and is independent of
     how EP/ETP map onto ranks.
+
+    When ``tp_size > num_heads`` several TP ranks also hold the same KV
+    heads. Each destination reads from the source replica whose index
+    matches its own (modulo the source replica count), which spreads reads
+    over the replicas and maps a homogeneous layout onto itself. The choice
+    depends only on the (src, dst) pair, so a side that plans against a
+    single peer layout computes the same transfers.
     """
     if srcs and dsts:
         if srcs[0].num_layers != dsts[0].num_layers or srcs[0].num_heads != dsts[0].num_heads:
@@ -162,6 +186,8 @@ def plan_kv_reshard(
         dl, dh = d.layer_range(), d.head_range()
         for s in srcs:
             if s.global_rank not in source_ranks:
+                continue
+            if s.kv_replica_index() != d.kv_replica_index() % s.kv_replicas():
                 continue
             li = intersect(s.layer_range(), dl)
             if li is None:
