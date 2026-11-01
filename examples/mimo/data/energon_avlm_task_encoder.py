@@ -30,7 +30,12 @@ sys.path.append(
 )
 from dataloader_provider import train_valid_test_dataloaders_provider
 from transformers import AutoProcessor
-from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
+from examples.mimo.data.avlm_sample_loader import reject_clip_list
+from examples.mimo.data.utils.calculate_audio_tokens import (
+    capped_whisper_lengths,
+    expand_audio_placeholders,
+    stack_or_cat,
+)
 
 from megatron.energon import (
     DefaultTaskEncoder,
@@ -181,37 +186,59 @@ class AVLMTaskEncoder(
         else:
             image_tensor = None
 
-        # Convert raw audio data to tensor
-        if sample.audio is not None:
-            audio_io = io.BytesIO(sample.audio)
-            # Read audio first
-            waveform, sample_rate = sf.read(audio_io)
-            # Resample if needed
-            fixed_sample_rate = 16000
-            if sample_rate != fixed_sample_rate:
-                # Calculate number of samples for 16kHz
-                num_samples = int(len(waveform) * fixed_sample_rate / sample_rate)
-                # Resample using scipy's resample
-                waveform = signal.resample(waveform, num_samples)
-            # Convert to tensor
-            audio_tensor = torch.from_numpy(waveform).float()
-        else:
-            audio_tensor = None
+        # Convert raw audio data to tensor. A list is every clip, in file order.
+        fixed_sample_rate = 16000
+        all_clips = bool(getattr(args, "all_audio_clips", False))
+        reject_clip_list(sample.audio, all_clips)
 
-        # Process audio + prompt
-        # Here, we:
-        #  + process the audio
-        #  + manually calculate the number of audio tokens, then add them to the prompt
+        def _waveform_from_bytes(audio_bytes):
+            audio_io = io.BytesIO(audio_bytes)
+            waveform, sample_rate = sf.read(audio_io)
+            if sample_rate != fixed_sample_rate:
+                num_samples = int(len(waveform) * fixed_sample_rate / sample_rate)
+                waveform = signal.resample(waveform, num_samples)
+            return torch.from_numpy(waveform).float()
+
+        if sample.audio is None:
+            audio_tensor = None
+        elif isinstance(sample.audio, (list, tuple)):
+            audio_tensor = [_waveform_from_bytes(blob) for blob in sample.audio]
+        else:
+            audio_tensor = _waveform_from_bytes(sample.audio)
+
+        # Process audio + prompt. feature_lengths is the capped mel, not 2 * tokens.
         if audio_tensor is not None:
-            processed_audios = self.audio_processor(audio_tensor, sampling_rate=fixed_sample_rate)
-            processed_audios = torch.tensor(processed_audios["input_features"])
-            processed_audios = processed_audios.squeeze(0)  # remove batch dim
-            num_audio_tokens = calculate_num_audio_tokens(audio_tensor.unsqueeze(0), args.audio_encoder_model)
-            audios_seq_lengths = torch.tensor(num_audio_tokens)
-            processed_prompt = prompt.replace(AUDIO_TOKEN, AUDIO_TOKEN * num_audio_tokens)
+            waveforms = audio_tensor if isinstance(audio_tensor, list) else [audio_tensor]
+            features = []
+            feature_lengths = []
+            token_counts = []
+            for waveform in waveforms:
+                processed = self.audio_processor(waveform, sampling_rate=fixed_sample_rate)
+                mel_features = torch.tensor(processed["input_features"]).squeeze(0)
+                length = int(waveform.shape[-1])
+                mel, num_tokens = capped_whisper_lengths(
+                    length,
+                    args.audio_encoder_model,
+                    feature_time=mel_features.shape[-1],
+                )
+                features.append(mel_features)
+                feature_lengths.append(mel)
+                token_counts.append(num_tokens)
+            # Flag on keeps a clip axis for K=1 so stack_or_cat can cat variable K.
+            # Flag off stays rank-2 so a batch still stacks to [B, 80, T].
+            if all_clips:
+                processed_audios = torch.stack(features, dim=0)
+                audios_seq_lengths = torch.tensor(token_counts)
+                audios_feature_lengths = torch.tensor(feature_lengths)
+            else:
+                processed_audios = features[0]
+                audios_seq_lengths = torch.tensor(token_counts[0])
+                audios_feature_lengths = torch.tensor(feature_lengths[0])
+            processed_prompt = expand_audio_placeholders(prompt, token_counts)
         else:
             processed_audios = None
             audios_seq_lengths = None
+            audios_feature_lengths = None
             processed_prompt = prompt
 
         # Process image + prompt
@@ -255,6 +282,7 @@ class AVLMTaskEncoder(
         if processed_audios is not None:
             inputs["audios"] = processed_audios
             inputs["audios_seq_lengths"] = audios_seq_lengths
+            inputs["audios_feature_lengths"] = audios_feature_lengths
 
         answers = sample.answers
         if answers:
@@ -323,6 +351,7 @@ class AVLMTaskEncoder(
         images = batch_data.get("images")
         audios = batch_data.get("audios")
         audios_seq_lengths = batch_data.get("audios_seq_lengths")
+        audios_feature_lengths = batch_data.get("audios_feature_lengths")
 
         output = {
             "input_ids": input_ids,
@@ -342,7 +371,8 @@ class AVLMTaskEncoder(
             output["modality_inputs"]["audios"] = {
                 "whisper_encoder": {
                     "input_features": audios,
-                    "seq_lengths": audios_seq_lengths
+                    "seq_lengths": audios_seq_lengths,
+                    "feature_lengths": audios_feature_lengths,
                 }
             }
 
@@ -473,10 +503,18 @@ class PaddingProcessor:
 
 
 # Registry mapping sample keys to their corresponding processor.
+class StackOrCatProcessor:
+    """Stack one clip per sample. Concatenate samples that already hold several clips."""
+
+    def __call__(self, values: List[torch.Tensor]) -> torch.Tensor:
+        return stack_or_cat(values)
+
+
 KEY_PROCESSORS: Dict[str, KeyProcessor] = {
     "images": StackProcessor(),
-    "audios": StackProcessor(),
-    "audios_seq_lengths": StackProcessor(),
+    "audios": StackOrCatProcessor(),
+    "audios_seq_lengths": StackOrCatProcessor(),
+    "audios_feature_lengths": StackOrCatProcessor(),
     "input_ids": PaddingProcessor(pad_value=0),
     "attention_mask": PaddingProcessor(pad_value=0),
     "loss_mask": PaddingProcessor(pad_value=0),
