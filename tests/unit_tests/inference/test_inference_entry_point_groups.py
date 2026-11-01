@@ -94,7 +94,10 @@ def inference(monkeypatch):
             return [_Model()]
 
     monkeypatch.setattr(utils, "get_args", lambda: args)
-    monkeypatch.setattr(utils, "get_model_builder", lambda args, pg_collection: Builder())
+    monkeypatch.setattr(utils, "get_run_config", lambda: SimpleNamespace(tokenizer=Mock()))
+    monkeypatch.setattr(
+        utils, "get_model_builder", lambda args, tokenizer_config, pg_collection: Builder()
+    )
     monkeypatch.setattr(utils, "load_checkpoint", lambda **kwargs: loaded.append(kwargs))
     monkeypatch.setattr(utils, "_get_checkpoint_model_modifier", lambda args, keys: None)
     return SimpleNamespace(args=args, built=built, loaded=loaded)
@@ -179,7 +182,7 @@ def test_modelopt_rejects_other_collections(inference, modelopt, monkeypatch):
 @pytest.fixture
 def engine_parts(monkeypatch):
     """Stand-ins for what get_dynamic_inference_engine() builds around the model."""
-    monkeypatch.setattr(utils, "build_tokenizer", lambda args: "tokenizer")
+    monkeypatch.setattr(utils, "get_tokenizer", lambda: "tokenizer")
     monkeypatch.setattr(
         utils, "get_inference_config_from_model_and_args", lambda model, args: "config"
     )

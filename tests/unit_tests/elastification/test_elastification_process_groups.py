@@ -27,6 +27,9 @@ from megatron.elastification.flextron_utils import (
     FlextronModelManager,
     inject_flextron_forward_logic,
 )
+from megatron.training import global_vars
+from megatron.training import utils as training_utils
+from megatron.training.datasets import providers
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -463,17 +466,15 @@ def test_dataset_provider_passes_the_run_groups_to_the_builder(monkeypatch):
     monkeypatch.setattr(
         pretrain_hybrid_flex,
         "get_args",
-        lambda: SimpleNamespace(
-            sft=False, mock_data=True, virtual_pipeline_model_parallel_size=None
-        ),
+        lambda: SimpleNamespace(virtual_pipeline_model_parallel_size=None),
     )
-    monkeypatch.setattr(
-        pretrain_hybrid_flex, "core_gpt_dataset_config_from_args", lambda args: None
-    )
-    monkeypatch.setattr(pretrain_hybrid_flex, "print_rank_0", lambda *args, **kwargs: None)
+    # The provider body is the shared build_gpt_datasets, which builds from the run's cfg.data.
+    data_config = SimpleNamespace(builder_inputs=lambda: ("dataset_type", "config", False))
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", SimpleNamespace(data=data_config))
+    monkeypatch.setattr(training_utils, "print_rank_0", lambda *args, **kwargs: None)
     builder = Mock()
     builder.return_value.build.return_value = ("train", "valid", "test")
-    monkeypatch.setattr(pretrain_hybrid_flex, "BlendedMegatronDatasetBuilder", builder)
+    monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", builder)
     pgs = ProcessGroupCollection(tp=_FakeGroup(1, 2), pp=_FakeGroup(0, 2))
 
     datasets = pretrain_hybrid_flex.train_valid_test_datasets_provider([1, 1, 1], pg_collection=pgs)

@@ -899,12 +899,12 @@ def test_checkpoint_loads_on_the_global_grid(trained, checkpoint, grids):
 
 @requires_cuda
 def test_inference_model_is_built_and_loaded_on_the_collection(
-    trained, checkpoint, grids, monkeypatch
+    trained, checkpoint, grids, monkeypatch, run_config
 ):
     collection = grids.collection
     built_on, loaded_with = [], []
 
-    def get_model_builder(args, pg_collection):
+    def get_model_builder(args, tokenizer_config, pg_collection):
         built_on.append(pg_collection)
         clear_nvte_env_vars()
         return GPTModelBuilder(_model_config())
@@ -923,7 +923,8 @@ def test_inference_model_is_built_and_loaded_on_the_collection(
         gpt_model.load_state_dict(loaded["model"], strict=kwargs["strict"])
 
     # The arguments get_model_for_inference reads, with the builder and the checkpoint loader
-    # of the training script replaced by the ones of this model.
+    # of the training script replaced by the ones of this model. It also reads the tokenizer
+    # config of `run_config`, which this builder ignores: the model config sets the vocabulary.
     args = SimpleNamespace(
         load=checkpoint,
         inference_ckpt_non_strict=False,

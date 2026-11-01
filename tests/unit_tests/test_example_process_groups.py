@@ -63,8 +63,10 @@ def test_model_provider_warns_without_a_collection(monkeypatch, folder, name):
     global_groups = ProcessGroupCollection()
     shim = Mock(return_value=global_groups)
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", shim)
-    # The provider reads the arguments once it has its groups.
+    # The provider reads the arguments and the run config once it has its groups; BERT reads
+    # the run config first, T5 the arguments.
     monkeypatch.setattr(script, "get_args", Mock(side_effect=_Stop))
+    monkeypatch.setattr(script, "get_run_config", Mock(side_effect=_Stop))
 
     with _fallback_warning(f"{name}.model_provider"), pytest.raises(_Stop):
         script.model_provider()

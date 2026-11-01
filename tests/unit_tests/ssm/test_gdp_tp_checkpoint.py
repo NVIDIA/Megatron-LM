@@ -309,3 +309,54 @@ def test_householder_components_reshard_tp2_to_tp1_in_semantic_order():
         ]
     )
     torch.testing.assert_close(reloaded, expected)
+
+
+def test_gtp_inproj_tp2_matches_non_gtp_chunks():
+    """GTP shards at TP=2 must save the same chunks as the non-GTP split factory."""
+    from megatron.core.ssm.gated_delta_product import _gtp_split_tensor_factory
+
+    tp_size, gtp_size = 2, 2
+    sections, names = _get_in_proj_checkpoint_split_layout(10, 3, 2, 3)
+    real_rows = sum(sections)
+    local_rows = 32
+    pad_rows = gtp_size * local_rows - real_rows
+    # The GTP shard boundary must cut a section, and the last shard must carry padding.
+    assert 0 < pad_rows < local_rows, (real_rows, pad_rows)
+
+    expected_chunks, actual_chunks = defaultdict(list), defaultdict(list)
+    for tp_rank in range(tp_size):
+        tp_local = torch.arange(real_rows * 2).reshape(real_rows, 2) + 1000 * tp_rank
+        reference = ShardedTensor.from_rank_offsets("w", tp_local, (0, tp_rank, tp_size))
+        for chunk in _split_tensor_factory(reference, sections, names, 0).build():
+            expected_chunks[chunk.key].append(chunk)
+        padded = torch.nn.functional.pad(tp_local, (0, 0, 0, pad_rows))
+        for gtp_rank in range(gtp_size):
+            shard = padded[gtp_rank * local_rows : (gtp_rank + 1) * local_rows]
+            original = ShardedTensor.from_rank_offsets(
+                "w", shard, (0, tp_rank * gtp_size + gtp_rank, tp_size * gtp_size)
+            )
+            factory = _gtp_split_tensor_factory(
+                original, sections, names, gtp_rank, tp_rank, tp_size
+            )
+            chunks = factory.build()
+            torch.testing.assert_close(
+                factory.merge_fn([chunk.data for chunk in chunks]), shard, rtol=0, atol=0
+            )
+            for chunk in chunks:
+                actual_chunks[chunk.key].append(chunk)
+
+    assert actual_chunks.keys() == expected_chunks.keys()
+    for key, references in expected_chunks.items():
+        chunks = sorted(actual_chunks[key], key=lambda chunk: chunk.global_offset)
+        global_shape, covered_rows = references[0].global_shape, 0
+        for chunk in chunks:
+            assert chunk.global_shape == global_shape, (key, chunk.global_shape, global_shape)
+            assert chunk.global_offset == (covered_rows, 0), (key, chunk.global_offset)
+            covered_rows += chunk.local_shape[0]
+        assert covered_rows == global_shape[0], (key, covered_rows, global_shape)
+        torch.testing.assert_close(
+            torch.cat([chunk.data for chunk in chunks]),
+            torch.cat([reference.data for reference in references]),
+            rtol=0,
+            atol=0,
+        )

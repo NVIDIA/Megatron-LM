@@ -48,6 +48,9 @@ INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
 COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
 # The groups whose None means that the axis is off.
 AXIS_GROUPS = ("ep", "cp", "expt_tp", "expt_dp")
+# The dynamic context and engine also read tp_ep. A configured collection may leave it unset; the
+# model's collection and the global fallback set it.
+RESOLVED_GROUPS = (*INFERENCE_GROUPS, "tp_ep")
 
 # The accessors that tools/check_process_group_usage.py counts.
 _ACCESSOR_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
@@ -154,13 +157,14 @@ _ABSENT = object()
 
 
 def _stand_in_collection(**overrides):
-    """Return a collection that sets every group inference reads, without creating any group.
+    """Return a collection that sets every group in `RESOLVED_GROUPS`, without creating any group.
 
     The groups that inference runs collectives on are distinct stand-in objects, and the groups
-    whose axis may be off are None. An override replaces a group, and `_ABSENT` leaves it unset.
+    whose axis may be off, tp_ep included, are None. An override replaces a group, and `_ABSENT`
+    leaves it unset.
     """
     groups = {name: object() for name in COMMUNICATION_GROUPS}
-    groups.update(dict.fromkeys(AXIS_GROUPS))
+    groups.update(dict.fromkeys((*AXIS_GROUPS, "tp_ep")))
     groups.update(overrides)
     return ProcessGroupCollection(
         **{name: group for name, group in groups.items() if group is not _ABSENT}
@@ -265,7 +269,7 @@ class TestInferenceConfigBoundary:
 
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         assert config.pg_collection is pg_collection
-        assert set(vars(pg_collection)) == set(INFERENCE_GROUPS)
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
         assert pg_collection.pp is parallel_state.get_pipeline_model_parallel_group()
         assert pg_collection.dp is parallel_state.get_data_parallel_group(with_gtp_remat=False)
@@ -276,9 +280,10 @@ class TestInferenceConfigBoundary:
         assert pg_collection.expt_dp is parallel_state.get_expert_data_parallel_group(
             with_gtp_remat=False
         )
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_uses_collection_of_model(self):
-        # Every group that inference reads is set; None means that an axis is off.
+        # Every group that inference reads, tp_ep included, is set; None means that an axis is off.
         model = torch.nn.Module()
         model.pg_collection = _stand_in_collection()
         config = InferenceConfig()
@@ -318,10 +323,30 @@ class TestInferenceConfigBoundary:
 
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         assert pg_collection is not model.pg_collection
-        assert set(vars(pg_collection)) == set(INFERENCE_GROUPS)
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
+
+    def test_model_collection_without_tp_ep_takes_the_fallback(self):
+        # The dynamic context and engine read tp_ep, the group that the MoE dispatchers span; a
+        # model collection without it would leave that read at None, which sizes the group to 1.
+        _require_world_size_multiple_of(2)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model = torch.nn.Module()
+        model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=list(INFERENCE_GROUPS)
+        )
+        config = InferenceConfig()
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            pg_collection = config.resolve_pg_collection(model)
+
+        _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
+        assert pg_collection is not model.pg_collection
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_configured_collection_comes_first(self):
-        configured = _stand_in_collection()
+        # A configured collection is used as is, also without tp_ep.
+        configured = _stand_in_collection(tp_ep=_ABSENT)
         model = torch.nn.Module()
         model.pg_collection = _stand_in_collection()
         config = InferenceConfig(pg_collection=configured)
@@ -417,6 +442,8 @@ class TestComponentsShareOneCollection:
         pg_collection = inference_config.pg_collection
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
         assert context.expert_model_parallel_group is pg_collection.ep
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
+        assert context.expert_tensor_and_model_parallel_group is pg_collection.tp_ep
         assert context.pipeline_parallel_group is None
 
         model = SimpleNamespace(config=model_config, vocab_size=16)

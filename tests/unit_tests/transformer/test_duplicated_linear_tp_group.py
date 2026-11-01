@@ -4,8 +4,9 @@
 
 A duplicated linear holds the full weight on every rank of its owner's TP group. Transformer Engine
 runs it without TP communication, and the group only sets the weight's checkpoint replica id. The
-owners (MLA, absorbed MLA, the DSA, simplified DSA and CSA indexers) pass their collection's group,
-so on a grid other than the global one exactly one rank saves each duplicated weight.
+owners (MLA, absorbed MLA, the DSA, simplified DSA and CSA indexers, and the KDA two-stage gates)
+pass their collection's group, so on a grid other than the global one exactly one rank saves each
+duplicated weight.
 """
 
 import sys
@@ -22,6 +23,12 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import (
+    HAVE_FLA_KDA,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -230,6 +237,40 @@ def _build_csa_indexer(pg_collection):
     ]
 
 
+def _build_kda(pg_collection):
+    if not HAVE_FLA_KDA:
+        pytest.skip("FLA with KDA support is not installed")
+    # Two-stage gates build the duplicated f_a_proj and g_a_proj.
+    config = KDALayerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        kda_two_stage_gates=True,
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        tensor_model_parallel_size=2,
+    )
+    backend = TESpecProvider()
+    submodules = KimiDeltaAttentionSubmodules(
+        in_proj=backend.column_parallel_linear(),
+        beta_proj=backend.column_parallel_linear(),
+        f_a_proj=TELinear,
+        f_b_proj=backend.column_parallel_linear(),
+        g_a_proj=TELinear,
+        g_b_proj=backend.column_parallel_linear(),
+        out_norm=TENorm,
+        out_proj=backend.row_parallel_linear(),
+    )
+    module = KimiDeltaAttention(config, submodules, layer_number=1, pg_collection=pg_collection)
+    return module, ["f_a_proj", "g_a_proj"]
+
+
 _OWNERS = {
     "mla": (_build_mla, 2),
     "fused_mla": (_build_fused_mla, 2),
@@ -237,6 +278,7 @@ _OWNERS = {
     "dsa_indexer": (_build_dsa_indexer, 2),
     "simplified_dsa_indexer": (_build_simplified_dsa_indexer, 2),
     "csa_indexer": (_build_csa_indexer, 1),
+    "kda": (_build_kda, 2),
 }
 
 
