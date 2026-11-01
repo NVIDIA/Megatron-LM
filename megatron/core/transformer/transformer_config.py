@@ -1488,7 +1488,9 @@ class TransformerConfig(ModelParallelConfig):
     (persistent Triton matmul; any dtype)."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
-    """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
+    """Cross-rank EP combine collective under batch_invariant_mode (at TP >= 3 it also selects
+    the TP reduction sum: "ordered" = fp32 rank-order fold, "multimem" = fp64 accumulate with
+    one rounding to fp32; see tensor_parallel/ordered_reduce.py). "ordered"
     (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
     deterministic by construction on any hardware. "multimem" keeps the native
     NVLS in-switch reduce-scatter: measured to return the correctly-rounded
@@ -1496,6 +1498,18 @@ class TransformerConfig(ModelParallelConfig):
     channels on B200), deterministic and batch-invariant, with better scaling
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
+
+    batch_invariant_tp_shards: Optional[int] = None
+    """Under batch_invariant_mode, make the forward bits of every row-parallel (non-expert)
+    linear independent of tensor_model_parallel_size. The reduction dimension is split into
+    this many fixed shards; each shard's GEMM output is one partial, and the partials are
+    summed in shard order (fp32 accumulator, one rounding; see
+    tensor_parallel/ordered_reduce.py). Any TP size that divides this value then gives the
+    same bits, so training and inference can use different TP sizes. At TP equal to this
+    value each rank owns one shard and the reduction is the ordered TP reduction; at a
+    smaller TP each rank computes its shards in one batched GEMM and sends one partial per
+    shard (BF16 only); the backward is the stock row-parallel one. None (default) keeps the
+    reduction tied to the TP size."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4682,6 +4696,17 @@ class TransformerConfig(ModelParallelConfig):
             assert self.flash_attention_version in (2, 3, 4), (
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
+            )
+
+        if self.batch_invariant_tp_shards is not None:
+            assert (
+                self.batch_invariant_mode
+            ), "batch_invariant_tp_shards requires batch_invariant_mode"
+            assert self.batch_invariant_tp_shards >= 1 and (
+                self.batch_invariant_tp_shards % self.tensor_model_parallel_size == 0
+            ), (
+                f"batch_invariant_tp_shards ({self.batch_invariant_tp_shards}) must be a multiple "
+                f"of tensor_model_parallel_size ({self.tensor_model_parallel_size})"
             )
 
         if self.batch_invariant_mode:
