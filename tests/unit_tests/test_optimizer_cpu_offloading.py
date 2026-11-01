@@ -400,6 +400,7 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
             bf16=True,
             use_distributed_optimizer=True,
             optimizer_cpu_offload=True,
+            use_precision_aware_optimizer=True,
             optimizer_offload_fraction=1.0,
         )
 
