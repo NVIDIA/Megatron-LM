@@ -15,7 +15,6 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
-    StragglerDetectionConfig,
 )
 from megatron.training.models import GPTModelConfig
 
@@ -106,11 +105,9 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
     [
         ("rerun_state_machine", "rerun_mode", "report_stats", "report_determinism_stats"),
         ("rerun_state_machine", "error_injection_type", "unknown", "persistent_error"),
-        ("straggler", "straggler_ctrlr_port", 65536, 0),
     ],
 )
 def test_resiliency_validation_observes_recipe_edits(run_config, section, field, invalid, valid):
-    run_config.straggler = StragglerDetectionConfig(log_straggler=True)
     config = getattr(run_config, section)
     setattr(config, field, invalid)
     before = copy.deepcopy(run_config.to_dict())

@@ -47,6 +47,8 @@ class RerunStateMachineConfig:
 
     def validate(self) -> None:
         """Check rerun settings without constructing or modifying runtime state."""
+        # Constructing an enum from a string checks that it is a supported value;
+        # otherwise, it raises ValueError.
         RerunMode(self.rerun_mode)
         RerunDiagnostic(self.error_injection_type)
 
@@ -66,8 +68,3 @@ class StragglerDetectionConfig:
 
     disable_straggler_on_startup: bool = False
     """If set, StragglerDetector is disabled on startup."""
-
-    def validate(self) -> None:
-        """Check enabled detector settings without opening its controller socket."""
-        if self.log_straggler and not 0 <= self.straggler_ctrlr_port <= 65535:
-            raise ValueError("straggler_ctrlr_port must be between 0 and 65535")
