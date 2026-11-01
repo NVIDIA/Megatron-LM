@@ -469,9 +469,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/moe/echo_moe_scheduler.py",
             "megatron/core/transformer/moe/eplb_moe_scheduler.py",
+            "megatron/core/transformer/moe/ultraep_moe_scheduler.py",
             "megatron/core/transformer/moe/replica_weight_triton.py",
         ),
-        tests=("tests/unit_tests/transformer/moe/test_scheduler_determinism.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+            "tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py",
+        ),
         kind="triton",
         notes="GB200 multi-rank replay of placement, rerouting/probability backward, "
         "BF16/MXFP8 peer-TMA weights/scales and replica gradient accumulation, under "
@@ -488,9 +492,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/moonep_execution_runtime.py",
             "megatron/core/transformer/moe/moonep_peer_transport.py",
         ),
-        tests=("tests/unit_tests/transformer/moe/test_scheduler_determinism.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+            "tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py",
+        ),
         kind="dispatch",
-        notes="The orchestrator selects ECHO/EPLB/MoonEP planners and replica transports; "
+        notes="The orchestrator selects ECHO/EPLB/MoonEP/UltraEP planners and replica transports; "
         "its Triton import only validates availability. Replay exercises those backends "
         "through the real MoELayer and its scheduler.",
     ),

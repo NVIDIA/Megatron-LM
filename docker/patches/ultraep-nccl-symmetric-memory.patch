@@ -1,0 +1,24 @@
+diff --git a/ultra_ep/runtime.py b/ultra_ep/runtime.py
+index ab5e269..9953620 100644
+--- a/ultra_ep/runtime.py
++++ b/ultra_ep/runtime.py
+@@ -70,8 +70,8 @@ def init_runtime(group: dist.ProcessGroup):
+         raise RuntimeError("UltraEP requires PyTorch >= 2.9 for CUDA symmetric memory")
+     if dist.get_backend(group) != "nccl":
+         raise ValueError("UltraEP requires an NCCL EP process group")
+-    if symm_mem.get_backend("cuda") != "CUDA":
+-        symm_mem.set_backend("CUDA")
++    if symm_mem.get_backend("cuda") != "NCCL":
++        symm_mem.set_backend("NCCL")
+ 
+     domains = [None] * group.size()
+     dist.all_gather_object(domains, _nvlink_domain_key(), group=group)
+@@ -106,7 +106,7 @@ def init_runtime(group: dist.ProcessGroup):
+         symmetric_group = _symmetric_groups[key]
+ 
+     _group, _symmetric_group, _nvl_domain_size = group, symmetric_group, domain_size
+-    print_rank_0(f"UltraEP: CUDA symmetric memory, NVLink domain size={domain_size}")
++    print_rank_0(f"UltraEP: NCCL symmetric memory, NVLink domain size={domain_size}")
+     return domain_size
+ 
+ 

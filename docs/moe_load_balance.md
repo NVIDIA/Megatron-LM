@@ -8,7 +8,7 @@ state, to balance work across expert-parallel (EP) ranks.
 
 ## Main features
 
-- Three load planners: `echo`, `eplb`, and `moon_ep`.
+- Four load planners: `echo`, `eplb`, `moon_ep`, and `ultra_ep`.
 - Configurable replica slots, with weight transfer and gradient reduction through
   Peer-TMA or NCCL P2P.
 - Periodic EPLB home-expert migration, including optimizer state, after successful
@@ -52,6 +52,7 @@ CLI, use the corresponding hyphenated options, such as `--moe-enable-scheduler`,
 | `moe_scheduler_planner_type: echo` | Redistributes overloaded expert work to replica slots. |
 | `moe_scheduler_planner_type: eplb` | Uses global expert loads to choose replication and placement; optionally migrates home experts. |
 | `moe_scheduler_planner_type: moon_ep` | Uses MoonEP placement and token rerouting; requires as many replica slots as logical experts. |
+| `moe_scheduler_planner_type: ultra_ep` | Uses UltraEP quota placement and token rerouting; home experts stay fixed. Requires UltraEP. |
 | `moe_scheduler_expert_dispatcher_type: replica_peer_tma` | Uses Peer-TMA within one NVLink domain; requires native NCCL symmetric-memory support. |
 | `moe_scheduler_expert_dispatcher_type: replica_nccl` | Uses packed NCCL P2P over the EP group; supports home migration. |
 
@@ -59,6 +60,14 @@ CLI, use the corresponding hyphenated options, such as `--moe-enable-scheduler`,
 Both this count and `num_moe_experts` must be divisible by the EP size.
 For `moon_ep`, set it equal to `num_moe_experts` and provide equal physical token
 counts on all EP ranks before scheduling.
+
+For `ultra_ep`, install [UltraEP](https://github.com/Dots-Infra/UltraEP). Only its
+planning is used; replicas still move through the configured transport. A process
+has one PyTorch symmetric-memory backend, and Peer-TMA needs NCCL. UltraEP builds
+on PyTorch symmetric memory (main since `1474022`) select CUDA, so apply
+`docker/patches/ultraep-nccl-symmetric-memory.patch` before building them; the
+patch only switches that selection in `ultra_ep/runtime.py` to NCCL. NVSHMEM-based
+UltraEP builds need no patch.
 
 ### Enable home-expert migration
 
