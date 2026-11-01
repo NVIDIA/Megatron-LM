@@ -399,6 +399,9 @@ def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.transformer.heterogeneous.heterogeneous_config import (
         HeterogeneousTransformerConfig,
     )
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    cfg = get_run_config() if is_run_config_initialized() else None
 
     # Config class.
     config_class = config_class or TransformerConfig
@@ -419,7 +422,17 @@ def core_transformer_config_from_args(args, config_class=None):
     # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
     kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
+    if isinstance(cfg, PretrainConfigContainer):
+        kw_args['deallocate_pipeline_outputs'] = not (
+            cfg.ddp.use_megatron_fsdp and cfg.ddp.megatron_fsdp_version == 2
+        )
+        kw_args['fp8_param'] = cfg.ddp.fp8_param_gather
+        kw_args['fp4_param'] = cfg.ddp.fp4_param_gather
+    else:
+        # CLI bootstrap and inference have not selected a training wrapper.
+        kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
+        kw_args['fp8_param'] = args.fp8_param_gather
+        kw_args['fp4_param'] = args.fp4_param_gather
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
@@ -428,8 +441,6 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
-    kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True

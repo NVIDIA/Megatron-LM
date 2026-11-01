@@ -10,6 +10,7 @@ _TRAIN_START_TIME = time.time()  # The earliest we can measure the start time.
 
 # Standard library.
 import argparse
+import copy
 import dataclasses
 import functools
 import gc
@@ -2557,14 +2558,16 @@ def _forward_backward_grad_context(args):
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using the supplied DDP config or the finalized run config."""
+    """Build the model using a supplied or registered finalized wrapper configuration."""
     cfg = get_run_config()
+    if ddp_config is None and isinstance(cfg, PretrainConfigContainer):
+        ddp_config = cfg.ddp
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        if args.create_all_gather_group:
+        if wrap_with_ddp and ddp_config.create_all_gather_group:
             timeout = timedelta(minutes=cfg.dist.distributed_timeout_minutes) if cfg.dist.distributed_timeout_minutes else None
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
@@ -2662,7 +2665,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     if (
-        not (cfg.dist.use_torch_fsdp2 and args.use_cpu_initialization)
+        not (
+            ddp_config is not None
+            and ddp_config.use_torch_fsdp2
+            and args.use_cpu_initialization
+        )
         and not args.init_model_with_meta_device
     ):
         for model_module in model:
@@ -2674,7 +2681,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if args.init_model_with_meta_device and not cfg.dist.use_torch_fsdp2 and not args.use_megatron_fsdp:
+    if args.init_model_with_meta_device and not (
+        ddp_config is not None
+        and (ddp_config.use_torch_fsdp2 or ddp_config.use_megatron_fsdp)
+    ):
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
@@ -2685,19 +2695,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if cfg.dist.use_torch_fsdp2:
+        if ddp_config.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_megatron_fsdp:
+        elif ddp_config.use_megatron_fsdp:
             DP = FullyShardedDataParallel
         else:
             DP = DDP
 
         config = get_model_config(model[0])
 
-        if ddp_config is None:
-            ddp_config = cfg.ddp
-        if not cfg.dist.use_torch_fsdp2:
+        # Wrappers resolve model-dependent buckets in place; keep the saved config declarative.
+        ddp_config = copy.copy(ddp_config)
+        if not ddp_config.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
                 ddp_config,
@@ -2740,11 +2750,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 config,
                 ddp_config,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=getattr(
-                    args, 'use_layer_wise_param_layout', True
-                ),
+                use_layer_wise_param_layout=ddp_config.use_layer_wise_param_layout,
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=pg_collection if ddp_config.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2812,7 +2820,11 @@ def get_megatron_ddp_config(
 
     if use_torch_fsdp2:
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+        return TorchFullyShardedDataParallelConfig(
+            reshard_after_forward=reshard_after_forward,
+            fp8_param_gather=getattr(args, "fp8_param_gather", False),
+            fp4_param_gather=getattr(args, "fp4_param_gather", False),
+        )
     else:
         kwargs = {}
         for f in dataclasses.fields(DistributedDataParallelConfig):
@@ -2866,8 +2878,6 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-    cfg = cfg_container if cfg_container is not None else get_run_config()
-
     build_optimizer = not cfg.validation.skip_train and not (
         run_train_loop_without_updates and not cfg.checkpoint.load_optim
     )
@@ -2896,14 +2906,14 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
-                ddp_config=cfg.ddp,
+                ddp_config=copy.copy(cfg.ddp),
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
-                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+                use_torch_fsdp2=cfg.ddp.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
-                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                use_layer_wise_param_layout=cfg.ddp.use_layer_wise_param_layout,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
@@ -2912,7 +2922,7 @@ def setup_model_and_optimizer(
                 model_type,
                 wrap_with_ddp=wrap_with_ddp,
                 pg_collection=pg_collection,
-                ddp_config=cfg_container.ddp if cfg_container is not None else None,
+                ddp_config=cfg.ddp,
             )
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
@@ -2930,9 +2940,7 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
-            reduce_scatter_with_fp32_accumulation=getattr(
-                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
-            ),
+            reduce_scatter_with_fp32_accumulation=cfg.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation,
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
@@ -2978,7 +2986,7 @@ def setup_model_and_optimizer(
     if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
-        optim_cfg = cfg.optimizer
+        optim_cfg = copy.copy(cfg.optimizer)
         optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
         optim_cfg.timers = timers
         if getattr(args, "use_mup", False): # TODO (@chencui): address in model config args->config PR
@@ -3075,7 +3083,7 @@ def setup_model_and_optimizer(
                 checkpointing_context=checkpointing_context,
                 restore_training_state=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
-                and cfg.dist.use_torch_fsdp2
+                and cfg.ddp.use_torch_fsdp2
                 and args.ckpt_format == "torch_dist",
                 tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
                 pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
@@ -4812,7 +4820,7 @@ def train(
     # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
     # so without that flag there is nothing for no_sync to suppress.
     if isinstance(model[0], FullyShardedDataParallelV2) or (
-        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and cfg.ddp.overlap_grad_reduce
     ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
@@ -4825,7 +4833,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if cfg.optimizer.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and cfg.ddp.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -5292,9 +5300,9 @@ def train(
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
-            getattr(args, "fsdp_manual_registration", False)
-            and getattr(args, "nccl_ub", False)
-            and getattr(args, "use_megatron_fsdp", False)
+            cfg.ddp.fsdp_manual_registration
+            and cfg.ddp.nccl_ub
+            and cfg.ddp.use_megatron_fsdp
             and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
@@ -6194,8 +6202,8 @@ def should_disable_forward_pre_hook(args, optimizer):
     has_optimizer = optimizer is not None
     cfg = get_run_config()
     return (
-        not args.use_megatron_fsdp
-        and has_optimizer
+        has_optimizer
+        and not cfg.ddp.use_megatron_fsdp
         and (
             cfg.optimizer.use_distributed_optimizer
             or cfg.optimizer.use_layer_wise_distributed_optimizer

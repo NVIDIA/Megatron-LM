@@ -62,7 +62,9 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
 
 def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
-    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=32, num_attention_heads=4, fp8="hybrid"
+    )
     transformer.cuda_graph_impl = "transformer_engine"
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
@@ -70,6 +72,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     run_config.ddp.fp8_param_gather = True
     run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     before = copy.deepcopy(run_config.to_dict())
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         run_config.finalize()
@@ -79,6 +82,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
 
     # A rejected configuration remains editable and can be finalized after correction.
     run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     run_config.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
