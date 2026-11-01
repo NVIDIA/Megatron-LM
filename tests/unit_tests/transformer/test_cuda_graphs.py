@@ -106,6 +106,7 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
 def isolated_cuda_graph_record(monkeypatch):
     """Give each test its own runner registry and global capture state."""
     monkeypatch.setattr(_CudagraphGlobalRecord, "all_runners", weakref.WeakSet())
+    monkeypatch.setattr(_CudagraphGlobalRecord, "captured_runners", weakref.WeakSet())
     monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", True)
     monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
     monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_inference_record", [])
@@ -114,10 +115,12 @@ def isolated_cuda_graph_record(monkeypatch):
     monkeypatch.setattr(CudaGraphManager, "global_mempool", object())
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
 
 class _Graph:
-    pass
+    def reset(self):
+        pass
 
 
 def _runner_with_created_graphs():
@@ -150,7 +153,7 @@ def test_release_all_cuda_graphs_releases_runner_without_capture_records(
 ):
     runner, graph_refs = _runner_with_created_graphs()
 
-    # Capture clears the records, but the model still owns this runner.
+    # Neither recorded nor in 'captured_runners', but the model still owns this runner.
     release_all_cuda_graphs()
 
     _assert_runner_released(runner, graph_refs)
@@ -160,22 +163,20 @@ def test_release_all_cuda_graphs_releases_runner_without_capture_records(
 
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
-def test_delete_cuda_graphs_keeps_created_training_graphs(isolated_cuda_graph_record):
-    # An inference engine's suspend calls delete_cuda_graphs(). Graphs that
-    # create_cudagraphs() captured for training are not in the record and must survive.
+def test_delete_cuda_graphs_releases_created_training_graphs(isolated_cuda_graph_record):
+    # An inference engine's suspend calls delete_cuda_graphs(). Capture added the
+    # training runner to 'captured_runners', so its created graphs are released too.
     training_runner, training_graph_refs = _runner_with_created_graphs()
+    _CudagraphGlobalRecord.captured_runners.add(training_runner)
     inference_runner, inference_graph_refs = _runner_with_created_graphs()
     _CudagraphGlobalRecord.cudagraph_inference_record.append((inference_runner, "fwd", (), {}))
 
     delete_cuda_graphs()
 
-    _assert_runner_released(inference_runner, inference_graph_refs)
-    assert all(graph_ref() is not None for graph_ref in training_graph_refs)
-    assert training_runner.cudagraph_created
-    assert training_runner.fwd_graph_recorded and training_runner.bwd_graph_recorded
-
-    release_all_cuda_graphs()
     _assert_runner_released(training_runner, training_graph_refs)
+    _assert_runner_released(inference_runner, inference_graph_refs)
+    assert len(_CudagraphGlobalRecord.captured_runners) == 0
+    assert CudaGraphManager.global_mempool is None
 
 
 @pytest.mark.parametrize("has_te_modules", [False, True])
