@@ -2,6 +2,7 @@
 
 """Exercise marker selection and file ownership without importing GPU tests."""
 
+import ast
 import importlib.util
 import os
 import subprocess
@@ -82,6 +83,88 @@ def test_real_pytest_marker_selection(tmp_path, enabled, expression, passed):
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"{passed} passed" in result.stdout
     assert "skipped" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "enabled,expression,selected_count,nccl_ep_count",
+    [
+        ("true", "launch_on_gb200", 28, 0),
+        ("false", "launch_on_gb200", 28, 0),
+        ("true", "not gb200_only", 19, 7),
+        ("false", "not gb200_only", 35, 7),
+    ],
+)
+def test_grouped_dispatcher_markers_keep_nccl_ep_on_h100(
+    tmp_path, enabled, expression, selected_count, nccl_ep_count
+):
+    """Collect the actual parameter matrix and markers without importing GPU code."""
+    relative = "tests/unit_tests/transformer/moe/test_grouped_tensor_dispatcher_numerics.py"
+    source = ast.parse((ROOT / relative).read_text())
+    assignments = {
+        node.targets[0].id: node
+        for node in source.body
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+    }
+    marks = assignments["pytestmark"]
+    # CUDA availability is the only environment-dependent module marker.
+    marks.value.elts = [mark for mark in marks.value.elts if not isinstance(mark, ast.Call)]
+    test_class = next(
+        node
+        for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name == "TestGroupedTensorDispatcherNumerics"
+    )
+    test_class.body = [
+        node
+        for node in test_class.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    ]
+    for method in test_class.body:
+        method.body = [ast.Pass()]
+    module = ast.Module(
+        body=[
+            ast.Import(names=[ast.alias(name="pytest")]),
+            assignments["_PARAMETER_LAYOUTS"],
+            marks,
+            test_class,
+        ],
+        type_ignores=[],
+    )
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(ast.unparse(ast.fix_missing_locations(module)))
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\nmarkers =\n"
+        "    launch_on_gb200: GB200 coverage\n"
+        "    internal: internal test\n"
+        "    timeout: test timeout\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "tests.unit_tests.gb200_placement_plugin",
+            "--collect-only",
+            "-q",
+            "-m",
+            expression,
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(ROOT),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "UNIT_TEST_GB200_ENABLED": enabled,
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    nodeids = [line for line in result.stdout.splitlines() if line.startswith(relative + "::")]
+    assert len(nodeids) == selected_count
+    assert sum("::test_ncclep_" in nodeid for nodeid in nodeids) == nccl_ep_count
 
 
 @pytest.mark.parametrize("enabled", [False, True])

@@ -248,6 +248,59 @@ def test_approved_method_boundaries(path, node, params, expected):
     assert selected(path, node, **params) is expected
 
 
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+@pytest.mark.parametrize("learned_output_contract", [False, True])
+@pytest.mark.parametrize(
+    "precision,autocast_forward,expected",
+    [
+        ("fp32", False, False),
+        ("bf16_fp32_mixing", False, True),
+        ("bf16_fused", False, True),
+        ("bf16_fp32_mixing", True, True),
+    ],
+)
+def test_hybrid_mhc_recompute_keeps_failed_fp32_cases_on_h100(
+    recompute_method, learned_output_contract, precision, autocast_forward, expected
+):
+    assert (
+        selected(
+            "models/test_hybrid_mhc.py",
+            "TestHybridStackMHC::test_full_recompute_matches_forward_backward[opaque]",
+            recompute_method=recompute_method,
+            learned_output_contract=learned_output_contract,
+            precision=precision,
+            autocast_forward=autocast_forward,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+def test_hybrid_mhc_real_moe_recompute_stays_on_h100(recompute_method):
+    assert not selected(
+        "models/test_hybrid_mhc.py",
+        "TestHybridStackMHC::test_full_recompute_real_moe_matches_forward_backward[opaque]",
+        recompute_method=recompute_method,
+    )
+
+
+def test_hybrid_mhc_other_cases_still_run_on_gb200():
+    path = "models/test_hybrid_mhc.py"
+    assert selected(path, "test_mhc_mtp_requires_hybrid_contract")
+    assert selected(path, "TestHybridStackMHC::test_fused_bf16_forward_backward")
+    assert selected(
+        path,
+        "TestHybridStackMHC::test_forward_backward[False-full]",
+        learned_output_contract=False,
+        recompute_kwargs={
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+        },
+    )
+    assert not selected(path, "TestHybridStackMHC::test_full_recompute_matches_forward_backward")
+
+
 @pytest.mark.parametrize("implementation", ["local", "inference_optimized"])
 @pytest.mark.parametrize("sizes", [(1, 1, 1), (2, 2, 1), (2, 1, 2), (2, 2, 2)])
 def test_dynamic_parallel_inference_preserves_four_rank_limit(implementation, sizes):

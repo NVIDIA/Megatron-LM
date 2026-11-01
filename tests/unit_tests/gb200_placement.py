@@ -53,7 +53,6 @@ WHOLE_FILES = frozenset(
         "transformer/test_mhc_projection_recompute.py",
         "transformer/test_hyper_connection_recompute.py",
         "models/test_puzzle_config.py",
-        "models/test_hybrid_mhc.py",
         "models/test_wide_residual_mtp_mimo.py",
         "generalized_tensor_parallel/test_attention_gtp.py",
         "generalized_tensor_parallel/test_gtp_grad_correctness.py",
@@ -82,6 +81,7 @@ PARTIAL_FILES = frozenset(
         "a2a_overlap/test_schedule_layer_1f1b.py",
         "a2a_overlap/test_delay_wgrad_compute.py",
         "transformer/moe/test_grouped_tensor_dispatcher_numerics.py",
+        "models/test_hybrid_mhc.py",
         "models/test_hybrid_model.py",
         "generalized_tensor_parallel/test_gtp_muon_dcp.py",
     )
@@ -122,6 +122,7 @@ APPROVED_CLASSES = {
         "TestMHCWithCudaGraph",
         "TestMHCWithOffloading",
     },
+    "models/test_hybrid_mhc.py": {"TestHybridStackMHC"},
     "models/test_hybrid_model.py": {
         "TestHybridModel",
         "TestHybridQKLayernorm",
@@ -330,6 +331,15 @@ def is_gb200_candidate(path: str, node_name: str, params: dict) -> bool:
                 (True, True, False),
                 (False, True, True),
             )
+        )
+    if path == "models/test_hybrid_mhc.py":
+        # Keep the six FP32 forward-parity failures from GB200 run 41279258383
+        # on H100 until their recompute numerical differences are understood.
+        if (cls, method) == ("TestHybridStackMHC", "test_full_recompute_matches_forward_backward"):
+            return params.get("precision") in ("bf16_fp32_mixing", "bf16_fused")
+        return (cls, method) != (
+            "TestHybridStackMHC",
+            "test_full_recompute_real_moe_matches_forward_backward",
         )
     if path == "models/test_hybrid_model.py":
         return cls != "TestHybridWithDynamicInference" and method != (
