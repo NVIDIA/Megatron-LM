@@ -16,6 +16,7 @@ pytest.importorskip("modelopt", reason="modelopt is not installed")
 import modelopt.torch.opt as mto
 import modelopt.torch.utils.distributed as mdist
 
+from megatron.core import parallel_state
 from megatron.core.post_training.modelopt.checkpointing import (
     _load_extra_state_from_sharded_checkpoint,
     remove_per_module_state,
@@ -96,11 +97,29 @@ class TestSaveModeloptState:
         with (
             mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
             mock.patch.object(mto, "modelopt_state", side_effect=[{"i": i} for i in range(2)]),
-            mock.patch("megatron.core.post_training.modelopt.checkpointing.mpu"),
         ):
             save_modelopt_state([mock.MagicMock(), mock.MagicMock()], state_dict)
         assert "modelopt_state_0" in state_dict
         assert "modelopt_state_1" in state_dict
+
+    def test_multiple_models_leave_the_global_virtual_pipeline_rank_alone(self, monkeypatch):
+        # Megatron Core does not read the global virtual pipeline rank, and nvidia-modelopt 0.45
+        # only sets it in its own checkpoint helpers, so collecting the state of a model chunk
+        # does not need it and saving does not set it.
+        monkeypatch.setattr(
+            parallel_state, "_VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK", mock.sentinel.vp_rank
+        )
+        models = [mock.MagicMock(), mock.MagicMock()]
+        state_dict = {}
+        with (
+            mock.patch.object(mto.ModeloptStateManager, "is_converted", return_value=True),
+            mock.patch.object(mto, "modelopt_state", side_effect=lambda model: {"model": model}),
+        ):
+            save_modelopt_state(models, state_dict)
+        assert state_dict == {
+            f"modelopt_state_{i}": {"model": model} for i, model in enumerate(models)
+        }
+        assert parallel_state._VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK is mock.sentinel.vp_rank
 
 
 class TestSaveShardedModeloptState:

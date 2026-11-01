@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.transformer.moe import batch_invariant
 from megatron.core.transformer.moe.moe_utils import permute
 
@@ -42,15 +41,6 @@ def _routed(num_tokens, hidden, num_experts, topk, dtype, seed):
     return rows, inverse_map
 
 
-@pytest.fixture
-def ep_world_size():
-    def _set(size):
-        parallel_state.set_expert_model_parallel_world_size(size)
-
-    yield _set
-    parallel_state.set_expert_model_parallel_world_size(None)
-
-
 @pytest.mark.parametrize("collective", ["ordered", "multimem"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
@@ -64,17 +54,21 @@ def ep_world_size():
     ],
 )
 def test_fused_unpermute_matches_loop_bitwise(
-    monkeypatch, ep_world_size, collective, dtype, num_tokens, hidden, num_experts, topk, ep_size
+    monkeypatch, collective, dtype, num_tokens, hidden, num_experts, topk, ep_size
 ):
     monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
-    ep_world_size(ep_size)
     rows, inverse_map = _routed(num_tokens, hidden, num_experts, topk, dtype, seed=num_tokens)
     restore_shape = torch.Size((num_tokens, hidden))
     grad = _adversarial((num_tokens, hidden), dtype, seed=num_tokens + 2)
 
     fused_rows = rows.clone().requires_grad_()
     fused = batch_invariant.unpermute(
-        fused_rows, restore_shape, probs=None, num_experts=num_experts, inverse_map=inverse_map
+        fused_rows,
+        restore_shape,
+        probs=None,
+        num_experts=num_experts,
+        inverse_map=inverse_map,
+        ep_size=ep_size,
     )
     fused.backward(grad)
 
@@ -89,32 +83,35 @@ def test_fused_unpermute_matches_loop_bitwise(
     assert torch.equal(_bits(fused_rows.grad), _bits(loop_rows.grad))
 
 
-def test_fused_unpermute_rank_tree_rounding(ep_world_size):
+def test_fused_unpermute_rank_tree_rounding():
     """Rank partials round to fp32 before the cross-rank sum, so 1e20 + 1 - 1e20 + 1 is 0."""
-    ep_world_size(2)
     rows = torch.tensor([[1e20], [1.0], [-1e20], [1.0]], device="cuda").expand(4, 4).contiguous()
     inverse_map = torch.tensor([[[0, 1, 2, 3]], [[0, 1, 2, 3]]], device="cuda")
     out = batch_invariant.unpermute(
-        rows, torch.Size((1, 4)), probs=None, num_experts=4, inverse_map=inverse_map
+        rows, torch.Size((1, 4)), probs=None, num_experts=4, inverse_map=inverse_map, ep_size=2
     )
     assert torch.equal(out, torch.zeros(1, 4, device="cuda"))
 
 
-def test_unpermute_with_probs_uses_loop(ep_world_size):
-    ep_world_size(2)
+def test_unpermute_with_probs_uses_loop():
     num_tokens, hidden, num_experts, topk = 64, 32, 8, 2
     rows, inverse_map = _routed(num_tokens, hidden, num_experts, topk, torch.bfloat16, seed=5)
     probs = torch.rand(num_tokens, num_experts, device="cuda")
     restore_shape = torch.Size((num_tokens, hidden))
     out = batch_invariant.unpermute(
-        rows, restore_shape, probs=probs, num_experts=num_experts, inverse_map=inverse_map
+        rows,
+        restore_shape,
+        probs=probs,
+        num_experts=num_experts,
+        inverse_map=inverse_map,
+        ep_size=2,
     )
     ref = batch_invariant._unpermute_loop(rows, restore_shape, probs, num_experts, inverse_map, 2)
     assert torch.equal(_bits(out), _bits(ref))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype):
+def test_fused_unpermute_backward_is_cuda_graph_capturable(dtype):
     """The fused forward and backward capture into one CUDA graph and replay bitwise.
 
     The engine's AllToAll combine takes this ``probs=None`` path inside captured graphs, so
@@ -122,7 +119,6 @@ def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype)
     an invalid slot and leaves rows 3 and 5 unused; their gradients must stay zero. The
     upstream gradient is non-contiguous and carries signed zeros.
     """
-    ep_world_size(2)
     num_experts, hidden = 4, 40
     # Tokens x top-2 slots; slot (1, 1) is invalid, rows 3 and 5 belong to no slot.
     inverse_rows = torch.tensor([[0, 4], [1, -1], [2, 6]], device="cuda")
@@ -136,7 +132,12 @@ def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype)
     def step():
         rows.grad = None
         out = batch_invariant.unpermute(
-            rows, restore_shape, probs=None, num_experts=num_experts, inverse_map=inverse_map
+            rows,
+            restore_shape,
+            probs=None,
+            num_experts=num_experts,
+            inverse_map=inverse_map,
+            ep_size=2,
         )
         out.backward(grad)
         return out
@@ -152,7 +153,12 @@ def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype)
     rows.grad = None
     with torch.cuda.graph(graph):
         out = batch_invariant.unpermute(
-            rows, restore_shape, probs=None, num_experts=num_experts, inverse_map=inverse_map
+            rows,
+            restore_shape,
+            probs=None,
+            num_experts=num_experts,
+            inverse_map=inverse_map,
+            ep_size=2,
         )
         out.backward(grad)
     graph.replay()

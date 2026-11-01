@@ -32,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import ArgumentGroupFactory
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     _make_config,
@@ -205,7 +206,7 @@ def test_weights_projection_precision_contract(
     qr = torch.randn(
         32, 1, config.q_lora_rank, dtype=torch.bfloat16, device="cuda", requires_grad=True
     )
-    runtime_context = get_fp8_context(config, layer_no=0)
+    runtime_context = get_fp8_context(config, layer_no=0, pg_collection=global_amax_groups())
     with runtime_context:
         _q, _k, weights = indexer.forward_before_topk(x, qr)
 

@@ -71,8 +71,17 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     gtp_remat_group = _FakeProcessGroup()
     gtp_replica_group = _FakeProcessGroup()
     checkpoint_dp_cp_group = _FakeProcessGroup()
+    # The dummy router and token dispatcher read none of the other MoE layer groups.
     pg_collection = ProcessGroupCollection(
-        tp=tp_group, ep=ep_group, dp_cp=gtp_replica_group, gtp_remat=gtp_remat_group
+        tp=tp_group,
+        ep=ep_group,
+        dp_cp=gtp_replica_group,
+        gtp_remat=gtp_remat_group,
+        cp=None,
+        expt_tp=None,
+        tp_ep=None,
+        tp_cp=None,
+        tp_dp_cp=None,
     )
     checkpoint_calls = {}
     config = TransformerConfig(
@@ -112,6 +121,7 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     assert all(
         kwargs["gtp_replica_group"] is gtp_replica_group for _, kwargs in _RecordingLinear.calls
     )
+    assert all(kwargs["pg_collection"] is pg_collection for _, kwargs in _RecordingLinear.calls)
     assert layer.fc1_latent_proj._tp_group is tp_group
     assert layer.fc2_latent_proj._tp_group is tp_group
 
@@ -137,6 +147,9 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     MoELayer(config, submodules, pg_collection=pg_collection)
 
     assert len(_RecordingInferenceLinear.calls) == 2
+    assert all(
+        kwargs["pg_collection"] is pg_collection for _, kwargs in _RecordingInferenceLinear.calls
+    )
     assert all(
         "gtp_remat_group" not in kwargs and "gtp_replica_group" not in kwargs
         for _, kwargs in _RecordingInferenceLinear.calls

@@ -4,12 +4,14 @@ import gc
 import inspect
 import os
 import sys
+import weakref
 
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -29,7 +31,8 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutput,
@@ -45,6 +48,7 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
     delete_cuda_graphs,
     is_graph_warmup,
+    release_all_cuda_graphs,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -98,6 +102,83 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+@pytest.fixture
+def isolated_cuda_graph_record(monkeypatch):
+    """Give each test its own runner registry and global capture state."""
+    monkeypatch.setattr(_CudagraphGlobalRecord, "all_runners", weakref.WeakSet())
+    monkeypatch.setattr(_CudagraphGlobalRecord, "captured_runners", weakref.WeakSet())
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", True)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_inference_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_saved_tensors_observer", None)
+    monkeypatch.setattr(cuda_graphs_module, "_GTP_RUNNER_STREAMS", [])
+    monkeypatch.setattr(CudaGraphManager, "global_mempool", object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+
+class _Graph:
+    def reset(self):
+        pass
+
+
+def _runner_with_created_graphs():
+    """Return a runner in the state 'create_cudagraphs' leaves it in, plus graph weakrefs."""
+    runner = _CudaGraphRunner(
+        MegatronModule(config=None), object(), [], {}, func=None, need_backward=True
+    )
+    runner.cudagraph_created = True
+    runner.fwd_graph_recorded = True
+    runner.bwd_graph_recorded = True
+    runner.fwd_graph = _Graph()
+    runner.bwd_graph = _Graph()
+    runner._gtp_fwd_params_to_ensure_ready = (object(),)
+    return runner, (weakref.ref(runner.fwd_graph), weakref.ref(runner.bwd_graph))
+
+
+def _assert_runner_released(runner, graph_refs):
+    assert all(graph_ref() is None for graph_ref in graph_refs)
+    assert not runner.cudagraph_created
+    assert not runner.fwd_graph_recorded
+    assert not runner.bwd_graph_recorded
+    assert runner.mempool is None
+    assert runner._gtp_fwd_params_to_ensure_ready == ()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_release_all_cuda_graphs_releases_runner_without_capture_records(
+    isolated_cuda_graph_record,
+):
+    runner, graph_refs = _runner_with_created_graphs()
+
+    # Neither recorded nor in 'captured_runners', but the model still owns this runner.
+    release_all_cuda_graphs()
+
+    _assert_runner_released(runner, graph_refs)
+    assert not _CudagraphGlobalRecord.cudagraph_created
+    assert CudaGraphManager.global_mempool is None
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_delete_cuda_graphs_releases_created_training_graphs(isolated_cuda_graph_record):
+    # An inference engine's suspend calls delete_cuda_graphs(). Capture added the
+    # training runner to 'captured_runners', so its created graphs are released too.
+    training_runner, training_graph_refs = _runner_with_created_graphs()
+    _CudagraphGlobalRecord.captured_runners.add(training_runner)
+    inference_runner, inference_graph_refs = _runner_with_created_graphs()
+    _CudagraphGlobalRecord.cudagraph_inference_record.append((inference_runner, "fwd", (), {}))
+
+    delete_cuda_graphs()
+
+    _assert_runner_released(training_runner, training_graph_refs)
+    _assert_runner_released(inference_runner, inference_graph_refs)
+    assert len(_CudagraphGlobalRecord.captured_runners) == 0
+    assert CudaGraphManager.global_mempool is None
 
 
 @pytest.mark.parametrize("has_te_modules", [False, True])
@@ -929,6 +1010,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
             max_sequence_length=1024,
             position_embedding_type="rope",
             vp_stage=i,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         model.append(this_model)
 
@@ -1059,6 +1141,7 @@ class TestLLaVACudaGraph:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1319,6 +1402,7 @@ class TestTECudaGraphHelper:
                 parallel_output=True,
                 position_embedding_type="rope",
                 vp_stage=i if vpp_size else None,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
             model.append(this_model)
 
@@ -1329,6 +1413,7 @@ class TestTECudaGraphHelper:
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             optimizers=[],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Call _get_cuda_graph_input_data (which internally calls _get_sample_arguments)
@@ -1580,6 +1665,7 @@ class TestPartialCudaGraph:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             mtp_block_spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def create_test_args(
@@ -1698,6 +1784,7 @@ class TestPartialCudaGraph:
                 seq_length=self.seq_length,
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         loss_list = []
@@ -2067,7 +2154,11 @@ class TestCheckpointParameterDiscovery:
         module.load_state_dict(reference.state_dict())
 
         manager = CudaGraphManager(
-            config, base_module=module, function_name="my_op", need_backward=True
+            config,
+            base_module=module,
+            function_name="my_op",
+            need_backward=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
         ddp_model = DistributedDataParallel(
             config,
@@ -2153,7 +2244,11 @@ class TestRepeatedParameterCapture:
         module.load_state_dict(reference.state_dict())
 
         manager = CudaGraphManager(
-            config, base_module=module, function_name="project", need_backward=True
+            config,
+            base_module=module,
+            function_name="project",
+            need_backward=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
         ddp_model = DistributedDataParallel(
             config,
@@ -2253,6 +2348,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         # First call captures, second replays
@@ -2276,6 +2372,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2296,6 +2393,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2328,6 +2426,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2337,6 +2436,161 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+def _forbid_global_process_groups(monkeypatch):
+    """Make the global group, rank and world-size accessors and the collection shim raise."""
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the global parallel state was read")
+
+    for name in dir(parallel_state):
+        if name.startswith("get_") and name.endswith(
+            ("_rank", "_ranks", "_world_size", "_group", "_groups")
+        ):
+            monkeypatch.setattr(parallel_state, name, forbidden)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbidden)
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestCudaGraphManagerProcessGroups:
+    """Local CUDA graphs decide graph reuse from the graphed module's own pipeline group."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    def teardown_method(self, method):
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        _CudagraphGlobalRecord._disable_saved_tensors_observer()
+        CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _model_pipeline_group(global_pp):
+        """Initialize a global grid with `global_pp` stages and return the model's PP group.
+
+        The model's pipeline size differs from the global one: under a global PP of 1 the model
+        gets 2-rank pipeline groups, and under a global PP of 2 its pipeline parallelism is off
+        (None). A read of the global grid would flip the reuse decision.
+        """
+        if Utils.world_size < 4 or Utils.world_size % 2:
+            pytest.skip("needs an even world size of at least 4")
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=global_pp)
+        model_parallel_cuda_manual_seed(123)
+        if global_pp == 2:
+            return None
+        pairs = [[rank, rank + 1] for rank in range(0, Utils.world_size, 2)]
+        group, _ = torch.distributed.new_subgroups_by_enumeration(pairs)
+        return group
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_function_manager_follows_module_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        module = _SimpleModule(config).cuda()
+        module.pg_collection = ProcessGroupCollection(pp=model_pp_group)
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            manager = CudaGraphManager(
+                config, base_module=module, function_name="my_op", need_backward=False
+            )
+            assert manager.reuse_cudagraphs is None
+            module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        assert manager.reuse_cudagraphs is (global_pp == 2)
+
+    def test_function_manager_without_module_pipeline_group_warns_and_uses_global_grid(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+        self._model_pipeline_group(global_pp=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        module = _SimpleModule(config).cuda()
+        manager = CudaGraphManager(
+            config, base_module=module, function_name="my_op", need_backward=False
+        )
+        with pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="CudaGraphManager was called without `pg_collection.pp`",
+        ):
+            module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        assert manager.reuse_cudagraphs is False
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_transformer_layer_follows_its_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.pp = model_pp_group
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        hidden_states = torch.ones((32, 2, config.hidden_size), device="cuda")
+        attention_mask = torch.ones((1, 1, 32, 32), dtype=bool, device="cuda")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ProcessGroupCollection,
+                "use_mpu_process_groups",
+                lambda *args, **kwargs: pytest.fail("the global parallel state was read"),
+            )
+            layer = TransformerLayer(
+                config,
+                get_gpt_layer_with_transformer_engine_submodules(),
+                pg_collection=pg_collection,
+            ).cuda()
+            assert layer.cudagraph_manager.reuse_cudagraphs is None
+            layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
+
+    @pytest.mark.parametrize("global_pp", [1, 2])
+    def test_mamba_layer_follows_its_pipeline_group(self, monkeypatch, global_pp):
+        model_pp_group = self._model_pipeline_group(global_pp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp", "gtp_remat", "expt_gtp_remat"]
+        )
+        pg_collection.pp = model_pp_group
+        config = TransformerConfig(
+            hidden_size=256,  # The Mamba layer places several constraints on this.
+            num_layers=1,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        hidden_states = torch.ones((32, 2, config.hidden_size), device="cuda")
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                ProcessGroupCollection,
+                "use_mpu_process_groups",
+                lambda *args, **kwargs: pytest.fail("the global parallel state was read"),
+            )
+            layer = MambaLayer(
+                config,
+                hybrid_stack_spec.submodules.mamba_layer.submodules,
+                pg_collection=pg_collection,
+            ).cuda()
+            assert layer.pg_collection is pg_collection
+            layer(hidden_states=hidden_states)
+        assert layer.cudagraph_manager.reuse_cudagraphs is (global_pp == 2)
 
 
 class TestSkipFp8WeightUpdateTensor:
