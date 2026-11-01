@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
 import os
@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import squared_relu
+from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -69,6 +70,211 @@ def test_grouped_tensor_requires_grouped_gemm():
             num_moe_experts=2,
             moe_use_grouped_tensor=True,
         )
+
+
+def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.5,
+        moe_paged_stash=True,
+        use_transformer_engine_op_fuser=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
+    )
+
+    assert config.moe_paged_stash is True
+    assert config.moe_use_grouped_tensor is True
+    assert config.use_transformer_engine_op_fuser is False
+
+
+def _construct_grouped_mlp_with_gtp_weights(
+    monkeypatch, *, moe_paged_stash, te_supports_sharded_weights, native_fp8_gather
+):
+    from megatron.core.tensor_parallel import gtp_api
+
+    modules = []
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = SimpleNamespace(_gtp_native_fp8=native_fp8_gather)
+            self.use_grouped_tensor = True
+
+    def build_grouped_linear(*args, **kwargs):
+        module = FakeGroupedLinear()
+        modules.append(module)
+        return module
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.5,
+        moe_paged_stash=moe_paged_stash,
+        use_transformer_engine_op_fuser=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
+        bias_dropout_fusion=False,
+    )
+    monkeypatch.setattr(gtp_api, "HAVE_GTP", True)
+    monkeypatch.setattr(gtp_api, "is_gtp_param", lambda weight: True)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        experts_module,
+        "Fp8Padding",
+        lambda num_experts, align_size: SimpleNamespace(
+            num_experts=num_experts, align_size=align_size
+        ),
+    )
+    monkeypatch.setattr(
+        experts_module,
+        "Fp8Unpadding",
+        lambda num_experts, align_size: SimpleNamespace(
+            num_experts=num_experts, align_size=align_size
+        ),
+    )
+    monkeypatch.setattr(
+        experts_module,
+        "_te_grouped_tensor_supports_sharded_weights",
+        lambda: te_supports_sharded_weights,
+    )
+
+    submodules = SimpleNamespace(
+        linear_fc1=build_grouped_linear, linear_fc2=build_grouped_linear, activation_func=None
+    )
+    pg_collection = SimpleNamespace(ep=None, expt_tp=None)
+    module = TEGroupedMLP(
+        num_local_experts=2, config=config, submodules=submodules, pg_collection=pg_collection
+    )
+    return module, modules
+
+
+@pytest.mark.parametrize(
+    "te_supports_sharded_weights,native_fp8_gather",
+    [pytest.param(False, False, id="te-unsupported"), pytest.param(True, True, id="native-fp8")],
+)
+def test_paged_stash_rejects_gtp_split_quantize_fallback(
+    monkeypatch, te_supports_sharded_weights, native_fp8_gather
+):
+    with pytest.raises(RuntimeError, match="requires GroupedTensor execution"):
+        _construct_grouped_mlp_with_gtp_weights(
+            monkeypatch,
+            moe_paged_stash=True,
+            te_supports_sharded_weights=te_supports_sharded_weights,
+            native_fp8_gather=native_fp8_gather,
+        )
+
+
+@pytest.mark.parametrize(
+    "te_supports_sharded_weights,native_fp8_gather",
+    [pytest.param(False, False, id="te-unsupported"), pytest.param(True, True, id="native-fp8")],
+)
+def test_gtp_split_quantize_fallback_remains_available_without_paged_stash(
+    monkeypatch, te_supports_sharded_weights, native_fp8_gather
+):
+    module, grouped_linears = _construct_grouped_mlp_with_gtp_weights(
+        monkeypatch,
+        moe_paged_stash=False,
+        te_supports_sharded_weights=te_supports_sharded_weights,
+        native_fp8_gather=native_fp8_gather,
+    )
+
+    assert module._use_grouped_tensor is False
+    assert all(linear.use_grouped_tensor is False for linear in grouped_linears)
+
+
+def test_paged_stash_keeps_supported_gtp_grouped_tensor(monkeypatch):
+    module, grouped_linears = _construct_grouped_mlp_with_gtp_weights(
+        monkeypatch, moe_paged_stash=True, te_supports_sharded_weights=True, native_fp8_gather=False
+    )
+
+    assert module._use_grouped_tensor is True
+    assert all(linear.use_grouped_tensor is True for linear in grouped_linears)
+
+
+@pytest.mark.parametrize(
+    "invalid_fused_activation_config",
+    [
+        pytest.param({"bias_activation_fusion": False}, id="fusion-disabled"),
+        pytest.param({"gated_linear_unit": False}, id="not-gated"),
+        pytest.param({"activation_func": F.gelu}, id="unsupported-activation"),
+        pytest.param({"moe_mlp_glu_interleave_size": 16}, id="glu-interleaved"),
+    ],
+)
+def test_non_fused_grouped_tensor_paged_stash_requires_fused_bias_activation(
+    invalid_fused_activation_config,
+):
+    kwargs = {
+        "num_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_moe_experts": 2,
+        "moe_grouped_gemm": True,
+        "moe_use_grouped_tensor": True,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.5,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": False,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+        "bias_activation_fusion": True,
+    }
+    kwargs.update(invalid_fused_activation_config)
+
+    with pytest.raises(
+        ValueError, match="non-op-fuser GroupedTensor path requires fused SwiGLU or QuickGeGLU"
+    ):
+        TransformerConfig(**kwargs)
+
+
+def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
+    marked = []
+    tensors = (torch.zeros(2, 4), None, torch.ones(2, 1))
+
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+    te_ext.mark_grouped_tensor(*tensors)
+
+    assert len(marked) == 1
+    assert marked[0][0] is tensors[0]
+    assert marked[0][1] is tensors[2]
+
+
+@pytest.mark.parametrize("source_marked", [False, True])
+def test_fused_activation_marker_propagation_uses_te_adapter(monkeypatch, source_marked):
+    marked = []
+    source = torch.zeros(2, 4)
+    target = torch.ones(2, 4)
+    if source_marked:
+        source.grouped_tensor_scale_inv = False
+
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+
+    assert te_ext.propagate_te_grouped_tensor_marker(source, target) is target
+    assert marked == ([(target,)] if source_marked else [])
+
+
+def test_grouped_tensor_marking_ignores_absent_operands_without_te(monkeypatch):
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", None)
+    te_ext.mark_grouped_tensor()
+    te_ext.mark_grouped_tensor(None, None)
+    with pytest.raises(RuntimeError, match="mark_grouped_tensor utility"):
+        te_ext.mark_grouped_tensor(torch.zeros(1), None)
 
 
 def test_clamped_swiglu_allows_te_op_fuser():
@@ -155,6 +361,8 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    # __new__ bypasses the compatibility check cached by TEGroupedMLP.__init__.
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=16,
         delay_wgrad_compute=False,
@@ -250,10 +458,69 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
         assert len(fused_ops.args) == 4
 
 
+def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
+    events = []
+
+    class FakeStashContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("exit")
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(
+        fp8=False, fp4=False, moe_paged_stash=True, moe_expert_rank_capacity_factor=1.5
+    )
+    module._with_fused_impl = False
+    module._use_grouped_tensor = True
+
+    monkeypatch.setattr(experts_module, "skip_routed_expert_padding", lambda _config: True)
+
+    def group_start(hidden_states):
+        events.append("start")
+        return hidden_states
+
+    def get_context(**kwargs):
+        events.append("context")
+        assert kwargs["name"] == "grouped_mlp"
+        assert kwargs["max_num_tokens"] == 2
+        torch.testing.assert_close(kwargs["num_tokens_tensor"], torch.tensor(2))
+        assert kwargs["avg_num_tokens"] == 1
+        return FakeStashContext()
+
+    def group_commit(output, *, name):
+        events.append("commit")
+        assert name == "grouped_mlp"
+        return output
+
+    monkeypatch.setattr(experts_module, "paged_stash_group_start", group_start)
+    monkeypatch.setattr(experts_module, "get_paged_stash_context", get_context)
+    monkeypatch.setattr(experts_module, "paged_stash_group_commit", group_commit)
+
+    def unfused_forward(hidden_states, tokens_per_expert, permuted_probs):
+        events.append("compute")
+        assert isinstance(tokens_per_expert, torch.Tensor)
+        return hidden_states + permuted_probs
+
+    module._unfused_forward = unfused_forward
+
+    hidden_states = torch.zeros(2, 4)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.ones(2)
+    output, output_bias = module.forward(hidden_states, tokens_per_expert, probs)
+
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert output_bias is None
+    assert events == ["start", "context", "enter", "compute", "exit", "commit"]
+
+
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
 
-    output = TEGroupedMLP._apply_bias(
+    output = module._apply_bias(
         intermediate, bias_parallel=None, tokens_per_expert=[2, 1], permuted_probs=torch.ones(3)
     )
 
@@ -261,32 +528,56 @@ def test_apply_bias_returns_input_unchanged_when_bias_is_none():
 
 
 def test_apply_bias_combines_per_expert_bias_and_probs():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
     tokens_per_expert = [2, 1]
     permuted_probs = torch.tensor([0.5, 0.5, 1.0])
     expected = torch.tensor([[6.0, 12.0], [8.0, 14.0], [105.0, 206.0]], dtype=torch.float32)
 
-    output = TEGroupedMLP._apply_bias(
-        intermediate, bias_parallel, tokens_per_expert, permuted_probs
-    )
+    output = module._apply_bias(intermediate, bias_parallel, tokens_per_expert, permuted_probs)
 
     torch.testing.assert_close(output, expected)
     assert output.dtype == intermediate.dtype
 
 
 def test_apply_bias_combines_packed_grouped_bias_and_accumulates_gradient():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     packed_bias = torch.tensor([[10.0, 20.0], [100.0, 200.0]], requires_grad=True)
     tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
     permuted_probs = torch.tensor([0.25, 0.5, 1.5])
     expected = torch.tensor([[3.5, 7.0], [8.0, 14.0], [155.0, 306.0]])
 
-    output = TEGroupedMLP._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
+    output = module._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
     output.sum().backward()
 
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(packed_bias.grad, torch.tensor([[0.75, 0.75], [1.5, 1.5]]))
+
+
+@pytest.mark.parametrize("paged_stash", [False, True])
+def test_apply_packed_bias_marks_saved_operands_from_config(monkeypatch, paged_stash):
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=paged_stash)
+    marked = []
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+
+    intermediate = torch.zeros(3, 2)
+    packed_bias = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
+    # Deliberately leave this tensor unmarked: paged-stash intent comes from config, not an
+    # attribute that selective recompute may have placed on a detached tensor object.
+    permuted_probs = torch.tensor([0.25, 0.5, 1.0])
+
+    module._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
+
+    assert len(marked) == (2 if paged_stash else 0)
+    if paged_stash:
+        assert marked[0][0].shape == (3, 1)
+        assert marked[1][0].shape == (3, 2)
 
 
 def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
@@ -427,6 +718,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=8,
         delay_wgrad_compute=False,
@@ -586,6 +878,7 @@ def test_make_fused_ops_uses_clamped_qgeglu(
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
@@ -626,6 +919,7 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -663,6 +957,7 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -700,6 +995,7 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -796,6 +1092,24 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     module = _make_fused_impl_support_module(
         FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
     )
+
+    assert module._is_fused_impl_supported() is True
+
+
+def test_is_fused_impl_supported_ignores_offload_knobs(monkeypatch):
+    """expert_fc1/moe_act offload must not push a fusable GroupedMLP onto the unfused path;
+    the knobs are reconciled per instance in __init__ instead."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.offload_expert_fc1 = True
+    module.offload_moe_act = True
 
     assert module._is_fused_impl_supported() is True
 
@@ -944,6 +1258,7 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=2,
         delay_wgrad_compute=False,
@@ -1307,6 +1622,83 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch):
+        """Explicit split alignment enables the real fused kernels without the legacy env var."""
+        import inspect
+
+        import transformer_engine.pytorch as te
+
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        if "split_alignment" not in inspect.signature(GroupedLinear).parameters:
+            pytest.skip("Installed TE op fuser GroupedLinear lacks split_alignment")
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+
+        mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
+        if not mxfp8_available:
+            pytest.skip(reason)
+        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+        )
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        with get_fp8_context(config, is_init=True):
+            layer = MoELayer(config, submodules)
+        experts = layer.experts.cuda()
+        tokens_per_expert = torch.full((self.num_experts,), 256, dtype=torch.long, device="cuda")
+        hidden = torch.randn(
+            (256 * self.num_experts, config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        probs = torch.rand(hidden.size(0), device="cuda", dtype=torch.float32, requires_grad=True)
+        with get_fp8_context(config):
+            output, _ = experts(hidden, tokens_per_expert, probs)
+        output.backward(torch.randn_like(output))
+
+        (sequential,) = experts._fused_ops
+        assert sequential[0].split_alignment == 256
+        assert sequential[2].split_alignment == 256
+        (fuser,) = sequential._module_groups
+        assert len(fuser._forward_ops) == 1
+        assert len(fuser._backward_ops) == 1
+        assert isinstance(fuser._forward_ops[0][0], fused_cls)
+        assert fuser._backward_ops[0][0] is fuser._forward_ops[0][0]
+        assert torch.isfinite(output).all()
+        for tensor in (hidden, probs, *experts.parameters()):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
     def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
         """A per-module precision override must keep these experts off the op-fuser path.
@@ -1384,6 +1776,102 @@ class TestTEGroupedMLP:
             assert experts._with_fused_impl
         else:
             assert not experts._with_fused_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "offload_modules",
+        (["expert_fc1", "moe_act"], ["fused_group_mlp"], ["moe_act"]),
+        ids=("unfused_knobs", "fused_knob", "partial_unfused_knob"),
+    )
+    @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("fused", "unfused"))
+    def test_gpu_offload_knobs_follow_the_experts_path(self, override_pattern, offload_modules):
+        """'fused_group_mlp' and 'expert_fc1' + 'moe_act' are equivalent spellings; each
+        GroupedMLP maps whichever is given onto its own path. A fused instance offloads the
+        block input (a partial 'expert_fc1'/'moe_act' selection is widened to that, with a
+        warning), an unfused instance offloads the fc1 and activation inputs. Listing the
+        unfused knobs must not force fusable experts onto the unfused path.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        quant_recipe = None
+        if override_pattern is not None:
+            quant_recipe = RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "high_precision": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {},
+                        }
+                    },
+                    "matchers": {
+                        "experts_high_precision": {
+                            "type": "glob",
+                            "enabled": True,
+                            "pattern": override_pattern,
+                            "config": "high_precision",
+                        }
+                    },
+                }
+            )
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        fused_instance = override_pattern is None
+        partial = offload_modules == ["moe_act"]
+        if fused_instance and partial:
+            with pytest.warns(UserWarning, match=r"partial 'expert_fc1' or 'moe_act' selection"):
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        else:
+            import warnings as _warnings
+
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error", UserWarning)
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        if fused_instance:
+            assert experts._with_fused_impl
+            assert experts._is_fused_impl_supported()
+            assert experts.offload_fused_group_mlp
+            assert not experts.offload_expert_fc1
+            assert not experts.offload_moe_act
+        else:
+            assert not experts._with_fused_impl
+            assert not experts.offload_fused_group_mlp
+            assert experts.offload_expert_fc1 == (not partial)
+            assert experts.offload_moe_act
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
@@ -1978,6 +2466,7 @@ def _build_moe_act_recompute_module():
     module.config = SimpleNamespace(
         fp8=False,
         fp4=False,
+        moe_paged_stash=False,
         moe_router_padding_for_quantization=False,
         moe_token_dispatcher_type=None,
         moe_flex_dispatcher_backend=None,

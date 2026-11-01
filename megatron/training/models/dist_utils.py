@@ -38,7 +38,11 @@ try:
 except ImportError:
     correct_amax_history_if_needed = None
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    RuntimePolicy,
+    fully_shard_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +388,15 @@ def _ddp_wrap(
             DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
         ) and ddp_config.megatron_fsdp_version == 2
         construction_context = (
-            fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+            fully_shard_context(
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    )
+                )
+            )
             if is_mfsdp_v2
             else nullcontext()
         )
