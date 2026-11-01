@@ -62,6 +62,8 @@ def test_combined_1f1b_runs_the_combined_chunk_under_autocast():
         b_output_tensor=b_output_tensor,
         b_output_tensor_grad=torch.ones(2, 2, device="cuda"),
         config=config,
+        cp_group_size=1,
+        is_last_stage=True,
     )
 
     assert plan.autocast_enabled is True
@@ -100,6 +102,8 @@ def test_combined_1f1b_leaves_autocast_off_when_not_enabled():
         b_output_tensor=b_output_tensor,
         b_output_tensor_grad=torch.ones(2, 2, device="cuda"),
         config=config,
+        cp_group_size=1,
+        is_last_stage=True,
     )
 
     assert plan.autocast_enabled is False
