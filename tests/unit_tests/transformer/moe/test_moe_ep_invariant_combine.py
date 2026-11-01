@@ -270,9 +270,7 @@ def test_config_rejects_expert_tensor_parallel_inference():
         tensor_model_parallel_size=2,
         sequence_parallel=True,
     )
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        HAVE_DEEPGEMM_BF16,
-    )
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import HAVE_DEEPGEMM_BF16
 
     with pytest.raises(ValueError, match="expert_tensor_parallel_size=1"):
         _ep_invariant_moe_config(expert_tensor_parallel_size=2, **inference)
