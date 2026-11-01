@@ -134,30 +134,6 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
-def test_prefetch_stops_at_phase_boundary(distributed_setup):
-    """The last forward must not prefetch earlier layers for backward."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
-    first_weight = model[0].weight
-    with fully_shard_context(FsdpContext(device=device)):
-        for layer in model:
-            fully_shard(
-                layer,
-                mesh,
-                _default_placements(),
-                # Enough budget to reach the first layer if lookahead crosses into backward.
-                schedule_policy=SchedulePolicy(32, 32),
-            )
-
-    def check_first_layer_stays_sharded(_module, _args):
-        assert first_weight.untyped_storage().nbytes() == 0
-
-    # Run after FSDP's pre-forward hook, once the second layer has issued its prefetch.
-    model[1].register_forward_pre_hook(check_first_layer_stays_sharded)
-    model(torch.ones(2, 4, device=device)).sum().backward()
-
-
 def test_registration_order_rejects_reordered_execution(distributed_setup):
     """Execution must follow registration order when recording is disabled."""
 

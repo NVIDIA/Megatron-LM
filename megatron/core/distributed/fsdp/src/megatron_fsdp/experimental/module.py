@@ -329,7 +329,7 @@ class FsdpModule:
                     )
 
     def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
-        """Validate the current event, prefetch within its phase, and advance once."""
+        """Validate the current event, prefetch successors, and advance once."""
         event = ExecutionEvent(cast(nn.Module, self), self.phase)
         if order.peek() != event:
             raise RuntimeError(
@@ -338,8 +338,6 @@ class FsdpModule:
             )
         prefetched_size = 0
         for next_event in order.successors():
-            if next_event.phase is not self.phase:
-                break
             if prefetch_size is not None and prefetched_size >= prefetch_size:
                 break
             fsdp_module = cast(FsdpModule, next_event.module)
