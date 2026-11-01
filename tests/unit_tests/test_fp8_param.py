@@ -311,7 +311,6 @@ class TestFP8Param:
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder,
-                self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )

@@ -525,6 +525,8 @@ class TestRLUtils:
         args.num_layers = 8
         args.num_attention_heads = 8
         args.vocab_size = VOCAB
+        # No tokenizer is built; the fixture already supplies the model's vocabulary.
+        args.pad_vocab_size = False
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256

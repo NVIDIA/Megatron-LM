@@ -18,6 +18,7 @@ from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer import TransformerConfig
 from megatron.training import argument_utils, arguments, global_vars
 from megatron.training.argument_utils import (
     _DATASET_FIELD_SOURCES,
@@ -39,6 +40,7 @@ from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
+from megatron.training.models import GPTModelConfig
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -47,7 +49,7 @@ MODEL_ARGV = (
 ).split()
 SOURCE = ["--data-path", "prefix-a", "--split", "9,1,0"]
 BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
-# The layout fields the container writes from the model config; a run without one keeps them.
+# The layout fields the container writes from the required model config.
 LAYOUT_FIELDS = (
     "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
     "dynamic_context_parallel", "hybrid_context_parallel",
@@ -149,13 +151,13 @@ def container_factory(monkeypatch):
     )
 
     def build(argv, *, data=False, **kwargs):
-        # finalize() resolves the batch sizes from the registered arguments (upstream #8149):
-        # a micro batch and the batch-parallel size validate_args derives from the world size.
+        # These tests exercise data translation; supply the required model section separately.
         args = _parse(["--micro-batch-size", "1", *argv])
         args.batch_parallel_size = 1
         monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
         if data:
             kwargs["data_cfg"] = gpt_data_config_from_args(args)
+        kwargs.setdefault("model_cfg", _layout())
         return args, pretrain_cfg_container_from_args(args, **kwargs)
 
     return build
@@ -176,11 +178,14 @@ def _layout(**overrides):
         sequence_parallel=False,
         dynamic_context_parallel=False,
         gtp_weight_remat_size=1,
-        gtp_remat_num_sequence_shards=1,
+        tensor_parallel_num_sequence_shards=None,
         cuda_graph_impl="none",
     )
     layout.update(overrides)
-    return SimpleNamespace(transformer=SimpleNamespace(**layout), seq_length=4096)
+    transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8)
+    for name, value in layout.items():
+        setattr(transformer, name, value)
+    return GPTModelConfig(transformer=transformer, seq_length=4096, vocab_size=2048)
 
 
 # Construction from the arguments.
@@ -525,18 +530,14 @@ def test_the_deprecated_hybrid_alias_is_folded_into_dynamic_context_parallel(
     assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
 
 
-def test_layout_without_a_model_section_survives_a_reload(
-    container_factory, monkeypatch, tokenizer
-):
-    """What a run without a model section (pretrain_hybrid_flex.py) saves reproduces its layout
-    fields: Megatron Core's defaults."""
+def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
+    """Reloading reconstructs dataset layout from the authoritative model section."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
     layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
-    assert layout == (1, None, 0, False, False)
+    assert layout == (8, 1, 0, False, False)
     cfg.validate()  # Core's defaults are not explicit values
     reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
     reloaded.finalize()
@@ -544,25 +545,23 @@ def test_layout_without_a_model_section_survives_a_reload(
     assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_FIELDS) == layout
 
 
-def test_owned_fields_without_a_model_section(container_factory, tokenizer):
-    """pretrain_hybrid_flex.py builds its container without a model config: the validation flags
-    are written, the layout fields have no owner and keep what they hold (Megatron Core's defaults
-    from the factory; a Python caller's value is used by the run and not saved)."""
+def test_dataset_layout_requires_a_model_section(container_factory):
+    """A dataset's layout fields cannot replace the required model owner."""
     _, cfg = container_factory(
         ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
     )
     cfg.model = None
     dataset = cfg.data.dataset
     dataset.data_parallel_size = 4
-    cfg.validate()
-    cfg.finalize()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.validate()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.finalize()
     assert dataset.random_seed == 1234  # --seed, from construction
-    assert dataset.full_validation is True and dataset.multiple_validation_sets is False
+    assert dataset.full_validation is None and dataset.multiple_validation_sets is None
     assert dataset.data_parallel_size == 4 and dataset.context_parallel_size is None
     assert "data_parallel_size" not in cfg.to_dict()["data"]["dataset"]
-    cfg.data.bind_tokenizer(tokenizer)  # Core's defaults stay on the rest of the layout
     assert (dataset.sequence_parallel_size, dataset.hybrid_context_parallel) == (0, False)
-    cfg.validate()
 
 
 @pytest.mark.parametrize(
@@ -595,13 +594,13 @@ def test_each_owned_field_is_checked_against_its_owner(container_factory, field,
     [
         (8, dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2), 1, 2),
         (8, dict(tensor_model_parallel_size=2, context_parallel_size=2), 2, 2),
-        (16, dict(tensor_model_parallel_size=2, context_parallel_size=2, gtp_weight_remat_size=2, gtp_remat_num_sequence_shards=2), 1, 4),
+        (16, dict(tensor_model_parallel_size=2, sequence_parallel=True, context_parallel_size=2, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=4), 1, 4),
         (16, dict(tensor_model_parallel_size=2, context_parallel_size=2, gtp_weight_remat_size=2), 2, 2),
         (4, dict(), 1, 4),
     ],
 )  # fmt: skip
 def test_get_data_parallel_size_matches_validate_args(
-    container_factory, world_size, layout, configured_cp, expected
+    container_factory, monkeypatch, world_size, layout, configured_cp, expected
 ):
     """validate_args: world_size // (tp * pp * configured cp * weight remat); the model config holds
     the resolved cp (configured cp times the GTP sequence shards)."""
@@ -619,19 +618,21 @@ def test_get_data_parallel_size_matches_validate_args(
         * transformer.gtp_weight_remat_size
     )
     assert expected == legacy
-    assert cfg.get_data_parallel_size(world_size) == expected
-    cfg.model = None
-    assert cfg.get_data_parallel_size(world_size) is None
+    assert cfg.get_parallel_layout(world_size).dp == expected
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: world_size)
+    assert cfg.get_data_parallel_size() == expected
 
 
 def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
     _, cfg = container_factory(["--seq-length", "64"])
     cfg.model = _layout(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
     with pytest.raises(ValueError, match="divisible"):
-        cfg.get_data_parallel_size(6)
-    cfg.model = _layout(context_parallel_size=3, gtp_remat_num_sequence_shards=2)
-    with pytest.raises(ValueError, match="multiple of the GTP sequence shards"):
-        cfg.get_data_parallel_size(12)
+        cfg.get_parallel_layout(6)
+    cfg.model = _layout(
+        context_parallel_size=3, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=2
+    )
+    with pytest.raises(ValueError, match="must contain the GTP sequence shards"):
+        cfg.get_parallel_layout(12)
 
 
 def test_model_capacity_must_cover_the_sample_length(container_factory):
@@ -643,7 +644,8 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
     cfg.model.seq_length = 64
     cfg.validate()
     cfg.model = None
-    cfg.validate()
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.validate()
 
 
 # Serialization and loading.
@@ -676,7 +678,6 @@ def test_full_container_round_trips_before_and_after_binding_the_tokenizer(
     assert from_file.data.dataset_type is GPTDataset
     assert from_file.data.to_cfg_dict() == cfg.data.to_cfg_dict()
     # After finalize() and binding the tokenizer the file still carries no runtime state.
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 2)
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
@@ -727,7 +728,6 @@ def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     container_factory, monkeypatch, tokenizer
 ):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
     with pytest.raises(RuntimeError, match="before the container is finalized"):
@@ -747,7 +747,6 @@ def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     loader_only.finalize()
     global_vars._bind_dataset_tokenizer(loader_only)  # nothing to bind
     _, unbound = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    unbound.model = None
     unbound.finalize()
     global_vars._bind_dataset_tokenizer(unbound)  # no tokenizer (build_tokenizer=False)
     assert unbound.data.dataset.tokenizer is None
@@ -774,7 +773,6 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "_set_telemetry", lambda args, **kwargs: None)
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
     args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = None
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)  # the bootstrap registers them
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_run_config() is cfg and cfg._finalized

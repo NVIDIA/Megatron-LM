@@ -25,7 +25,8 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.datasets.utils import Split, compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training import argument_utils, arguments, global_vars, training
+from megatron.core.transformer import TransformerConfig
+from megatron.training import argument_utils, global_vars, training
 from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,
@@ -34,6 +35,7 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
 
@@ -55,7 +57,7 @@ PARALLEL_OVERRIDES = dict(
     multiple_validation_sets=True,
 )
 VALIDATION_OVERRIDES = dict(full_validation=True, multiple_validation_sets=True)
-# The layout fields the container writes from the model config (pretrain_hybrid_flex.py has none).
+# The layout fields the container writes from the model config.
 LAYOUT_FIELDS = (
     "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
     "dynamic_context_parallel", "hybrid_context_parallel",
@@ -169,9 +171,8 @@ LEGACY_CLASS_CHANGES = {
     ("hybrid_flex", "sft_mock"): (SFTDataset, MockSFTDataset),
 }
 # The Core fields each legacy factory left at Megatron Core's defaults, forwarded now like every
-# other data argument (the "forwarded" case sets them all). pretrain_hybrid_flex.py's layout fields
-# are not among them: it builds its container without a model config, so they keep Core's defaults
-# on both sides.
+# other data argument (the "forwarded" case sets them all). Hybrid-flex now also gets its layout
+# from the required model section rather than keeping Core's defaults.
 LEGACY_OMISSIONS = {
     "hybrid": {"sft_mock_dataset_config_json"},
     "hybrid_flex": {
@@ -218,17 +219,23 @@ def _validated(extra, overrides):
 
 def _layout_from_args(args):
     """The model section a real run derives from the same arguments (gpt_config_from_args)."""
-    transformer = SimpleNamespace(
+    transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8)
+    layout = dict(
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
         dynamic_context_parallel=args.dynamic_context_parallel,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
-        gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
+        tensor_parallel_num_sequence_shards=args.gtp_remat_num_sequence_shards
+        * (args.tensor_model_parallel_size if args.sequence_parallel else 1),
         cuda_graph_impl="none",
     )
-    return SimpleNamespace(transformer=transformer, seq_length=args.max_position_embeddings)
+    for name, value in layout.items():
+        setattr(transformer, name, value)
+    return GPTModelConfig(
+        transformer=transformer, seq_length=args.max_position_embeddings, vocab_size=2048
+    )
 
 
 def _world_size_for(args):
@@ -251,12 +258,11 @@ def _data_config(entry_point, args):
 
 def _prepare(monkeypatch, extra, overrides, entry_point="gpt"):
     """Validated args, the container as the entry point builds it (not yet finalized) and the
-    run's tokenizer, registered as globals. pretrain_hybrid_flex.py builds its container without a
-    model config, so its layout fields have no owner there; the other scripts carry the layout the
-    same arguments give gpt_config_from_args."""
+    run's tokenizer, registered as globals. All training containers have a model section."""
     args = _validated(extra, overrides)
-    cfg = pretrain_cfg_container_from_args(args, data_cfg=_data_config(entry_point, args))
-    cfg.model = None if entry_point == "hybrid_flex" else _layout_from_args(args)
+    cfg = pretrain_cfg_container_from_args(
+        args, model_cfg=_layout_from_args(args), data_cfg=_data_config(entry_point, args)
+    )
     cfg.validation.full_validation = args.full_validation
     cfg.validation.multiple_validation_sets = args.multiple_validation_sets
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: _world_size_for(args))
@@ -332,15 +338,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
     else:
         assert isinstance(actual, type(expected))
         names = [f.name for f in fields(expected)]
-    compared = names
-    if entry_point == "hybrid_flex":
-        # No model config: the layout fields keep Megatron Core's defaults, as the legacy factory
-        # left them; the standalone wrapper fills them from args like the other wrappers.
-        flex_layout = legacy.legacy_hybrid_flex_dataset_config(args)
-        for name in LAYOUT_FIELDS:
-            assert getattr(actual, name) == getattr(flex_layout, name), name
-        compared = [name for name in names if name not in LAYOUT_FIELDS]
-    assert _signature(actual, compared) == _signature(expected, compared)
+    assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
     if case == "implicit_mock":
@@ -388,11 +386,13 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         _, actual, _ = _ready(cfg).builder_inputs()
     names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
-    assert changed == LEGACY_OMISSIONS[entry_point]
+    if entry_point == "hybrid_flex":
+        assert changed - set(LAYOUT_FIELDS) == LEGACY_OMISSIONS[entry_point]
+    else:
+        assert changed == LEGACY_OMISSIONS[entry_point]
     expected = legacy.legacy_gpt_dataset_config(args)
     expected.validate()  # Megatron Core's checks and derivations, which the builder runs
-    same = [n for n in names if entry_point != "hybrid_flex" or n not in LAYOUT_FIELDS]
-    assert {n: getattr(actual, n) for n in same} == {n: getattr(expected, n) for n in same}
+    assert {n: getattr(actual, n) for n in names} == {n: getattr(expected, n) for n in names}
 
 
 def test_hybrid_flex_rejects_the_varlen_family(monkeypatch, warnings_log, corpus):
@@ -584,19 +584,22 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
 
 
-def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
-    """providers.is_dataset_built_on_rank, the predicate pretrain_gpt and pretrain_hybrid pass and the
-    default of build_gpt_datasets, applies the rule to the registered arguments and the transformer
-    config built from them, read at call time from global_vars and arguments (where tests patch
-    them; tests/unit_tests/data/test_get_batch.py does the same on eight GPUs)."""
+def test_shared_rank_predicate_reads_the_registered_model_config(monkeypatch):
+    """Dataset placement uses the model config, without requiring legacy arguments."""
     rule_calls = []
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     monkeypatch.setattr(
-        global_vars, "_GLOBAL_ARGS", SimpleNamespace(sequence_packing_scheduler=None)
-    )
-    monkeypatch.setattr(
-        arguments,
-        "core_transformer_config_from_args",
-        lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
+        global_vars,
+        "_GLOBAL_RUN_CONFIG",
+        SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(
+                    sequence_packing_scheduler="dp_balanced",
+                    pipeline_model_parallel_layout="layout",
+                    mtp_num_layers=2,
+                )
+            )
+        ),
     )
     monkeypatch.setattr(
         providers,
@@ -608,9 +611,9 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
         (
             (2, False),
             {
-                "sequence_packing_scheduler": None,
+                "sequence_packing_scheduler": "dp_balanced",
                 "pipeline_model_parallel_layout": "layout",
-                "mtp_num_layers": None,
+                "mtp_num_layers": 2,
             },
         )
     ]

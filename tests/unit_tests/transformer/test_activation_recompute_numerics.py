@@ -30,7 +30,7 @@ from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.global_vars import destroy_global_vars, get_run_config, set_global_variables
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -147,6 +147,8 @@ class TestActivationRecomputeNumerics:
         args = parse_args()
         args.num_layers = 1
         args.vocab_size = 1024
+        # This fixture supplies its exact embedding size without constructing a tokenizer.
+        args.pad_vocab_size = False
         args.hidden_size = 256
         args.ffn_hidden_size = 512
         args.num_attention_heads = 8
@@ -221,7 +223,7 @@ class TestActivationRecomputeNumerics:
             config=config,
             transformer_layer_spec=layer_spec,
             mtp_block_spec=mtp_block_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=get_run_config().model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,

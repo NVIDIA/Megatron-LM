@@ -19,9 +19,10 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.parallel_state import get_data_parallel_world_size
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, WideResidualConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
@@ -41,6 +42,13 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
 from megatron.training.global_vars import set_args
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -536,7 +544,7 @@ def test_load_args_restores_wide_residual_config_from_checkpoint():
     assert restored_args.wide_residual_retention_max_forget == 0.2
 
 
-def test_check_checkpoint_args_rejects_wide_residual_mismatch():
+def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
     """Resuming must reject a checkpoint with different wide-residual geometry."""
     current_args = SimpleNamespace(
         num_layers=2,
@@ -555,6 +563,16 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
     )
     checkpoint_args = SimpleNamespace(**vars(current_args))
     checkpoint_args.wide_residual_num_streams = 4
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            wide_residual=WideResidualConfig(num_streams=3),
+        ),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
@@ -562,6 +580,118 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         pytest.raises(AssertionError, match='wide_residual_num_streams value from checkpoint'),
     ):
         check_checkpoint_args(checkpoint_args)
+
+
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, BertModelConfig, MimoBuildConfig])
+def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls):
+    kwargs = {"position_embedding_type": "rope"} if model_cls is GPTModelConfig else {}
+    run_config.model = model_cls(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+        vocab_size=128,
+        **kwargs,
+    )
+    args = SimpleNamespace(vocab_file=None, use_dist_ckpt=True, phase_transition_iterations=None)
+    saved = run_config.to_dict()
+    stale = SimpleNamespace(num_layers=99, hidden_size=99, num_attention_heads=99)
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(stale, checkpoint_config=saved)
+        saved['model']['transformer']['hidden_size'] = 64
+        with pytest.raises(AssertionError, match='hidden_size value from checkpoint'):
+            check_checkpoint_args(stale, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("saved_config", [False, True])
+def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_config):
+    run_config.tokenizer.padded_vocab_size = 512
+    run_config.model.vocab_size = 640
+    run_config.model.should_pad_vocab = False
+    args = SimpleNamespace(
+        vocab_file="vocab",
+        use_dist_ckpt=False,
+        phase_transition_iterations=None,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=999,
+    )
+    checkpoint_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        max_position_embeddings=16,
+        make_vocab_size_divisible_by=128,
+        tokenizer_type="NullTokenizer",
+        padded_vocab_size=512,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    saved = run_config.to_dict() if saved_config else None
+    if saved_config:
+        checkpoint_args.padded_vocab_size = 999
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        run_config.tokenizer.padded_vocab_size = 768
+        with pytest.raises(AssertionError, match='padded_vocab_size value from checkpoint'):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        check_checkpoint_args(
+            checkpoint_args, skip_args={'padded_vocab_size'}, checkpoint_config=saved
+        )
+
+
+@pytest.mark.parametrize("restore_parallelism", [False, True])
+def test_checkpoint_args_restore_preserves_mlm_policy(restore_parallelism):
+    """CLI bootstrap retains MLM precedence; saved config does not replace launch settings."""
+    args = SimpleNamespace(
+        load='checkpoint',
+        hidden_size=64,
+        num_layers=None,
+        seq_length=None,
+        attention_dropout=0.3,
+        tensor_model_parallel_size=2,
+        recompute_granularity='selective',
+        tp_comm_overlap=False,
+        bf16=True,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=restore_parallelism,
+    )
+    checkpoint_args = SimpleNamespace(
+        hidden_size=32,
+        num_layers=2,
+        seq_length=128,
+        spec=['custom_model', 'layer_spec'],
+        attention_dropout=0.1,
+        tensor_model_parallel_size=4,
+        recompute_granularity='full',
+        tp_comm_overlap=True,
+        bf16=False,
+    )
+    # Native configuration is not implicitly merged into the CLI bootstrap path.
+    saved_config = {'model': {'transformer': {'num_layers': 99, 'attention_dropout': 0.9}}}
+    state = {'args': checkpoint_args, 'checkpoint_version': 3.0}
+    with (
+        mock.patch(
+            'megatron.training.checkpointing._load_base_checkpoint',
+            return_value=(state, 'checkpoint', False, CheckpointType.LEGACY),
+        ),
+        mock.patch(
+            'megatron.training.checkpointing._read_checkpoint_run_config', return_value=saved_config
+        ),
+    ):
+        load_args_from_checkpoint(args)
+    assert args.hidden_size == 64  # Non-None CLI inputs retain precedence.
+    assert args.num_layers == 2
+    assert args.seq_length == 128
+    assert args.spec == checkpoint_args.spec  # Keep the original CLI import path.
+    assert args.attention_dropout == 0.1  # Existing MLM force=True behavior.
+    assert args.tensor_model_parallel_size == (4 if restore_parallelism else 2)
+    assert args.recompute_granularity == 'selective'
+    assert args.tp_comm_overlap is False
+    assert args.bf16 is True
 
 
 @pytest.mark.parametrize(
@@ -575,6 +705,12 @@ def test_check_checkpoint_args_uses_config_owner(
     monkeypatch, run_config, section, name, current, other, saved_source
 ):
     """Config precedence, old checkpoint fallback and skips share one comparison path."""
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+        position_embedding_type="rope",
+    )
     args = SimpleNamespace(
         num_layers=2,
         hidden_size=128,
@@ -659,6 +795,11 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1),
+        seq_length=16,
+        position_embedding_type='rope',
+    )
 
     yield args
 
@@ -828,6 +969,9 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize(
+    "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig]
+)
 @pytest.mark.parametrize("owned_rng", [False, True])
 @pytest.mark.parametrize("iteration", [0, 123])
 @pytest.mark.parametrize(
@@ -842,6 +986,7 @@ def test_load_checkpoint(
     iteration,
     run_config,
     load_kwargs,
+    model_cls,
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
@@ -850,6 +995,11 @@ def test_load_checkpoint(
     args.use_dist_ckpt = ckpt_format != "torch"
     args.fp16 = False
     args.bf16 = False
+    kwargs = {"encoder_num_layers": 1} if model_cls is T5ModelConfig else {}
+    run_config.model = model_cls(transformer=run_config.model.transformer, seq_length=16, **kwargs)
+    # Live runtime callbacks are not part of the saved model configuration.
+    run_config.model.transformer.grad_scale_func = lambda value: value
+    run_config.model.transformer.no_sync_func = [lambda: None]
     rng_config = run_config.rng
     if owned_rng:
         rng_config.seed = 987
@@ -899,9 +1049,20 @@ def test_load_checkpoint(
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
             assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+        restored_config = type(run_config).from_yaml(
+            ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
+        )
+        assert type(restored_config.model) is model_cls
+        # The shared YAML comes from rank 0; distributed rank fields differ on other ranks.
+        assert restored_config.to_dict()["model"] == run_config.to_dict()["model"]
+        assert restored_config.model.transformer.grad_scale_func is None
+        assert restored_config.model.transformer.no_sync_func is None
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
+        with torch.no_grad():
+            new_model.l.weight.zero_()
+            new_model.l.bias.fill_(1)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
@@ -1036,6 +1197,9 @@ def test_strict_load_idle_rerun_checkpoint(
 ):
     """Load an idle rerun shard without treating it as a pending rerun."""
     args = create_ckpt_load_args
+    # Startup normally fills these; the saved topology must match the real launch.
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = get_data_parallel_world_size()
     args.ckpt_format = "torch_dist"
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
@@ -1205,6 +1369,7 @@ def test_checkpoint_load_without_microbatch_calculator(
         config = TransformerConfig(
             num_layers=1, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
         )
+        run_config.model = GPTModelConfig(transformer=config, seq_length=16, vocab_size=32)
 
         def build_model():
             # CPU-initialized DP replicas must match the weights saved by rank 0.
@@ -1251,7 +1416,9 @@ def test_checkpoint_load_without_microbatch_calculator(
             # Converters restore consumed-sample metadata without a training config.
             monkeypatch.setattr(
                 "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
-                inference_cfg_container_from_args(args, build_model_config=False),
+                inference_cfg_container_from_args(
+                    args, model_cfg=run_config.model, build_model_config=False
+                ),
             )
         if is_inference:
             with mock.patch(

@@ -47,7 +47,15 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
-from megatron.training.models import GPTModelConfig, HybridModelConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    ModelConfig,
+    T5ModelConfig,
+)
 from megatron.training.utils import warn_rank_0
 
 # TODO: support arg renames
@@ -586,13 +594,13 @@ def resolve_tokenizer_vocab_size(
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
-            vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
+            vocabulary is preserved; only unresolved model sizes are bound.
 
     Raises:
-        ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
+        ValueError: A model's vocabulary remains unresolved.
     """
     padded_vocab_size = cfg.tokenizer.padded_vocab_size
-    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
+    if cfg.model is not None and hasattr(cfg.model, "vocab_size") and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
         cfg.model.vocab_size = padded_vocab_size
@@ -746,6 +754,7 @@ def hybrid_config_from_args(
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -789,6 +798,77 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
         kwargs["use_nsys_profiler"] = args.profile and not use_pytorch
         kwargs["use_pytorch_profiler"] = args.profile and use_pytorch
     return ProfilingConfig(**deepcopy(kwargs))
+
+
+def model_config_from_args(
+    args: Namespace,
+    *,
+    model_config_cls: type[
+        ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
+    ]
+    | None = None,
+) -> ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig:
+    """Build a model-family config at the CLI boundary.
+
+    BERT, T5, LLaVA, and MIMO applications select their config class explicitly.
+    Decoder-only callers use the existing GPT/Hybrid adapters. Model construction
+    remains independent: an explicit provider callback is retained by pretrain.
+    Add a dedicated <model>_config_from_args adapter for model-specific handling;
+    keep the shared field mapping below independent of individual model families.
+    """
+    if model_config_cls is None:
+        model_config_cls = (
+            HybridModelConfig
+            if getattr(args, "hybrid_layer_pattern", None) is not None
+            else GPTModelConfig
+        )
+    if issubclass(model_config_cls, GPTModelConfig):
+        return gpt_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, HybridModelConfig):
+        return hybrid_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, BertModelConfig):
+        return bert_config_from_args(args, model_config_cls=model_config_cls)
+    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+
+
+def bert_config_from_args(
+    args: Namespace, model_config_cls: type[BertModelConfig] = BertModelConfig
+) -> BertModelConfig:
+    """Resolve the BERT layer spec and shared model fields at the CLI boundary."""
+    from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
+
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if args.spec is not None:
+        kwargs["transformer_layer_spec"] = (
+            bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    return model_config_cls(**kwargs)
+
+
+def _model_config_kwargs_from_args(args: Namespace, model_config_cls: type) -> dict[str, Any]:
+    """Map common CLI fields without applying model-specific policies."""
+    if args.yaml_cfg is not None:
+        from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+        transformer = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        transformer = core_transformer_config_from_args(args)
+    vocab_size = getattr(args, "padded_vocab_size", None)
+    if vocab_size is None and not args.pad_vocab_size:
+        vocab_size = args.vocab_size
+    kwargs = _default_config_from_args(model_config_cls, args, return_instance=False)
+    aliases = dict(
+        transformer=transformer,
+        seq_length=args.max_position_embeddings,
+        vocab_size=vocab_size,
+        should_pad_vocab=False,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        rope_scaling=args.use_rope_scaling,
+        seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+    )
+    model_fields = {f.name for f in fields(model_config_cls) if f.init}
+    kwargs.update({name: value for name, value in aliases.items() if name in model_fields})
+    return kwargs
 
 
 # args attribute -> Megatron Core GPTDatasetConfig field, as the legacy entry-point factories read
@@ -991,11 +1071,7 @@ def pretrain_cfg_container_from_args(
         data_cfg = DataConfig(dataloader=dataloader_config_from_args(args))
 
     if model_cfg is None:
-        msg = """
-        It is recommended to use a ModelConfig (e.g. megatron.training.models.HybridModelConfig) instead
-        of a model builder/model provider function pointer.
-        """
-        warnings.warn(msg)
+        model_cfg = model_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim
@@ -1009,15 +1085,6 @@ def pretrain_cfg_container_from_args(
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg = _default_config_from_args(OptimizerConfig, args)
-    if model_cfg is None:
-        # Legacy model providers still own these inputs in args. Do not create a placeholder
-        # model config: that would select the native model builder instead of the provider.
-        optim_cfg.validate_model(
-            moe_single_grouped_weight=getattr(args, "moe_single_grouped_weight", False),
-            virtual_pipeline_model_parallel_size=getattr(
-                args, "virtual_pipeline_model_parallel_size", None
-            ),
-        )
     ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
@@ -1070,14 +1137,17 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        build_model_config: If False, retain model_cfg (including None) for legacy callers
-            that still construct the model through a model provider.
+        build_model_config: If False, allow model_cfg=None for callers without model
+            inputs. Callers with model dimensions still receive a typed model config;
+            application-specific families pass model_cfg explicitly.
     """
     if model_cfg is None and build_model_config:
-        if getattr(args, "hybrid_layer_pattern", None) is not None:
-            model_cfg = hybrid_config_from_args(args)
-        else:
-            model_cfg = gpt_config_from_args(args)
+        model_cfg = model_config_from_args(args)
+    elif model_cfg is None and all(
+        getattr(args, name, None) is not None
+        for name in ("num_layers", "hidden_size", "num_attention_heads")
+    ):
+        model_cfg = model_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.

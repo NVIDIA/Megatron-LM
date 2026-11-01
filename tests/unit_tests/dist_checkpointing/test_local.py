@@ -81,6 +81,8 @@ class TestLocalCheckpointing:
         init_basic_mock_args(args, 1, 1)
         init_checkpointing_mock_args(args, None)
         args.non_persistent_ckpt_type = "local"
+        # RNG shard compatibility uses the actual launch size, including DP ranks.
+        args.world_size = torch.distributed.get_world_size()
         args.non_persistent_local_ckpt_algo = "atomic"
         args.ckpt_fully_parallel_save = True
         # Deliberately disagree with the config-owned policy.

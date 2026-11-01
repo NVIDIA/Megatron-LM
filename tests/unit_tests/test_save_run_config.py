@@ -35,11 +35,15 @@ class MockFullConfig:
 
     def __init__(self, data, use_distributed_optimizer=False):
         from megatron.training.config import LoggerConfig, RNGConfig
+        from megatron.training.models import GPTModelConfig
 
         self._data = data
         self.optimizer = OptimizerConfig(use_distributed_optimizer=use_distributed_optimizer)
         self.logger = LoggerConfig()
         self.rng = RNGConfig()
+        self.model = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=1, kv_channels=1), seq_length=16
+        )
 
     def to_yaml(self, yaml_path):
         with open(yaml_path, "w") as f:
