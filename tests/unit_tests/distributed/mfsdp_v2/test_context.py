@@ -186,37 +186,31 @@ def test_prefetch_replays_interleaved_occurrences(distributed_setup, budget):
 
 
 @pytest.mark.parametrize("wrong_phase", [False, True])
-def test_prefetch_rejects_divergence_without_consuming(distributed_setup, wrong_phase):
-    """Public unsharding rejects an unexpected module or phase without moving the cursor."""
+def test_registration_order_rejects_divergence_without_consuming(distributed_setup, wrong_phase):
+    """Execution that violates registration order fails without moving the cursor."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    first, second = (nn.Linear(4, 4, bias=False).to(device) for _ in range(2))
-    with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
-    ) as context:
-        for module in (first, second):
-            fully_shard(
-                module,
-                mesh,
-                _default_placements(),
-                schedule_policy=SchedulePolicy(0, 0, register_hooks=False),
-            )
-    events = [ExecutionEvent(first, Phase.FORWARD), ExecutionEvent(second, Phase.BACKWARD)]
-    for event in events:
-        context.execution_order.append(event)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    with fully_shard_context(FsdpContext(device=device)) as context:
+        for layer in model:
+            fully_shard(layer, mesh, _default_placements())
 
-    module = first if wrong_phase else second
-    phase = Phase.BACKWARD if wrong_phase else Phase.FORWARD
-    module.phase = phase
-    context.allgather_stream.wait_stream(context.current_stream())
-    with pytest.raises(RuntimeError, match="diverged.*position 0"):
-        module.unshard(phase, prefetch=True)
-    module.phase = Phase.RESTING
-    assert context.execution_order.peek() == events[0]
-    assert context.execution_order.position == 0
-    first.phase = Phase.FORWARD
-    first.unshard(Phase.FORWARD, prefetch=True)
-    assert context.execution_order.peek() == events[1]
+    inputs = torch.ones(2, 4, device=device)
+    if wrong_phase:
+        model(inputs)
+        # The next call should be the second layer's backward, not another forward.
+        expected = ExecutionEvent(model[1], Phase.BACKWARD)
+        position = 2
+    else:
+        # Calling the second layer first violates the static forward order.
+        expected = ExecutionEvent(model[0], Phase.FORWARD)
+        position = 0
+
+    assert context.execution_order.peek() == expected
+    with pytest.raises(RuntimeError, match=f"diverged.*position {position}"):
+        model[1](inputs)
+    assert context.execution_order.peek() == expected
+    assert context.execution_order.position == position
     torch.cuda.synchronize(device)
 
 
