@@ -13,7 +13,7 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.utils import normalize
+from megatron.core.datasets.utils import normalize, save_index_cache
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
@@ -200,12 +200,14 @@ class BlendedDataset(torch.utils.data.Dataset):
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
-                # Write the description
-                with open(path_to_description, "wt") as writer:
-                    writer.write(self.unique_description)
-                # Save the indexes
-                numpy.save(path_to_dataset_index, dataset_index, allow_pickle=True)
-                numpy.save(path_to_dataset_sample_index, dataset_sample_index, allow_pickle=True)
+                save_index_cache(
+                    path_to_description,
+                    self.unique_description,
+                    {
+                        path_to_dataset_index: dataset_index,
+                        path_to_dataset_sample_index: dataset_sample_index,
+                    },
+                )
             else:
                 log_single_rank(
                     logger,
