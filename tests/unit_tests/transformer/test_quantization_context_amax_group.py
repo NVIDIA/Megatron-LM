@@ -148,7 +148,7 @@ class TestMultiTokenPredictionAmaxReductionGroup:
         layer = _bare_module(
             MultiTokenPredictionLayer, _config(**QUANTIZATION["fp8-tensorwise"]), pg_collection
         )
-        layer.mtp_layer_pattern = None
+        layer.is_hybrid_mtp = False
         layer.mhc_enabled = False
         layer._concat_embeddings = lambda hidden_states, decoder_input: hidden_states
         layer.mtp_model_layer = lambda hidden_states, **kwargs: (hidden_states, None)
