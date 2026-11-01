@@ -10,22 +10,22 @@ from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 LSQ_SCALE_PARAM_NAMES = ("*_amax_pre", "*_amax_post")
 
 
-def get_lsq_config_overrides(args) -> Dict[ParamKey, ParamGroupOverride]:
+def get_lsq_config_overrides(args, *, base_lr: float | None) -> Dict[ParamKey, ParamGroupOverride]:
     """Optimizer overrides for scale-learning QAD (LSQ).
 
     Puts the learnable scale (amax) params in their own param group with
-    max_lr=--lsq-scale-lr. Returns no override when it equals --lr: the group would then
-    match the default group on every field that identifies a group on checkpoint load,
-    and the two would collide on resume.
+    max_lr=--lsq-scale-lr. Returns no override when it equals the optimizer config's
+    base_lr: the group would then match the default group on every field that identifies
+    a group on checkpoint load, and the two would collide on resume.
     """
     lsq_scale_lr = getattr(args, "lsq_scale_lr", None)
-    if lsq_scale_lr is None or lsq_scale_lr == args.lr:
+    if lsq_scale_lr is None or lsq_scale_lr == base_lr:
         return {}
     return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
 
 
 def install_lsq_optimizer_overrides():
-    """Wrap megatron.training.training.get_megatron_optimizer_config to add the LSQ overrides.
+    """Wrap megatron.training.training.get_standard_config_overrides to add LSQ overrides.
 
     setup_model_and_optimizer() looks the function up by module global at call time, so this
     takes effect if installed before the optimizer is built (it is called from the model
@@ -35,14 +35,18 @@ def install_lsq_optimizer_overrides():
     """
     import megatron.training.training as training
 
-    orig = training.get_megatron_optimizer_config
+    orig = training.get_standard_config_overrides
     if getattr(orig, "_lsq_wrapped", False):
         return
 
-    def get_megatron_optimizer_config(args):
-        config, config_overrides = orig(args)
-        config_overrides = {**(config_overrides or {}), **get_lsq_config_overrides(args)}
-        return config, config_overrides
+    def get_standard_config_overrides(config):
+        config_overrides = orig(config)
+        args = training.get_args()
+        config_overrides = {
+            **(config_overrides or {}),
+            **get_lsq_config_overrides(args, base_lr=config.lr),
+        }
+        return config_overrides
 
-    get_megatron_optimizer_config._lsq_wrapped = True
-    training.get_megatron_optimizer_config = get_megatron_optimizer_config
+    get_standard_config_overrides._lsq_wrapped = True
+    training.get_standard_config_overrides = get_standard_config_overrides

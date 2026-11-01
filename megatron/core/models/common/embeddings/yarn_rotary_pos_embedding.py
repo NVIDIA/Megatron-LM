@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import OrderedDict
 from functools import lru_cache
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    RotaryEmbedding,
+    _RotaryCacheKey,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -45,6 +48,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
+
+    # Use a separated cache rather than reusing base RotaryEmbedding for
+    # a separated capacity counting
+    _embedding_cache: ClassVar[OrderedDict[_RotaryCacheKey, tuple[Tensor, float]]] = OrderedDict()
 
     def __init__(
         self,
@@ -99,11 +106,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
-            # clear the lru_cache for the forward method. If not cleared, the cache of forward
-            # method causes a memory leak in NeMo-RL.
-            self.forward.cache_clear()
+            # The constructor only needs the cos/sin buffers, not the intermediate embedding.
+            self.clear_cache()
 
-    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> tuple[Tensor, float]:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -111,7 +117,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             offset (int, optional): RoPE offset. Defaults to 0.
 
         Returns:
-            Tensor: Embeddings after applying Yarn RoPE.
+            tuple[Tensor, float]: Rotary embeddings and the attention scaling factor.
         """
         assert (
             not self.rotary_interleaved
@@ -156,7 +162,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
-    @lru_cache(maxsize=32)
+    def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
+        return self.get_emb(max_seq_len, offset)
+
     @internal_api
     def forward(
         self,
@@ -164,7 +172,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, float]:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -175,16 +183,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 Defaults to None.
 
         Returns:
-            Tensor: Embeddings after applying Yarn RoPE.
+            tuple[Tensor, float]: Rotary embeddings and the attention scaling factor.
         """
-        emb, _mscale = self.get_emb(max_seq_len, offset)
-        if cp_group is None:
-            cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
-        return emb, _mscale
+        return self._get_cached_emb(max_seq_len, offset, packed_seq, cp_group)
 
     def _set_cos_sin_cache(
         self, seq_len, offset, dtype, packed_seq=False, cp_group=None, mscale=None
@@ -235,6 +236,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         ):
             self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group, mscale)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
+
+
+setattr(YarnRotaryEmbedding.forward, "cache_clear", YarnRotaryEmbedding.clear_cache)
+setattr(YarnRotaryEmbedding.forward, "cache_parameters", YarnRotaryEmbedding.cache_parameters)
 
 
 # Inverse dim formula to find dim based on number of rotations
