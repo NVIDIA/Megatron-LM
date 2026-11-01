@@ -9,16 +9,41 @@ same tensor signature. The module never retains a forward's state mapping.
 """
 
 import gc
-from contextlib import contextmanager
-from typing import Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import fields, is_dataclass, replace
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+
+
+def detach_state(value: Any) -> Any:
+    """Copy a forward-local state object while detaching all tensor leaves."""
+    if isinstance(value, Tensor):
+        return value.detach()
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if is_dataclass(value):
+        return replace(
+            value,
+            **{field.name: detach_state(getattr(value, field.name)) for field in fields(value)},
+        )
+    if isinstance(value, dict):
+        return type(value)((key, detach_state(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return [detach_state(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(detach_state(item) for item in value)
+    # Forward state metadata should normally be dataclasses. Do not walk arbitrary
+    # object __dict__ values here: process-group and runtime objects may contain
+    # cycles or large non-state graphs. Unknown objects are immutable metadata from
+    # the state detacher's perspective and can be shared safely.
+    return value
 
 
 class StatefulModule(nn.Module):
@@ -57,7 +82,15 @@ class StatefulModule(nn.Module):
         if recompute and torch.is_grad_enabled():
             if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise ValueError("Stateful full recomputation cannot be nested in CUDA capture")
-            result = checkpoint(self, *args, use_reentrant=False, context_fn=_checkpoint_contexts)
+            # A quantized replay must run to completion: TE restores delayed-scaling
+            # metadata when each module's forward ends, which early stop can skip.
+            replay_scope = (
+                nullcontext() if _active_fp8_recipe() is None else set_checkpoint_early_stop(False)
+            )
+            with replay_scope:
+                result = checkpoint(
+                    self, *args, use_reentrant=False, context_fn=_checkpoint_contexts
+                )
         else:
             result = self(*args)
         return self.restore_result(result, state)
@@ -71,8 +104,34 @@ class StatefulModule(nn.Module):
         return result[0], updated
 
 
+def _active_fp8_recipe() -> Any:
+    """Return the active TE quantization recipe, or ``None`` when quantization is off."""
+    if rng.HAVE_TE and rng.FP8GlobalStateManager.is_fp8_enabled():
+        return rng.FP8GlobalStateManager.get_fp8_recipe()
+    return None
+
+
+@contextmanager
+def _quantized_checkpoint_phase(fp8_recipe: Any, *, replay: bool):
+    """Enter TE's activation-recompute phase, and on replay the recorded recipe.
+
+    This mirrors TE's own non-reentrant checkpoint. The original forward stashes
+    delayed-scaling metadata for the replay. The replay runs during backward,
+    outside the caller's ``fp8_autocast``, so it re-enters the recorded recipe;
+    otherwise it would run unquantized against persistent FP8 weights.
+    """
+    with ExitStack() as stack:
+        if fp8_recipe is not None:
+            stack.enter_context(
+                rng.activation_recompute_forward(activation_recompute=True, recompute_phase=replay)
+            )
+            if replay:
+                stack.enter_context(rng.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe))
+        yield
+
+
 def _checkpoint_contexts():
-    """Preserve Megatron's model-parallel RNG in addition to PyTorch's default RNG."""
+    """Preserve Megatron's model-parallel RNG and TE's quantization recipe for replay."""
     saved = {}
 
     def clone_states(states):
@@ -85,10 +144,12 @@ def _checkpoint_contexts():
     @contextmanager
     def forward():
         saved["tracker"] = clone_states(rng.get_cuda_rng_tracker().get_states())
+        saved["fp8_recipe"] = _active_fp8_recipe()
         previous = rng.is_checkpointing()
         rng._set_checkpointing()
         try:
-            yield
+            with _quantized_checkpoint_phase(saved["fp8_recipe"], replay=False):
+                yield
         finally:
             if not previous:
                 rng._unset_checkpointing()
@@ -100,7 +161,10 @@ def _checkpoint_contexts():
         tracker.set_states(clone_states(saved["tracker"]))
         rng._set_checkpointing()
         try:
-            with suspend_tensor_observations():
+            with (
+                _quantized_checkpoint_phase(saved["fp8_recipe"], replay=True),
+                suspend_tensor_observations(),
+            ):
                 yield
         finally:
             tracker.set_states(previous_states)

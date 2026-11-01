@@ -184,6 +184,43 @@ def test_checkpoint_replays_model_parallel_rng_and_restores_tracker(
 
 
 @pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("recipe_name", ["delayed", "current"])
+def test_quantized_replay_matches_eager_gradients(recipe_name):
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.common import recipe as te_recipe
+
+    if torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 GEMMs need compute capability 8.9 or newer")
+    fp8_recipe = (
+        te_recipe.DelayedScaling() if recipe_name == "delayed" else te_recipe.Float8CurrentScaling()
+    )
+
+    class Region(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = te.Linear(64, 64, bias=False, params_dtype=torch.bfloat16, device="cuda")
+
+        def forward(self, hidden, state):
+            return self.linear(hidden), {}
+
+    eager = StatefulModule(Region())
+    replay = deepcopy(eager)
+    x = torch.randn(32, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    y = x.detach().clone().requires_grad_()
+    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+        h1, _ = eager.run(x, {})
+        h2, _ = replay.run(y, {}, recompute=True)
+    torch.testing.assert_close(h1, h2, rtol=0, atol=0)
+    # Backward runs outside the autocast, as in training; the replay must still quantize.
+    h1.float().square().sum().backward()
+    h2.float().square().sum().backward()
+    torch.testing.assert_close(x.grad, y.grad, rtol=0, atol=0)
+    torch.testing.assert_close(
+        eager.module.linear.weight.grad, replay.module.linear.weight.grad, rtol=0, atol=0
+    )
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
