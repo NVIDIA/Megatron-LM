@@ -54,14 +54,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         ), 'interleaving schedule is not supported for inference'
         self.model = model
         self.config = get_model_config(self.model)
-        if getattr(self.config, "moe_shortcut_connection", False):
-            raise NotImplementedError(
-                "Inference is not supported with moe_shortcut_connection. The shortcut block "
-                "regroups each attention/MoE pair into one logical layer, so the decoder's "
-                "layers no longer line up with the physical layer types that recurrent state "
-                "discovery indexes them with, and its paired attention layer runs a "
-                "training-only two-stage path that never updates the KV cache."
-            )
         self.pipeline_communication_dtype = (
             torch.float if self.config.fp32_residual_connection else self.config.params_dtype
         )
@@ -82,6 +74,15 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
+
+        if (
+            getattr(self.config, "enable_mhc_connections", False)
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "mHC inference with pipeline parallelism is not supported: receive buffers "
+                "do not account for the expanded residual streams."
+            )
 
         if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)

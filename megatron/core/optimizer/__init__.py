@@ -100,7 +100,7 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    config_overrides: Dict[ParamKey, ParamGroupOverride] = {}
     # Select the model-family convention for zero weight decay on vector-like parameters:
     # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
     # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
@@ -110,18 +110,33 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
             and not ("q_layernorm." in name or "k_layernorm." in name)
-            and not getattr(param, "is_wide_residual_retention_parameter", False),
+            and not getattr(param, "is_wide_residual_retention_parameter", False)
+            and not (
+                config.rmsnorm_weight_decay_mult is not None
+                and getattr(param, "is_rmsnorm_weight", False)
+            ),
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
         param_length_1_match = ParamPredicate(
-            name="param_len_1_except_wide_residual_retention",
+            name="param_len_1_except_wide_residual_retention_and_rmsnorm_override",
             fn=lambda param: len(param.shape) == 1
-            and not getattr(param, "is_wide_residual_retention_parameter", False),
+            and not getattr(param, "is_wide_residual_retention_parameter", False)
+            and not (
+                config.rmsnorm_weight_decay_mult is not None
+                and getattr(param, "is_rmsnorm_weight", False)
+            ),
         )
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
     config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+
+    if config.rmsnorm_weight_decay_mult is not None:
+        # Norm constructors mark gamma, including TE's fused layer_norm_weight.
+        # Exclude it from the generic skip above to avoid conflicting wd_mult overrides.
+        config_overrides[ParamKey(attr="is_rmsnorm_weight")] = ParamGroupOverride(
+            wd_mult=config.rmsnorm_weight_decay_mult
+        )
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
@@ -705,6 +720,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
     setattr(optimizer, 'expert_tp_group', expert_tp_group)
+    # The GTP axes this optimizer's params are sharded over. Taken from the collection rather
+    # than MPU because a MIMO module owns its axes through its own grid and leaves the MPU
+    # globals unset, where the duplicate filter would read rank 0 everywhere.
+    setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+    setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
 
     return optimizer
 
@@ -930,6 +950,8 @@ def _get_megatron_emerging_optimizer(
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
             setattr(optimizer, 'expert_tp_group', expert_tp_group)
+            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
             results.append(optimizer)
             continue
         else:
@@ -1059,6 +1081,8 @@ def get_megatron_optimizer(
     Returns:
         Instance of MegatronOptimizer.
     """
+
+    config.validate()
 
     # A MimoModel routes to the heterogeneous per-module optimizer builder.
     from megatron.core.models.mimo.model.base import MimoModel

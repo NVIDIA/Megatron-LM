@@ -36,7 +36,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -51,7 +50,8 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -294,7 +294,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_runtime_services(args)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
     # Start Nsight profiler.
@@ -307,8 +307,7 @@ def main():
 
     configure_nvtx_profiling(True)
 
-    # Build tokenizer
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.

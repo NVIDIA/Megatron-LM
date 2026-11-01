@@ -67,11 +67,19 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce (restore only), or baseline (main producer only)."
+    description: "Unit-test mode: full, enforce, preselected (CPU plan), or baseline (main producer only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
     description: "Baseline source branch. Selective unit tests currently support main only."
+    required: false
+    default: ""
+  unit_test_pr_files_artifact_id:
+    description: "Artifact containing the validated PR file list from the configure job."
+    required: false
+    default: ""
+  unit_testmon_plan_artifact:
+    description: "Artifact containing the CPU-selected plan.json for this bucket."
     required: false
     default: ""
 runs:
@@ -147,7 +155,7 @@ runs:
 
     - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'baseline') && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       env:
@@ -164,11 +172,32 @@ runs:
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
 
+    - name: Download CPU unit Testmon plan
+      id: download-unit-testmon-plan
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != ''
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      with:
+        name: ${{ inputs.unit_testmon_plan_artifact }}
+        path: assets_dir/testmon
+
+    - name: Validate CPU unit Testmon plan
+      id: validate-unit-testmon-plan
+      if: steps.download-unit-testmon-plan.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+      run: |
+        python tests/unit_tests/testmon_selector.py prepare \
+          --plan assets_dir/testmon/plan.json --cache-dir assets_dir/testmon \
+          --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+          --source-sha "$(git rev-parse HEAD)"
+
     # Only main publishes this namespace. Synthetic PR pushes can read caches
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
@@ -176,15 +205,41 @@ runs:
         key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
+    - name: Prepare PR file download
+      id: unit-test-pr-files-directory
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      run: |
+        # Keep the artifact separate from the restored Testmon cache. A fresh
+        # directory also prevents a failed download from reusing stale files.
+        PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/unit-test-pr-files.XXXXXX")
+        echo "path=$PR_FILES_DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Download PR files for mandatory unit tests
+      id: download-unit-test-pr-files
+      if: steps.unit-test-pr-files-directory.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+        path: ${{ steps.unit-test-pr-files-directory.outputs.path }}
+        merge-multiple: true
+
     - name: Resolve unit Testmon mode
       id: unit-testmon
       if: inputs.is_unit_test == 'true'
       shell: bash -e -u -o pipefail {0}
       env:
-        REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        # Precision profiles and disaggregation collectives must always run in full.
+        REQUESTED_MODE: ${{ (inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' || (startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))) && 'full' || inputs.unit_testmon_mode }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
+        PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
+        PLAN_OUTCOME: ${{ steps.validate-unit-testmon-plan.outcome }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -195,12 +250,32 @@ runs:
             [[ "$IDENTITY_OUTCOME" == "success" ]]
             EFFECTIVE_MODE=baseline
             ;;
+          preselected)
+            [[ "${PLAN_OUTCOME:-}" == "success" ]]
+            EFFECTIVE_MODE=preselected
+            ;;
           enforce)
             if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
-              EFFECTIVE_MODE=enforce
+              # Configure fetches the PR's files once for all buckets. The
+              # artifact is tied to the tested commit, not the Testmon baseline.
+              if [[ "$PR_FILES_OUTCOME" == "success" && -n "$PR_FILES_DIR" ]] \
+                && PR_CHANGED_PATHS=$(jq -er --arg sha "$TESTED_SHA" \
+                  'select(.tested_sha == $sha) |
+                   select(.changed_files | type == "number" and . >= 0 and . <= 3000 and floor == .) |
+                   .changed_paths | select(type == "number" and . >= 0 and . <= 6000 and floor == .)' \
+                  "$PR_FILES_DIR/metadata.json") \
+                && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+                && [[ "$CHANGED_PATHS" == "$PR_CHANGED_PATHS" ]] \
+                && cp "$PR_FILES_DIR/changed-files" assets_dir/testmon/changed-files; then
+                EFFECTIVE_MODE=enforce
+              else
+                EFFECTIVE_MODE=full
+                FALLBACK_REASON="unable to read the complete PR changed-file list for the tested commit; running the full bucket without recording or saving"
+                echo "::notice::PR changed-file list unavailable or incomplete; running the full unit-test bucket."
+              fi
             else
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
@@ -222,6 +297,9 @@ runs:
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
+          fi
+          if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
+            echo "- Changed paths in PR: ${CHANGED_PATHS}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"

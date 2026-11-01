@@ -37,6 +37,7 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
+from tests.unit_tests.inference.test_endpoints_common import COMPLETIONS_PATH, build_app
 
 _MEDIA_TOKEN_ID = 99
 _PROMPT_TOKENS = [10, _MEDIA_TOKEN_ID, 20]
@@ -365,15 +366,8 @@ async def test_repeated_media_hits_vision_cache_and_coordinator_affinity(
 async def test_completions_multimodal_entrypoint_with_toy_model(
     wrapper_cls, modality, toy_media_preprocessing
 ):
-    quart = pytest.importorskip("quart")
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.completions import (
-        bp,
-    )
-
     service = _ToyInferenceService(wrapper_cls, deserialize=False)
-    app = quart.Quart(__name__)
-    app.config.update(client=service, tokenizer=service.tokenizer, verbose=False)
-    app.register_blueprint(bp)
+    app = build_app(COMPLETIONS_PATH, service, tokenizer=service.tokenizer)
     encoded_media = base64.b64encode(_MEDIA_BYTES).decode("ascii")
     if modality == "video":
         encoded_media = f"data:video/mp4;base64,{encoded_media}"
@@ -383,7 +377,7 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
         wraps=compute_media_cache_key,
     ) as compute_key:
         response = await app.test_client().post(
-            "/v1/completions",
+            COMPLETIONS_PATH,
             json={
                 "prompt": [_PROMPT_TOKENS, _PROMPT_TOKENS],
                 "max_tokens": 2,
@@ -408,6 +402,7 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
 @pytest.mark.parametrize(
     ("prompt", "multi_modal_data", "status", "error"),
     [
+        (_PROMPT_TOKENS, "not-a-dict", 400, "multi_modal_data must be a dictionary"),
         (_PROMPT_TOKENS, {"audio": "payload"}, 400, "Unsupported multimodal modalities"),
         (
             _PROMPT_TOKENS,
@@ -430,18 +425,11 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
 async def test_completions_rejects_invalid_multimodal_payloads(
     prompt, multi_modal_data, status, error, toy_media_preprocessing
 ):
-    quart = pytest.importorskip("quart")
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.completions import (
-        bp,
-    )
-
     service = _ToyInferenceService(VLMInferenceWrapper, deserialize=False)
-    app = quart.Quart(__name__)
-    app.config.update(client=service, tokenizer=service.tokenizer, verbose=False)
-    app.register_blueprint(bp)
+    app = build_app(COMPLETIONS_PATH, service, tokenizer=service.tokenizer)
 
     response = await app.test_client().post(
-        "/v1/completions", json={"prompt": prompt, "multi_modal_data": multi_modal_data}
+        COMPLETIONS_PATH, json={"prompt": prompt, "multi_modal_data": multi_modal_data}
     )
 
     assert response.status_code == status

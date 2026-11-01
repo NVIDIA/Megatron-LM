@@ -4,6 +4,7 @@ import contextlib
 import gc
 import os
 import sys
+import traceback
 
 import pytest
 import torch
@@ -20,14 +21,14 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
     set_run_config,
 )
 from megatron.training.training import (
@@ -182,10 +183,14 @@ class TestFP8Param:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
+        cfg = Utils.pretrain_config_from_global_args(args, model_class)
+        cfg.finalize()
+        set_run_config(cfg)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -215,7 +220,7 @@ class TestFP8Param:
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             self.copy_main_params_to_param_buffer(model_chunks, optimizer)
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model_chunks, param_sync=True)
 
         model_chunks[0].eval()
@@ -231,7 +236,7 @@ class TestFP8Param:
         eval_loss = eval_output.mean()
         model_chunks[0].train()
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             enable_forward_pre_hook(model_chunks)
 
         return eval_loss.item()
@@ -292,8 +297,7 @@ class TestFP8Param:
             use_cudagraphable_rng=args.cuda_graph_impl != "none",
             force_reset_rng=True,
         )
-        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
-        cfg_container = Utils.pretrain_config_from_global_args(args, model_class)
+        cfg_container = get_run_config()
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
             model_cfg = cfg_container.model
@@ -312,7 +316,7 @@ class TestFP8Param:
                 pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
-        if getattr(args, "use_layer_wise_distributed_optimizer", False):
+        if cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
             assert has_param_layout == args.use_layer_wise_param_layout, (
                 "LayerWise test did not enter the requested parameter-layout path: "
@@ -388,7 +392,9 @@ class TestFP8Param:
         # the first successful optimizer step. CUDA-graph tests retain their existing capture-time
         # hook lifecycle, which handles this transition separately.
         first_iteration_pre_hook_disabled = (
-            not inference and not use_cuda_graph and should_disable_forward_pre_hook(args)
+            not inference
+            and not use_cuda_graph
+            and should_disable_forward_pre_hook(args, optimizer)
         )
         if first_iteration_pre_hook_disabled:
             disable_forward_pre_hook(gpt_model, param_sync=False)
@@ -410,7 +416,7 @@ class TestFP8Param:
                 # native-FP8 GTP shards are refreshed from masters (not stale grad scratch).
                 # Exercise it so the save-perturbation test is a real regression test for the
                 # post-save loss spike.
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     force_param_sync(gpt_model, optimizer=optimizer)
                 _ = gpt_model[0].sharded_state_dict()
 
@@ -418,10 +424,10 @@ class TestFP8Param:
             # Hard coded cuda_graph_warmup_steps = 0.
             cuda_graph_warmup_steps = 0
             if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
                 self.cuda_graph_helper.create_cudagraphs()
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     enable_forward_pre_hook(gpt_model)
                     self.cuda_graph_helper.cuda_graph_set_manual_hooks()
 
@@ -749,7 +755,7 @@ class TestFP8Param:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         model_parallel_cuda_manual_seed(_SEED)
-        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container = get_run_config()
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             ModelType.encoder_or_decoder,
             self.model_provider,
@@ -868,7 +874,9 @@ class TestFP8Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+            )
             assert iteration == 3
             loaded_state = self.quantized_param_state(model[0])
 
@@ -887,3 +895,95 @@ class TestFP8Param:
         assert (
             not mismatches
         ), "quantized params changed across a checkpoint round trip:\n" + "\n".join(mismatches)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("recipe", ["mxfp8", "tensorwise", "blockwise"])
+    def test_fp8_param_weights_only_load_stream_ckpt_dequant_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe
+    ):
+        """A weights-only load (optimizer=None, as inference does) must produce the same
+        quantized params with --stream-ckpt-dequant as with the upfront dequantize path.
+
+        The streaming path quantizes each param in place during the distributed checkpoint
+        load instead of dequantizing the whole state dict first, and hands `load_state_dict`
+        the quantized param itself. Compared bitwise on the element codes and on the
+        dequantized values, which must also match the values the saving run held.
+        """
+        if recipe == "mxfp8" and get_device_arch_version() < 10:
+            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        if recipe == "blockwise" and get_device_arch_version() != 9:
+            pytest.skip("blockwise is only supported on Hopper architecture")
+        # TE refuses to load a pickled extra state by default. This checkpoint is created by
+        # the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {
+            "overlap_param_gather": True,
+            "overlap_grad_reduce": True,
+            "reuse_grad_buf_for_mxfp8_param_ag": recipe == "mxfp8",
+        }
+        Utils.initialize_distributed()
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_fp8_ckpt_stream_dequant", sync=True
+        ) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, recipe, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=2)
+            force_param_sync(model, optimizer=optimizer)
+            saved_state = self.quantized_param_state(model[0])
+            save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            loaded_states = {}
+            for stream_ckpt_dequant in (False, True):
+                self.cleanup_between_runs()
+                # Build the model without loading (load=None), then load weights-only like
+                # `megatron.inference.utils.get_model_for_inference` does.
+                args, model, _, _ = self.setup_checkpoint_case(
+                    tp_size,
+                    recipe,
+                    None,
+                    no_load_optim=True,
+                    stream_ckpt_dequant=stream_ckpt_dequant,
+                    **kwargs,
+                )
+                args.load = str(ckpt_dir)
+                try:
+                    iteration, _ = load_checkpoint(model, None, None, strict=True)
+                except Exception:
+                    # A failure on one rank only leaves the other rank waiting in a collective
+                    # and pytest's report is never reached: print the traceback right away.
+                    print(
+                        f"[rank {Utils.rank}] load_checkpoint(stream_ckpt_dequant="
+                        f"{stream_ckpt_dequant}) failed:\n{traceback.format_exc()}",
+                        flush=True,
+                    )
+                    raise
+                assert iteration == 2
+                loaded_states[stream_ckpt_dequant] = self.quantized_param_state(model[0])
+
+        assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
+        upfront_state, stream_state = loaded_states[False], loaded_states[True]
+        assert saved_state.keys() == upfront_state.keys() == stream_state.keys()
+        mismatches = []
+        for name, upfront_tensors in upfront_state.items():
+            for attr, upfront_tensor in upfront_tensors.items():
+                stream_tensor = stream_state[name][attr]
+                num_differing = int((upfront_tensor != stream_tensor).sum())
+                if num_differing:
+                    mismatches.append(
+                        f"{name}{attr}: streaming differs from upfront in "
+                        f"{num_differing}/{upfront_tensor.numel()}"
+                    )
+            # The BF16 checkpoint round trip preserves the values (block scales may re-encode).
+            num_differing = int(
+                (stream_state[name]["dequantized"] != saved_state[name]["dequantized"]).sum()
+            )
+            if num_differing:
+                mismatches.append(f"{name}: values differ from the saved ones in {num_differing}")
+        if mismatches:
+            print(f"[rank {Utils.rank}] " + "\n".join(mismatches), flush=True)
+        assert not mismatches, "\n".join(mismatches)

@@ -82,6 +82,8 @@ def deterministic_mode():
         "NCCL_NVLS_ENABLE": "0",
         "NVTE_FUSED_ATTN": "0",
         "NCCL_ALGO": "^NVLS",
+        # Preserve expert token order before NCCL EP creates its process-wide group.
+        "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
         "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
         "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
     }
