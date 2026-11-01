@@ -206,3 +206,53 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+def _overlap_param_gather_ddp():
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer import TransformerConfig
+    from tests.unit_tests.test_utilities import TestModel
+
+    # The distributed-optimizer layout gathers straight into the DDP param buffer, so the
+    # forced sync below needs no optimizer.
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        bucket_size=None,
+    )
+    module = TestModel(
+        input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
+    ).bfloat16()
+    return DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=module
+    )
+
+
+def test_capture_resets_the_param_gather_dispatch_of_a_forced_sync():
+    """A force_param_sync before capture (checkpoint save, evaluation) must not leave the
+    captured forward pre-hooks with no all-gather to record."""
+    from megatron.core.full_cuda_graph import reset_param_gather_dispatch_for_capture
+
+    Utils.initialize_model_parallel()
+    try:
+        model = _overlap_param_gather_ddp()
+        model.start_param_sync(force_sync=True)  # what force_param_sync() does before a save
+        assert all(bg.param_gather_dispatched for bg in model.bucket_groups)
+
+        reset_param_gather_dispatch_for_capture([model])
+        assert not any(bg.param_gather_dispatched for bg in model.bucket_groups)
+
+        # Hooks disabled: the caller drives parameter sync, the state is left alone.
+        model.disable_forward_pre_hook(param_sync=True)
+        reset_param_gather_dispatch_for_capture([model])
+        assert all(bg.param_gather_dispatched for bg in model.bucket_groups)
+        model.enable_forward_pre_hook()
+
+        # The optimizer step dispatches the all-gather: left alone as well.
+        model.overlap_param_gather_with_optimizer_step = True
+        reset_param_gather_dispatch_for_capture([model])
+        assert all(bg.param_gather_dispatched for bg in model.bucket_groups)
+    finally:
+        Utils.destroy_model_parallel()

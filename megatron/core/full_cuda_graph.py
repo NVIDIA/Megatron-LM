@@ -239,6 +239,29 @@ def replay_iterator(data_iterator, batches, static_stage=None):
     return iter(batches)
 
 
+def reset_param_gather_dispatch_for_capture(model):
+    """Make the capture record every overlapped parameter all-gather.
+
+    With ``overlap_param_gather`` the DDP forward pre-hooks dispatch a bucket group's
+    all-gather only while it is marked undispatched; a capture records exactly what the hooks
+    do in that one step, and replays repeat it with no Python. An eager synchronization before
+    the capture (``force_param_sync`` ahead of a checkpoint save, or disabling the hooks around
+    evaluation) leaves every group marked dispatched, so the graph would gather nothing and
+    ranks would keep stale copies of the parameters they do not own on every later replay.
+    Reset that state for each model chunk whose hooks drive the all-gather.
+    """
+    for chunk in model if isinstance(model, list) else [model]:
+        if not getattr(chunk, "use_forward_hook", False):
+            continue
+        if not chunk.remove_forward_pre_hook_handles:
+            # Hooks disabled: the caller drives parameter sync itself.
+            continue
+        if chunk.overlap_param_gather_with_optimizer_step:
+            # The optimizer step dispatches the all-gather; the hooks only wait.
+            continue
+        chunk.reset_param_sync_dispatch_state()
+
+
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
 # maintains separate static buffers for training and validation CUDA graphs.
 class StaticBufferLoader:
@@ -351,6 +374,7 @@ class FullCudaGraphWrapper:
                     'if autograd nodes hold stale references to non-capturing streams. '
                     'Upgrade to a PyTorch build that includes pytorch/pytorch#180090.'
                 )
+            reset_param_gather_dispatch_for_capture(model)
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
