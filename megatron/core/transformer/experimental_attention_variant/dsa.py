@@ -20,7 +20,11 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
@@ -2119,6 +2123,7 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
@@ -2708,7 +2713,11 @@ class DSAttention(MegatronModule):
         )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        # forward() takes the context- and tensor-parallel layout from these groups, where None
+        # means that the axis is off, so an unset field must not read as None.
+        require_process_groups(pg_collection, ("tp", "cp"), owner=type(self).__name__)
         self.pg_collection = pg_collection
 
         self.indexer = None
@@ -2833,10 +2842,10 @@ class DSAttention(MegatronModule):
         sq, b, _, _ = query.size()
         local_sequence_rows = x.size(0)
 
-        cp_group = getattr(self.pg_collection, "cp", None)
+        cp_group = self.pg_collection.cp
         cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
-        tp_group = getattr(self.pg_collection, "tp", None)
+        tp_group = self.pg_collection.tp
         tp_size = get_pg_size(tp_group)
         sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
         sequence_parallel_tp_row_start = 0

@@ -740,7 +740,9 @@ class TestHybridBlock:
         model_parallel_cuda_manual_seed(123)
 
     def get_pg_collection(self):
-        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        return ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'pp', 'cp', 'embd']
+        )
 
     def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
         """Reject overlap before constructing any HybridModel submodule."""
@@ -763,7 +765,7 @@ class TestHybridBlock:
                 max_sequence_length=8,
                 hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-                    required_pgs=["tp", "pp", "cp", "dp_cp"]
+                    required_pgs=["tp", "pp", "cp", "dp_cp", "embd"]
                 ),
             )
 

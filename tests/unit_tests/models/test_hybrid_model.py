@@ -28,6 +28,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_observation import capture_tensor_observations
@@ -67,20 +68,22 @@ def test_hybrid_logging_process_groups_are_paired():
     tp_group = object()
     dp_cp_group = object()
 
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace()) == {}
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=dp_cp_group)) == {
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=None)) == {}
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group)) == {
         'tp_group': tp_group,
         'dp_cp_group': dp_cp_group,
     }
 
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(dp_cp=dp_cp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=None))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
+    # A field the collection never set reads as None through ProcessGroupCollection, so it must
+    # raise instead of passing for an axis that is off.
+    for groups in ({}, {'tp': tp_group}, {'dp_cp': dp_cp_group}):
+        with pytest.raises(ValueError, match="HybridModel requires pg_collection to set"):
+            _hybrid_logging_pg_kwargs(ProcessGroupCollection(**groups))
+
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=None))
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=dp_cp_group))
 
 
 @pytest.fixture
@@ -93,7 +96,7 @@ def config_list_model_boundary(monkeypatch):
     def init_language_module(model, config, pg_collection=None):
         torch.nn.Module.__init__(model)
         model.config = config
-        model.pg_collection = SimpleNamespace(pp=None)
+        model.pg_collection = SimpleNamespace(pp=None, tp=None, dp_cp=None)
 
     def allocation_reached(*args, **kwargs):
         raise AllocationReached()
@@ -257,6 +260,8 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         embd_group, _ = torch.distributed.new_subgroups_by_enumeration(
             embd_rank_groups, timeout=timedelta(minutes=30)
         )
+        if embd_group == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            embd_group = None
 
         # Create model with custom process groups
         from megatron.core.process_groups_config import ProcessGroupCollection
@@ -330,6 +335,7 @@ class TestHybridModel:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -402,6 +408,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern="-/M",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert model_config.tp_comm_overlap is True
@@ -423,6 +430,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern="-",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
     @pytest.mark.parametrize("mtp_num_layers", [0, 1, 3])
@@ -449,6 +457,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern="-/-/-",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_num_layers == mtp_num_layers
@@ -473,6 +482,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern=pattern,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_hsm is True
@@ -493,6 +503,7 @@ class TestHybridModel:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="-/-/-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert config.mtp_num_layers == 2
@@ -519,6 +530,7 @@ class TestHybridModel:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-/*",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         placement.assert_called_once()
@@ -688,6 +700,7 @@ class TestHybridModel:
             vocab_size=vocab_size,
             max_sequence_length=12,
             hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sequence_length = model.max_sequence_length
@@ -820,6 +833,7 @@ class TestHybridQKLayernorm:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def _get_attention_layer(self, model):
@@ -929,6 +943,7 @@ class TestHybridMLAQKLayernorm(TestHybridQKLayernorm):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M+-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def test_qk_l2_norm_from_config(self):
@@ -990,6 +1005,7 @@ class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="MD-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def test_qk_l2_norm_from_config(self):
@@ -1051,6 +1067,7 @@ class _MLAQKNormTestBase:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern=self.hybrid_layer_pattern,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def _get_mla_attention(self, model):
@@ -1326,6 +1343,7 @@ class TestMLADownProjFusion:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern=pattern,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def _get_layer_with_mla(self, model):
@@ -1470,7 +1488,8 @@ class TestHybridWithDynamicInference:
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
-            hybrid_layer_pattern="M*",  # 1 Mamba, 1 attention
+            hybrid_layer_pattern="M*",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),  # 1 Mamba, 1 attention
         )
         self.model = Float16Module(self.model.config, self.model)
 
@@ -1582,6 +1601,7 @@ class TestHybridModelWithYarn:
             hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
             position_embedding_type='yarn',
             rotary_base=10000,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
