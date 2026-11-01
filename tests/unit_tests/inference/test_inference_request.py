@@ -919,6 +919,24 @@ def test_offloaded_request_payload_and_serialize():
     assert torch.equal(vlm_payload.media_tensors["imgs"], imgs)
     assert vlm_payload.media_tensors["imgs"].device.type == "cpu"
 
+    class DeviceTensor:
+        """Stands in for a device tensor: .cpu() returns a distinct host copy."""
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return imgs
+
+    # The request gives up its device media for the payload's host copy, so a finished
+    # request kept alive while its payload is staged holds no device memory.
+    vlm_req = make_request()
+    vlm_req.media_tensors = {"imgs": DeviceTensor(), "num_tiles": None}
+    vlm_payload = OffloadedRequestPayload.from_request(vlm_req)
+    assert vlm_req.media_tensors == {"imgs": imgs}
+    assert vlm_payload.media_tensors == {"imgs": imgs}
+    assert vlm_payload.media_tensors is not vlm_req.media_tensors
+
     obj = req.serialize(payload_offloaded=True)
     assert obj["payload_offloaded"] is True
     assert obj["generated_log_probs"] is None
