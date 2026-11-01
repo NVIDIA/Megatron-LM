@@ -5,13 +5,17 @@ import torch
 from megatron.core import parallel_state
 
 
-def clip_qk(model, log_max_only=False) -> float:
+def clip_qk(model, log_max_only=False, *, dp_cp_group=None) -> float:
     """
     Clips QK attention logits to prevent numerical instability.
 
     Args:
         model (List[MegatronModule]): Model chunks containing attention layers.
         log_max_only (bool): If True, only computes max logit without clipping.
+        dp_cp_group (torch.distributed.ProcessGroup, optional): Group over which the maximum
+            logits are reduced: the model's data- and context-parallel group including its
+            GTP-remat peers (``pg_collection.dp_cp_gtp_remat``). Defaults to the global
+            ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
 
     Returns:
         float: The maximum QK logit value across all chunks.
@@ -27,10 +31,15 @@ def clip_qk(model, log_max_only=False) -> float:
                         is None
                     ):
                         continue
+                    if dp_cp_group is None:
+                        # Migration fallback for callers that do not pass the model's group.
+                        dp_cp_group = parallel_state.get_data_parallel_group(
+                            with_context_parallel=True
+                        )
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                        group=dp_cp_group,
                     )
                     log_max_attention_logit = max(
                         log_max_attention_logit,
