@@ -197,7 +197,18 @@ class AbsorbedMLASelfAttention(Attention):
         self.qkv_up_checkpoint = None
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
-        self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
+        # Must match MultiLatentAttention's softmax_scale exactly (this class is documented as
+        # mathematically equivalent to it): an explicit config.softmax_scale override -- e.g. the
+        # one TransformerConfig.__post_init__ derives for muP training -- was silently dropped here.
+        self.softmax_scale = (
+            mscale
+            * mscale
+            * (
+                (1 / math.sqrt(self.q_head_dim))
+                if self.config.softmax_scale is None
+                else self.config.softmax_scale
+            )
+        )
         self.cache_mla_latents = self.config.cache_mla_latents
         assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
 
