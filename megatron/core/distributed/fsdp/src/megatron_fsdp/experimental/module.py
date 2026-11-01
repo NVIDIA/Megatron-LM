@@ -286,7 +286,11 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        if context.is_recording_execution_order and not is_recomputing:
+            context.forward_order.append(cast(nn.Module, self))
+        self.unshard(
+            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
+        )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -414,19 +418,21 @@ class FsdpModule:
         # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
         # hook fires once after both uses contribute, so our post_backward() has not
         # reset BACKWARD when depth 1 enters.
-        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # TODO: Separate post_backward (phase/weight release) from post_accumulate_grad
+        # (gradient reduction): https://github.com/NVIDIA/Megatron-LM/pull/7902
+        # For invocations with gradient-requiring inputs:
         # In shared MTP, post_backward would run twice (once per depth), resetting
         # the phase after each invocation. Depth 1 could then enter from RESTING
-        # and gather its weights normally, without this guard. grads_ready would
+        # and gather its weights normally, without this guard. post_accumulate_grad would
         # run once, after both depths' local gradient contributions have accumulated,
         # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
-        # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
             return
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
+        if context.is_recording_execution_order:
+            context.backward_order.append(cast(nn.Module, self))
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
@@ -439,7 +445,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(Phase.BACKWARD, prefetch=True)
+        self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

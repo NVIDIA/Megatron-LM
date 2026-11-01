@@ -18,6 +18,7 @@ from torch.distributed.tensor import Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
     fully_shard,
@@ -84,6 +85,48 @@ class NestedSiblingModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_recorded_execution_order(distributed_setup):
+    """Recorded orders follow execution when submodules are registered in reverse."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.second(self.first(x))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = Model().to(device)
+    unsharded_weights = {layer: layer.weight for layer in model.children()}
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    assert context.is_recording_execution_order
+    model(inputs).sum().backward()
+    assert not context.is_recording_execution_order
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
+
+    def check_prefetched(layer, _args):
+        storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
+        assert storage_bytes > 0
+
+    for layer in model.children():
+        # Check before FSDP's own hooks, so on-demand unsharding cannot satisfy the assertion.
+        layer.register_forward_pre_hook(check_prefetched, prepend=True)
+        layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
+    model.zero_grad(set_to_none=True)
+    model(inputs).sum().backward()
 
 
 @pytest.mark.parametrize("unify_communication_stream", [False, True])
