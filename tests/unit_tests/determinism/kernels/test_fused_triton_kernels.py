@@ -6,9 +6,12 @@
   unique stores -- replay and agree with the torch reference.
 * ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
   ``Tensor.contiguous`` on row-strided views.
+* ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
+  agree bit for bit with the two unfused adds it replaces.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
-  ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
-  autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
+  ``triton.autotune``; forward and backward replay in sbhd and thd layouts (the query kernels in
+  both RoPE output layouts), at a head count the autotuned ``BLOCK_H`` divides and at one it does
+  not, plus a check that the result does not
   depend on ``BLOCK_H`` at all -- a replay cannot see that, because Triton caches the config the
   first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
@@ -20,10 +23,12 @@ import contextlib
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
@@ -123,6 +128,61 @@ def test_csa_teacher_lse_replays():
     assert torch.isfinite(outputs["out"]).all()
 
 
+def test_dsa_weights_projection_replays():
+    """Replay the DSA weights projection GEMM dispatch under stream contention."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        _dsa_weights_proj_forward_gemm,
+    )
+
+    seeded()
+    x = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+
+    outputs, _ = assert_replays_bit_exact(
+        lambda hidden, proj_weight: _dsa_weights_proj_forward_gemm(hidden, proj_weight, None)[0],
+        (x, weight),
+        backward=False,
+        contention=True,
+        what="DSA weights projection",
+    )
+    assert outputs["out"].dtype == torch.float32
+
+
+def test_dsa_kpool_chunked_selection_replays(monkeypatch):
+    """Replay the fixed-memory KPool score and top-k path across query chunks."""
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    monkeypatch.setattr(dsa, "_KPOOL_SCORE_CHUNK_BYTES", 128)
+    q = torch.randn(9, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(16, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(9, 1, 2, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(4, 8, device="cuda")
+
+    def run(query, key, head_weights, gate_score, positional_bias):
+        _, topk = dsa.fused_qk_topk_kpool(
+            query,
+            key,
+            head_weights,
+            index_topk=8,
+            pool_size=4,
+            gate_score=gate_score,
+            ape=positional_bias,
+            rotate_activation_enabled=False,
+            return_index_scores=False,
+        )
+        return topk
+
+    assert_replays_bit_exact(
+        run,
+        (q, k, weights, gate, ape),
+        backward=False,
+        contention=True,
+        what="DSA KPool chunked selection",
+    )
+
+
 def _topk_routing_map(num_tokens, num_experts, topk):
     logits = torch.randn(num_tokens, num_experts, device="cuda")
     idx = logits.topk(topk, dim=-1).indices
@@ -194,6 +254,33 @@ def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
     assert bytes_equal(outputs["out"], view.detach().contiguous())
 
 
+# --- MoE output residual add ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_moe_residual_add_replays_and_matches_unfused_adds(dtype):
+    seeded()
+    # 4097 x 1024 elements: the last program covers a partial block.
+    shape = (4097, 1, 1024)
+    inputs = tuple(
+        torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True) for _ in range(3)
+    )
+    grad_output = torch.randn(shape, device="cuda", dtype=dtype)
+    outputs, grads = assert_replays_bit_exact(
+        fused_moe_residual_add,
+        inputs,
+        grad_outputs={"out": grad_output},
+        contention=True,
+        what="fused_moe_residual_add",
+    )
+    expert_output, shared_expert_output, residual = inputs
+    with torch.no_grad():
+        reference = residual + (expert_output + shared_expert_output)
+    assert bytes_equal(outputs["out"], reference)
+    assert len(grads) == 3
+    assert all(bytes_equal(grad, grad_output) for grad in grads.values())
+
+
 # --- MLA YaRN RoPE --------------------------------------------------------------------------
 
 
@@ -239,7 +326,8 @@ def _pinned_block_h(block_h):
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
 @pytest.mark.parametrize("heads", [32, 12])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
+@pytest.mark.parametrize("remove_interleaving", [False, True])
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interleaving):
     seeded()
     nope_dim, emb_dim = 128, 64
     dtype = torch.bfloat16
@@ -257,9 +345,23 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     fn = fused_mla_rope_out_of_place if variant == "out_of_place" else fused_mla_rope_inplace
 
     def run(t):
-        return fn(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+        return fn(
+            t,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=cu_seqlens,
+            remove_interleaving=remove_interleaving,
+        )
 
-    assert_replays_bit_exact(run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]")
+    outputs, _ = assert_replays_bit_exact(
+        run,
+        (t,),
+        replays=3,
+        what=f"fused_mla_rope_{variant}[{layout}, remove_interleaving={remove_interleaving}]",
+    )
+    assert torch.isfinite(outputs["out"]).all()
 
 
 # Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the
@@ -395,6 +497,35 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
     )
 
 
+@pytest.mark.parametrize("compile_cache_limit", [1, 8])
+def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compile_cache_limit):
+    """Checkpointing must reuse the forward arithmetic even after compiler fallback."""
+    from megatron.core.transformer.hyper_connection import native_sinkhorn
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(cache_size_limit=compile_cache_limit):
+            seeded()
+            logits = _mhc_rand(8, 2, 4, 4, dtype=torch.float32)
+            grad_output = torch.randn_like(logits)
+
+            def run(x):
+                # Mapping operations produce logits with requires_grad=False in the
+                # checkpoint's no-grad forward, unlike the original forward.
+                return native_sinkhorn(x * 1.0, 20, 1e-6)
+
+            expected = run(logits)
+            # At limit=1, this backward hits the recompile limit for a new grad-mode guard.
+            expected.backward(grad_output)
+            replay_logits = logits.detach().clone().requires_grad_(True)
+            actual = checkpoint(run, replay_logits, use_reentrant=True)
+            assert bytes_equal(actual, expected)
+            actual.backward(grad_output)
+            assert bytes_equal(replay_logits.grad, logits.grad)
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
@@ -507,4 +638,53 @@ def test_contiguous_thd_rope_and_teacher_replay():
         backward=False,
         contention=True,
         what="packed CSA teacher",
+    )
+
+
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
+    """Native mHC reductions and FP32 mapping projections replay bit-exactly."""
+    from megatron.core.transformer.hyper_connection import (
+        _proj_rms_impl,
+        native_h_aggregate,
+        native_h_post_bda,
+        native_proj_rms,
+    )
+
+    seeded()
+    s, b, n, c = 128, 2, 4, 128
+    x = _mhc_rand(s, b, n, c)
+    h_pre = _mhc_rand(s, b, n)
+    assert_replays_bit_exact(
+        native_h_aggregate, (x, h_pre), replays=3, what="native mHC h_aggregate"
+    )
+
+    h_res = _mhc_rand(s, b, n, n)
+    original_residual = _mhc_rand(s, b, n, c)
+    h_post = _mhc_rand(s, b, n)
+    x_single = _mhc_rand(s, b, c)
+    bias = _mhc_rand(c)
+    assert_replays_bit_exact(
+        lambda h_res, residual, h_post, x, bias: native_h_post_bda(
+            h_res, residual, h_post, x, bias
+        ),
+        (h_res, original_residual, h_post, x_single, bias),
+        replays=3,
+        what="native mHC h_post_bda",
+    )
+
+    projection_input = _mhc_rand(s * b, n * c, dtype=torch.float32)
+    projection_weight = _mhc_rand(n * n + 2 * n, n * c, dtype=torch.float32)
+    assert_replays_bit_exact(
+        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input, projection_weight),
+        replays=3,
+        what="native mHC proj_rms",
+    )
+    # The module uses eager FP32 projection for both the no-grad forward and replay.
+    assert_replays_bit_exact(
+        lambda x, weight: _proj_rms_impl(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input.to(torch.bfloat16).detach().requires_grad_(True), projection_weight),
+        replays=3,
+        what="eager mHC proj_rms with BF16 saved input",
     )

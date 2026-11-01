@@ -90,6 +90,41 @@ def test_nixl_accepts_matching_variant_with_vram_support(monkeypatch):
     nixl_mod._validate_nixl_cuda_support(FakeAgent(), _FakeCudaBuffer())
 
 
+def test_nixl_start_failure_exposes_pollable_cleanup():
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def get_xfer_descs(self, values, mem_type):
+            return values
+
+        def initialize_xfer(self, *_args):
+            return object()
+
+        def transfer(self, _xfer):
+            raise RuntimeError("failed")
+
+    backend = object.__new__(nixl_mod.NixlTransferBackend)
+    backend._agent = FakeAgent()
+    backend._ensure_peer_registered = lambda _meta: "peer"
+    backend._bytes_per_slice = 16
+    backend._outer_stride_bytes = 64
+    backend._buf_ptr = 1024
+    backend._device_id = 0
+
+    with pytest.raises(base.TransferStartError) as error:
+        backend._begin_transfer(
+            {"base_addr": 2048, "device_id": 0, "bytes_per_slice": 16, "outer_stride_bytes": 64},
+            [1],
+            [2],
+            0,
+            0,
+            1,
+        )
+
+    assert len(error.value.cleanup_handles) == 1
+    assert not error.value.storage_safe
+
+
 def test_backend_registry_selects_by_explicit_name():
     assert base.construct_kv_transfer_backend_class("nixl").name == "nixl"
 
@@ -133,6 +168,39 @@ def test_ssm_geometry_uses_conv_and_recurrent_state_names():
             ssm_layout=layout,
             ssm_state_kind="ssm",
         )
+
+
+def test_kv_geometry_exports_layout_when_tp_replicates_kv_heads():
+    """TP4 over 2 KV heads: each rank caches one replicated head. The layout
+    must still be exported so every rank advertises the same KV geometry."""
+    from megatron.core.inference.disaggregation.coordinator_runtime import (
+        _instance_transfer_signature,
+    )
+
+    num_layers, num_heads, tp_size, head_dim, tokens, blocks = 2, 2, 4, 4, 3, 5
+    metas = []
+    for tp_rank in range(tp_size):
+        geometry = base.compute_buffer_geometry(
+            torch.zeros(2, num_layers, blocks, tokens, 1, head_dim),
+            expected_num_blocks=blocks,
+            backend_name="test",
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            num_kv_heads_global=num_heads,
+            heads_per_partition=1,
+            head_dim=head_dim,
+            tokens_per_block=tokens,
+            global_rank=tp_rank,
+            pp_size=1,
+            pp_rank=0,
+            num_layers_global=num_layers,
+            layer_start=0,
+            layer_end=num_layers,
+        )
+        assert geometry.layout.head_range() == (tp_rank // 2, tp_rank // 2 + 1)
+        metas.append(base.export_geometry_meta(geometry))
+
+    _instance_transfer_signature(metas)
 
 
 def test_ssm_geometry_uses_explicit_live_slot_axis():

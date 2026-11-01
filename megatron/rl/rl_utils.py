@@ -51,9 +51,11 @@ from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_S
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
+    create_unified_mempool,
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
@@ -62,7 +64,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding import prepare_swap_model_weights, swap_model_weights
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -96,6 +98,7 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
@@ -122,6 +125,7 @@ from megatron.training.global_vars import (
     get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
+    get_train_state,
     get_wandb_writer,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
@@ -138,6 +142,40 @@ _GLOBAL_PACKING_CONTEXT = None
 # Track whether the inference model is currently paused (offloaded to CPU).
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
+
+
+def inference_model_alloc_context():
+    """Return the allocation context for a separate RL inference model."""
+    rl_config = get_run_config().rl
+    uvm_level = rl_config.rl_inference_model_unified_memory_level
+    if rl_config.rl_offload_inference_model_weights and uvm_level == 0 and HAVE_TORCH_MEMORY_SAVER:
+        return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
+    if uvm_level and uvm_level > 0:
+        return torch.cuda.use_mem_pool(create_unified_mempool())
+    return nullcontext()
+
+
+def refit_inference_model(model, inference_model, args) -> int:
+    """Copy training weights and return the number of destination pools."""
+
+    rl_config = get_run_config().rl
+    num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
+    prepare_swap_model_weights(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
+        execution_batch_bytes=rl_config.refit_execution_batch_bytes,
+    )
+    swap_model_weights(
+        model,
+        inference_model,
+        rl_config.refit_method,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
+        execution_batch_bytes=rl_config.refit_execution_batch_bytes,
+    )
+    return num_dst_pools
 
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
@@ -366,8 +404,7 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         # Persistent ledger of per-request metadata (e.g. staleness stats).
         self.request_ledger = {}
-        self.sequences_this_iteration_on_rank = 0
-        self.latest_batch_num_sequences = 0
+        self.consumed_train_bins = 0
         # Durable rollout-bank state (rank 0 only). Recovered groups live on the
         # rollout agent, which treats them as per-environment producers.
         self.rollout_bank = None
@@ -389,17 +426,11 @@ class RLRuntimeState:
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
-        self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
         self.tokens_per_sec = None
         self.compute_tokens_per_sec = None
         self.actual_tokens_per_sec = None
         self.packing_efficiency = None
-
-    def increment_sequences(self, count):
-        """Increment the sequence counter."""
-        self.sequences_this_iteration_on_rank += count
-        self.latest_batch_num_sequences = count
 
 
 # Global runtime state instance
@@ -797,6 +828,7 @@ def colocated_inference(
     """
     args = get_args()
     cfg = get_run_config()
+    train_state = get_train_state()
     nvtx_range = get_nvtx_range()
 
     if cfg.rl.rl_offload_optimizer_during_inference:
@@ -818,13 +850,8 @@ def colocated_inference(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        swap_model_weights(
-            model,
-            inference_model,
-            cfg.rl.refit_method,
-            execution_batch_bytes=cfg.rl.refit_execution_batch_bytes,
-        )
-        if cfg.rl.rl_verify_model_weights_swap:
+        num_dst_pools = refit_inference_model(model, inference_model, args)
+        if cfg.rl.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
@@ -853,7 +880,7 @@ def colocated_inference(
             if bank is not None:
                 agent = _get_or_create_rollout_agent(cfg.rl.langrl_env_config)
                 if not runtime_state.bank_restored:
-                    restored_groups: GroupedRollouts = bank.recover(args.iteration)
+                    restored_groups: GroupedRollouts = bank.recover(train_state.resume_iteration)
                     total_restored_groups = agent.set_restored_groups(restored_groups)
                     runtime_state.bank_restored = True
                     if total_restored_groups:
@@ -861,9 +888,9 @@ def colocated_inference(
                             logger,
                             logging.INFO,
                             f"RolloutBank restored {total_restored_groups} completed groups from "
-                            f"disk at resume iteration {args.iteration}",
+                            f"disk at resume iteration {train_state.resume_iteration}",
                         )
-                bank.set_collection(args.curr_iteration)
+                bank.set_collection(train_state.iteration)
 
             with nvtx_range("rl/inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
@@ -882,7 +909,7 @@ def colocated_inference(
                     consumption_granularity=cfg.rl.rl_consumption_granularity,
                     generation_lag=inference_interface.generation_lag,
                     env_config_path=cfg.rl.langrl_env_config,
-                    current_iteration=args.curr_iteration,
+                    current_iteration=train_state.iteration,
                 )
 
             # NOTE(jbarker): we need to double check this when using PP>1
@@ -892,7 +919,7 @@ def colocated_inference(
                     log_single_rank(
                         logger,
                         logging.INFO,
-                        f"Collecting rollouts, Iteration {args.curr_iteration}...",
+                        f"Collecting rollouts, Iteration {train_state.iteration}...",
                     )
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
@@ -904,7 +931,7 @@ def colocated_inference(
                     # these; once a checkpoint includes the update they are pruned.
                     if bank is not None:
                         bank.mark_consumed_many(
-                            (group.uid for group in rollouts), args.curr_iteration + 1
+                            (group.uid for group in rollouts), train_state.iteration + 1
                         )
                 else:
                     # Just set up space to collect the rollouts
@@ -939,6 +966,7 @@ def get_environment_rollouts(
     """
     args = get_args()
     cfg = get_run_config()
+    train_state = get_train_state()
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
 
@@ -953,7 +981,7 @@ def get_environment_rollouts(
             logger,
             logging.INFO,
             f"Consuming {n_prompts} buffered rollout groups without inference, "
-            f"Iteration {args.curr_iteration}...",
+            f"Iteration {train_state.iteration}...",
         )
         loop = get_asyncio_loop()
         rollouts = [
@@ -981,7 +1009,7 @@ def get_environment_rollouts(
         if rank == get_pg_rank(inference_pg_collection.tp):
             with open(
                 lang_rl_log_dir
-                + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
+                + f'/rollouts_rank{rank}_iteration{train_state.iteration}_'
                 + f'{Path(cfg.rl.langrl_env_config).stem}.json',
                 'w',
             ) as f:
@@ -1032,6 +1060,145 @@ def selective_log_softmax(logits, index):
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
     return per_token_logps
+
+
+def _vp_chunk_tokens(partition_vocab_size: int, target_bytes: int = 512 * 2**20) -> int:
+    """Derive tokens-per-chunk so that the buffers' memory-usage stays bounded."""
+    return max(1, target_bytes // 2 // (partition_vocab_size * 4))
+
+
+class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
+    """`selective_log_softmax` over vocab-parallel (TP-sharded) logits."""
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_tokens, out_dtype):
+        """See `vocab_parallel_selective_log_softmax` for the contract."""
+        orig_shape = target.shape
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        target_1d = target.reshape(-1)
+
+        if tp_group is not None and torch.distributed.is_initialized():
+            tp_rank = torch.distributed.get_rank(tp_group)
+            tp_world = torch.distributed.get_world_size(tp_group)
+        else:
+            tp_rank, tp_world = 0, 1
+
+        # Same partition convention as the vocab-parallel output layer
+        # (VocabUtility.vocab_range_from_per_partition_vocab_size).
+        vocab_start = tp_rank * partition_vocab_size
+        vocab_end = vocab_start + partition_vocab_size
+
+        target_mask = (target_1d < vocab_start) | (target_1d >= vocab_end)
+        masked_target = (target_1d - vocab_start).masked_fill(target_mask, 0)
+
+        n = logits_2d.size(0)
+        chunk = chunk_tokens or _vp_chunk_tokens(partition_vocab_size)
+        # local_lse[i]: this rank's log-sum-exp over its own vocab partition for row i
+        #   (the local log_softmax normalizer). Recovered from log_softmax's output,
+        #   since log_softmax(x)_c = x_c - lse(x) for every column c.
+        #   Read at c = argmax: there the kernel's own value is exactly -log(sum(exp(x - max))),
+        #   so the recovery is max + log(sum) with a single rounding, and a -inf
+        #   logit elsewhere in the row cannot turn it into NaN.
+        # raw_target_logit[i]: logit[i, target] in fp32, nonzero only on the rank that
+        #   owns the target id (masked, same convention as the pre-log_softmax design).
+        local_lse = torch.empty(n, dtype=torch.float32, device=logits_2d.device)
+        raw_target_logit = torch.empty(n, dtype=torch.float32, device=logits_2d.device)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            # copy=True: `.float()` would alias (and log_softmax writing through
+            # that alias would corrupt) the saved logits when input is already fp32.
+            chunk_fp32 = logits_2d[s:e].to(torch.float32, copy=True)
+            row_log_softmax = torch.nn.functional.log_softmax(chunk_fp32, dim=-1)
+            row_max, row_argmax = chunk_fp32.max(dim=-1, keepdim=True)
+            local_lse[s:e] = (row_max - row_log_softmax.gather(-1, row_argmax)).squeeze(-1)
+            raw_target_logit[s:e] = chunk_fp32.gather(
+                -1, masked_target[s:e].unsqueeze(-1)
+            ).squeeze(-1)
+        raw_target_logit.masked_fill_(target_mask, 0.0)
+
+        # global_lse = logsumexp_r(local_lse_r)
+        if tp_world > 1:
+            # All gather LSE and logits across ranks.
+            local_stats = torch.stack([local_lse, raw_target_logit])  # [2, n]
+            gathered = torch.empty(
+                tp_world * local_stats.numel(), dtype=torch.float32, device=local_stats.device
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local_stats.view(-1), group=tp_group)
+            rank_lse, rank_target = gathered.view(tp_world, 2, n).unbind(1)  # [tp_world, n] each
+            # Local calculations.
+            rank_max = rank_lse.amax(dim=0)
+            total = torch.zeros_like(rank_max)
+            target_logit = torch.zeros_like(rank_max)
+            # Loop bounded by TP; launch latency is hidden in CUDA graphs.
+            for r in range(tp_world):
+                total += (rank_lse[r] - rank_max).exp()
+                target_logit += rank_target[r]  # one nonzero term per row: the owner's logit
+            global_lse = rank_max + total.log()
+        else:
+            global_lse = local_lse
+            target_logit = raw_target_logit
+
+        # log p(target) = logit[target] - logsumexp(logits)
+        logprobs = target_logit - global_lse
+
+        ctx.save_for_backward(vocab_parallel_logits, global_lse, target_mask, masked_target)
+        ctx.vp_chunk = chunk
+        return logprobs.view(orig_shape).to(out_dtype)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        """d log p(target) / d logit_j = (1 if j == target else 0) - softmax_j."""
+        vocab_parallel_logits, global_lse, target_mask, masked_target = ctx.saved_tensors
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.reshape(-1, partition_vocab_size)
+        n = logits_2d.size(0)
+
+        grad_out_1d = grad_output.reshape(-1).float()
+        grad_input = torch.empty_like(vocab_parallel_logits)
+        grad_2d = grad_input.reshape(-1, partition_vocab_size)
+
+        chunk = ctx.vp_chunk
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            go = grad_out_1d[s:e]
+            # softmax_j = exp(logit_j - global_lse) (global_lse is TP-global);
+            # grad_j = go * delta_{j==target} - go * softmax_j.
+            sm = logits_2d[s:e].to(torch.float32, copy=True)
+            sm.sub_(global_lse[s:e].unsqueeze(-1)).exp_().mul_(go.unsqueeze(-1)).neg_()
+            # One-hot term via fixed-size arange + masked grad: no torch.nonzero,
+            # so no device-host sync (CUDA-graph-capture-safe).
+            arange = torch.arange(e - s, device=sm.device)
+            sm[arange, masked_target[s:e]] += go * (~target_mask[s:e]).to(go.dtype)
+            grad_2d[s:e] = sm.to(grad_input.dtype)
+        return grad_input, None, None, None, None
+
+
+def vocab_parallel_selective_log_softmax(
+    vocab_parallel_logits,
+    index,
+    tp_group=None,
+    chunk_tokens=None
+):
+    """Vocab-parallel, sequence-chunked drop-in for `selective_log_softmax`.
+
+    Args:
+        vocab_parallel_logits: [..., vocab/tp] logits sharded over the TP group.
+            Rank `r` owns rows `[r * Vp, (r + 1) * Vp]`.
+        index: target token ids.
+        tp_group: process group over which the vocab dimension is sharded.
+        chunk_tokens: tokens per chunk; used to restrict size of the temporary buffers.
+
+    Returns:
+        Logprobs with the same shape as `index`; fp32 under `--batch-invariant-mode`,
+        otherwise the dtype of `vocab_parallel_logits`.
+    """
+    # Same dtype contract as selective_log_softmax; compute_logprobs_batch asserts it.
+    out_dtype = torch.float32 if is_batch_invariant_mode_enabled() else vocab_parallel_logits.dtype
+    return _VocabParallelSelectiveLogProbs.apply(
+        vocab_parallel_logits, index, tp_group, chunk_tokens, out_dtype
+    )
 
 
 @dataclass
@@ -1209,6 +1376,8 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             set_model_config_attribute(model, "flash_decode", False)
             fp32_output = not (args.fp16 or args.bf16)
 
+            # Keep the logits TP-sharded and compute logprobs without gathering the full vocab.
+
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 tokens_in, position_ids_in, packed_seq_params_in, local_labels, cp_scatter = (
@@ -1227,7 +1396,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     position_ids_in,
                     attention_mask_for_forward,
                     packed_seq_params=packed_seq_params_in,
-                    runtime_gather_output=True,
+                    runtime_gather_output=False,
                     fp32_output=fp32_output,
                 )
 
@@ -1239,9 +1408,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logits_or_hidden_states
 
         logits = logits_or_hidden_states
+        tp_group = pg_collection.tp
         with nvtx_range("rl/log-softmax", time=True):
             if cp_size > 1:
-                local_logprobs = selective_log_softmax(logits, local_labels)
+                local_logprobs = vocab_parallel_selective_log_softmax(
+                    logits, local_labels, tp_group
+                )
                 # Differentiable all-gather so training pass can backprop through the reassembly.
                 # With no-grad, this acts as a plain all_gather.
                 gathered = torch.distributed.nn.functional.all_gather(
@@ -1252,7 +1424,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 logprobs = full[:, :-1]
             else:
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                logprobs = vocab_parallel_selective_log_softmax(
+                    logits[:, :-1, :], tokens[:, 1:], tp_group
+                )
         return logprobs
 
 
@@ -1542,7 +1716,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:
@@ -2403,7 +2577,7 @@ def prepare_data_for_update(
         rollouts = [r for g in rollouts for r in g]
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = args.global_batch_size / cfg.rl.grpo_samples_per_iteration
+        samples_ratio_per_step = cfg.train.global_batch_size / cfg.rl.grpo_samples_per_iteration
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         # Build training rows. A rollout collapses to one combined row when its turns form a
@@ -2431,7 +2605,7 @@ def prepare_data_for_update(
         # The rollout count is data-dependent (oversampling, group filtering), so it need not
         # divide evenly across ranks and microbatches. Pad to the next multiple of
         # (DP size * micro_batch_size) with inert rows (zero advantage, no loss contribution).
-        pad_to_multiple = data_parallel_world_size * args.micro_batch_size
+        pad_to_multiple = data_parallel_world_size * cfg.train.micro_batch_size
         if pad_n := -len(rows) % pad_to_multiple:
             rows = rows + [PAD_ROW] * pad_n
             advantages = global_advantages = torch.cat(
@@ -2504,9 +2678,9 @@ def prepare_data_for_update(
                 compute_position_ids = original_position_ids
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=args.micro_batch_size,
+                    batch_size=cfg.train.micro_batch_size,
                 )
-                logprobs_batch_size = args.micro_batch_size
+                logprobs_batch_size = cfg.train.micro_batch_size
 
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
@@ -2615,11 +2789,11 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size,
-                    micro_batch_size=args.micro_batch_size,
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+                    global_batch_size=cfg.train.global_batch_size,
+                    micro_batch_size=cfg.train.micro_batch_size,
+                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
                )
-                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
+                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), cfg.train.micro_batch_size)
         else:
             with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
@@ -2642,8 +2816,8 @@ def prepare_data_for_update(
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
                     global_batch_size=math.ceil(samples_ratio_per_step*total_rows),
-                    micro_batch_size=args.micro_batch_size,
-                    decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+                    micro_batch_size=cfg.train.micro_batch_size,
+                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
@@ -2660,7 +2834,7 @@ def prepare_data_for_update(
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
-                loader = DataLoader(data, batch_size=args.micro_batch_size)
+                loader = DataLoader(data, batch_size=cfg.train.micro_batch_size)
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
@@ -2759,7 +2933,6 @@ def get_grpo_data_iterator(
 
 
 def evaluate_and_print_results_rl(
-    data_iterator: Iterator[TensorDataset],
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     iteration: int,
@@ -2769,7 +2942,6 @@ def evaluate_and_print_results_rl(
     """Helper function to evaluate and dump results on screen.
 
     Args:
-        data_iterator: Iterator over batches of evaluation dataset.
         model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
@@ -2778,6 +2950,7 @@ def evaluate_and_print_results_rl(
     """
     args = get_args()
     cfg = get_run_config()
+    train_state = get_train_state()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
     # megatron-lm uses forward_step_func to do the above.
@@ -2858,7 +3031,7 @@ def evaluate_and_print_results_rl(
                         tb_writer.add_scalar(k, v, iteration)
             wandb_writer = get_wandb_writer()
             if wandb_writer:
-                if args.do_train:
+                if train_state.do_train:
                     wandb_writer.log(eval_metrics, step=iteration)
                 else:
                     # Without a training loop the eval may target an arbitrary (older) checkpoint,
@@ -2877,11 +3050,73 @@ def evaluate_and_print_results_rl(
             if lang_rl_log_dir:
                 with open(
                     lang_rl_log_dir
-                    + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
+                    + f'/eval_rank{rank}_iteration{iteration}_'
                     + f'{Path(cfg.rl.langrl_env_config).stem}.json',
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
+
+
+def next_rollout_iterator(
+    iteration: int,
+    current_iterator: Any,
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    ref_state_dict: Optional[dict],
+    rl_config: Any,
+    train_config: Any,
+) -> Any:
+    """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    if optimizer is None:
+        # Release stale CUDA cached memory before inference.
+        torch.cuda.empty_cache()
+    with torch.no_grad():
+        return get_grpo_data_iterator(
+            model,
+            inference_model,
+            optimizer,
+            iteration,
+            ref_state_dict,
+            grpo_iterations=rl_config.grpo_iterations,
+            grpo_prompts_per_step=rl_config.grpo_prompts_per_step,
+            grpo_group_size=rl_config.grpo_group_size,
+            global_batch_size=train_config.global_batch_size,
+            sequence_packing=rl_config.rl_use_sequence_packing,
+            buffered_rollouts=current_iterator,
+            is_correction=rl_config.rl_inference_logprobs_is_correction,
+            optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+        )
+
+
+def evaluate_rollouts(
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    prefix: str,
+    iteration: int,
+    verbose: bool,
+    write_to_tensorboard: bool,
+) -> None:
+    """Run the RL evaluation rollouts, on the separate inference model when there is one."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    eval_model, training_model = model, None
+    if inference_model is not None:
+        # Swap the training weights onto the inference model first.
+        inf_core = unwrap_model(inference_model[0])
+        _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        refit_inference_model(model, inference_model, get_args())
+        eval_model, training_model = inference_model, model
+    evaluate_and_print_results_rl(
+        eval_model,
+        optimizer,
+        iteration,
+        write_to_tensorboard=write_to_tensorboard,
+        training_model=training_model,
+    )
 
 
 def calculate_grpo_loss(
@@ -3002,6 +3237,7 @@ def megatron_rl_inference_mode(
     """
     args = get_args()
     cfg = get_run_config()
+    train_state = get_train_state()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
@@ -3017,6 +3253,9 @@ def megatron_rl_inference_mode(
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+    training_lang_module = (
+        unwrap_model(training_model[0]) if training_model is not None else lang_module
+    )
 
     # Switch MoE layers to full CUDA graph capture for inference
     if cfg.rl.rl_training_cuda_graphs and args.num_experts is not None:
@@ -3040,13 +3279,14 @@ def megatron_rl_inference_mode(
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
-
-    rotary_module = getattr(lang_module, "rotary_pos_emb", None)
-    # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
-    # as it tries to reuse frequences tensors cached in inference mode.
-    has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
-    if has_lru_cache:
-        rotary_module.forward.cache_clear()
+    rotary_modules = (
+        getattr(lang_module, "rotary_pos_emb", None),
+        getattr(training_lang_module, "rotary_pos_emb", None),
+    )
+    # Release ordinary embeddings while retaining constants used by live CUDA graphs.
+    for rotary_module in rotary_modules:
+        if isinstance(rotary_module, RotaryEmbedding):
+            rotary_module.clear_cache()
 
     with torch.no_grad():
 
@@ -3054,11 +3294,14 @@ def megatron_rl_inference_mode(
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not cfg.rl.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
-                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload = (
+                            training_model if training_model is not None else model
+                        )
                         model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                    )
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
@@ -3066,7 +3309,7 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-        inference_interface.set_generation_epoch(get_args().curr_iteration)
+        inference_interface.set_generation_epoch(train_state.iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -3121,11 +3364,11 @@ def megatron_rl_inference_mode(
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
-        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
         training_lang_module.train()
 
-        if has_lru_cache:
-            rotary_module.forward.cache_clear()
+        for rotary_module in rotary_modules:
+            if isinstance(rotary_module, RotaryEmbedding):
+                rotary_module.clear_cache()
 
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 
@@ -3154,16 +3397,6 @@ def rl_inference_interface_shutdown():
     import os
     os._exit(0)
 
-
-def get_iteration_sequence_count(args):
-    """Get the total number of sequences processed in this iteration across all ranks."""
-    runtime_state = get_rl_runtime_state()
-    sequences_tensor = torch.tensor(
-        runtime_state.sequences_this_iteration_on_rank, device='cuda', dtype=torch.long
-    )
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
-    return int(sequences_tensor.item())
 
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
     """Pad each element of a list of tensors to the length required.
