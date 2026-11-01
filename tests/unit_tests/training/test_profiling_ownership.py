@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.config import ProfilingConfig
@@ -458,7 +459,20 @@ def test_training_log_memory_snapshot_without_profiling_args(
     monkeypatch.setattr(training.torch.distributed, "get_backend", lambda: backend)
     dump = Mock()
     monkeypatch.setattr(training.torch.cuda.memory, "_dump_snapshot", dump)
-    training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, None)
+    training.training_log(
+        {},
+        {},
+        0.01,
+        1,
+        1.0,
+        False,
+        0,
+        None,
+        None,
+        None,
+        None,
+        pg_collection=ProcessGroupCollection(),
+    )
     if expected:
         dump.assert_called_once_with(f"owned_{rank}.pickle")
     else:

@@ -564,22 +564,35 @@ def _assert_same_datasets(expected, built):
 def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
     """The provider body is megatron.training.datasets.providers.build_gpt_datasets; each script's
     train_valid_test_datasets_provider keeps the legacy shape and passes its rank predicate (the
-    shared GPT / hybrid rule, or hybrid-flex's own, which accepts the packed-sequence flag)."""
+    shared GPT / hybrid rule, or hybrid-flex's own, which accepts the packed-sequence flag). The
+    GPT and hybrid providers also take the run's process groups, which training passes to a
+    provider with a ``pg_collection`` parameter, and bind them to the shared rule."""
+    pg_collection = object()
     for name in ("gpt", "hybrid", "hybrid_flex"):
         module = _entry_point(name)
         calls = []
         monkeypatch.setattr(
             module, "build_gpt_datasets", lambda *a, **k: calls.append((a, k)) or (1, 2, 3)
         )
+        shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
+        assert shared is (name != "hybrid_flex")
         parameters = inspect.signature(module.train_valid_test_datasets_provider).parameters
-        assert list(parameters) == ["train_val_test_num_samples", "vp_stage"]  # main's shape
-        built = module.train_valid_test_datasets_provider((8, 8, 8), 1)
+        legacy_shape = ["train_val_test_num_samples", "vp_stage"]  # main's shape
+        assert list(parameters) == (legacy_shape + ["pg_collection"] if shared else legacy_shape)
+        if shared:
+            built = module.train_valid_test_datasets_provider((8, 8, 8), 1, pg_collection)
+        else:
+            built = module.train_valid_test_datasets_provider((8, 8, 8), 1)
         assert built == (1, 2, 3)
         ((positional, keywords),) = calls
         assert positional == ((8, 8, 8), 1)
-        assert keywords == {"built_on_rank": module.is_dataset_built_on_rank}
-        shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
-        assert shared is (name != "hybrid_flex")
+        assert list(keywords) == ["built_on_rank"]
+        built_on_rank = keywords["built_on_rank"]
+        if shared:
+            assert built_on_rank.func is module.is_dataset_built_on_rank
+            assert built_on_rank.keywords == {"pg_collection": pg_collection}
+        else:
+            assert built_on_rank is module.is_dataset_built_on_rank
         parameters = inspect.signature(module.is_dataset_built_on_rank).parameters
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
 
@@ -596,7 +609,11 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
     monkeypatch.setattr(
         arguments,
         "core_transformer_config_from_args",
-        lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
+        lambda args: SimpleNamespace(
+            pipeline_model_parallel_layout="layout",
+            mtp_num_layers=None,
+            virtual_pipeline_model_parallel_size=None,
+        ),
     )
     monkeypatch.setattr(
         providers,
@@ -611,6 +628,9 @@ def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
                 "sequence_packing_scheduler": None,
                 "pipeline_model_parallel_layout": "layout",
                 "mtp_num_layers": None,
+                # Without a virtual pipeline the predicate passes a size of 1, not None.
+                "vp_size": 1,
+                "pg_collection": None,
             },
         )
     ]
