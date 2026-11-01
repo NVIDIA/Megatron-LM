@@ -2,7 +2,7 @@
 
 import os
 import random
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 
 import pytest
 import torch
@@ -13,6 +13,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.training.arguments import add_megatron_arguments
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from tools.prepare_cache import (
@@ -101,13 +102,18 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         object_storage_cache_path=None,
         mid_level_dataset_surplus=0.005,
         allow_ambiguous_pad_tokens=False,
+        dataloader_inter_document_masking=False,
+        sft_mock_dataset_config_json=None,
+        varlen_mock_dataset_config_json=None,
+        varlen_sbhd_validation=False,
+        use_varlen_dataset=False,
         dataloader_fast_cache_load=True,
         dataloader_defer_npy_index_mmap=True,
         context_parallel_size=1,
         data_parallel_size=4,
         tensor_model_parallel_size=1,
         sequence_parallel=False,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         multiple_validation_sets=False,
         full_validation=False,
         num_dataset_builder_threads=1,
@@ -125,15 +131,25 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         eval_interval=2,
         start_eval_at_iter=None,
         global_batch_size=8,
+        micro_batch_size=2,
+        gtp_weight_remat_size=1,
         phase_transition_iterations=None,
         iteration=0,
         mock_data=False,
         sft=False,
         fim_data=False,
         step_batch_size_schedule=None,
+        main_grads_dtype=torch.float32,
+        main_params_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
     )
     args.update(overrides)
-    return Namespace(**args)
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    parsed_args = parser.parse_args([])
+    vars(parsed_args).update(args)
+    return parsed_args
 
 
 def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt):
@@ -286,5 +302,5 @@ def test_prepare_cache_builds_with_train_samples(tmp_path_dist_ckpt):
 
         summary = build_dataset_caches(args)
 
-        assert args.train_iters == 32 // args.global_batch_size
         assert summary["train_valid_test_num_samples"][0] == 32
+        assert summary["train_valid_test_num_samples"][1:] == (48, 16)

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import warnings
 from copy import deepcopy
 from enum import Enum
@@ -11,7 +12,10 @@ import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -26,7 +30,6 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
-    get_pg_size,
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
@@ -413,6 +416,11 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         self._fused_grouped_swiglu_unit_scale = None
         self._fused_grouped_swiglu_tokens_per_expert = {}
         self._validate_fused_grouped_swiglu()
+        # Older TE versions use the legacy environment variable to enable fusion.
+        # Cache API support here to keep signature inspection out of forward.
+        self._grouped_linear_kwargs = {}
+        if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+            self._grouped_linear_kwargs["split_alignment"] = TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
 
     def _validate_fused_grouped_swiglu(self) -> None:
         """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
@@ -485,7 +493,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
         """Construct the grouped-linear shared-expert MLP operations."""
         ops = te.pytorch.ops.Sequential()
-        tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
         if get_cuda_rng_tracker().is_initialized():
             rng_state_tracker_function = get_cuda_rng_tracker
@@ -495,12 +502,14 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op = te.pytorch.ops.GroupedLinear(
             num_groups=1,
             in_features=fc1_weight.size(1),
-            out_features=fc1_weight.size(0) * tp_world_size,
+            # fc1_weight is the local TP shard and GroupedLinear has no TP, so use the local size.
+            out_features=fc1_weight.size(0),
             device="meta",
             dtype=fc1_weight.dtype,
             bias=False,
             rng_state_tracker_function=rng_state_tracker_function,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            **self._grouped_linear_kwargs,
         )
         op.weight0 = fc1_weight
         op._glu_interleave_size = glu_interleave_size
@@ -532,6 +541,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             bias=False,
             rng_state_tracker_function=rng_state_tracker_function,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            **self._grouped_linear_kwargs,
         )
         op.weight0 = fc2_weight
         ops.append(op)
@@ -558,6 +568,13 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         hidden_size = hidden_states.size(-1)
         hidden_states_2d = hidden_states.view(-1, hidden_size)
         total_tokens = hidden_states_2d.size(0)
+        if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
+            raise ValueError(
+                f"{self.__class__.__name__} requires the token count after tensor-parallel "
+                f"communication to be divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}, "
+                f"but got {total_tokens}. "
+                f"split_alignment={TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} does not pad the input."
+            )
         tokens_key = (hidden_states.device, total_tokens)
         tokens_per_expert = self._fused_grouped_swiglu_tokens_per_expert.get(tokens_key)
         if tokens_per_expert is None:

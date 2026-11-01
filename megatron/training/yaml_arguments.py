@@ -198,9 +198,6 @@ def validate_yaml(args, defaults={}):
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.consumed_valid_samples = 0
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
