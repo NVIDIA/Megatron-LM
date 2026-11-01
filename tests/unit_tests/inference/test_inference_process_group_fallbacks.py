@@ -43,6 +43,9 @@ from tests.unit_tests.test_utilities import Utils
 
 # The groups that inference reads from `InferenceConfig.pg_collection`.
 INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep")
+# The dynamic context and engine also read tp_ep. A configured collection may leave it unset; the
+# model's collection and the global fallback set it.
+RESOLVED_GROUPS = (*INFERENCE_GROUPS, "tp_ep")
 
 # The accessors that tools/check_process_group_usage.py counts.
 _ACCESSOR_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
@@ -242,29 +245,32 @@ class TestInferenceConfigBoundary:
 
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         assert config.pg_collection is pg_collection
-        assert set(vars(pg_collection)) == set(INFERENCE_GROUPS)
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
         assert pg_collection.pp is parallel_state.get_pipeline_model_parallel_group()
         assert pg_collection.dp is parallel_state.get_data_parallel_group(with_gtp_remat=False)
         assert pg_collection.mp is parallel_state.get_model_parallel_group()
         assert pg_collection.ep is parallel_state.get_expert_model_parallel_group()
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_uses_collection_of_model(self):
         # Every group that inference reads is set; None means the axis is off.
         model = torch.nn.Module()
-        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(INFERENCE_GROUPS))
+        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(RESOLVED_GROUPS))
         config = InferenceConfig()
 
         with forbid_global_process_groups(), no_fallback_warnings():
             assert config.resolve_pg_collection(model) is model.pg_collection
         assert config.pg_collection is model.pg_collection
 
-    def test_partial_model_collection_takes_the_fallback(self):
+    # The second collection lacks only tp_ep, which would otherwise read as None (size 1).
+    @pytest.mark.parametrize("required_pgs", [["tp", "cp", "pp", "embd"], list(INFERENCE_GROUPS)])
+    def test_partial_model_collection_takes_the_fallback(self, required_pgs):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model = torch.nn.Module()
         model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "cp", "pp", "embd"]
+            required_pgs=required_pgs
         )
         config = InferenceConfig()
 
@@ -274,11 +280,13 @@ class TestInferenceConfigBoundary:
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         assert pg_collection is not model.pg_collection
         assert pg_collection.dp is parallel_state.get_data_parallel_group(with_gtp_remat=False)
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_configured_collection_comes_first(self):
+        # A configured collection is used as is, also without tp_ep.
         configured = ProcessGroupCollection(**dict.fromkeys(INFERENCE_GROUPS))
         model = torch.nn.Module()
-        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(INFERENCE_GROUPS))
+        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(RESOLVED_GROUPS))
         config = InferenceConfig(pg_collection=configured)
 
         with forbid_global_process_groups(), no_fallback_warnings():
@@ -330,6 +338,8 @@ class TestComponentsShareOneCollection:
         pg_collection = inference_config.pg_collection
         assert pg_collection.tp is parallel_state.get_tensor_model_parallel_group()
         assert context.expert_model_parallel_group is pg_collection.ep
+        assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
+        assert context.expert_tensor_and_model_parallel_group is pg_collection.tp_ep
         assert context.pipeline_parallel_group is None
 
         model = SimpleNamespace(config=model_config, vocab_size=16)

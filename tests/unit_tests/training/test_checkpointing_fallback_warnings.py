@@ -158,7 +158,7 @@ def _metadata_args():
     return SimpleNamespace(use_distributed_optimizer=False, ckpt_format="torch_dist")
 
 
-def test_sharded_state_dict_metadata_group():
+def test_sharded_state_dict_metadata_group(run_config):
     """The metadata carries the caller's group, or warns and carries the global one."""
     group = _StandInGroup(0, 2)
     with _no_global_grid():
@@ -205,7 +205,7 @@ def _generate_state_dict(ckpt_format, **kwargs):
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dist", "fsdp_dtensor"])
-def test_generate_state_dict_metadata_uses_the_given_group(ckpt_format):
+def test_generate_state_dict_metadata_uses_the_given_group(ckpt_format, run_config):
     """The default torch_dist metadata and the fsdp_dtensor metadata use the caller's group."""
     group = _StandInGroup(0, 2)
     with _no_global_grid():
@@ -217,7 +217,7 @@ def test_generate_state_dict_metadata_uses_the_given_group(ckpt_format):
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dist", "fsdp_dtensor"])
-def test_generate_state_dict_warns_without_a_group(ckpt_format):
+def test_generate_state_dict_warns_without_a_group(ckpt_format, run_config):
     group = _StandInGroup(0, 2)
     global_grid = mock.Mock()
     global_grid.get_data_parallel_group.return_value = group

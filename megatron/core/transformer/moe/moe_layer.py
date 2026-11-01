@@ -11,7 +11,10 @@ import torch
 from megatron.core import utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
-from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    require_flashinfer_cutlass_mxfp8,
+    require_flashinfer_routed_mxfp8,
+)
 from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_routed_nvfp4
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -22,6 +25,11 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.megakernel import (
+    build_megakernel_backend,
+    megakernel_shared_expert_init_context,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MOE_LAYER_PROCESS_GROUPS,
     MoECudaGraphPartialCaptureSignal,
@@ -362,32 +370,34 @@ class MoELayer(BaseMoELayer):
                 self.fc1_latent_proj._tp_group = pg_collection.tp
                 self.fc2_latent_proj._tp_group = pg_collection.tp
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "allgather":
-            self.token_dispatcher = MoEAllGatherTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "alltoall":
-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "flex":
-            self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
-            )
+        # Megakernel backends replace native dispatch, expert compute, and combine,
+        # so only construct a token dispatcher for the native MoE path.
+        if config.moe_megakernel_backend is None:
+            if config.moe_token_dispatcher_type == "allgather":
+                self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "alltoall":
+                self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "flex":
+                self.token_dispatcher = MoEFlexTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+                )
 
         # Initialize experts
         self.experts = self.submodules.experts(
@@ -406,14 +416,37 @@ class MoELayer(BaseMoELayer):
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            self.shared_experts = self.submodules.shared_experts(
-                config=self.config,
-                pg_collection=pg_collection,
-                gate=self.config.moe_shared_expert_gate,
-                name=(name + ".shared_experts") if name is not None else None,
-            )
+            if self.config.moe_megakernel_backend is None:
+                self.shared_experts = self.submodules.shared_experts(
+                    config=self.config,
+                    pg_collection=pg_collection,
+                    gate=self.config.moe_shared_expert_gate,
+                    name=(name + ".shared_experts") if name is not None else None,
+                )
+            else:
+                shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
+                with megakernel_shared_expert_init_context(self.config):
+                    self.shared_experts = self.submodules.shared_experts(
+                        config=shared_expert_config,
+                        pg_collection=pg_collection,
+                        gate=self.config.moe_shared_expert_gate,
+                        name=(name + ".shared_experts") if name is not None else None,
+                    )
             if self.shared_expert_overlap:
+                assert self.token_dispatcher is not None
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
+
+        # Native expert modules remain the authoritative parameter, optimizer,
+        # DDP, and checkpoint owners for every megakernel backend.
+        self.megakernel_experts = None
+        if self.config.moe_megakernel_backend is not None:
+            self.megakernel_experts = build_megakernel_backend(
+                config=self.config,
+                ep_group=self.ep_group,
+                routed_experts=self.experts,
+                shared_experts=self.shared_experts,
+                num_local_experts=self.num_local_experts,
+            )
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
@@ -425,7 +458,10 @@ class MoELayer(BaseMoELayer):
                 )
                 fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
                 if config.fp8 and fp8_recipe == "mxfp8":
-                    require_flashinfer_routed_mxfp8()
+                    if config.activation_func_tanh_clamp_scale is not None:
+                        require_flashinfer_cutlass_mxfp8()
+                    else:
+                        require_flashinfer_routed_mxfp8()
                 if config.inference_moe_nvfp4_recipe is not None:
                     # Per-token NVFP4 runs CuTe DSL JIT kernels, not the pre-compiled
                     # CUTLASS kernels shipped in flashinfer-jit-cache.
@@ -538,7 +574,8 @@ class MoELayer(BaseMoELayer):
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        if self.token_dispatcher is not None:
+            hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
         )
@@ -551,13 +588,14 @@ class MoELayer(BaseMoELayer):
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
         passed through untouched and the dispatcher decides whether its backend excludes padded
-        rows.
+        rows. ``packed_seq_params`` tells the dispatcher whether the input is packed (THD).
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -588,9 +626,14 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
+            # padded rows) and the packed-sequence metadata.
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, padding_mask=padding_mask
+                hidden_states,
+                routing_map,
+                probs,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
             )
         else:
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -742,6 +785,27 @@ class MoELayer(BaseMoELayer):
             )
         self.select_token_dispatcher()
 
+        if self.config.moe_megakernel_backend is not None:
+            if intermediate_tensors is not None:
+                raise RuntimeError(
+                    "The selected MoE megakernel backend does not support partial MoE "
+                    "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
+                )
+
+            def megakernel_forward(hidden_states, padding_mask):
+                probs, routing_map = self.route(
+                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                )
+                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+
+            if self.moe_layer_recompute and self.training:
+                output = precision_aware_checkpoint(
+                    megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
+                )
+            else:
+                output = megakernel_forward(hidden_states, padding_mask)
+            return output, None
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             shared_expert_output = None
@@ -757,7 +821,11 @@ class MoELayer(BaseMoELayer):
                         layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
                     )
                     hidden_states, probs = self.preprocess(
-                        layer_input, probs, routing_map, padding_mask
+                        layer_input,
+                        probs,
+                        routing_map,
+                        padding_mask,
+                        packed_seq_params=packed_seq_params,
                     )
 
                     if self.run_shared_experts_after_router:

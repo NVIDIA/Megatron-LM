@@ -131,7 +131,8 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    set_run_config(cfg)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -160,7 +161,7 @@ def main(model_type: str = "gpt"):
                 pg_collection=pg_collection,
             )
         else:
-            builder = get_model_builder(args, provider=model_type)
+            builder = get_model_builder(args, cfg.tokenizer, provider=model_type)
             model = builder.build_distributed_models(
                 pg_collection=pg_collection, wrap_with_ddp=False
             )

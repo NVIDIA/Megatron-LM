@@ -946,3 +946,75 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
+    """The fused core owns output rotation; the outer projection must not rotate twice."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as hybrid,
+    )
+
+    batch = 1 if packed else 2
+    hidden = torch.randn(4, batch, 4, requires_grad=True)
+    cu = torch.tensor([0, 1, 4], dtype=torch.int32) if packed else None
+    params = (
+        PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=3, max_seqlen_kv=3
+        )
+        if packed
+        else None
+    )
+    cos, sin = torch.ones(4, 2), torch.zeros(4, 2)
+    cache = Mock(return_value=(cos, sin))
+    observed = []
+
+    def core(query, *_args, out_rope, **_kwargs):
+        observed.append(out_rope)
+        # Sentinel output stands for a core that has already applied inverse RoPE.
+        return query.reshape(4, batch, 4) * 3
+
+    core.use_fused_kernels = True
+    monkeypatch.setattr(hybrid, "apply_module", lambda module: module)
+    outer_rope = Mock(side_effect=AssertionError("output RoPE applied twice"))
+    monkeypatch.setattr(hybrid, "fused_mla_rope_out_of_place", outer_rope)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            apply_rope_fusion=True,
+            v_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            output_projection_lora_rank=4,
+            dsa_kernel_backend="cudnn",
+            deterministic_mode=False,
+            attention_cp_layout="contiguous",
+        ),
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)),
+        rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
+        get_query_key_value_tensors=lambda *_args, **_kwargs: (hidden, hidden, hidden, None, None),
+        core_attention=core,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        training=True,
+        recompute_up_proj=False,
+        output_projection_local_groups=1,
+        linear_o_group_proj=torch.eye(4),
+        linear_proj=lambda x: (x, None),
+    )
+    output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
+    torch.testing.assert_close(output, hidden * 3)
+    output.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 3))
+    assert len(observed) == 1
+    rope = observed[0]
+    assert rope.cos is cos and rope.sin is sin
+    assert rope.cu_seqlens_q is cu
+    assert rope.sbhd_batch_size == (None if packed else batch)
+    assert (rope.nope_dim, rope.pos_dim, rope.cp_rank, rope.cp_size) == (2, 2, 0, 1)
+    cache.assert_called_once_with(
+        3 if packed else 4, dtype=hidden.dtype, packed_seq=packed, mscale=1.0
+    )
+    outer_rope.assert_not_called()

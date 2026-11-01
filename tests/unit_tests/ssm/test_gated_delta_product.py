@@ -21,14 +21,18 @@ from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import (
     HAVE_CUTEDSL_GDP,
+    HAVE_CUTEDSL_GDP_CP,
     HAVE_EINOPS,
     HAVE_FLA,
+    HAVE_FLA_GDP_CP,
     HAVE_MAMBA_SSM,
     GatedDeltaProductMixer,
     causal_conv1d_fn,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import Float16Module
+from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
@@ -129,6 +133,30 @@ def _assert_replay_matches(baseline, recomputed):
         )
 
 
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires GDP dependencies")
+@pytest.mark.parametrize("parameter_name", ["A_log", "dt_bias"])
+def test_decay_parameters_stay_fp32_in_float16_module(parameter_name):
+    """Preserve the initialized decay values when wrapping GDP for BF16 training."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = _make_config([])
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        mixer = _build_mixer(config)
+        parameter = getattr(mixer, parameter_name)
+        assert parameter.dtype == torch.float32
+        expected = parameter.detach().clone()
+
+        wrapped = Float16Module(config=config, module=mixer).module
+
+        parameter = getattr(wrapped, parameter_name)
+        assert parameter.dtype == torch.float32
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+        assert wrapped.in_proj.weight.dtype == torch.bfloat16
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
 @pytest.mark.parametrize("recompute_qkv", [False, True])
 def test_in_proj_recompute_parity(recompute_qkv):
@@ -191,6 +219,110 @@ def test_fp8_in_proj_recompute_parity(fp8_recipe):
         _assert_replay_matches(
             _run(baseline, hidden_states, grads), _run(recomputed, hidden_states, grads)
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
+@pytest.mark.parametrize("recompute_qkv", [False, True])
+@pytest.mark.parametrize("fp8_recipe", [None, "mxfp8"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_in_proj_recompute_preserves_norm_gate_view(
+    monkeypatch, recompute_qkv, fp8_recipe, cp_size
+):
+    """At MB=1, CP1 and chunkwise CP must discard and restore the norm's saved gate."""
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires at least {cp_size} distributed ranks")
+    if cp_size > 1:
+        if not is_causal_conv1d_min_version("1.7.0"):
+            pytest.skip("chunkwise CP requires causal-conv1d >= 1.7.0")
+        if not (HAVE_FLA_GDP_CP if HAVE_FLA else HAVE_CUTEDSL_GDP_CP):
+            pytest.skip("the selected GDP backend does not support chunkwise CP")
+    if fp8_recipe == "mxfp8":
+        te = pytest.importorskip("transformer_engine.pytorch")
+        available, reason = te.is_mxfp8_available(return_reason=True)
+        if not available:
+            pytest.skip(reason)
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        modules = ["gdp_in_proj"] + (["gdp_qkv"] if recompute_qkv else [])
+        config = _make_config(modules, fp8_recipe=fp8_recipe)
+        config.context_parallel_size = cp_size
+        config.linear_cp_mode = "chunkwise"
+        config.linear_cp_layout = "contiguous"
+        if fp8_recipe:
+            config.fp8 = "e4m3"
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        # Eight heads align the projection's ba width to MXFP8's 32-element blocks.
+        config.mamba_num_heads = 8
+        baseline = _build_mixer(config)
+        recomputed = _build_mixer(config, state_dict=baseline.state_dict())
+
+        baseline_norm_forward = baseline.norm.forward
+
+        def contiguous_norm_forward(x, z):
+            return baseline_norm_forward(x, z.contiguous())
+
+        monkeypatch.setattr(baseline.norm, "forward", contiguous_norm_forward)
+
+        projection_gate_storages = []
+        in_proj_preprocess = recomputed._in_proj_preprocess
+
+        def tracked_in_proj_preprocess(*args, **kwargs):
+            outputs = in_proj_preprocess(*args, **kwargs)
+            projection_gate_storages.append(outputs[0].untyped_storage())
+            return outputs
+
+        monkeypatch.setattr(recomputed, "_in_proj_preprocess", tracked_in_proj_preprocess)
+        saved_gates = []
+        expected_gates = []
+
+        def capture_saved_gate(module, inputs, output):
+            z = inputs[1]
+            assert not z.is_contiguous()
+            assert z.stride(-1) == 1
+            assert z.untyped_storage().data_ptr() == projection_gate_storages[0].data_ptr()
+            # Inspect the actual Mamba autograd save, including its internal 2D reshape.
+            saved_gate = output.grad_fn.saved_tensors[-1]
+            assert saved_gate.untyped_storage().data_ptr() == z.untyped_storage().data_ptr()
+            saved_gates.append(saved_gate)
+            expected_gates.append(saved_gate.detach().clone())
+
+            def check_restored_gate(grad_outputs):
+                assert len(projection_gate_storages) == 2
+                assert (
+                    saved_gate.untyped_storage().data_ptr()
+                    == projection_gate_storages[1].data_ptr()
+                )
+                torch.testing.assert_close(saved_gate, expected_gates[0], rtol=0, atol=0)
+
+            output.grad_fn.register_prehook(check_restored_gate)
+
+        norm_hook = recomputed.norm.register_forward_hook(capture_saved_gate)
+        hidden_states = torch.randn((256, 1, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
+        grads = torch.randn_like(hidden_states)
+        baseline_result = _run(baseline, hidden_states, grads)
+
+        x = hidden_states.clone().requires_grad_(True)
+        with get_fp8_context(recomputed.config):
+            output, _ = recomputed(x)
+        assert len(saved_gates) == len(projection_gate_storages) == 1
+        assert saved_gates[0].untyped_storage().nbytes() == 0
+        assert projection_gate_storages[0].nbytes() == 0
+
+        output.backward(grads)
+        assert len(projection_gate_storages) == 2
+        assert saved_gates[0].untyped_storage().data_ptr() == projection_gate_storages[1].data_ptr()
+        torch.testing.assert_close(saved_gates[0], expected_gates[0], rtol=0, atol=0)
+        recomputed_result = (
+            output.detach().clone(),
+            x.grad.clone(),
+            {name: param.grad.clone() for name, param in recomputed.named_parameters()},
+        )
+        _assert_replay_matches(baseline_result, recomputed_result)
+        norm_hook.remove()
     finally:
         Utils.destroy_model_parallel()
 
