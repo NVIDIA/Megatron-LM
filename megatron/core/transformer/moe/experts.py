@@ -1827,6 +1827,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return None
         return num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size()
 
+    def _ep_invariant_expert_tp_group(self) -> Optional[torch.distributed.ProcessGroup]:
+        """``moe_ep_invariant_combine``: the expert-TP group whose partial rows are summed
+        before the combine tree, else None."""
+        return self.tp_group if self.config.moe_ep_invariant_combine else None
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1844,6 +1849,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
             ep_invariant_leaves=self._ep_invariant_leaves(),
+            ep_invariant_expert_tp_group=self._ep_invariant_expert_tp_group(),
         )
         return output, None
 
@@ -1864,6 +1870,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
             ep_invariant_leaves=self._ep_invariant_leaves(),
+            ep_invariant_expert_tp_group=self._ep_invariant_expert_tp_group(),
         )
         return output, None
 

@@ -20,6 +20,11 @@ of a token's rows and evaluates the whole tree. Every EP size thus performs the 
 fp32 additions and gives the same bits, at the cost of the existing fp32 combine.
 Adding an empty (+0.0) subtree is exact, so empty leaves and ranks do not change the
 result; starting each leaf from +0.0 also turns -0.0 into +0.0 consistently.
+
+With expert tensor parallelism, the ranks of an expert-TP group hold partial sums of the
+same experts' rows. Training reduces those rows over expert TP before the tree. Inference
+does the same with ``expert_tp_fold`` before evaluating its subtree, and only expert-TP
+rank 0 contributes it; the others contribute +0.0, which the reduce-scatter adds exactly.
 """
 
 from typing import Optional
@@ -496,6 +501,40 @@ class _TreeCombine(torch.autograd.Function):
             d_probs.scatter_(1, cols.long(), d_slot_probs)
             d_probs = d_probs[:, :-1].to(ctx.probs_dtype)
         return d_rows, None, None, None, d_probs
+
+
+def expert_tp_fold(rows: torch.Tensor, group) -> torch.Tensor:
+    """Sum ``rows`` over the expert-TP ``group`` the way training's expert-TP reduction does.
+
+    Training reduce-scatters each expert row's expert-TP partials in the row dtype before
+    the combine. This all-gathers the partials and adds them in rank order with an fp32
+    accumulator and one rounding to the row dtype: at expert TP 2 that is the single
+    correctly rounded addition the stock reduction performs, and at expert TP >= 3 it is
+    the ordered TP reduction (fp64 accumulation, rounded to fp32, under the "multimem"
+    batch-invariant collective). Every rank of the group returns the same rows.
+    """
+    world_size = group.size()
+    if world_size == 1:
+        return rows
+    # Deferred: batch_invariant_kernels imports Transformer Engine at module level.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        get_batch_invariant_collective,
+    )
+
+    rows = rows.contiguous()
+    parts = torch.empty((world_size, *rows.shape), dtype=rows.dtype, device=rows.device)
+    torch.distributed.all_gather_into_tensor(parts, rows, group=group)
+    return fold_expert_tp_partials(
+        parts, exact=world_size >= 3 and get_batch_invariant_collective() == "multimem"
+    )
+
+
+def fold_expert_tp_partials(parts: torch.Tensor, exact: bool = False) -> torch.Tensor:
+    """((p_0 + p_1) + p_2) + ... over dim 0 in fp32 (fp64 if ``exact``), one rounding."""
+    acc = parts[0].to(torch.float64 if exact else torch.float32)
+    for rank in range(1, parts.shape[0]):
+        acc += parts[rank]
+    return acc.to(torch.float32).to(parts.dtype)
 
 
 def tree_combine(

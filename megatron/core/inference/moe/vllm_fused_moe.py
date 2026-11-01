@@ -39,7 +39,10 @@ from megatron.core.inference.moe.permute import (
     compute_expert_offsets,
     compute_local_tokens_per_expert,
 )
-from megatron.core.transformer.moe.ep_invariant_combine import tree_combine_topk_forward
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    expert_tp_fold,
+    tree_combine_topk_forward,
+)
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
@@ -718,6 +721,7 @@ def vllm_fused_moe(
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
     ep_invariant_leaves: Optional[int] = None,
+    ep_invariant_expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -748,6 +752,9 @@ def vllm_fused_moe(
         ep_invariant_leaves: batch-invariant mode only (``moe_ep_invariant_combine``):
             sum each token over this rank's subtree of the EP-invariant combine tree,
             which has this many leaves over the local experts, instead of in top-k order.
+        ep_invariant_expert_tp_group: with ``ep_invariant_leaves``, the expert-TP group: the
+            FC2 rows are summed over it first (as training's expert-TP reduction does) and
+            only its rank 0 contributes the subtree; the others contribute +0.0.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -900,6 +907,12 @@ def vllm_fused_moe(
             out = VllmFusedMoeBuffers.get(
                 "moe_sum_out", (max_tokens, K), torch.float32, hidden_states.device
             )
+        expert_tp_rank = 0
+        if ep_invariant_expert_tp_group is not None:
+            intermediate3 = expert_tp_fold(intermediate3, ep_invariant_expert_tp_group)
+            expert_tp_rank = ep_invariant_expert_tp_group.rank()
+        if expert_tp_rank != 0:
+            return out.zero_()
         return tree_combine_topk_forward(
             intermediate3,
             routing_map,

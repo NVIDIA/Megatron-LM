@@ -366,27 +366,108 @@ def _ep_invariant_moe_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_config_rejects_expert_tensor_parallel_inference():
-    """Inference's tp_ep partials must be whole expert subtrees; ETP splits experts."""
-    inference = dict(
+def test_config_accepts_expert_tensor_parallel_inference():
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import HAVE_DEEPGEMM_BF16
+
+    if not HAVE_DEEPGEMM_BF16:
+        pytest.skip("Building a batch-invariant MoE config requires DeepGEMM bf16 kernels.")
+    _ep_invariant_moe_config(
         transformer_impl="inference_optimized",
         normalization="RMSNorm",
         inference_grouped_gemm_backend="torch",
         inference_moe_token_dispatcher_type="nvls",
+        expert_tensor_parallel_size=2,
         tensor_model_parallel_size=2,
         sequence_parallel=True,
     )
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import HAVE_DEEPGEMM_BF16
 
-    with pytest.raises(ValueError, match="expert_tensor_parallel_size=1"):
-        _ep_invariant_moe_config(expert_tensor_parallel_size=2, **inference)
-    if not HAVE_DEEPGEMM_BF16:
-        pytest.skip("Building a batch-invariant MoE config requires DeepGEMM bf16 kernels.")
-    _ep_invariant_moe_config(expert_tensor_parallel_size=1, **inference)
-    # Training reduces each expert row over expert TP before the tree, so it stays allowed.
-    _ep_invariant_moe_config(
-        expert_tensor_parallel_size=2, tensor_model_parallel_size=2, sequence_parallel=True
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_fold_expert_tp_partials_is_a_rank_order_fold(exact):
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    parts = (
+        torch.randn(4, 300, 96, device="cuda", generator=gen)
+        * torch.logspace(-6, 6, 96, device="cuda")
+    ).bfloat16()
+    acc = parts[0].double() if exact else parts[0].float()
+    for r in range(1, 4):
+        acc = acc + (parts[r].double() if exact else parts[r].float())
+    ref = acc.float().bfloat16()
+    out = eic.fold_expert_tp_partials(parts, exact=exact)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
+@pytest.mark.parametrize("etp_outer", [False, True], ids=["ep-major", "etp-major"])
+def test_inference_expert_tp_combine_matches_training(etp_outer):
+    """Expert TP: inference folds each expert row over expert TP, expert-TP rank 0 evaluates
+    its subtree and the partners add +0.0; the pairwise reduce-scatter over the tp_ep ranks
+    then equals the training tree over expert-TP-reduced rows, for either tp_ep rank order.
+    """
+    experts, tokens, hidden, expert_tp, ep = 16, 96, 256, 4, 2
+    leaves = eic.num_leaf_blocks(experts)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    scale = torch.logspace(-3, 3, hidden, device="cuda")
+    partials = (
+        torch.randn(expert_tp, tokens * experts, hidden, device="cuda", generator=gen) * scale
+    ).bfloat16()
+    rows = eic.fold_expert_tp_partials(partials)  # training's expert-TP reduction
+    t = torch.arange(tokens, device="cuda").unsqueeze(1)
+
+    def slots(lo, hi):
+        return (t * experts + torch.arange(lo, hi, device="cuda")).to(torch.int32)
+
+    training = eic.tree_combine_forward(rows, slots(0, experts), leaves, _all(tokens))
+
+    per_rank = experts // ep
+    rank_partials = {}
+    for ep_rank in range(ep):
+        for etp_rank in range(expert_tp):
+            if etp_rank == 0:
+                rank_partials[ep_rank, etp_rank] = eic.tree_combine_forward(
+                    rows,
+                    slots(ep_rank * per_rank, (ep_rank + 1) * per_rank),
+                    leaves // ep,
+                    _all(tokens),
+                )
+            else:
+                rank_partials[ep_rank, etp_rank] = torch.zeros_like(training)
+    if etp_outer:
+        order = [(e, k) for k in range(expert_tp) for e in range(ep)]
+    else:
+        order = [(e, k) for e in range(ep) for k in range(expert_tp)]
+    level = [rank_partials[key] for key in order]
+    while len(level) > 1:  # the reduce-scatter's pairwise tree in tp_ep rank order
+        level = [level[i] + level[i + 1] for i in range(0, len(level), 2)]
+    assert torch.equal(level[0].view(torch.int32), training.view(torch.int32))
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="needs >= 4 GPUs")
+def test_expert_tp_fold_matches_training_reduction():
+    """expert_tp_fold on a real expert-TP group: a rank-order fold, and at expert TP 2 the
+    same bits as training's stock bf16 reduce-scatter."""
+    Utils.initialize_model_parallel(
+        1, 1, expert_model_parallel_size=Utils.world_size // 2, expert_tensor_parallel_size=2
     )
+    try:
+        group = parallel_state.get_expert_tensor_parallel_group()
+        assert group.size() == 2
+        gen = torch.Generator(device="cuda").manual_seed(11 + torch.distributed.get_rank())
+        rows = (
+            torch.randn(1024, 512, device="cuda", generator=gen)
+            * torch.logspace(-4, 4, 512, device="cuda")
+        ).bfloat16()
+        folded = eic.expert_tp_fold(rows, group)
+        parts = torch.empty((2, *rows.shape), dtype=rows.dtype, device="cuda")
+        torch.distributed.all_gather_into_tensor(parts, rows, group=group)
+        assert torch.equal(
+            folded.view(torch.int16), eic.fold_expert_tp_partials(parts).view(torch.int16)
+        )
+        shard = torch.empty(512, 512, dtype=rows.dtype, device="cuda")
+        torch.distributed.reduce_scatter_tensor(shard, rows, group=group)
+        mine = folded[group.rank() * 512 : (group.rank() + 1) * 512]
+        assert torch.equal(mine.view(torch.int16), shard.view(torch.int16))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestEPInvariantCollectives:
