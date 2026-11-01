@@ -220,7 +220,7 @@ class TestFP8Param:
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             self.copy_main_params_to_param_buffer(model_chunks, optimizer)
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model_chunks, param_sync=True)
 
         model_chunks[0].eval()
@@ -236,7 +236,7 @@ class TestFP8Param:
         eval_loss = eval_output.mean()
         model_chunks[0].train()
 
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             enable_forward_pre_hook(model_chunks)
 
         return eval_loss.item()
@@ -410,7 +410,9 @@ class TestFP8Param:
         # the first successful optimizer step. CUDA-graph tests retain their existing capture-time
         # hook lifecycle, which handles this transition separately.
         first_iteration_pre_hook_disabled = (
-            not inference and not use_cuda_graph and should_disable_forward_pre_hook(args)
+            not inference
+            and not use_cuda_graph
+            and should_disable_forward_pre_hook(args, optimizer)
         )
         if first_iteration_pre_hook_disabled:
             disable_forward_pre_hook(gpt_model, param_sync=False)
@@ -436,7 +438,7 @@ class TestFP8Param:
                 # native-FP8 GTP shards are refreshed from masters (not stale grad scratch).
                 # Exercise it so the save-perturbation test is a real regression test for the
                 # post-save loss spike.
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     force_param_sync(gpt_model, optimizer=optimizer)
                 _ = gpt_model[0].sharded_state_dict()
 
@@ -444,10 +446,10 @@ class TestFP8Param:
             # Hard coded cuda_graph_warmup_steps = 0.
             cuda_graph_warmup_steps = 0
             if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
                 self.cuda_graph_helper.create_cudagraphs()
-                if should_disable_forward_pre_hook(args):
+                if should_disable_forward_pre_hook(args, optimizer):
                     enable_forward_pre_hook(gpt_model)
                     self.cuda_graph_helper.cuda_graph_set_manual_hooks()
 

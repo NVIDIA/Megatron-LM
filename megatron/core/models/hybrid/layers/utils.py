@@ -1,5 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from collections.abc import Callable, Sequence
+
+from torch import Tensor
+
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -116,6 +120,40 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+
+def validate_shared_rotary_config(
+    layer_configs: Sequence[TransformerConfig], kv_channels: int, position_embedding_type: str
+) -> None:
+    """Require standard attention layers to match the model's shared RoPE width.
+
+    MLA, DSA, and CSA construct their own rotary embeddings and are not constrained here.
+    """
+    if position_embedding_type not in ("rope", "yarn"):
+        return
+    for layer_config in layer_configs:
+        if type(layer_config) is AttentionLayerConfig and layer_config.kv_channels != kv_channels:
+            raise ValueError(
+                f"AttentionLayerConfig.kv_channels ({layer_config.kv_channels}) must match "
+                f"HybridModel config.kv_channels ({kv_channels}) when using "
+                f"position_embedding_type={position_embedding_type!r}: decoder and MTP "
+                "attention layers use the model's shared rotary embeddings."
+            )
+
+
+def get_attention_variant_loss_scale_func(
+    layer_configs: Sequence[TransformerConfig],
+) -> Callable[[Tensor], None] | None:
+    """Return the scheduler loss-scale hook required by the architecture's indexers."""
+    if any(
+        type(layer_config) in (DSALayerConfig, CSALayerConfig) for layer_config in layer_configs
+    ):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        return DSAIndexerLossAutoScaler.set_loss_scale
+    return None
 
 
 def validate_tp_comm_overlap(

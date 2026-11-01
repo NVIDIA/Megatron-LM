@@ -52,11 +52,11 @@ class MoKMegakernel(MegakernelBackend):
             from mok.functional import MoKConfig
         except ImportError as exc:
             raise ImportError(
-                "moe_megakernel_backend='mok' requires the latest mixture-of-kittens package "
-                "on PYTHONPATH"
+                "moe_megakernel_backend='mok' requires the MCore integration fork of "
+                "mixture-of-kittens; see the MOK installation instructions in "
+                "megatron/core/transformer/moe/README.md"
             ) from exc
 
-        # TODO: Add a materialized-wgrad adapter before allowing non-fused accumulation.
         if not config.gradient_accumulation_fusion:
             raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
         if config.moe_mlp_glu_interleave_size is not None:
@@ -84,16 +84,6 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        if self.use_mxfp8_weights:
-            from megatron.core import fp8_utils
-
-            if fp8_utils.te_post_all_gather_processing is None:
-                raise RuntimeError(
-                    "MOK MXFP8 requires Transformer Engine with "
-                    "post_all_gather_processing support (normally TE >= 2.10.0). Older TE "
-                    "versions rely on a later TE expert forward to refresh columnwise weights, "
-                    "but MOK bypasses that forward path."
-                )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         try:
             self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
@@ -244,13 +234,21 @@ class MoKMegakernel(MegakernelBackend):
                 "MOK shared output gate must be a native contiguous BF16 Parameter "
                 "with shape [1, H]"
             )
-        # Include the same gate Parameter in MOK's param-gather hooks. Its native
-        # shared_experts owner still saves/loads the only checkpoint entry.
+        # Include the native gate in parameter-gather hooks without adding a
+        # second optimizer parameter or checkpoint entry.
         self.register_parameter("shared_output_gate_weight", output_gate)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
-        """Build or refresh cached MOK routed-weight views."""
+        """Alias native payloads and refresh the converted scales after parameter sync.
+
+        With overlapped parameter gathering, DDP's pre-hook on our aliases finishes
+        all-gather before forward.
+        Grad-buffer reuse requantizes into TE storage and clears the staging buffer;
+        the MOK payload views reference TE storage, not that temporary buffer.
+        Scale conversion still needs to run after each optimizer update, in place
+        so descriptors keep their addresses. It does not requantize the weights.
+        """
         needs_weight_view_update = self._routed_weight_view_cache is None or (
             self.use_mxfp8_weights and self.is_first_microbatch
         )
@@ -260,42 +258,41 @@ class MoKMegakernel(MegakernelBackend):
                 if self._routed_weight_view_cache is None
                 else self._routed_weight_view_cache
             )
-            if self.native_single_grouped_weights:
-                fc1_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc1_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc2_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
-            else:
-                fc1_weight_view = _native_split_weight_view(
-                    self.routed_fc1_parameters,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_split_weight_view(
-                    self.routed_fc2_parameters,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
+            fc1_weight_view = self._routed_weight_view(
+                self.routed_fc1_parameters,
+                rows=2 * self.intermediate_size,
+                columns=self.hidden_size,
+                cached_view=cached_fc1,
+            )
+            fc2_weight_view = self._routed_weight_view(
+                self.routed_fc2_parameters,
+                rows=self.hidden_size,
+                columns=self.intermediate_size,
+                cached_view=cached_fc2,
+            )
             self._routed_weight_view_cache = (fc1_weight_view, fc2_weight_view)
 
         self.is_first_microbatch = False
         return self._routed_weight_view_cache
+
+    def _routed_weight_view(self, parameters, *, rows, columns, cached_view):
+        """Select the storage adapter using this backend's layout and precision."""
+        if self.native_single_grouped_weights:
+            return _native_single_grouped_weight_view(
+                parameters[0],
+                num_experts=self.num_local_experts,
+                rows=rows,
+                columns=columns,
+                use_mxfp8=self.use_mxfp8_weights,
+                cached_view=cached_view,
+            )
+        return _native_split_weight_view(
+            parameters,
+            rows=rows,
+            columns=columns,
+            use_mxfp8=self.use_mxfp8_weights,
+            cached_view=cached_view,
+        )
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,
     # optimizer state, and checkpoint shards. This supports regular/distributed
@@ -352,7 +349,7 @@ class MoKMegakernel(MegakernelBackend):
                 if isinstance(value, MethodType) and value.__self__ is old_param:
                     value = MethodType(value.__func__, new_param)
                 setattr(new_param, key, value)
-        # Invalidate derived views after conversion; parameters stay native-owned.
+        # Device/dtype conversion invalidates cached storage views and descriptors.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
         self.is_first_microbatch = True

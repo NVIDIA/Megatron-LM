@@ -190,11 +190,28 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
+    """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.megatron_fsdp_padded_shards is True
+    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
+
+    disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
+    assert disabled_args.megatron_fsdp_padded_shards is False
+    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
+    assert ddp_config.megatron_fsdp_padded_shards is False
+
+
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size
 ):
-    from megatron.training import global_vars
+    from megatron.training import global_vars, vocab_utils
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -203,19 +220,20 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     args.moe_num_hash_layers = 1
     args.hash_moe_vocab_size = explicit_hash_vocab_size
     args.vocab_size = 100000
-    args.padded_vocab_size = 100352
     tokenizer = SimpleNamespace(vocab_size=100003)
+    cfg = MagicMock()
+    cfg.tokenizer = SimpleNamespace(pad_vocab_size=True, padded_vocab_size=100352)
     monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
-    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+    monkeypatch.setattr(vocab_utils, 'build_tokenizer', lambda _args: tokenizer)
 
-    global_vars._build_tokenizer(args)
+    global_vars._build_tokenizer(cfg, args)
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
 
     expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
     assert config.hash_moe_vocab_size == expected
     assert args.hash_moe_vocab_size == expected
     assert args.vocab_size == 100000
-    assert args.padded_vocab_size == 100352
+    assert cfg.tokenizer.padded_vocab_size == 100352
 
 
 @pytest.mark.parametrize('legacy', [False, True])

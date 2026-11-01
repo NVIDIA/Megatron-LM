@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -12,11 +13,13 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
-from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core import tensor_parallel
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -63,6 +66,8 @@ __all__ = [
     "_GDNBase",
     "_build_head_perm_for_split_sections",
     "_build_thd_cp_a2a_perm",
+    "_build_with_kda_fp8_disabled",
+    "_kda_fp8_disabled",
     "_split_tensor_factory",
     "a2a_cp_to_hp",
     "a2a_hp_to_cp",
@@ -105,6 +110,22 @@ def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     This path avoids timing-selected reduction layouts in deterministic training.
     """
     return _TorchL2Norm.apply(x, eps)
+
+
+def _kda_fp8_disabled(config: TransformerConfig) -> bool:
+    # Copied GDN layer configs can carry KDA settings from the stack config too.
+    return isinstance(config, KDALayerConfig) and config.kda_disable_fp8
+
+
+def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
+    """Build a KDA projection without quantized parameter initialization when requested."""
+    init_context = (
+        get_fp8_disabled_context(fp8_config, is_init=True)
+        if _kda_fp8_disabled(fp8_config)
+        else nullcontext()
+    )
+    with init_context:
+        return build_module(module_spec, *args, **kwargs)
 
 
 @dataclass
@@ -278,16 +299,21 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
         # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        # Two-stage gates use separate projections; in_proj emits QKV only.
+        if getattr(self, "two_stage_gates", False):
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim
+        else:
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8:
+        if self.config.fp8 and not _kda_fp8_disabled(self.config):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
+        self.in_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
@@ -356,7 +382,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_gdn = "gdn" in self.config.recompute_modules
 
-        self.out_proj = build_module(
+        self.out_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.out_proj,
             self.v_dim,
             self.hidden_size,
@@ -475,6 +502,34 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_forward(hidden_states):
+                norm_out = self.forward_pre_attn_and_core_attn(
+                    hidden_states,
+                    attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                    **kwargs,
+                )
+                return self.forward_post_core_attn(norm_out)
+
+            if self.config.fp8 or self.config.fp4:
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                return te_checkpoint(
+                    _checkpointed_forward,
+                    self.config.distribute_saved_activations,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            return tensor_parallel.checkpoint(
+                _checkpointed_forward, self.config.distribute_saved_activations, hidden_states
+            )
+
         norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
             attention_mask,

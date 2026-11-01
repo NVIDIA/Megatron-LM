@@ -2727,6 +2727,30 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+
+        if self.ddp_config.gradient_reduce_div_fusion:
+            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
+            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
+            requires_grad_only = (
+                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
+            )
+            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
+                if bucket_id != bucket_group[0]:
+                    continue
+                grad_comm_dtypes = {
+                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
+                    for i in bucket_group
+                    if self.parameter_groups[i].requires_grad or not requires_grad_only
+                }
+                if len(grad_comm_dtypes) > 1:
+                    raise ValueError(
+                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
+                        "mixed gradient communication dtypes in a coalesced bucket group "
+                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
+                        "Set gradient_reduce_div_fusion=False "
+                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
+                    )
+
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Persistent communication-buffer pooling. The default pool size is two,
             # while combined 1F1B overlap may require a third concurrently-live unit.
@@ -4671,6 +4695,8 @@ class AllGatherPipeline:
         self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
         # One DP-Outer event may be shared by all buckets in a coalesced group.
         self.outer_bucket_ready_events: Dict[Tuple[int, bool], torch.cuda.Event] = {}
+        # Buckets whose row-wise weights are re-gathered by activation recompute in backward.
+        self.recompute_buckets: set = set()
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4826,23 +4852,23 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         bwd: bool,
+        outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that need
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
+        stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
+        group added may exceed it."""
         parameter_groups = self.buffer.parameter_groups
-        result = list(bucket_ids)
+        allgathered_bucket_ids = set(bucket_ids)
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                candidate = result[0] + 1
-                for existing_bucket_id in result[1:]:
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = min(allgathered_bucket_ids) + 1
+                while candidate in allgathered_bucket_ids:
                     candidate += 1
             else:
-                candidate = result[-1] - 1
-                for existing_bucket_id in reversed(result[:-1]):
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = max(allgathered_bucket_ids) - 1
+                while candidate in allgathered_bucket_ids:
                     candidate -= 1
             if candidate < 0 or candidate >= self.buffer.num_buckets:
                 return None
@@ -4851,32 +4877,39 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
-        base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
-        )
-        bucket_id = next_bucket_id()
-        while bucket_id is not None:
-            prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
-                - base_all_gather_size
+        def needs_outer_gather(bucket_id):
+            group = parameter_groups[bucket_id]
+            if not outer_fsdp_group_param_gather or group.hfsdp_helper_wbuf is None:
+                return False
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
             )
-            if prefetched_size >= suggested_prefetch_size:
-                break
+            return outer_fsdp_group.size() > 1
 
+        def all_gather_size(bucket_id):
+            if not (
+                needs_outer_gather(bucket_id) or self.get_fsdp_buffer(bucket_id).is_data_distributed
+            ):
+                return 0
+            return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+
+        prefetched_size = 0
+        bucket_id = next_bucket_id()
+        while bucket_id is not None and prefetched_size < suggested_prefetch_size:
             if self.buffer.ddp_config.fsdp_double_buffer:
                 candidate_buckets = self.buffer.bucket_to_bucket_group[bucket_id]
-                if not self._persistent_allocators_can_fit(result + candidate_buckets, bwd):
+                if not self._persistent_allocators_can_fit(
+                    sorted(allgathered_bucket_ids) + candidate_buckets, bwd
+                ):
                     break
 
-            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            result = list(sorted(set(result)))
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id])
+            new_bucket_ids -= allgathered_bucket_ids
+            prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
+            allgathered_bucket_ids |= new_bucket_ids
             bucket_id = next_bucket_id()
 
-        return result
+        return sorted(allgathered_bucket_ids)
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
@@ -4942,6 +4975,7 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
+        recompute: bool = False,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4958,10 +4992,72 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
+            recompute (bool, optional): Whether this is a row-wise (`bwd=False`) gather for
+                the forward that activation recompute re-runs during the backward pass. The
+                gathered buckets that have a transpose buffer are recorded, and later backward
+                gathers also gather the row-wise weights of recorded buckets in their window.
         """
+        assert not (bwd and recompute), "Recompute gathers are row-wise (bwd=False)."
         if len(params) == 0:
             return
 
+        gather_kwargs = dict(
+            prefetch_order=prefetch_order,
+            suggested_AG_prefetch_size=suggested_AG_prefetch_size,
+            async_param_gather=async_param_gather,
+            outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+        )
+        window = self._all_gather_bucket_window(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        if recompute:
+            self._record_recompute_buckets(window)
+        elif bwd:
+            self._gather_recompute_buckets(window, gather_kwargs)
+
+    def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
+        """Record the buckets whose row-wise weights a recomputed forward re-gathered.
+        Buckets without a transpose buffer use the same weights in forward and backward.
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            return
+        parameter_groups = self.buffer.parameter_groups
+        self.recompute_buckets.update(
+            bucket_id
+            for bucket_id in bucket_ids
+            if parameter_groups[bucket_id].transpose_weight_buffer is not None
+        )
+
+    def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
+        """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
+        not already gathered, so that their recomputed forward does not wait on them."""
+        pending = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.recompute_buckets
+            and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
+        ]
+        if not pending:
+            return
+        params = [
+            param
+            for bucket_id in pending
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        self._all_gather_bucket_window(params, prefetch=False, bwd=False, **gather_kwargs)
+
+    def _all_gather_bucket_window(
+        self,
+        params: List[torch.Tensor],
+        prefetch: bool = False,
+        prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_AG_prefetch_size: Optional[int] = None,
+        async_param_gather: bool = True,
+        outer_fsdp_group_param_gather: bool = False,
+        bwd: bool = False,
+    ) -> List[int]:
+        """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
+        them, as described in `all_gather_params`. Return all of these bucket IDs, including
+        those that were already gathered."""
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
@@ -5000,7 +5096,11 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, bwd
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                bwd,
+                outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
@@ -5016,6 +5116,7 @@ class AllGatherPipeline:
         for bucket_id in ag_buckets:
             self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
+        extended_buckets = ag_buckets
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
         ag_buckets = [
@@ -5025,7 +5126,7 @@ class AllGatherPipeline:
             in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
-            return
+            return extended_buckets
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
@@ -5075,6 +5176,8 @@ class AllGatherPipeline:
         if not async_param_gather:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
+
+        return extended_buckets
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
         """Wait for the bucket to be ready."""

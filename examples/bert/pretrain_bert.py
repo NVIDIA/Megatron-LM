@@ -20,7 +20,6 @@ from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.bert.bert_model import BertModel
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.argument_utils import (
@@ -29,6 +28,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from megatron.training.utils import average_losses_across_data_parallel_group
@@ -41,6 +41,7 @@ def model_provider(
 
     print_rank_0('building BERT model ...')
 
+    cfg = get_run_config()
     args = get_args()
     if config is None:
         config = core_transformer_config_from_args(args)
@@ -57,7 +58,7 @@ def model_provider(
     model = BertModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         num_tokentypes=num_tokentypes,
         add_binary_head=args.bert_binary_head,
@@ -140,8 +141,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """Build train, valid, and test datasets."""
     cfg = get_run_config()
     args = get_args()
-
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,
