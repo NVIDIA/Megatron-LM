@@ -243,7 +243,8 @@ class TestDynamicContextTensorParallelSize:
         assert nvls_buffers.call_args.kwargs["per_rank_worst_case_token_count"] == (
             per_rank_token_count
         )
-        assert nvls_buffers.call_args.kwargs["ep_group"] is pg_collection.ep
+        # With an expert TP size of 1, the tp_ep group spans the same ranks as the EP group.
+        assert nvls_buffers.call_args.kwargs["tp_ep_group"] is pg_collection.tp_ep
         vllm_buffers.assert_called_once()
         assert vllm_buffers.call_args.kwargs["max_tokens"] == max(
             max_tokens, per_rank_token_count * ep_size

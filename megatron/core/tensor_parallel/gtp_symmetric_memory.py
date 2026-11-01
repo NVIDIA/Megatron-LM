@@ -232,6 +232,26 @@ class RegisteredLIFOPool:
         flat._gtp_wgrad_reuse_event = ready_event
         self._free[(buf.numel(), buf.dtype, group.group_name)].append(flat)
 
+    def reset_completed_reuse_events(self) -> None:
+        """Drop every reuse fence, retaining the registered storage.
+
+        Call outside capture, when no eager reader can be in flight (the device synchronized):
+
+        * before a full-iteration capture: fences recorded by eager work cannot be waited on
+          from inside a capture, even once that work has completed. Fences left by an earlier
+          capture may be present too; they must not be queried, which is why this drops
+          unconditionally rather than checking completion;
+        * when the graphs are reset: training resumes eagerly, and an eager ``wait_event`` on a
+          fence recorded inside a capture fails with ``cudaErrorInvalidValue``.
+
+        Releases during capture still attach their normal fences, which become graph edges.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Reset GTP symmetric reuse events outside CUDA-graph capture")
+        for bucket in self._free.values():
+            for buf in bucket:
+                buf._gtp_wgrad_reuse_event = None
+
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
         self._free.clear()
