@@ -955,7 +955,8 @@ def test_callbacks_construct_from_registered_model_config(
         assert build.call_args.kwargs["relative_attention_max_distance"] == 128
 
 
-def test_model_precision_is_derived_centrally(monkeypatch, run_config):
+@pytest.mark.parametrize("fp8_recipe", ["delayed", "tensorwise"])
+def test_model_precision_is_derived_centrally(monkeypatch, run_config, fp8_recipe):
     from megatron.core.optimizer import OptimizerConfig
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
@@ -969,23 +970,20 @@ def test_model_precision_is_derived_centrally(monkeypatch, run_config):
             num_attention_heads=4,
             bf16=True,
             params_dtype=torch.bfloat16,
+            fp8_recipe=fp8_recipe,
         ),
         seq_length=64,
     )
+    run_config.optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
+    assert run_config.optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
     run_config.finalize()
-    runtime_optimizer = OptimizerConfig()
-    runtime_optimizer = run_config.finalize_optimizer_config(runtime_optimizer)
-    for config in (run_config.optimizer, runtime_optimizer):
-        assert config.bf16 and not config.fp16
-        assert config.params_dtype is torch.bfloat16
-
+    assert run_config.optimizer.bf16 and not run_config.optimizer.fp16
+    assert run_config.optimizer.params_dtype is torch.bfloat16
+    assert run_config.optimizer.fp8_recipe == fp8_recipe
     # The recipe also changes an optimizer-derived precision flag, not just metadata.
-    run_config.model.transformer.fp8_recipe = "tensorwise"
-    runtime_optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
-    assert runtime_optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-    runtime_optimizer = run_config.finalize_optimizer_config(runtime_optimizer)
-    assert runtime_optimizer.fp8_recipe == "tensorwise"
-    assert not runtime_optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    assert run_config.optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8 is (
+        fp8_recipe == "delayed"
+    )
 
 
 def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals, run_config):

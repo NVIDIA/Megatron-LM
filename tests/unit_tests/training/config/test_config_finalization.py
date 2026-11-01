@@ -2,6 +2,7 @@
 """Container validation is read-only; runtime initialization owns derivation."""
 
 import copy
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -128,14 +129,45 @@ def test_validate_topology_without_launch_state(monkeypatch, run_config, field, 
 
 
 def test_optimizer_precision_override_is_reported(run_config, caplog):
+    run_config.train.micro_batch_size = 1
     run_config.model.transformer.bf16 = True
     with caplog.at_level("WARNING", logger="megatron.training.config.container"):
-        optimizer = run_config.finalize_optimizer_config(run_config.optimizer)
-    assert optimizer.bf16
+        run_config.finalize()
+    assert run_config.optimizer.bf16
     assert "bf16" in caplog.text and "Overriding optimizer precision" in caplog.text
     caplog.clear()
-    run_config.finalize_optimizer_config(optimizer)
+    run_config.finalize()
     assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "model_recipe,optimizer_recipe", [("delayed", None), ("tensorwise", "delayed")]
+)
+def test_optimizer_validation_uses_model_precision(run_config, model_recipe, optimizer_recipe):
+    run_config.train.micro_batch_size = 1
+    run_config.model.transformer.fp8_recipe = model_recipe
+    run_config.optimizer.fp8_recipe = optimizer_recipe
+    run_config.optimizer.optimizer_cpu_offload = True
+    run_config.optimizer.use_precision_aware_optimizer = True
+    run_config.ddp.fp8_param_gather = True
+    before = copy.deepcopy(run_config.to_dict())
+
+    for _ in range(2):
+        if model_recipe == "delayed":
+            run_config.validate()
+        else:
+            with pytest.raises(AssertionError, match="delayed"):
+                run_config.validate()
+        assert run_config.to_dict() == before
+        assert not run_config._finalized
+
+    if model_recipe == "delayed":
+        run_config.finalize()
+        assert run_config.optimizer.fp8_recipe == model_recipe
+    else:
+        with pytest.raises(AssertionError, match="delayed"):
+            run_config.finalize()
+        assert run_config.to_dict() == before
 
 
 @pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])
@@ -180,6 +212,48 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
     assert run_config.rng.te_rng_tracker
+
+
+@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+@pytest.mark.parametrize(
+    "optimizer, use_distributed_optimizer, use_layer_wise_distributed_optimizer",
+    [
+        ("adam", True, False),
+        ("sgd", True, False),
+        ("muon", True, False),
+        ("dist_muon", False, False),
+        ("muon", False, True),
+    ],
+)
+def test_finalization_resolves_layer_wise_ddp_flag(
+    monkeypatch,
+    run_config,
+    use_layer_wise_param_layout,
+    optimizer,
+    use_distributed_optimizer,
+    use_layer_wise_distributed_optimizer,
+):
+    monkeypatch.setattr(
+        global_vars,
+        "_GLOBAL_ARGS",
+        SimpleNamespace(
+            batch_parallel_size=1, use_layer_wise_param_layout=use_layer_wise_param_layout
+        ),
+    )
+    run_config.train.micro_batch_size = 1
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
+    run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    run_config.ddp.use_distributed_optimizer = use_distributed_optimizer
+
+    run_config.finalize()
+
+    layer_wise = optimizer in ("muon", "dist_muon")
+    assert run_config.optimizer.use_layer_wise_distributed_optimizer is layer_wise
+    assert run_config.optimizer.use_distributed_optimizer is (not layer_wise)
+    # Layout-enabled wrapping opts back into DistOpt buffers later; finalization
+    # must preserve the legacy baseline for either layout setting.
+    assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
 
 
 @pytest.mark.parametrize("storage", ["dict", "yaml"])

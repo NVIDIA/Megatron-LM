@@ -147,9 +147,6 @@ def container_factory(monkeypatch):
     from megatron.training import training
 
     monkeypatch.setattr(
-        training, "get_megatron_optimizer_config", lambda args, **_: (OptimizerConfig(), None)
-    )
-    monkeypatch.setattr(
         training, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
     )
 

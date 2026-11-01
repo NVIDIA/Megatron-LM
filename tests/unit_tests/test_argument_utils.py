@@ -4,6 +4,7 @@ import signal
 import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
@@ -26,6 +27,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.models import BertModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -1423,13 +1425,7 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with (
-        patch(
-            "megatron.training.training.get_megatron_optimizer_config",
-            return_value=(mock_optimizer_config, {}),
-        ),
-        patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config),
-    ):
+    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
         yield
 
 
@@ -1441,25 +1437,9 @@ class TestPretrainContainerFromArgsStructure:
         assert isinstance(result, PretrainConfigContainer)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
-        """Test that optimizer config comes from get_megatron_optimizer_config."""
-        mock_optimizer = OptimizerConfig(lr=0.123, weight_decay=0.456)
-        mock_opt.return_value = (mock_optimizer, {})
-        mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
-        args = _make_args()
-        result = pretrain_cfg_container_from_args(args)
-        mock_opt.assert_called_once_with(args)
-        assert result.optimizer.lr == mock_optimizer.lr
-        assert result.optimizer.weight_decay == mock_optimizer.weight_decay
-        assert result.optimizer.params_dtype == result.model.transformer.params_dtype
-
-    @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
+    def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
-        mock_opt.return_value = (OptimizerConfig(), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
@@ -1469,10 +1449,6 @@ class TestPretrainContainerFromArgsStructure:
     @pytest.mark.parametrize("enabled", [False, True])
     def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
         args = _make_args(use_megatron_fsdp=enabled, fake_process_group=enabled)
-        monkeypatch.setattr(
-            "megatron.training.training.get_megatron_optimizer_config",
-            lambda args: (OptimizerConfig(), {}),
-        )
 
         cfg = pretrain_cfg_container_from_args(args)
 
@@ -1480,6 +1456,54 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.ddp.use_megatron_fsdp is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
+
+
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("constraint", ["vpp", "grouped_weights"])
+def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, constraint):
+    args = _make_args(moe_grouped_gemm=True, moe_use_grouped_tensor=True)
+    args.micro_batch_size = 1
+    args.global_batch_size = 1
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.optimizer = "adam" if constraint == "vpp" else "muon"
+    args.overlap_param_gather = constraint == "vpp"
+    args.overlap_grad_reduce = constraint == "vpp"
+    args.overlap_param_gather_with_optimizer_step = constraint == "vpp"
+    model_inputs = dict(
+        virtual_pipeline_model_parallel_size=2 if valid else None,
+        moe_single_grouped_weight=not valid,
+    )
+    # Native model values must win even when the old args disagree.
+    args_valid = not valid if native_model else valid
+    args.virtual_pipeline_model_parallel_size = 2 if args_valid else None
+    args.moe_single_grouped_weight = not args_valid
+    model = None
+    if native_model:
+        # Callback models do not proxy TransformerConfig attributes at the top level.
+        transformer = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+        transformer.virtual_pipeline_model_parallel_size = model_inputs[
+            "virtual_pipeline_model_parallel_size"
+        ]
+        transformer.moe_single_grouped_weight = model_inputs["moe_single_grouped_weight"]
+        model = BertModelConfig(transformer=transformer, seq_length=64)
+    message = "interleaved pipeline" if constraint == "vpp" else "single-grouped-weight"
+    with nullcontext() if valid else pytest.raises(AssertionError, match=message):
+        cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
+        cfg.validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
+def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch"
+    args.use_layer_wise_param_layout = False
+    with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
 
 
 class TestCheckpointConfigMapping:

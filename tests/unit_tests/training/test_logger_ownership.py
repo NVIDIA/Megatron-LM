@@ -68,9 +68,6 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     args.modules_to_filter = ['module']
     args.log_interval = 7
     monkeypatch.setattr(
-        training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
-    )
-    monkeypatch.setattr(
         training,
         'get_megatron_ddp_config',
         lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),
@@ -303,7 +300,6 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     import torch
 
     from megatron.training.argument_utils import core_transformer_config_from_args
-    from megatron.training.training import get_megatron_optimizer_config
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -320,11 +316,8 @@ def test_core_metric_flags_keep_cli_defaults_and_owners(enabled):
     args.main_grads_dtype = args.main_params_dtype = torch.float32
     args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
     transformer = core_transformer_config_from_args(args)
-    optimizer, _ = get_megatron_optimizer_config(args)
     assert transformer.log_max_attention_logit is enabled
     assert transformer.barrier_with_L1_time is (not enabled)
-    assert optimizer.log_num_zeros_in_grad is enabled
-    assert optimizer.barrier_with_L1_time is (not enabled)
     names = {item.name for item in fields(LoggerConfig)}
     assert not names & {'log_max_attention_logit', 'log_num_zeros_in_grad', 'barrier_with_L1_time'}
 

@@ -297,21 +297,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
-    def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
-        """Derive configured or legacy-built optimizer precision from the finalized model."""
+    def _optimizer_with_model_precision(self) -> OptimizerConfig:
+        """Return an optimizer copy with authoritative model precision, without mutation."""
         precision = {
             name: getattr(self.model.transformer, name)
             for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
         }
-        changes = {
-            name: (getattr(optimizer, name), value)
-            for name, value in precision.items()
-            if getattr(optimizer, name) != value
-        }
-        if changes:
-            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
-        # Reconstruct so optimizer-local derived precision settings are recomputed too.
-        return replace(optimizer, **precision)
+        return replace(self.optimizer, **precision)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -407,7 +399,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
         self.rl.validate_ddp_config(self.ddp)
-        super().validate()
+        optimizer = self._optimizer_with_model_precision()
+        # Validate effective precision without modifying either config or finalizing early.
+        ConfigContainerBase.validate(replace(self, optimizer=optimizer))
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
@@ -437,6 +431,21 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
+        optimizer.validate_run(
+            ddp_config=self.ddp,
+            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            ckpt_format=self.checkpoint.ckpt_format,
+        )
+        optimizer.validate_model(
+            moe_single_grouped_weight=transformer.moe_single_grouped_weight,
+            virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
+        )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
         self._validate_data_section()
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
@@ -456,12 +465,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The rollout deployment (inference shards, model CP) is not a pretrain section;
             # validate_args checks that rule from the launch arguments.
             separate_inference_model=None,
-        )
-        self.scheduler.validate_run(
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            weight_decay=self.optimizer.weight_decay,
         )
 
     def _validate_data_section(self) -> None:
@@ -559,13 +562,23 @@ class PretrainConfigContainer(ConfigContainerBase):
         finalize_model = getattr(self.model, "finalize", None)
         if callable(finalize_model):
             finalize_model()
-        optimizer = self.finalize_optimizer_config(self.optimizer)
+        optimizer = self._optimizer_with_model_precision()
+        changes = {
+            name: (getattr(self.optimizer, name), getattr(optimizer, name))
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+            if getattr(self.optimizer, name) != getattr(optimizer, name)
+        }
+        if changes:
+            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         self.optimizer = optimizer
+        self.optimizer.finalize_optimizer_config()
+        if self.optimizer.use_layer_wise_distributed_optimizer:
+            self.ddp.use_distributed_optimizer = False
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:

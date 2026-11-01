@@ -6,6 +6,7 @@ import itertools
 import math
 import tempfile
 import traceback
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -19,6 +20,8 @@ import torch.multiprocessing as mp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -854,8 +857,16 @@ class TestRLUtils:
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
     @pytest.mark.parametrize("has_optimizer", [False, True], ids=["no-optimizer", "optimizer"])
+    @pytest.mark.parametrize("separate_training_model", [False, True])
+    @pytest.mark.parametrize("initialize_model_parallel", [(1, 1)], indirect=True)
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts, has_optimizer
+        self,
+        monkeypatch,
+        initialize_model_parallel,
+        share_config,
+        num_experts,
+        has_optimizer,
+        separate_training_model,
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -872,7 +883,24 @@ class TestRLUtils:
             )
         )
         lang_module = DummyLangModule(layer_config)
+        lang_module.rotary_pos_emb = RotaryEmbedding(32, 1.0)
         model = [SimpleNamespace(config=config, module=lang_module)]
+        training_lang_module = lang_module
+        training_model = None
+        if separate_training_model:
+            training_lang_module = DummyLangModule(config)
+            training_lang_module.rotary_pos_emb = YarnRotaryEmbedding(32, 1.0)
+            training_model = [SimpleNamespace(module=training_lang_module)]
+
+        def cached_embedding_refs():
+            refs = []
+            for module in (lang_module, training_lang_module):
+                embedding = module.rotary_pos_emb(16)
+                refs.append(
+                    weakref.ref(embedding[0] if isinstance(embedding, tuple) else embedding)
+                )
+            return refs
+
         args = SimpleNamespace(
             num_experts=num_experts,
             cuda_graph_impl="local",
@@ -887,13 +915,19 @@ class TestRLUtils:
 
         # --rl-rollout-only --no-load-optim runs the loop with no optimizer: no param sync.
         optimizer = MagicMock() if has_optimizer else None
-        with rl_utils.megatron_rl_inference_mode(model, optimizer, "local", False) as result:
+        training_refs = cached_embedding_refs()
+        with rl_utils.megatron_rl_inference_mode(
+            model, optimizer, "local", False, training_model=training_model
+        ) as result:
             assert result is interface
+            assert all(ref() is None for ref in training_refs)
+            generation_refs = cached_embedding_refs()
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
                 assert current_config.cuda_graph_modules == []
                 assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
+        assert all(ref() is None for ref in generation_refs)
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),
             call(lang_module, "none"),
@@ -914,9 +948,13 @@ class TestRLUtils:
             assert current_config.cuda_graph_modules == expected_modules
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
-        lang_module.train.assert_called_once()
-        if has_optimizer:
+        training_lang_module.train.assert_called_once()
+        if separate_training_model:
+            lang_module.train.assert_not_called()
+        if has_optimizer and not separate_training_model:
             optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+        elif has_optimizer:
+            optimizer.prepare_model_params_for_param_sync.assert_not_called()
 
     @pytest.mark.parametrize("do_train", [True, False], ids=["training", "eval_only"])
     def test_evaluate_and_print_results_rl_wandb_step_handling(self, monkeypatch, do_train):
