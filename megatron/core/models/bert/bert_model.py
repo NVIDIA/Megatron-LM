@@ -126,6 +126,7 @@ class BertModel(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.cp_group,
             )
 
         # Transformer.
@@ -140,7 +141,11 @@ class BertModel(LanguageModule):
         # Output
         if post_process:
             # TODO: Make sure you are passing in the mpu_vocab_size properly
-            self.lm_head = BertLMHead(config.hidden_size, config) if self.apply_lm_head else None
+            self.lm_head = (
+                BertLMHead(config.hidden_size, config, tp_group=self.pg_collection.tp)
+                if self.apply_lm_head
+                else None
+            )
 
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,

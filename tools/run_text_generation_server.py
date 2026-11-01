@@ -25,8 +25,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
@@ -43,7 +45,6 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -174,10 +175,13 @@ def main(model_type: str = "gpt"):
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
         )
 
+    # The HTTP server runs on the first rank of the model's tensor- and expert-parallel groups
+    # on the first pipeline stage.
+    model_pg_collection = get_attr_wrapped_model(model, "pg_collection")
     if (
-        mpu.is_pipeline_first_stage()
-        and mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_expert_model_parallel_rank() == 0
+        is_pp_first_stage(model_pg_collection.pp)
+        and model_pg_collection.tp.rank() == 0
+        and model_pg_collection.ep.rank() == 0
     ):
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)

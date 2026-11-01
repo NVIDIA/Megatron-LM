@@ -7,31 +7,40 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
 from megatron.core import tensor_parallel
+from megatron.core.datasets.bert_dataset import (
+    BERTMaskedWordPieceDataset,
+    BERTMaskedWordPieceDatasetConfig,
+)
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.enums import ModelType
+from megatron.core.models.bert.bert_layer_specs import (
+    bert_layer_local_spec,
+    bert_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.bert.bert_model import BertModel
-from megatron.training import pretrain
-from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.utils import get_pg_rank
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
     get_tokenizer,
     set_run_config,
 )
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
-from megatron.core.datasets.utils import get_blend_from_list
-from megatron.core import mpu, tensor_parallel
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
     """Build the model."""
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building BERT model ...')
 
@@ -60,7 +69,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
         parallel_output=True,
         pre_process=pre_process,
         post_process=post_process,
-        vp_stage=vp_stage)
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
+    )
 
     return model
 
@@ -137,8 +148,29 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
-    """Build train, valid, and test datasets."""
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, pg_collection=None
+):
+    """Build train, valid, and test datasets.
+
+    Args:
+        train_val_test_num_samples: Target sizes of the train, validation and test datasets.
+        vp_stage: Virtual pipeline stage of the model chunk the datasets feed.
+        pg_collection: Process groups of the run. The first rank of its tensor-parallel group
+            builds the datasets. Omitting it is deprecated: the groups are then built from the
+            global parallel state, with a ProcessGroupFallbackWarning.
+    """
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "pretrain_bert.train_valid_test_datasets_provider",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+    if pg_collection.tp is None:
+        raise ValueError("train_valid_test_datasets_provider requires pg_collection.tp")
+    tp_group = pg_collection.tp
+
     cfg = get_run_config()
     args = get_args()
     tokenizer = get_tokenizer()
@@ -173,7 +205,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         BERTMaskedWordPieceDataset,
         train_val_test_num_samples,
-        lambda: mpu.get_tensor_model_parallel_rank() == 0,
+        lambda: get_pg_rank(tp_group) == 0,
         config,
     ).build()
 

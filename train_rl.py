@@ -12,9 +12,9 @@ from hybrid_builders import hybrid_builder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import is_pipeline_last_stage
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
@@ -299,7 +299,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             packed_seq_params=packed_seq_params
         )
 
-        if not is_pipeline_last_stage():
+        # get_logprobs returns hidden states on every stage but the model's last one.
+        if not is_pp_last_stage(get_attr_wrapped_model(model_to_use, "pg_collection").pp):
             output_tensor = logprobs_or_hidden_states
             kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
                 None,

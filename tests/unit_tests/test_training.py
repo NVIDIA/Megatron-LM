@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
@@ -19,6 +22,7 @@ from megatron.training.global_vars import (
     set_args,
 )
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.state import TrainState
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
@@ -119,13 +123,70 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         pass
 
     builder.build_distributed_models.side_effect = ReachedBuilder
+    pg_collection = ProcessGroupCollection()
     with pytest.raises(ReachedBuilder):
-        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+        training.setup_model_and_optimizer(
+            Mock(), cfg_container=run_config, pg_collection=pg_collection
+        )
     kwargs = builder.build_distributed_models.call_args.kwargs
+    assert kwargs["pg_collection"] is pg_collection
     assert kwargs["ddp_config"] is run_config.ddp
     assert kwargs["use_torch_fsdp2"] is fsdp2
     # Forward both flags unchanged, including the pair rejected by the builder.
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp
+
+
+@pytest.mark.parametrize("pass_collection", [True, False])
+def test_setup_builds_the_model_and_optimizer_on_one_collection(
+    monkeypatch, run_config, pass_collection
+):
+    """Without a collection, one is built once, with a warning, for the model and optimizer."""
+    args = SimpleNamespace(
+        no_load_optim=False,
+        logits_save_dir=None,
+        logits_load_dir=None,
+        moe_use_upcycling=False,
+        load=None,
+        pretrained_checkpoint=None,
+        ckpt_convert_format=None,
+        dump_param_to_param_group_map=None,
+    )
+    pg_collection = ProcessGroupCollection()
+    built_pg_collection = ProcessGroupCollection()
+    build = Mock(return_value=built_pg_collection)
+    get_model = Mock(return_value=[torch.nn.Linear(1, 1)])
+    get_optimizer = Mock()
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_train_state", lambda: TrainState())
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "_build_pg_collection_from_parallel_state", build)
+    monkeypatch.setattr(training, "get_model", get_model)
+    monkeypatch.setattr(training, "get_megatron_optimizer", get_optimizer)
+    monkeypatch.setattr(training, "get_optimizer_param_scheduler", Mock())
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always", ProcessGroupFallbackWarning)
+        training.setup_model_and_optimizer(
+            None,
+            lambda: None,
+            cfg_container=run_config,
+            pg_collection=pg_collection if pass_collection else None,
+        )
+
+    expected = pg_collection if pass_collection else built_pg_collection
+    assert build.call_count == (0 if pass_collection else 1)
+    assert get_model.call_args.kwargs["pg_collection"] is expected
+    assert get_optimizer.call_args.kwargs["pg_collection"] is expected
+    fallbacks = [w for w in record if issubclass(w.category, ProcessGroupFallbackWarning)]
+    assert [str(w.message).split()[0] for w in fallbacks] == (
+        [] if pass_collection else ["setup_model_and_optimizer"]
+    )
 
 
 @pytest.mark.parametrize("optimizer", [None, "optimizer"])
@@ -248,7 +309,9 @@ class TestTraining:
         monkeypatch.setattr(training, "save_checkpoint", save)
 
         with pytest.raises(SystemExit):
-            training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
+            training.setup_model_and_optimizer(
+                None, lambda: None, cfg_container=run_config, pg_collection=ProcessGroupCollection()
+            )
         load.assert_called_once()
         save.assert_called_once()
 

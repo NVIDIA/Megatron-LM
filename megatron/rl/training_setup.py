@@ -3,7 +3,6 @@
 import copy
 from typing import Any, Optional
 
-from megatron.core import mpu
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.num_microbatches_calculator import (
@@ -12,7 +11,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     update_num_microbatches,
 )
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
@@ -210,5 +209,9 @@ class RLSetupCallback(Callback):
                 args,
                 rollout_only=self._rl_config.rl_rollout_only,
             )
-            # RL runs on the plain MPU groups: the loop's data-parallel size for them.
-            reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())
+            # The loop's data-parallel size is that of the model's data-parallel group, which
+            # spans the GTP weight-remat axis, as get_data_parallel_world_size() does by default.
+            # Collections that predate the GTP weight-remat fields carry only the replicate group.
+            pg_collection = get_attr_wrapped_model(self.model[0], "pg_collection")
+            data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+            reinitialize_grpo_microbatch_calculator(args, data_parallel_group.size())
