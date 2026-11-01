@@ -1,30 +1,29 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
-"""Construction-time wide-residual connections and model-boundary helpers."""
+"""Wide-residual parameters, connection policy, and model-boundary helpers."""
 
 from __future__ import annotations
 
 import math
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
     ResidualConnectionOperation,
     ResidualConnectionState,
-    ResidualConnectionWriteState,
 )
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_read,
     streamwise_sigmoid_writeback,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.typed_torch import apply_module
 
 _MIN_CONTROLLER_NUMEL = 128
 
@@ -224,28 +223,25 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             else None
         )
 
-    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return (
-            streamwise_sigmoid_read(
-                hidden_states, self.read_map(return_logits=True), self.num_streams
-            ),
-            (),
-        )
+    def _read(
+        self,
+        hidden_states: Tensor,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        """Read in branch precision before promoting the carried residual."""
 
-    def _read_with_output_dtype(
-        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
-    ) -> tuple[Tensor, ResidualConnectionWriteState]:
-        """Fuse an optional branch-output conversion into the streamwise read."""
-
-        return (
-            streamwise_sigmoid_read(
-                hidden_states,
-                self.read_map(return_logits=True),
-                self.num_streams,
-                output_dtype=output_dtype,
-            ),
-            (),
+        branch_input = streamwise_sigmoid_read(
+            hidden_states,
+            self.read_map(return_logits=True),
+            self.num_streams,
+            output_dtype=branch_input_dtype,
         )
+        # Full-model FP32-residual inputs are normally already FP32. Preserve the defensive
+        # promotion for direct low-precision inputs, after the read has consumed its input.
+        residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual_stream,)
 
     def _write(
         self,
@@ -290,6 +286,78 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             retention_max_forget=(self.retention.max_forget if self.retention is not None else 0.0),
         )
 
+    def _checkpoint_read(
+        self,
+        hidden_states: Tensor,
+        context: ResidualStreamRecomputeContext,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None = None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        """Replay WR's read while retaining its incoming residual stream.
+
+        An optional branch-input dtype request is captured by the replay closure so eager execution
+        and backward reconstruction produce the same branch dtype.
+        """
+
+        def run_read(stream: Tensor) -> tuple[Tensor, ...]:
+            branch_input, state = apply_module(self)(
+                stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
+            )
+            if state[0].shape != stream.shape:
+                raise ValueError(
+                    "Residual connection read returned an incompatible carried stream."
+                )
+            return (branch_input, *state[1:])
+
+        outputs = context.checkpoint(run_read, hidden_states)
+        if torch.is_tensor(outputs):
+            outputs = (outputs,)
+        if not isinstance(outputs, tuple) or not outputs:
+            raise TypeError("Checkpointed residual read must return a non-empty tensor tuple.")
+        if not all(torch.is_tensor(output) for output in outputs):
+            raise TypeError("Checkpointed residual read state must contain only tensors.")
+
+        # This mirrors WR's defensive state promotion. Normal full-model
+        # FP32-residual inputs are already FP32, making .float() an alias rather than a cast kernel;
+        # direct/custom low-precision inputs still need the conversion to preserve replay state.
+        residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
+        return outputs[0], (residual_stream, *outputs[1:])
+
+    def _checkpoint_write(
+        self,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        context: ResidualStreamRecomputeContext,
+        *,
+        dropout_probability: float,
+        training: bool,
+    ) -> Tensor:
+        """Replay WR's whole write, whose output has independent storage."""
+
+        if isinstance(branch_output, tuple):
+            output, bias = branch_output
+            return_tuple = True
+        else:
+            output, bias = branch_output, None
+            return_tuple = False
+
+        def run_write(
+            branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
+        ) -> Tensor:
+            value = (branch_update, branch_bias) if return_tuple else branch_update
+            return apply_module(self)(
+                value,
+                state=connection_state,
+                dropout_probability=dropout_probability,
+                training=training,
+            )
+
+        hidden_states = context.checkpoint(run_write, output, bias, *state)
+        if not torch.is_tensor(hidden_states):
+            raise TypeError("Checkpointed residual write must return a tensor.")
+        return hidden_states
+
 
 _RESIDUAL_STATE_PREFIXES = tuple(
     (f"residual_{operation}{suffix}.{parameter}.", f"residual_connection{suffix}.{parameter}.")
@@ -312,137 +380,6 @@ def load_residual_state(
             if key.startswith(prefix + legacy):
                 state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
-
-
-class WideResidualTransformerLayer(TransformerLayer):
-    """Transformer layer carrying a wide stream around ordinary-width branches."""
-
-    supports_wide_residual_connections: bool = True
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: TransformerLayerSubmodules,
-        layer_number: int = 1,
-        hidden_dropout: Optional[float] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-        vp_stage: Optional[int] = None,
-        is_mtp_layer: bool = False,
-        add_layer_offset: bool = True,
-        pp_layer_offset: Optional[int] = None,
-        hash_moe_layer_threshold: Optional[int] = None,
-        name: str | None = None,
-    ) -> None:
-        if is_mtp_layer:
-            raise ValueError(
-                "MTP auxiliary stacks must use ordinary-width TransformerLayer, not "
-                "WideResidualTransformerLayer."
-            )
-        super().__init__(
-            config=config,
-            submodules=submodules,
-            layer_number=layer_number,
-            hidden_dropout=hidden_dropout,
-            pg_collection=pg_collection,
-            vp_stage=vp_stage,
-            is_mtp_layer=is_mtp_layer,
-            add_layer_offset=add_layer_offset,
-            pp_layer_offset=pp_layer_offset,
-            hash_moe_layer_threshold=hash_moe_layer_threshold,
-            name=name,
-        )
-
-        if config.wide_residual is None:
-            raise ValueError("WideResidualTransformerLayer requires wide_residual config.")
-        if not isinstance(self.cross_attention, IdentityOp):
-            raise NotImplementedError(
-                "WideResidualTransformerLayer does not support cross-attention branches."
-            )
-
-        self.residual_read_self_attn = None
-        self.residual_write_self_attn = None
-        if not isinstance(self.self_attention, IdentityOp):
-            self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="read"
-            )
-            self.residual_write_self_attn = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "self_attention", operation="write"
-            )
-
-        self.residual_read_mlp = None
-        self.residual_write_mlp = None
-        if not isinstance(self.mlp, IdentityOp):
-            self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="read"
-            )
-            self.residual_write_mlp = StreamwiseSigmoidWideResidualConnection(
-                config, self.layer_number, "mlp", operation="write"
-            )
-
-        self.register_load_state_dict_pre_hook(load_residual_state)
-        residual_connections = [
-            reader
-            for reader in (self.residual_read_self_attn, self.residual_read_mlp)
-            if reader is not None
-        ]
-
-        if self.residual_read_self_attn is not None and self._input_layernorm_returns_residual:
-            raise ValueError(
-                "A self-attention residual connection cannot be combined with a layer norm "
-                "that returns its own residual."
-            )
-        if self.residual_read_mlp is not None and self._pre_mlp_layernorm_returns_residual:
-            raise ValueError(
-                "An MLP residual connection cannot be combined with a layer norm that returns "
-                "its own residual."
-            )
-        if residual_connections and self.config.inference_fuse_tp_communication:
-            raise NotImplementedError(
-                "Wide-residual connections do not support fused tensor-parallel inference."
-            )
-
-        self.residual_stream_hidden_size = (
-            config.wide_residual.num_streams * self.config.hidden_size
-        )
-        for connection in residual_connections:
-            if connection.residual_stream_hidden_size != self.residual_stream_hidden_size:
-                raise ValueError(
-                    "All wide-residual connections must carry num_streams * hidden_size "
-                    f"features, expected {self.residual_stream_hidden_size}, got "
-                    f"{connection.residual_stream_hidden_size}."
-                )
-            if connection.branch_hidden_size != self.config.hidden_size:
-                raise ValueError(
-                    "Wide-residual connections around TransformerLayer branches must produce "
-                    f"hidden_size={self.config.hidden_size}, got "
-                    f"{connection.branch_hidden_size}."
-                )
-
-    def _get_self_attention_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the self-attention branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_self_attn
-            case "write":
-                return self.residual_write_self_attn
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
-
-    def _get_mlp_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the MLP or MoE branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_mlp
-            case "write":
-                return self.residual_write_mlp
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):
@@ -488,3 +425,15 @@ def expand_wide_residual_stream(hidden_states: Tensor, num_streams: int) -> Tens
     repeat_shape = [1] * hidden_states.ndim
     repeat_shape[-1] = num_streams
     return hidden_states.repeat(*repeat_shape)
+
+
+def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
+    """Return whether selective residual-stream replay is active for this forward."""
+
+    return bool(
+        training
+        and torch.is_grad_enabled()
+        and config.recompute_granularity == "selective"
+        and config.recompute_modules is not None
+        and "residual_stream" in config.recompute_modules
+    )
