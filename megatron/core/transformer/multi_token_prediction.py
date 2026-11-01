@@ -1169,18 +1169,24 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
-        mtp_preds = None
+        correct = total = None
         if loss_returns_argmax:
             head_loss, mtp_preds = compute_language_model_loss(
                 head_labels, mtp_logits, return_argmax=True
             )
+            if is_training:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
+                )
         else:
+            # Without the argmax from the loss, acceptance must run before CE: fused or
+            # FP32 native CE may overwrite the logits buffer in place, which would make a
+            # later argmax report zero acceptance while the loss stays correct.
+            if is_training:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group
+                )
             head_loss = compute_language_model_loss(head_labels, mtp_logits)
-        correct = total = None
-        if is_training:
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
-            )
         head_loss = layer_loss_mask * head_loss
         return head_loss, correct, total
 
