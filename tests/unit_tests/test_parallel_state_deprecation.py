@@ -761,14 +761,14 @@ class TestStandardGrid:
                 deprecated_in="0.21",
                 removed_in="0.23",
             )
+            # Count only the fallback warning of resolve_process_groups; the helper's own fallback
+            # warning is covered by the helper's tests. The helper and the shim below read the grid
+            # from megatron/core, so neither adds an accessor warning.
+            fallbacks = _fallbacks(record)
             tp_group = get_tensor_model_parallel_group_if_none(None)
         shim = ProcessGroupCollection.use_mpu_process_groups()
 
-        assert [owner for owner, _ in _fallbacks(record)] == [
-            "Owner",
-            "get_tensor_model_parallel_group_if_none "
-            "(from TestStandardGrid.test_core_fallbacks_warn_once_without_accessor_warnings)",
-        ]
+        assert [owner for owner, _ in fallbacks] == ["Owner"]
         assert _deprecated_calls(record) == []
         global_tp_group = parallel_state.get_tensor_model_parallel_group()
         assert pg_collection.tp is tp_group is shim.tp is global_tp_group

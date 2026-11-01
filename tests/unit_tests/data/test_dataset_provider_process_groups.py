@@ -23,9 +23,10 @@ import pretrain_hybrid
 import pretrain_vlm
 from megatron.core import parallel_state, process_groups_config, tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from megatron.training import training
+from megatron.training import arguments, global_vars, training
+from megatron.training import utils as training_utils
 from megatron.training.config import TrainingConfig, ValidationConfig
-from megatron.training.datasets import data_samplers
+from megatron.training.datasets import data_samplers, providers
 from megatron.training.state import TrainState
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from tests.unit_tests.test_utilities import Utils
@@ -153,7 +154,11 @@ def test_dataset_provider_without_a_pg_collection_parameter_is_called_with_the_s
 
 @pytest.fixture(params=[pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
 def dataset_script(request, monkeypatch):
-    """A training script whose dataset rank check reads stubbed arguments and config."""
+    """A training script whose dataset rank check reads stubbed arguments and config.
+
+    The scripts pass the shared predicate of megatron.training.datasets.providers, which reads
+    the arguments and the transformer config at call time from global_vars and arguments.
+    """
     module = request.param
     args = SimpleNamespace(
         sequence_packing_scheduler=None,
@@ -167,8 +172,8 @@ def dataset_script(request, monkeypatch):
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
     )
-    monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(arguments, "core_transformer_config_from_args", lambda args: config)
     return SimpleNamespace(module=module, args=args, config=config)
 
 
@@ -184,14 +189,15 @@ def dataset_script(request, monkeypatch):
         # Middle pipeline stages read data only for packed sequences.
         (0, 1, 4, None, None, None, False, False),
         (0, 1, 4, None, None, None, True, True),
-        # The packing scheduler sends middle stages their metadata itself.
-        (0, 1, 4, None, None, "dp_balanced", True, False),
-        (0, 3, 4, None, None, "dp_balanced", True, True),
+        # The packing scheduler runs on every pipeline stage and reads its input there.
+        (0, 1, 4, None, None, "dp_balanced", True, True),
+        (0, 1, 4, None, None, "dp_balanced", False, True),
+        (1, 1, 4, None, None, "dp_balanced", False, False),
         # With a virtual pipeline, only the first and last model chunks read data.
         (0, 0, 4, 0, 2, None, False, True),
         (0, 0, 4, 1, 2, None, False, False),
         (0, 3, 4, 1, 2, None, False, True),
-        (0, 3, 4, 0, 2, "dp_balanced", True, False),
+        (0, 3, 4, 0, 2, "dp_balanced", True, True),
     ],
 )
 def test_dataset_rank_check_reads_the_supplied_groups(
@@ -229,7 +235,7 @@ def test_dataset_rank_check_places_mtp_on_the_supplied_pipeline_group(
     _use_fake_groups(monkeypatch)
     dataset_script.config.virtual_pipeline_model_parallel_size = vp_size
     mtp_on_this_rank = Mock(return_value=True)
-    monkeypatch.setattr(dataset_script.module, "mtp_on_this_rank_func", mtp_on_this_rank)
+    monkeypatch.setattr(providers, "mtp_on_this_rank", mtp_on_this_rank)
     pgs = _groups(0, 1, 4)
 
     # A middle stage reads data when it holds MTP layers.
@@ -270,9 +276,11 @@ def test_dataset_provider_builds_on_the_supplied_groups(
     _forbid_global_process_groups(monkeypatch)
     _use_fake_groups(monkeypatch)
     module = dataset_script.module
-    monkeypatch.setattr(module, "print_rank_0", lambda message: None)
-    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda args: object())
-    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+    # The scripts' providers run the shared provider body on the run config's data section.
+    data_config = SimpleNamespace(builder_inputs=lambda: (object, object(), False))
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: SimpleNamespace(data=data_config))
+    monkeypatch.setattr(training_utils, "print_rank_0", lambda message: None)
+    monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
 
     datasets = module.train_valid_test_datasets_provider(
         [4, 2, 1], vp_stage=None, pg_collection=_groups(tp_rank, 0, 2)
@@ -325,9 +333,7 @@ def test_dataset_rank_check_without_groups_warns_and_uses_the_global_groups(
     global_groups = _groups(tp_rank, pp_rank, 2)
     use_mpu = Mock(return_value=global_groups)
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", use_mpu)
-    owner = f"{dataset_script.module.__name__}.is_dataset_built_on_rank"
-
-    with _fallback_warning(owner):
+    with _fallback_warning("is_dataset_built_on_rank"):
         built = dataset_script.module.is_dataset_built_on_rank()
 
     assert built is expected
@@ -508,6 +514,7 @@ def test_vlm_model_provider_without_groups_warns_before_using_the_global_groups(
         pass
 
     monkeypatch.setattr(pretrain_vlm, "get_args", Mock)
+    monkeypatch.setattr(pretrain_vlm, "get_run_config", Mock)
     monkeypatch.setattr(
         ProcessGroupCollection, "use_mpu_process_groups", Mock(side_effect=GlobalGroupsRead)
     )
@@ -610,9 +617,7 @@ def _expected_dataset_rank(vp_stage, scheduler, packed):
     is_first_or_last_stage = parallel_state.is_pipeline_first_stage(
         ignore_virtual=ignore_virtual, vp_stage=vp_stage
     ) or parallel_state.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-    if scheduler is not None:
-        return is_first_or_last_stage
-    return packed or is_first_or_last_stage
+    return packed or scheduler is not None or is_first_or_last_stage
 
 
 @pytest.mark.parametrize("vp_size", [None, 2])
