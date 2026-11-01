@@ -1439,6 +1439,24 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
 
+    @pytest.mark.parametrize(
+        "flags, delayed",
+        [
+            ([], False),
+            (["--delay-wgrad-compute"], True),
+            (["--overlap-dispatch-backward-with-experts-wgrad"], True),
+        ],
+    )
+    def test_ddp_hooks_follow_delayed_expert_wgrad(self, flags, delayed):
+        """Both flags delay TE's expert wgrad to backward_dw(), where DDP's hooks must fire."""
+        from megatron.training.training import get_megatron_ddp_config
+
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        args = parser.parse_args(flags)
+
+        assert get_megatron_ddp_config(args, use_torch_fsdp2=False).delay_wgrad_compute is delayed
+
 
 @pytest.mark.parametrize("native_model", [False, True])
 @pytest.mark.parametrize("valid", [False, True])
