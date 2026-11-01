@@ -24,9 +24,10 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
     get_tokenizer,
@@ -89,10 +90,12 @@ def model_provider(
     Returns:
         T5Model: The returned T5 model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     args = get_args()
     cfg = get_run_config()
-    
+
     if config is None:
         config = core_transformer_config_from_args(args)
 
@@ -137,6 +140,7 @@ def model_provider(
         relative_attention_max_distance=args.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
+        pg_collection=pg_collection,
     )
 
     return model

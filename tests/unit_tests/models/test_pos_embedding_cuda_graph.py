@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -71,6 +72,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
                 vocab_size=128,
                 max_sequence_length=128,
                 position_embedding_type=position_embedding_type,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
         else:
             model = HybridModel(
@@ -81,6 +83,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
                 max_sequence_length=128,
                 position_embedding_type=position_embedding_type,
                 post_process=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             model.decoder = _RotaryConsumer()
         model = model.cuda().eval()
