@@ -16,6 +16,7 @@ from transformer_engine.pytorch.optimizers import FusedAdam
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -23,7 +24,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    ShardLayout,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer import (
     QuantizedDBuffer,
 )
@@ -101,7 +105,13 @@ requires_mxfp8 = pytest.mark.skipif(
 )
 
 
-def _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches):
+def _check_mxfp8_mlp_matches_reference(
+    distributed_setup,
+    mesh,
+    placements,
+    num_microbatches,
+    shard_layout: ShardLayout = ShardLayout.PADDED,
+):
     """Train an MXFP8 MLP with MFSDP and check its losses track an unsharded reference."""
     device = distributed_setup.device
     recipe = MXFP8BlockScaling()
@@ -110,8 +120,8 @@ def _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_
         model = _make_mlp(device)
         torch.manual_seed(2026)
         reference = _make_mlp(device)
-    with fully_shard_context(device=device) as context:
-        fully_shard(model, mesh=mesh, placements=placements)
+    with fully_shard_context(FsdpContext(device=device)) as context:
+        fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
 
     # MLP weights share one quantized group; biases use a regular DBuffer.
     [weight_group] = [
@@ -180,12 +190,21 @@ def _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
-def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
-    """MXFP8 MLP losses track an independently trained unsharded model."""
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, shard_layout):
+    """MXFP8 MLP losses track an independently trained unsharded model.
+
+    With ``ShardLayout.UNPADDED`` the two weights (128x64 and 32x128) pack into 12288 elements
+    split at 32-row block boundaries, so on 8 ranks some ranks own no weight rows at all.
+    """
     if distributed_setup.world_size < 2:
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches=1)
+    _check_mxfp8_mlp_matches_reference(
+        distributed_setup, mesh, placements, num_microbatches=1, shard_layout=shard_layout
+    )
 
 
 @pytest.mark.launch_on_gb200
@@ -221,7 +240,7 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         model = _RecomputedMLP(device, use_reentrant=None)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
@@ -296,7 +315,7 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
-        with fully_shard_context(device=device):
+        with fully_shard_context(FsdpContext(device=device)):
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)

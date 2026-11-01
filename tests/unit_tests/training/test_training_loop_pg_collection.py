@@ -308,17 +308,84 @@ class TestTrainingLoopPgCollection:
 
         assert (
             training._get_model_pg_collection(
-                [SimpleNamespace(pg_collection=model_pg_collection)], run_pg_collection
+                SimpleNamespace(pg_collection=model_pg_collection), run_pg_collection
             )
             is model_pg_collection
         )
         # A model without a collection runs on the run's single-grid collection.
         assert (
             training._get_model_pg_collection(
-                [SimpleNamespace(pg_collection=None)], run_pg_collection
+                SimpleNamespace(pg_collection=None), run_pg_collection
             )
             is run_pg_collection
         )
+
+    def test_train_step_observes_tensor_metrics_on_the_run_collection(
+        self, monkeypatch, run_config
+    ):
+        # The model carries no collection, so every read in train_step uses the run's.
+        pg_collection = ProcessGroupCollection(mp=object(), pp=object(), dp_cp=object())
+        model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+        optimizer = SimpleNamespace(zero_grad=lambda: None, step=lambda: (True, 1.0, 0))
+        args = SimpleNamespace(
+            save_params_interval=None,
+            save_activations_interval=None,
+            save_tokens_per_expert_interval=None,
+            save_wgrads_interval=None,
+            save_dgrads_interval=None,
+            seq_length=8,
+            decoder_seq_length=None,
+            vision_pretraining=False,
+            qk_clip=False,
+        )
+        observed, counted = [], []
+
+        class _Observer:
+            def observe_forward_backward(self, pg_collection, **kwargs):
+                observed.append(pg_collection)
+                return nullcontext()
+
+            def __call__(self, pg_collection, **kwargs):
+                observed.append(pg_collection)
+
+        class _RunOnceThroughOptimizer(_RunOnce):
+            def should_checkpoint_and_exit(self):
+                return False, False, 0
+
+        monkeypatch.setattr(training, "get_args", lambda: args)
+        monkeypatch.setattr(training, "get_timers", lambda: MagicMock())
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+        monkeypatch.setattr(training, "get_rerun_state_machine", _RunOnceThroughOptimizer)
+        monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+        monkeypatch.setattr(training, "is_pp_last_stage", lambda group: False)
+        monkeypatch.setattr(
+            training,
+            "_get_samples_seen_in_iteration",
+            lambda losses_reduced, args, pg_collection: counted.append(pg_collection) or 1,
+        )
+        monkeypatch.setattr(
+            training, "logical_and_across_model_parallel_group", lambda value, group: value
+        )
+        monkeypatch.setattr(
+            training, "reduce_max_stat_across_model_parallel_group", lambda value, group: value
+        )
+        _forbid_global_reads(monkeypatch, training)
+
+        training.train_step(
+            forward_step_func=None,
+            data_iterator=iter([]),
+            model=model,
+            optimizer=optimizer,
+            opt_param_scheduler=MagicMock(),
+            config=SimpleNamespace(barrier_with_L1_time=False, log_max_attention_logit=False),
+            forward_backward_func=lambda **kwargs: [],
+            iteration=0,
+            pg_collection=pg_collection,
+            tensor_metric_observer=_Observer(),
+        )
+
+        assert observed == [pg_collection, pg_collection]
+        assert counted == [pg_collection]
 
     def test_sniff_test_runs_on_the_collection(self, monkeypatch, run_config):
         pg_collection = ProcessGroupCollection()
@@ -386,11 +453,10 @@ class TestTrainingLoopPgCollection:
                 None,
                 None,
                 None,
-                None,
-                None,
                 SimpleNamespace(),
                 None,
-                None,
+                next_train_iterator=lambda iteration, iterator: iterator,
+                run_eval=lambda **kwargs: None,
                 pg_collection=multi_module_pg_collection,
             )
 
