@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import io
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,7 +31,10 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+from megatron.core.optimizer.optimizer import (
+    Float16OptimizerWithFloat16Params,
+    copy_optimizer_param_metadata,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1593,3 +1597,83 @@ def test_synchronize_steps_aligns_lagging_group():
     assert outer._synchronize_steps() == 7
     assert dense.param_groups[0]['step'] == 7
     assert 'step' not in expert.param_groups[0]
+
+
+def _decay_layer_params(fp32_decay):
+    """Two GDP-like layers plus one native FP32 parameter, in optimizer order."""
+    decay_dtype = torch.float32 if fp32_decay else torch.bfloat16
+    params = {}
+    for layer in range(2):
+        params[f'{layer}.weight'] = (8, 8), torch.bfloat16
+        params[f'{layer}.A_log'] = (4,), decay_dtype
+        params[f'{layer}.dt_bias'] = (4,), decay_dtype
+        params[f'{layer}.norm'] = (4,), torch.bfloat16
+    params['scale'] = (3,), torch.float32
+    return {
+        name: torch.nn.Parameter(torch.zeros(shape, dtype=dtype, device='cuda'))
+        for name, (shape, dtype) in params.items()
+    }
+
+
+def _float16_optimizer(params):
+    return Float16OptimizerWithFloat16Params(
+        Adam(list(params.values()), lr=0.01),
+        OptimizerConfig(optimizer='adam', bf16=True),
+        None,
+        lambda optimizer, config=None: None,
+    )
+
+
+def test_float16_optimizer_restores_main_params_saved_before_fp32_marking():
+    """A torch-format checkpoint from before ``mark_keep_in_fp32`` resumes per parameter.
+
+    Saved main params are one list per group, ordered by the float16 params of the
+    saving run. Once ``A_log`` and ``dt_bias`` stay in FP32, their saved entries must
+    land on those parameters and not shift onto the next float16 parameters.
+    """
+    torch.manual_seed(0)
+    old_params = _decay_layer_params(fp32_decay=False)
+    old_optimizer = _float16_optimizer(old_params)
+    main_params = {}
+    for name, param in old_params.items():
+        main_param = getattr(param, 'main_param', param)
+        main_param.data.copy_(torch.randn_like(main_param, dtype=torch.float32))
+        param.data.copy_(main_param.data)
+        main_params[name] = main_param.detach().clone()
+        state = old_optimizer.optimizer.state[main_param]
+        state['step'] = torch.tensor(1.0)
+        state['exp_avg'] = torch.randn_like(main_param)
+        state['exp_avg_sq'] = torch.rand_like(main_param)
+    old_states = {
+        name: {key: value.clone() for key, value in old_optimizer.optimizer.state[main].items()}
+        for name, main in (
+            (name, getattr(param, 'main_param', param)) for name, param in old_params.items()
+        )
+    }
+    buffer = io.BytesIO()
+    torch.save(old_optimizer.state_dict(), buffer)
+
+    new_params = _decay_layer_params(fp32_decay=True)
+    # Training loads the model weights before the optimizer state.
+    for name, param in new_params.items():
+        param.data.copy_(old_params[name].data)
+    new_optimizer = _float16_optimizer(new_params)
+    buffer.seek(0)
+    new_optimizer.load_state_dict(torch.load(buffer, weights_only=False))
+
+    for name, param in new_params.items():
+        main_param = getattr(param, 'main_param', param)
+        torch.testing.assert_close(main_param, main_params[name], atol=0, rtol=0)
+        for key, value in new_optimizer.optimizer.state[main_param].items():
+            torch.testing.assert_close(value, old_states[name][key], atol=0, rtol=0)
+
+
+def test_float16_optimizer_rejects_unmatchable_main_params():
+    """Saved main params that match no parameter raise instead of shifting silently."""
+    old_params = _decay_layer_params(fp32_decay=False)
+    state_dict = _float16_optimizer(old_params).state_dict()
+    state_dict['fp32_from_fp16_params'][0].insert(0, torch.ones(5, device='cuda'))
+
+    new_optimizer = _float16_optimizer(_decay_layer_params(fp32_decay=True))
+    with pytest.raises(RuntimeError, match="Cannot match the 9 saved main params"):
+        new_optimizer.load_state_dict(state_dict)
