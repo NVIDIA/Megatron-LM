@@ -136,7 +136,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     pre_mlp_layernorm_output, padding_mask, packed_seq_params=packed_seq_params
                 )
                 local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map, padding_mask
+                    pre_mlp_layernorm_output,
+                    probs,
+                    routing_map,
+                    padding_mask,
+                    packed_seq_params=packed_seq_params,
                 )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
