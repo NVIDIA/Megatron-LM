@@ -803,6 +803,29 @@ def test_te_native_device_metadata_workspace(monkeypatch, supported):
     assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
 
 
+@pytest.mark.parametrize(
+    "capability,cublaslt_version,expected",
+    [
+        ((10, 0), 130501, True),
+        ((10, 3), 130501, True),
+        ((10, 0), 130600, False),
+        ((10, 3), 130600, False),
+        ((9, 0), 130501, False),
+        ((12, 0), 130501, False),
+    ],
+)
+def test_te_device_metadata_gemm_requires_validated_pair(
+    monkeypatch, capability, cublaslt_version, expected
+):
+    """The grouped-GEMM gate admits only the validated (SM, cuBLASLt) pairs."""
+    tex = pytest.importorskip("transformer_engine_torch")
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(tex, "get_cublasLt_version", lambda: cublaslt_version)
+    assert batch_invariant_kernels.te_supports_batch_invariant_grouped_gemm() is expected
+
+
 # ============================================================================
 # Numerical Tests for General GEMM
 # ============================================================================
