@@ -804,6 +804,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Set when an image request is admitted without its encode; lets
+        # _encode_waiting_images return at once on text-only or fully-encoded queues.
+        self._has_deferred_image_encodes = False
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
@@ -903,6 +906,14 @@ class DynamicInferenceEngine(AbstractEngine):
         """Rebuild missing media state for a known-multimodal request."""
         if request.image_embeddings is not None and request.image_token_mask is not None:
             return
+        if (
+            request.deferred_image_embedding_count is not None
+            and request.request_id in self.waiting_request_ids
+        ):
+            # Still waiting with its encode deferred: the next _encode_waiting_images pass
+            # encodes it together with the other waiting requests.
+            self._has_deferred_image_encodes = True
+            return
         if request.imgs is None:
             raise RuntimeError(
                 f"Cannot refresh vision state for request {request.request_id}: raw media "
@@ -961,28 +972,262 @@ class DynamicInferenceEngine(AbstractEngine):
         with torch.inference_mode():
             embeddings = wrapper._forward_vision_encoder(imgs, **encoder_kwargs)
 
-        expected_count = int((mask >= 0).sum().item())
-        actual_count = embeddings.numel() // embeddings.shape[-1] if embeddings.ndim > 0 else 0
-        if actual_count != expected_count:
-            raise ValueError(
-                f"Refreshed request {request.request_id} has {expected_count} media-token "
-                f"position(s), but the vision encoder produced {actual_count} embedding(s)."
-            )
-
-        request.image_embeddings = embeddings
-        request.image_token_mask = mask
-        self._cache_vision_embedding(
-            request.media_cache_key,
+        self._register_image_embeddings(
+            request,
             embeddings,
+            mask,
+            expected_count=int((mask >= 0).sum().item()),
             modality=modality,
             imgs=imgs,
             num_tiles=num_tiles,
-            num_img_embeddings_per_tile=request.num_img_embeddings_per_tile,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
-            video_frame_indices=request.video_frame_indices,
-            video_fps=request.video_fps,
+            error_subject=f"Refreshed request {request.request_id}",
         )
+
+    @staticmethod
+    def _can_defer_image_encode(
+        *,
+        imgs: Tensor,
+        num_tiles: Optional[Tensor],
+        imgs_sizes: Optional[Tensor],
+        num_frames: Optional[Tensor],
+    ) -> bool:
+        """Whether a request's image encode can wait until prefill scheduling.
+
+        Only dynamic-resolution images with a concatenable patch layout (``[P, F]`` or
+        ``[1, P, F]``) qualify; videos, static tiling and other layouts keep the per-request
+        encode in ``_build_vlm_request``.
+        """
+        if imgs_sizes is None or num_tiles is not None or num_frames is not None:
+            return False
+        return imgs.ndim == 2 or (imgs.ndim == 3 and imgs.shape[0] == 1)
+
+    def _encode_waiting_images(self) -> None:
+        """Encode the images of waiting requests whose admission deferred the encode.
+
+        ``_build_vlm_request`` admits batchable image requests without running the vision
+        encoder. This runs right before waiting requests are scheduled for prefill, so the
+        images of every such request that arrived since the last prefill go through the
+        encoder together: a request with several images already hands
+        ``_forward_vision_encoder`` their patches concatenated with one ``imgs_sizes`` row per
+        image, so the images of several requests are concatenated the same way and the output
+        is split back by each request's embedding count. One call covers at most
+        ``context.max_tokens`` embeddings. Cache hits are filled from the vision cache,
+        requests sharing a ``media_cache_key`` are encoded once, a group whose shared encode
+        fails falls back to per-request encodes, and a request whose encode fails is failed
+        on its own and removed from the waiting queue.
+        """
+        if not self._has_deferred_image_encodes:
+            return
+        deferred = [
+            request
+            for request in (self.get_request(rid) for rid in self.waiting_request_ids)
+            if isinstance(request, DynamicVLMInferenceRequest)
+            and request.deferred_image_embedding_count is not None
+            and request.image_embeddings is None
+        ]
+        if not deferred:
+            self._has_deferred_image_encodes = False
+            return
+        try:
+            self._encode_deferred_image_requests(deferred)
+        finally:
+            # Anything still waiting without embeddings (after an exception above, or a
+            # request failed further down) is picked up by the next pass.
+            self._has_deferred_image_encodes = any(
+                request.image_embeddings is None and request.request_id in self.waiting_request_ids
+                for request in deferred
+            )
+
+    def _encode_deferred_image_requests(self, deferred: List[DynamicVLMInferenceRequest]) -> None:
+        """Encode, register or fail the given waiting requests (see _encode_waiting_images)."""
+        encoded: Dict[int, Tensor] = {}
+        failed: Dict[int, Exception] = {}
+        pending: List[Tuple[DynamicVLMInferenceRequest, int]] = []
+        first_request_by_key: Dict[str, int] = {}
+        duplicates: List[Tuple[DynamicVLMInferenceRequest, int]] = []
+        # Requests whose embeddings alias a tensor the cache or another request already
+        # holds; they are registered without inserting into the cache again.
+        aliased_ids = set()
+        for request in deferred:
+            cached = self._get_cached_vision_embedding(request.media_cache_key)
+            if cached is not None:
+                encoded[request.request_id] = cached
+                aliased_ids.add(request.request_id)
+                continue
+            key = request.media_cache_key
+            if key:
+                if key in first_request_by_key:
+                    duplicates.append((request, first_request_by_key[key]))
+                    continue
+                else:
+                    first_request_by_key[key] = request.request_id
+            pending.append((request, request.deferred_image_embedding_count))
+
+        budget = int(self.context.max_tokens)
+        groups: List[List[Tuple[DynamicVLMInferenceRequest, int]]] = [[]]
+        group_total = 0
+        for item in pending:
+            if groups[-1] and group_total + item[1] > budget:
+                groups.append([])
+                group_total = 0
+            groups[-1].append(item)
+            group_total += item[1]
+
+        for group in groups:
+            if len(group) > 1:
+                try:
+                    encoded.update(self._batched_request_image_encode(group))
+                    continue
+                except Exception as error:  # pylint: disable=broad-except
+                    # Includes out-of-memory and an output that does not match the expected
+                    # counts: the group is encoded per request below, so a request whose own
+                    # count is wrong fails alone instead of taking the engine down.
+                    logger.warning(
+                        "shared vision encoding of %d requests failed, encoding per request: %s",
+                        len(group),
+                        error,
+                    )
+            for request, _ in group:
+                try:
+                    encoded[request.request_id] = self._encode_image_request(request)
+                except Exception as error:  # pylint: disable=broad-except
+                    failed[request.request_id] = error
+
+        for request, first_request_id in duplicates:
+            if first_request_id in encoded:
+                encoded[request.request_id] = encoded[first_request_id]
+                aliased_ids.add(request.request_id)
+            elif first_request_id in failed:
+                failed[request.request_id] = failed[first_request_id]
+
+        for request in deferred:
+            embeddings = encoded.get(request.request_id)
+            if embeddings is None or request.request_id in failed:
+                continue
+            try:
+                self._register_image_embeddings(
+                    request,
+                    embeddings,
+                    request.image_token_mask,
+                    expected_count=request.deferred_image_embedding_count,
+                    modality="image",
+                    imgs=request.imgs,
+                    num_tiles=None,
+                    imgs_sizes=request.imgs_sizes,
+                    num_frames=None,
+                    error_subject=f"Request {request.request_id}",
+                    cache=request.request_id not in aliased_ids,
+                )
+            except Exception as error:  # pylint: disable=broad-except
+                failed[request.request_id] = error
+
+        for request_id, error in failed.items():
+            self.get_request(request_id).add_event_error_nontransient(error)
+            self.waiting_request_ids.remove(request_id)
+            self._handle_failed_request(request_id, stage="encode its images before prefill")
+
+    def _batched_request_image_encode(
+        self, group: List[Tuple[DynamicVLMInferenceRequest, int]]
+    ) -> Dict[int, Tensor]:
+        """Run one vision-encoder call over the images of several requests and split it back.
+
+        Args:
+            group: ``(request, embedding_count)`` pairs whose summed count fits the budget.
+
+        Returns:
+            Dict[int, Tensor]: Each request's slice of the encoder output, keyed by request id.
+        """
+        device = torch.cuda.current_device()
+        imgs = [request.imgs.to(device=device) for request, _ in group]
+        ndims = {tensor.ndim for tensor in imgs}
+        if ndims == {2}:
+            patch_dim = 0
+        elif ndims == {3} and all(tensor.shape[0] == 1 for tensor in imgs):
+            patch_dim = 1
+        else:
+            raise ValueError(
+                f"cannot concatenate image tensors of shapes {[tuple(t.shape) for t in imgs]}"
+            )
+        imgs_sizes = torch.cat([request.imgs_sizes.to(device=device) for request, _ in group])
+        counts = [count for _, count in group]
+        total = sum(counts)
+        nvtx_range_push("megatron.inference.multimodal.batched_vision_encoder")
+        try:
+            with torch.inference_mode():
+                embeddings = self.controller.inference_wrapped_model._forward_vision_encoder(
+                    torch.cat(imgs, dim=patch_dim), num_image_tiles=None, imgs_sizes=imgs_sizes
+                )
+        finally:
+            nvtx_range_pop("megatron.inference.multimodal.batched_vision_encoder")
+        if embeddings.ndim >= 1 and embeddings.shape[0] == total:
+            split_dim = 0
+        elif embeddings.ndim >= 2 and embeddings.shape[0] == 1 and embeddings.shape[1] == total:
+            split_dim = 1
+        else:
+            raise ValueError(
+                f"shared vision encode of {len(group)} requests produced shape "
+                f"{tuple(embeddings.shape)}, expected {total} embeddings on a leading dim"
+            )
+        # The slices are views of one tensor, which lives until the last of these requests
+        # finishes. A slice that goes into the vision cache is copied instead: the cache sizes
+        # entries by their storage and keeps them past the group.
+        cache_on = self.vision_embedding_cache_max_bytes > 0
+        return {
+            request.request_id: (piece.clone() if cache_on and request.media_cache_key else piece)
+            for (request, _), piece in zip(group, torch.split(embeddings, counts, dim=split_dim))
+        }
+
+    def _encode_image_request(self, request: DynamicVLMInferenceRequest) -> Tensor:
+        """Run the vision encoder for one request's images (the per-request path)."""
+        device = torch.cuda.current_device()
+        with torch.inference_mode():
+            return self.controller.inference_wrapped_model._forward_vision_encoder(
+                request.imgs.to(device=device),
+                num_image_tiles=None,
+                imgs_sizes=request.imgs_sizes.to(device=device),
+            )
+
+    def _register_image_embeddings(
+        self,
+        request: DynamicVLMInferenceRequest,
+        embeddings: Tensor,
+        mask: Tensor,
+        *,
+        expected_count: int,
+        modality: str,
+        imgs: Tensor,
+        num_tiles: Optional[Tensor],
+        imgs_sizes: Optional[Tensor],
+        num_frames: Optional[Tensor],
+        error_subject: str,
+        cache: bool = True,
+    ) -> None:
+        """Check the embedding count against the mask, then store the embeddings on the
+        request, in the vision cache and on the context (shared by the post-admission paths)."""
+        actual_count = embeddings.numel() // embeddings.shape[-1] if embeddings.ndim > 0 else 0
+        if actual_count != expected_count:
+            raise ValueError(
+                f"{error_subject} has {expected_count} media-token position(s), but the "
+                f"vision encoder produced {actual_count} embedding(s)."
+            )
+        request.image_embeddings = embeddings
+        request.image_token_mask = mask
+        request.deferred_image_embedding_count = None
+        if cache:
+            self._cache_vision_embedding(
+                request.media_cache_key,
+                embeddings,
+                modality=modality,
+                imgs=imgs,
+                num_tiles=num_tiles,
+                num_img_embeddings_per_tile=request.num_img_embeddings_per_tile,
+                imgs_sizes=imgs_sizes,
+                num_frames=num_frames,
+                video_frame_indices=request.video_frame_indices,
+                video_fps=request.video_fps,
+            )
         self.context.add_vlm_request_data(
             request.request_id, image_embeddings=embeddings, image_token_mask=mask
         )
@@ -1497,14 +1742,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
-        # initialize zmq-based EP communicator
-        self.ep_rank = get_pg_rank(self.pg_collection.ep)
-        self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        # initialize zmq-based EP communicator.
+        # MoE dispatch collectives span the expert tensor-and-model-parallel (tp_ep)
+        # group, so every rank in it must step in lockstep. With ETP == 1 this is
+        # the EP group; with ETP > 1 it also includes the expert-TP peers.
+        # Falls back to the EP group for pg_collections built without tp_ep.
+        tp_ep_group = getattr(self.pg_collection, "tp_ep", self.pg_collection.ep)
+        self.tp_ep_rank = get_pg_rank(tp_ep_group)
+        self.tp_ep_world_size = get_pg_size(tp_ep_group)
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
-        if self.ep_world_size > 1:
+        if self.tp_ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+                self.zmq_context, process_group=tp_ep_group, hostname=hostname
             )
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
@@ -1671,10 +1921,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     # scores must replace rather than follow the partial scores.
                     req.prompt_log_probs = None
                     req.prompt_top_n_logprobs = None
+                    req.cached_prompt_log_probs.clear()
                     req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
-            self.chunked_prefill_request_id = -1
+            self.context.chunked_prefill_request_id = -1
         else:
             recompute_resident_ids = []
         self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]
@@ -1976,10 +2227,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 serialized[key] = None
         return serialized
 
-    def _handle_failed_request(self, request_id: int):
+    def _handle_failed_request(self, request_id: int, *, stage: str = "be added to the engine"):
         """Handle a failed request by sending the reply immediately.
 
         The request is added to failed_request_ids so that the next bookkeeping pass can return it.
+
+        Args:
+            request_id (int): The failed request.
+            stage (str): What the request failed to do, for the operator warning.
         """
         request_entry = self.requests[request_id]
         request = request_entry.record[-1]
@@ -1998,7 +2253,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
             )
             warnings.warn(
-                f"Request {request_id} failed to be added to the engine ({errors_str}). "
+                f"Request {request_id} failed to {stage} ({errors_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
@@ -2515,6 +2770,14 @@ class DynamicInferenceEngine(AbstractEngine):
             media_cache_key = compute_media_cache_key(modality, media_inputs)
 
         device = torch.cuda.current_device()
+        defer_image_encode = (
+            imgs is not None
+            and cached_vision_entry is None
+            and self._can_defer_image_encode(
+                imgs=imgs, num_tiles=num_tiles, imgs_sizes=imgs_sizes, num_frames=num_frames
+            )
+        )
+        deferred_embedding_count = None
         num_tiles = num_tiles.to(device=device) if num_tiles is not None else None
         imgs_sizes = imgs_sizes.to(device=device) if imgs_sizes is not None else None
         num_frames = num_frames.to(device=device) if num_frames is not None else None
@@ -2640,7 +2903,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Retrieve or compute the vision embedding.
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
-            if image_embeddings is None and imgs is not None:
+            if image_embeddings is None and defer_image_encode:
+                # The encode runs together with the other waiting image requests right
+                # before they are scheduled for prefill (_encode_waiting_images), and its
+                # output is split back by the embedding count the prompt expansion expects.
+                deferred_embedding_count = expected_embedding_count
+                imgs = imgs.to(device=device)
+                self._has_deferred_image_encodes = True
+            elif image_embeddings is None and imgs is not None:
                 imgs = imgs.to(device=device)
                 # PP>1 is rejected above, so this is the only stage that owns
                 # the vision encoder.
@@ -2731,7 +3001,141 @@ class DynamicInferenceEngine(AbstractEngine):
             decoder_seq_length=0,
             image_embeddings=image_embeddings,
             image_token_mask=mask_tensor,
+            deferred_image_embedding_count=deferred_embedding_count,
         )
+
+    def _place_cached_prompt_log_probs(self, request: DynamicInferenceRequest) -> None:
+        """Append the cached prompt log-probs that continue a request's prompt scores.
+
+        A chunk that skips cached tokens is given their rows at admission. Under
+        async scheduling that precedes post-processing of the previous chunk, so
+        each cached run is placed only once every score before it has arrived.
+
+        Args:
+            request (DynamicInferenceRequest): Request whose prompt scores to extend.
+        """
+        pending = request.cached_prompt_log_probs
+        while pending and pending[0][0] == len(request.prompt_log_probs or []):
+            _, log_probs, top_n_log_probs, top_n_token_ids = pending.pop(0)
+            if request.prompt_log_probs is None:
+                request.prompt_log_probs = []
+            request.prompt_log_probs.extend(log_probs.tolist())
+            if request.sampling_params.top_n_logprobs > 0:
+                if request.prompt_top_n_logprobs is None:
+                    request.prompt_top_n_logprobs = []
+                detokenize = self.controller.tokenizer.detokenize
+                for values, token_ids in zip(top_n_log_probs.tolist(), top_n_token_ids.tolist()):
+                    request.prompt_top_n_logprobs.append(
+                        {
+                            detokenize([token_id]): value
+                            for value, token_id in zip(values, token_ids)
+                        }
+                    )
+
+    def _promote_recomputed_prompt_scores(self, entry: RequestEntry) -> None:
+        """Restore the original prompt scores from the first complete recomputation.
+
+        A request checkpointed before its prompt scores arrive recomputes them into
+        a later record segment, but completion and streaming read them from the first.
+
+        Args:
+            entry (RequestEntry): Entry whose first record segment to repair.
+        """
+        record = entry.record
+        original_request = record[0]
+        expected_count = len(original_request.prompt_tokens) - 1
+        needs_top_n = original_request.sampling_params.top_n_logprobs > 0
+
+        def has_complete_prompt_scores(request: DynamicInferenceRequest) -> bool:
+            return len(request.prompt_log_probs or []) >= expected_count and (
+                not needs_top_n or len(request.prompt_top_n_logprobs or []) >= expected_count
+            )
+
+        if (
+            len(record.requests) == 1
+            or not original_request.sampling_params.return_log_probs
+            or original_request.sampling_params.skip_prompt_log_probs
+            or expected_count <= 0
+            or has_complete_prompt_scores(original_request)
+        ):
+            return
+
+        # A recomputation scores its whole prompt from position zero, with cached
+        # rows placed ahead of computed ones, so its leading rows are the originals.
+        for recomputed_request in record.requests[1:]:
+            if has_complete_prompt_scores(recomputed_request):
+                original_request.prompt_log_probs = list(
+                    recomputed_request.prompt_log_probs[:expected_count]
+                )
+                if needs_top_n:
+                    original_request.prompt_top_n_logprobs = list(
+                        recomputed_request.prompt_top_n_logprobs[:expected_count]
+                    )
+                return
+
+    @staticmethod
+    def _find_step_stop_match(
+        generated_tokens: List[int],
+        step_tokens: List[int],
+        stop_word_ids: Optional[List[List[int]]],
+    ) -> Optional[Tuple[int, int]]:
+        """Find the earliest stop-sequence match ending in the current burst.
+
+        Args:
+            generated_tokens: Tokens retained before the current burst.
+            step_tokens: Untrimmed tokens produced by the current step.
+            stop_word_ids: Configured tokenized stop sequences.
+
+        Returns:
+            The zero-based position in ``step_tokens`` of the stop sequence's
+            final token and the matched sequence length, or ``None`` when no
+            stop sequence ends in this burst.
+        """
+        if not stop_word_ids or not step_tokens:
+            return None
+
+        max_stop_length = max((len(stop_tokens) for stop_tokens in stop_word_ids), default=0)
+        history_length = max(0, max_stop_length - 1)
+        history = generated_tokens[-history_length:] if history_length else []
+        previous_count = len(history)
+        candidate_tokens = history + step_tokens
+        for step_position in range(len(step_tokens)):
+            end = previous_count + step_position + 1
+            for stop_tokens in stop_word_ids:
+                stop_length = len(stop_tokens)
+                if stop_length > 0 and end >= stop_length:
+                    if candidate_tokens[end - stop_length : end] == stop_tokens:
+                        return step_position, stop_length
+        return None
+
+    @staticmethod
+    def _get_usable_speculative_proposal_count(
+        num_speculative_tokens: int,
+        accepted_token_count: int,
+        terminal_token_position: Optional[int],
+    ) -> int:
+        """Count proposal positions usable before a semantic terminal boundary.
+
+        A terminal accepted draft makes only proposals through that draft usable.
+        A replacement-token boundary still required verification of the entire
+        speculative group, as did a step with no terminal boundary.
+
+        Args:
+            num_speculative_tokens: Configured proposals per decode request.
+            accepted_token_count: Accepted draft prefix length for this request.
+            terminal_token_position: Earliest logical output-burst boundary, ``-1``
+                for a boundary before this burst, or ``None`` for no boundary.
+
+        Returns:
+            Number of leading proposal positions to include in acceptance metrics.
+        """
+        if terminal_token_position is None:
+            return num_speculative_tokens
+        if terminal_token_position < 0:
+            return 0
+        if terminal_token_position < accepted_token_count:
+            return min(num_speculative_tokens, terminal_token_position + 1)
+        return num_speculative_tokens
 
     def _process_request_outputs(
         self,
@@ -2856,6 +3260,35 @@ class DynamicInferenceEngine(AbstractEngine):
             num_stop_word_prompt_score_trim = 0
             eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
+            semantic_terminal_position = None
+            accepted_token_count = len(accepted_tokens_list) - accepted_tokens_list.count(-1)
+            if self.num_speculative_tokens > 0 and not is_prefill:
+                boundaries = []
+                eos_position = self._find_mid_block_eos(request, tokens)
+                if eos_position is not None:
+                    boundaries.append(eos_position)
+                remaining = request.sampling_params.num_tokens_to_generate - len(
+                    request.generated_tokens
+                )
+                if remaining <= len(tokens):
+                    boundaries.append(max(-1, remaining - 1))
+                if request.stop_word_ids:
+                    # Only the longest stop's suffix is needed, including tokens
+                    # retained in older checkpoint segments.
+                    history_length = max(map(len, request.stop_word_ids)) - 1
+                    history = []
+                    for segment in reversed(self.requests[request_id].record.requests):
+                        take = min(history_length - len(history), len(segment.generated_tokens))
+                        if take > 0:
+                            history[:0] = segment.generated_tokens[-take:]
+                        if len(history) == history_length:
+                            break
+                    stop_match = self._find_step_stop_match(history, tokens, request.stop_word_ids)
+                    if stop_match is not None:
+                        boundaries.append(stop_match[0])
+                semantic_terminal_position = min(boundaries) if boundaries else None
+                if request_id in self.stop_word_being_finished_ids:
+                    semantic_terminal_position = -1
             if request_id != consumed_chunked_prefill_request_id:
                 tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
                     request, tokens, request_log_probs, top_n_logprobs, req_idx
@@ -2980,17 +3413,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
                 # the denominator and artificially deflate the acceptance rate.
-                if (
-                    not is_prefill
-                    and len(request.generated_tokens) > 0
-                    and self.num_speculative_tokens > 0
-                ):
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
-                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
-                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (
-                        accepted_t != -1
-                    ).long()
+                if not is_prefill and self.num_speculative_tokens > 0:
+                    actual_proposed = self._get_usable_speculative_proposal_count(
+                        self.num_speculative_tokens,
+                        accepted_token_count,
+                        semantic_terminal_position,
+                    )
+                    if actual_proposed > 0:
+                        self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                        accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                        self._spec_tokens_accepted_per_pos[:actual_proposed] += (
+                            accepted_t != -1
+                        ).long()
 
                 if (
                     stop_word_hit or eos_mid_block_hit
@@ -3050,6 +3484,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     request_log_probs = request_log_probs[:-num_stop_word_score_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_score_trim]
+
+            # Cached rows that precede this step's rows go first.
+            self._place_cached_prompt_log_probs(request)
 
             # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -3137,6 +3574,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Cached rows that follow this step's rows, i.e. the skipped start of
+            # the next chunk, go after them.
+            self._place_cached_prompt_log_probs(request)
+
+            # Both record.merge() and coordinator streaming read original prompt
+            # scores from record[0], so repair it as soon as recomputation completes.
+            self._promote_recomputed_prompt_scores(self.requests[request_id])
 
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
@@ -3644,6 +4089,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
+        # Waiting image requests whose admission deferred the vision encode are encoded
+        # together here, before any of them can enter the context.
+        self._encode_waiting_images()
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
@@ -3694,7 +4142,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether request, token, and KV-cache capacity permit a chunk.
         """
-        request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(
+            req, prefill_chunk_length=1
+        )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
         token_capacity_available = self.context.active_token_count < self.context.max_tokens
         return (
@@ -3941,6 +4391,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
                         self.waiting_request_ids.popleft()
                     )
+                    can_schedule = True
                     continue
 
             # Use remaining prompt tokens for scheduling decisions
@@ -4013,6 +4464,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
+
+                # A bypass must finish prefill now. Starting a partial request would
+                # keep it at the queue head after the earlier prefix conflict clears.
+                if (
+                    prefix_caching_enabled
+                    and pending_request_ids
+                    and prefill_chunk_length < remaining_len
+                ):
+                    break
+
+                request_available, tokens_available, kv_available = self.context.check_availability(
+                    req, prefill_chunk_length
+                )
+                if not (
+                    (is_continuing_chunked_prefill or request_available)
+                    and tokens_available
+                    and kv_available
+                ):
+                    can_schedule = False
+                    break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
@@ -5137,7 +5608,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # will be zero and we will defer processing the signal.
         # When all ranks receive the signal, global consensus will be -1 and we can process.
 
-        if self.ep_world_size > 1:
+        if self.tp_ep_world_size > 1:
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
@@ -5200,10 +5671,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
-                        global_work_from_last_consensus == 0
+                        self.tp_ep_world_size == 1
+                        or global_work_from_last_consensus == 0
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
+                        # 0. there are no EP peers -> consensus is local and free. A cached value
+                        #    goes stale once local work drains and would trigger a dummy forward
+                        #    with no collective to join. Such a dummy forward would also need a
+                        #    request-owned recurrent-state slot (the dedicated dummy slot is only
+                        #    reserved for EP > 1), which pending handoffs may all be holding.
                         # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus

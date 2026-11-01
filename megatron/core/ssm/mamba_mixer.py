@@ -441,6 +441,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.weight.is_rmsnorm_weight = True
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
             self.norm.tp_group = self.pg_collection.tp
