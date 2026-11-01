@@ -18,6 +18,7 @@ from torch.distributed.tensor import Shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
     fully_shard,
@@ -86,14 +87,58 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-@pytest.mark.parametrize("unify_communication_stream", [False, True])
-def test_context_defaults_to_current_cuda_device(distributed_setup, unify_communication_stream):
+def test_recorded_execution_order(distributed_setup):
+    """Recorded orders follow execution when submodules are registered in reverse."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.second(self.first(x))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = Model().to(device)
+    unsharded_weights = {layer: layer.weight for layer in model.children()}
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    assert context.is_recording_execution_order
+    model(inputs).sum().backward()
+    assert not context.is_recording_execution_order
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
+
+    def check_prefetched(layer, _args):
+        storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
+        assert storage_bytes > 0
+
+    for layer in model.children():
+        # Check before FSDP's own hooks, so on-demand unsharding cannot satisfy the assertion.
+        layer.register_forward_pre_hook(check_prefetched, prepend=True)
+        layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
+    model.zero_grad(set_to_none=True)
+    model(inputs).sum().backward()
+
+
+@pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
+def test_context_defaults_to_current_cuda_device(distributed_setup, overlap_allgather_reduction):
     """The policy controls stream sharing without changing the default device."""
     context = FsdpContext(
-        runtime_policy=RuntimePolicy(unify_communication_stream=unify_communication_stream)
+        runtime_policy=RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction)
     )
     assert context.allgather_stream.device == torch.device("cuda", torch.cuda.current_device())
-    assert (context.allgather_stream is context.reduce_scatter_stream) == unify_communication_stream
+    assert (
+        context.allgather_stream is not context.inner_reduction_stream
+    ) == overlap_allgather_reduction
 
 
 def test_context_rejects_non_cuda_device(distributed_setup):
@@ -353,3 +398,25 @@ def test_microbatch_scopes_context(distributed_setup):
         assert not context.is_last_microbatch
 
     assert context.is_last_microbatch
+
+
+@pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
+@pytest.mark.parametrize("overlap_outer_communication", [False, True])
+def test_communication_stream_assignment(
+    distributed_setup, overlap_allgather_reduction, overlap_outer_communication
+):
+    """All-gather/reduction and inner/outer stream separation are independent."""
+    context = FsdpContext(
+        runtime_policy=RuntimePolicy(
+            overlap_allgather_reduction=overlap_allgather_reduction,
+            overlap_outer_communication=overlap_outer_communication,
+        )
+    )
+    assert (
+        context.allgather_stream != context.inner_reduction_stream
+    ) == overlap_allgather_reduction
+    assert (
+        context.outer_reduction_stream != context.inner_reduction_stream
+    ) == overlap_outer_communication
+    if overlap_outer_communication:
+        assert context.outer_reduction_stream != context.allgather_stream
