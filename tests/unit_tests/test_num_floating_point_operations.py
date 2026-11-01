@@ -1611,3 +1611,15 @@ class TestQSAHybrid:
         idx = 2 * 2 * (2 * 1024) * 512 * 160 + 3 * 2 * (2 * 1024 * 1024) * 16
         expected = _flops(dense, 2) + self._OUTPUT_GATE + idx
         assert _flops(args, 2) == pytest.approx(expected, rel=1e-12)
+
+    def test_dense_when_fits_is_plain_attention(self):
+        """--qsa-dense-when-fits: Q == '*' + output gate -- dense core, no indexer terms."""
+        args = _make_qsa_hybrid_args(qsa_indexer_loss_coeff=None)
+        args.transformer.qsa_indexer_budget = 1024
+        args.transformer.qsa_dense_when_fits = True
+        dense = _make_qsa_hybrid_args(qsa_indexer_loss_coeff=None)
+        dense.hybrid_layer_pattern = "*"
+        expected = _flops(dense, 2) + self._OUTPUT_GATE
+        assert _flops(args, 2) == pytest.approx(expected, rel=1e-12)
+        args.transformer.qsa_dense_when_fits = False
+        assert _flops(args, 2) > expected
