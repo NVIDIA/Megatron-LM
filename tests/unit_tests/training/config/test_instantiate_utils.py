@@ -19,6 +19,7 @@ from megatron.training.config.instantiate_utils import (
     _Keys,
     _locate,
     _prepare_input_dict_or_list,
+    _reject_unsafe_target_name,
     _resolve_target,
     instantiate,
     instantiate_node,
@@ -578,3 +579,59 @@ class TestInstantiateEnum:
         # This previously failed because _args_ was dropped in lenient mode
         result = instantiate(config)
         assert result == TestEnum.B
+
+
+class TestRejectUnsafeTargetName:
+    """``_reject_unsafe_target_name`` rejects known code-loading targets by name alone."""
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+            "transformers.dynamic_module_utils.get_class_in_module",
+            "transformers.dynamic_module_utils.os.system",
+            "transformers.utils.import_utils.direct_transformers_import",
+            "transformers.pipeline",
+            "transformers.pipelines.pipeline",
+            "transformers.AutoTokenizer.from_pretrained",
+            "transformers.models.auto.tokenization_auto.AutoTokenizer.from_pretrained",
+            "transformers.AutoModel.from_config",
+            "torch.load",
+            "numpy.load",
+            "torch.hub.load",
+            "megatron.training.config.instantiate_utils.target_allowlist.add_prefix",
+        ],
+    )
+    def test_rejects_unsafe_targets(self, target):
+        with pytest.raises(InstantiationException, match="bypass target validation"):
+            _reject_unsafe_target_name(target=target, full_key="model.target")
+
+    def test_includes_full_key_in_message(self):
+        with pytest.raises(InstantiationException, match=r"full_key: model\.target"):
+            _reject_unsafe_target_name(target="transformers.pipeline", full_key="model.target")
+
+    def test_allows_transformers_config_factory(self):
+        _reject_unsafe_target_name(
+            target="transformers.generation.configuration_utils.GenerationConfig.from_dict",
+            full_key="model.target",
+        )
+
+    def test_allows_ordinary_target(self):
+        _reject_unsafe_target_name(target=_target_qualname(TestClass), full_key="model.target")
+
+    @pytest.mark.parametrize(
+        "field", ["collate_impl", "hf_filter_lambda", "preprocess_fn", "process_example_fn"]
+    )
+    def test_rejects_callable_config_fields(self, field):
+        with pytest.raises(InstantiationException, match="callable config field"):
+            _reject_unsafe_target_name(
+                target=_target_qualname(test_function), full_key=f"dataset.{field}"
+            )
+
+    def test_callable_field_check_uses_last_key_segment(self):
+        with pytest.raises(InstantiationException, match="callable config field"):
+            _reject_unsafe_target_name(target="some.fn", full_key="a.b.preprocess_fn")
+        _reject_unsafe_target_name(target="some.fn", full_key="preprocess_fn.child")
+
+    def test_non_string_full_key_skips_field_check(self):
+        _reject_unsafe_target_name(target="some.fn", full_key=0)

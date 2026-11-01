@@ -249,6 +249,9 @@ def prepare_next_forward_pass(
                 if accepted_tokens_per_request[pid, s].item() != -1:
                     count += 1
             accepted_token_counts[pid] = count
+        else:
+            accepted_tokens_per_request[pid].fill_(-1)
+            accepted_token_counts[pid] = 0
 
 
 def mamba_state_selective_copy(
