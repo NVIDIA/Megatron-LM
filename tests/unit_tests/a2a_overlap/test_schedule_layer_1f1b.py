@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -286,6 +287,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             params = reset_model(gpt_model)
@@ -329,6 +331,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             params = reset_model(gpt_model)
@@ -348,6 +351,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             reset_model(gpt_model, params)
             with mock.patch.object(
@@ -386,6 +390,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             params = reset_model(gpt_model)
@@ -405,6 +410,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
@@ -439,6 +445,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             params = reset_model(gpt_model)
@@ -517,6 +524,7 @@ class TestA2AOverlap:
                     pre_process=True,
                     post_process=True,
                     max_sequence_length=300,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 params = reset_model(gpt_model)
                 input_tensors = [build_data() for _ in range(microbatches)]
@@ -589,6 +597,7 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             gpt_model.decoder.final_layernorm = None
             gpt_model.cuda()
