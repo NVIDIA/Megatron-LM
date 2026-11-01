@@ -257,3 +257,47 @@ def test_warn_single_rank_does_not_rearm_other_warnings():
                 warn_single_rank("job-level message")
 
     assert len([w for w in seen if w.category is FutureWarning]) == 1
+
+
+def test_warn_single_rank_does_not_rearm_other_warnings_before_distributed_init(monkeypatch):
+    """Same as above, on the branch taken before torch distributed is initialized."""
+    monkeypatch.setenv("RANK", "5")
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("default")
+        with patch(
+            "megatron.core._rank_utils.torch.distributed.is_initialized", return_value=False
+        ):
+            for _ in range(3):
+                _emit_unrelated_future_warning()
+                warn_single_rank("job-level message")
+
+    assert len([w for w in seen if w.category is FutureWarning]) == 1
+
+
+@pytest.mark.parametrize(
+    "env, slurm_rank, warns",
+    [
+        ({"RANK": "0"}, None, True),
+        ({"RANK": "3"}, 0, False),
+        ({}, 0, True),
+        ({}, 2, False),
+        ({}, None, True),
+    ],
+)
+def test_warn_single_rank_resolves_rank_before_distributed_init(
+    monkeypatch, env, slurm_rank, warns
+):
+    """RANK wins over SLURM, and no launcher means rank 0, without a fallback warning."""
+    monkeypatch.delenv("RANK", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    with (
+        patch("megatron.core._rank_utils.torch.distributed.is_initialized", return_value=False),
+        patch("megatron.core._rank_utils.resolve_slurm_rank", return_value=slurm_rank),
+        warnings.catch_warnings(record=True) as seen,
+    ):
+        warnings.simplefilter("always")
+        warn_single_rank("job-level message")
+
+    assert [str(w.message) for w in seen] == (["job-level message"] if warns else [])
