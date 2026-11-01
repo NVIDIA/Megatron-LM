@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -80,8 +80,14 @@ try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
+    try:
+        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
+    except ImportError:
+        _te_mark_grouped_tensor = None
+
     HAVE_TE = True
 except ImportError:
+    _te_mark_grouped_tensor = None
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
@@ -112,6 +118,30 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
+    """Mark dynamic grouped tensors through TE, ignoring absent optional operands."""
+    tensors_to_mark = tuple(tensor for tensor in tensors if tensor is not None)
+    if not tensors_to_mark:
+        return
+    if _te_mark_grouped_tensor is None:
+        raise RuntimeError(
+            "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+        )
+    _te_mark_grouped_tensor(*tensors_to_mark)
+
+
+def is_grouped_tensor_marked(tensor: Any) -> bool:
+    """Return whether a tensor carries Transformer Engine's grouped-tensor marker."""
+    return hasattr(tensor, "grouped_tensor_scale_inv")
+
+
+def propagate_te_grouped_tensor_marker(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Preserve TE's grouped-tensor marker across view/cast operations."""
+    if is_grouped_tensor_marked(source):
+        mark_grouped_tensor(target)
+    return target
 
 
 def _set_expert_parameter_attributes(
@@ -623,7 +653,9 @@ def split_te_layernorm_column_parallel_linear(
     out_features = fused_layer.out_features * fused_layer.tp_size
 
     # Create the norm layer
-    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps)
+    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps).to(
+        device=fused_layer.weight.device
+    )
 
     with torch.no_grad():
         # Copy layer norm weight
@@ -646,7 +678,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
-    )
+    ).to(device=fused_layer.weight.device)
 
     with torch.no_grad():
         # Copy weight
@@ -1231,6 +1263,8 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
         instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
@@ -1671,6 +1705,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
+
+        if self.config.normalization == "RMSNorm":
+            self.layer_norm_weight.is_rmsnorm_weight = True
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)
