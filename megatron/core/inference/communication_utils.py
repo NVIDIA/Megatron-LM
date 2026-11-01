@@ -5,20 +5,38 @@ import torch
 from torch.distributed import ProcessGroup
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 
 
-def is_pipeline_first_stage(pp_group: ProcessGroup):
-    """Check if the current process is the first stage of the pipeline"""
+def _warn_pp_group_fallback(owner: str) -> None:
+    """Warn, once per `owner`, that it was called without `pp_group` and uses the global group."""
+    warn_global_process_group_fallback(owner, "pp_group", deprecated_in="0.21", removed_in="0.23")
+
+
+def is_pipeline_first_stage(pp_group: Optional[ProcessGroup]):
+    """Check if the current process is the first stage of the pipeline.
+
+    Args:
+        pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
+            group is used; that fallback is deprecated.
+    """
     if pp_group is None:
+        _warn_pp_group_fallback("is_pipeline_first_stage")
         # set ignore_virtual=True since vpp is not used in inference
         return parallel_state.is_pipeline_first_stage(ignore_virtual=True)
     else:
         return pp_group.rank() == 0
 
 
-def is_pipeline_last_stage(pp_group: ProcessGroup):
-    """Check if the current process is the last stage of the pipeline"""
+def is_pipeline_last_stage(pp_group: Optional[ProcessGroup]):
+    """Check if the current process is the last stage of the pipeline.
+
+    Args:
+        pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
+            group is used; that fallback is deprecated.
+    """
     if pp_group is None:
+        _warn_pp_group_fallback("is_pipeline_last_stage")
         # set ignore_virtual=True since vpp is not used in inference
         return parallel_state.is_pipeline_last_stage(ignore_virtual=True)
     else:
@@ -49,10 +67,12 @@ def broadcast_from_last_pipeline_stage(
         size: Expected tensor size
         dtype: Expected tensor dtype
         tensor: Tensor to broadcast (only on last stage)
-        pp_group: Custom process group (if None, uses global state)
+        pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
+            group is used; that fallback is deprecated.
     """
     # Use custom process group or fall back to global state
     if pp_group is None:
+        _warn_pp_group_fallback("broadcast_from_last_pipeline_stage")
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
 
@@ -87,10 +107,12 @@ def recv_from_prev_pipeline_rank_(
 
     Args:
         recv_buffer: Buffer to receive data into
-        pp_group: Custom process group (if None, uses global state)
+        pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
+            group is used; that fallback is deprecated.
     """
     # Determine previous rank
     if pp_group is None:
+        _warn_pp_group_fallback("recv_from_prev_pipeline_rank_")
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
     else:
         # Lists of ProcessGroups are used for multimodal inference but not supported here
@@ -118,10 +140,12 @@ def send_to_next_pipeline_rank(
 
     Args:
         tensor: Tensor to send
-        pp_group: Custom process group (if None, uses global state)
+        pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
+            group is used; that fallback is deprecated.
     """
     # Determine next rank
     if pp_group is None:
+        _warn_pp_group_fallback("send_to_next_pipeline_rank")
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
     else:
         # Lists of ProcessGroups are used for multimodal inference but not supported here
@@ -149,17 +173,17 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
     """
+    # Single compatibility boundary: the source rank is rank 0 of the model-parallel group, so
+    # both are derived from one lookup. See docs/developer/parallel-state-deprecation.md.
+    group = None
     if data_parallel:
-        rank = parallel_state.get_model_parallel_src_rank()
+        group = parallel_state.get_model_parallel_group()
+        rank = torch.distributed.get_global_rank(group, 0)
 
     if torch.distributed.get_rank() == rank:
         _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
-
-    group = None
-    if data_parallel:
-        group = parallel_state.get_model_parallel_group()
 
     torch.distributed.broadcast(tensor, rank, group=group)
 
@@ -176,10 +200,9 @@ def broadcast_list(size, dtype, list_values=None, rank=0, data_parallel=False):
     tensor = None
 
     if data_parallel:
-        if parallel_state.get_model_parallel_src_rank() == torch.distributed.get_rank():
-            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
-
         rank = parallel_state.get_model_parallel_src_rank()
+        if rank == torch.distributed.get_rank():
+            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
     else:
         if torch.distributed.get_rank() == rank:
             tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
