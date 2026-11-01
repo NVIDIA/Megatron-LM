@@ -3739,7 +3739,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
                 self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
+                request = self.get_request(request_id)
+                request.add_event_evict()
+
+                # Without chunked prefill, a checkpoint longer than one step's token
+                # budget can never be re-admitted, and would block every request queued
+                # behind it. Fail it now, as _add_request does for such a prompt.
+                if (
+                    len(request.prompt_tokens) > self.context.max_tokens
+                    and not self.enable_chunked_prefill
+                ):
+                    self.waiting_request_ids.remove(request_id)
+                    request.add_event_error_nontransient(TokenOverflowError(request_id))
+                    self._handle_failed_request(request_id, stage="be re-admitted after eviction")
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
