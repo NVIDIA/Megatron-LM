@@ -375,6 +375,11 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                align_fp4_wgrad=bool(
+                    config.fp4
+                    and config.gradient_accumulation_fusion
+                    and not self.ddp_config.use_distributed_optimizer
+                ),
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)
