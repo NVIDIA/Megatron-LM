@@ -273,7 +273,7 @@ def mcore_to_pyt_state_dict(
         - if `allow_shape_mismatch` is True, the data is initialized with zeros
             prior to loading (not all parts of the tensor will be read from the checkpoint)
         """
-        from ...utils import is_torch_min_version
+        from ...utils import get_torch_version, is_torch_min_version
 
         assert all(isinstance(sh_ten, ShardedTensor) for sh_ten in sh_tens), sh_tens
         for sh_ten in sh_tens:
