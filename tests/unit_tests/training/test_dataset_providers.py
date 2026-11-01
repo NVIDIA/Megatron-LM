@@ -572,7 +572,9 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
             module, "build_gpt_datasets", lambda *a, **k: calls.append((a, k)) or (1, 2, 3)
         )
         parameters = inspect.signature(module.train_valid_test_datasets_provider).parameters
-        assert list(parameters) == ["train_val_test_num_samples", "vp_stage"]  # main's shape
+        # main's shape; hybrid-flex also takes the run's process groups (None by default)
+        groups = ["pg_collection"] if name == "hybrid_flex" else []
+        assert list(parameters) == ["train_val_test_num_samples", "vp_stage", *groups]
         built = module.train_valid_test_datasets_provider((8, 8, 8), 1)
         assert built == (1, 2, 3)
         ((positional, keywords),) = calls
