@@ -106,6 +106,8 @@ def default_layer_spec(
             remap_te_layernorm=True,
             real_quant_cfg="None",
             use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+            vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(

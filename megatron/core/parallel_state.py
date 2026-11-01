@@ -2,9 +2,11 @@
 
 """Model and data parallel groups."""
 
+import enum
 import logging
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
@@ -15,7 +17,7 @@ import torch
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
-from .utils import GlobalMemoryBuffer, is_torch_min_version
+from .utils import destroy_global_memory_buffer, get_global_memory_buffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -163,14 +165,62 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
-# Memory buffers to avoid dynamic memory allocation
-_GLOBAL_MEMORY_BUFFER = None
+# The ProcessGroupCollection passed to register_process_groups(). The group and rank-list
+# variables above hold its groups, and the accessors of this module return them.
+_REGISTERED_PROCESS_GROUPS = None
 
 
-# List of all process groups
-# Used for updating the timeout for all process groups
-# None represents the default process group
+# Member groups recorded by create_group, in creation order, for timeout updates
+# and teardown. The first entry, None, represents the default process group.
 _global_process_group_list = None
+
+
+class TeardownStage(enum.IntEnum):
+    """Stages of destroy_model_parallel(), in execution order."""
+
+    VALIDATE = 0
+    """Raise if teardown must not start. Runs before anything is aborted or released."""
+
+    RELEASE_COMMUNICATION = 1
+    """Release contexts and buffers that use model-parallel communicators."""
+
+    RELEASE_CUDA_GRAPHS = 2
+    """Release captured CUDA graphs, which keep the communicators they captured alive."""
+
+    RESET_STATE = 3
+    """Reset library state that refers to the ending lifetime's process groups."""
+
+
+# Teardown callbacks by stage. See register_model_parallel_teardown().
+_MODEL_PARALLEL_TEARDOWN_CALLBACKS = {stage: [] for stage in TeardownStage}
+_MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS = {}
+
+
+def register_model_parallel_teardown(
+    stage: TeardownStage,
+    callback: Callable[[], None],
+    *,
+    on_abort: Optional[Callable[[Sequence[torch.distributed.ProcessGroup]], None]] = None,
+) -> None:
+    """Run ``callback`` at ``stage`` of every destroy_model_parallel() call.
+
+    Modules that cache resources bound to model-parallel process groups register a
+    callback when they are imported, so this module does not depend on them. Callbacks
+    run whether or not their resource exists, so they must be cheap and idempotent.
+    Within a stage, callbacks run in reverse registration order: a module registers
+    after the modules it imports, so it releases its resources before theirs.
+    Registering the same callback again has no effect.
+
+    If supplied, ``on_abort`` replaces ``callback`` during abort teardown and receives
+    the groups whose NCCL backends were aborted. This lets owners discard registrations
+    already released by NCCL abort without deregistering them a second time. Resources
+    associated with other groups still require normal cleanup.
+    """
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS[stage]
+    if callback not in callbacks:
+        callbacks.append(callback)
+    if on_abort is not None:
+        _MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS[callback] = on_abort
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -269,7 +319,7 @@ def create_group(
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
-    if torch.distributed.get_rank() in ranks:
+    if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
         _global_process_group_list.append(group)
     return group
 
@@ -633,7 +683,8 @@ def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
 class StandardGridExtras:
     """Groups and global rank lists of the standard grid that ProcessGroupCollection has no field
     for. build_process_group_collection() returns them next to the collection, and the
-    parallel_state accessors return them after initialize_model_parallel().
+    parallel_state accessors return them after register_process_groups(), which
+    initialize_model_parallel() calls.
 
     A group or rank list is None when this rank is not a member, or when the configuration does
     not build it.
@@ -645,14 +696,15 @@ class StandardGridExtras:
     intra_dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup]
     # Partial expert data parallel group spanning EGTP_remat (intra_expt_dp when EGTP_remat is 1).
     intra_expt_dp_gtp_remat: Optional[torch.distributed.ProcessGroup]
-    # Gloo groups with the ranks of dp, dp_cp, intra_dp_cp, expt_dp and intra_expt_dp.
+    # Gloo groups with the ranks of dp, dp_cp, intra_dp_cp, expt_dp and intra_expt_dp. The
+    # intra ones are also collection fields, and register_process_groups() takes the collection's.
     dp_gloo: Optional[torch.distributed.ProcessGroup]
     dp_cp_gloo: Optional[torch.distributed.ProcessGroup]
     intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup]
     expt_dp_gloo: Optional[torch.distributed.ProcessGroup]
     intra_expt_dp_gloo: Optional[torch.distributed.ProcessGroup]
     # Global ranks of every dense weight-replica (dp_cp) group of the grid, on every rank.
-    weight_replica_rank_sets: List[List[int]]
+    weight_replica_rank_sets: Optional[List[List[int]]]
     # Global ranks of this rank's groups, in the order they were passed to create_group().
     tp_global_ranks: Optional[List[int]]
     pp_global_ranks: Optional[List[int]]
@@ -667,10 +719,85 @@ class StandardGridExtras:
     expt_gtp_remat_global_ranks: Optional[List[int]]
 
 
-def _register_process_groups(
-    pg_collection: "ProcessGroupCollection", extras: StandardGridExtras
+def _grid_extras_from_collection(pg_collection: "ProcessGroupCollection") -> StandardGridExtras:
+    """The StandardGridExtras that follow from the groups of a collection alone.
+
+    The global rank lists are the ranks of the collection's groups. The partial data parallel
+    groups that span GTP_remat are the collection's partial data parallel groups when the
+    GTP_remat axis is off or has size 1, and None otherwise. The intra partial Gloo groups are
+    the collection's. The tensor x data parallel group, the other Gloo groups and the
+    weight-replica rank lists of the other ranks are None: a collection has no field for them.
+    """
+
+    def global_ranks(group):
+        return None if group is None else torch.distributed.get_process_group_ranks(group)
+
+    def spans_ranks(group):
+        return group is not None and group.size() > 1
+
+    return StandardGridExtras(
+        tp_dp=None,
+        intra_dp_cp_gtp_remat=(
+            None if spans_ranks(pg_collection.gtp_remat) else pg_collection.intra_dp_cp
+        ),
+        intra_expt_dp_gtp_remat=(
+            None if spans_ranks(pg_collection.expt_gtp_remat) else pg_collection.intra_expt_dp
+        ),
+        dp_gloo=None,
+        dp_cp_gloo=None,
+        intra_dp_cp_gloo=pg_collection.intra_dp_cp_gloo,
+        expt_dp_gloo=None,
+        intra_expt_dp_gloo=pg_collection.intra_expt_dp_gloo,
+        weight_replica_rank_sets=None,
+        tp_global_ranks=global_ranks(pg_collection.tp),
+        pp_global_ranks=global_ranks(pg_collection.pp),
+        mp_global_ranks=global_ranks(pg_collection.mp),
+        dp_global_ranks=global_ranks(pg_collection.dp),
+        dp_cp_global_ranks=global_ranks(pg_collection.dp_cp),
+        cp_global_ranks=global_ranks(pg_collection.cp),
+        embd_global_ranks=global_ranks(pg_collection.embd),
+        pos_embd_global_ranks=global_ranks(pg_collection.pos_embd),
+        ep_global_ranks=global_ranks(pg_collection.ep),
+        gtp_remat_global_ranks=global_ranks(pg_collection.gtp_remat),
+        expt_gtp_remat_global_ranks=global_ranks(pg_collection.expt_gtp_remat),
+    )
+
+
+def register_process_groups(
+    pg_collection: "ProcessGroupCollection", *, extras: Optional[StandardGridExtras] = None
 ) -> None:
-    """Set the parallel_state globals to the groups built by build_process_group_collection()."""
+    """Register the process groups that the parallel_state accessors return.
+
+    initialize_model_parallel() registers the groups it builds with this function. A framework
+    that builds its own grid, for example with HyperCommGrid, registers its collection here so
+    that code which still reads parallel_state, including
+    ProcessGroupCollection.use_mpu_process_groups(), uses that grid. destroy_model_parallel()
+    clears the registration; until then get_registered_process_groups() returns pg_collection.
+
+    The groups are registered when this function is called: setting a field of pg_collection
+    afterwards does not change what the accessors return. A field that is None or not set
+    registers no group, and the accessor of that group then reports it as not initialized.
+    dp_cp_ag and expt_dp_ag have no accessor.
+
+    Args:
+        pg_collection: The process groups of this rank.
+        extras: The groups and global rank lists of the grid that the collection has no field
+            for, as build_process_group_collection() returns them. When omitted, they are
+            derived from the collection's groups: the global rank lists are the ranks of its
+            groups, and the groups that a collection cannot describe, such as the dp, dp_cp and
+            expt_dp Gloo groups and the tensor x data parallel group, are not registered. The
+            intra partial Gloo groups are collection fields, so they come from pg_collection
+            either way.
+
+    Raises:
+        TypeError: pg_collection is not a ProcessGroupCollection, or extras is not a
+            StandardGridExtras.
+        RuntimeError: Process groups are already registered. Call destroy_model_parallel()
+            first.
+    """
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
     global _TENSOR_MODEL_PARALLEL_GROUP, _PIPELINE_MODEL_PARALLEL_GROUP, _MODEL_PARALLEL_GROUP
     global _EMBEDDING_GROUP, _POSITION_EMBEDDING_GROUP
     global _CONTEXT_PARALLEL_GROUP, _TENSOR_AND_CONTEXT_PARALLEL_GROUP
@@ -697,6 +824,14 @@ def _register_process_groups(
     global _EXPERT_MODEL_PARALLEL_RANKS
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS, _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     global _WEIGHT_REPLICA_RANK_SETS
+    global _REGISTERED_PROCESS_GROUPS
+
+    if not isinstance(pg_collection, ProcessGroupCollection):
+        raise TypeError(
+            f"pg_collection must be a ProcessGroupCollection, got {type(pg_collection).__name__}"
+        )
+    if extras is not None and not isinstance(extras, StandardGridExtras):
+        raise TypeError(f"extras must be a StandardGridExtras, got {type(extras).__name__}")
 
     for group, description in (
         (_DATA_PARALLEL_GROUP, "data parallel group"),
@@ -724,7 +859,17 @@ def _register_process_groups(
         (_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Inter partial expert data group"),
         (_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP, "Intra distributed optimizer instance group"),
     ):
-        assert group is None, f"{description} is already initialized"
+        if group is not None:
+            raise RuntimeError(
+                f"{description} is already initialized. Call destroy_model_parallel() first."
+            )
+    if _REGISTERED_PROCESS_GROUPS is not None:
+        raise RuntimeError(
+            "Process groups are already registered. Call destroy_model_parallel() first."
+        )
+
+    if extras is None:
+        extras = _grid_extras_from_collection(pg_collection)
 
     _TENSOR_MODEL_PARALLEL_GROUP = pg_collection.tp
     _PIPELINE_MODEL_PARALLEL_GROUP = pg_collection.pp
@@ -747,10 +892,15 @@ def _register_process_groups(
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = pg_collection.dp_cp_gtp_remat
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = pg_collection.intra_dp_cp
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = extras.intra_dp_cp_gtp_remat
-    _DYNAMIC_DP_CP_GROUPS.update(pg_collection.dynamic_cp)
+    if pg_collection.dynamic_cp is not None:
+        _DYNAMIC_DP_CP_GROUPS.update(pg_collection.dynamic_cp)
     # With TP1 the TP x runtime-CP accessors return the runtime CP groups, so this map only
     # holds the groups built for TP > 1.
-    if pg_collection.tp is not None and pg_collection.tp.size() > 1:
+    if (
+        pg_collection.tp is not None
+        and pg_collection.tp.size() > 1
+        and pg_collection.dynamic_tp_cp is not None
+    ):
         _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS.update(pg_collection.dynamic_tp_cp)
     _GTP_WEIGHT_REMAT_GROUP = pg_collection.gtp_remat
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = pg_collection.expt_gtp_remat
@@ -763,9 +913,9 @@ def _register_process_groups(
 
     _DATA_PARALLEL_GROUP_GLOO = extras.dp_gloo
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = extras.dp_cp_gloo
-    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = extras.intra_dp_cp_gloo
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = pg_collection.intra_dp_cp_gloo
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = extras.expt_dp_gloo
-    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = extras.intra_expt_dp_gloo
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = pg_collection.intra_expt_dp_gloo
 
     _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = extras.tp_global_ranks
     _PIPELINE_GLOBAL_RANKS = extras.pp_global_ranks
@@ -779,6 +929,17 @@ def _register_process_groups(
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = extras.gtp_remat_global_ranks
     _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = extras.expt_gtp_remat_global_ranks
     _WEIGHT_REPLICA_RANK_SETS = extras.weight_replica_rank_sets
+
+    _REGISTERED_PROCESS_GROUPS = pg_collection
+
+
+def get_registered_process_groups() -> Optional["ProcessGroupCollection"]:
+    """Return the collection passed to register_process_groups(), or None if there is none.
+
+    initialize_model_parallel() registers the collection it returns. destroy_model_parallel()
+    clears the registration.
+    """
+    return _REGISTERED_PROCESS_GROUPS
 
 
 # pylint: disable=C0301
@@ -999,6 +1160,10 @@ def build_process_group_collection(
 
     if get_position_embedding_ranks is None:
         get_position_embedding_ranks = default_position_embedding_ranks
+
+    # Finalization may run on a different thread during in-process restart. DTensor
+    # caches are thread-local, so invalidate them on the model's thread as well.
+    _clear_dtensor_sharding_cache()
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -1897,8 +2062,9 @@ def initialize_model_parallel(
 ) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
 
-    Creates the groups with build_process_group_collection() and registers them in
-    parallel_state, whose accessors such as get_tensor_model_parallel_group() then return them.
+    Creates the groups with build_process_group_collection() and registers them with
+    register_process_groups(), so that the parallel_state accessors such as
+    get_tensor_model_parallel_group() return them.
 
     Args:
         virtual_pipeline_model_parallel_size (int, optional):
@@ -1922,8 +2088,9 @@ def initialize_model_parallel(
         The other arguments are documented in build_process_group_collection().
 
     Returns:
-        ProcessGroupCollection: the registered groups of this rank, which are the same objects
-        that ProcessGroupCollection.use_mpu_process_groups() returns.
+        ProcessGroupCollection: the registered groups of this rank. It is the collection that
+        get_registered_process_groups() returns, and ProcessGroupCollection.use_mpu_process_groups()
+        returns its groups.
     """
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 1:
@@ -1971,13 +2138,7 @@ def initialize_model_parallel(
         min_dynamic_context_parallel_size=min_dynamic_context_parallel_size,
         gtp_remat_num_sequence_shards=gtp_remat_num_sequence_shards,
     )
-    _register_process_groups(pg_collection, extras)
-
-    # Initialize global memory buffer
-    # This isn't really "parallel state" but there isn't another good place to
-    # put this. If we end up with a more generic initialization of megatron-core
-    # we could stick it there
-    _set_global_memory_buffer()
+    register_process_groups(pg_collection, extras=extras)
 
     return pg_collection
 
@@ -2934,22 +3095,12 @@ def get_inter_distributed_optimizer_instance_group(check_initialized=True):
 
 
 def _set_global_memory_buffer():
-    """Initialize global buffer."""
-    global _GLOBAL_MEMORY_BUFFER
-    assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
-    _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    """Create the process-wide GlobalMemoryBuffer if it does not exist yet.
 
-
-def get_global_memory_buffer():
-    """Return the global GlobalMemoryBuffer object"""
-    assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
-    return _GLOBAL_MEMORY_BUFFER
-
-
-def destroy_global_memory_buffer():
-    """Sets the global memory buffer to None"""
-    global _GLOBAL_MEMORY_BUFFER
-    _GLOBAL_MEMORY_BUFFER = None
+    Calling this is optional: get_global_memory_buffer (from megatron.core.utils) creates the
+    buffer on first use.
+    """
+    get_global_memory_buffer()
 
 
 def get_all_ranks():
@@ -2966,35 +3117,147 @@ def get_all_ranks():
     return "_".join(map(lambda x: str(x or 0), ranks))
 
 
-def destroy_model_parallel():
-    """Set the groups to none."""
-    # MoonEP's symmetric-memory windows must be released while their expert process group
-    # is still alive. Idempotent and a no-op when virtual experts were never initialized.
-    try:
-        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-            VirtualExpertLoadBalancer,
-        )
+def _destroy_created_process_groups():
+    """Destroy this rank's created groups in reverse order, preserving WORLD."""
+    global _global_process_group_list
+    # create_group records each creation once; aliases do not add entries. None is
+    # the default group used by update_pg_timeout, which this function does not own.
+    groups = _global_process_group_list or []
+    _global_process_group_list = None
+    first_error = None
+    for group in reversed(groups):
+        if group is not None and group in torch.distributed.distributed_c10d._world.pg_map:
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception as error:
+                logger.warning("Failed to destroy a model-parallel process group.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
 
-        VirtualExpertLoadBalancer.finalize()
-    except Exception:
-        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
 
-    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
-    # process group's communicator is torn down. TE registers an atexit ep_finalize that would
-    # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped.
-    try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+def _abort_created_process_groups():
+    """Abort owned NCCL backends before cleanup that may synchronize CUDA work."""
+    groups = [
+        group
+        for group in reversed(_global_process_group_list or [])
+        if group is not None
+        and group in torch.distributed.distributed_c10d._world.pg_map
+        and torch.distributed.get_backend(group) == "nccl"
+    ]
+    if not groups:
+        return []
 
-        nccl_ep_finalize()
-    except Exception:  # finalize must never block teardown
-        pass
+    def abort_group(group):
+        group._get_backend(torch.device("cuda")).abort()
+
+    # Start all aborts together: outstanding work on different communicators can
+    # depend on one another, so aborting them one at a time can block.
+    first_error = None
+    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        futures = [executor.submit(abort_group, group) for group in groups]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as error:
+                logger.warning("Failed to abort a model-parallel NCCL backend.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    # Do not enter graceful finalization if an abort failed: it may wait forever.
+    if first_error is not None:
+        raise first_error
+    return groups
+
+
+def _clear_dtensor_sharding_cache():
+    """Invalidate this thread's sharding specs, which can name a previous lifetime's groups."""
+    from torch.distributed.tensor import DTensor
+
+    cache = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding
+    if is_torch_min_version("2.10.0"):
+        cache.cache_clear()
+        # The C++ dispatch fast path keeps its own sharding cache in front of the LRU.
+        torch._C._clear_DTensor_sharding_propagator_cache()
+    else:
+        # LocalLRUCache exposes cache_clear() from torch 2.10; before that, clear the LRU
+        # it wraps.
+        cache.cache.cache_clear()
+
+
+def destroy_model_parallel(*, abort: bool = False) -> None:
+    """Destroy model-parallel process groups and clear their global state.
+
+    Call on every member of each group after communications and Transformer Engine
+    autocast contexts have finished. Release any CUDA graphs managed by the caller
+    (including TE graphed callables) before invoking this function. The default
+    process group is preserved.
+
+    Teardown runs the registered TeardownStage.VALIDATE callbacks, aborts the owned
+    NCCL backends if requested, runs the remaining stages' callbacks in stage order
+    while the groups still exist, clears this module's state, and destroys the created
+    groups last. See register_model_parallel_teardown().
+
+    Args:
+        abort: Abort the owned NCCL backends before releasing cached resources. Failure
+            handlers with outstanding collectives must use this mode, or abort their
+            backends before calling. This does not abort WORLD or communication owned
+            by external libraries such as DeepEP; those require caller-managed recovery.
+
+    Raises:
+        RuntimeError: A validation callback refused teardown, for example because a TE
+            autocast context is still active. Nothing has been released.
+        Exception: A resource or process group could not be released. If a callback
+            fails, the remaining callbacks still run, and the first failure is raised
+            before any group is destroyed or module state is cleared. Group destruction
+            attempts all registered groups before reporting the first failure.
+    """
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS
+    for validate in reversed(callbacks[TeardownStage.VALIDATE]):
+        validate()
+
+    aborted_groups = _abort_created_process_groups() if abort else []
+
+    # Release cached resources while their process groups still exist. Run every
+    # callback even if one fails: some releases rendezvous with peer ranks, which run
+    # all of them.
+    first_error = None
+    for stage in (
+        TeardownStage.RELEASE_COMMUNICATION,
+        TeardownStage.RELEASE_CUDA_GRAPHS,
+        TeardownStage.RESET_STATE,
+    ):
+        for release in reversed(callbacks[stage]):
+            try:
+                on_abort = _MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS.get(release)
+                if abort and on_abort is not None:
+                    on_abort(aborted_groups)
+                else:
+                    release()
+            except Exception as error:
+                logger.warning("Failed to release a model-parallel resource.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    # A resource that failed to release may still use its communicator, so destroying
+    # the group could wait forever. Keep the groups and this module's state.
+    if first_error is not None:
+        raise first_error
+
+    # DTensor's sharding cache compares meshes by layout, not process-group identity.
+    # A later initialization with the same layout would reuse specs naming dead groups.
+    _clear_dtensor_sharding_cache()
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
+    global _MODEL_PARALLEL_GLOBAL_RANKS
+    _MODEL_PARALLEL_GLOBAL_RANKS = None
+
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
     global _GTP_WEIGHT_REMAT_GROUP
     _GTP_WEIGHT_REMAT_GROUP = None
@@ -3007,8 +3270,14 @@ def destroy_model_parallel():
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
 
+    global _PIPELINE_GLOBAL_RANKS
+    _PIPELINE_GLOBAL_RANKS = None
+
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    _DATA_PARALLEL_GLOBAL_RANKS = None
 
     global _DATA_PARALLEL_GROUP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
@@ -3016,11 +3285,23 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
+    global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
+
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
 
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+
+    global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
@@ -3036,6 +3317,9 @@ def destroy_model_parallel():
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
+
+    global _EMBEDDING_GLOBAL_RANKS
+    _EMBEDDING_GLOBAL_RANKS = None
 
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
@@ -3070,27 +3354,12 @@ def destroy_model_parallel():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
-    global _GLOBAL_MEMORY_BUFFER
-    _GLOBAL_MEMORY_BUFFER = None
+    destroy_global_memory_buffer()
 
     global _DATA_PARALLEL_GROUP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
     _DATA_PARALLEL_GROUP_GLOO = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     # Destroy parallel state related to expert parallelism.
@@ -3102,6 +3371,9 @@ def destroy_model_parallel():
 
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
+
+    global _EXPERT_MODEL_PARALLEL_RANKS
+    _EXPERT_MODEL_PARALLEL_RANKS = None
 
     global _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
@@ -3137,28 +3409,12 @@ def destroy_model_parallel():
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -3168,7 +3424,11 @@ def destroy_model_parallel():
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
-    global _global_process_group_list
-    _global_process_group_list = None
+    global _REGISTERED_PROCESS_GROUPS
+    _REGISTERED_PROCESS_GROUPS = None
 
     SymmetricMemoryManager.destroy()
+
+    # Destroy the tracked process groups last, after every cache above has released the
+    # resources it held on their communicators.
+    _destroy_created_process_groups()

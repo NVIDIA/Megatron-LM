@@ -98,7 +98,6 @@ from megatron.core.optimizer_param_scheduler import (
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
-    destroy_global_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout,
 )
@@ -136,6 +135,7 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
+    destroy_global_memory_buffer,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -3265,14 +3265,8 @@ def setup_model_and_optimizer(
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and cfg.dist.use_torch_fsdp2
                 and args.ckpt_format == "torch_dist",
-                tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
-                pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-                # Replica_id must match the save path (see save_checkpoint_and_time): use the
-                # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
-                dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
-                dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
-                expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                pg_collection=ckpt_pgc,
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
@@ -3681,13 +3675,23 @@ def train_step(
                 pg_collection=pg_collection,
             )
         if save_activations_in_this_iteration:
-            save_activations(iteration + 1)
+            save_activations(
+                iteration + 1,
+                pg_collection=_get_model_pg_collection(
+                    model[0], pg_collection, owner="train_step"
+                ),
+            )
             disable_activation_logging()
         if save_tpe_in_this_iteration:
             save_tokens_per_expert(iteration + 1)
             disable_tokens_per_expert_logging()
         if save_dgrads_in_this_iteration:
-            save_dgrads(iteration + 1)
+            save_dgrads(
+                iteration + 1,
+                pg_collection=_get_model_pg_collection(
+                    model[0], pg_collection, owner="train_step"
+                ),
+            )
             disable_dgrad_logging()
 
         # Advance the router tracer step if active.
@@ -3710,8 +3714,17 @@ def train_step(
                     tensor_on_cpu = getattr(param, attr_name).cpu()
                     state_dict[model_chunk_name][param_name] = tensor_on_cpu
 
-        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(args.save, state_dict, iteration + 1, label)
+        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging. The files
+        # are named by the ranks of the model's process groups.
+        save_grads(
+            args.save,
+            state_dict,
+            iteration + 1,
+            label,
+            pg_collection=_get_model_pg_collection(
+                model[0], pg_collection, owner="train_step"
+            ),
+        )
 
     # Checkpoint wgrads with parameter names.
     if save_wgrads_in_this_iteration:
@@ -4577,18 +4590,9 @@ def save_checkpoint_and_time(
         timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
         timers(timer_key, log_level=0).start(barrier=False)
 
-        # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-        # falls back to the mpu groups inside save_checkpoint (byte-identical).
+        # Checkpointing runs on the process groups of the model it saves.
         ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-        tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-        pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
-        dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
-        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
-        # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
-        dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
-        expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
+        dp_gtp_remat_group = ckpt_pgc.dp_gtp_remat if ckpt_pgc is not None else None
         # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
         rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
 
@@ -4612,15 +4616,9 @@ def save_checkpoint_and_time(
                 non_persistent_ckpt=non_persistent_ckpt,
                 train_data_iterator=train_data_iterator,
                 preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                tp_group=tp_group,
-                pp_group=pp_group,
-                dp_cp_group=dp_cp_group,
-                dp_group=dp_group,
-                dp_gtp_remat_group=dp_gtp_remat_group,
-                expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
-                cp_group=cp_group,
                 on_saved=on_saved,
+                pg_collection=ckpt_pgc,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -6334,14 +6332,30 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
-    """Build pretraining datasets."""
+def build_train_valid_test_datasets(
+    build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, pg_collection=None
+):
+    """Build pretraining datasets.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets from their target sizes. A provider with a ``pg_collection``
+            parameter also receives ``pg_collection``, which decides the ranks that build the
+            datasets; other providers are called with the target sizes alone.
+        train_valid_test_num_samples: Target sizes of the train, validation and test datasets.
+            None computes them from the run configuration.
+        pg_collection: Process groups of the run.
+    """
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
+    if "pg_collection" in inspect.signature(build_train_valid_test_datasets_provider).parameters:
+        return build_train_valid_test_datasets_provider(
+            train_valid_test_num_samples, pg_collection=pg_collection
+        )
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
@@ -6354,9 +6368,10 @@ def build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider: Function that builds the train, validation
             and test datasets.
         pg_collection: Process groups of the run. Unless the provider is distributed-aware,
-            the first rank of its tensor-parallel group builds the data pipeline, and the
-            loaders shard samples over its data-parallel group. None uses the global
-            parallel state.
+            the first rank of its tensor-parallel group builds the data pipeline. A provider
+            with a ``pg_collection`` parameter receives it, and the loaders shard samples over
+            its data-parallel group. Omitting it is deprecated: the global parallel state is
+            used instead, with a ProcessGroupFallbackWarning.
         build_train_dataloader: Whether to build the training data loader. False leaves the
             training data to a caller-provided iterator.
     """
@@ -6396,7 +6411,9 @@ def build_train_valid_test_data_loaders(
     if build_data_pipeline:
 
         # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            build_train_valid_test_datasets_provider, pg_collection=pg_collection
+        )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
         if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
@@ -6482,8 +6499,9 @@ def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider: Function that builds the train, validation
             and test datasets.
         pg_collection: Process groups of the run, used to build the data loaders and to agree
-            on the number of full-validation iterations across its data-parallel ranks. None
-            uses the global parallel state.
+            on the number of full-validation iterations across its data-parallel ranks.
+            Omitting it is deprecated: the global parallel state is used instead, with a
+            ProcessGroupFallbackWarning.
         build_train_dataloader: Whether to build the training data loader. False leaves the
             training data to a caller-provided iterator.
     """
