@@ -166,8 +166,10 @@ def gdp_prepare_kernel(
         # The query goes on the *last* copy so that it reads the state after all
         # M updates have been applied; the other copies get zeros, which the
         # recurrent kernel's in-kernel L2 norm leaves at zero (0 / sqrt(eps)).
-        b_q = tl.load(p_q, mask=mask_hn, other=0.0).to(tl.float32)
-        b_q = tl.where(i_m == M - 1, b_q, 0.0)
+        if i_m == M - 1:
+            b_q = tl.load(p_q, mask=mask_hn, other=0.0).to(tl.float32)
+        else:
+            b_q = tl.full((BH, BN), 0.0, tl.float32)
         tl.store(
             q + (i_o * H + o_h[:, None]) * N + o_n[None, :],
             b_q.to(q.dtype.element_ty),
@@ -175,10 +177,13 @@ def gdp_prepare_kernel(
         )
         # The decay belongs on the *first* copy: the state decays once per step,
         # before the M Householder updates.
-        b_a = tl.load(p_ba + M * H + o_h, mask=mask_h, other=0.0).to(tl.float32)
-        b_dt = tl.load(dt_bias + o_h, mask=mask_h, other=0.0).to(tl.float32)
-        b_A = tl.load(A_log + o_h, mask=mask_h, other=0.0).to(tl.float32)
-        b_g = tl.where(i_m == 0, -libdevice.exp(b_A) * softplus(b_a + b_dt), 0.0)
+        if i_m == 0:
+            b_a = tl.load(p_ba + M * H + o_h, mask=mask_h, other=0.0).to(tl.float32)
+            b_dt = tl.load(dt_bias + o_h, mask=mask_h, other=0.0).to(tl.float32)
+            b_A = tl.load(A_log + o_h, mask=mask_h, other=0.0).to(tl.float32)
+            b_g = -libdevice.exp(b_A) * softplus(b_a + b_dt)
+        else:
+            b_g = tl.full((BH,), 0.0, tl.float32)
         tl.store(g + i_o * H + o_h, b_g, mask=mask_h)
     else:
         # Prefill: one per token in the compact `[n, T, H, ...]` layout, written
