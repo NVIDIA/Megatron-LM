@@ -62,6 +62,8 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
     config = OptimizerConfig(
         optimizer=path if path in ('muon', 'adam', 'sgd') else 'adam',
         lr=0.1,
+        use_distributed_optimizer=path == 'fsdp_overlap',
+        overlap_param_gather=path == 'fsdp_overlap',
         overlap_param_gather_with_optimizer_step=path == 'fsdp_overlap',
     )
     built = []
