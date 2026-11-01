@@ -150,6 +150,22 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
         client._connect_with_inference_coordinator()
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_failed_submission_releases_source_ownership(streaming):
+    """A request that never reached the socket cannot own remote state."""
+    client, _, fake_socket = _make_client()
+    fake_socket.send_multipart.side_effect = RuntimeError("send failed")
+
+    submit = client.add_request_streaming if streaming else client.add_request
+    with pytest.raises(RuntimeError, match="send failed"):
+        submit("prompt", SamplingParams())
+
+    assert not client._pending_source_requests
+    assert not client.completion_futures
+    assert not client.streams
+    assert not client.request_submission_times
+
+
 async def test_add_request_with_kv_handoff_returns_future():
     """Non-streaming handoffs use the normal final-reply future path."""
     client, _, fake_socket = _make_client()
@@ -193,17 +209,20 @@ async def test_terminal_error_and_abort_acknowledgement():
         await asyncio.wait_for(failed, timeout=2.0)
     assert error.value.source_safe
 
+    fake_socket.send.reset_mock()
     unsafe = client.add_request("unsafe", SamplingParams())
     recv_queue.append([msgpack.packb([Headers.REQUEST_ERROR.value, 1, "read failed", False])])
     with pytest.raises(InferenceRequestError, match="read failed") as error:
         await asyncio.wait_for(unsafe, timeout=2.0)
     assert not error.value.source_safe
+    automatic_abort = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert automatic_abort == [Headers.ABORT_REQUEST.value, 1]
     assert 1 not in client.abort_futures
+    fake_socket.send.reset_mock()
     abort_ack = client.abort_request_and_wait(1)
     assert abort_ack.get_loop() is asyncio.get_running_loop()
     assert not abort_ack.done()
-    abort_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
-    assert abort_payload == [Headers.ABORT_REQUEST.value, 1]
+    fake_socket.send.assert_not_called()
     recv_queue.append([msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True])])
     assert await asyncio.wait_for(abort_ack, timeout=2.0)
     await asyncio.sleep(0)
@@ -474,12 +493,28 @@ async def test_add_request_with_id_returns_the_id_abort_needs():
     delegated.cancel()
 
 
+async def test_fire_and_forget_abort_after_unsafe_terminal_error():
+    client, _, socket = _make_client()
+    request_id, future = client.add_request_with_id("unsafe", SamplingParams())
+    # REQUEST_ERROR(source_safe=False) pops the public future but deliberately
+    # retains this ownership marker until an abort acknowledgement arrives.
+    client.completion_futures.pop(request_id)
+    socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    payload = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
+    assert payload == [Headers.ABORT_REQUEST.value, request_id]
+    future.cancel()
+
+
 def _consume_reply_for_a_completed_request(client):
     """Submit, then stand in for _recv_task delivering the final reply."""
     request_id, future = client.add_request_with_id("hello", SamplingParams())
     # _recv_task pops the future from completion_futures immediately before
     # resolving it.
     client.completion_futures.pop(request_id)
+    client._mark_source_safe(request_id)
     future.set_result({"tokens": [1]})
     return request_id
 
@@ -489,6 +524,7 @@ def _consume_reply_for_a_finished_stream(client):
     stream = client.add_request_streaming("hello", SamplingParams())
     # _recv_task pops the stream before delivering the final frame.
     client.streams.pop(stream.request_id)
+    client._mark_source_safe(stream.request_id)
     return stream.request_id
 
 
