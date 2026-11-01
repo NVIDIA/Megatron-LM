@@ -257,17 +257,19 @@ def unfused_compressed_sparse_attn(
     # Flatten batch and KV position before gathering. Gathering from a logical
     # [b, sq, n_kv, hn] expanded view makes gather backward allocate that entire
     # dense shape before reducing the stride-0 query dimension.
+    # Gather FP32 rows: the gather's backward scatter-adds the gradient of every KV row
+    # once per query that selected it, and doing that in BF16 loses several percent of
+    # the KV gradient when many queries share a row.
     n_kv = kv_full.size(0)
     topk = topk_indices.size(-1)
-    kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn)
+    kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn).float()
     batch_offsets = (torch.arange(b, device=kv_full.device, dtype=torch.int64) * n_kv).view(b, 1, 1)
     safe_indices = topk_indices.clamp(min=0).to(dtype=torch.int64) + batch_offsets
-    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(b, sq, topk, hn)
+    kv_g = kv_flat.index_select(0, safe_indices.reshape(-1)).view(b, sq, topk, hn)
 
     # --- Attention scores ---
     # query: [sq, b, np, hn] -> [b, np, sq, hn]
     q = query.permute(1, 2, 0, 3).float()
-    kv_g = kv_gathered.float()  # [b, sq, topk, hn]
 
     # [b, np, sq, topk]
     scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
