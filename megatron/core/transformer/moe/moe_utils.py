@@ -428,6 +428,12 @@ def permute(
         assert not fused, "batch-invariant MoE permute requires the unfused path"
         assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
 
+    if fused and num_out_tokens == 0:
+        # An empty assignment is legal in dropless routing (no token picked this rank's experts),
+        # but TE's mask-map permute requires num_out_tokens > 0. The unfused path handles zero
+        # rows and keeps the output in the autograd graph; unpermute takes the same path for it.
+        fused = False
+
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
@@ -567,6 +573,10 @@ def unpermute(
     if batch_invariant_mode:
         assert not fused, "batch-invariant MoE unpermute requires the unfused path"
         assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
+    if fused and permuted_tokens.size(0) == 0:
+        # permute() returns unfused indices for an empty assignment; see the note there.
+        fused = False
 
     if fused:
         if not HAVE_TE or fused_unpermute is None:
