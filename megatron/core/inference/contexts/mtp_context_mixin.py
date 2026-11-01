@@ -391,29 +391,13 @@ class MTPContextMixin:
         n = mtp.active_request_count
         padded = mtp.padded_count
 
-        positions = mtp.active_offsets  # [n] int, MTP write position P_r for this depth
+        # Token write maps (one token per active request at its MTP write position P_r, padded
+        # rows sent to the dummy block) and MHA read metadata (query_length=1 per request,
+        # kv_length = P_r + 1, write-then-attend), in one sync-free launch.
+        kv_len = mtp.write_draft_step_metadata(self.gpu_view)
 
-        # Token write maps (one token per active request), padded rows sent to the dummy block.
-        mtp.write_token_maps(
-            gpu_view=self.gpu_view,
-            rows=mtp.row_ids[:n],
-            positions=positions,
-            block_table=mtp.active_block_table,
-            padded_token_count=padded,
-        )
-
-        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
-        query_lengths, kv_len = mtp.stage_decode_lengths()
-        mtp.write_mha_metadata(
-            gpu_view=self.gpu_view,
-            query_lengths=query_lengths,
-            kv_lengths=kv_len,
-            block_table=mtp.active_block_table,
-            padded_request_count=padded,
-        )
-
-        # The staged buffers above are read only by these writes; the graph reads `gpu_view`
-        # alone, whose addresses are fixed, so replaying against them is graph-safe.
+        # Outside the eager max below, the graph reads `gpu_view` alone, whose addresses are
+        # fixed, so replaying against them is graph-safe.
         if mtp.graphed:
             # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
             # bound (baked into the flash-attn kernel launch at capture) rather than a per-step
@@ -430,6 +414,53 @@ class MTPContextMixin:
             max_seqlen_k=max_seqlen_k,
             token_count=n,
             padded_token_count=padded,
+        )
+
+    def _mtp_setup_commit_graphed(
+        self,
+        active_request_count: int,
+        padded_count: int,
+        accepted_counts: Optional[Tensor] = None,
+        base_positions: Optional[Tensor] = None,
+        block_table_src: Optional[Tensor] = None,
+    ) -> None:
+        """Publish the metadata for a CUDA-graphed (fixed-shape) commit pass.
+
+        Every request contributes `num_speculative_tokens` rows, so the forward's shape depends
+        only on `padded_count` and one graph per request count serves every step. With no
+        `accepted_counts` (CUDA-graph capture and EP dummy forwards), every row writes the dummy
+        block and attends over the dummy block's first `num_speculative_tokens` positions.
+
+        Args:
+            active_request_count (int): Decode requests whose accepted drafts are refreshed.
+            padded_count (int): Request slots the forward launches over.
+            accepted_counts (Optional[Tensor]): [>=active_request_count] accepted drafts.
+            base_positions (Optional[Tensor]): [>=active_request_count] position of each
+                request's next draft, one past its last committed token.
+            block_table_src (Optional[Tensor]): [>=active_request_count, max_kv_block_count]
+                block ids per request.
+        """
+        assert self.enable_mtp_kv_cache
+        mtp = self.mtp_metadata
+        num_slots = self.num_speculative_tokens
+        if accepted_counts is None:
+            accepted_counts = mtp.capture_accepted_counts
+            base_positions = mtp.capture_base_positions
+            block_table_src = None
+            active_request_count = padded_count
+        mtp.begin_commit_graphed(active_request_count, padded_count, block_table_src)
+        mtp.write_commit_step_metadata(
+            self.gpu_view, accepted_counts, base_positions, num_slots=num_slots
+        )
+        # Fixed capture-time KV bound, as in the graphed draft loop: kv_length = start + slots
+        # never exceeds the draft loop's own last kv_length.
+        self._mtp_activate_attn_metadata(
+            graphed=True,
+            padded_request_count=padded_count,
+            max_seqlen_q=num_slots,
+            max_seqlen_k=self.graph_attn_metadata["mha_metadata"].max_seqlen,
+            token_count=active_request_count * num_slots,
+            padded_token_count=padded_count * num_slots,
         )
 
     def _mtp_setup_prefill_step(
