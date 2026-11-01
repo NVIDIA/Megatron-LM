@@ -42,6 +42,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -193,6 +194,7 @@ class TestMTPCudaGraphInference:
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type="none",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_type == 'hybrid':
             model = HybridModel(
@@ -207,6 +209,7 @@ class TestMTPCudaGraphInference:
                 # GPTModel defaults to learned_absolute; HybridModel defaults to 'none'.
                 # Pin it so both arms build the same position-embedding stack.
                 position_embedding_type='none',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1014,6 +1017,7 @@ class TestMTPCudaGraphExpertParallel:
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type="none",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_type == 'hybrid':
             model = HybridModel(
@@ -1026,6 +1030,7 @@ class TestMTPCudaGraphExpertParallel:
                 post_process=True,
                 hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
                 position_embedding_type='none',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1355,6 +1360,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type="none",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_type == 'hybrid':
             # A single-`*` MTP block keeps the head one non-recurrent attention layer, which
@@ -1369,6 +1375,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
                 post_process=True,
                 hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
                 position_embedding_type='none',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1596,6 +1603,7 @@ class TestMTPBlockScopeCudaGraph:
                 pre_process=True,
                 post_process=True,
                 position_embedding_type='none',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_type == 'hybrid':
             hybrid_stack_spec = _build_hybrid_stack_spec()
@@ -1609,6 +1617,7 @@ class TestMTPBlockScopeCudaGraph:
                 post_process=True,
                 hybrid_layer_pattern="****/*",
                 position_embedding_type='none',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")

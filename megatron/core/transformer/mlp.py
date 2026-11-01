@@ -25,7 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, require_process_groups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -192,6 +192,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
+        self.pg_collection = pg_collection
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
@@ -392,7 +393,10 @@ class MLP(MegatronModule):
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Return the sharded state dictionary of the module."""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        dp_cp_group = None
+        if self.pg_collection is not None:
+            dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
@@ -433,9 +437,9 @@ class MLP(MegatronModule):
         del is_mtp_layer
         if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
             raise ValueError("Dense MLP does not support hash MoE routing.")
-        assert hasattr(
-            pg_collection, 'tp'
-        ), 'TP process group is required for MLP in TransformerLayer'
+        (tp_group,) = require_process_groups(
+            pg_collection, ('tp',), owner=f"{cls.__name__}.as_mlp_submodule"
+        )
 
         # fc1/fc2 resolve GTP_remat at the leaf; the TE op-fused MLP ignores shards, so fail fast.
         if hasattr(cls, '_make_fused_impl'):
@@ -447,7 +451,7 @@ class MLP(MegatronModule):
         return cls(
             config=config,
             submodules=submodules,
-            tp_group=pg_collection.tp,
+            tp_group=tp_group,
             pg_collection=pg_collection,
             is_expert=is_expert,
             input_size=input_size,

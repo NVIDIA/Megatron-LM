@@ -13,7 +13,7 @@ import logging
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state
+from megatron.core.process_groups_config import resolve_process_groups
 
 logger = logging.getLogger(__name__)
 
@@ -328,12 +328,28 @@ def apply_rotary_pos_emb(
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+
+    ``cp_group`` is the context-parallel group of the model that owns ``t``. Only packed
+    sequences (``cu_seqlens`` given) read it. Omitting it for packed sequences is deprecated:
+    the global context-parallel group is used, with a ``ProcessGroupFallbackWarning``.
     """
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
-    # Keep for backward compatibility. Will deprecate in the future.
-    if cp_group is None:
-        cp_group = parallel_state.get_context_parallel_group()
+    if cp_group is None and cu_seqlens is not None:
+        # Deprecated fallback for callers that do not pass the model's context-parallel group.
+        cp_group = resolve_process_groups(
+            None,
+            owner="apply_rotary_pos_emb",
+            required=("cp",),
+            argument="cp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        ).cp
+        if cp_group is None:
+            raise ValueError(
+                "apply_rotary_pos_emb: packed sequences need cp_group, and parallel_state has "
+                "no context-parallel group. Pass the model's context-parallel group."
+            )
     if mla_rotary_interleaved is None:
         mla_rotary_interleaved = config.multi_latent_attention
 

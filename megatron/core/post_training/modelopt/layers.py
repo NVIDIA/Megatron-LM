@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -129,17 +130,17 @@ class Linear(torch.nn.Linear):
         parallel_mode: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,  # Not used
+        pg_collection: Optional[ProcessGroupCollection] = None,  # Not used
     ):
         if parallel_mode not in (None, "duplicated"):
             raise ValueError(
                 f"{type(self).__name__} only supports parallel_mode='duplicated' or None"
             )
-        if parallel_mode == "duplicated" and tp_group is not None:
-            raise ValueError("duplicated Linear should not have tp_group set")
 
         self.config = config
         self.parallel_mode = parallel_mode
-        self.tp_group = None if parallel_mode == "duplicated" else tp_group
+        # Every rank of tp_group holds the full weight; the group sets its checkpoint replica id.
+        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 

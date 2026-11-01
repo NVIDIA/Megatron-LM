@@ -914,3 +914,86 @@ def test_wrap_data_iterator_raises_stop_iteration_on_every_rank(tp):
     finally:
         Utils.destroy_model_parallel()
         unset_global_variables()
+
+
+def _packing_config():
+    return SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=64,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
+
+
+_PACKING_GROUP_FIELDS = ("tp", "pp", "dp", "dp_cp", "dp_gtp_remat", "dp_cp_gtp_remat")
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+@pytest.mark.parametrize(
+    ("unset", "missing"),
+    [
+        (("tp",), "tp"),
+        (("pp",), "pp"),
+        (("dp_cp_gtp_remat", "dp_cp"), "dp_cp_gtp_remat (or dp_cp)"),
+        (("dp_gtp_remat", "dp"), "dp_gtp_remat (or dp)"),
+        (_PACKING_GROUP_FIELDS, "dp_cp_gtp_remat (or dp_cp), dp_gtp_remat (or dp), tp, pp"),
+    ],
+)
+def test_wrap_data_iterator_names_missing_groups(unset, missing, explicit_none):
+    '''
+    A collection that lacks a group packing needs raises ValueError naming exactly the
+    missing groups. A field set to None counts as missing. The placeholders fail on any
+    group method, so the error must come before any CUDA or collective call.
+    '''
+    groups = {name: object() for name in _PACKING_GROUP_FIELDS if name not in unset}
+    if explicit_none:
+        groups.update({name: None for name in unset})
+    with pytest.raises(ValueError) as error:
+        wrap_data_iterator(
+            None, _packing_config(), 1, pg_collection=ProcessGroupCollection(**groups)
+        )
+    assert str(error.value) == f"pg_collection must define {missing} for sequence packing"
+
+
+def test_wrap_data_iterator_requires_pg_collection():
+    with pytest.raises(ValueError, match="pg_collection is required for sequence packing"):
+        wrap_data_iterator(None, _packing_config(), 1, pg_collection=None)
+
+
+@pytest.mark.parametrize(
+    "fields", [("tp", "pp", "dp", "dp_cp"), ("tp", "pp", "dp_gtp_remat", "dp_cp_gtp_remat")]
+)
+def test_wrap_data_iterator_accepts_either_data_group_field(fields):
+    '''
+    With GTP-remat off, a collection that sets only dp/dp_cp, or only the GTP-remat-inclusive
+    data groups, packs the same global batch as the full collection.
+    '''
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        num_microbatches = 2
+
+        def _wrap(pg_collection):
+            device = torch.device("cuda", torch.cuda.current_device())
+            # Lengths differ across DP ranks so the schedule and its token sums span the group.
+            length = 8 * (torch.distributed.get_rank() % 4 + 1)
+            tokens = torch.arange(length, dtype=torch.int64, device=device)
+            sample = {
+                "tokens": tokens,
+                "labels": tokens + 1,
+                "loss_mask": torch.ones(length, dtype=torch.float32, device=device),
+                "position_ids": tokens,
+                "cu_seqlens": torch.tensor([0, length], dtype=torch.int32, device=device),
+            }
+            data_iterator = RerunDataIterator(iter([dict(sample) for _ in range(num_microbatches)]))
+            _, num_micro_batches, seqlen_sum, seqlen_squared_sum = wrap_data_iterator(
+                data_iterator, _packing_config(), num_microbatches, pg_collection=pg_collection
+            )
+            return num_micro_batches, float(seqlen_sum), float(seqlen_squared_sum)
+
+        subset = ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(fields))
+        assert set(vars(subset)) == set(fields)
+        assert _wrap(subset) == _wrap(ProcessGroupCollection.use_mpu_process_groups())
+    finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()

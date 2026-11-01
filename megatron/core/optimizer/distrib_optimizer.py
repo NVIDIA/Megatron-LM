@@ -62,11 +62,16 @@ from ..fp8_utils import (
     quantize_param_shard,
 )
 from ..full_cuda_graph import FullIterationGradCopy
-from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from ..process_groups_config import ProcessGroupCollection
+from ..transformer.fsdp_dtensor_checkpoint import (
+    get_model_ep_rank_and_size,
+    handle_experts_in_state_dict,
+)
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _warn_grad_stats_reduced_over_world,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
     param_group_identifier_keys,
@@ -768,6 +773,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup],
         data_parallel_group_idx: int,
         distributed_optimizer_instance_id: int,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
@@ -799,12 +806,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 used by distributed checkpointing logic.
             distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
+            pg_collection (ProcessGroupCollection, optional): process groups of the model whose
+                parameters this optimizer updates. They name the config-logger file; without them
+                the file name falls back, with a warning, to the global parallel state.
         """
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
-        super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        super().__init__(optimizer, config, grad_scaler, init_state_fn, pg_collection=pg_collection)
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
@@ -931,13 +943,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
 
-    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+    def get_grad_stats_parallel_group(self) -> Optional[torch.distributed.ProcessGroup]:
         """
         With the distributed optimizer, gradient statistics (num_zeros & norm) are reduced over
         all ranks in the distributed optimizer instance (versus only the model-parallel ranks
         with the non-distributed optimizer).
+
+        ``get_megatron_optimizer`` sets the group from ``pg_collection.intra_dist_opt``. When the
+        group is unset or ``None``, the reductions run over the default (WORLD) group and a
+        ``ProcessGroupFallbackWarning`` reports that this fallback is deprecated.
         """
-        return getattr(self, 'grad_stats_parallel_group', None)
+        group = getattr(self, 'grad_stats_parallel_group', None)
+        if group is None:
+            _warn_grad_stats_reduced_over_world(type(self).__name__)
+        return group
 
     @property
     def optimizer_state_keys(self):
@@ -1594,7 +1613,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                 name_to_param.update(_name_to_param)
             num_experts = self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
-            name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
+            # The model's own expert-parallel layout gives its local experts their global names.
+            ep_rank = ep_size = None
+            if num_experts:
+                ep_rank, ep_size = get_model_ep_rank_and_size(self.model_chunks[0])
+            name_to_param = handle_experts_in_state_dict(
+                name_to_param, num_experts, ep_rank=ep_rank, ep_size=ep_size
+            )
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name

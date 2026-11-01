@@ -67,7 +67,7 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
         mock.patch.object(
             training_mod,
             "get_attr_wrapped_model",
-            return_value=SimpleNamespace(pp=object(), dp_cp=object()),
+            return_value=SimpleNamespace(pp=object(), dp_cp=object(), gtp_remat=None),
         ),
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=True),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
