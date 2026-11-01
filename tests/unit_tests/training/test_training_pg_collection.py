@@ -205,12 +205,9 @@ class TestTrainingPgCollection:
         monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
         monkeypatch.setattr(training, "get_model", get_model)
         monkeypatch.setattr(
-            training,
-            "get_megatron_optimizer_config",
-            lambda args: (
-                OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
-                None,
-            ),
+            run_config,
+            "optimizer",
+            OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
         )
         monkeypatch.setattr(training, "get_megatron_optimizer", get_megatron_optimizer)
         monkeypatch.setattr(

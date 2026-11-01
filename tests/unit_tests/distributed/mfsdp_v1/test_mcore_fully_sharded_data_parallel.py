@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import gc
 import random
@@ -1076,6 +1076,7 @@ class TestMegatronFSDPE2E:
         from megatron.training import pretrain
         from megatron.training.argument_utils import (
             gpt_config_from_args,
+            gpt_data_config_from_args,
             pretrain_cfg_container_from_args,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
@@ -1182,7 +1183,10 @@ class TestMegatronFSDPE2E:
             validate_args(args)
             set_args(args)
             model_cfg = gpt_config_from_args(args)
-            cfg = pretrain_cfg_container_from_args(args, model_cfg)
+            # The data section, as pretrain_gpt.py's main builds it: the GPT provider builds from it.
+            cfg = pretrain_cfg_container_from_args(
+                args, model_cfg, data_cfg=gpt_data_config_from_args(args)
+            )
             set_run_config(cfg)
 
             from gpt_builders import gpt_builder
