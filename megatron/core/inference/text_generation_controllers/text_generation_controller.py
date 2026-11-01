@@ -294,6 +294,10 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Inference consumes logits in fp32, so they are held and broadcast in fp32.
+    # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
+    _logits_dtype: torch.dtype = torch.float32
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -397,7 +401,7 @@ class TextGenerationController(MTPControllerMixin):
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
+        logits_dtype = self._logits_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
@@ -997,10 +1001,7 @@ class TextGenerationController(MTPControllerMixin):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
             logits = broadcast_from_last_pipeline_stage(
-                logits_shape,
-                dtype=self.model_config.params_dtype,
-                tensor=logits,
-                pp_group=self.pp_group,
+                logits_shape, dtype=self._logits_dtype, tensor=logits, pp_group=self.pp_group
             )
 
         # Copy logits to contiguous buffer.
@@ -3945,7 +3946,7 @@ class TextGenerationController(MTPControllerMixin):
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, self.vocab_size],
-                        dtype=self.model_config.params_dtype,
+                        dtype=self._logits_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )

@@ -2,9 +2,17 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from megatron.core.inference.utils import Counter, detokenize_tokens, get_language_model
+from megatron.core.inference.utils import (
+    Counter,
+    detokenize_tokens,
+    get_language_model,
+    lm_head_can_emit,
+)
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 
 
 class _Wrapper(torch.nn.Module):
@@ -13,6 +21,17 @@ class _Wrapper(torch.nn.Module):
     def __init__(self, language_model):
         super().__init__()
         self.language_model = language_model
+
+
+class _MXFP8Head(torch.nn.Module):
+    """Stands in for `TELMHeadColumnParallelLinear`, which emits only its input dtype."""
+
+
+def _lm_head(head_cls, params_dtype):
+    """An LM head of `head_cls` reduced to the config the predicate reads."""
+    head = object.__new__(head_cls)
+    head.config = SimpleNamespace(params_dtype=params_dtype)
+    return head
 
 
 def _tokenizer(generation_config=None):
@@ -62,3 +81,58 @@ class TestInferenceUtils:
     def test_detokenize_without_generation_config_strips_only_eod(self):
         tokenizer = _tokenizer()
         assert detokenize_tokens(tokenizer, [5, 11, 2]) == "5 11"
+
+    @staticmethod
+    def _head_capabilities(monkeypatch, general_gemm, batch_invariant=False):
+        monkeypatch.setattr(
+            "megatron.core.extensions.transformer_engine.te_general_gemm",
+            object() if general_gemm else None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "is_batch_invariant_mode_enabled",
+            lambda: batch_invariant,
+        )
+
+    @pytest.mark.parametrize(
+        "params_dtype, head_cls, general_gemm, batch_invariant, expected",
+        [
+            (torch.bfloat16, ColumnParallelLinear, True, False, True),  # general_gemm emits fp32
+            (torch.float32, ColumnParallelLinear, False, False, True),  # an fp32 head needs nothing
+            (torch.bfloat16, ColumnParallelLinear, False, False, False),  # no general_gemm
+            (torch.bfloat16, _MXFP8Head, True, False, False),  # MXFP8 head emits its input dtype
+            (torch.bfloat16, ColumnParallelLinear, True, True, False),  # BI keeps training's bf16
+            (torch.float32, ColumnParallelLinear, False, True, True),  # fp32 short-circuit under BI
+        ],
+    )
+    def test_lm_head_can_emit_fp32(
+        self, monkeypatch, params_dtype, head_cls, general_gemm, batch_invariant, expected
+    ):
+        """The GEMM input dtype is always available; fp32 from a half-precision head needs TE
+        general_gemm, which only the plain `ColumnParallelLinear` head routes through, and is
+        skipped under batch-invariant mode (whose guarantee is bitwise parity with the training
+        forward)."""
+        self._head_capabilities(monkeypatch, general_gemm, batch_invariant)
+        head = _lm_head(head_cls, params_dtype)
+        assert lm_head_can_emit(head, torch.float32) is expected
+        assert lm_head_can_emit(head, params_dtype) is True
+
+    def test_lm_head_can_emit_fp32_follows_batch_invariant_mode(self, monkeypatch):
+        """Enabling batch-invariant mode after a model's first inference step must switch the
+        head back to training's bf16 logits, so the model-level property is read live."""
+        self._head_capabilities(monkeypatch, general_gemm=True)
+        mode = {"enabled": False}
+        monkeypatch.setattr(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "is_batch_invariant_mode_enabled",
+            lambda: mode["enabled"],
+        )
+        model = object.__new__(LanguageModule)
+        torch.nn.Module.__init__(model)
+        model.output_layer = _lm_head(ColumnParallelLinear, torch.bfloat16)
+
+        assert model.lm_head_can_emit_fp32 is True
+        mode["enabled"] = True
+        assert model.lm_head_can_emit_fp32 is False
+        mode["enabled"] = False
+        assert model.lm_head_can_emit_fp32 is True
