@@ -358,8 +358,27 @@ class PretrainConfigContainer(ConfigContainerBase):
         # scheduler (get_optimizer_param_scheduler) is what requires one.
         if self.train.train_iters is None and self.train.train_samples is None:
             return
+        # Iteration-based training with a step batch size schedule.
+        if self.train.train_iters and self.train.step_batch_size_schedule is not None:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            # Each step advances the scheduler by the scheduled global batch size, so convert
+            # iteration counts into the samples the schedule consumes over those iterations.
+            self.scheduler.lr_decay_steps = _get_samples_for_iterations(self.scheduler.lr_decay_iters)
+            self.scheduler.wd_incr_steps = _get_samples_for_iterations(self.train.train_iters)
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                # The WSD anneal covers the last lr_wsd_decay_iters iterations of the decay.
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_decay_steps - _get_samples_for_iterations(
+                    self.scheduler.lr_decay_iters - self.scheduler.lr_wsd_decay_iters
+                )
+            if self.scheduler.lr_warmup_fraction is not None:
+                lr_warmup_iters = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_iters
+            else:
+                lr_warmup_iters = self.scheduler.lr_warmup_iters
+            self.scheduler.lr_warmup_steps = _get_samples_for_iterations(lr_warmup_iters)
         # Iteration-based training.
-        if self.train.train_iters:
+        elif self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
@@ -573,6 +592,26 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def _get_samples_for_iterations(num_iterations: float) -> float:
+    """Return the samples consumed by the first ``num_iterations`` training iterations.
+
+    Walks the global num-microbatches calculator like ``update_train_iters``, then resets it
+    to sample 0. The fractional part of ``num_iterations`` uses the next iteration's batch and
+    a negative count uses the first batch, so a one-entry schedule gives
+    ``num_iterations * global_batch_size``.
+    """
+    full_iterations = max(int(num_iterations), 0)
+    consumed_samples = 0
+    for _ in range(full_iterations):
+        update_num_microbatches(consumed_samples, consistency_check=False)
+        consumed_samples += get_current_global_batch_size()
+    update_num_microbatches(consumed_samples, consistency_check=False)
+    consumed_samples += (num_iterations - full_iterations) * get_current_global_batch_size()
+    # Reset
+    update_num_microbatches(0, consistency_check=False)
+    return consumed_samples
 
 
 def update_train_iters(train: TrainingConfig) -> None:
