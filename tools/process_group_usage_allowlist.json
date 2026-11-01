@@ -65,6 +65,7 @@
     "megatron/core/inference/contexts/dynamic_context.py": [
       "DynamicInferenceContext.__init__:accessor:parallel_state.get_expert_model_parallel_group",
       "DynamicInferenceContext.__init__:accessor:parallel_state.get_expert_model_parallel_world_size",
+      "DynamicInferenceContext.__init__:accessor:parallel_state.get_expert_tensor_and_model_parallel_group",
       "DynamicInferenceContext.__init__:accessor:parallel_state.get_pipeline_model_parallel_group",
       "DynamicInferenceContext.round_up_requests:accessor:parallel_state.get_tensor_model_parallel_world_size",
       "DynamicInferenceContext.round_up_tokens:accessor:parallel_state.get_tensor_model_parallel_world_size"
@@ -265,5 +266,5 @@
       "make_tp_sharded_tensor_for_checkpoint:accessor:parallel_state.get_tensor_model_parallel_group"
     ]
   },
-  "total": 161
+  "total": 162
 }
