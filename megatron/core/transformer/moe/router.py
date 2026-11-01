@@ -559,6 +559,9 @@ class TopKRouter(Router):
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
         config = self.config
+        # Megakernels adapt the boolean routing map independently of native dispatchers.
+        if config.moe_megakernel_backend is not None:
+            return None
         fused_dense_routing = (
             config.moe_token_dispatcher_type == "flex"
             and config.moe_expert_capacity_factor is None
@@ -1447,7 +1450,7 @@ class InferenceTopKRouter(TopKRouter):
     ) -> bool:
         """Whether this inference call uses the fused sigmoid top-k kernel.
 
-        It is opt-in through config.inference_moe_triton_router and covers sigmoid
+        It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
         scores with an expert bias, fp32 logits and supported shapes, without
         group-limited routing, router replay, precomputed indices or TE's fused
         router. Batch-invariant mode routes through topk_routing_with_score_function,
@@ -1459,7 +1462,7 @@ class InferenceTopKRouter(TopKRouter):
         probability can differ from it in the last bit.
         """
         return (
-            self.config.inference_moe_triton_router
+            self.config.inference_moe_router_backend == 'triton'
             and HAVE_SIGMOID_TOPK_KERNEL
             and logits.is_cuda
             and logits.dtype == torch.float32

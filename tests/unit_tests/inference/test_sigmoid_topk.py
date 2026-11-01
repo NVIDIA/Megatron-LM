@@ -206,7 +206,7 @@ class TestInferenceRouterUsesKernel:
             add_bias_linear=False,
             bf16=True,
             params_dtype=torch.bfloat16,
-            inference_moe_triton_router=True,
+            inference_moe_router_backend="triton",
         )
         kwargs.update(overrides)
         config = TransformerConfig(**kwargs)

@@ -39,7 +39,9 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -55,8 +57,11 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        FsdpContext,
         Placements,
+        RuntimePolicy,
         SchedulePolicy,
+        ShardLayout,
         fully_shard,
         fully_shard_context,
         microbatch,
@@ -598,7 +603,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, and Mamba layers are used.
+                unspecified, transformer and Mamba layers, shortcut MoE blocks, and
+                TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
+                replaces these defaults. Expert containers use the expert-DP mesh;
+                custom lists must include them when expert and dense sharding settings
+                differ.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -628,8 +637,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
 
+        # Importing experts at module load creates a cycle through pipeline schedules
+        # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
+        from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+
         if fsdp_unit_modules is None:
-            fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MambaLayer,
+                ShortcutMoEBlock,
+                TEGroupedMLP,
+                SequentialMLP,
+            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -686,11 +705,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         schedule_policy = SchedulePolicy(
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
-            register_hooks=not config.overlap_moe_expert_parallel_comm,
+            shard_layout=(
+                ShardLayout.PADDED
+                if ddp_config.megatron_fsdp_padded_shards
+                else ShardLayout.UNPADDED
+            ),
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
@@ -698,54 +722,36 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
-                device=device,
-                use_symmetric_memory=ddp_config.nccl_ub,
-                caller_managed_grad_sync=True,
+                FsdpContext(
+                    device=device,
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    ),
+                )
             )
         else:
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "caller_managed_grad_sync=True."
+                    "RuntimePolicy(caller_managed_grad_sync=True)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            if expert_dp_mesh is not None:
-                for submodule in module.modules():
-                    if isinstance(submodule, MoELayer):
-                        if config.init_model_with_meta_device:
-                            _materialize_owned_meta_modules(submodule.experts, device)
-                        fully_shard(
-                            submodule.experts,
-                            mesh=expert_dp_mesh,
-                            placements=expert_placements,
-                            grad_scale=expert_grad_scale,
-                            **common_fully_shard_kwargs,
-                        )
-            for submodule in reversed(list(module.modules())):
-                if submodule is module:
-                    # The root is always sharded after selected child units so it is not
-                    # wrapped twice when its type also appears in fsdp_unit_modules.
-                    continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                    if config.init_model_with_meta_device:
-                        _materialize_owned_meta_modules(submodule, device)
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=dense_placements,
-                        grad_scale=dense_grad_scale,
-                        **common_fully_shard_kwargs,
-                    )
-            if config.init_model_with_meta_device:
-                _materialize_owned_meta_modules(module, device)
-            fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                grad_scale=dense_grad_scale,
-                **common_fully_shard_kwargs,
-            )
+            collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
+            for submodule in collector.collect(module):
+                is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
+                if config.init_model_with_meta_device:
+                    _materialize_owned_meta_modules(submodule, device)
+                fully_shard(
+                    submodule,
+                    mesh=expert_dp_mesh if is_expert else dp_mesh,
+                    placements=expert_placements if is_expert else dense_placements,
+                    grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
+                    **common_fully_shard_kwargs,
+                )
+
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
@@ -793,6 +799,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
+
+        if "residual_stream" in (config.recompute_modules or []):
+            # Stack-managed replay can run before the owning layer gathers its weights.
+            raise ValueError(
+                "MFSDP v2 does not support residual_stream recomputation (#7777). "
+                "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
+            )
 
         if config.mtp_detach_heads:
             # Detached MTP heads are tagged into a separate gradient-norm group, which
@@ -889,6 +902,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
+        if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
+            raise ValueError(
+                "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
+                "symmetric-memory collectives require equal shard sizes."
+            )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.num_buckets is not None:
