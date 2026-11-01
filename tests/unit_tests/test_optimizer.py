@@ -32,10 +32,10 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import (
-    MegatronOptimizer,
-    get_param_group_identifier_tuple,
     Float16OptimizerWithFloat16Params,
+    MegatronOptimizer,
     copy_optimizer_param_metadata,
+    get_param_group_identifier_tuple,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
