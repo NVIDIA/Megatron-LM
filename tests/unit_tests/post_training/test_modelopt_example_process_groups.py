@@ -213,10 +213,11 @@ def test_feature_extraction_splits_samples_over_the_model_expert_data_parallel_g
         def __call__(self, input_ids, return_eagle_inputs):
             return input_ids
 
-    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    barriers = []
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(None))
 
     with forbid_global_process_groups():
-        offline_feature_extract.extract_feature(_Dataset(), _Model(), str(tmp_path), 0, 12)
+        offline_feature_extract.extract_feature(_Dataset(), _Model(), str(tmp_path), 0, 13)
 
     # Expert data-parallel rank 2 of 4 handles samples 2, 6 and 10.
     assert sorted(path.name for path in tmp_path.iterdir()) == [
@@ -224,3 +225,6 @@ def test_feature_extraction_splits_samples_over_the_model_expert_data_parallel_g
         "00000006.pt",
         "00000010.pt",
     ]
+    # Rank 0 of the same group would handle four samples (0, 4, 8 and 12), so the barrier must
+    # not depend on the number of samples: every rank enters exactly one per call.
+    assert len(barriers) == 1

@@ -46,7 +46,9 @@ def extract_feature(dataset, model, output_dir, idx_start, idx_end):
             output = model(input_ids, return_eagle_inputs=True)
             if pg_collection.tp.rank() == 0 and pg_collection.ep.rank() == 0:
                 torch.save(output, file_path)
-            torch.distributed.barrier()
+    # One barrier per split, outside the loop: ranks handle different numbers of samples (and
+    # skip the files that already exist), so a per-sample barrier would not pair up across ranks.
+    torch.distributed.barrier()
 
 if __name__ == "__main__":
     args = parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
