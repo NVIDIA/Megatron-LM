@@ -20,6 +20,10 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.tp_buffer_order import (
+    skip_all_gather_barrier_after_reduce_scatter,
+    skip_all_gather_barrier_after_synchronizing_collective,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -33,7 +37,6 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
-    is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
@@ -1475,6 +1478,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 name=(name + ".h_proj") if name is not None else None,
                 **projection_kwargs,
             )
+            # _concat_embeddings runs h_proj's input all-gather right after the NCCL gather of
+            # e_proj's output, which synchronizes the TP group (see
+            # megatron.core.inference.tp_buffer_order).
+            skip_all_gather_barrier_after_synchronizing_collective(self.h_proj)
             self.eh_proj = None
         else:
             # Combine each hidden state with the corresponding future-token embedding.
@@ -1497,13 +1504,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
             self.e_proj = None
             self.h_proj = None
-            # eh_proj's input all-gather reuses the shared "tp" symmetric buffer right
-            # after the preceding layer's all-gather (the fused rs-add-norm-ag terminates
-            # with one, as does the previous MTP step's output all-gather), so it must
-            # barrier before overwriting. Only the inference-optimized linear implements
-            # this all-gather; other eh_proj impls have no such buffer to guard.
-            if is_inference_column_parallel_linear(self.eh_proj):
-                self.eh_proj.set_barrier_before_all_gather(True)
 
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid architecture support
@@ -1552,23 +1552,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
-        # The MTP inner block's first all-gather reuses the same "tp" symmetric buffer
-        # that _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
-        # between, so it must barrier before overwriting. Later all-gathers in the inner
-        # block are each preceded by a reduce-scatter and need no barrier. modules() yields
-        # in forward order, so the first inference column-parallel linear is that all-gather.
-        if self.is_hybrid_mtp:
-            # Hybrid path: HybridStack of layers.
-            first_inner_layer = self.mtp_model_layer.layers[0]
-        else:
-            # GPT path: single TransformerLayer.
-            first_inner_layer = self.mtp_model_layer
-
-        for module in first_inner_layer.modules():
-            if is_inference_column_parallel_linear(module):
-                module.set_barrier_before_all_gather(True)
-                break
-
         self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
             hidden_size=self.config.hidden_size,
@@ -1587,6 +1570,19 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_base, "sequence_parallel", True)
                     setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
+
+    def declare_tp_buffer_order_after_embedding(self, embedding) -> None:
+        """Declare that each forward embeds its tokens with embedding right before e_proj.
+
+        See megatron.core.inference.tp_buffer_order. The model that owns this layer passes the
+        embedding it also passes to every forward. With hyper connections, e_proj's input
+        all-gather is then the first operation on the "tp" buffer after the embedding's
+        reduce-scatter, on the same tokens, normalized: _get_embeddings and
+        forward_single_position look the tokens up right before _concat_embeddings. Given
+        precomputed embeddings instead, MultiTokenPredictionBlock rolls them with an NCCL
+        all-gather over the TP group before each layer, which synchronizes the group.
+        """
+        skip_all_gather_barrier_after_reduce_scatter(embedding.word_embeddings, self.e_proj)
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
@@ -1792,7 +1788,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states, _ = self.eh_proj(hidden_states)
             if InferenceMode.is_active():
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                    hidden_states, self.tp_group, self.config, barrier_before=True
+                    hidden_states, self.tp_group, self.config
                 )
             else:
                 hidden_states = gather_from_tensor_model_parallel_region(

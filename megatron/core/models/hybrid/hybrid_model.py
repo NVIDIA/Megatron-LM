@@ -563,6 +563,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hash_moe_layer_threshold=hash_moe_layer_threshold or None,
                 name="mtp",
             )
+            # Every MTP forward looks its tokens up with self.embedding.
+            for layer in self.mtp.layers:
+                layer.declare_tp_buffer_order_after_embedding(self.embedding)
             self._setup_mtp_cuda_graphs()
 
         # Output
@@ -1040,7 +1043,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            # The sequence-parallel gather above synchronized the TP group, as the output
+            # layer's own input gather does otherwise, so the logits gather needs no barrier.
+            inference_tp_ag_barrier=not sequence_parallel_override,
         )
         logits = self._scale_logits(logits)
         gather_output = (

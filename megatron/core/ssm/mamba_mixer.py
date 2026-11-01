@@ -20,6 +20,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
+from megatron.core.inference.tp_buffer_order import skip_all_gather_barrier_after_reduce_scatter
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -523,6 +524,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
     def forward_post_core_attn(self, y):
         """Apply the Mamba output projection to an SSM output tensor."""
         return self.out_proj(y)
+
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
+
+        in_proj's all-gather of the layer input comes first; out_proj's reduce-scatter comes last.
+        """
+        skip_all_gather_barrier_after_reduce_scatter(preceding_reduce_scatter, self.in_proj)
+        return self.out_proj
 
     def forward(
         self,

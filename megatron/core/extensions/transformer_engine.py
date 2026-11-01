@@ -2056,8 +2056,13 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        inference_tp_ag_barrier: bool = True,
     ):
-        """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
+        """Run TE MXFP8 output projection. Returns ``(output, bias)``.
+
+        ``inference_tp_ag_barrier`` matches ``ColumnParallelLinear.forward``; it is unused, since
+        this layer gathers its output with NCCL rather than through symmetric memory.
+        """
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:

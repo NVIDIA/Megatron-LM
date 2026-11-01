@@ -17,6 +17,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -35,6 +36,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleForwardState,
     DecodeOnly,
@@ -60,8 +62,15 @@ from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.utils import get_attr_wrapped_model, is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.inference.symmetric_buffer_test_utils import (
+    ALL_GATHER,
+    barrier_trace,
+    find_symmetric_buffer_races,
+    record_symmetric_buffer_ops,
+    skip_unless_nvls,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
@@ -100,6 +109,8 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
+        inference_fuse_tp_communication: bool = False,
+        moe_shared_expert_intermediate_size: int = None,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -141,9 +152,25 @@ class TextGenerationControllerTestBase:
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
+            moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
             add_bias_linear=num_moe_experts is None and not inference_optimized,
             **(
-                dict(transformer_impl="inference_optimized", normalization="RMSNorm")
+                dict(
+                    transformer_impl="inference_optimized",
+                    normalization="RMSNorm",
+                    inference_fuse_tp_communication=inference_fuse_tp_communication,
+                    # Inference-optimized MoE layers route in fp32 with grouped experts, which
+                    # implement squared ReLU and SwiGLU.
+                    **(
+                        dict(
+                            moe_router_dtype="fp32",
+                            moe_grouped_gemm=True,
+                            activation_func=squared_relu,
+                        )
+                        if num_moe_experts
+                        else {}
+                    ),
+                )
                 if inference_optimized
                 else {}
             ),
@@ -174,7 +201,9 @@ class TextGenerationControllerTestBase:
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
             layer_spec = (
-                get_gpt_layer_with_inference_spec()
+                get_gpt_layer_with_inference_spec(
+                    num_experts=num_moe_experts, moe_grouped_gemm=True
+                )
                 if inference_optimized
                 else get_gpt_layer_local_spec()
             )
@@ -4029,42 +4058,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     # Symmetric-buffer all-gather barrier invariant (real inference-optimized MTP)
     # ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _assert_no_unbarriered_consecutive_all_gathers(events):
-        """Enforce the buffer-reuse invariant over a recorded collective trace.
-
-        ``events`` is an ordered list of ``(multicast_ptr, kind, barrier_before)``,
-        where ``kind`` is "AG" (plain multimem all-gather), "RS" (multimem
-        reduce-scatter), or "FUSED_RS_AG" (fused reduce-scatter+add+norm+all-gather).
-
-        A plain all-gather overwrites its symmetric buffer. If the previous op on the
-        same buffer also left it written by an all-gather (another plain AG, or the
-        all-gather tail of a fused RS+AG) with no reduce-scatter in between, the
-        all-gather must have requested ``barrier_before`` so peers finish reading the
-        previous contents before the overwrite. A reduce-scatter synchronizes ranks
-        inside its own kernel, so it clears the hazard for the next all-gather.
-        """
-        last_write = {}  # multicast_ptr -> "AG" | "RS"
-        violations = []
-        for idx, (ptr, kind, barrier_before) in enumerate(events):
-            if kind == "AG":
-                if last_write.get(ptr) == "AG" and not barrier_before:
-                    violations.append((idx, ptr))
-                last_write[ptr] = "AG"
-            elif kind == "RS":
-                last_write[ptr] = "RS"
-            elif kind == "FUSED_RS_AG":
-                # Its own reduce-scatter precedes its all-gather (internally safe), but
-                # it leaves the buffer written by an all-gather for whatever runs next.
-                last_write[ptr] = "AG"
-            else:
-                raise AssertionError(f"unexpected collective kind {kind!r}")
-        assert not violations, (
-            f"{len(violations)} all-gather(s) reused a symmetric buffer immediately after "
-            f"another all-gather without barrier_before or an intervening reduce-scatter "
-            f"(event indices/ptrs: {violations}).\nFull trace: {events}"
-        )
-
     def _run_serial_mtp_step(self, active_request_count=4):
         """Drive _compute_serial_mtp_and_sample with a valid SP hidden-state cache.
 
@@ -4105,45 +4098,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         ctrl._compute_serial_mtp_and_sample()
 
-    def _collect_symm_collective_trace(self):
-        """Run the serial-MTP inference step and record every symmetric collective.
-
-        The three buffer-writing collectives are instrumented at their call site
-        (megatron.core.tensor_parallel.inference_layers) so the real Triton kernels
-        still run; returns the ordered ``(ptr, kind, barrier_before)`` trace.
-        """
-        import megatron.core.tensor_parallel.inference_layers as il
-
-        real_ag = il.multimem_all_gather
-        real_rs = il.multimem_reduce_scatter
-        real_fused = il.fused_multimem_rs_add_norm_ag
-        events = []
-
-        def rec_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append(
-                (symm_mem_hdl.multicast_ptr, "AG", bool(kwargs.get("barrier_before", False)))
-            )
-            return real_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
-
-        def rec_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append((symm_mem_hdl.multicast_ptr, "RS", False))
-            return real_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
-
-        def rec_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs):
-            events.append((symm_mem_hdl.multicast_ptr, "FUSED_RS_AG", False))
-            return real_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs)
-
-        with (
-            mock.patch.object(il, "multimem_all_gather", rec_ag),
-            mock.patch.object(il, "multimem_reduce_scatter", rec_rs),
-            mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused),
-        ):
-            self._run_serial_mtp_step()
-
-        return events
-
     def _check_mtp_all_gather_barrier_invariant(self):
-        """Skip unless the NVLS path engaged, then enforce the barrier invariant."""
+        """Skip unless the NVLS path engaged, then check the symmetric buffers for races."""
         from megatron.core.inference.communication.torch_symm_triton.utils import (
             is_device_nvls_capable,
         )
@@ -4153,17 +4109,19 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         if parallel_state.get_tensor_model_parallel_world_size() < 2:
             pytest.skip("requires a tensor-model-parallel world size >= 2")
 
-        events = self._collect_symm_collective_trace()
+        with record_symmetric_buffer_ops() as ops:
+            self._run_serial_mtp_step()
 
-        if not any(kind == "AG" for _, kind, _ in events):
+        all_gather_barriers = [
+            barrier for kind, barrier in barrier_trace(ops) if kind == ALL_GATHER
+        ]
+        if not all_gather_barriers:
             pytest.skip("NVLS all-gather path did not engage (symmetric memory unavailable)")
-        # The MTP path must request at least one buffer-reuse barrier (eh_proj, output
-        # projection, or the inner-block qkv) — otherwise the wiring silently regressed.
-        assert any(barrier for _, kind, barrier in events if kind == "AG"), (
-            "expected the MTP inference path to request barrier_before on at least one "
-            f"all-gather, but none did. Trace: {events}"
-        )
-        self._assert_no_unbarriered_consecutive_all_gathers(events)
+        # eh_proj's, the output projection's and the inner block's first all-gather follow
+        # other all-gathers and keep their default barrier.
+        assert any(all_gather_barriers), f"no all-gather barriered: {ops}"
+        races = find_symmetric_buffer_races(ops)
+        assert not races, f"{races}\nrecorded: {ops}"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
@@ -4186,6 +4144,90 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             hybrid_layer_pattern="M*M*/*/*",
         )
         self._check_mtp_all_gather_barrier_invariant()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="needs flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "model_kwargs",
+        [
+            pytest.param({}, id="gpt"),
+            pytest.param(
+                {"inference_fuse_tp_communication": True},
+                marks=pytest.mark.skip(
+                    reason="Fused TP communication keeps the norm weights captured at "
+                    "construction (TransformerLayer.get_*_layer_norm_weights return .data), so "
+                    "a model built on the CPU hands the fused kernel host pointers after .cuda()"
+                ),
+                id="gpt_fused_tp",
+            ),
+            pytest.param(
+                {"num_moe_experts": 4, "moe_shared_expert_intermediate_size": 64}, id="gpt_moe"
+            ),
+            pytest.param(
+                {"hybrid_layer_pattern": "M*M-"},
+                marks=pytest.mark.skip(
+                    reason="MambaMixer.ssm_prefill squeezes A to a scalar (A.squeeze(0)) when a "
+                    "rank holds one Mamba head, as this model's 2 heads at TP=2 do"
+                ),
+                id="hybrid",
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_inference_optimized_steps_barrier_once_per_forward(self, model_kwargs):
+        """Dynamic-batching prefill and decode steps at TP=2 + SP with NVLS, on full MPU groups.
+
+        No operation on a symmetric buffer may overwrite bytes a peer may still read. Each
+        forward barriers once, at its decoder's first all-gather, which follows an operation the
+        decoder cannot know; every later all-gather of the forward, including the shared
+        experts' and the logits', drops its barrier as declared.
+        """
+        # Drop buffers registered on other tests' process groups.
+        SymmetricMemoryManager.destroy()
+        self.setup_model(
+            torch.bfloat16,
+            static=False,
+            tensor_model_parallel_size=2,
+            max_requests=8,
+            sequence_parallel=True,
+            transformer_impl="inference_optimized",
+            position_embedding_type="none",
+            **model_kwargs,
+        )
+        skip_unless_nvls(parallel_state.get_tensor_model_parallel_group())
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        decoder = get_attr_wrapped_model(controller.inference_wrapped_model.model, "decoder")
+        for request_id in range(4):
+            prompt_tokens = torch.arange(request_id + 3, device="cuda") % (self.vocab_size - 1)
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(top_k=1, num_tokens_to_generate=4),
+                )
+            )
+
+        decoder_starts = []
+        with record_symmetric_buffer_ops() as ops:
+            hook = decoder.register_forward_pre_hook(lambda *_: decoder_starts.append(len(ops)))
+            try:
+                while context.has_unfinished_requests():
+                    controller.generate_output_tokens_dynamic_batch()
+            finally:
+                hook.remove()
+
+        races = find_symmetric_buffer_races(ops)
+        assert not races, f"{races}\nrecorded: {ops}"
+        barriers_per_forward = [
+            [barrier for kind, barrier in barrier_trace(ops[start:end]) if kind == ALL_GATHER]
+            for start, end in zip(decoder_starts, decoder_starts[1:] + [len(ops)])
+        ]
+        assert len(barriers_per_forward) > 1, "expected a prefill and a decode forward"
+        for barriers in barriers_per_forward:
+            assert barriers[:1] == [True] and not any(barriers[1:]), barriers_per_forward
 
     def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
         """Test that chaining MTP depths produces correct SP-format shapes throughout.

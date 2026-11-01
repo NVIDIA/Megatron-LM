@@ -20,6 +20,9 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
+from megatron.core.inference.tp_buffer_order import (
+    skip_all_gather_barrier_after_synchronizing_collective,
+)
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -823,6 +826,24 @@ class MLASelfAttention(MultiLatentAttention):
     ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
         """Resolve which Q/KV norm and up-projection implementations to build."""
         return QKNormConfigResolver(self.config, submodules).resolve()
+
+    def declare_tp_buffer_order(self, preceding_reduce_scatter):
+        """See megatron.core.inference.tp_buffer_order.
+
+        The query projection's all-gather (linear_q_up_proj, or linear_q_proj without
+        q_lora_rank) comes first. get_query_key_value_tensors runs it after gathering the RoPE
+        key or the whole KV latent across the TP group with NCCL, which inference-optimized
+        linears always do, since they require sequence parallelism at TP > 1. That gather
+        synchronizes the group, so the query projection needs no barrier, whatever its width.
+        linear_kv_up_proj's all-gather, without latent caching, directly follows the query
+        projection's and keeps its barrier. linear_proj's reduce-scatter comes last.
+        """
+        if self.config.q_lora_rank is None:
+            q_proj = self.linear_q_proj
+        else:
+            q_proj = self.linear_q_up_proj
+        skip_all_gather_barrier_after_synchronizing_collective(q_proj)
+        return self.linear_proj
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
