@@ -57,6 +57,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -2165,7 +2166,10 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+        # A relaunch resumes the same wandb run, which may hold an earlier job name.
+        wandb_writer.config.update(
+            {'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True
+        )
 
     # OTel: megatron.startup deliberately stays open into train() -- its
     # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
@@ -2451,8 +2455,12 @@ def wrap_model_chunks_with_ddp(
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
         fully_shard_context(
-            runtime_policy=RuntimePolicy(
-                use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+            FsdpContext(
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ddp_config.nccl_ub,
+                    caller_managed_grad_sync=True,
+                    overlap_outer_communication=ddp_config.overlap_outer_communication,
+                )
             )
         )
         if is_mfsdp_v2
@@ -2549,7 +2557,7 @@ def _forward_backward_grad_context(args):
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None, ddp_config=None):
-    """Build the model using a finalized DDP config, or legacy args if omitted."""
+    """Build the model using the supplied DDP config or the finalized run config."""
     cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
@@ -2688,11 +2696,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
 
         if ddp_config is None:
-            ddp_config = get_megatron_ddp_config(
-                args,
-                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
-                check_for_nan_in_grad=cfg.ddp.check_for_nan_in_grad,
-            )
+            ddp_config = cfg.ddp
         if not cfg.dist.use_torch_fsdp2:
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             ddp_config.bucket_size = resolve_ddp_bucket_size(
@@ -2707,7 +2711,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -2735,9 +2739,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
@@ -2769,8 +2771,8 @@ def get_optimizer_param_scheduler(optimizer):
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=cfg.scheduler.lr_warmup_init,
-        max_lr=args.lr,
-        min_lr=args.min_lr,
+        max_lr=cfg.optimizer.lr,
+        min_lr=cfg.optimizer.min_lr,
         lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
         lr_decay_steps=cfg.scheduler.lr_decay_steps,
         lr_decay_style=cfg.scheduler.lr_decay_style,
@@ -2803,23 +2805,8 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
-
-    return config, config_overrides
-
 def get_megatron_ddp_config(
-    args: argparse.Namespace, *, use_torch_fsdp2: bool, check_for_nan_in_grad: bool
+    args: argparse.Namespace, *, use_torch_fsdp2: bool
 ) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
@@ -2832,7 +2819,7 @@ def get_megatron_ddp_config(
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-        kwargs["check_for_nan_in_grad"] = check_for_nan_in_grad
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
         kwargs["check_for_large_grads"] = args.check_for_large_grads
         kwargs["num_buckets"] = args.ddp_num_buckets
         kwargs["bucket_size"] = args.ddp_bucket_size
@@ -2991,25 +2978,26 @@ def setup_model_and_optimizer(
     if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
-        if getattr(args, "use_mup", False):
+        optim_cfg = cfg.optimizer
+        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
+        optim_cfg.timers = timers
+        if getattr(args, "use_mup", False): # TODO (@chencui): address in model config args->config PR
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )
             model_config = get_model_config(model_config_source)
             mup_overrides = get_mup_config_overrides(
-                config=config,
+                config=optim_cfg,
                 mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+                optimizer_type=optim_cfg.optimizer,
             )
             if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
-            config,
+            optim_cfg,
             model,
-            config_overrides=config_overrides,
+            config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
@@ -3332,6 +3320,7 @@ def train_step(
     """
     cfg = get_run_config()
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3581,7 +3570,7 @@ def train_step(
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
+    if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -4840,7 +4829,7 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and args.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -4922,7 +4911,7 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -4930,7 +4919,7 @@ def train(
             optimizer,
             forward_backward_func,
         )
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
@@ -5518,7 +5507,7 @@ def train(
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
@@ -5612,6 +5601,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     cfg = get_run_config()
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5656,7 +5646,7 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        copy_main_params = cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
         forward_backward_func = PagedStashRunner(
             config,
             copy_main_params,
@@ -5976,10 +5966,16 @@ def get_train_valid_test_num_samples():
             eval_iters = cfg.validation.eval_iters
         else:
             assert cfg.train.train_iters is not None
-            total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
-            if cfg.validation.start_eval_at_iter is not None:
-                skipped_eval_points = cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
-                total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            if cfg.validation.eval_interval:
+                total_eval_points = cfg.train.train_iters // cfg.validation.eval_interval + 1
+                if cfg.validation.start_eval_at_iter is not None:
+                    skipped_eval_points = (
+                        cfg.validation.start_eval_at_iter // cfg.validation.eval_interval
+                    )
+                    total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            else:
+                # Without eval_interval, validation only runs once, after training.
+                total_eval_points = 1
             eval_iters = total_eval_points * cfg.validation.eval_iters
         eval_samples = eval_iters * cfg.validation.eval_global_batch_size
     test_samples = cfg.validation.eval_iters * cfg.validation.eval_global_batch_size
@@ -6084,7 +6080,8 @@ def backfill_consumed_samples_from_iteration():
 
         train_state.consumed_train_samples = train_state.iteration * cfg.train.global_batch_size
     if train_state.iteration > 0 and train_state.consumed_valid_samples == 0:
-        if cfg.train.train_samples is None:
+        # Without eval_interval, no validation runs during training, so none was consumed.
+        if cfg.train.train_samples is None and cfg.validation.eval_interval:
             effective_start = cfg.validation.start_eval_at_iter if cfg.validation.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // cfg.validation.eval_interval
             train_state.consumed_valid_samples = (
@@ -6199,12 +6196,13 @@ def should_disable_forward_pre_hook(args, optimizer):
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = optimizer is not None
+    cfg = get_run_config()
     return (
         not args.use_megatron_fsdp
         and has_optimizer
         and (
-            args.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            cfg.optimizer.use_distributed_optimizer
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
-        and args.overlap_param_gather
+        and cfg.optimizer.overlap_param_gather
     )

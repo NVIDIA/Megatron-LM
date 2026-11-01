@@ -32,7 +32,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
 from .execution_order import ExecutionOrder
-from .module_utils import get_parameter_owner
+from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
     FsdpParameterGroup,
@@ -41,12 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
-from .schedule import SchedulePolicy
-
-
-def _is_in_backward() -> bool:
-    """Return whether the current thread is executing an autograd GraphTask."""
-    return torch._C._current_graph_task_id() != -1
+from .schedule_policy import SchedulePolicy
 
 
 class FsdpModule:
@@ -74,15 +69,11 @@ class FsdpModule:
         grad_scale: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
-        register_hooks: bool = True,
-        grad_accumulation_count: int | None = None,
         shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
-            grad_accumulation_count: Total parameter-gradient callbacks per reduction
-                window. Defaults to one per owned trainable parameter.
             shard_layout: Padded or unpadded rank segments for every parameter group.
                 See ``fully_shard``.
         """
@@ -117,16 +108,16 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            grad_accumulation_count
-            if grad_accumulation_count is not None
+            schedule_policy.grad_accumulation_count
+            if schedule_policy.grad_accumulation_count is not None
             else sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
-        # required to keep loading a state dict safe when ``register_hooks`` is
+        # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
         # together with the auto-execution hooks below.
         self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if register_hooks:
+        if schedule_policy.register_hooks:
             self._register_hooks()
         context.register_module(cast(nn.Module, self))
 
@@ -277,7 +268,7 @@ class FsdpModule:
         context.ensure_finalized()
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -290,7 +281,11 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        if context.is_recording_execution_order and not is_recomputing:
+            context.forward_order.append(cast(nn.Module, self))
+        self.unshard(
+            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
+        )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -364,13 +359,18 @@ class FsdpModule:
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
             )
+        # Recomputation that does not re-enter this module's pre_forward reads MXFP8 rowwise
+        # planes in backward, so gather them together with columnwise ones. Other dtype
+        # weights serve both phases already.
+        if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
+            phase = None
         with torch.cuda.stream(self.context.allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(phase)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
         if is_recomputing:
             self._release_unsharded_storage(rowwise_only=True)
         else:
@@ -418,19 +418,21 @@ class FsdpModule:
         # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
         # hook fires once after both uses contribute, so our post_backward() has not
         # reset BACKWARD when depth 1 enters.
-        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
+        # TODO: Separate post_backward (phase/weight release) from post_accumulate_grad
+        # (gradient reduction): https://github.com/NVIDIA/Megatron-LM/pull/7902
+        # For invocations with gradient-requiring inputs:
         # In shared MTP, post_backward would run twice (once per depth), resetting
         # the phase after each invocation. Depth 1 could then enter from RESTING
-        # and gather its weights normally, without this guard. grads_ready would
+        # and gather its weights normally, without this guard. post_accumulate_grad would
         # run once, after both depths' local gradient contributions have accumulated,
         # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
-        # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
             return
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
+        if context.is_recording_execution_order:
+            context.backward_order.append(cast(nn.Module, self))
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
@@ -441,9 +443,13 @@ class FsdpModule:
             # the reduce-scatter stream falls back to a raw cudaMalloc, which is
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
-            context.reduce_scatter_stream.wait_stream(current_stream)
+            context.inner_reduction_stream.wait_stream(current_stream)
+            # The DP-outer reduction stream needs no fork here: it never allocates (the
+            # finalize reuses the persistent main_grad and its view), and it joins any
+            # capture via its wait on the reduce-scatter stream before each finalize in
+            # _reduce_gradient_groups.
 
-        self.unshard(Phase.BACKWARD, prefetch=True)
+        self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -454,27 +460,42 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and launch their reductions.
+
+        When overlap is enabled, the last-microbatch DP-outer reduction runs on its
+        own stream so a group's DP-outer reduction overlaps the next group's DP-inner
+        reduction; otherwise both share the reduce-scatter stream and stay serialized.
+        """
         with self._nvtx_range("reduce_gradients"):
             context = self.context
-            reduce_scatter_stream = context.reduce_scatter_stream
+            inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
+                with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
 
-                current_stream.wait_stream(reduce_scatter_stream)
+                current_stream.wait_stream(inner_reduction_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
 
-                reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(
-                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
-                    )
+                inner_reduction_stream.wait_stream(current_stream)
+                with torch.cuda.stream(inner_reduction_stream):
+                    group.reduce_inner_gradients(partial_grad)
+
+                if not context.is_last_microbatch:
+                    continue
+                # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                # distinct, so it overlaps the following group's DP-inner reduce; the
+                # persistent accumulator and its optimizer-layout view stay alive across
+                # the handoff. When disabled the stream aliases inner_reduction_stream and
+                # this stays serialized.
+                if context.outer_reduction_stream is not inner_reduction_stream:
+                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                with torch.cuda.stream(context.outer_reduction_stream):
+                    group.reduce_outer_gradients()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

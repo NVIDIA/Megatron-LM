@@ -403,6 +403,12 @@ class LoggerConfig:
     wandb_entity: str | None = None
     """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
 
+    wandb_run_id: str | None = None
+    """The wandb run id, which is what a relaunch resumes. Defaults to the experiment
+    name with any character wandb rejects in a run id replaced by '-'. Set it explicitly
+    when two runs would otherwise derive the same id, or to resume a run whose
+    experiment name has since changed."""
+
     logging_level: int | None = None
     """Set default logging level"""
 

@@ -4,6 +4,7 @@ import signal
 import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
@@ -108,19 +109,11 @@ def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
 
     default_args = parser.parse_args([])
     assert default_args.megatron_fsdp_padded_shards is True
-    assert get_megatron_ddp_config(
-        default_args,
-        use_torch_fsdp2=False,
-        check_for_nan_in_grad=default_args.check_for_nan_in_loss_and_grad,
-    ).megatron_fsdp_padded_shards
+    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
 
     disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
     assert disabled_args.megatron_fsdp_padded_shards is False
-    ddp_config = get_megatron_ddp_config(
-        disabled_args,
-        use_torch_fsdp2=False,
-        check_for_nan_in_grad=disabled_args.check_for_nan_in_loss_and_grad,
-    )
+    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
     assert ddp_config.megatron_fsdp_padded_shards is False
 
 
@@ -1412,13 +1405,7 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with (
-        patch(
-            "megatron.training.training.get_megatron_optimizer_config",
-            return_value=(mock_optimizer_config, {}),
-        ),
-        patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config),
-    ):
+    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
         yield
 
 
@@ -1430,27 +1417,13 @@ class TestPretrainContainerFromArgsStructure:
         assert isinstance(result, PretrainConfigContainer)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
-        """Test that optimizer config comes from get_megatron_optimizer_config."""
-        mock_optimizer = MagicMock(spec=OptimizerConfig)
-        mock_opt.return_value = (mock_optimizer, {})
-        mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
-        args = _make_args()
-        result = pretrain_cfg_container_from_args(args)
-        mock_opt.assert_called_once_with(args)
-        assert result.optimizer is mock_optimizer
-
-    @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
+    def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
-        mock_opt.return_value = (MagicMock(spec=OptimizerConfig), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False, check_for_nan_in_grad=True)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
         assert result.ddp is mock_ddp_instance
 
     @pytest.mark.parametrize("enabled", [False, True])
@@ -1458,10 +1431,6 @@ class TestPretrainContainerFromArgsStructure:
         parser = ArgumentParser()
         add_megatron_arguments(parser)
         args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
-        monkeypatch.setattr(
-            "megatron.training.training.get_megatron_optimizer_config",
-            lambda args: (OptimizerConfig(), {}),
-        )
 
         cfg = pretrain_cfg_container_from_args(args)
 
@@ -1469,6 +1438,48 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.ddp.use_megatron_fsdp is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
+
+
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("constraint", ["vpp", "grouped_weights"])
+def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, constraint):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.micro_batch_size = 1
+    args.global_batch_size = 1
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.optimizer = "adam" if constraint == "vpp" else "muon"
+    args.overlap_param_gather = constraint == "vpp"
+    args.overlap_grad_reduce = constraint == "vpp"
+    args.overlap_param_gather_with_optimizer_step = constraint == "vpp"
+    model_inputs = dict(
+        virtual_pipeline_model_parallel_size=2 if valid else None,
+        moe_single_grouped_weight=not valid,
+    )
+    # Native model values must win even when the old args disagree.
+    args_valid = not valid if native_model else valid
+    args.virtual_pipeline_model_parallel_size = 2 if args_valid else None
+    args.moe_single_grouped_weight = not args_valid
+    model = SimpleNamespace(**model_inputs) if native_model else None
+    message = "interleaved pipeline" if constraint == "vpp" else "single-grouped-weight"
+    with nullcontext() if valid else pytest.raises(AssertionError, match=message):
+        cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
+        cfg.validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
+def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch"
+    args.use_layer_wise_param_layout = False
+    with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
 
 
 class TestCheckpointConfigMapping:
