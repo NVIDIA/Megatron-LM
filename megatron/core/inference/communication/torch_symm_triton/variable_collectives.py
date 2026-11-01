@@ -431,8 +431,6 @@ def _multimem_all_gatherv_3tensor_kernel(
     local_tokens,
     rank_token_offset_ptr,
     ep_max_tokens_ptr,
-    mask_rows_from_ptr,
-    mask_row_offset,
     HIDDEN_SIZE_0: tl.constexpr,
     HIDDEN_SIZE_1: tl.constexpr,
     HIDDEN_SIZE_2: tl.constexpr,
@@ -445,7 +443,6 @@ def _multimem_all_gatherv_3tensor_kernel(
     BITS_2: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    MASK_ROWS_1: tl.constexpr = False,
 ):
     """Variable-count multicast all-gather for three tensors in a single kernel.
 
@@ -474,17 +471,12 @@ def _multimem_all_gatherv_3tensor_kernel(
             write offset in the global output (prefix sum over lower-ranked EP ranks).
         ep_max_tokens_ptr: pointer to a scalar int32 CUDA tensor holding the maximum
             local_tokens across all EP ranks. CTAs with pid >= this value exit immediately.
-        mask_rows_from_ptr: with MASK_ROWS_1, pointer to a scalar int32 CUDA tensor; local
-            rows r with r + mask_row_offset >= its value gather tensor 1 as all-ones bits
-            (-1 for an integer routing map) instead of their local values.
-        mask_row_offset: row offset added to local rows for that comparison.
         HIDDEN_SIZE_0/1/2: hidden dimension (elements per token row) for each tensor (constexpr).
         BLOCK_SIZE: threads per block — max of the three per-tensor block sizes (constexpr).
         NUMEL_PER_THREAD_0/1/2: elements per thread per load/store for each tensor (constexpr).
         BITS_0/1/2: load/store width in bits (128 or 64) for each tensor (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
-        MASK_ROWS_1: apply the row mask above to tensor 1 (constexpr).
     """
     pid = tl.program_id(axis=0)
 
@@ -494,8 +486,6 @@ def _multimem_all_gatherv_3tensor_kernel(
 
     tid = tl.arange(0, BLOCK_SIZE)
     rank_token_offset = tl.load(rank_token_offset_ptr)
-    if MASK_ROWS_1:
-        mask_rows_from = tl.load(mask_rows_from_ptr).to(tl.int32)
 
     numel_per_token_0 = tl.cdiv(HIDDEN_SIZE_0, NUMEL_PER_THREAD_0)
     numel_per_token_1 = tl.cdiv(HIDDEN_SIZE_1, NUMEL_PER_THREAD_1)
@@ -533,11 +523,6 @@ def _multimem_all_gatherv_3tensor_kernel(
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 1 ---
-        # Masked rows gather as all-ones bits: OR every 32-bit word with 0xFFFFFFFF.
-        fill_1 = tl.zeros([BLOCK_SIZE], dtype=tl.uint32)
-        if MASK_ROWS_1:
-            if token_offset + mask_row_offset >= mask_rows_from:
-                fill_1 = ~fill_1
         for channel_offset in range(0, numel_per_token_1, BLOCK_SIZE):
             local_offsets = token_offset * numel_per_token_1 + channel_offset + tid
             mask = channel_offset + tid < numel_per_token_1
@@ -550,8 +535,6 @@ def _multimem_all_gatherv_3tensor_kernel(
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
                 x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
-                if MASK_ROWS_1:
-                    x, y, z, w = x | fill_1, y | fill_1, z | fill_1, w | fill_1
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -561,8 +544,6 @@ def _multimem_all_gatherv_3tensor_kernel(
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets
                 x, y = ld_64(local_ptrs, mask=mask)
-                if MASK_ROWS_1:
-                    x, y = x | fill_1, y | fill_1
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 2 ---
@@ -720,8 +701,6 @@ def multimem_all_gatherv_3tensor(
     output_byte_offset_0: int = 0,
     output_byte_offset_1: int = 0,
     output_byte_offset_2: int = 0,
-    mask_rows_from: Optional[torch.Tensor] = None,
-    mask_row_offset: int = 0,
     **kwargs,
 ) -> tuple:
     """Variable-count multicast all-gather for three tensors in a single kernel launch.
@@ -755,11 +734,6 @@ def multimem_all_gatherv_3tensor(
             min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         output_byte_offset_0/1/2: byte offset of each tensor within its symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
-        mask_rows_from: optional scalar int32 CUDA tensor. Local rows r of tensor 1 with
-            r + mask_row_offset >= mask_rows_from[0] are gathered as all-ones bits (-1
-            for an integer routing map), as if they had been filled with -1 before the
-            gather. Read on device, so the boundary may change between graph replays.
-        mask_row_offset: row offset added to local rows for that comparison.
 
     Returns:
         Tuple of (output_tensor_0, output_tensor_1, output_tensor_2) with all ranks'
@@ -797,12 +771,6 @@ def multimem_all_gatherv_3tensor(
     assert (
         symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
-    if mask_rows_from is not None:
-        assert (
-            mask_rows_from.numel() == 1
-            and mask_rows_from.dtype == torch.int32
-            and mask_rows_from.is_cuda
-        ), "mask_rows_from must be a scalar int32 CUDA tensor."
 
     MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
     MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
@@ -848,8 +816,6 @@ def multimem_all_gatherv_3tensor(
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
         ep_max_tokens_ptr=ep_max_tokens,
-        mask_rows_from_ptr=mask_rows_from if mask_rows_from is not None else rank_token_offset,
-        mask_row_offset=mask_row_offset,
         HIDDEN_SIZE_0=hidden_size_0,
         HIDDEN_SIZE_1=hidden_size_1,
         HIDDEN_SIZE_2=hidden_size_2,
@@ -862,7 +828,6 @@ def multimem_all_gatherv_3tensor(
         BITS_2=bits_2,
         RANK=symm_mem_hdl_0.rank,
         WORLD_SIZE=symm_mem_hdl_0.world_size,
-        MASK_ROWS_1=mask_rows_from is not None,
         num_warps=num_warps,
     )
 

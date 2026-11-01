@@ -596,14 +596,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # discarded downstream -- but it scales the MoE cost with the CUDA-graph
         # bucket rather than the live batch, which is most of the bucket
         # whenever the batch is draining.
-        #
-        # Outside batch-invariant mode, the AGV applies the mask while gathering
-        # at ep_size > 1, saving a launch per layer. Keep the original local mask
-        # and unmasked collective for both batch-invariant collective modes.
-        real_token_count = self.__class__._real_token_count_tensor
-        fuse_routing_mask = self.ep_size > 1 and not batch_invariant.enabled()
-        if not fuse_routing_mask and real_token_count is not None:
-            mask_routing_padding(self.routing_map, real_token_count, self.sp_rank)
+        if self.__class__._real_token_count_tensor is not None:
+            mask_routing_padding(
+                self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+            )
 
         if self.tp_size * self.ep_size == 1:
             if self._runs_metadata_sync:
@@ -643,9 +639,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             per_rank_max_tokens=per_rank_max,
-            # mask_routing_padding's frame: local row r is global row r + sp_rank * rows.
-            mask_rows_from=real_token_count if fuse_routing_mask else None,
-            mask_row_offset=self.sp_rank * self.routing_map.shape[0],
         )
 
         topk = probs.shape[1]
@@ -715,8 +708,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         # The multimem RSV writes bf16 directly and adds the overlapped shared-expert
         # output, bitwise identical to an fp32 output cast to bf16 and the bf16 add
-        # in combine_postprocess. The shared expert, launched before the AGV (see
-        # launch_shared_expert), has normally finished before the routed experts.
+        # in combine_postprocess. Each rank's RSV then waits for its own shared expert,
+        # so a late shared expert also delays its EP peers in the RSV barrier. The wait
+        # cannot form a cycle: the shared expert depends only on work queued before the
+        # AGV (see launch_shared_expert), so a rank spinning in the RSV has finished it.
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
@@ -727,9 +722,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         addend = None
         if (
             shared is not None
-            # The raw NVLS kernel has no autograd edge for its addend. Preserve
-            # the separate addition when the shared expert needs gradients.
-            and not (torch.is_grad_enabled() and shared.requires_grad)
             and shared.dtype == torch.bfloat16
             and shared.is_contiguous()
             # The RSV reads the addend with 8-byte loads.
