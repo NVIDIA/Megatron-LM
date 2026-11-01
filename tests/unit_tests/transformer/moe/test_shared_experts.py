@@ -7,9 +7,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
@@ -687,3 +691,32 @@ class TestSharedExperts:
             "Clamping had no observable effect on shared-expert output; "
             "activation_func_clamp_value may not be plumbed through."
         )
+
+    def test_sharded_state_dict_without_metadata(self):
+        """A direct call with metadata=None checkpoints gate_weight over the DP x CP group."""
+        tp_size = 2 if Utils.world_size % 2 == 0 else 1
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        shared_expert = SharedExpertMLP(
+            self.config,
+            MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+            gate=True,
+            pg_collection=pg_collection,
+        )
+
+        sharded_sd = shared_expert.sharded_state_dict(prefix="shared_experts.", metadata=None)
+
+        gate = sharded_sd["shared_experts.gate_weight"]
+        assert isinstance(gate, ShardedTensor)
+        assert gate.replica_id == (
+            0,
+            torch.distributed.get_rank(pg_collection.tp),
+            torch.distributed.get_rank(pg_collection.dp_cp),
+        )
+        # Every entry matches a call that passes the DP x CP group explicitly.
+        expected_sd = shared_expert.sharded_state_dict(
+            prefix="shared_experts.", metadata={"dp_cp_group": pg_collection.dp_cp}
+        )
+        assert sharded_sd.keys() == expected_sd.keys()
+        for key, expected in expected_sd.items():
+            assert sharded_sd[key].replica_id == expected.replica_id, key

@@ -28,6 +28,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     is_te_min_version,
@@ -214,6 +215,9 @@ class SharedExpertMLP(MLP):
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Gets sharded state dict."""
+        # MLP.sharded_state_dict fills only its own copy when metadata is None. Fill it here so
+        # gate_weight below gets the same DP x CP group as linear_fc1 and linear_fc2.
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.use_shared_expert_gate:
             name = 'gate_weight'
