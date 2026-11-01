@@ -9,7 +9,7 @@ import torch
 
 from megatron.core import process_groups_config
 from megatron.core.process_groups_config import ProcessGroupFallbackWarning
-from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer import MLATransformerConfig, ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
@@ -396,6 +396,24 @@ class TestGPTModelConfigSetAttr:
     def test_proxied_write_does_not_shadow_on_self(self):
         self.config.hidden_size = 2048
         assert "hidden_size" not in self.config.__dict__
+
+    def test_rotary_fields_reach_an_mla_transformer_config(self):
+        """rotary_base / rotary_percent exist on both GPTModelConfig and MLATransformerConfig;
+        MLA builds its rotary embeddings from the inner config, so the proxy must forward them."""
+        mla = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+        )
+        GPTModelConfig(transformer=mla, vocab_size=32000, rotary_base=500000, rotary_percent=0.5)
+        assert mla.rotary_base == 500000
+        assert mla.rotary_percent == 0.5
 
 
 class TestGPTModelConfigFinalize:
@@ -966,3 +984,14 @@ class TestGPTConfigFromArgs:
 
         assert config.rope_scaling is True
         assert config.rope_scaling_factor == 32.0
+
+    def test_seq_length_and_max_position_embeddings_land_on_different_fields(self):
+        """--seq-length is the per-sample training length that core modules (NCCL EP) size
+        buffers from; --max-position-embeddings is the position-embedding capacity on the
+        model config. They must not be conflated."""
+        args = self._make_args(seq_length=128, max_position_embeddings=131072)
+
+        config = gpt_config_from_args(args)
+
+        assert config.transformer.max_seq_length_per_sample == 128
+        assert config.seq_length == 131072

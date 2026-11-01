@@ -15,7 +15,12 @@ from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_paddi
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
 from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
-from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
+from megatron.training.global_vars import (
+    _set_train_state,
+    destroy_global_vars,
+    get_train_state,
+    set_args,
+)
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.state import TrainState
 from megatron.training.training import (
@@ -159,7 +164,6 @@ def test_setup_builds_the_model_and_optimizer_on_one_collection(
     monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
     monkeypatch.setattr(training, "_build_pg_collection_from_parallel_state", build)
     monkeypatch.setattr(training, "get_model", get_model)
-    monkeypatch.setattr(training, "get_megatron_optimizer_config", lambda args: (Mock(), None))
     monkeypatch.setattr(training, "get_megatron_optimizer", get_optimizer)
     monkeypatch.setattr(training, "get_optimizer_param_scheduler", Mock())
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
@@ -183,6 +187,24 @@ def test_setup_builds_the_model_and_optimizer_on_one_collection(
     assert [str(w.message).split()[0] for w in fallbacks] == (
         [] if pass_collection else ["setup_model_and_optimizer"]
     )
+
+
+@pytest.mark.parametrize("optimizer", [None, "optimizer"])
+@pytest.mark.parametrize("layer_wise", [False, True])
+def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise, run_config):
+    """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
+    toggles them only when an optimizer was built (not under --skip-train or
+    --rl-rollout-only --no-load-optim)."""
+    args = SimpleNamespace(use_megatron_fsdp=False)
+    run_config.optimizer.use_distributed_optimizer = not layer_wise
+    run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
+    run_config.optimizer.overlap_param_gather = True
+    assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
+    run_config.optimizer.overlap_param_gather = False
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
+    run_config.optimizer.overlap_param_gather = True
+    args.use_megatron_fsdp = True
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
@@ -293,14 +315,35 @@ class TestTraining:
         load.assert_called_once()
         save.assert_called_once()
 
-    def test_build_train_valid_test_data_iterators(self, run_config):
+    @pytest.mark.parametrize("build_train", [True, False])
+    def test_build_train_valid_test_data_iterators(self, run_config, build_train):
+        """A caller-managed training iterator (build_train_dataloader=False) skips only the
+        training loader; validation and test loaders and the data flags are still built."""
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
-            mock_train_valid_test_datasets_provider
+            mock_train_valid_test_datasets_provider, build_train_dataloader=build_train
         )
-        train_data = next(train_iter)
-        valid_data = next(valid_iter)
-        test_data = next(test_iter)
-        assert (train_data, valid_data, test_data) == (1, 2, 3)
+        if build_train:
+            assert next(train_iter) == 1
+        else:
+            assert train_iter is None
+        assert (next(valid_iter), next(test_iter)) == (2, 3)
+        train_state = get_train_state()
+        flags = (train_state.do_train, train_state.do_valid, train_state.do_test)
+        assert flags == (True, True, True)
+
+    def test_build_train_valid_test_data_iterators_resume_without_eval_interval(self, run_config):
+        """Resuming without eval_interval should not count any consumed validation samples."""
+        run_config.train.train_samples = None
+        run_config.validation.eval_interval = None
+        train_state = get_train_state()
+        train_state.iteration = 10
+        train_state.consumed_train_samples = 0
+        train_state.consumed_valid_samples = 0
+
+        build_train_valid_test_data_iterators(mock_train_valid_test_datasets_provider)
+
+        assert train_state.consumed_train_samples == 10
+        assert train_state.consumed_valid_samples == 0
 
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
@@ -350,18 +393,16 @@ class TestTraining:
         for vocab in range(1, 600000, 1000):
             for mult in [1, 17, 32, 64, 128]:
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
         for vocab in range(1, 10_000, 500):
             for mult in range(1, 1024 + 1):
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -420,14 +461,10 @@ class TestPackedSampleAccounting:
         self, monkeypatch, schedule, expected_iters
     ):
         from megatron.core import num_microbatches_calculator as calculator
-        from megatron.training import training
+        from megatron.training.config import container
 
         monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
 
-        def unexpected_global_config():
-            raise AssertionError("sample horizon must use the supplied TrainingConfig")
-
-        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
         train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
@@ -441,7 +478,7 @@ class TestPackedSampleAccounting:
             data_parallel_size=1,
             step_batch_size_schedule=schedule,
         )
-        training.update_train_iters(train)
+        container.update_train_iters(train)
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 
