@@ -303,6 +303,11 @@ markers = [
     "flaky_in_dev: mark flaky tests for DEV environment",
     "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
 ]
+filterwarnings = [
+    # Tests set up and read the global parallel grid on purpose; the deprecation of its
+    # parallel_state accessors is aimed at library and training code.
+    "ignore::megatron.core.parallel_state.ParallelStateDeprecationWarning",
+]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]

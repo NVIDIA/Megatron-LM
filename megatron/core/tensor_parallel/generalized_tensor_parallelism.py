@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 from packaging.version import Version
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     clear_graph_wgrad_rings,
@@ -44,6 +45,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_params_to_ensure_ready,
     register_capture_wgrad_finalize,
     register_capture_wgrad_ring_slot,
+    set_cuda_graph_mempool,
 )
 from megatron.core.tensor_parallel.gtp_eager_wgrad import (
     EagerWgradRingSlot,
@@ -303,7 +305,7 @@ class GTPWeightState(Enum):
     DATA_READY_SYNC = "DATA_READY_SYNC"  # Sync all-gather complete, result in cache
 
 
-# Global GTP buffer cache (persists across clear(); never set to None after creation).
+# Global GTP buffer cache (persists across clear(), released at model-parallel teardown).
 _GTP_CACHE = None
 _GTP_PARAMS = []
 
@@ -3007,6 +3009,29 @@ def reset_gtp_state():
         ):
             if hasattr(param, attr):
                 delattr(param, attr)
+
+
+def _destroy_gtp_state():
+    """Drop the ending lifetime's parameters, tickets and streams after graphs are released.
+
+    Discard unfinished gradient accumulation without issuing new collectives: its groups
+    are about to be destroyed (or were already aborted during failure recovery). Model
+    construction's reset_gtp_state() intentionally preserves tickets, so it cannot perform
+    this full cleanup while building another pipeline chunk.
+    """
+    global _GTP_CACHE
+    reset_gtp_state()
+    _GTP_PARAMS.clear()
+    _inflight_comm_params.clear()
+    _GTP_CACHE = None
+    _AG_STREAMS.clear()
+    _RS_STREAMS.clear()
+    _wgrad_buf_pool.clear()
+    set_cuda_graph_modules(None)
+    set_cuda_graph_mempool(None, None)
+
+
+register_model_parallel_teardown(TeardownStage.RESET_STATE, _destroy_gtp_state)
 
 
 # ------------------------------------------------------------------------
