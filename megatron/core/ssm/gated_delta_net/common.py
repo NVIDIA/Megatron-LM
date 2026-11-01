@@ -456,7 +456,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                     hidden_states,
                 )
             return tensor_parallel.checkpoint(
-                _checkpointed_forward, self.config.distribute_saved_activations, hidden_states
+                _checkpointed_forward,
+                self.config.distribute_saved_activations,
+                hidden_states,
+                tp_group=self.pg_collection.tp,
             )
 
         norm_out = self.forward_pre_attn_and_core_attn(
