@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 import warnings
 import weakref
 from collections.abc import Callable, Iterable
@@ -252,6 +253,47 @@ def _te_grouped_tensor_supports_sharded_weights() -> bool:
     return "is_dist_weight" in signature.parameters
 
 
+_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM_ENV = "MCORE_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM"
+
+
+def _check_cublaslt_grouped_gemm_version() -> None:
+    """Refuse GroupedTensor execution on a cuBLASLt whose grouped GEMM can corrupt outputs.
+
+    cuBLASLt 13.7.0 up to 13.8.1 can leave rows of a grouped GEMM output unwritten on Blackwell
+    and Rubin (SM100-SM110), so experts silently read stale memory: grad-norm spikes, or NaN when
+    that memory was never written. See
+    https://docs.nvidia.com/cuda/cublas-patch-release-notes/#cublas-patch-release-13-8-1.
+    TE only warns once at the first grouped GEMM, which is easy to miss in a training log.
+    """
+    if not torch.cuda.is_available():
+        return
+    major, minor = torch.cuda.get_device_capability()
+    sm = 10 * major + minor
+    if not 100 <= sm <= 110:
+        return
+    import transformer_engine_torch as tex
+
+    # The cuBLASLt library loaded at run time, versioned as major * 10000 + minor * 100 + patch.
+    version = tex.get_cublasLt_version()
+    if not 130700 <= version < 130801:
+        return
+    message = (
+        f"cuBLASLt {version // 10000}.{version // 100 % 100}.{version % 100} grouped GEMM can "
+        f"leave output rows unwritten on Blackwell and Rubin GPUs (this GPU is SM{sm}), which "
+        "silently corrupts MoE expert outputs with moe_use_grouped_tensor=True (also enabled by "
+        "use_transformer_engine_op_fuser). Upgrade cuBLAS to 13.8.1 or newer, or disable both "
+        "options."
+    )
+    if os.environ.get(_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM_ENV, "0") == "1":
+        # Message text is constant so the default warning filter shows it once.
+        warnings.warn(message)
+        return
+    raise RuntimeError(
+        f"{message} Set {_ALLOW_BUGGY_CUBLAS_GROUPED_GEMM_ENV}=1 to downgrade this error to a "
+        "warning."
+    )
+
+
 class _VirtualExpertFC2WgradStore:
     """Start the FC2 virtual-expert gradient reduction when TE enqueues FC2's wgrad GEMM.
 
@@ -483,6 +525,8 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
+        if self._use_grouped_tensor:
+            _check_cublaslt_grouped_gemm_version()
 
     def bind_virtual_experts(self, load_balancer) -> None:
         """Bind native and virtual runtime weights after main gradients are initialized."""
