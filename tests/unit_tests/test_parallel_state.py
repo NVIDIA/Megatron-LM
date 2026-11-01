@@ -666,16 +666,14 @@ def test_separate_all_gather_group():
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize('order', ['tp-cp-ep-dp-pp', 'tp-cp-dp-ep-pp'])
-def test_expert_all_gather_group(order):
+@pytest.mark.parametrize("order", ["tp-cp-ep-dp-pp", "tp-cp-dp-ep-pp"])
+def test_expert_all_gather_group(order: str) -> None:
     """Test expert AG groups for MoE models with AG/RS overlap."""
     if world_size < 8 or world_size % 8 != 0:
         pytest.skip(f"Test requires world_size divisible by 8, but got {world_size}")
 
     Utils.initialize_model_parallel(
-        pipeline_model_parallel_size=2,
-        expert_model_parallel_size=2,
-        order=order,
+        pipeline_model_parallel_size=2, expert_model_parallel_size=2, order=order
     )
 
     expt_dp_group = ps.get_expert_data_parallel_group()

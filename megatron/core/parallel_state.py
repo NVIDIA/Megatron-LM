@@ -1799,7 +1799,9 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     if for_expert_parallelism and ep_size > 1:
         # Reuse the exact expert weight layout resolved during initialization. Reconstructing it
         # here would lose custom axis ordering, rank offsets, and future layout extensions.
-        assert _EXPERT_WEIGHT_REPLICA_RANK_SETS is not None
+        assert (
+            _EXPERT_WEIGHT_REPLICA_RANK_SETS is not None
+        ), "Expert data parallel ranks are not initialized"
         for expert_dp_ranks in _EXPERT_WEIGHT_REPLICA_RANK_SETS:
             expert_dp_ag = create_group(
                 expert_dp_ranks,
