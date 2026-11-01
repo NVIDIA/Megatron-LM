@@ -1588,10 +1588,19 @@ class TestRerunStateMachineConfigMapping:
 
     def test_direct_rerun_state_machine_fields_from_args(self, patch_training_helpers):
         """RerunStateMachineConfig fields with 1-to-1 name mapping are pulled directly from args."""
-        args = _make_args(error_injection_rate=500, rerun_mode="report_stats")
+        args = _make_args(error_injection_rate=500, rerun_mode="report_determinism_stats")
         result = pretrain_cfg_container_from_args(args)
         assert result.rerun_state_machine.error_injection_rate == 500
-        assert result.rerun_state_machine.rerun_mode == "report_stats"
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+
+    @pytest.mark.parametrize("mode", ["report_stats", "report_determinism_stats"])
+    def test_stats_cli_spellings_resolve_to_core_mode(self, patch_training_helpers, mode):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        parsed = parser.parse_args(["--rerun-mode", mode])
+        result = pretrain_cfg_container_from_args(_make_args(rerun_mode=parsed.rerun_mode))
+        assert result.rerun_state_machine.rerun_mode == "report_determinism_stats"
+        result.rerun_state_machine.validate()
 
 
 class TestTrainingConfigMapping:

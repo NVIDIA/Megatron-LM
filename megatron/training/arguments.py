@@ -14,7 +14,6 @@ import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.msc_utils import MultiStorageClientFeature
-from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1092,12 +1091,6 @@ def validate_args(args, defaults={}):
     if args.fp16:
         assert not args.bf16
         args.params_dtype = torch.half
-        # Turn off checking for NaNs in loss and grads if using dynamic loss scaling,
-        # where NaNs in grads / loss are signal to the loss scaler.
-        if not args.loss_scale:
-            args.check_for_nan_in_loss_and_grad = False
-            warn_rank_0('Setting args.check_for_nan_in_loss_and_grad to False since '
-                        'dynamic loss scaling is being used')
     # main_grads_dtype is still the CLI string here; it is mapped to a torch.dtype later, in
     # OptimizerConfig.finalize_optimizer_config.
     main_grads_is_fp32 = args.main_grads_dtype in ('fp32', torch.float32)
@@ -1638,13 +1631,6 @@ def validate_args(args, defaults={}):
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
 
-    if args.result_rejected_tracker_filename is not None:
-        # Append to passed-in args.iterations_to_skip.
-        iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
-            args.result_rejected_tracker_filename
-        )
-        args.iterations_to_skip.extend(iterations_to_skip_from_file)
-
     if args.optimizer not in ('sgd', 'adam'):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
@@ -1664,9 +1650,6 @@ def validate_args(args, defaults={}):
 
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
-        # Disable nan check for fake process group
-        args.check_for_nan_in_loss_and_grad = False
-        warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
         # Disable gloo process groups for fake process group
         args.use_gloo_process_groups = False
         warn_rank_0('use_gloo_process_groups is set to False for fake process group.')
@@ -2779,8 +2762,6 @@ def _add_training_args(parser):
     group.add_argument('--check-for-large-grads', action='store_true',
                        help='Check for unexpectedly large grads',
                        dest='check_for_large_grads')
-    group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
-                       help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 

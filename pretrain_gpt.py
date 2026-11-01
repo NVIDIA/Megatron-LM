@@ -59,7 +59,7 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -294,7 +294,8 @@ def loss_func(
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
-    if args.check_for_nan_in_loss_and_grad:
+    cfg = get_run_config()
+    if cfg.rerun_state_machine.check_for_nan_in_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isnan,
@@ -310,7 +311,7 @@ def loss_func(
             fatal=True,
         )
     # Check for spiky loss
-    if args.check_for_spiky_loss:
+    if cfg.rerun_state_machine.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=partial(

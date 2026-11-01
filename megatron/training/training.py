@@ -4465,7 +4465,11 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % cfg.logger.log_interval == 0 and args.log_straggler:
+    if (
+        iteration % cfg.logger.log_interval == 0
+        and cfg.straggler is not None
+        and cfg.straggler.log_straggler
+    ):
         # Use FLOPs accumulated since last log event and then reset the counter
         stimer.report(num_floating_point_operations_since_last_log_event, cfg.logger.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
@@ -4877,17 +4881,17 @@ def train(
         gc.collect()
 
     # Singleton initialization of straggler detector.
-    if args.log_straggler:
+    if cfg.straggler is not None and cfg.straggler.log_straggler:
         global stimer
         world = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        mmcnt = args.straggler_minmax_count
+        mmcnt = cfg.straggler.straggler_minmax_count
         stimer.configure(
             world,
             rank,
             mmcnt=mmcnt,
-            enabled=not args.disable_straggler_on_startup,
-            port=args.straggler_ctrlr_port,
+            enabled=not cfg.straggler.disable_straggler_on_startup,
+            port=cfg.straggler.straggler_ctrlr_port,
         )
     num_floating_point_operations_since_last_log_event = 0.0
 
