@@ -87,6 +87,11 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
     assert _get_indexer_logging_layer_counts(args) == (3, 2)
 
 
+def test_no_optimizer_does_not_require_training_wrapper_config(monkeypatch):
+    monkeypatch.setattr(training, "get_run_config", lambda: SimpleNamespace())
+    assert not training.should_disable_forward_pre_hook(SimpleNamespace(), None)
+
+
 @pytest.mark.parametrize("fsdp2", [False, True])
 @pytest.mark.parametrize("megatron_fsdp", [False, True])
 def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2, megatron_fsdp):
@@ -97,7 +102,6 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         use_torch_fsdp2=not fsdp2,
         use_megatron_fsdp=not megatron_fsdp,
     )
-    run_config.dist.use_torch_fsdp2 = fsdp2
     run_config.ddp = (
         training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
         if fsdp2
@@ -122,7 +126,8 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     with pytest.raises(ReachedBuilder):
         training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
     kwargs = builder.build_distributed_models.call_args.kwargs
-    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["ddp_config"] is not run_config.ddp
+    assert kwargs["ddp_config"] == run_config.ddp
     assert kwargs["use_torch_fsdp2"] is fsdp2
     # Forward both flags unchanged, including the pair rejected by the builder.
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp
@@ -134,7 +139,7 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
     toggles them only when an optimizer was built (not under --skip-train or
     --rl-rollout-only --no-load-optim)."""
-    args = SimpleNamespace(use_megatron_fsdp=False)
+    args = SimpleNamespace(use_megatron_fsdp=True)  # The registered config owns this flag.
     run_config.optimizer.use_distributed_optimizer = not layer_wise
     run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
     run_config.optimizer.overlap_param_gather = True
@@ -142,7 +147,8 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     run_config.optimizer.overlap_param_gather = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
     run_config.optimizer.overlap_param_gather = True
-    args.use_megatron_fsdp = True
+    run_config.ddp.use_megatron_fsdp = True
+    args.use_megatron_fsdp = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 

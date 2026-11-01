@@ -132,7 +132,7 @@ def load_reference_state_dict(
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
         skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
+        and cfg.ddp.use_torch_fsdp2
         and args.ckpt_format == "torch_dist",
     )
     ref_state_dict = {
@@ -150,7 +150,7 @@ def load_reference_state_dict(
         checkpointing_context=checkpointing_context,
         restore_training_state=True,
         skip_load_to_model_and_opt=HAVE_FSDP2
-        and cfg.dist.use_torch_fsdp2
+        and cfg.ddp.use_torch_fsdp2
         and args.ckpt_format == "torch_dist",
     )
     update_num_microbatches(consumed_samples=get_train_state().consumed_train_samples, verbose=True)

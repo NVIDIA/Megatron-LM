@@ -47,7 +47,12 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
+from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import (
+    get_run_config,
+    get_train_state,
+    initialize_runtime_services,
+)
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -158,6 +163,11 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            num_distributed_optimizer_instances=(
+                cfg.ddp.num_distributed_optimizer_instances
+                if isinstance(cfg, PretrainConfigContainer)
+                else 1
+            ),
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -342,7 +352,8 @@ def _initialize_tp_communicators(
 
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+                            skip_model_parallel_init=False, *,
+                            num_distributed_optimizer_instances=1):
     """Initialize torch.distributed and core model parallel."""
     cfg = get_run_config()
     args = get_args()
@@ -468,7 +479,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 dynamic_context_parallel=args.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
-                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                num_distributed_optimizer_instances=num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=cfg.dist.distributed_timeout_minutes,
                 nccl_communicator_config_path=cfg.dist.nccl_communicator_config_path,

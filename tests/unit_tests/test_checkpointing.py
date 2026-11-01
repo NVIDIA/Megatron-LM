@@ -75,6 +75,42 @@ def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkey
         load_checkpoint([], None, None)
 
 
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("fsdp", [False, True])
+def test_checkpoint_backend_uses_config(
+    create_ckpt_load_args, run_config, monkeypatch, inference, fsdp
+):
+    from megatron.training import checkpointing
+
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.auto_detect_ckpt_format = True
+    args.ckpt_format = "torch_dist"
+    args.use_megatron_fsdp = not fsdp
+    run_config.ddp.use_megatron_fsdp = fsdp
+    run_config.checkpoint.ckpt_format = "fsdp_dtensor" if fsdp else "torch_dist"
+    cfg = (
+        InferenceConfigContainer(
+            model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
+        )
+        if inference
+        else run_config
+    )
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "get_run_config", lambda: cfg)
+
+    class BackendReached(Exception):
+        pass
+
+    def load_base(*unused_args, **kwargs):
+        assert kwargs["use_megatron_fsdp"] is fsdp
+        raise BackendReached
+
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", load_base)
+    with pytest.raises(BackendReached):
+        load_checkpoint([], None, None)
+
+
 class MockModel(MegatronModule):
     """Dummy megatron model."""
 
