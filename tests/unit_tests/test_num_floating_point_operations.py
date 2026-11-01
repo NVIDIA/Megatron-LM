@@ -1605,3 +1605,16 @@ class TestQSAHybrid:
         assert num_floating_point_operations(args, 2) == pytest.approx(
             num_floating_point_operations(dense, 2) + idx, rel=1e-12
         )
+
+    def test_dense_when_fits_is_plain_attention(self):
+        """--qsa-dense-when-fits: Q == '*' exactly -- dense core, no indexer terms."""
+        args = _make_qsa_hybrid_args(qsa_indexer_loss_coeff=None)
+        args.qsa_indexer_budget = 1024
+        args.qsa_dense_when_fits = True
+        dense = _make_qsa_hybrid_args(qsa_indexer_loss_coeff=None)
+        dense.hybrid_layer_pattern = "*"
+        assert num_floating_point_operations(args, 2) == pytest.approx(
+            num_floating_point_operations(dense, 2), rel=1e-12
+        )
+        args.qsa_dense_when_fits = False
+        assert num_floating_point_operations(args, 2) > num_floating_point_operations(dense, 2)

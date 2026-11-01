@@ -549,6 +549,20 @@ class TransformerConfig(ModelParallelConfig):
     4-token blocks, SM100/SM103, no context parallelism. None (default) follows
     ``qsa_use_sparse_attention``; any other value sets it (``dense`` -> False, else True)."""
 
+    qsa_dense_when_fits: bool = False
+    """Run QSA layers as plain dense causal attention when every document fits the budget.
+
+    A document of at most ``qsa_indexer_budget`` tokens selects all of its visible blocks
+    (own block + top ``budget / compress_ratio``), so QSA on it is exactly dense causal
+    attention within the document. With this flag the indexer (projection, block keys,
+    top-k) and the sparse kernel are skipped; q/k/v, RoPE and the output gate are the same,
+    and core attention is the layer's TransformerEngine attention with a (padding-)causal
+    mask over the packed THD documents. The indexer gets no gradient and is frozen, so
+    ``qsa_indexer_loss_coeff`` must be None or 0 (no silent change of the training
+    objective). The caller guarantees the fit (e.g. ``--seq-length <= qsa_indexer_budget``,
+    validated by the training arguments); each layer additionally checks it on its first
+    eager forward. Single-rank attention only (no context parallelism)."""
+
     qsa_cudnn_bwd_impl: Literal["qsa_api", "sparse_gqa"] = "sparse_gqa"
     """Backward of ``qsa_attn_backend='cudnn'``. ``sparse_gqa`` (default): the index-list QSA
     backward (``cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100``), one launch per sequence; it needs
@@ -2324,6 +2338,18 @@ class TransformerConfig(ModelParallelConfig):
             # Note: the indexer reuses the main attention's rotary frequencies. Their dim
             # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
             # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_dense_when_fits:
+                if self.qsa_indexer_loss_coeff:
+                    raise ValueError(
+                        "qsa_dense_when_fits skips the QSA indexer, so its distillation loss "
+                        "cannot be computed; set qsa_indexer_loss_coeff to 0 (got "
+                        f"{self.qsa_indexer_loss_coeff})."
+                    )
+                if self.context_parallel_size > 1:
+                    raise ValueError(
+                        "qsa_dense_when_fits runs single-rank dense attention; it does not "
+                        "support context parallelism."
+                    )
             if self.qsa_cudnn_bwd_impl not in ("qsa_api", "sparse_gqa"):
                 raise ValueError(
                     "qsa_cudnn_bwd_impl must be 'qsa_api' or 'sparse_gqa', got "

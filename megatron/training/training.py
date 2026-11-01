@@ -1108,7 +1108,8 @@ def num_floating_point_operations(
                      qsa_indexer_head_dim=128,
                      qsa_indexer_budget=2048,
                      qsa_indexer_compress_ratio=4,
-                     qsa_indexer_loss_coeff=None):
+                     qsa_indexer_loss_coeff=None,
+                     qsa_dense_when_fits=False):
         """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
@@ -1145,7 +1146,14 @@ def num_floating_point_operations(
         # outside the global fwd+bwd factor.
         qsa_attn_flops = 0
         qsa_indexer_total = 0
-        if num_qsa_layers:
+        if num_qsa_layers and qsa_dense_when_fits:
+            # --qsa-dense-when-fits: every document fits the budget (min(i, budget) = i)
+            # and the indexer is skipped -- plain causal attention, no indexer terms.
+            qsa_attn_flops = num_qsa_layers * attn_layer_flops(
+                total_tokens, seqlen_squared_sum, hidden_size,
+                num_attn_heads, gqa, gqa_groups, kv_channels, attention_output_gate,
+            )
+        elif num_qsa_layers:
             qsa_core_scale = _dsa_sparse_core_scale(
                 total_tokens, seqlen_squared_sum, qsa_indexer_budget
             )
@@ -1648,6 +1656,7 @@ def num_floating_point_operations(
             qsa_indexer_budget=getattr(args, "qsa_indexer_budget", 2048),
             qsa_indexer_compress_ratio=getattr(args, "qsa_indexer_compress_ratio", 4),
             qsa_indexer_loss_coeff=getattr(args, "qsa_indexer_loss_coeff", None),
+            qsa_dense_when_fits=getattr(args, "qsa_dense_when_fits", False),
         ))
     else:
         # Compute standard Transformer model FLOPs.

@@ -1236,6 +1236,15 @@ def validate_args(args, defaults={}):
             f"or equal to seq_length ({args.seq_length})."
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
+    if getattr(args, "qsa_dense_when_fits", False):
+        # The dense QSA path is exact only for documents within the selection budget.
+        # --seq-length is the per-sample (document) cap; packed THD bins are sized by
+        # --max-seqlen-per-dp-cp-rank and may hold several such documents.
+        assert args.seq_length is not None and args.seq_length <= args.qsa_indexer_budget, (
+            f"--qsa-dense-when-fits needs every document within the QSA budget: "
+            f"--seq-length ({args.seq_length}) must be <= --qsa-indexer-budget "
+            f"({args.qsa_indexer_budget})."
+        )
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:

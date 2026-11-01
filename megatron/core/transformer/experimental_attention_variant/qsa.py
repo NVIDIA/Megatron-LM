@@ -61,6 +61,23 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 
+def _layout_cu_seqlens(packed_seq_params, which: str) -> Optional[Tensor]:
+    """Document boundaries of the packed rows as they are laid out in memory.
+
+    QSA reads document starts off these boundaries (block grid, RoPE rows, kernel block
+    ranges), so they must describe where each document's rows physically sit. When
+    documents are padded individually that is ``cu_seqlens_*_padded``; entry points differ
+    in whether they also put it in ``cu_seqlens_*`` (the static THD contract has no
+    per-document padding, multimodal_dev keeps the real lengths in ``cu_seqlens_*``), so
+    prefer the padded field. Padding rows then trail their own document and are never
+    visible to its real tokens under causal selection.
+    """
+    if packed_seq_params is None:
+        return None
+    padded = getattr(packed_seq_params, f"cu_seqlens_{which}_padded", None)
+    return padded if padded is not None else getattr(packed_seq_params, f"cu_seqlens_{which}")
+
+
 class QSASelection(NamedTuple):
     """Selection artifacts for the sparse attention path and the sparse-KL loss.
 
@@ -981,6 +998,7 @@ class QSASelfAttention(SelfAttention):
         if not self.config.qsa_indexer_loss_coeff:
             for param in self.indexer.parameters():
                 param.requires_grad_(False)
+        self._dense_fit_checked = False
         _require_qsa_kernel_support(self.config, self.pg_collection.tp.size())
 
     def is_cuda_graph_capturable(self) -> bool:
@@ -1014,7 +1032,12 @@ class QSASelfAttention(SelfAttention):
         loss_coeff = self.config.qsa_indexer_loss_coeff or 0.0
         train_indexer = self.training and loss_coeff > 0 and torch.is_grad_enabled()
 
-        if self.config.qsa_use_sparse_attention:
+        if self.config.qsa_dense_when_fits:
+            # Every document fits the budget, so the selection is all visible blocks:
+            # QSA is dense causal attention (config forbids the indexer loss here).
+            output, bias = self._dense_fits_forward(hidden_states, freqs, packed_seq_params)
+            selection = None
+        elif self.config.qsa_use_sparse_attention:
             if attention_mask is not None and attention_mask.dtype != torch.bool:
                 raise ValueError(
                     "QSA expects a bool attention mask (True = masked out); additive "
@@ -1134,6 +1157,89 @@ class QSASelfAttention(SelfAttention):
             gather_from_sequence_parallel_region(t, group=cp_group).index_select(0, reorder)
             for t in tensors
         ]
+
+    def _check_documents_fit(self, s: int, cu_seqlens: Optional[Tensor], packed_seq_params):
+        """Eager-only, first-call check of the ``qsa_dense_when_fits`` contract.
+
+        Every real document must be at most ``qsa_indexer_budget`` tokens. Under static
+        THD the pack is filled up by one dummy tail document (and zero-length entries);
+        its rows are padding, so documents are measured by their non-padding rows when
+        ``PackedSeqParams.padding_mask`` is present; without one, the last non-empty
+        document of a static pack (the possible dummy tail) is left unchecked. Runs once
+        per layer (it reads device values), never under CUDA graph capture.
+        """
+        if self._dense_fit_checked or torch.cuda.is_current_stream_capturing():
+            return
+        budget = self.config.qsa_indexer_budget
+        if cu_seqlens is None:
+            lengths = torch.tensor([s])
+        else:
+            cu = cu_seqlens.to(torch.int64)
+            padding_mask = getattr(packed_seq_params, "padding_mask", None)
+            if padding_mask is not None:
+                real = (~padding_mask.reshape(-1)).to(torch.int64)
+                csum = torch.nn.functional.pad(real.cumsum(0), (1, 0))
+                lengths = (csum[cu[1:]] - csum[cu[:-1]]).cpu()
+            else:
+                lengths = (cu[1:] - cu[:-1]).cpu()
+                if self.indexer.static_shapes:
+                    # Static THD appends the padding as one dummy document after the real
+                    # ones (then zero-length entries); without a mask it cannot be told
+                    # apart, so the last non-empty document is not checked.
+                    nonzero = torch.nonzero(lengths).flatten()
+                    if nonzero.numel():
+                        lengths = lengths[: int(nonzero[-1])]
+        longest = int(lengths.max()) if lengths.numel() else 0
+        if longest > budget:
+            raise ValueError(
+                f"qsa_dense_when_fits: a document of {longest} tokens exceeds "
+                f"qsa_indexer_budget={budget}; dense attention would differ from QSA. "
+                "Cap the sample length at the budget or disable qsa_dense_when_fits."
+            )
+        self._dense_fit_checked = True
+
+    @nvtx_decorator(message="QSA::dense_fits_attn")
+    def _dense_fits_forward(self, hidden_states, freqs, packed_seq_params):
+        """``qsa_dense_when_fits`` path: dense causal attention, no indexer.
+
+        Same q/k/v projection, partial (m)RoPE and output gate as :meth:`_sparse_forward`;
+        the core is the layer's TransformerEngine attention with a causal mask, per
+        document for packed THD (``padding_causal`` over ``cu_seqlens``).
+        """
+        cu_seqlens = None
+        if packed_seq_params is not None:
+            assert packed_seq_params.qkv_format == 'thd', "QSA supports BSHD or packed THD"
+            cu_seqlens = _layout_cu_seqlens(packed_seq_params, "q")
+        self._check_documents_fit(hidden_states.shape[0], cu_seqlens, packed_seq_params)
+
+        qkv = self.get_query_key_value_tensors(
+            hidden_states, None, split_qkv=True, output_gate=self.config.attention_output_gate
+        )
+        if self.config.attention_output_gate:
+            query, key, value, gate = qkv
+        else:
+            query, key, value = qkv
+            gate = None
+        query, key = self._rope_qk(query, key, freqs, cu_seqlens)
+
+        if packed_seq_params is not None:
+            # TE THD takes squeezed [t, h, d] tensors.
+            core_out = self.core_attention(
+                query.squeeze(1),
+                key.squeeze(1),
+                value.squeeze(1),
+                None,
+                attn_mask_type=AttnMaskType.padding_causal,
+                packed_seq_params=packed_seq_params,
+            )
+            core_out = core_out.reshape(core_out.size(0), 1, -1)
+        else:
+            core_out = self.core_attention(
+                query, key, value, None, attn_mask_type=AttnMaskType.causal
+            )
+        if gate is not None:
+            core_out = self._apply_output_gate(core_out, gate)
+        return self.linear_proj(core_out)
 
     @nvtx_decorator(message="QSA::sparse_attn")
     def _sparse_forward(self, hidden_states, freqs, packed_seq_params):
