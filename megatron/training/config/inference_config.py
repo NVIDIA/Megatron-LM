@@ -157,6 +157,12 @@ class InferenceSetupConfig:
     scheduling phases by reordering them to prepare-before-resolve. Select "legacy" to disable
     async scheduling and use the resolve-before-prepare path."""
 
+    inference_gc_mode: Literal["default", "freeze", "freeze_overlap"] = "default"
+    """Python garbage collection policy while the inference engine serves requests. `default`
+    leaves automatic collection unchanged. `freeze` freezes the long-lived heap after engine
+    setup so collections skip it. `freeze_overlap` also runs due collections right after each
+    forward pass is submitted, overlapping them with GPU work."""
+
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
     )
@@ -468,4 +474,5 @@ class InferenceSetupConfig:
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
+            gc_mode=self.inference_gc_mode,
         )
