@@ -170,6 +170,39 @@ def test_ssm_geometry_uses_conv_and_recurrent_state_names():
         )
 
 
+def test_kv_geometry_exports_layout_when_tp_replicates_kv_heads():
+    """TP4 over 2 KV heads: each rank caches one replicated head. The layout
+    must still be exported so every rank advertises the same KV geometry."""
+    from megatron.core.inference.disaggregation.coordinator_runtime import (
+        _instance_transfer_signature,
+    )
+
+    num_layers, num_heads, tp_size, head_dim, tokens, blocks = 2, 2, 4, 4, 3, 5
+    metas = []
+    for tp_rank in range(tp_size):
+        geometry = base.compute_buffer_geometry(
+            torch.zeros(2, num_layers, blocks, tokens, 1, head_dim),
+            expected_num_blocks=blocks,
+            backend_name="test",
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            num_kv_heads_global=num_heads,
+            heads_per_partition=1,
+            head_dim=head_dim,
+            tokens_per_block=tokens,
+            global_rank=tp_rank,
+            pp_size=1,
+            pp_rank=0,
+            num_layers_global=num_layers,
+            layer_start=0,
+            layer_end=num_layers,
+        )
+        assert geometry.layout.head_range() == (tp_rank // 2, tp_rank // 2 + 1)
+        metas.append(base.export_geometry_meta(geometry))
+
+    _instance_transfer_signature(metas)
+
+
 def test_ssm_geometry_uses_explicit_live_slot_axis():
     layout = SSMShardLayout(
         global_rank=0,
