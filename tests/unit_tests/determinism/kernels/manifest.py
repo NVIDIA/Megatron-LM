@@ -362,6 +362,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
@@ -406,7 +407,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
         ),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention.",
@@ -414,7 +418,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
     ),
@@ -440,9 +447,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Activation page copy kernels (no arithmetic); functional round-trip coverage.",
     ),
     KernelEntry(
+        name="moe_ep_invariant_combine",
+        sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
+        tests=("tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",),
+        kind="triton",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; bit-exact forward and "
+        "gradient replay, plus parity across EP sizes and training/inference paths.",
+    ),
+    KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
         tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_unpermute.py",
             K + "test_moe_kernels.py",
@@ -671,7 +687,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
+            K + "test_inference_kernels.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
