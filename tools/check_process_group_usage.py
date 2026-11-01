@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Fail on *new* reads of global process-group state in ``megatron/core``.
+"""Fail on *new* uses of the global ``parallel_state`` in ``megatron/core``.
 
 ``megatron.core.parallel_state`` holds the process groups for a single, global parallel grid.
 Reading it inside library code is being removed: for a model built on independent parallel grids
@@ -15,10 +15,25 @@ recent import of its name that precedes it in the same scope, even if the name i
 later; aliases created through assignments (``grid = parallel_state``) or dynamic attribute
 lookup are outside its scope.
 
+Each entry has one of four kinds:
+
+* ``accessor``: a ``parallel_state`` group, rank or size accessor;
+* ``function``: another deprecated ``parallel_state`` function: a pipeline-stage predicate, the
+  virtual-pipeline rank or size, ``get_all_ranks``, a rank or size override, a dynamic
+  context-parallel group map, or a memory-buffer alias;
+* ``shim``: ``ProcessGroupCollection.use_mpu_process_groups()``, which reads the same globals;
+* ``guarded``: ``resolve_process_groups()``, the warned fallback in ``process_groups_config.py``.
+  It reads the globals only when the caller omits its groups, and warns first.
+
+A guarded call is still a read, so wrapping a fallback in ``resolve_process_groups()`` does not
+remove it from the allowlist. A guarded call that replaces a removed accessor, function or shim
+read in the same file and scope is a conversion, and ``--update`` swaps the entry. Any other new
+guarded call fails like a new read.
+
 Usage::
 
     python tools/check_process_group_usage.py            # check
-    python tools/check_process_group_usage.py --update   # remove stale allowlist entries
+    python tools/check_process_group_usage.py --update   # remove stale entries, record conversions
     python tools/check_process_group_usage.py --stats    # summarize without failing
 """
 
@@ -37,24 +52,63 @@ ALLOWLIST = REPO_ROOT / "tools" / "process_group_usage_allowlist.json"
 # Everything else in megatron/core is subject to the ratchet, including existing fallbacks.
 EXEMPT = {"megatron/core/parallel_state.py", "megatron/core/process_groups_config.py"}
 
-# Accessors that read the global grid. Deliberately excludes initialize/destroy/is_initialized
-# (the intended long-term surface) and the virtual-pipeline and memory-buffer globals, which have
-# no replacement yet and are tracked separately.
+# Group, rank and size accessors that read the global grid. Deliberately excludes
+# initialize/destroy/is_initialized (the intended long-term surface).
 DEPRECATED_PREFIXES = ("get_",)
 # "_gloo" covers the Gloo group accessors (get_data_parallel_group_gloo,
 # get_expert_data_parallel_group_gloo), which also return groups of the global grid.
 DEPRECATED_SUFFIXES = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
-NOT_DEPRECATED = {
+# get_ functions that are not accessors, whether or not the suffixes above match them:
+# get_nccl_options is not deprecated, and the others are counted with DEPRECATED_FUNCTIONS. The
+# test helpers that forbid the global grid stub the accessors only and expect these to keep working.
+NOT_ACCESSORS = {
     "get_nccl_options",
     "get_all_ranks",
     "get_global_memory_buffer",
     "get_virtual_pipeline_model_parallel_rank",
     "get_virtual_pipeline_model_parallel_world_size",
 }
+# The other deprecated functions of the global grid. A call of a setter writes the grid rather
+# than reads it, and counts the same way.
+DEPRECATED_FUNCTIONS = {
+    # Pipeline-stage predicates.
+    "is_pipeline_first_stage",
+    "is_pipeline_last_stage",
+    "is_rank_in_embedding_group",
+    "is_rank_in_position_embedding_group",
+    # Virtual-pipeline rank and size.
+    "get_virtual_pipeline_model_parallel_rank",
+    "set_virtual_pipeline_model_parallel_rank",
+    "get_virtual_pipeline_model_parallel_world_size",
+    "set_virtual_pipeline_model_parallel_world_size",
+    # The ranks of all groups, and the overrides of ranks and sizes.
+    "get_all_ranks",
+    "set_tensor_model_parallel_world_size",
+    "set_tensor_model_parallel_rank",
+    "set_pipeline_model_parallel_world_size",
+    "set_pipeline_model_parallel_rank",
+    "set_data_parallel_rank",
+    "set_expert_model_parallel_world_size",
+    "set_expert_model_parallel_rank",
+    "set_expert_tensor_parallel_world_size",
+    "set_expert_tensor_parallel_rank",
+    # Dynamic context-parallel group maps.
+    "get_dynamic_data_context_parallel_group_map",
+    "get_dynamic_tensor_data_context_parallel_group_map",
+    # Aliases of the memory-buffer functions of megatron.core.utils.
+    "get_global_memory_buffer",
+    "destroy_global_memory_buffer",
+    "_set_global_memory_buffer",
+}
+
+# Entry kinds in --stats order. "guarded" calls always warn before they read the globals; a call
+# of another kind may follow a warning in a fallback too, which the kind does not record.
+KINDS = ("accessor", "function", "shim", "guarded")
+GUARDED = "guarded"
 
 
 def _is_deprecated_accessor(name: str) -> bool:
-    if name in NOT_DEPRECATED:
+    if name in NOT_ACCESSORS:
         return False
     return name.startswith(DEPRECATED_PREFIXES) and name.endswith(DEPRECATED_SUFFIXES)
 
@@ -211,10 +265,14 @@ def _violations_in(path: pathlib.Path):
             if module in ("megatron.core.parallel_state", "megatron.core.mpu"):
                 if _is_deprecated_accessor(accessor):
                     identity = f"accessor:parallel_state.{accessor}"
+                elif accessor in DEPRECATED_FUNCTIONS:
+                    identity = f"function:parallel_state.{accessor}"
             elif name == (
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
             ):
                 identity = "shim:use_mpu_process_groups"
+            elif name == "megatron.core.process_groups_config.resolve_process_groups":
+                identity = "guarded:resolve_process_groups"
             if identity:
                 scope = ".".join(self.scope) or "<module>"
                 self.hits.append((node.lineno, f"{scope}:{identity}"))
@@ -262,6 +320,30 @@ def _difference(left, right):
     return diff
 
 
+def _split_conversions(added, removed):
+    """Separate the guarded calls in ``added`` that replace a removed read of the same scope.
+
+    Returns ``(new, converted)``. ``converted`` holds guarded calls matched one for one with
+    removed accessor, function or shim reads in the same file and scope; ``new`` holds every
+    other call.
+    """
+    new, converted = {}, {}
+    for rel, hits in added.items():
+        replaceable = Counter(
+            scope
+            for scope, kind, _ in (hit.split(":", 2) for hit in removed.get(rel, []))
+            if kind != GUARDED
+        )
+        for hit in hits:
+            scope, kind, _ = hit.split(":", 2)
+            if kind == GUARDED and replaceable[scope]:
+                replaceable[scope] -= 1
+                converted.setdefault(rel, []).append(hit)
+            else:
+                new.setdefault(rel, []).append(hit)
+    return new, converted
+
+
 def main(argv=None) -> int:
     """Check the baseline, or refresh it only after verifying no new calls were introduced."""
     ap = argparse.ArgumentParser(description=__doc__)
@@ -277,19 +359,21 @@ def main(argv=None) -> int:
     total = sum(counts.values())
 
     if args.stats:
-        print(f"{total} global process-group read(s) across {len(found)} file(s) in megatron/core")
-        for kind, n in counts.most_common():
-            print(f"  {kind:10} {n}")
+        print(
+            f"{total} use(s) of global parallel_state across {len(found)} file(s) in megatron/core"
+        )
+        for kind in KINDS:
+            print(f"  {kind:10} {counts[kind]}")
         return 0
 
     allowed = _load_allowlist()
 
-    added = _difference(found, allowed)
     removed = _difference(allowed, found)
+    added, converted = _split_conversions(_difference(found, allowed), removed)
 
     if added:
         n = sum(len(v) for v in added.values())
-        print(f"ERROR: {n} new read(s) of global process-group state in megatron/core:\n")
+        print(f"ERROR: {n} new use(s) of global parallel_state in megatron/core:\n")
         for rel, hits in sorted(added.items()):
             # Show current source locations while keeping line numbers out of the baseline.
             for lineno, identity in _violations_in(REPO_ROOT / rel):
@@ -298,9 +382,22 @@ def main(argv=None) -> int:
         print(
             "\nmegatron/core must not read process groups from parallel_state. Accept a "
             "ProcessGroupCollection or an explicit torch.distributed.ProcessGroup from the "
-            "caller and pass it through.\n"
+            "caller and pass it through."
+        )
+        if any(hit.split(":", 2)[1] == "function" for hits in added.values() for hit in hits):
+            print(
+                "A 'function' use has a replacement of its own, which the function's "
+                "_deprecated_accessor decorator in parallel_state.py names: for example the "
+                "vp_stage of the model chunk, the virtual_pipeline_model_parallel_size of the "
+                "model's configuration, is_pp_first_stage() or is_vp_first_stage() and their "
+                "last-stage forms in megatron.core.pipeline_parallel.utils, or megatron.core.utils "
+                "for the memory buffer."
+            )
+        print(
             "Note that ProcessGroupCollection.use_mpu_process_groups() is NOT a valid "
             "replacement -- it reads the same global state.\n"
+            "resolve_process_groups() is counted too: it may only replace a read in the same "
+            "function, for callers that do not pass their groups yet.\n"
             "See https://github.com/NVIDIA/Megatron-LM/issues/6307\n"
         )
         return 1
@@ -310,7 +407,7 @@ def main(argv=None) -> int:
             json.dumps(
                 {
                     "_comment": (
-                        "Grandfathered reads of global process-group state in megatron/core. "
+                        "Grandfathered uses of global parallel_state in megatron/core. "
                         "Entries are scope:kind:detail; duplicates count separate calls. "
                         "This list must only shrink. Remove stale entries with "
                         "`python tools/check_process_group_usage.py --update`."
@@ -339,9 +436,18 @@ def main(argv=None) -> int:
         for rel, hits in sorted(removed.items()):
             for h in hits:
                 print(f"  {rel}  {h}")
+        if converted:
+            n = sum(len(v) for v in converted.values())
+            print(f"\n{n} of them became guarded fallback(s), which --update records:\n")
+            for rel, hits in sorted(converted.items()):
+                for h in hits:
+                    print(f"  {rel}  {h}")
         return 1
 
-    print(f"OK: no new global process-group reads ({total} grandfathered).")
+    print(
+        f"OK: no new uses of global parallel_state ({total} grandfathered, "
+        f"{counts[GUARDED]} of them guarded)."
+    )
     return 0
 
 
