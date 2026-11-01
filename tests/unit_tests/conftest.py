@@ -14,6 +14,8 @@ from tests.test_utils.python_scripts.download_unit_tests_dataset import download
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import (
     Utils,
+    build_test_pg_collection,
+    destroy_test_pg_collection,
     reset_transient_process_state,
     restore_process_state,
     snapshot_process_state,
@@ -89,6 +91,19 @@ def run_config(monkeypatch):
     )
     global_vars.set_run_config(container)
     return container
+
+
+@pytest.fixture
+def grid_pg_collection(request):
+    """A collection from build_test_pg_collection, destroyed after the test.
+
+    Pass the builder's keyword arguments by indirect parametrization, for example
+    `@pytest.mark.parametrize("grid_pg_collection", [{"tp": 2, "pp": 2}], indirect=True)`.
+    """
+    Utils.initialize_distributed()
+    pg_collection = build_test_pg_collection(**getattr(request, "param", {}))
+    yield pg_collection
+    destroy_test_pg_collection(pg_collection)
 
 
 def pytest_sessionfinish(session, exitstatus):

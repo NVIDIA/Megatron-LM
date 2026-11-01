@@ -263,6 +263,9 @@ class ViTModel(MegatronModule):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        # The encoder's own weights outside the decoder are replicated across the decoder's
+        # tensor-parallel group, which sets their checkpoint replica ids.
+        self.tp_group = self.decoder.tp_group
 
         # Optional Pixtral-Large-style 2×2 patch merger after the transformer stack.
         # Keeps output width at hidden_size; sequence length shrinks by merge_size**2.
@@ -618,6 +621,9 @@ class QwenVLViTModel(MegatronModule):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        # The encoder's own weights outside the decoder are replicated across the decoder's
+        # tensor-parallel group, which sets their checkpoint replica ids.
+        self.tp_group = self.decoder.tp_group
 
         # Patch merger
         self.merger = QwenPatchMerger(hidden_size, spatial_merge_size, out_hidden_size)
@@ -915,6 +921,9 @@ class KimiViTModel(MegatronModule):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        # The encoder's own weights outside the decoder are replicated across the decoder's
+        # tensor-parallel group, which sets their checkpoint replica ids.
+        self.tp_group = self.decoder.tp_group
 
         # Final layer norm (Kimi has a post-transformer norm)
         self.final_ln = _NORM_IMPL(
