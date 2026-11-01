@@ -235,6 +235,56 @@ def test_config_validation():
         )
 
 
+def _ep_invariant_moe_config(**overrides):
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        moe_router_dtype="fp32",
+        moe_token_dispatcher_type="alltoall",
+        moe_ep_invariant_combine=True,
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_config_rejects_expert_tensor_parallel_inference():
+    """Inference's tp_ep partials must be whole expert subtrees; ETP splits experts."""
+    inference = dict(
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        inference_grouped_gemm_backend="torch",
+        inference_moe_token_dispatcher_type="nvls",
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        HAVE_DEEPGEMM_BF16,
+    )
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size=1"):
+        _ep_invariant_moe_config(expert_tensor_parallel_size=2, **inference)
+    if not HAVE_DEEPGEMM_BF16:
+        pytest.skip("Building a batch-invariant MoE config requires DeepGEMM bf16 kernels.")
+    _ep_invariant_moe_config(expert_tensor_parallel_size=1, **inference)
+    # Training reduces each expert row over expert TP before the tree, so it stays allowed.
+    _ep_invariant_moe_config(
+        expert_tensor_parallel_size=2, tensor_model_parallel_size=2, sequence_parallel=True
+    )
+
+
 class TestEPInvariantCollectives:
     """Real EP collectives at EP = world size vs the EP-1 result on one rank."""
 

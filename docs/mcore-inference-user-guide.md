@@ -172,7 +172,8 @@ workload rather than generalizing from any single comparison.
 > expert outputs over one fixed fp32 tree over the expert ids, so MoE outputs are
 > bitwise identical at every power-of-two EP that divides `num_moe_experts`. It covers
 > the training AllToAll dispatcher and the inference `nvls` dispatcher with the `torch`
-> grouped-GEMM backend, and moves no more data than the default combine.
+> grouped-GEMM backend and `expert_tensor_parallel_size=1`, and moves no more data than
+> the default combine.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
