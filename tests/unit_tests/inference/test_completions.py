@@ -233,8 +233,8 @@ _INVALID_PROMPT_FORMAT = (
             "Error tokenizing prompt: cannot tokenize 'hello'",
             id="tokenizer-error",
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # Sampling conversion failures are client errors, regardless of whether
+        # Python reports a bad value or an incompatible type.
         pytest.param(
             {"prompt": "hello", "temperature": "hot"},
             {},
@@ -256,9 +256,15 @@ _INVALID_PROMPT_FORMAT = (
             "Invalid sampling parameter: invalid literal for int() with base 10: 'lots'",
             id="max-tokens-not-an-int",
         ),
-        pytest.param({"prompt": "hello", "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param(
+            {"prompt": "hello", "top_k": [1]},
+            {},
+            400,
+            "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real number, not 'list'",
+            id="top-k-list",
+        ),
         # Sampling fields are read with a plain .get(), so an explicit null reaches the
-        # float()/int() conversion and escapes as a 500 (chat treats null as "use the default").
+        # float()/int() conversion and is rejected as a client error.
         pytest.param(
             {
                 "prompt": "hello",
@@ -269,7 +275,7 @@ _INVALID_PROMPT_FORMAT = (
                 "streaming_interval": None,
             },
             {},
-            500,
+            400,
             None,
             id="null-sampling-fields",
         ),

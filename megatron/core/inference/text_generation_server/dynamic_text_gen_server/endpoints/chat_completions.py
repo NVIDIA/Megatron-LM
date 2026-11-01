@@ -894,6 +894,8 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        if not isinstance(req, dict):
+            return Response("Invalid or missing JSON body", status=400)
         offload_params = req.get("offload_params")
         offload_params_error = validate_offload_params(offload_params)
         if offload_params_error is not None:
@@ -1145,6 +1147,8 @@ try:
                 tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
             )
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
+            if n < 1:
+                return Response("'n' must be at least 1", status=400)
 
             if temperature == 0.0:
                 top_k = 1
@@ -1216,7 +1220,7 @@ try:
                 # coordinator matters because that is one process shared by all DP ranks.
                 detokenize_generations=False,
             )
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
@@ -1226,7 +1230,11 @@ try:
         # requests on the engine that owns the cached vision embedding.
         prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
+        stream_options = req.get("stream_options")
+        if stream_requested and stream_options is not None and not isinstance(stream_options, dict):
+            return Response("'stream_options' must be an object", status=400)
         if stream_requested:
+            include_usage = bool((stream_options or {}).get("include_usage", False))
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
@@ -1280,7 +1288,6 @@ try:
                     )
                     for _ in range(n)
                 ]
-            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
                     streams,

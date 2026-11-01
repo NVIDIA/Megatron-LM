@@ -902,3 +902,31 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
         else []
     )
     assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_malformed_stream_options_is_rejected_before_submission(path, monkeypatch):
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path, json={**BODIES[path], "stream": True, "stream_options": ["include_usage"]}
+    )
+
+    assert response.status_code == 400
+    assert client.prompt_tokens == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_non_object_json_body_is_rejected_before_submission(path, monkeypatch):
+    """A JSON array is not a request object; reject it instead of failing with a 500."""
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(path, json=["not", "an", "object"])
+
+    assert response.status_code == 400
+    assert "Invalid or missing JSON body" in (await response.get_data(as_text=True))
+    assert client.prompt_tokens == []
