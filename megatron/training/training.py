@@ -1770,11 +1770,7 @@ def pretrain(
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
         skip_random_seed=skip_random_seed,
-        seed_pp_group=getattr(pg_collection, "pp", None),
-        seed_dp_group=getattr(pg_collection, "dp", None),
-        seed_tp_group=getattr(pg_collection, "tp", None),
-        seed_ep_group=getattr(pg_collection, "ep", None),
-        seed_etp_group=getattr(pg_collection, "expt_tp", None),
+        seed_pg_collection=None if skip_random_seed else pg_collection,
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -2936,9 +2932,17 @@ def setup_model_and_optimizer(
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=False, owner="setup_model_and_optimizer"
+                )
+            )
         if getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(
+                    pg_collection, is_expert=True, owner="setup_model_and_optimizer"
+                )
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)

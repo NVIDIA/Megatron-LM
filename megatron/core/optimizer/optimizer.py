@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -47,6 +47,13 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
+from ..process_groups_config import (
+    _FALLBACK_WARNING_SKIP_PREFIXES,
+    ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -184,6 +191,81 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+def set_duplicate_filter_groups(optimizer, pg_collection: ProcessGroupCollection) -> None:
+    """Set the groups over which ``optimizer`` counts a replicated gradient once.
+
+    Gradient norms and zero counts include a parameter replicated along the tensor-parallel or
+    GTP axis on one rank of that axis only. The groups come from ``pg_collection``, and a field
+    set to ``None`` marks an axis that is off, so no parameter is replicated along it.
+    ``expt_tp`` defaults to ``tp`` when the collection does not set it. An unset ``gtp_remat``
+    or ``expt_gtp_remat`` resolves as the model's layers resolve it
+    (``resolve_gtp_remat_group``), so the filter matches how the weights were sharded.
+
+    An optimizer whose groups are not set this way filters duplicates by the global grid.
+
+    Args:
+        optimizer: The optimizer, or a child optimizer that runs the filters itself.
+        pg_collection: The collection of the model whose parameters ``optimizer`` updates.
+
+    Raises:
+        ValueError: If ``pg_collection`` does not set ``tp``.
+    """
+    groups = vars(pg_collection)
+    if 'tp' not in groups:
+        raise ValueError(
+            "pg_collection must set tp, the tensor-parallel group of the optimizer's "
+            "parameters; set it to None only if tensor parallelism is off"
+        )
+    optimizer.tp_group = groups['tp']
+    optimizer.expert_tp_group = groups.get('expt_tp', optimizer.tp_group)
+    optimizer.gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=False, owner="get_megatron_optimizer"
+    )
+    optimizer.expert_gtp_group = resolve_gtp_remat_group(
+        pg_collection, is_expert=True, owner="get_megatron_optimizer"
+    )
+    optimizer.duplicate_filter_groups_from_collection = True
+
+
+# Releases in which the grad-stats group fallbacks started to warn and are removed.
+_GRAD_STATS_FALLBACK_DEPRECATED_IN = "0.21"
+_GRAD_STATS_FALLBACK_REMOVED_IN = "0.23"
+
+# Owners that have warned, in this process, that they reduce gradient statistics over WORLD.
+_warned_world_grad_stats_owners: Set[str] = set()
+
+
+def _warn_grad_stats_reduced_over_world(owner: str) -> None:
+    """Warn, once per ``owner``, that its gradient statistics are reduced over WORLD.
+
+    ``torch.distributed`` reads a ``None`` group as the default (WORLD) group. WORLD holds the
+    intended ranks only when they are every rank in the job, as for one model with one
+    distributed-optimizer instance. Otherwise the gradient norm and zero count include gradients
+    replicated across optimizer instances or data-parallel ranks, or mix in other models, and
+    ranks that run no optimizer step leave the reduction waiting.
+
+    As with ``warn_global_process_group_fallback``, the category is
+    ``ProcessGroupFallbackWarning``, and a warning that a filter turns into an error is not
+    recorded, so under an ``error`` filter every fallback raises.
+
+    Args:
+        owner: Name of the optimizer class whose grad-stats group is ``None``.
+    """
+    if owner in _warned_world_grad_stats_owners:
+        return
+    warnings.warn(
+        f"{owner} has no grad_stats_parallel_group, so it reduces the gradient norm, the zero "
+        "count and the found-inf flag over the default (WORLD) process group. This fallback is "
+        f"deprecated since Megatron Core {_GRAD_STATS_FALLBACK_DEPRECATED_IN} and will be "
+        f"removed in {_GRAD_STATS_FALLBACK_REMOVED_IN}; set the group explicitly, for example "
+        "to pg_collection.intra_dist_opt for a distributed optimizer or to pg_collection.mp for "
+        "a non-distributed one.",
+        ProcessGroupFallbackWarning,
+        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+    )
+    _warned_world_grad_stats_owners.add(owner)
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -273,6 +355,7 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
+        use_global_fallback = not getattr(self, 'duplicate_filter_groups_from_collection', False)
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
@@ -300,11 +383,13 @@ class MegatronOptimizer(ABC):
                 param,
                 tp_group=getattr(self, 'tp_group', None),
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(
                 param,
                 gtp_group=getattr(self, 'gtp_group', None),
                 expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+                use_global_fallback=use_global_fallback,
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
@@ -352,12 +437,18 @@ class MegatronOptimizer(ABC):
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
-    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+    def get_grad_stats_parallel_group(self) -> Optional[torch.distributed.ProcessGroup]:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
         The two most common cases are:
         - Non-distributed optimizer (default): Return the model-parallel group.
-        - Distributed optimizer (overridden in distrib_optimizer.py): Return the entire world.
+        - Distributed optimizer (overridden in distrib_optimizer.py): Return the ranks of one
+          distributed-optimizer instance.
+
+        ``get_megatron_optimizer`` sets ``grad_stats_parallel_group``. An optimizer built without
+        it falls back to the global model-parallel group, and one whose group is ``None``
+        reduces over the default (WORLD) group. Both fallbacks are deprecated and emit a
+        ``ProcessGroupFallbackWarning``.
         """
         if hasattr(self, 'model_parallel_group'):
             warnings.warn(
@@ -367,9 +458,16 @@ class MegatronOptimizer(ABC):
             )
             self.grad_stats_parallel_group = self.model_parallel_group
             delattr(self, "model_parallel_group")
-            return self.grad_stats_parallel_group
         if hasattr(self, 'grad_stats_parallel_group'):
+            if self.grad_stats_parallel_group is None:
+                _warn_grad_stats_reduced_over_world(type(self).__name__)
             return self.grad_stats_parallel_group
+        warn_global_process_group_fallback(
+            type(self).__name__,
+            "grad_stats_parallel_group",
+            deprecated_in=_GRAD_STATS_FALLBACK_DEPRECATED_IN,
+            removed_in=_GRAD_STATS_FALLBACK_REMOVED_IN,
+        )
         return parallel_state.get_model_parallel_group()
 
     @abstractmethod
@@ -470,6 +568,7 @@ class MegatronOptimizer(ABC):
             expert_tp_group=getattr(self, 'expert_tp_group', None),
             gtp_group=getattr(self, 'gtp_group', None),
             expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+            use_global_fallback=not getattr(self, 'duplicate_filter_groups_from_collection', False),
         )
 
     @abstractmethod
@@ -1967,6 +2066,9 @@ class ChainedOptimizer(MegatronOptimizer):
                 expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
                 gtp_group=getattr(self.chained_optimizers[0], 'gtp_group', None),
                 expert_gtp_group=getattr(self.chained_optimizers[0], 'expert_gtp_group', None),
+                use_global_fallback=not getattr(
+                    self.chained_optimizers[0], 'duplicate_filter_groups_from_collection', False
+                ),
             )
         else:
             num_zeros_in_grad = 0
