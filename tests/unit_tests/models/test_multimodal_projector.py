@@ -9,10 +9,16 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.amax_reduction_group_utils import (
+    forbid_global_amax_group,
+    record_amax_groups,
+    with_copied_amax_groups,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -67,6 +73,29 @@ class TestMultimodalProjector:
         assert len(logits) == 2
         assert logits.shape == torch.Size([2, 64])
 
+    def test_fp8_context_uses_the_projector_collection(self):
+        pg_collection = with_copied_amax_groups(ProcessGroupCollection.use_mpu_process_groups())
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+        )
+        projector = MultimodalProjector(
+            config=config,
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=None),
+            projector_type="affine",
+            input_size=64,
+            pg_collection=pg_collection,
+        ).cuda()
+
+        with forbid_global_amax_group(), record_amax_groups() as groups:
+            projector(torch.randn(32, 64, device="cuda"))
+
+        assert len(groups) == 1 and groups[0] is pg_collection.tp_dp_cp
+
     def test_save_load(self, tmp_path):
         path = tmp_path / "mlp.pt"
         torch.save(self.mlp.state_dict(), path)
@@ -87,10 +116,11 @@ class TestMultimodalProjector:
         projector = MultimodalProjector.__new__(MultimodalProjector)
         torch.nn.Module.__init__(projector)
         projector.config = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", gtp_weight_remat_size=2)
+        projector.pg_collection = None
         projector.encoder = RecordingEncoder()
         monkeypatch.setattr(
             "megatron.core.models.vision.multimodal_projector.get_fp8_context",
-            lambda config: nullcontext(),
+            lambda config, pg_collection: nullcontext(),
         )
         monkeypatch.setattr(
             "megatron.core.models.vision.multimodal_projector.get_fp8_align_size", lambda recipe: 32

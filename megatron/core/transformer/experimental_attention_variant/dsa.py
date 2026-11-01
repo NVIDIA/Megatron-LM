@@ -2166,6 +2166,7 @@ class DSAIndexer(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                pg_collection=self.pg_collection,
             )
             self.linear_wk = build_module(
                 submodules.linear_wk,
@@ -2177,6 +2178,7 @@ class DSAIndexer(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                pg_collection=self.pg_collection,
             )
 
         k_norm_config = copy.copy(self.config)
@@ -2206,6 +2208,7 @@ class DSAIndexer(MegatronModule):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
+                pg_collection=self.pg_collection,
             )
         self._weights_proj_te_gemm_supported: Optional[bool] = None
 
