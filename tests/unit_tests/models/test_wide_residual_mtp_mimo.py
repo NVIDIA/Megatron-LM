@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
