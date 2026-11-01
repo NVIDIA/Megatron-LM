@@ -3075,14 +3075,8 @@ def setup_model_and_optimizer(
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and cfg.dist.use_torch_fsdp2
                 and args.ckpt_format == "torch_dist",
-                tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
-                pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-                # Replica_id must match the save path (see save_checkpoint_and_time): use the
-                # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
-                dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
-                dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
-                expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                pg_collection=ckpt_pgc,
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
@@ -4334,18 +4328,9 @@ def save_checkpoint_and_time(
         timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
         timers(timer_key, log_level=0).start(barrier=False)
 
-        # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-        # falls back to the mpu groups inside save_checkpoint (byte-identical).
+        # Checkpointing runs on the process groups of the model it saves.
         ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-        tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-        pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
-        dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
-        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
-        # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
-        dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
-        expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
+        dp_gtp_remat_group = ckpt_pgc.dp_gtp_remat if ckpt_pgc is not None else None
         # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
         rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
 
@@ -4369,15 +4354,9 @@ def save_checkpoint_and_time(
                 non_persistent_ckpt=non_persistent_ckpt,
                 train_data_iterator=train_data_iterator,
                 preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                tp_group=tp_group,
-                pp_group=pp_group,
-                dp_cp_group=dp_cp_group,
-                dp_group=dp_group,
-                dp_gtp_remat_group=dp_gtp_remat_group,
-                expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
-                cp_group=cp_group,
                 on_saved=on_saved,
+                pg_collection=ckpt_pgc,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
