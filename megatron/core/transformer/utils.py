@@ -604,6 +604,24 @@ def is_layer_window_attention(
     )
 
 
+def use_te_checkpoint(config: 'TransformerConfig') -> bool:
+    """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
+
+    TE's checkpoint is required under FP8/FP4: ``tensor_parallel.checkpoint`` recomputes outside
+    the quantization autocast (FP4 is also implemented with TE's ``fp8_autocast``, see
+    ``fp4_utils.get_fp4_context``), so a TE module in the region would recompute in BF16 or
+    dequantize FP8 parameters and lose their ``main_grad``, whereas TE's checkpoint re-enters the
+    recorded quantization state. It is also used for every precision under chunk-wise Transformer
+    Engine CUDA graphs (``cuda_graph_impl == "chunk_wise"``): the captured block contains the
+    checkpointed forward and its recompute as one unit, whereas ``tensor_parallel.checkpoint``
+    runs the function without a checkpoint node while a graph is warmed up or captured, which
+    would keep every activation of the block alive inside the graph.
+    """
+    if config.fp8 or config.fp4:
+        return True
+    return getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+
+
 def precision_aware_checkpoint(
     function: Callable[..., Any],
     config: 'TransformerConfig',
@@ -616,12 +634,14 @@ def precision_aware_checkpoint(
     """Activation-checkpoint ``function`` with the implementation its precision requires.
 
     FP8 and FP4 recompute must go through Transformer Engine's checkpoint, because FP4 is
-    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). Other
-    precisions use ``tensor_parallel.checkpoint``.
+    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``); so does
+    every precision inside chunk-wise CUDA graphs (see ``use_te_checkpoint``). Other
+    configurations use ``tensor_parallel.checkpoint``.
 
     Args:
         function: Callable to checkpoint.
-        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        config: Transformer config whose ``fp8``, ``fp4`` and ``cuda_graph_impl`` fields select
+            the implementation.
         tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
         *args: Positional arguments for ``function``.
         distribute_saved_activations: Passed through to the checkpoint implementation.
@@ -630,7 +650,7 @@ def precision_aware_checkpoint(
     Returns:
         The output of ``function``.
     """
-    if config.fp8 or config.fp4:
+    if use_te_checkpoint(config):
         # Imported lazily to avoid a circular import.
         from megatron.core.extensions.transformer_engine import te_checkpoint
 

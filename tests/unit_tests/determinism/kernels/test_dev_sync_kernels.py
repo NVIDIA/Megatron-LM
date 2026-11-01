@@ -98,6 +98,60 @@ def test_mtp_packed_cp1_roll_replays():
     assert_replays_bit_exact(roll, (value,), contention=True, what="MTP packed CP1 roll")
 
 
+def test_mtp_packed_cp1_roll_replays_in_a_cuda_graph_across_packings():
+    """Chunk CUDA graphs capture the packed roll with static ``cu_seqlens`` buffers whose values
+    change per replay (repeated final boundaries pad the entry count). The roll plan therefore
+    keeps empty slots instead of compacting them with a data-dependent boolean index, and the
+    captured graph must reproduce the eager roll of every packing that fits the static slots."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+    capacity, slots = 8, 4
+
+    def cu_seqlens(seqlens):
+        boundaries = [0]
+        for length in seqlens:
+            boundaries.append(boundaries[-1] + length)
+        # A dummy tail sequence pads the tokens to the capacity; the final boundary repeats so
+        # the metadata always has ``slots + 1`` entries (static THD padding).
+        if boundaries[-1] < capacity:
+            boundaries.append(capacity)
+        boundaries += [capacity] * (slots + 1 - len(boundaries))
+        return torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+
+    def roll(x, cu):
+        packed = PackedSeqParams(
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            qkv_format="thd",
+        )
+        return roll_tensor(x, packed_seq_params=packed, return_sum=False)[0]
+
+    packings = ([3, 2], [4, 3], [8], [1, 1, 1])
+    value = torch.arange(1, capacity + 1, dtype=torch.float32, device="cuda")
+    references = [roll(value, cu_seqlens(seqlens)) for seqlens in packings]
+    assert torch.equal(references[0], value.new_tensor([2, 3, 0, 5, 0, 7, 8, 0]))
+
+    static_x = value.clone()
+    static_cu = cu_seqlens(packings[0]).clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            roll(static_x, static_cu)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = roll(static_x, static_cu)
+    for seqlens, reference in zip(packings, references):
+        static_cu.copy_(cu_seqlens(seqlens))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_out, reference), seqlens
+
+
 def test_mtp_prefix_replays():
     """Include an exact-zero acceptance in the fused prefix-product backward."""
     from megatron.core.fusions.fused_mtp_prefix import (
