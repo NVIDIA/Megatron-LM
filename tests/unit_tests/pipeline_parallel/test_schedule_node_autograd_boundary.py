@@ -152,3 +152,58 @@ def test_backward_ignores_non_differentiable_outputs():
     )
     assert torch.equal(input_grad, torch.full_like(input_tensor, 3.0))
     assert torch.equal(weight.grad, torch.full_like(weight, 6.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ScheduleNode requires CUDA")
+@pytest.mark.parametrize("free_input", [False, True])
+def test_input_storage_survives_cross_stream_backward(monkeypatch, free_input):
+    """Input storage stays live until its consumer's backward kernels finish."""
+    torch.cuda.synchronize()
+    producer = torch.cuda.Stream()
+    consumer = torch.cuda.Stream()
+    event = torch.cuda.Event()
+    size = 1024
+    with torch.cuda.stream(consumer):
+        weight = torch.ones((size, size), device="cuda", requires_grad=True)
+        # Initialize cuBLAS before delaying the asynchronous backward below.
+        warmup = torch.ones_like(weight, requires_grad=True)
+        (warmup @ weight).backward(torch.ones_like(weight))
+        weight.grad = None
+        del warmup
+    torch.cuda.synchronize()
+    with torch.cuda.stream(producer):
+        input_tensor = torch.ones_like(weight, requires_grad=True)
+        input_pointer = input_tensor.data_ptr()
+        event.record()
+
+    recorded_consumer = False
+    original_record_stream = torch.Tensor.record_stream
+
+    def record_stream(tensor, stream):
+        nonlocal recorded_consumer
+        # Retain metadata only: saving the tensor here would conceal premature frees.
+        if tensor.data_ptr() == input_pointer and stream == consumer:
+            recorded_consumer = True
+        return original_record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+    node = ScheduleNode(
+        lambda tensor: tensor @ weight, stream=consumer, event=event, free_input=free_input
+    )
+    output = node.forward(input_tensor)
+    # Check the lifetime contract independently of allocator reuse and GPU timing.
+    assert recorded_consumer
+    with torch.cuda.stream(consumer):
+        output_grad = torch.ones_like(output)
+    del output, input_tensor
+    with torch.cuda.stream(consumer):
+        torch.cuda._sleep(200_000_000)
+    input_grad = node.backward(output_grad)
+    with torch.cuda.stream(producer):
+        # Reuse pressure on the allocating stream must not overwrite backward inputs.
+        replacements = [torch.empty_like(weight) for _ in range(16)]
+        for replacement in replacements:
+            replacement.fill_(float("nan"))
+    torch.cuda.synchronize()
+    assert torch.equal(weight.grad, torch.full_like(weight, size))
+    assert torch.equal(input_grad, torch.full_like(input_grad, size))
