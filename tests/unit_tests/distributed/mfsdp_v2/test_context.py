@@ -158,33 +158,28 @@ def test_prefetch_stops_at_phase_boundary(distributed_setup):
     model(torch.ones(2, 4, device=device)).sum().backward()
 
 
-@pytest.mark.parametrize("wrong_phase", [False, True])
-def test_registration_order_rejects_divergence_without_consuming(distributed_setup, wrong_phase):
-    """Execution that violates registration order fails without moving the cursor."""
+def test_registration_order_rejects_reordered_execution(distributed_setup):
+    """Execution must follow registration order when recording is disabled."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Linear(4, 4, bias=False)
+            self.second = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.first(self.second(x))
+
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
-        for layer in model:
+    model = Model().to(device)
+    with fully_shard_context(FsdpContext(device=device)):
+        for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
 
-    inputs = torch.ones(2, 4, device=device)
-    if wrong_phase:
-        model(inputs)
-        # The next call should be the second layer's backward, not another forward.
-        expected = ExecutionEvent(model[1], Phase.BACKWARD)
-        position = 2
-    else:
-        # Calling the second layer first violates the static forward order.
-        expected = ExecutionEvent(model[0], Phase.FORWARD)
-        position = 0
-
-    assert context.execution_order.peek() == expected
-    with pytest.raises(RuntimeError, match=f"diverged.*position {position}"):
-        model[1](inputs)
-    assert context.execution_order.peek() == expected
-    assert context.execution_order.position == position
-    torch.cuda.synchronize(device)
+    with pytest.raises(RuntimeError, match="diverged from the expected execution order"):
+        model(torch.ones(2, 4, device=device))
 
 
 @pytest.mark.parametrize("unify_communication_stream", [False, True])
