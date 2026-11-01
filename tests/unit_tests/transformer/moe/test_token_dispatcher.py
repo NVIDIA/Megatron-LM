@@ -26,7 +26,11 @@ from megatron.core.transformer.moe.fused_a2a import (
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
+from megatron.core.transformer.moe.moe_utils import (
+    get_align_size_for_quantization,
+    get_capacity,
+    pad_routing_map,
+)
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
@@ -772,6 +776,55 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def test_hybridep_static_budget_without_setup_metadata(monkeypatch):
+    """CUDA graph replay of moe_preprocess skips setup_metadata's Python side effects, and the
+    previous combine cleared the budget. Dispatch must rebuild the static budget itself;
+    without it HybridEP takes its dynamic path, which synchronizes the host every dispatch."""
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_router_topk=6,
+        moe_use_grouped_tensor=True,
+        use_transformer_engine_op_fuser=False,
+        moe_flex_dispatcher_num_sms=32,
+        moe_hybridep_num_blocks_permute=None,
+        moe_hybridep_num_blocks_unpermute=None,
+        moe_permute_fusion_into_hybridep=False,
+        moe_hybridep_num_sms_preprocessing=None,
+    )
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.moe_expert_rank_capacity_factor = 1.5
+    manager.drop_and_pad = False
+    manager.over_budget = torch.zeros(1, dtype=torch.bool)
+    manager.handle = None
+    manager.num_permuted_tokens = None
+    manager._original_num_tokens = None
+    manager._padded_num_tokens = None
+
+    budgets = []
+
+    def fake_dispatch(x, num_permuted_tokens, **kwargs):
+        budgets.append(num_permuted_tokens)
+        handle = (torch.zeros(1, dtype=torch.int32),)
+        return x, None, None, torch.zeros(manager.num_local_experts, dtype=torch.int64), handle
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", fake_dispatch)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_combine", lambda x, **kwargs: x)
+
+    for _ in range(2):  # The first combine clears the budget; the second dispatch rebuilds it.
+        # Graph replay of moe_preprocess restores only the tensor attributes in cudagraph_attrs.
+        manager.routing_map = None
+        manager.topk_idx = torch.zeros((100, 6), dtype=torch.int16)
+        manager.token_probs = torch.zeros((100, 4), dtype=torch.float32)
+        manager.combine(manager.dispatch(torch.zeros((100, 16))))
+
+    align = get_align_size_for_quantization(manager.config)
+    expected = int(100 * 6 * 1.5)
+    expected += -expected % align
+    assert budgets == [expected, expected]
 
 
 def _ncclep_manager_stub(**config_overrides):
