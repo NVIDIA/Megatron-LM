@@ -1,0 +1,82 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  --num-layers: 4
+  --hidden-size: 256
+  --ffn-hidden-size: 512
+  --num-attention-heads: 4
+  --linear-key-head-dim: 32
+  --linear-value-head-dim: 32
+  --linear-num-key-heads: 4
+  --linear-num-value-heads: 4
+  --hybrid-layer-pattern: '*E*E/*E/*E'
+  --spec: '[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]'
+  --enable-mhc-connections: true
+  --mhc-num-residual-streams: 2
+  --mtp-num-layers: 2
+  --mtp-loss-scaling-factor: 0.1
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+  --sequence-parallel: true
+  --micro-batch-size: 1
+  --global-batch-size: 16
+  --seq-length: 128
+  --max-position-embeddings: 128
+  --train-iters: 20
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 256
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  --distributed-backend: nccl
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --min-lr: 1.0e-05
+  --lr-warmup-iters: 2
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --hidden-dropout: 0.0
+  --attention-dropout: 0.0
+  --normalization: RMSNorm
+  --position-embedding-type: rope
+  --transformer-impl: transformer_engine
+  --bf16: true
+  --deterministic-mode: true
+  --use-distributed-optimizer: true
+  --no-gradient-accumulation-fusion: true
+  --untie-embeddings-and-output-weights: true
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-interval: 1
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 10000
+  --eval-interval: 1000
+  --eval-iters: 2
+  --ckpt-format: torch_dist
+  --cuda-graph-warmup-steps: 3
+  --use-fused-mhc: true
+  --te-rng-tracker: true
+  --cuda-graph-impl: transformer_engine
+  --cuda-graph-modules: '[attn moe_router moe_preprocess]'
+  --num-experts: 4
+  --moe-router-topk: 2
+  --moe-grouped-gemm: true
+  --moe-token-dispatcher-type: alltoall
+  --moe-router-load-balancing-type: none
+  --expert-model-parallel-size: 2
+  --expert-tensor-parallel-size: 2
+  --disable-bias-linear: true
+TEST_TYPE: regular
+METRICS:
+- lm loss
+- mtp_1 loss
+- mtp_2 loss
+LAUNCHER: ft_launcher

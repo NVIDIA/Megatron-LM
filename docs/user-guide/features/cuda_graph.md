@@ -99,6 +99,19 @@ wired into custom training loops. The trade-off is that it requires more manual 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
 
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP also requires `--cuda-graph-dynamic-microbatches`, which
+keeps graph inputs alive until their corresponding backward even when packing
+reduces the number of microbatches. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. GDN layers stay eager with these batches
+because they read the packed sequence offsets on the host. For mHC models, scheduler-packed THD
+graphs additionally require the mHC attention graph split described under mHC
+training.
+
 ### Usage
 
 ```bash
@@ -148,6 +161,114 @@ This implementation does not create inference CUDA graphs. For inference, use
 ---
 
 ## Common Configuration Examples
+
+### mHC training
+
+`--enable-mhc-connections` supports Transformer Engine training graphs and
+full-iteration graphs with fixed sequence lengths and microbatch shapes. The
+existing mHC parameter names, checkpoint keys, fused-kernel selection, and
+residual-stream contraction are shared with eager training.
+
+For `HybridModel`, the graph boundary is the mHC wrapper. Capture includes its
+stream aggregation and mixing, and static inputs have width
+`hidden_size * mhc_num_residual_streams`. Hybrid MTP stacks participate in TE
+capture through their individual wrapped layers. A custom GPT layer specification
+using `HyperConnectionTransformerLayer` follows the same TE protocol.
+
+| Training path | mHC capture coverage |
+|---|---|
+| TE, dense Hybrid layers | Attention, dense MLP, GDN, and Mamba, selected by the applicable module scopes |
+| TE, MoE | Router and optional preprocessing; expert dispatch and computation continue eagerly |
+| Full iteration | Forward, backward, and gradient synchronization; optimizer steps remain outside the graph |
+
+For a Hybrid attention/MoE model, including a Hybrid MTP pattern, use:
+
+```bash
+--enable-mhc-connections \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn moe_router moe_preprocess
+```
+
+The partial MoE graph returns the mHC residual and mixing tensors alongside the
+router tensors. This preserves the backward path from the eager expert output
+through the captured mHC prefix. Whole-layer and whole-MoE TE capture are not
+supported for mHC MoE models. Hybrid partial MoE capture requires separate attention and
+MoE layers, as provided by the standard Hybrid layer specs. TE graphs require independent
+MTP depths (`mtp_use_repeated_layer=False`); this restriction is specific to TE graphs.
+Except under the attention graph split described below, TE mHC capture/replay also
+requires `padding_mask=None`: the mHC graph boundaries do not yet carry the MoE token
+padding mask into a captured router. The split captures no router, and its eager MLP
+receives the padding mask.
+
+Full-iteration MoE capture requires fixed-capacity, padded expert inputs. The
+eager reference must use the same capacity and padding settings, since capacity
+changes can change token routing:
+
+```bash
+--enable-mhc-connections \
+--cuda-graph-impl full_iteration \
+--moe-token-dispatcher-type alltoall \
+--moe-expert-capacity-factor 1.0 \
+--moe-pad-expert-input-to-capacity
+```
+
+Selective mHC recompute releases the outputs of the mHC aggregate and
+bias-dropout-add after the forward pass and rebuilds them eagerly in the backward
+pass. The graph modes above capture those operations, so they reject selective mHC
+recompute. To combine it with Transformer Engine graphs, capture only the input
+layernorm and self-attention of each mHC attention sublayer:
+
+```bash
+--enable-mhc-connections \
+--recompute-granularity selective \
+--recompute-modules mhc \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn \
+--mhc-recompute-attn-cuda-graph-split
+```
+
+Each mHC attention sublayer computes its aggregate eagerly, replays its graph, and
+applies its mHC bias-dropout-add eagerly. TE copies the aggregate into the graph's
+static input and keeps that copy for the captured backward, so the aggregate is not
+checkpointed and no checkpoint output shares memory with the graph. The bias-dropout-add
+and the MLP sublayer are recomputed as in eager training; `mla_up_proj` may also be
+recomputed. The split applies to GPT layers built from `HyperConnectionTransformerLayer`
+and to Hybrid wrappers around attention or GDN mixers. Hybrid MLP, MoE, and Mamba
+wrappers run eagerly. Under a graph-safe RNG tracker, which CUDA graphs use, a rebuilt
+checkpoint restores copies of the forward generator states, so a recomputed
+bias-dropout-add applies its forward dropout mask.
+
+The split also accepts scheduler-packed THD batches with the packing options described
+above: its attention graph takes the fixed-capacity sequence offsets, while the eager
+mHC operations and MLP receive the batch's packed metadata. GDN wrappers then run
+eagerly, as for any GDN layer with these batches.
+
+Activation offloading and expert-parallel communication overlap are rejected for
+these mHC graph modes. Packed THD input outside the attention graph split,
+dynamic context parallelism, and inference capture are outside this training
+support. The existing pipeline-parallel and MTP placement requirements still
+apply. Nonzero dropout requires the graph-safe RNG implementation used by the
+selected backend; it is not subject to a blanket mHC dropout restriction.
+
+When combined with PP/VPP support, full-iteration dropout can expose a native
+allocator capture error in NGC PyTorch 26.08 (`4fdf77b940`). Lazy RNG state
+initialization can query device-wide allocator events while another stream is
+capturing. This configuration requires a PyTorch allocator capture-safety fix;
+the MCore graph support does not repair that dependency error.
+
+The full-iteration loader returns a fresh batch dictionary for each consumer
+while retaining the captured tensor storage. This allows pipeline stages to
+discard unused batch fields without corrupting subsequent refills. Batched P2P
+communication retains its eager synchronization fence and omits that device-wide
+fence only while the CUDA stream is being captured.
+
+The mHC functional regression recipes enable `--deterministic-mode` and set
+`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` to request exact golden verification, including
+the number of zero gradients. A passing repeat is still required to establish
+reproducibility. GDN uses its existing deterministic implementation under this
+setting and allocates its initial recurrent state directly on the input device
+so capture does not perform a CPU-to-CUDA copy. Fused mHC remains enabled in the
+recipes.
 
 ### Dense Model Training
 

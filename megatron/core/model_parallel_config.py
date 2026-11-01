@@ -614,6 +614,17 @@ class ModelParallelConfig:
                 raise ValueError(
                     "max_seqlen_per_dp_cp_rank is required for packed sequence padding"
                 )
+            if self.pad_packed_seq_alignment == "max":
+                if self.sequence_parallel:
+                    assert (
+                        self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size == 0
+                    ), "Packed padding must preserve sequence-parallel TP divisibility."
+                assert (
+                    self.max_seqlen_per_dp_cp_rank % 2 == 0
+                ), "Packed padding must preserve zigzag CP alignment."
+            # Integer alignment is combined with TP/CP/MXFP8 requirements by
+            # get_packed_sequence_alignment, so the requested multiple need not
+            # itself be divisible by TP.
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

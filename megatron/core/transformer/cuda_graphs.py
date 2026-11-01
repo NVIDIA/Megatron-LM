@@ -2298,11 +2298,20 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
+    from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+        HyperConnectionHybridLayer,
+    )
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    if isinstance(layer, HyperConnectionHybridLayer):
+        # The wrapper owns capture, but the concrete inner layer determines
+        # which configured scopes apply. A MoE-only wrapper has no attention
+        # work to graph when only attn is selected.
+        return _layer_is_graphable(layer.inner_layer, config)
 
     if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.
@@ -2312,6 +2321,14 @@ def _layer_is_graphable(layer, config):
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
+            from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+            # GDN reads packed sequence offsets on the host, which capture forbids, so it
+            # stays eager for scheduler-packed THD batches.
+            if getattr(config, "sequence_packing_scheduler", None) is not None and isinstance(
+                layer.self_attention, _GDNBase
+            ):
+                return False
             # attn layer.
             return True
         if (
@@ -2325,6 +2342,23 @@ def _layer_is_graphable(layer, config):
             # mlp layer.
             return True
     return False
+
+
+def _get_mtp_te_layers(mtp_model_layer):
+    """Expose individual graphable layers inside a Hybrid MTP stack."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+    if isinstance(mtp_model_layer, HybridStack):
+        return list(mtp_model_layer.layers)
+    return [mtp_model_layer]
+
+
+def _is_mtp_te_layer(layer, model):
+    return any(
+        layer is candidate
+        for mtp_layer in getattr(getattr(model, 'mtp', None), 'layers', [])
+        for candidate in _get_mtp_te_layers(mtp_layer.mtp_model_layer)
+    )
 
 
 class TECudaGraphHelper:
@@ -2350,9 +2384,16 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            assert micro_batch_size == 1, "Scheduler THD graphs require micro_batch_size=1."
         self.model = model
         self.config = config
-        self.seq_length = seq_length
+        self.seq_length = (
+            config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+            if getattr(config, "sequence_packing_scheduler", None) is not None
+            and config.pad_packed_seq_alignment is not None
+            else seq_length
+        )
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
@@ -2416,11 +2457,12 @@ class TECudaGraphHelper:
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    for layer in _get_mtp_te_layers(mtp_model_layer):
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2541,8 +2583,8 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_layer(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
@@ -2560,7 +2602,9 @@ class TECudaGraphHelper:
                     )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                            rotary_seq_len,
+                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
+                            is not None,
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
@@ -2568,12 +2612,18 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
+            from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+                HyperConnectionHybridLayer,
+            )
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
@@ -2758,6 +2808,10 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         else:
+            # Keep the source-batch bound when dp_balanced produces fewer packs.
+            # With a fixed source batch and MBS=1, each aligned packed schedule is
+            # a subsequence of this capture order, preserving the existing input
+            # buffer lifetimes without wrapping around the captured graph list.
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
@@ -3218,6 +3272,8 @@ def set_current_microbatch(model, microbatch_id):
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
                 layer.mtp_model_layer.current_microbatch = microbatch_id
+                for inner_layer in _get_mtp_te_layers(layer.mtp_model_layer):
+                    inner_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,
