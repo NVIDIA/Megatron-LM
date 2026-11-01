@@ -134,55 +134,28 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
-@pytest.mark.parametrize("budget", [None, 0, 32])
-def test_prefetch_replays_interleaved_occurrences(distributed_setup, budget):
-    """Public unsharding gathers the recorded successors within the element budget."""
+def test_prefetch_stops_at_phase_boundary(distributed_setup):
+    """The last forward must not prefetch earlier layers for backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    modules = [nn.Linear(4, 4, bias=False).to(device) for _ in range(3)]
-    unsharded_weights = [module.weight for module in modules]
-    with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
-    ) as context:
-        for module in modules:
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device)
+    first_weight = model[0].weight
+    with fully_shard_context(FsdpContext(device=device)):
+        for layer in model:
             fully_shard(
-                module,
+                layer,
                 mesh,
                 _default_placements(),
-                schedule_policy=SchedulePolicy(budget, budget, register_hooks=False),
+                # Enough budget to reach the first layer if lookahead crosses into backward.
+                schedule_policy=SchedulePolicy(32, 32),
             )
 
-    calls = [
-        (0, Phase.FORWARD),
-        (0, Phase.FORWARD),
-        (1, Phase.FORWARD),
-        (0, Phase.BACKWARD),
-        (2, Phase.FORWARD),
-        (1, Phase.BACKWARD),
-        (0, Phase.BACKWARD),
-        (2, Phase.BACKWARD),
-    ]
-    for index, phase in calls:
-        context.execution_order.append(ExecutionEvent(modules[index], phase))
+    def check_first_layer_stays_sharded(_module, _args):
+        assert first_weight.untyped_storage().nbytes() == 0
 
-    for _ in range(2):
-        for position, (index, phase) in enumerate(calls):
-            # Clear previous gathers so each observation belongs to this call.
-            for module in modules:
-                module.reshard()
-            modules[index].phase = phase
-            context.allgather_stream.wait_stream(context.current_stream())
-            modules[index].unshard(phase, prefetch=True)
-            modules[index].phase = Phase.RESTING
-            torch.cuda.synchronize(device)
-
-            count = 1 if budget is None else budget // 16
-            expected = {index} | {i for i, _ in calls[position + 1 : position + 1 + count]}
-            gathered = {
-                i for i, weight in enumerate(unsharded_weights) if weight.untyped_storage().nbytes()
-            }
-            assert gathered == expected
-        assert context.execution_order.position == 0
+    # Run after FSDP's pre-forward hook, once the second layer has issued its prefetch.
+    model[1].register_forward_pre_hook(check_first_layer_stays_sharded)
+    model(torch.ones(2, 4, device=device)).sum().backward()
 
 
 @pytest.mark.parametrize("wrong_phase", [False, True])
