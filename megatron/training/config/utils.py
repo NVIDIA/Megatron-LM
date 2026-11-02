@@ -1,10 +1,10 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib
 import logging
-from functools import lru_cache
-from dataclasses import is_dataclass
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
         if key in init_false_fields:
             if target_class is not None:
                 logger.debug(
-                    f"Removing init=False field '{key}' from {target_class.__name__} config for backward compatibility"
+                    f"Removing derived field '{key}' (init=False or a property) from {target_class.__name__} config for backward compatibility"
                 )
             continue
 
@@ -91,15 +91,23 @@ def _resolve_target_class(target: str) -> type | None:
 
 @lru_cache(maxsize=128)
 def _get_init_false_fields(target_class: type) -> frozenset[str]:
-    """Get the set of field names with init=False for a dataclass.
+    """Get the names a dataclass config dict may carry that its constructor does not take.
+
+    Fields with init=False, and read-only properties: derived state that older files serialized as
+    fields (for example ``mock`` and ``split_matrix`` of the Megatron Core dataset configs).
 
     Args:
         target_class: A dataclass type to inspect.
 
     Returns:
-        A frozenset of field names that have init=False.
+        A frozenset of the init=False field names and the property names.
     """
     if not is_dataclass(target_class):
         return frozenset()
 
-    return frozenset(f.name for f in dataclass_fields(target_class) if not f.init)
+    properties = {
+        name for name in dir(target_class) if isinstance(getattr(target_class, name, None), property)
+    }
+    return frozenset(f.name for f in dataclass_fields(target_class) if not f.init) | frozenset(
+        properties
+    )

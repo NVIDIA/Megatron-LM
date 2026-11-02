@@ -463,6 +463,24 @@ def test_prevalidated_forward_checks_only_the_physical_length():
     assert len(calls) == 2
 
 
+def test_hybrid_model_rejects_config_list_before_any_preprocessing():
+    """Shared-prefix guards read the model-level config, not config-list per-layer configs."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    # The guard runs before the forward touches any module, so no allocation is needed.
+    model = HybridModel.__new__(HybridModel)
+    torch.nn.Module.__init__(model)
+    model.hybrid_layer_config_list = (_config(),)
+    with pytest.raises(NotImplementedError, match="hybrid_layer_config_list"):
+        HybridModel.forward(
+            model,
+            torch.zeros(1, _PHYSICAL_LEN[1], dtype=torch.long),
+            None,
+            None,
+            shared_prefix_layout=_LAYOUT,
+        )
+
+
 # Run in a fresh interpreter as if einops were not installed (Transformer Engine needs einops, so
 # it is hidden too), import HybridModel, and check that the adapter was not loaded.
 _IMPORT_HYBRID_MODEL_WITHOUT_EINOPS = """

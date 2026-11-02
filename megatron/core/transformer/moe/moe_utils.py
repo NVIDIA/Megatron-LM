@@ -1634,7 +1634,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             output = _router_gating_gemm(inp, weight, bias, router_dtype)
         else:
             output = _router_gating_gemm_blocks(inp, weight, bias, router_dtype, block_size)
-        output = output.view(*inp_shape[:-1], -1)
+        output = output.view(*inp_shape[:-1], weight.shape[0])
         return output
 
     @staticmethod
