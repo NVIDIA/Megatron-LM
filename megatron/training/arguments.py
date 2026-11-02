@@ -1816,6 +1816,18 @@ def validate_args(args, defaults={}):
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
+    # Training's batch-invariant MoE combine reproduces the rollouts'; derived here so every
+    # config built from or copied from the training config carries it.
+    args.batch_invariant_moe_combine_ep_size = rl_cfg.batch_invariant_moe_combine_ep_size(
+        batch_invariant_mode=args.batch_invariant_mode,
+        transformer_impl=args.transformer_impl,
+        num_moe_experts=args.num_experts,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        expert_model_parallel_size=args.expert_model_parallel_size,
+        expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+        inference_shards=args.inference_shards,
+        world_size=args.world_size,
+    )
     rl_cfg.validate_run(
         cuda_graph_impl=args.cuda_graph_impl,
         micro_batch_size=args.micro_batch_size,
@@ -2384,7 +2396,7 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
-        # internal/derived: RL sets it from --rl-inference-expert-model-parallel-size
+        # internal/derived: validate_args derives it from the RL rollout layout
         "batch_invariant_moe_combine_ep_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",

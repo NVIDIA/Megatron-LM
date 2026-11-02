@@ -4,7 +4,10 @@ import argparse
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from megatron.core.inference.shards_spec import spec_declares_disaggregation
+from megatron.core.inference.shards_spec import (
+    parse_inference_shards_spec,
+    spec_declares_disaggregation,
+)
 
 if TYPE_CHECKING:
     from megatron.core.distributed import DistributedDataParallelConfig
@@ -300,6 +303,119 @@ class RLConfig:
             or self.rl_inference_expert_tensor_model_parallel_size is not None
             or context_parallel_size > 1
         )
+
+    def rollout_parallel_layouts(
+        self,
+        *,
+        tensor_model_parallel_size: int,
+        expert_model_parallel_size: int,
+        expert_tensor_parallel_size: int,
+        inference_shards: str | None,
+        world_size: int,
+    ) -> list[tuple[int, int, int]]:
+        """(TP, EP, expert TP) of each model that runs rollouts: every disaggregated inference
+        shard, else the separate inference model (its --rl-inference-* sizes, training's where
+        unset) or the training model itself."""
+        if spec_declares_disaggregation(inference_shards):
+            return [
+                (shard.tp, shard.ep, shard.expt_tp)
+                for shard in parse_inference_shards_spec(inference_shards, world_size)
+            ]
+
+        def rollout_size(override: int | None, training_size: int) -> int:
+            return training_size if override is None else override
+
+        return [
+            (
+                rollout_size(
+                    self.rl_inference_tensor_model_parallel_size, tensor_model_parallel_size
+                ),
+                rollout_size(
+                    self.rl_inference_expert_model_parallel_size, expert_model_parallel_size
+                ),
+                rollout_size(
+                    self.rl_inference_expert_tensor_model_parallel_size, expert_tensor_parallel_size
+                ),
+            )
+        ]
+
+    def batch_invariant_moe_combine_ep_size(
+        self,
+        *,
+        batch_invariant_mode: bool,
+        transformer_impl: str,
+        num_moe_experts: int | None,
+        tensor_model_parallel_size: int,
+        expert_model_parallel_size: int,
+        expert_tensor_parallel_size: int,
+        inference_shards: str | None,
+        world_size: int,
+    ) -> int | None:
+        """Check that the rollouts can reproduce training's reductions under batch-invariant mode,
+        and return the EP size of the MoE combine that training reproduces
+        (TransformerConfig.batch_invariant_moe_combine_ep_size).
+
+        Returns None outside batch-invariant RL with MoE. Raises ValueError for a rollout layout
+        whose reductions training cannot reproduce bit for bit:
+
+        * A TP or expert-TP size other than training's: it sets how each row-parallel GEMM
+          splits its reduction.
+        * Inference-optimized MoE rollouts with expert TP > 1: their combine adds the expert-TP
+          partials and the EP partials in one rank-order sum.
+        * Inference-optimized MoE rollouts at several EP sizes: each rollout EP rank rounds the
+          sum over its experts to one partial, and training can reproduce one such partition.
+
+        TE and local rollout models combine with the same batch-invariant unpermute as
+        training, on the partition this returns, so their EP sizes are free.
+        """
+        if not (self.perform_rl_step and batch_invariant_mode):
+            return None
+        layouts = self.rollout_parallel_layouts(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            inference_shards=inference_shards,
+            world_size=world_size,
+        )
+        rollout_tp = sorted({tp for tp, _, _ in layouts})
+        if rollout_tp != [tensor_model_parallel_size]:
+            raise ValueError(
+                "Batch-invariant RL requires rollouts at the training tensor-parallel size "
+                f"({tensor_model_parallel_size}); the rollout models use {rollout_tp}. The TP size "
+                "sets how each row-parallel GEMM splits its reduction, so rollouts at another TP "
+                "cannot reproduce training's log-probs bit for bit."
+            )
+        if not num_moe_experts:
+            return None
+        rollout_expt_tp = sorted({expt_tp for _, _, expt_tp in layouts})
+        if rollout_expt_tp != [expert_tensor_parallel_size]:
+            raise ValueError(
+                "Batch-invariant RL with MoE requires rollouts at the training expert "
+                f"tensor-parallel size ({expert_tensor_parallel_size}; it defaults to the TP "
+                f"size); the rollout models use {rollout_expt_tp}. It sets how each expert's "
+                "output projection splits its reduction."
+            )
+        if transformer_impl != "inference_optimized":
+            # Rollout models build their configs from training's, so they combine on this
+            # partition too, whatever their own EP size.
+            return expert_model_parallel_size
+        if expert_tensor_parallel_size != 1:
+            raise ValueError(
+                "Batch-invariant RL with inference-optimized MoE requires "
+                f"expert_tensor_parallel_size 1 (got {expert_tensor_parallel_size}; it defaults "
+                "to the TP size): the rollouts' combine adds the expert-TP partials and the "
+                "expert-parallel partials in one rank-order sum, which training's combine cannot "
+                "reproduce."
+            )
+        rollout_ep = sorted({ep for _, ep, _ in layouts})
+        if len(rollout_ep) != 1:
+            raise ValueError(
+                "Batch-invariant RL with inference-optimized MoE requires one expert-parallel "
+                f"size across the rollout models; they use {rollout_ep}. Each rollout EP rank "
+                "rounds the sum over its experts to one partial, and training's combine can "
+                "reproduce only one such partition."
+            )
+        return rollout_ep[0]
 
     def validate_run(
         self,

@@ -1509,8 +1509,9 @@ class TransformerConfig(ModelParallelConfig):
     """EP size of the MoE combine that the batch-invariant training combine reproduces.
     Under batch_invariant_mode each EP rank rounds the sum over its contiguous shard of
     experts to one fp32 partial before the cross-rank reduction, so the bits depend on
-    the EP size. RL sets it to the EP size of its rollout model. None uses the layer's
-    own EP size."""
+    the EP size. RL derives it from its rollout layout when the config is built
+    (RLConfig.batch_invariant_moe_combine_ep_size), so every config copied from this one
+    (rollout models, per-layer configs) carries it. None uses the layer's own EP size."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4722,6 +4723,23 @@ class TransformerConfig(ModelParallelConfig):
                 "flash_attention_version must be one of 2, 3, or 4, got "
                 f"{self.flash_attention_version}"
             )
+
+        if self.batch_invariant_moe_combine_ep_size is not None:
+            if not (self.batch_invariant_mode and self.num_moe_experts):
+                raise ValueError(
+                    "batch_invariant_moe_combine_ep_size applies only to MoE models in "
+                    "batch_invariant_mode."
+                )
+            if (
+                self.batch_invariant_moe_combine_ep_size < 1
+                or self.num_moe_experts % self.batch_invariant_moe_combine_ep_size
+            ):
+                raise ValueError(
+                    "batch_invariant_moe_combine_ep_size "
+                    f"({self.batch_invariant_moe_combine_ep_size}) must divide num_moe_experts "
+                    f"({self.num_moe_experts}): the combine it reproduces gives each EP rank an "
+                    "equal, contiguous shard of the experts."
+                )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (

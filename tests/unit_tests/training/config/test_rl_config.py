@@ -256,6 +256,128 @@ def test_uses_separate_inference_model(
     )
 
 
+# Batch-invariant RL: training at TP 2, EP 2, expert TP 1 on 8 ranks, an 8-expert MoE.
+BI_TRAINING = dict(
+    batch_invariant_mode=True,
+    transformer_impl="transformer_engine",
+    num_moe_experts=8,
+    tensor_model_parallel_size=2,
+    expert_model_parallel_size=2,
+    expert_tensor_parallel_size=1,
+    inference_shards=None,
+    world_size=8,
+)
+
+
+def _pools(*eps, tp=2, expt_tp=1):
+    """A disaggregated prefill + decode layout, one 4-rank pool per EP size."""
+    roles = ("prefill", "decode")
+    return "+".join(
+        f"tp={tp},dp={4 // tp},ep={ep},expt_tp={expt_tp},role={role}"
+        for ep, role in zip(eps, roles)
+    )
+
+
+def _combine_ep(rl_kwargs, **training):
+    cfg = RLConfig(**{"perform_rl_step": True, **GRPO_4x3, **rl_kwargs})
+    return cfg.batch_invariant_moe_combine_ep_size(**{**BI_TRAINING, **training})
+
+
+@pytest.mark.parametrize(
+    "rl_kwargs, training, expected",
+    [
+        # Only batch-invariant RL with MoE has a combine to reproduce.
+        (dict(perform_rl_step=False), {}, None),
+        (dict(rl_inference_expert_model_parallel_size=8), dict(batch_invariant_mode=False), None),
+        (dict(), dict(num_moe_experts=None), None),
+        # TE rollout models combine with training's unpermute on the partition training passes
+        # them in their config copy: training's EP, whatever their own EP. This includes
+        # disaggregated pools, which take the EP from their shard spec.
+        (dict(), {}, 2),
+        (dict(rl_inference_expert_model_parallel_size=8), {}, 2),
+        (dict(), dict(inference_shards=_pools(4, 4)), 2),
+        (dict(), dict(inference_shards=_pools(1, 4)), 2),
+        # Inference-optimized rollouts round once per rollout EP rank: training reproduces that.
+        (dict(), dict(transformer_impl="inference_optimized"), 2),
+        (
+            dict(rl_inference_expert_model_parallel_size=8),
+            dict(transformer_impl="inference_optimized"),
+            8,
+        ),
+        (dict(), dict(transformer_impl="inference_optimized", inference_shards=_pools(4, 4)), 4),
+    ],
+)
+def test_batch_invariant_moe_combine_ep_size(rl_kwargs, training, expected):
+    assert _combine_ep(rl_kwargs, **training) == expected
+
+
+@pytest.mark.parametrize(
+    "rl_kwargs, training, match",
+    [
+        # A different TP splits every row-parallel GEMM's reduction differently, MoE or not.
+        (dict(rl_inference_tensor_model_parallel_size=4), {}, "training tensor-parallel size"),
+        (
+            dict(rl_inference_tensor_model_parallel_size=1),
+            dict(num_moe_experts=None),
+            "size \\(2\\)",
+        ),
+        (dict(), dict(inference_shards=_pools(2, 2, tp=4)), "rollout models use \\[4\\]"),
+        # So does a different expert TP; a shard's expert TP defaults to its TP.
+        (dict(rl_inference_expert_tensor_model_parallel_size=2), {}, "expert tensor-parallel"),
+        (
+            dict(),
+            dict(inference_shards="tp=2,dp=2,ep=2,role=prefill+tp=2,dp=2,ep=2,role=decode"),
+            "expert tensor-parallel",
+        ),
+        # Inference-optimized rollouts sum expert-TP and EP partials together.
+        (
+            dict(),
+            dict(transformer_impl="inference_optimized", expert_tensor_parallel_size=2),
+            "expert_tensor_parallel_size 1",
+        ),
+        # and partition the experts physically: one EP size across the pools.
+        (
+            dict(),
+            dict(transformer_impl="inference_optimized", inference_shards=_pools(2, 4)),
+            "one expert-parallel size",
+        ),
+    ],
+)
+def test_batch_invariant_rl_rejects_rollouts_that_cannot_reproduce_training(
+    rl_kwargs, training, match
+):
+    with pytest.raises(ValueError, match=match):
+        _combine_ep(rl_kwargs, **training)
+
+
+def test_validate_args_builds_the_combine_ep_into_the_training_config():
+    """validate_args derives the combine EP, so the training config is built with it and every
+    config copied from that one (rollout models, per-layer configs) carries it."""
+    import copy
+
+    from megatron.training.argument_utils import core_transformer_config_from_args
+
+    dp = int(os.environ.get("WORLD_SIZE", "1"))
+    argv = (
+        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
+        f"--micro-batch-size 1 --global-batch-size {12 * dp} --seq-length 32 "
+        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {4 * dp} "
+        "--grpo-group-size 3 --num-experts 8 --moe-token-dispatcher-type alltoall "
+        "--batch-invariant-mode --bf16 --attention-backend flash --flash-attention-version 3 "
+        "--attention-dropout 0.0 --rl-inference-expert-model-parallel-size 4"
+    ).split()
+    with patch("sys.argv", argv):
+        args = validate_args(parse_args())
+    config = core_transformer_config_from_args(args)
+    assert args.batch_invariant_moe_combine_ep_size == 1
+    assert copy.deepcopy(config).batch_invariant_moe_combine_ep_size == 1
+    with (
+        patch("sys.argv", argv + ["--rl-inference-tensor-model-parallel-size", "2"]),
+        pytest.raises(ValueError, match="training tensor-parallel size"),
+    ):
+        validate_args(parse_args())
+
+
 def test_validate_run_at_every_call_site():
     from megatron.core.optimizer import OptimizerConfig
     from megatron.training.config import (

@@ -263,6 +263,8 @@ def _training_combine(routing_map, outputs, combine_ep_size):
         flash_attention_version=3,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        # As validate_args derives it from the RL rollout layout.
+        batch_invariant_moe_combine_ep_size=combine_ep_size,
     )
     dispatcher = MoEAlltoAllTokenDispatcher(
         NUM_EXPERTS,
@@ -270,9 +272,6 @@ def _training_combine(routing_map, outputs, combine_ep_size):
         config=config,
         pg_collection=get_default_pg_collection(),
     )
-    if combine_ep_size is not None:
-        # Set after the dispatcher is built, as RL does once it builds its rollout model.
-        config.batch_invariant_moe_combine_ep_size = combine_ep_size
     num_tokens = routing_map.shape[0]
     hidden_states = torch.zeros(num_tokens, 1, HIDDEN, dtype=torch.bfloat16, device="cuda")
     with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
