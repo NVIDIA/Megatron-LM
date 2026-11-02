@@ -19,6 +19,8 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.inference.moe.activations import GLUOptions, bounded_silu_mul
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -398,7 +400,12 @@ class SharedExpertMLP(MLP):
 
 
 class FusedSharedExpertMLP(SharedExpertMLP):
-    """Shared expert MLP implemented with TE GroupedLinear(num_groups=1) fused ops."""
+    """Shared expert MLP implemented with TE GroupedLinear(num_groups=1) fused ops.
+
+    The fused ops need token counts aligned to TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT, which
+    inference batches are not, so inference runs the module's own linears instead (see
+    _inference_forward).
+    """
 
     def __init__(
         self,
@@ -421,6 +428,12 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         self._grouped_linear_kwargs = {}
         if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
             self._grouped_linear_kwargs["split_alignment"] = TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+        # The activation of the fused ops: clamped SwiGLU over interleaved FC1 rows, without
+        # the linear offset (see _make_fused_grouped_swiglu_ops).
+        self._inference_glu_options = GLUOptions(
+            clamp_value=self.config.activation_func_clamp_value,
+            interleave_size=self.config.moe_shared_expert_glu_interleave_size,
+        )
 
     def _validate_fused_grouped_swiglu(self) -> None:
         """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
@@ -606,22 +619,43 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
         if self.config.sequence_parallel:
             fc1_input = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=True
+                hidden_states, tensor_parallel_output_grad=True, group=self.tp_group
             )
         else:
-            fc1_input = copy_to_tensor_model_parallel_region(hidden_states)
+            fc1_input = copy_to_tensor_model_parallel_region(hidden_states, group=self.tp_group)
 
         fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
 
         if self.config.sequence_parallel:
-            output = reduce_scatter_to_sequence_parallel_region(fc2_output)
+            output = reduce_scatter_to_sequence_parallel_region(fc2_output, group=self.tp_group)
         else:
-            output = reduce_from_tensor_model_parallel_region(fc2_output)
+            output = reduce_from_tensor_model_parallel_region(fc2_output, group=self.tp_group)
+        return output
+
+    def _inference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute the fused ops' MLP with the module's linears, for any token count.
+
+        The linears communicate over this module's TP group (the inference-optimized ones
+        through symmetric memory) and use the inference weight formats. The SwiGLU reads
+        FC1's interleaved rows directly: the fused ops train in that layout, and the
+        checkpoint loader interleaves the stored rows for them.
+        """
+        fc1_output, _ = apply_module(self.linear_fc1)(hidden_states)
+        rows = fc1_output.reshape(-1, fc1_output.size(-1))
+        # Every row is live; the kernel takes the count on device (CUDA-graph safe).
+        num_rows = torch.full((1,), rows.size(0), dtype=torch.int32, device=rows.device)
+        intermediate = bounded_silu_mul(rows, num_rows, glu_options=self._inference_glu_options)
+        output, _ = apply_module(self.linear_fc2)(
+            intermediate.view(*fc1_output.shape[:-1], intermediate.size(-1))
+        )
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function."""
-        output = self._fused_grouped_swiglu_forward(hidden_states)
+        if InferenceMode.is_active():
+            output = self._inference_forward(hidden_states)
+        else:
+            output = self._fused_grouped_swiglu_forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
