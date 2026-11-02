@@ -1,14 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import dataclasses
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
 from copy import copy
 from typing import Literal, Optional
 
-from megatron.training.config.training_config import TokenizerConfig
-from megatron.training.global_vars import get_run_config, get_tokenizer
 import torch
 
 from megatron.core import dist_checkpointing
@@ -35,7 +32,14 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
-from megatron.training.models import GPTModelBuilder, GPTModelConfig, HybridModelBuilder, ModelBuilder
+from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
+from megatron.training.models import (
+    GPTModelBuilder,
+    GPTModelConfig,
+    HybridModelBuilder,
+    ModelBuilder,
+)
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -207,18 +211,16 @@ def get_model_for_inference(
         builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
-    # Load checkpoint. Inference must not start from random weights: exit_on_missing_checkpoint
-    # is forced through an override of this load; the registered section and the arguments are
-    # left as they are.
+    # Load checkpoint. Inference must not start from random weights.
     checkpoint = get_run_config().checkpoint
     assert checkpoint.load is not None
+    checkpoint.exit_on_missing_checkpoint = True
     requested_keys = set()
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
-        checkpoint=dataclasses.replace(checkpoint, exit_on_missing_checkpoint=True),
         tp_group=pg_collection.tp if pg_collection is not None else None,
         pp_group=pg_collection.pp if pg_collection is not None else None,
         dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,

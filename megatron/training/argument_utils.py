@@ -28,6 +28,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
+    MultiModalTokenizerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
@@ -38,7 +39,6 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
-    MultiModalTokenizerConfig,
 )
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 
@@ -804,17 +804,25 @@ def checkpoint_config_from_args(args: Namespace) -> CheckpointConfig:
     return CheckpointConfig(**kwargs)
 
 
-def project_checkpoint_policy(args: Namespace, checkpoint: CheckpointConfig) -> Namespace:
+def project_checkpoint_policy(
+    args: Namespace, checkpoint: CheckpointConfig, **overrides: Any
+) -> Namespace:
     """The inverse of ``checkpoint_config_from_args``: a shallow copy of ``args`` whose
-    checkpoint-owned names reflect ``checkpoint``.
+    checkpoint-owned names reflect ``checkpoint``, with ``overrides`` (field name to value) in
+    place of the section's values: the directory and format of a conversion save.
 
     Used for the argument namespace persisted in a checkpoint, so that saved arguments describe
-    the policy that produced the file; the live namespace is never written.
+    the policy that produced the file; neither the live namespace nor the section is written.
     """
+    unknown = set(overrides) - {item.name for item in fields(CheckpointConfig)}
+    if unknown:
+        raise TypeError(f"not checkpoint fields: {sorted(unknown)}")
+    values = {item.name: getattr(checkpoint, item.name) for item in fields(CheckpointConfig)}
+    values.update(overrides)
     projected = copy.copy(args)
     defaults = {item.name: item.default for item in fields(CheckpointConfig)}
     for item in fields(CheckpointConfig):
-        value = getattr(checkpoint, item.name)
+        value = values[item.name]
         if item.name in _CHECKPOINT_ALIASED_FIELDS:
             # A namespace built in Python may carry the canonical name; it follows the policy.
             # The CLI spellings are handled below.
@@ -829,21 +837,22 @@ def project_checkpoint_policy(args: Namespace, checkpoint: CheckpointConfig) -> 
     # A namespace with neither spelling gets the alias when the value departs from the default,
     # which is what the factory would otherwise reconstruct.
     for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
-        alias, value = f"no_{name}", getattr(checkpoint, name)
+        alias, value = f"no_{name}", values[name]
         if hasattr(args, alias):
             if bool(getattr(args, alias)) != (not value):
                 setattr(projected, alias, not value)
         elif not hasattr(args, name) and value != defaults[name]:
             setattr(projected, alias, not value)
     for name in ("fully_parallel_save", "fully_parallel_load"):
-        alias, value = f"ckpt_{name}", getattr(checkpoint, name)
+        alias, value = f"ckpt_{name}", values[name]
         if hasattr(args, alias):
             if getattr(args, alias) != value:
                 setattr(projected, alias, value)
         elif not hasattr(args, name) and value != defaults[name]:
             setattr(projected, alias, value)
-    if getattr(args, "use_dist_ckpt", _MISSING) != checkpoint.use_dist_ckpt:
-        projected.use_dist_ckpt = checkpoint.use_dist_ckpt
+    use_dist_ckpt = values["ckpt_format"] != "torch"
+    if getattr(args, "use_dist_ckpt", _MISSING) != use_dist_ckpt:
+        projected.use_dist_ckpt = use_dist_ckpt
     return projected
 
 

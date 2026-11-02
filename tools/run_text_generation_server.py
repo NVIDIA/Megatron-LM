@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Sample Generate"""
-import dataclasses
 import os
 import sys
 import warnings
@@ -160,15 +159,10 @@ def main(model_type: str = "gpt"):
 
     checkpoint = get_run_config().checkpoint
     if checkpoint.load is not None:
-        # Text generation must not start from random weights: exit_on_missing_checkpoint is
-        # forced for this load (the entry point also passes it through args_defaults).
-        _ = load_checkpoint(
-            model,
-            None,
-            None,
-            strict=False,
-            checkpoint=dataclasses.replace(checkpoint, exit_on_missing_checkpoint=True),
-        )
+        # Text generation must not start from random weights (the entry point also passes the
+        # flag through args_defaults).
+        checkpoint.exit_on_missing_checkpoint = True
+        _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

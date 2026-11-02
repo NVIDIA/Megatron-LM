@@ -4,7 +4,6 @@
 
 import contextlib
 import copy
-import dataclasses
 import inspect
 import os
 import random
@@ -183,52 +182,18 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
-# The fields a per-call override of the checkpoint section may change. Everything else (the async
-# worker and its knobs, the local checkpoint manager and its directories, replication, the number
-# of checkpoint workers) establishes run-wide resources once and cannot differ per operation: a
-# one-off ``async_save=True`` would never be finalized, because maybe_finalize_async_save returns
-# when the run's policy is synchronous.
-_LOAD_OVERRIDES = frozenset(
-    ('load', 'finetune', 'load_optim', 'load_rng', 'ckpt_format', 'exit_on_missing_checkpoint')
-)
-_SAVE_OVERRIDES = frozenset(('save', 'ckpt_format', 'verify_integrity'))
+# ``load_checkpoint(load_dir=_UNSET)``: the run's load directory. ``None`` clears it (the
+# pretrained-checkpoint fallback then applies), a string names another directory.
+_UNSET = object()
 
 
-def _resolve_operation_policy(
-    override: Optional[CheckpointConfig], *, kind: str
-) -> CheckpointConfig:
-    """The checkpoint section this save or load follows.
-
-    The registered run config's section, or an override that differs from it only in the fields
-    the operation may vary (``_LOAD_OVERRIDES`` / ``_SAVE_OVERRIDES``). Callers build an override
-    with ``dataclasses.replace(get_run_config().checkpoint, ...)`` instead of writing the
-    registered section or the argument namespace.
-    """
-    registered = get_run_config().checkpoint
-    if override is None:
-        return registered
-    allowed = _LOAD_OVERRIDES if kind == 'load' else _SAVE_OVERRIDES
-    differing = [
-        item.name
-        for item in dataclasses.fields(CheckpointConfig)
-        if item.name not in allowed
-        and getattr(override, item.name) != getattr(registered, item.name)
-    ]
-    if differing:
-        raise ValueError(
-            f'A checkpoint {kind} may override only {sorted(allowed)} of the checkpoint section; '
-            f'{differing} differ from the registered run config. Resource policy is established '
-            'once per run.'
-        )
-    return override
-
-
-def _run_config_dict(run_config, checkpoint: CheckpointConfig) -> dict:
-    """The run config as persisted with a checkpoint: the registered sections, with the checkpoint
-    section replaced by the effective policy of this save, so the saved metadata describes the
-    file it sits next to (a converted checkpoint records the format it was written in)."""
+def _run_config_dict(run_config, **save_policy) -> dict:
+    """The run config as persisted with a checkpoint: the registered sections, with the values of
+    this save (``save``, ``ckpt_format``, ``verify_integrity``) in the checkpoint section, so the
+    saved metadata describes the file it sits next to (a converted checkpoint records the format
+    it was written in). A detached dict: nothing of the run is written."""
     config_dict = run_config.to_dict()
-    config_dict['checkpoint'] = run_config._convert_value_to_dict(checkpoint)
+    config_dict['checkpoint'] = {**config_dict['checkpoint'], **save_policy}
     return config_dict
 
 
@@ -300,13 +265,16 @@ def check_checkpoint_args(
     *,
     checkpoint_config: dict | None = None,
     check_training_state: bool = True,
-    checkpoint: Optional[CheckpointConfig] = None,
+    ckpt_format: Optional[str] = None,
 ):
     """Ensure fixed arguments for a model are the same for the input
-    arguments and the one retrieved from checkpoint."""
+    arguments and the one retrieved from checkpoint.
+
+    ``ckpt_format`` is the format of this load (default: the run's checkpoint section's).
+    """
     cfg = get_run_config()
     args = get_args()
-    checkpoint = cfg.checkpoint if checkpoint is None else checkpoint
+    use_dist_ckpt = (cfg.checkpoint.ckpt_format if ckpt_format is None else ckpt_format) != 'torch'
     skip_args = skip_args or set()
 
     def _compare(arg_name, old_arg_name=None, default=None, *, config_section=None):
@@ -358,7 +326,7 @@ def check_checkpoint_args(
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
-        if not checkpoint.use_dist_ckpt:
+        if not use_dist_ckpt:
             _compare('padded_vocab_size')
         _compare('tokenizer_type')
     if cfg.rng.data_parallel_random_init:
@@ -367,7 +335,7 @@ def check_checkpoint_args(
         _compare('global_batch_size', config_section='train')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size')
-    if get_checkpoint_version() >= 3.0 and not checkpoint.use_dist_ckpt:
+    if get_checkpoint_version() >= 3.0 and not use_dist_ckpt:
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
 
@@ -662,7 +630,7 @@ def _build_sharded_state_dict_metadata(
     args: Namespace,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
-    checkpoint: Optional[CheckpointConfig] = None,
+    ckpt_format: Optional[str] = None,
 ) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -677,9 +645,11 @@ def _build_sharded_state_dict_metadata(
     Args:
         args: Arguments namespace
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
-        checkpoint: The checkpoint section of the operation (default: the registered run config's)
+        ckpt_format: The format of the operation (default: the run's checkpoint section's)
     """
-    checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
+    checkpoint = get_run_config().checkpoint
+    if ckpt_format is None:
+        ckpt_format = checkpoint.ckpt_format
     metadata = {}
 
     # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
@@ -690,10 +660,10 @@ def _build_sharded_state_dict_metadata(
         args, 'use_layer_wise_distributed_optimizer', False
     )
 
-    if has_distributed_optimizer and checkpoint.ckpt_format == 'fsdp_dtensor':
+    if has_distributed_optimizer and ckpt_format == 'fsdp_dtensor':
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    if has_distributed_optimizer and checkpoint.ckpt_format != 'fsdp_dtensor':
+    if has_distributed_optimizer and ckpt_format != 'fsdp_dtensor':
         if checkpoint.dist_ckpt_optim_fully_reshardable:
             metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
             metadata['distrib_optim_fully_reshardable_mem_efficient'] = (
@@ -773,7 +743,9 @@ def save_checkpoint(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     on_saved: Optional[Callable[[], None]] = None,
     *,
-    checkpoint: Optional[CheckpointConfig] = None,
+    save: Optional[str] = None,
+    ckpt_format: Optional[str] = None,
+    verify_integrity: Optional[bool] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -800,13 +772,19 @@ def save_checkpoint(
             when available. Callers using CP without global MPU initialization must pass it.
         on_saved: Called once the checkpoint is durable: after the barrier of a synchronous
             save, as a finalize function of an asynchronous one.
-        checkpoint: The checkpoint section this save follows. Defaults to the registered run
-            config's; an override may differ from it in ``_SAVE_OVERRIDES`` only (checkpoint
-            conversion saves in another format and directory).
+        save, ckpt_format, verify_integrity: The directory, format and integrity check of this
+            save where they differ from the run's checkpoint section (checkpoint conversion saves
+            in another format and directory). Everything else (the async worker and its knobs,
+            the local checkpoint manager and its directories, replication) is run-wide and
+            follows the section, which is not written.
     """
     start_ckpt = time()
     args = get_args()
-    checkpoint = _resolve_operation_policy(checkpoint, kind='save')
+    checkpoint = get_run_config().checkpoint
+    # The values of this save; ``ckpt_format`` below is the format actually written.
+    save_root = checkpoint.save if save is None else save
+    save_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
+    verify_integrity = checkpoint.verify_integrity if verify_integrity is None else verify_integrity
 
     if checkpoint.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -826,10 +804,10 @@ def save_checkpoint(
     # progress is recorded separately via the post-logits finalize (see the async block below).
     skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
 
-    # Handle non_persistent_ckpt flag. Besides overwriting `checkpoint.save` and
-    # `checkpoint.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
-    ckpt_type = CheckpointType.GLOBAL if checkpoint.use_dist_ckpt else CheckpointType.LEGACY
-    save_dir = checkpoint.save
+    # Handle non_persistent_ckpt flag. Besides overwriting the save directory and the checkpoint
+    # type, non-persistent global ckpt requires no additional logic
+    ckpt_type = CheckpointType.GLOBAL if save_format != 'torch' else CheckpointType.LEGACY
+    save_dir = save_root
     if non_persistent_ckpt:
         if checkpoint.non_persistent_ckpt_type == 'global':
             ckpt_type = CheckpointType.GLOBAL
@@ -850,7 +828,7 @@ def save_checkpoint(
                 f'Please use local or global non-persistent checkpoints (got: {checkpoint.non_persistent_ckpt_type})'
             )
 
-    ckpt_format = checkpoint.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    ckpt_format = save_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
     print_rank_0(
         f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving checkpoint '
         f'at iteration {iteration:7d} to {save_dir} in {ckpt_format} format'
@@ -861,7 +839,7 @@ def save_checkpoint(
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(
-        checkpoint.ckpt_format,
+        save_format,
         tp_group,
         pp_group,
         dp_cp_group=dp_cp_group,
@@ -872,7 +850,7 @@ def save_checkpoint(
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
     rerun_state = rerun_state_machine.state_dict(
-        data_iterator=train_data_iterator, ckpt_format=checkpoint.ckpt_format
+        data_iterator=train_data_iterator, ckpt_format=save_format
     )
 
     # Checkpoint name.
@@ -902,7 +880,7 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and checkpoint.ckpt_format == 'torch':
+    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and save_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
@@ -917,13 +895,13 @@ def save_checkpoint(
             raise NotImplementedError(
                 'Async checkpoint save not implemented for legacy checkpoints'
             )
-        elif ckpt_type == CheckpointType.GLOBAL and checkpoint.ckpt_format not in [
+        elif ckpt_type == CheckpointType.GLOBAL and save_format not in [
             'torch_dist',
             'torch_dcp',
             'fsdp_dtensor',
         ]:
             raise NotImplementedError(
-                f'Async checkpoint save not implemented for {checkpoint.ckpt_format} distributed checkpoint format'
+                f'Async checkpoint save not implemented for {save_format} distributed checkpoint format'
             )
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -960,7 +938,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, checkpoint=checkpoint
+                args, dp_cp_group=dp_cp_group, ckpt_format=save_format
             )
             if args.use_distributed_optimizer:
                 print_rank_0(
@@ -980,7 +958,9 @@ def save_checkpoint(
                 optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
-                checkpoint=checkpoint,
+                ckpt_format=save_format,
+                save=save_root,
+                verify_integrity=verify_integrity,
             )
 
         validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
@@ -999,7 +979,7 @@ def save_checkpoint(
                 save_strategy = TorchDistSaveShardedStrategy(
                     cpu_shm_mode=checkpoint.async_ckpt_use_cpu_shm
                 )
-                if checkpoint.ckpt_assume_constant_structure and checkpoint.ckpt_format == 'torch_dist':
+                if checkpoint.ckpt_assume_constant_structure and save_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = checkpoint.ckpt_assume_constant_structure
                     if checkpoint.async_save:
                         save_strategy.thread_count = checkpoint.dist_ckpt_workers
@@ -1067,11 +1047,11 @@ def save_checkpoint(
                     validate_access_integrity=validate_sharding_integrity,
                     preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                     content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                    verify_integrity=checkpoint.verify_integrity,
+                    verify_integrity=verify_integrity,
                 )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
-                save_sharded_modelopt_state(model, checkpoint_name, (checkpoint.ckpt_format, 1))
+                save_sharded_modelopt_state(model, checkpoint_name, (save_format, 1))
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -1141,7 +1121,12 @@ def save_checkpoint(
             )
             if ckpt_type == CheckpointType.LOCAL:
                 # Local checkpoints have no YAML sidecar; persist the full run config here.
-                state_dict['run_config'] = _run_config_dict(get_run_config(), checkpoint)
+                state_dict['run_config'] = _run_config_dict(
+                    get_run_config(),
+                    save=save_root,
+                    ckpt_format=save_format,
+                    verify_integrity=verify_integrity,
+                )
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1230,7 +1215,7 @@ def save_checkpoint(
                 )
                 if cfg.logger.log_progress and checkpoint.async_save:
                     append_to_progress_log(
-                        checkpoint.save,
+                        save_root,
                         f'Saved async local checkpoint\tIteration: {iteration}',
                         barrier=False,
                     )
@@ -1293,7 +1278,13 @@ def save_checkpoint(
                     warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
                 else:
                     _write_run_config_yaml(
-                        _run_config_dict(run_config, checkpoint), run_config_filename
+                        _run_config_dict(
+                            run_config,
+                            save=save_root,
+                            ckpt_format=save_format,
+                            verify_integrity=verify_integrity,
+                        ),
+                        run_config_filename,
                     )
 
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
@@ -1308,14 +1299,14 @@ def save_checkpoint(
 
                 if (
                     checkpoint.save_tokenizer_assets
-                    and checkpoint.ckpt_format == 'torch_dist'
+                    and save_format == 'torch_dist'
                     and iteration > 0
                 ):
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if cfg.logger.log_progress and checkpoint.async_save:
                     append_to_progress_log(
-                        checkpoint.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                        save_root, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
                 if train_state_dict is not None:
@@ -1330,7 +1321,7 @@ def save_checkpoint(
 
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {checkpoint.save} '
+                    f'checkpoint from iteration {int(iteration):7d} to {save_root} '
                     f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
@@ -1341,7 +1332,7 @@ def save_checkpoint(
                         prev_iteration, iteration, save_retain_interval
                     ):
                         checkpoint_name = get_checkpoint_name(
-                            checkpoint.save, iteration=prev_iteration, return_base_dir=True
+                            save_root, iteration=prev_iteration, return_base_dir=True
                         )
                         # Don't delete if `checkpoint_name` is a symbolic link.
                         if os.path.islink(
@@ -1349,12 +1340,12 @@ def save_checkpoint(
                         ):  # TODO: Make this work with MSC remote paths?
                             print_rank_0(
                                 f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {checkpoint.save} since it is a symbolic link'
+                                f'at {save_root} since it is a symbolic link'
                             )
                         else:
                             th = threading.Thread(
                                 target=_async_delete_checkpoint_impl,
-                                args=(checkpoint.save, prev_iteration, cfg.logger.log_progress),
+                                args=(save_root, prev_iteration, cfg.logger.log_progress),
                             )
                             th.start()
 
@@ -1413,7 +1404,7 @@ def save_checkpoint(
             ):
 
                 def progress_finalize_fn():
-                    tracker_filename = get_checkpoint_tracker_filename(checkpoint.save)
+                    tracker_filename = get_checkpoint_tracker_filename(save_root)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
                     print(f"  recorded logits-dump progress: iteration "
@@ -1789,21 +1780,32 @@ def generate_state_dict(
     optim_sd_kwargs=None,
     model_sd_kwargs=None,
     rerun_state=None,
-    checkpoint: Optional[CheckpointConfig] = None,
+    *,
+    ckpt_format: Optional[str] = None,
+    save: Optional[str] = None,
+    verify_integrity: Optional[bool] = None,
 ):
     """Generate a state dict from given model, optimizer, scheduler, rng state and others.
 
-    ``checkpoint`` is the section of the operation this state dict serves (a save, or the load
-    template of a load); it defaults to the registered run config's.
+    ``ckpt_format``, ``save`` and ``verify_integrity`` are the values of the operation this state
+    dict serves (a save, or the load template of a load) where they differ from the run's
+    checkpoint section: the format shapes the template, and all three are recorded in the
+    persisted arguments.
     """
-    checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
+    checkpoint = get_run_config().checkpoint
+    if ckpt_format is None:
+        ckpt_format = checkpoint.ckpt_format
+    saved_policy = dict(ckpt_format=ckpt_format, save=save, verify_integrity=verify_integrity)
 
     # Arguments, iteration, and model. The saved arguments describe the policy that produced the
-    # checkpoint: their checkpoint-owned names are projected from the effective section, so the
-    # readers of saved args (this loader's fallbacks, older trees, Megatron Bridge) stay right
-    # when the live namespace and the run config disagree. The live namespace is not written.
+    # checkpoint: their checkpoint-owned names are projected from the section and the values of
+    # this save, so the readers of saved args (this loader's fallbacks, older trees, Megatron
+    # Bridge) stay right when the live namespace and the run config disagree. The live namespace
+    # is not written.
     state_dict = {}
-    state_dict['args'] = project_checkpoint_policy(args, checkpoint)
+    state_dict['args'] = project_checkpoint_policy(
+        args, checkpoint, **{name: value for name, value in saved_policy.items() if value is not None}
+    )
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -1813,7 +1815,7 @@ def generate_state_dict(
         if len(model) > 1:
             key = f'model{i}'
 
-        if checkpoint.ckpt_format == 'torch_dist':
+        if ckpt_format == 'torch_dist':
             model_sd = model[i].sharded_state_dict(
                 **(
                     model_sd_kwargs
@@ -1832,7 +1834,7 @@ def generate_state_dict(
     # Optimizer stuff.
     if checkpoint.save_optim:
         if optimizer is not None and not optimizer.is_stub_optimizer:
-            if checkpoint.ckpt_format == 'torch_dist':
+            if ckpt_format == 'torch_dist':
                 optimizer_sd = optimizer.sharded_state_dict(
                     state_dict,
                     **(
@@ -1846,13 +1848,13 @@ def generate_state_dict(
                         }
                     ),
                 )
-            elif checkpoint.ckpt_format == 'fsdp_dtensor':
+            elif ckpt_format == 'fsdp_dtensor':
                 if optim_sd_kwargs is None:
                     optim_sd_kwargs = {}
                 if 'metadata' not in optim_sd_kwargs:
                     optim_sd_kwargs['metadata'] = {}
                 optim_sd_kwargs['metadata'].update(
-                    _build_sharded_state_dict_metadata(args, checkpoint=checkpoint)
+                    _build_sharded_state_dict_metadata(args, ckpt_format=ckpt_format)
                 )
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
             else:
@@ -1877,7 +1879,7 @@ def generate_state_dict(
     # Applied here so the SAME decision is used for both the save state dict and
     # the load *request* (`generate_state_dict` is the shared chokepoint), which
     # keeps the two symmetric and backward compatible.
-    if checkpoint.ckpt_format == "torch_dist" and checkpoint.ckpt_drop_redundant_extra_state:
+    if ckpt_format == "torch_dist" and checkpoint.ckpt_drop_redundant_extra_state:
         _localize_redundant_extra_states(state_dict)
 
     return state_dict
@@ -2273,17 +2275,21 @@ def _load_base_checkpoint(
     gtp_pad_for_alignment=None,
     *,
     checkpoint: Optional[CheckpointConfig] = None,
+    finetune: Optional[bool] = None,
 ):
     """Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
-    ``checkpoint`` is the load policy (default: the registered run config's section; the
-    parse-time load of ``--use-checkpoint-args`` passes a section built from the arguments).
+    ``checkpoint`` is the run's checkpoint section (default: the registered run config's; the
+    parse-time load of ``--use-checkpoint-args`` passes a section built from the arguments) and
+    ``finetune`` whether this load is weights-only (default: the section's).
     ``args`` is still read for the settings other sections own.
     """
     if args is None:
         args = get_args()
     checkpoint = get_run_config().checkpoint if checkpoint is None else checkpoint
+    if finetune is None:
+        finetune = checkpoint.finetune
     # Try to load non-persistent checkpoint first
     non_persistent_global_dir = (
         checkpoint.non_persistent_global_ckpt_dir
@@ -2462,7 +2468,7 @@ def _load_base_checkpoint(
             # A partial load silently skips model weights the checkpoint does not have,
             # leaving them at their initialized values. Report that, unless this is a
             # fine-tune where loading only part of the model is the intent.
-            if not checkpoint.finetune:
+            if not finetune:
                 validate_fsdp_dtensor_model_load(
                     state_dict_metadata,
                     state_dict,
@@ -2677,9 +2683,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
 
 def _maybe_setup_gpt_to_hybrid_load(
-    args, ckpt_args, model, *, checkpoint: CheckpointConfig, saved_save_optim: bool
+    args, ckpt_args, model, *, load_optim: bool, saved_save_optim: bool
 ):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
+
+    ``load_optim`` is this load's policy, ``saved_save_optim`` whether the checkpoint holds
+    optimizer state.
 
     Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
     the run's sharded state dict at the GPT checkpoint's keys (see
@@ -2751,7 +2760,7 @@ def _maybe_setup_gpt_to_hybrid_load(
     # The optimizer state is loaded unless the user opts out or the GPT run saved
     # no optimizer state. Fresh layers (e.g. Mamba) have no counterpart in the GPT
     # checkpoint, so their optimizer state stays freshly initialized; warn about it.
-    load_optim = checkpoint.load_optim and saved_save_optim
+    load_optim = load_optim and saved_save_optim
     if load_optim and layer_maps.fresh_init:
         print_rank_0(
             f'> WARNING: {len(layer_maps.fresh_init)} hybrid layer(s) have no GPT '
@@ -2789,7 +2798,11 @@ def load_checkpoint(
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
     restore_training_state: bool = False,
-    checkpoint: Optional[CheckpointConfig] = None,
+    load_dir=_UNSET,
+    finetune: Optional[bool] = None,
+    load_optim: Optional[bool] = None,
+    load_rng: Optional[bool] = None,
+    ckpt_format: Optional[str] = None,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2809,21 +2822,30 @@ def load_checkpoint(
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     checkpoint_group: Ranks that collectively form one complete checkpoint
         view (default: None, uses the global process group)
-    checkpoint: The checkpoint section this load follows. Defaults to the registered run
-        config's; an override may differ from it in ``_LOAD_OVERRIDES`` only (the reference-weights
-        load of RL, the distillation teacher, inference forcing exit_on_missing_checkpoint).
+    load_dir: The directory this load reads. Omitted: the run's ``load`` (or the argument
+        ``load_arg`` names). ``None`` clears it, so the pretrained-checkpoint fallback applies
+        (the reference weights of RL). A string names another directory (the distillation
+        teacher's).
+    finetune, load_optim, load_rng, ckpt_format: The policy of this load where it differs from
+        the run's checkpoint section (a weights-only load of the teacher or of RL's reference
+        weights; the pretrained load of the finetune tasks without its RNG state). Everything
+        else follows the section, which is not written.
     """
     cfg = get_run_config()
     args = get_args()
-    checkpoint = _resolve_operation_policy(checkpoint, kind='load')
-    # ``load_arg`` names an argument other than --load (the distillation teacher's directory).
-    load_dir = checkpoint.load if load_arg == 'load' else getattr(args, load_arg)
-    loading_pretrained_checkpoint = False
-    # Two derivations below may turn this load into a weights-only one; they are folded into the
-    # effective policy of this load and never written to the registered section (the legacy
-    # namespace keeps receiving them for the readers outside this module).
-    finetune = checkpoint.finetune
+    checkpoint = cfg.checkpoint
+    # The policy of this load: the keyword arguments where given, the run's section otherwise.
+    # Two derivations below may turn the load into a weights-only one; they stay local to this
+    # call (the legacy namespace keeps receiving them for the readers outside this module).
+    if load_dir is _UNSET:
+        # ``load_arg`` names an argument other than --load (the distillation teacher's directory).
+        load_dir = checkpoint.load if load_arg == 'load' else getattr(args, load_arg)
+    finetune = checkpoint.finetune if finetune is None else finetune
+    load_optim = checkpoint.load_optim if load_optim is None else load_optim
+    load_rng = checkpoint.load_rng if load_rng is None else load_rng
+    load_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
     override_ckpt_iteration = checkpoint.override_ckpt_iteration
+    loading_pretrained_checkpoint = False
 
     if checkpoint.stream_ckpt_dequant and optimizer is not None:
         raise ValueError(
@@ -2865,13 +2887,9 @@ def load_checkpoint(
         loading_pretrained_checkpoint = True
         args.finetune = True  # Legacy namespace flag, see the --freeze-all-layers note above.
 
-    checkpoint = dataclasses.replace(
-        checkpoint, finetune=finetune, override_ckpt_iteration=override_ckpt_iteration
-    )
-
     model = unwrap_model(ddp_model)
 
-    ckpt_format = checkpoint.ckpt_format
+    ckpt_format = load_format
     state_dict = None
     release = False
     if checkpoint.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
@@ -2881,7 +2899,7 @@ def load_checkpoint(
                 args,
                 rank0=True,
                 checkpointing_context=checkpointing_context,
-                checkpoint=checkpoint,
+                finetune=finetune,
             )
 
         ckpt_format = None
@@ -2939,7 +2957,7 @@ def load_checkpoint(
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
         _maybe_setup_gpt_to_hybrid_load(
-            args, ckpt_args, model, checkpoint=checkpoint, saved_save_optim=saved.save_optim
+            args, ckpt_args, model, load_optim=load_optim, saved_save_optim=saved.save_optim
         )
         if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None
         else (None, False)
@@ -2960,8 +2978,8 @@ def load_checkpoint(
             optimizer is not None
             and not getattr(optimizer, 'is_stub_optimizer', False)
             and not is_release
-            and (not checkpoint.finetune or gpt_compat_load_optim)
-            and checkpoint.load_optim
+            and (not finetune or gpt_compat_load_optim)
+            and load_optim
             and holds_optimizer
         )
         validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
@@ -2997,15 +3015,15 @@ def load_checkpoint(
             ckpt_tp_pp == run_tp_pp
             and ckpt_world_size == run_world_size
             and not release
-            and not checkpoint.finetune
-            and checkpoint.load_rng
+            and not finetune
+            and load_rng
             and saved.save_rng
         ):
             if tp_group is None and pp_group is None:
                 tp_group = mpu.get_tensor_model_parallel_group()
                 pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(
-                checkpoint.ckpt_format,
+                load_format,
                 tp_group,
                 pp_group,
                 dp_cp_group=dp_cp_group,
@@ -3022,7 +3040,7 @@ def load_checkpoint(
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, checkpoint=checkpoint
+                args, dp_cp_group=dp_cp_group, ckpt_format=load_format
             )
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(
@@ -3038,8 +3056,8 @@ def load_checkpoint(
         if (
             restore_training_state
             and not release
-            and (not checkpoint.finetune or gpt_compat_load_optim)
-            and checkpoint.load_optim
+            and (not finetune or gpt_compat_load_optim)
+            and load_optim
             and saved.save_optim
         ):
             gen_sd_optim = optimizer
@@ -3130,7 +3148,7 @@ def load_checkpoint(
             and ckpt_tp_pp == run_tp_pp
             and ckpt_dp == run_dp
             and not release
-            and not checkpoint.finetune
+            and not finetune
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
@@ -3156,7 +3174,7 @@ def load_checkpoint(
         with (
             contextlib.ExitStack() as stack
         ):  # Allows multiple context managers for each model shard
-            if checkpoint.finetune and hasattr(model[0], 'hide_loss_modules'):
+            if finetune and hasattr(model[0], 'hide_loss_modules'):
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
             load_kwargs['sharded_state_dict'] = generate_state_dict(
@@ -3168,7 +3186,7 @@ def load_checkpoint(
                 optim_sd_kwargs=optim_sd_kwargs,
                 model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
-                checkpoint=checkpoint,
+                ckpt_format=load_format,
             )
 
         if gpt_compat_layer_maps is not None:
@@ -3191,7 +3209,7 @@ def load_checkpoint(
             for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
-    elif checkpoint.ckpt_format == 'torch_dcp':
+    elif load_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:
             tp_group = mpu.get_tensor_model_parallel_group()
@@ -3201,7 +3219,7 @@ def load_checkpoint(
             'args': None,
             'iteration': 1,
             'rng_state': get_rng_state(
-                checkpoint.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
             ),
             'checkpoint_version': None,
             'num_floating_point_operations_so_far': 0,
@@ -3210,7 +3228,7 @@ def load_checkpoint(
             sharded_state_dict['optimizer'] = optimizer.state_dict(is_loading=True)
             sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
-    elif checkpoint.ckpt_format == 'fsdp_dtensor':
+    elif load_format == 'fsdp_dtensor':
         reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
         try:
             state_dict_metadata = reader.read_metadata().state_dict_metadata
@@ -3221,27 +3239,27 @@ def load_checkpoint(
         gen_sd_opt_param_scheduler = None
         gen_sd_rng_state = None
         gen_sd_optim = None
-        if not checkpoint.finetune:
+        if not finetune:
             if restore_training_state and 'rerun_state_machine' in state_dict_metadata:
                 gen_sd_rerun_state = get_rerun_state_machine().state_dict(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
                 )
-            if checkpoint.load_rng:
+            if load_rng:
                 gen_sd_rng_state = get_rng_state(
-                    checkpoint.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                    load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
                 )
         if (
             restore_training_state
-            and (not checkpoint.finetune or gpt_compat_load_optim)
-            and checkpoint.load_optim
+            and (not finetune or gpt_compat_load_optim)
+            and load_optim
         ):
             gen_sd_optim = optimizer
-            if not checkpoint.finetune:
+            if not finetune:
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, checkpoint=checkpoint
+                args, dp_cp_group=dp_cp_group, ckpt_format=load_format
             ),
             is_loading=True,
         )
@@ -3282,7 +3300,7 @@ def load_checkpoint(
                 optim_sd_kwargs=optim_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
                 iteration=1,
-                checkpoint=checkpoint,
+                ckpt_format=load_format,
             )
         finally:
             for param_group, lr in optimizer_lrs:
@@ -3300,7 +3318,7 @@ def load_checkpoint(
         checkpoint_group=checkpoint_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
-        checkpoint=checkpoint,
+        finetune=finetune,
         **load_kwargs,
     )
 
@@ -3318,7 +3336,7 @@ def load_checkpoint(
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     # Convert to regular torch tensor to DTensor.
-    if ckpt_type == CheckpointType.LEGACY and checkpoint.ckpt_format == 'torch_dcp':
+    if ckpt_type == CheckpointType.LEGACY and load_format == 'torch_dcp':
         dtensor_state_dict = _to_dtensor(ddp_model, state_dict['model'])
         state_dict['model'] = dtensor_state_dict
 
@@ -3342,7 +3360,7 @@ def load_checkpoint(
             ckpt_train_state = read_train_state(train_state_filename)
 
     # Set iteration.
-    if checkpoint.finetune or release:
+    if finetune or release:
         iteration = 0
     elif ckpt_train_state is not None:
         iteration = ckpt_train_state.iteration
@@ -3366,7 +3384,7 @@ def load_checkpoint(
         num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not checkpoint.finetune:
+    if 'args' in state_dict and not finetune:
         checkpoint_args = state_dict['args']
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
@@ -3378,7 +3396,7 @@ def load_checkpoint(
             skip_args=skip_args,
             checkpoint_config=checkpoint_config,
             check_training_state=restore_training_state,
-            checkpoint=checkpoint,
+            ckpt_format=load_format,
         )
 
     current_train_state = get_train_state()
@@ -3388,7 +3406,7 @@ def load_checkpoint(
         current_train_state.num_floating_point_operations_so_far = num_floating_point_operations_so_far
 
         # Load samples trackers from checkpoint
-        if not checkpoint.finetune:
+        if not finetune:
             if ckpt_train_state is not None:
                 current_train_state.consumed_train_samples = ckpt_train_state.consumed_train_samples
                 current_train_state.skipped_train_samples = ckpt_train_state.skipped_train_samples
@@ -3404,8 +3422,8 @@ def load_checkpoint(
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
     # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
-    if restore_training_state and checkpoint.override_ckpt_iteration is not None:
-        if 'args' in state_dict and not checkpoint.finetune:
+    if restore_training_state and override_ckpt_iteration is not None:
+        if 'args' in state_dict and not finetune:
             saved_train = checkpoint_config.get('train', {}) if checkpoint_config is not None else {}
             ckpt_global_batch_size = saved_train.get(
                 'global_batch_size', getattr(state_dict['args'], 'global_batch_size', None)
@@ -3421,7 +3439,7 @@ def load_checkpoint(
                     "iteration is in the checkpoint run's units, the data loader resumes from a "
                     'shifted sample offset.'
                 )
-        iteration = checkpoint.override_ckpt_iteration
+        iteration = override_ckpt_iteration
         if current_train_state is not None:
             current_train_state.iteration = iteration
             current_train_state.consumed_train_samples = iteration * cfg.train.global_batch_size
@@ -3480,14 +3498,14 @@ def load_checkpoint(
     if (
         restore_training_state
         and not release
-        and (not checkpoint.finetune or gpt_compat_load_optim)
-        and checkpoint.load_optim
+        and (not finetune or gpt_compat_load_optim)
+        and load_optim
     ):
         try:
             # Load state dict.
             if (
                 getattr(args, 'use_layer_wise_distributed_optimizer', False)
-                and checkpoint.ckpt_format == 'torch'
+                and load_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()
@@ -3525,7 +3543,7 @@ def load_checkpoint(
                 )
 
             # Load scheduler unless --finetune requests a fresh iteration and LR schedule.
-            if opt_param_scheduler is not None and not checkpoint.finetune:
+            if opt_param_scheduler is not None and not finetune:
                 if 'lr_scheduler' in state_dict:  # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
@@ -3621,12 +3639,12 @@ def load_checkpoint(
             print_rank_0(f'Unable to restore RerunMachine from checkpoint: {e}. Skipping.')
 
     # rng states.
-    if not release and not checkpoint.finetune and checkpoint.load_rng and not ignore_rng_state:
+    if not release and not finetune and load_rng and not ignore_rng_state:
         try:
             cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
             graph_safe_rng = tensor_parallel.is_graph_safe_cuda_rng_tracker(cuda_rng_tracker)
             if 'rng_state' in state_dict:
-                if checkpoint.ckpt_format == 'fsdp_dtensor':
+                if load_format == 'fsdp_dtensor':
                     # FSDP DTensor checkpoints store rng_state in a different format.
                     tp_rank = (
                         get_pg_rank(tp_group)

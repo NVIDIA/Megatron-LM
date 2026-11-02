@@ -2,7 +2,6 @@
 
 """Finetune utilities."""
 
-import dataclasses
 import sys
 from functools import partial
 
@@ -282,15 +281,14 @@ def finetune(train_valid_datasets_provider, model_provider,
     timers('pretrained checkpoint', log_level=0).start(barrier=True)
     checkpoint = get_run_config().checkpoint
     if train_state.iteration == 0 and checkpoint.pretrained_checkpoint is not None:
-        # Weights from the pretrained checkpoint, without its RNG state: an override of this load.
+        # Weights from the pretrained checkpoint, without its RNG state, for this load only.
         _ = load_checkpoint(
             model,
             None,
             None,
             restore_training_state=True,
-            checkpoint=dataclasses.replace(
-                checkpoint, load=checkpoint.pretrained_checkpoint, load_rng=False
-            ),
+            load_dir=checkpoint.pretrained_checkpoint,
+            load_rng=False,
         )
         update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
         # This is critical when only model is loaded. We should make sure

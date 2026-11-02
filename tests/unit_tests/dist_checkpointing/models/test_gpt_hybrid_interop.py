@@ -54,7 +54,6 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     save_checkpoint,
 )
-from megatron.training.config import CheckpointConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
@@ -68,11 +67,7 @@ class TestGPTCompatLayerMaps:
         runtime_model = object.__new__(HybridModel)
 
         assert _maybe_setup_gpt_to_hybrid_load(
-            mock.Mock(),
-            SimpleNamespace(),
-            [runtime_model],
-            checkpoint=CheckpointConfig(),
-            saved_save_optim=True,
+            mock.Mock(), SimpleNamespace(), [runtime_model], load_optim=True, saved_save_optim=True
         ) == (None, False)
 
     def test_pairs_positions_in_pattern_order(self):

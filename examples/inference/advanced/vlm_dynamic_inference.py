@@ -13,7 +13,6 @@ support multimodal checkpoints:
   * :func:`get_model` — build and load either a GPT or LLaVA model
 """
 
-import dataclasses
 import json
 import os
 import re
@@ -495,14 +494,13 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
     checkpoint = get_run_config().checkpoint
     assert checkpoint.load is not None
-    # Inference must not start from random weights: exit_on_missing_checkpoint is forced for
-    # this load; the registered section and the arguments are left as they are.
+    # Inference must not start from random weights.
+    checkpoint.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
-        checkpoint=dataclasses.replace(checkpoint, exit_on_missing_checkpoint=True),
     )
     if is_mimo:
         _check_mimo_checkpoint_fully_loaded(args, model[0])

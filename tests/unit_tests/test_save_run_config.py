@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 
 import pytest
+import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -127,39 +128,46 @@ def test_save_checkpoint_writes_run_config_other_formats(
         _assert_saved_config(save_dir / "iter_0000123", run_config, checkpoint)
 
 
-def test_save_with_an_override_records_the_effective_policy(
+def test_save_with_explicit_values_records_the_policy_of_the_save(
     init_model_parallel, create_args, tmp_path_dist_ckpt, run_config
 ):
-    """A save that overrides the registered section (checkpoint conversion) records the format and
+    """A save with its own directory and format (checkpoint conversion) records the format and
     directory it wrote, in the YAML and in the persisted arguments, and leaves the registered
     section and the live arguments untouched."""
     args = create_args
     model, optimizer, opt_param_scheduler = _model_and_states("torch")
 
     with TempNamedDir(
-        tmp_path_dist_ckpt / "test_save_checkpoint_run_config_override", sync=True
+        tmp_path_dist_ckpt / "test_save_checkpoint_run_config_explicit", sync=True
     ) as save_dir:
         registered = _prepare(args, run_config, save_dir / "registered", "torch_dist")
+        before = replace(registered)
         converted_dir = str(save_dir / "converted")
-        effective = replace(registered, ckpt_format="torch", save=converted_dir)
-        save_checkpoint(123, [model], optimizer, opt_param_scheduler, 456, checkpoint=effective)
-
-        loaded = _assert_saved_config(
-            save_dir / "converted" / "iter_0000123", run_config, effective
+        save_checkpoint(
+            123,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            456,
+            save=converted_dir,
+            ckpt_format="torch",
         )
-        assert loaded["checkpoint"]["ckpt_format"] == "torch"
-        assert loaded["checkpoint"]["save"] == converted_dir
-        assert run_config.checkpoint == registered
+
+        loaded = read_run_config(
+            get_checkpoint_run_config_filename(str(save_dir / "converted" / "iter_0000123"))
+        )
+        assert loaded["checkpoint"] == {
+            **run_config._convert_value_to_dict(registered),
+            "ckpt_format": "torch",
+            "save": converted_dir,
+        }
+        # The persisted arguments describe the file they sit next to.
+        state = torch.load(
+            save_dir / "converted" / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt",
+            weights_only=False,
+        )
+        assert state["args"].ckpt_format == "torch" and state["args"].save == converted_dir
+        assert state["args"].use_dist_ckpt is False
+        assert run_config.checkpoint is registered and registered == before
         assert args.ckpt_format == "torch_dist" and args.save == str(save_dir / "registered")
         assert not os.path.exists(save_dir / "registered" / "iter_0000123")
-
-        # Resource policy cannot change per save.
-        with pytest.raises(ValueError, match="may override only"):
-            save_checkpoint(
-                124,
-                [model],
-                optimizer,
-                opt_param_scheduler,
-                456,
-                checkpoint=replace(registered, async_save=True),
-            )

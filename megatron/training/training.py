@@ -3214,19 +3214,10 @@ def setup_model_and_optimizer(
         if args.fp16:
             optimizer.reload_model_params()
 
-    # Convert checkpoint format: one save under the target format and directory. The override
-    # applies to this save only; the registered section and the arguments are left as they are.
+    # Convert checkpoint format: one save under the target format and directory, passed to this
+    # save only; the registered section and the arguments are left as they are.
     if cfg.checkpoint.ckpt_convert_format is not None:
-        converted = dataclasses.replace(
-            cfg.checkpoint,
-            ckpt_format=cfg.checkpoint.ckpt_convert_format,
-            save=os.path.join(cfg.checkpoint.ckpt_convert_save, cfg.checkpoint.ckpt_convert_format),
-            verify_integrity=(
-                cfg.checkpoint.verify_integrity
-                and cfg.checkpoint.ckpt_convert_format == "torch_dist"
-            ),
-        )
-
+        converted_format = cfg.checkpoint.ckpt_convert_format
         save_checkpoint(
             train_state.iteration,
             model,
@@ -3234,12 +3225,13 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             train_state.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
-            checkpoint=converted,
+            save=os.path.join(cfg.checkpoint.ckpt_convert_save, converted_format),
+            ckpt_format=converted_format,
+            verify_integrity=cfg.checkpoint.verify_integrity and converted_format == "torch_dist",
         )
 
         print_rank_0(
-            "> converted checkpoint: %s -> %s."
-            % (cfg.checkpoint.ckpt_format, converted.ckpt_format)
+            "> converted checkpoint: %s -> %s." % (cfg.checkpoint.ckpt_format, converted_format)
         )
         torch.distributed.barrier()
         exit()
@@ -4821,8 +4813,8 @@ def train(
                 and cfg.dist.use_torch_fsdp2
                 and cfg.checkpoint.ckpt_format == "torch_dist"
             )
-            # The reference weights come from --pretrained-checkpoint, weights-only: an override
-            # of this load, not a change of the run's checkpoint policy.
+            # The reference weights come from --pretrained-checkpoint, weights-only: the load
+            # directory is cleared so the pretrained fallback applies, for this load only.
             load_checkpoint(
                 model,
                 None,  # Don't load optimizer state
@@ -4830,9 +4822,9 @@ def train(
                 checkpointing_context=checkpointing_context,
                 restore_training_state=True,
                 skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-                checkpoint=dataclasses.replace(
-                    cfg.checkpoint, load=None, finetune=True, load_optim=False
-                ),
+                load_dir=None,
+                finetune=True,
+                load_optim=False,
             )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
@@ -4845,7 +4837,7 @@ def train(
                 checkpointing_context=checkpointing_context,
                 restore_training_state=True,
                 skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-                checkpoint=dataclasses.replace(cfg.checkpoint, load_optim=False),
+                load_optim=False,
             )
             update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
 

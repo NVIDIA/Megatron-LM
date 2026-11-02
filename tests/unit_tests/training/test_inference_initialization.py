@@ -5,7 +5,6 @@
 import importlib.util
 import sys
 from argparse import ArgumentParser, Namespace
-from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -339,10 +338,10 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config
     from examples.inference.advanced import vlm_dynamic_inference
 
     args = Namespace(inference_ckpt_non_strict=False)
-    # The load directory is the section's; the loader forces exit_on_missing_checkpoint for
-    # this load without writing the section or the namespace.
+    # The load directory is the section's; inference sets exit_on_missing_checkpoint on the
+    # section before loading (the namespace is not written).
     run_config.checkpoint.load = "checkpoint"
-    expected = replace(run_config.checkpoint, exit_on_missing_checkpoint=True)
+    assert run_config.checkpoint.exit_on_missing_checkpoint is False
     if is_mimo:
         args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
     model = Mock()
@@ -361,11 +360,7 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config
 
     def check_mimo(received_args, received_model):
         load.assert_called_once_with(
-            ddp_model=[model],
-            optimizer=None,
-            opt_param_scheduler=None,
-            strict=True,
-            checkpoint=expected,
+            ddp_model=[model], optimizer=None, opt_param_scheduler=None, strict=True
         )
         assert received_args is args
         assert received_model is model
@@ -375,14 +370,10 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config
     monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", check)
 
     assert vlm_dynamic_inference.get_model(is_vlm=is_vlm) is model
-    assert run_config.checkpoint.exit_on_missing_checkpoint is False
+    assert run_config.checkpoint.exit_on_missing_checkpoint is True
     assert not hasattr(args, "exit_on_missing_checkpoint")
     load.assert_called_once_with(
-        ddp_model=[model],
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=True,
-        checkpoint=expected,
+        ddp_model=[model], optimizer=None, opt_param_scheduler=None, strict=True
     )
     if is_mimo:
         check.assert_called_once_with(args, model)

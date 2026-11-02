@@ -42,7 +42,7 @@ from megatron.training.checkpointing import (
     set_checkpoint_version,
 )
 from megatron.training.config import CheckpointConfig, ProfilingConfig
-from megatron.training.global_vars import get_args, set_args
+from megatron.training.global_vars import get_args, get_run_config, set_args
 from megatron.training.state import TrainState
 from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -57,7 +57,7 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
     assert _maybe_setup_gpt_to_hybrid_load(
-        args, ckpt_args, [object()], checkpoint=CheckpointConfig(), saved_save_optim=True
+        args, ckpt_args, [object()], load_optim=True, saved_save_optim=True
     ) == (None, False)
 
 
@@ -1347,9 +1347,9 @@ def _make_metadata_args(
     return args
 
 
-def _metadata_checkpoint(args):
+def _register_metadata_section(args):
     """The checkpoint section the metadata builder reads; the namespace keeps the rest."""
-    return CheckpointConfig(
+    get_run_config().checkpoint = CheckpointConfig(
         ckpt_format=args.ckpt_format,
         dist_ckpt_optim_fully_reshardable=args.dist_ckpt_optim_fully_reshardable,
         distrib_optim_fully_reshardable_mem_efficient=(
@@ -1371,26 +1371,23 @@ class TestBuildShardedStateDictMetadata:
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self):
         args = _make_metadata_args(use_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_distributed_optimizer_fully_reshardable_flag(self):
         args = _make_metadata_args(
             use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
     def test_distributed_optimizer_fsdp_dtensor(self):
         args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
     def test_layer_wise_only_still_sets_sharding_type(self):
@@ -1398,25 +1395,22 @@ class TestBuildShardedStateDictMetadata:
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
         args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_layer_wise_with_fully_reshardable(self):
         args = _make_metadata_args(
             use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
     def test_no_distributed_optimizer_no_sharding_type(self):
         args = _make_metadata_args()
-        metadata = _build_sharded_state_dict_metadata(
-            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
-        )
+        _register_metadata_section(args)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
 
 
@@ -1572,12 +1566,12 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     assert decisions == [expected]
 
 
-def test_the_pretrained_fallback_folds_finetune_into_the_load_and_keeps_the_legacy_flag(
+def test_the_pretrained_fallback_makes_the_load_weights_only_and_keeps_the_legacy_flag(
     init_model_parallel, monkeypatch, run_config
 ):
     """A missing --load with --pretrained-checkpoint loads the pretrained directory weights-only:
-    the effective policy of that load carries finetune=True, the registered section is not
-    written, and the legacy namespace flag is set for the readers outside checkpointing.py
+    the base loader is called with finetune=True, the registered section is not written, and
+    the legacy namespace flag is set for the readers outside checkpointing.py
     (examples/multimodal/dataloader_resume.py)."""
     args = SimpleNamespace(
         finetune=False,
@@ -1593,9 +1587,9 @@ def test_the_pretrained_fallback_folds_finetune_into_the_load_and_keeps_the_lega
     run_config.checkpoint.load_rng = False
     loads = []
 
-    def base_load(load_dir, run_args, *a, checkpoint, **k):
-        loads.append((load_dir, checkpoint.finetune))
-        return None, "", False, None  # Stop right after the fold: nothing to load.
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        loads.append((load_dir, finetune))
+        return None, "", False, None  # Nothing to load: the call ends after the fallback.
 
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
@@ -1607,3 +1601,113 @@ def test_the_pretrained_fallback_folds_finetune_into_the_load_and_keeps_the_lega
     assert load_checkpoint([object()], None, None) == (0, 0)
     assert loads and loads[0] == ("/pretrained", True)
     assert run_config.checkpoint.finetune is False and args.finetune is True
+
+
+def test_the_load_directory_is_the_sections_unless_passed(
+    init_model_parallel, monkeypatch, run_config
+):
+    """``load_dir`` omitted reads the run's load directory; ``None`` clears it, so the
+    pretrained-checkpoint fallback applies (the reference weights of RL); a string names another
+    directory (the distillation teacher's). None of them writes the section."""
+    args = SimpleNamespace(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    run_config.checkpoint.load = "/run"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    loads = []
+
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        if not k.get("rank0"):  # The final read; the rank-0 metadata read carries the same policy.
+            loads.append((load_dir, finetune))
+        return None, "", False, None  # Nothing to load: the call ends after resolving the policy.
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing, "checkpoint_exists", lambda path: path in ("/run", "/pretrained", "/teacher")
+    )
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+
+    load_checkpoint([object()], None, None)
+    load_checkpoint([object()], None, None, load_dir=None, finetune=True, load_optim=False)
+    load_checkpoint([object()], None, None, load_dir="/teacher", finetune=True)
+    assert loads == [("/run", False), ("/pretrained", True), ("/teacher", True)]
+    assert run_config.checkpoint.load == "/run" and run_config.checkpoint.finetune is False
+
+
+@pytest.mark.parametrize("cleared", [True, False])
+def test_the_pretrained_reference_load_requests_the_llm_only_metadata(
+    init_model_parallel, monkeypatch, run_config, cleared
+):
+    """The reference-weights load of RL clears the load directory, so the pretrained fallback
+    classifies it as a pretrained load: with --allow-llm-only-checkpoint the load template then
+    carries ``load_from_llm_only_checkpoint``. Naming the pretrained directory directly is an
+    ordinary load and does not."""
+    args = SimpleNamespace(
+        finetune=False,
+        allow_llm_only_checkpoint=True,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    run_config.checkpoint.ckpt_format = "torch_dist"
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, "/pretrained/iter_0000001", False, CheckpointType.GLOBAL),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: None)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", mock.Mock())
+    templates = []
+
+    class StopAtTheTemplate(Exception):
+        pass
+
+    def capture(*a, model_sd_kwargs, **k):
+        templates.append(model_sd_kwargs["metadata"])
+        raise StopAtTheTemplate  # Before any tensor storage is read.
+
+    monkeypatch.setattr(checkpointing, "generate_state_dict", capture)
+    load_dir = None if cleared else "/pretrained"
+    with pytest.raises(StopAtTheTemplate):
+        load_checkpoint(
+            [object()],
+            None,
+            None,
+            restore_training_state=True,
+            load_dir=load_dir,
+            finetune=True,
+            load_optim=False,
+        )
+    assert templates[0].get("load_from_llm_only_checkpoint", False) is cleared

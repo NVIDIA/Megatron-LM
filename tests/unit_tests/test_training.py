@@ -201,11 +201,11 @@ class TestTraining:
             return 123, 456
 
         def save_checkpoint(*unused_args, **kwargs):
-            converted = kwargs["checkpoint"]
-            assert converted.ckpt_format == ckpt_format
-            assert converted.save == str(Path("converted-checkpoints") / ckpt_format)
-            assert converted.use_dist_ckpt is (ckpt_format != "torch")
-            assert converted.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+            # The target format and directory are passed to this save only.
+            assert "checkpoint" not in kwargs
+            assert kwargs["ckpt_format"] == ckpt_format
+            assert kwargs["save"] == str(Path("converted-checkpoints") / ckpt_format)
+            assert kwargs["verify_integrity"] is (verify_integrity and ckpt_format == "torch_dist")
             # Neither the registered section nor the namespace is written.
             assert run_config.checkpoint.ckpt_format == "torch_dist"
             assert run_config.checkpoint.verify_integrity is verify_integrity

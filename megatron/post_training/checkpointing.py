@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -146,17 +145,13 @@ def load_kd_teacher_checkpoint(model) -> None:
     teacher = unwrap_model(model[0]).teacher_model
     print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
     # The teacher is loaded weights-only (finetune-style) from its own directory and, when given,
-    # its own format: an override of this load, not a change of the run's checkpoint policy.
-    checkpoint = get_run_config().checkpoint
+    # its own format; the run's checkpoint policy is unchanged.
     load_checkpoint(
         [teacher],
         None,
         None,
-        checkpoint=dataclasses.replace(
-            checkpoint,
-            load=args.export_kd_teacher_load,
-            finetune=True,
-            ckpt_format=args.export_kd_teacher_ckpt_format or checkpoint.ckpt_format,
-        ),
+        load_dir=args.export_kd_teacher_load,
+        finetune=True,
+        ckpt_format=args.export_kd_teacher_ckpt_format or None,
     )
     print_rank_0("... teacher loaded successfully.")
