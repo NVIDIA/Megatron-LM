@@ -242,7 +242,9 @@ def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hy
 
     with (
         patch.object(utils, "get_args", return_value=args),
+        # utils imports get_run_config directly; build_modelopt_models reads it from global_vars.
         patch.object(utils, "get_run_config", return_value=cfg),
+        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
         patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
         patch.object(utils, "should_use_modelopt_config", return_value=True),
         patch.object(mc, "build_inference_models", return_value=[stage]) as build,
