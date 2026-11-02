@@ -1,30 +1,48 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import contextmanager
+import copy
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 import transformer_engine as te
 
+from megatron.core.fusions import wide_residual_shortcut as kernels
+from megatron.core.fusions.wide_residual_shortcut import (
+    PendingShortcutAdd,
+    api,
+    forward_kernel,
+    mxfp8_handoff,
+)
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import residual_replay_scope
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid import hybrid_layer_specs as specs
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
+from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
+from tests.unit_tests.test_utilities import Utils
 
-# The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
-# build and a GPU to run.
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="shortcut norms are Transformer Engine norms"
-)
+# Shortcut-owned norms are Transformer Engine norms, which need a GPU to build; the pairing
+# validation tests use only fake layers and run anywhere.
+GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="Transformer Engine norms")
 
 
 def _shortcut_config(*, parallel: bool = False, wide_residual: WideResidualConfig | None = None):
@@ -121,6 +139,7 @@ class _FakeMoE(torch.nn.Module):
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
 
 
+@GPU
 @pytest.mark.parametrize(
     ("compute_symbol", "parallel"),
     [
@@ -167,6 +186,7 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert "1.shortcut_post_norm.weight" in state_keys
 
 
+@GPU
 def test_wide_shortcut_owns_independent_registered_read():
     """The routed shortcut reads wide X_l through its own ordinary-width controller."""
 
@@ -197,6 +217,7 @@ def test_wide_shortcut_owns_independent_registered_read():
     assert wide_hidden.grad is not None
 
 
+@GPU
 def test_wide_shortcut_mtp_pair_stays_ordinary_width():
     """MTP auxiliary stacks do not inherit the decoder's wide residual stream."""
 
@@ -224,6 +245,7 @@ def test_shortcut_pair_rejects_mixed_mtp_ownership():
         ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False)
 
 
+@GPU
 @pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
 def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     config = _shortcut_config()
@@ -342,6 +364,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     torch.testing.assert_close(output, hidden_states + 14)
 
 
+@GPU
 def test_inference_runs_paired_layer_atomically(monkeypatch):
     """Inference routes on the pair input and runs the paired layer's ordinary forward.
 
@@ -475,6 +498,7 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
         )
 
 
+@GPU
 @pytest.mark.parametrize("tokens_per_sample", [None, 2])
 def test_shared_experts_propagates_the_layers_residual_and_mlp_state(tokens_per_sample):
     """The layer owns the unpack and the payload; the block must carry both through."""
@@ -508,6 +532,7 @@ def test_shared_experts_propagates_the_layers_residual_and_mlp_state(tokens_per_
     assert mlp_state is layer_mlp_state
 
 
+@GPU
 def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     """Schedules preserve numerics while each physical layer uses its own quant context."""
     config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
@@ -655,6 +680,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
         torch.testing.assert_close(overlap_gradients[name], serial_gradients[name])
 
 
+@GPU
 def test_shortcut_norm_recompute_and_offload(monkeypatch):
     """The shortcut path wires pre-norm recompute and post-norm offload together."""
     from megatron.core.models.hybrid import shortcut_block as shortcut_block_module
@@ -756,3 +782,637 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     assert calls["offload_entered"] and calls["offload_exited"]
     assert calls["forced_released_tensors"][0] is calls["offload_input"]
     assert hidden_states.grad is not None
+
+
+# ---------------------------------------------------------------- fused wide-residual shortcut blocks
+#
+# ShortcutMoEBlock with moe_shortcut_wide_residual_norm_fusion runs the one-reader kernel
+# (wide_residual_write_read_rmsnorm_quant) between its compute write and shared-expert read, and
+# the two-reader kernel (shortcut_add_wide_residual_write_two_reader_rmsnorm_quant) for the
+# shortcut add plus the next pair's reads. Kernel arithmetic is checked against independent FP64
+# references in tests/unit_tests/fusions/test_wide_residual_shortcut.py; these tests check the
+# block schedule bitwise against a serial oracle built from the same kernels.
+
+
+class _BF16Norm(torch.nn.RMSNorm):
+    def __init__(self, config, hidden_size, eps):
+        super().__init__(hidden_size, eps=eps, device="cuda", dtype=torch.bfloat16)
+
+
+class _TanhMixer(torch.nn.Module, TwoStageAttentionLayer):
+    def __init__(self, config, d_model, **kwargs):
+        super().__init__()
+        linear = lambda i, o: torch.nn.Linear(i, o, bias=False, device="cuda", dtype=torch.bfloat16)
+        self.input, self.output = linear(d_model, 32), linear(32, d_model)
+
+    def forward(self, x, **kwargs):
+        return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(x))
+
+    def supports_two_stage_attention(self):
+        return True
+
+    def forward_pre_attn_and_core_attn(self, x, **kwargs):
+        return torch.tanh(self.input(x))
+
+    def forward_post_core_attn(self, x):
+        return self.output(x), None
+
+
+class _SharedExperts(torch.nn.Module):
+    use_shared_expert = True
+    shared_expert_overlap = False
+    tp_group = None
+
+    def __init__(self, hidden):
+        super().__init__()
+        linear = lambda o: torch.nn.Linear(
+            hidden, o, bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        self.router, self.shared, self.routed = linear(1), linear(hidden), linear(hidden)
+        self.combine_calls = 0
+
+    def route(self, x, padding_mask=None, input_ids=None, packed_seq_params=None):
+        return self.router(x).sigmoid(), None
+
+    def preprocess(self, x, probs, routing, padding_mask=None, packed_seq_params=None):
+        return x, probs
+
+    def dispatch(self, x, probs):
+        return x, probs
+
+    def routed_experts_compute(self, x, probs):
+        return self.routed(x) * probs, None
+
+    def combine(self, x):
+        return x
+
+    def shared_experts_compute(self, x):
+        return self.shared(x)
+
+    def postprocess(self, x, shared):
+        self.combine_calls += 1
+        return x if shared is None else x + shared
+
+
+class _WideMoE(torch.nn.Module):
+    supports_wide_residual_connections = True
+    is_mtp_layer = False
+    is_last_layer = False
+
+    def __init__(self, config, layer_number, pg=None, pg_collection=None, **kwargs):
+        pg = pg_collection if pg_collection is not None else pg
+        super().__init__()
+        self.config, self.layer_number = config, layer_number
+        connection = lambda operation: StreamwiseSigmoidWideResidualConnection(
+            config, layer_number, "mlp", pg, operation=operation
+        )
+        self.residual_read_mlp, self.residual_write_mlp = connection("read"), connection("write")
+        self.pre_mlp_layernorm = _BF16Norm(config, config.hidden_size, 1e-5)
+        self.mlp = _SharedExperts(config.hidden_size)
+
+    def _get_mlp_residual_connection(self, operation):
+        return self.residual_read_mlp if operation == "read" else self.residual_write_mlp
+
+    def _pre_mlp_layernorm_and_residual(self, x, residual_stream_recompute_context=None):
+        x, state = self.residual_read_mlp(
+            x,
+            fp32_residual_connection=self.config.fp32_residual_connection,
+            branch_input_dtype=self.config.params_dtype,
+        )
+        return self.pre_mlp_layernorm(x), state[0], state
+
+    def _maybe_unflatten_for_moe(self, x, padding_mask=None, **kwargs):
+        return x, padding_mask, None, None
+
+    def _maybe_reflatten_from_moe(self, x, *args):
+        return x
+
+    def _apply_mlp_bda_step(self, output, residual, state, residual_stream_recompute_context=None):
+        return self.residual_write_mlp(
+            output, state=state, dropout_probability=0.0, training=self.training
+        )
+
+
+def _fused_config(**overrides):
+    """BF16 params, FP32 residual, RMSNorm and the fused wide-residual shortcut."""
+    options = dict(
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-5,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp32_residual_connection=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        add_bias_linear=False,
+        moe_shortcut_connection=True,
+        moe_shortcut_wide_residual_norm_fusion=True,
+    )
+    return TransformerConfig(**(options | overrides))
+
+
+def _fused_blocks(streams=3, enabled=True, retention=True, pairs=2, hidden=128):
+    # Bind before the fake module tests create the process-wide overlap stream.
+    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+    config = _fused_config(
+        num_layers=2 * pairs,
+        hidden_size=hidden,
+        num_attention_heads=4,
+        num_moe_experts=1,
+        moe_shared_expert_intermediate_size=128,
+        moe_shortcut_wide_residual_norm_fusion=enabled,
+        wide_residual=WideResidualConfig(num_streams=streams, learned_retention=retention),
+    )
+    pg = ProcessGroupCollection(tp=None)
+    physical = torch.nn.ModuleList()
+    for index in range(1, 2 * pairs, 2):
+        compute = WideResidualMambaLayer(
+            config,
+            MambaLayerSubmodules(mixer=_TanhMixer, norm=_BF16Norm),
+            layer_number=index,
+            pg_collection=pg,
+        )
+        physical.extend([compute, _WideMoE(config, index + 1, pg)])
+    return group_layers_into_shortcut_blocks(
+        physical, [LayerSymbols.GDN, LayerSymbols.MOE] * pairs, config
+    ).cuda()
+
+
+def _run_block(block, x, defer=False):
+    """Run one block; a PendingShortcutAdd input starts with the two-reader boundary and
+    ``defer`` returns one instead of finishing the shortcut add."""
+    pending = x if isinstance(x, PendingShortcutAdd) else None
+    return block(
+        None if pending is not None else x,
+        *(None,) * 6,
+        lambda *a: nullcontext(),
+        pending_prev_shortcut_add=pending,
+        defer_shortcut_add=defer,
+    )
+
+
+def _run_blocks(blocks, x, manager=None):
+    """Drive adjacent fused blocks like HybridStack: defer every MoE write but the last."""
+    for i, block in enumerate(blocks):
+        if manager is not None:
+            manager.advance(2)
+        x = _run_block(block, x, defer=i + 1 < len(blocks))
+        if i + 1 < len(blocks):
+            assert isinstance(x, PendingShortcutAdd)
+    return x
+
+
+def _explicit_pairs(blocks, residual, manager=None):
+    """Serial scheduling oracle using the same one-/two-reader arithmetic contract.
+
+    Independent of ShortcutMoEBlock.forward and its overlap/handoff logic.
+    """
+    prepared = None
+    for i, block in enumerate(blocks):
+        if manager is not None:
+            manager.advance(2)
+        compute, moe = block.compute_layer, block.moe_layer
+        if prepared is None:
+            shortcut = block._read_shortcut_hidden(residual, recompute_context=None)
+            route, probs = block._moe_router_preprocess(shortcut)
+            compute_input, _ = compute.residual_read(
+                residual, fp32_residual_connection=True, branch_input_dtype=torch.bfloat16
+            )
+            compute_input = compute.norm(compute_input.to(torch.bfloat16))
+        else:
+            compute_input, route = prepared
+            probs, _ = moe.mlp.route(route)
+        routed, _ = moe.mlp.routed_experts_compute(route, probs)
+        update, _ = compute.mixer.forward_post_core_attn(
+            compute.mixer.forward_pre_attn_and_core_attn(compute_input)
+        )
+        producer, consumer_read = compute.residual_write, moe.residual_read_mlp
+        consumer_write = moe.residual_write_mlp
+        residual, shared_input = kernels.wide_residual_write_read_rmsnorm_quant(
+            residual,
+            update,
+            producer.write_map(return_logits=True),
+            block._logits(producer, "retention"),
+            consumer_read.read_map(return_logits=True),
+            moe.pre_mlp_layernorm.weight,
+            num_streams=block.config.wide_residual.num_streams,
+        )
+        shared = moe.mlp.shared_experts_compute(shared_input)
+        if i + 1 < len(blocks):
+            nxt = blocks[i + 1]
+            residual, compute_input, shortcut = (
+                kernels.shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
+                    PendingShortcutAdd(
+                        residual,
+                        routed,
+                        shared,
+                        consumer_write.write_map(return_logits=True),
+                        block._logits(consumer_write, "retention"),
+                    ),
+                    (
+                        nxt.compute_layer.residual_read.read_map(return_logits=True),
+                        nxt.shortcut_residual_read.read_map(return_logits=True),
+                    ),
+                    (nxt.compute_layer.norm.weight, nxt.shortcut_pre_mlp_layernorm.weight),
+                    num_streams=block.config.wide_residual.num_streams,
+                )
+            )
+            prepared = compute_input, shortcut
+        else:
+            residual = block._postprocess(residual, routed, shared, mlp_state=(residual,))
+    return residual
+
+
+@GPU
+def test_fused_block_flags_and_validation():
+    blocks = _fused_blocks(pairs=3)
+    assert all(block.using_shortcut_moe_fused_residual_kernel for block in blocks)
+    assert all(block.compute_layer.using_shortcut_moe_fused_residual_kernel for block in blocks)
+    unfused = _fused_blocks(pairs=1, enabled=False)[0]
+    assert not unfused.using_shortcut_moe_fused_residual_kernel
+    assert not unfused.compute_layer.using_shortcut_moe_fused_residual_kernel
+    with pytest.raises(ValueError, match="require the fused residual kernels"):
+        _run_block(unfused, torch.randn(32, 1, 384, device="cuda"), defer=True)
+    block = _fused_blocks(pairs=1)[0].eval()
+    with pytest.raises(ValueError, match="requires InferenceMode"):
+        block(
+            torch.randn(64, 1, 384, device="cuda"),
+            None,
+            object(),
+            *(None,) * 4,
+            lambda *a: torch.no_grad(),
+        )
+
+
+@GPU
+@pytest.mark.parametrize("checkpointed,gtp", [(False, False), (True, False), (True, True)])
+def test_direct_mxfp8_handoff_always_declares_deferred_consumer(monkeypatch, checkpointed, gtp):
+    blocks = _fused_blocks()
+    mixer = blocks[1].compute_layer.mixer
+    mixer.config = blocks[1].config
+    mixer.in_proj = mixer.input
+    mixer.recompute_in_proj = checkpointed
+    mixer.in_proj.weight.is_gtp_weight_remat = gtp
+    monkeypatch.setattr(mxfp8_handoff, "eligible", lambda linear, *_: linear is mixer.in_proj)
+    residual = torch.randn(1024, 1, 384, device="cuda", requires_grad=True)
+
+    def boundary():
+        # The two-reader boundary runs at the start of the consuming block and emits its
+        # compute input.
+        pending = _run_block(blocks[0], residual, defer=True)
+        return blocks[1]._shortcut_add(pending, lambda *a: nullcontext())[1]
+
+    if checkpointed and not gtp:
+        with pytest.raises(ValueError, match="requires GTP weight finalization"):
+            boundary()
+        # There is no weight-gradient restriction during inference.
+        with torch.no_grad():
+            compute = boundary()
+        assert compute._rowwise_data is not None
+    else:
+        compute = boundary()
+        reader = mxfp8_handoff.reader_for(compute)
+        assert reader is not None and reader.consumer() is mixer.in_proj
+
+
+@GPU
+@pytest.mark.parametrize(
+    "streams,retention,overlap,interval,tokens,hidden",
+    [
+        (s, t, o, i, 1024, 128)
+        for s in range(2, 7)
+        for t in (False, True)
+        for o in (False, True)
+        for i in (None, 16)
+    ]
+    # Production shapes with the overlapped schedule.
+    + [(3, True, True, None, m, h) for m, h in ((16384, 3072), (8192, 4096), (8192, 10240))],
+)
+def test_fused_schedule_matches_serial_oracle(
+    streams, retention, overlap, interval, tokens, hidden
+):
+    """Block outputs, input gradients and every parameter gradient match bit for bit."""
+    torch.manual_seed(1234)
+    blocks = _fused_blocks(streams, retention=retention, pairs=9 if interval else 2, hidden=hidden)
+    blocks[0].config.residual_stream_recompute_num_layers = interval
+    explicit = copy.deepcopy(blocks)
+    if overlap:
+        for block in blocks:
+            block.overlap_mode = True
+            block.route_ready_event = torch.cuda.Event()
+    r = torch.randn(tokens, 1, streams * hidden, device="cuda", requires_grad=True)
+    other = r.detach().clone().requires_grad_(True)
+    with residual_replay_scope(blocks[0].config, True) as manager:
+        actual = _run_blocks(blocks, r, manager)
+    if interval is not None:
+        assert manager is not None
+        assert any(not slot.resident() for slot in manager.slots.values())
+    with residual_replay_scope(explicit[0].config, True) as manager:
+        expected = _explicit_pairs(explicit, other, manager)
+    assert isinstance(actual, torch.Tensor) and actual.dtype == torch.float32
+    assert torch.isfinite(actual).all()
+    assert bytes_equal(actual, expected), "block output"
+    incoming = torch.randn_like(actual)
+    actual.backward(incoming)
+    expected.backward(incoming)
+    assert torch.isfinite(r.grad).all()
+    assert bytes_equal(r.grad, other.grad), "input gradient"
+    for (name, a), (other_name, b) in zip(blocks.named_parameters(), explicit.named_parameters()):
+        assert name == other_name
+        if a.grad is None or b.grad is None:
+            assert a.grad is None and b.grad is None
+        else:
+            assert torch.isfinite(a.grad).all(), name
+            assert bytes_equal(a.grad, b.grad), name
+
+
+def taped_forward(forward, *args, **kwargs):
+    """Launch ``forward`` with a backward tape under the inference schedule, one CTA per row."""
+    choose = forward_kernel.choose_forward_config
+
+    def same_schedule(m, h, streams, readers=1, **options):
+        cfg = choose(m, h, streams, readers, **(options | {"inference": True}))
+        # Split inference readers reduce independently; retain normal tape ownership.
+        return cfg._replace(PARTS=1, SPLIT=False, PAIRED_REDUCE=cfg.PAIRED_REDUCE and not cfg.SPLIT)
+
+    with patch.object(forward_kernel, "choose_forward_config", side_effect=same_schedule):
+        return forward(*args, **(kwargs | {"inference": False}))
+
+
+def forbid_backward_state(monkeypatch):
+    """Fail if inference enters autograd or allocates backward state; returns one entry per
+    non-warmup forward launch."""
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inference entered autograd or allocated backward state")
+
+    targets = (api._Boundary, "apply"), (api, "current_manager"), (forward_kernel, "SavedWrite")
+    for owner, name in targets:
+        monkeypatch.setattr(owner, name, forbidden)
+    launch, observed = forward_kernel._forward.run, []
+
+    def inspect(*args, **kwargs):
+        if not kwargs.get("warmup"):
+            assert kwargs["saved_coefficients"] is None and args[0].summed_update is None
+            assert all(stat is None for stat in kwargs["read_tensors"].rstd)
+            observed.append(True)
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(forward_kernel._forward, "run", inspect)
+    return observed
+
+
+def _inference_and_taped(monkeypatch, execute):
+    """Run ``execute`` on the no-tape inference kernel, then on the fused training kernel with
+    the same schedule and a backward tape (the bitwise oracle); also return reader counts."""
+    launch, calls = forward_kernel.forward, []
+
+    def observe(*args, **kwargs):
+        result = launch(*args, **kwargs)
+        assert kwargs["inference"] is True and result[1] is None
+        calls.append(len(args[1]))
+        return result
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(forward_kernel, "forward", observe)
+        actual = execute()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(forward_kernel, "forward", lambda *a, **k: taped_forward(launch, *a, **k))
+        expected = execute()
+    return actual, expected, calls
+
+
+@GPU
+@pytest.mark.parametrize("hidden", [128, 3072, 4096, 10240])
+@pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode])
+def test_eager_no_grad_block_uses_inference_kernel(monkeypatch, hidden, mode):
+    blocks = _fused_blocks(hidden=hidden).eval()
+    residual = torch.randn(1024, 1, 3 * hidden, device="cuda", requires_grad=True)
+    with mode():
+        actual, expected, calls = _inference_and_taped(
+            monkeypatch, lambda: _run_blocks(blocks, residual)
+        )
+        assert torch.equal(actual, expected)
+        assert actual.grad_fn is None and not actual.requires_grad
+    assert calls == [1, 2, 1]
+
+
+@GPU
+@pytest.mark.parametrize("tokens", [1, 3, 31, 32, 64, 96, 1024])
+@pytest.mark.parametrize("with_context", [False, True])
+def test_fused_block_actual_engine_mode(monkeypatch, tokens, with_context):
+    block = _fused_blocks(pairs=1)[0].eval()
+    block.overlap_mode = True
+    residual = torch.randn(tokens, 1, 384, device="cuda", requires_grad=True)
+    context = object() if with_context else None
+    observed = forbid_backward_state(monkeypatch)
+    mixer = block.compute_layer.mixer
+    calls = []
+
+    def atomic(x, inference_context=None, **kwargs):
+        assert inference_context is context
+        assert not torch.is_grad_enabled()
+        calls.append(True)
+        return mixer.output(torch.tanh(mixer.input(x))), None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inference entered the training split or overlap stream")
+
+    monkeypatch.setattr(mixer, "forward", atomic)
+    monkeypatch.setattr(mixer, "forward_pre_attn_and_core_attn", forbidden)
+    monkeypatch.setattr(mixer, "forward_post_core_attn", forbidden)
+    monkeypatch.setattr(block, "_get_a2a_overlap_stream", forbidden)
+    with InferenceMode.active():
+        result = block(residual, None, context, *(None,) * 4, lambda *args: torch.no_grad())
+    assert calls == [True] and observed == [True]
+    assert not result.requires_grad and result.grad_fn is None
+    assert torch.is_grad_enabled()
+
+
+@GPU
+@pytest.mark.parametrize("tokens", [1, 3, 31, 32, 64, 96])
+def test_fused_block_short_eager_no_grad(tokens):
+    block = _fused_blocks(pairs=1)[0].eval()
+    with torch.inference_mode():
+        result = _run_block(block, torch.randn(tokens, 1, 384, device="cuda"))
+    assert not result.requires_grad
+
+
+# ---------------------------------------------------------------- HybridModel inference
+#
+# The no-tape contract is the fused forward with the same schedule and backward tape. The
+# ordinary unfused path rounds reads before RMSNorm and is not a bitwise oracle.
+
+
+@pytest.fixture
+def model_parallel():
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    yield
+    Utils.destroy_model_parallel()
+
+
+def _hybrid_model(mixer, optimized, hidden, dynamic):
+    config = _fused_config(
+        num_layers=5 if dynamic else 4,
+        hidden_size=hidden,
+        num_attention_heads=hidden // 64,
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        mamba_num_groups=2,
+        mamba_state_dim=32,
+        linear_key_head_dim=32,
+        linear_value_head_dim=64,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        ffn_hidden_size=256,
+        num_moe_experts=2,
+        moe_router_topk=2,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        inference_grouped_gemm_backend="torch",
+        moe_shared_expert_intermediate_size=256,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        moe_shortcut_parallel=True,
+        wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
+        transformer_impl="inference_optimized" if optimized else "transformer_engine",
+    )
+    if mixer == "gdp":
+        spec = specs.gated_delta_product_inference_stack_spec
+        spec = spec if optimized else specs.gated_delta_product_stack_spec
+    else:
+        spec = specs.hybrid_inference_stack_spec if optimized else specs.hybrid_stack_spec
+    pattern = ("GEGE" if mixer == "gdn" else "MEME") + ("*" if dynamic else "")
+    model = HybridModel(
+        config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
+    )
+    model = model.cuda().eval()
+    assert all(
+        isinstance(b, ShortcutMoEBlock) and b.using_shortcut_moe_fused_residual_kernel
+        for b in model.decoder.layers[:2]
+    )
+    return model
+
+
+def _static_prefill_decode(model):
+    ids = torch.randint(0, 128, (2, 99), device="cuda")
+    positions = torch.arange(99, device="cuda").expand(2, -1)
+
+    def execute():
+        context = StaticInferenceContext(2, 128)
+        outputs, states = [], []
+        for start, end in [(0, 96), (96, 97), (97, 98), (98, 99)]:
+            context.sequence_len_offset = start
+            if start:
+                context.enable_decode_mode()
+            result = model(
+                ids[:, start:end],
+                positions[:, start:end],
+                None,
+                inference_context=context,
+                runtime_gather_output=True,
+            )
+            assert not result.requires_grad
+            outputs.append(result.clone())
+            memory = context.key_value_memory_dict
+            states.append({k: tuple(v.clone() for v in vs) for k, vs in memory.items()})
+        assert set(states[0]) == {1, 3}
+        return outputs, states
+
+    return execute
+
+
+def _dynamic_prefill_decode(model):
+    from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.inference_request import DynamicInferenceRequest
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    prompts = [torch.randint(0, 128, (length,), device="cuda") for length in (64, 96)]
+    generated = torch.tensor([17, 23, 29])
+
+    def request(index, prompt, tokens):
+        sampling = SamplingParams(num_tokens_to_generate=tokens)
+        return DynamicInferenceRequest(
+            request_id=index, prompt_tokens=prompt, sampling_params=sampling
+        )
+
+    def execute():
+        context = DynamicInferenceContext(
+            model_config=model.config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=256,
+                max_requests=4,
+                max_tokens=256,
+                materialize_only_last_token_logits=True,
+                mamba_inference_state_config=MambaInferenceStateConfig.from_model(model),
+            ),
+        )
+        for index, prompt in enumerate(prompts):
+            context.add_request(request(index, prompt, 4))
+        outputs, states = [], []
+        for step in range(4):
+            context.initialize_attention_state()
+            if step == 1:
+                assert context.padded_batch_dimensions.decode_req_count > 0
+                assert context.padded_batch_dimensions.prefill_req_count > 0
+            ids, positions = context.current_input_and_position_ids()
+            result = model(
+                ids, positions, None, inference_context=context, runtime_gather_output=True
+            )
+            assert not result.requires_grad
+            outputs.append(result.clone())
+            active = context.get_active_request_count()
+            slots = context.mamba_metadata.request_to_mamba_state_idx[:active].to(
+                device="cuda", dtype=torch.long
+            )
+            states.append(
+                {
+                    key: tuple(v.index_select(0, slots) for v in context.mamba_states_cache(key))
+                    for key in (1, 3)
+                }
+            )
+            if step < 3:
+                context.update_requests(torch.ones(active, dtype=torch.bool), generated[:active])
+            if step == 0:
+                context.add_request(request(2, prompts[0][:32], 3))
+        return outputs, states
+
+    return execute
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize(
+    "dynamic,mixer,optimized,hidden",
+    [(False, mixer, False, hidden) for mixer in ("mamba", "gdp") for hidden in (256, 3072)]
+    + [(True, mixer, opt, 3072) for mixer in ("mamba", "gdp", "gdn") for opt in (False, True)],
+)
+def test_hybrid_inference_prefill_decode(monkeypatch, dynamic, mixer, optimized, hidden):
+    """Real HybridModel prefill/decode (static or dynamic batching, routed experts, recurrent
+    caches) uses only the no-tape kernel and matches the taped forward bit for bit."""
+    model = _hybrid_model(mixer, optimized, hidden, dynamic)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("inference used the training-only mixer split")
+
+    for block in model.decoder.layers[:2]:
+        compute_mixer = block._compute_parts()[3]
+        monkeypatch.setattr(compute_mixer, "forward_pre_attn_and_core_attn", forbidden)
+        monkeypatch.setattr(compute_mixer, "forward_post_core_attn", forbidden)
+    execute = (_dynamic_prefill_decode if dynamic else _static_prefill_decode)(model)
+    with torch.inference_mode(), InferenceMode.active():
+        (outputs, states), (taped_outputs, taped_states), calls = _inference_and_taped(
+            monkeypatch, execute
+        )
+    assert calls == [1, 2, 1] * 4
+    # Recurrent caches advance on every step.
+    for before, after in zip(states, states[1:]):
+        assert all(not torch.equal(before[k][1], after[k][1]) for k in before)
+    assert all(torch.equal(a, b) for a, b in zip(outputs, taped_outputs, strict=True))
+    for a, b in zip(states, taped_states, strict=True):
+        for key in a:
+            assert all(torch.equal(av, bv) for av, bv in zip(a[key], b[key]))

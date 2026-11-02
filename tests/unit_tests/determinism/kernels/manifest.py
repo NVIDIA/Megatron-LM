@@ -110,6 +110,29 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
     ),
+    KernelEntry(
+        name="wide_residual_shortcut_moe",
+        sources=(
+            "megatron/core/fusions/wide_residual_shortcut/api.py",
+            "megatron/core/fusions/wide_residual_shortcut/forward_kernel.py",
+            "megatron/core/fusions/wide_residual_shortcut/backward_kernel.py",
+            "megatron/core/fusions/wide_residual_shortcut/replay_kernel.py",
+            "megatron/core/fusions/wide_residual_shortcut/kernel_utils.py",
+            "megatron/core/fusions/wide_residual_shortcut/mxfp8_handoff.py",
+            "megatron/core/fusions/wide_residual_shortcut/residual_replay.py",
+        ),
+        tests=(
+            K + "test_wide_residual_shortcut.py",
+            "tests/unit_tests/fusions/test_wide_residual_shortcut.py",
+            "tests/unit_tests/models/test_shortcut_block.py",
+        ),
+        kind="triton",
+        notes=(
+            "Includes configurable-epsilon poisoned packet-forward replay for Nano/Super/Ultra, tree-sum RMSNorm, offset-view alignment, paired shared views, queues, "
+            "predecessor-only gradients, exact mixed one-/two-reader checkpoint replay (depths 1/3/16), "
+            "and independently quantized MXFP8 columns including poisoned padding."
+        ),
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -184,7 +207,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="te_fused_cross_entropy",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_te_wrappers.py",),
+        tests=(
+            K + "test_te_wrappers.py",
+            "tests/unit_tests/fusions/test_wide_residual_shortcut.py",
+        ),
         kind="external-lib",
         notes="Replays TE's overwrite_input path when supported.",
     ),
@@ -263,7 +289,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
-        tests=(K + "test_streamwise_residual_ops.py",),
+        tests=(K + "test_streamwise_residual_ops.py", K + "test_wide_residual_shortcut.py"),
         kind="triton",
         notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
         "replay covers identity carry and learned retention.",
@@ -328,6 +354,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_mla_device_placement.py",
             K + "test_te_wrappers.py",
+            "tests/unit_tests/fusions/test_wide_residual_shortcut.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
         ),

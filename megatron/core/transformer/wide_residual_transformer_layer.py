@@ -23,6 +23,10 @@ class WideResidualTransformerLayer(TransformerLayer):
     """Transformer layer carrying a wide stream around ordinary-width branches."""
 
     supports_wide_residual_connections: bool = True
+    # Set by ShortcutMoEBlock at init when the fused shortcut kernels own the self-attention
+    # residual read/norm and write: the layer takes a normalized input and returns the raw
+    # attention output with bias.
+    using_shortcut_moe_fused_residual_kernel: bool = False
 
     def __init__(
         self,
@@ -148,3 +152,20 @@ class WideResidualTransformerLayer(TransformerLayer):
                 return self.residual_write_mlp
             case _:
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
+
+    def _run_input_layernorm(self, hidden_states, *args, **kwargs):
+        """Skip the read and input norm when the fused shortcut kernel already applied them."""
+
+        if self.using_shortcut_moe_fused_residual_kernel:
+            self._input_layernorm_checkpoint_active = False
+            return hidden_states, None, ()
+        return super()._run_input_layernorm(hidden_states, *args, **kwargs)
+
+    def attention_bda_and_cross_attention(self, attention_output_with_bias, *args, **kwargs):
+        """Return the raw attention output when the fused shortcut kernel owns the write."""
+
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return attention_output_with_bias, kwargs.get("context")
+        return super().attention_bda_and_cross_attention(
+            attention_output_with_bias, *args, **kwargs
+        )

@@ -27,6 +27,10 @@ class WideResidualMambaLayer(MambaLayer):
     """Mamba layer carrying a wide stream around its ordinary-width mixer."""
 
     supports_wide_residual_connections: bool = True
+    # Set by ShortcutMoEBlock at init when the fused shortcut kernels own this layer's
+    # residual read/norm and write: the layer takes a normalized input and returns the raw
+    # mixer output.
+    using_shortcut_moe_fused_residual_kernel: bool = False
 
     def __init__(
         self,
@@ -96,6 +100,8 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> tuple[ResidualBranchInput[ResidualConnectionState], ResidualStreamRecomputeContext | None]:
         """Read the wide stream and optionally replay its connected input normalization."""
 
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return ResidualBranchInput(hidden_states, None), None
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
             hidden_states, connection_state = apply_module(self.residual_read)(
@@ -129,6 +135,8 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> Tensor:
         """Write the mixer update, replaying only nonterminal residual writes."""
 
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return mixer_out_with_bias
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
         if recompute_context is not None and not recompute_context.is_block_end:
@@ -153,6 +161,8 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> tuple[Tensor, Tensor, ResidualConnectionState]:
         """Keep WR's existing two-stage tuple for ShortcutMoE callers."""
 
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return ssm_output, None, None
         return ssm_output, state[0], state
 
     def forward_post_core_attn(

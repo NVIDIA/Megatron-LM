@@ -20,6 +20,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import residual_replay_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -147,6 +148,10 @@ class HybridStack(MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if config.moe_shortcut_wide_residual_norm_fusion and not is_mtp_layer:
+            from megatron.core.models.hybrid.hybrid_layer_specs import resolve_fusion_submodules
+
+            submodules = resolve_fusion_submodules(submodules)
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
@@ -682,7 +687,10 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
-        with outer_fp8_context:
+        replay_context = residual_replay_scope(
+            self.config, self.training and self.uses_wide_residual_stream
+        )
+        with outer_fp8_context, replay_context as replay_manager:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -701,6 +709,15 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                # A fused shortcut block hands its unwritten MoE output to an immediately
+                # following fused block, whose two-reader kernel applies it; any other successor (or the
+                # end of the stack) receives the written residual.
+                fused = [
+                    getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
+                    for layer in self.layers
+                ]
+                defer_shortcut_add = [a and b for a, b in zip(fused, fused[1:] + [False])]
+                pending_shortcut_add = None
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -709,6 +726,8 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
+                    if replay_manager is not None:
+                        replay_manager.advance(2 if isinstance(layer, ShortcutMoEBlock) else 1)
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -730,7 +749,9 @@ class HybridStack(MegatronModule):
                             )
                         moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
                         hidden_states = layer(
-                            hidden_states=hidden_states,
+                            hidden_states=(
+                                None if pending_shortcut_add is not None else hidden_states
+                            ),
                             attention_mask=attention_mask,
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
@@ -743,7 +764,12 @@ class HybridStack(MegatronModule):
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
                             padding_mask_by_layout=padding_mask_by_layout,
+                            pending_prev_shortcut_add=pending_shortcut_add,
+                            defer_shortcut_add=defer_shortcut_add[layer_idx],
                         )
+                        pending_shortcut_add = None
+                        if defer_shortcut_add[layer_idx]:
+                            pending_shortcut_add, hidden_states = hidden_states, None
                         residual_stream_recompute_context = moe_recompute_context
                     else:
                         if cp_layout_state is not None:

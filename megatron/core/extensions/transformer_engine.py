@@ -1501,7 +1501,15 @@ class TELinear(te.pytorch.Linear):
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+            if hasattr(x, "_rowwise_data"):
+                from megatron.core.fusions.wide_residual_shortcut.mxfp8_handoff import (
+                    install_linear_hooks,
+                )
+
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+                install_linear_hooks(x, out, self)
+            else:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise

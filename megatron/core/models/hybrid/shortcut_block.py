@@ -17,11 +17,13 @@ device-memory pressure from enabling Shortcut-MoE.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Sequence
 
 import torch
 
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd, validate_input
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -126,6 +128,12 @@ def group_layers_into_shortcut_blocks(
         )
         physical_index += 2
 
+    if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False) and not any(
+        getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
+        for layer in grouped_layers
+    ):
+        if not all(getattr(layer, "is_mtp_layer", False) for layer in layers):
+            raise ValueError("shortcut kernel fusion requires an adjacent Mamba/GDN and MoE pair")
     return grouped_layers
 
 
@@ -234,6 +242,184 @@ class ShortcutMoEBlock(MegatronModule):
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
 
+        # The fused kernels own the pair's residual seams:
+        # shortcut_add_wide_residual_write_two_reader_rmsnorm_quant (previous MoE write + this block's compute and shortcut norms) and
+        # wide_residual_write_read_rmsnorm_quant (compute write + MoE pre-MLP norm).
+        self.using_shortcut_moe_fused_residual_kernel = bool(
+            getattr(self.config, "moe_shortcut_wide_residual_norm_fusion", False)
+            and not self.is_mtp_layer
+        )
+        if self.using_shortcut_moe_fused_residual_kernel:
+            self._validate_fused_residual_kernel()
+            compute_layer.using_shortcut_moe_fused_residual_kernel = True
+
+    def _validate_fused_residual_kernel(self):
+        """Require the residual structure that the fused residual kernels implement."""
+        from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+        from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
+        from megatron.core.transformer.wide_residual_transformer_layer import (
+            WideResidualTransformerLayer,
+        )
+
+        compute = self.compute_layer
+        if not isinstance(compute, (WideResidualMambaLayer, WideResidualTransformerLayer)):
+            raise ValueError(
+                "shortcut kernel fusion requires a wide-residual Mamba/GDN predecessor"
+            )
+        if isinstance(compute, WideResidualTransformerLayer) and (
+            not isinstance(compute.mlp, IdentityOp)
+            or not isinstance(compute.cross_attention, IdentityOp)
+        ):
+            raise ValueError("shortcut kernel fusion requires a compute-only predecessor")
+        compute_read, compute_write, compute_norm, _ = self._compute_parts()
+        connections = (
+            compute_read,
+            compute_write,
+            self.moe_layer._get_mlp_residual_connection("read"),
+            self.moe_layer._get_mlp_residual_connection("write"),
+        )
+        if any(not isinstance(c, StreamwiseSigmoidWideResidualConnection) for c in connections):
+            raise ValueError("shortcut kernel fusion requires streamwise sigmoid connections")
+        if any(c.num_streams != self.config.wide_residual.num_streams for c in connections):
+            raise ValueError("shortcut kernel fusion connections must use the same stream count")
+        for name, norm in (
+            ("the compute layer's input norm", compute_norm),
+            ("pre_mlp_layernorm", self.moe_layer.pre_mlp_layernorm),
+            ("shortcut_pre_mlp_layernorm", self.shortcut_pre_mlp_layernorm),
+        ):
+            if (
+                getattr(norm, "eps", None) is None
+                or getattr(norm, "zero_centered_gamma", False)
+                or getattr(norm, "returns_residual", False)
+            ):
+                raise ValueError(
+                    f"shortcut kernel fusion requires {name} to be a standalone RMSNorm, got "
+                    f"{type(norm).__name__}. Custom stack specs must split input norms from "
+                    "their projections, as in "
+                    "hybrid_layer_specs.wide_residual_shortcut_fusion_stack_spec."
+                )
+        if compute_norm.eps != self.shortcut_pre_mlp_layernorm.eps:
+            # One two-reader kernel normalizes both inputs with a single epsilon.
+            raise ValueError(
+                "shortcut kernel fusion requires the compute layer's input norm and "
+                "shortcut_pre_mlp_layernorm to share an epsilon"
+            )
+        if not self.moe_layer.mlp.use_shared_expert:
+            raise ValueError("shortcut kernel fusion requires a shared expert")
+
+    def _compute_parts(self):
+        """Return the compute layer's read/write connections, input norm and mixer."""
+        from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+
+        compute = self.compute_layer
+        if isinstance(compute, WideResidualMambaLayer):
+            return compute.residual_read, compute.residual_write, compute.norm, compute.mixer
+        return (
+            compute._get_self_attention_residual_connection("read"),
+            compute._get_self_attention_residual_connection("write"),
+            compute.input_layernorm,
+            compute.self_attention,
+        )
+
+    @staticmethod
+    def _logits(connection, kind):
+        """Return a connection's read/write map (or retention) logits for the fused kernels."""
+        if kind == "retention":
+            # None selects the fixed identity branch; it is not a trainable logit.
+            if connection.retention is None:
+                return None
+            return connection.retention(return_logits=True).float()
+        return getattr(connection, f"{kind}_map")(return_logits=True).float()
+
+    def _shortcut_add(self, pending, quant_context_factory):
+        """Apply the previous block's pending MoE write and norm this block's two inputs.
+
+        Returns ``(residual, compute_input, shortcut_input)`` from
+        ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant``.
+        """
+        from megatron.core.fusions import wide_residual_shortcut as kernels
+        from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
+
+        streams = self.config.wide_residual.num_streams
+        compute_read, _, compute_norm, mixer = self._compute_parts()
+        linear = getattr(mixer, "in_proj", getattr(mixer, "linear_qkv", None))
+        with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+            # A GDP input-projection checkpoint keeps its weight hooks in an inner autograd
+            # graph that the boundary's weight edge cannot order; only GTP's explicit
+            # finalization follows the deferred weight GEMM. With activation offload, its
+            # weight-ready notifications are not preserved either, so that combination stays
+            # on the qualified BF16 handoff.
+            recompute = getattr(mixer, "recompute_in_proj", False)
+            offload = recompute and getattr(
+                mixer.config, "fine_grained_activation_offloading", False
+            )
+            direct = (
+                linear
+                if not offload and mxfp8_handoff.eligible(linear, pending.routed, streams)
+                else None
+            )
+            if (
+                torch.is_grad_enabled()
+                and direct is not None
+                and recompute
+                and not getattr(direct.weight, "is_gtp_weight_remat", False)
+            ):
+                raise ValueError(
+                    "direct shortcut MXFP8 requires deferred weight gradients; "
+                    "GDP input-projection recompute requires GTP weight finalization. "
+                    "Disable gdp_in_proj recompute or use a BF16 handoff."
+                )
+            return kernels.shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
+                pending,
+                (
+                    self._logits(compute_read, "read"),
+                    self._logits(self.shortcut_residual_read, "read"),
+                ),
+                (compute_norm.weight, self.shortcut_pre_mlp_layernorm.weight),
+                mxfp8_handoff=direct is not None,
+                mxfp8_consumer=direct,
+                num_streams=streams,
+                epsilon=compute_norm.eps,  # equal to the shortcut norm's (validated at init)
+            )
+
+    def _wide_residual_write_read(self, residual, update):
+        """Write the compute update and emit the shared-expert input (one-reader kernel)."""
+        from megatron.core.fusions import wide_residual_shortcut as kernels
+        from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+        streams = self.config.wide_residual.num_streams
+        _, compute_write, _, _ = self._compute_parts()
+        shared_expert = getattr(self.moe_layer.mlp, "shared_experts", None)
+        return kernels.wide_residual_write_read_rmsnorm_quant(
+            residual,
+            update,
+            self._logits(compute_write, "write"),
+            self._logits(compute_write, "retention"),
+            self._logits(self.moe_layer._get_mlp_residual_connection("read"), "read"),
+            self.moe_layer.pre_mlp_layernorm.weight,
+            mxfp8_consumer=(
+                shared_expert.linear_fc1
+                if shared_expert is not None
+                and type(shared_expert).forward is SharedExpertMLP.forward
+                and not shared_expert.use_shared_expert_gate
+                and mxfp8_handoff.eligible(shared_expert.linear_fc1, update, streams)
+                else None
+            ),
+            num_streams=streams,
+            epsilon=self.moe_layer.pre_mlp_layernorm.eps,
+        )
+
+    def _fused_compute_input(self, residual):
+        """Read and norm the compute layer's input when no pending shortcut add precedes it."""
+        compute_read, _, compute_norm, _ = self._compute_parts()
+        compute_input, _ = apply_module(compute_read)(
+            residual,
+            fp32_residual_connection=self.config.fp32_residual_connection,
+            branch_input_dtype=self.config.params_dtype,
+        )
+        return apply_module(compute_norm)(compute_input.to(dtype=self.config.params_dtype))
+
     def _read_shortcut_hidden(
         self,
         hidden_states: torch.Tensor,
@@ -256,9 +442,15 @@ class ShortcutMoEBlock(MegatronModule):
         padding_mask=None,
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
+        normalized: bool = False,
     ):
-        """Run shortcut normalization, routing, and dispatch preprocessing."""
-        if recompute_context is not None:
+        """Run shortcut normalization, routing, and dispatch preprocessing.
+
+        ``normalized`` input already went through the shortcut norm (fused two-reader kernel).
+        """
+        if normalized:
+            shortcut_input = shortcut_hidden
+        elif recompute_context is not None:
             shortcut_input = recompute_context.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
             )
@@ -288,13 +480,20 @@ class ShortcutMoEBlock(MegatronModule):
         padding_mask=None,
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
+        fused_residual: torch.Tensor | None = None,
     ):
         """Run the paired MoE layer's pre-MLP norm and shared experts.
+
+        With ``fused_residual``, ``hidden_states`` is the compute layer's raw update and
+        ``wide_residual_write_read_rmsnorm_quant`` writes it and emits the shared-expert input.
 
         Returns:
             `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
         """
-        if recompute_context is None:
+        if fused_residual is not None:
+            residual, pre_mlp_output = self._wide_residual_write_read(fused_residual, hidden_states)
+            mlp_state = (residual,)
+        elif recompute_context is None:
             pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
                 hidden_states
             )
@@ -317,8 +516,22 @@ class ShortcutMoEBlock(MegatronModule):
         moe_unflatten_mbs=None,
         mlp_state=(),
         recompute_context: ResidualStreamRecomputeContext | None = None,
+        defer_shortcut_add: bool = False,
     ):
-        """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
+        """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA.
+
+        ``defer_shortcut_add`` returns the MoE write as a PendingShortcutAdd for the next fused
+        block's ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` instead.
+        """
+        if defer_shortcut_add:
+            moe_write = self.moe_layer._get_mlp_residual_connection("write")
+            return PendingShortcutAdd(
+                residual,
+                self.moe_layer.mlp.postprocess(combined_output, None),
+                shared_expert_output,
+                self._logits(moe_write, "write"),
+                self._logits(moe_write, "retention"),
+            )
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
@@ -435,6 +648,19 @@ class ShortcutMoEBlock(MegatronModule):
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             )
+        if self.using_shortcut_moe_fused_residual_kernel:
+            # A compute-only attention layer ends after its attention branch; the flagged
+            # layer returns the raw (output, bias) there.
+            hidden_states, _ = self.compute_layer._forward_attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
+            return hidden_states
         hidden_states, _ = self.compute_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -461,14 +687,95 @@ class ShortcutMoEBlock(MegatronModule):
         attn_recompute_context: ResidualStreamRecomputeContext | None = None,
         moe_recompute_context: ResidualStreamRecomputeContext | None = None,
         padding_mask_by_layout=None,
+        pending_prev_shortcut_add: PendingShortcutAdd | None = None,
+        defer_shortcut_add: bool = False,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
         In inference the paired layer runs its ordinary forward instead of the two-stage split,
         which never updates KV-cache or recurrent state, and communication stays on the current
         stream.
-        """
 
+        With the fused residual kernels, ``pending_prev_shortcut_add`` (instead of
+        ``hidden_states``) carries the previous fused block's unwritten MoE output, and
+        ``defer_shortcut_add`` returns this block's MoE output the same way instead of writing it.
+        """
+        fused = self.using_shortcut_moe_fused_residual_kernel
+        if fused and inference_context is not None and not InferenceMode.is_active():
+            raise ValueError("shortcut inference_context requires InferenceMode.active()")
+        if not fused and (pending_prev_shortcut_add is not None or defer_shortcut_add):
+            raise ValueError("deferred shortcut adds require the fused residual kernels")
+        if fused:
+            unsupported = [
+                name
+                for name, value in (
+                    ("packed_seq_params", packed_seq_params),
+                    ("padding_mask", padding_mask),
+                    ("cp_layout_state", cp_layout_state),
+                    ("packed_sequence_cp_metadata", packed_sequence_cp_metadata),
+                    ("attn_recompute_context", attn_recompute_context),
+                    ("moe_recompute_context", moe_recompute_context),
+                    # HybridModel passes per-layout masks even without CP; only real masks count.
+                    (
+                        "padding_mask_by_layout",
+                        next(
+                            (m for m in (padding_mask_by_layout or {}).values() if m is not None),
+                            None,
+                        ),
+                    ),
+                )
+                if value is not None
+            ]
+            if unsupported:
+                # Fused residuals use checkpoint replay, not residual-stream recompute.
+                raise ValueError(
+                    "shortcut kernel fusion requires eager, unpacked execution; got "
+                    + ", ".join(unsupported)
+                )
+        # Fused inference never builds an autograd graph.
+        grad_context = (
+            torch.set_grad_enabled(torch.is_grad_enabled() and not InferenceMode.is_active())
+            if fused
+            else nullcontext()
+        )
+        with grad_context:
+            return self._forward(
+                hidden_states,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                quant_context_factory,
+                cp_layout_state,
+                packed_sequence_cp_metadata,
+                attn_recompute_context,
+                moe_recompute_context,
+                padding_mask_by_layout,
+                pending_prev_shortcut_add,
+                defer_shortcut_add,
+            )
+
+    def _forward(
+        self,
+        hidden_states,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        quant_context_factory,
+        cp_layout_state,
+        packed_sequence_cp_metadata,
+        attn_recompute_context,
+        moe_recompute_context,
+        padding_mask_by_layout,
+        pending_prev_shortcut_add,
+        defer_shortcut_add,
+    ):
+        fused = self.using_shortcut_moe_fused_residual_kernel
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
             select_token_dispatcher()
@@ -510,16 +817,36 @@ class ShortcutMoEBlock(MegatronModule):
                 self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
+        # The fused kernels own the residual seams; the flagged compute layer skips its own read,
+        # norm and write. A pending shortcut add already produced both normalized inputs.
+        fused_residual = None
+        shortcut_add = fused and pending_prev_shortcut_add is not None
+        if shortcut_add:
+            fused_residual, hidden_states, moe_hidden_states = self._shortcut_add(
+                pending_prev_shortcut_add, quant_context_factory
+            )
+        elif fused:
+            fused_residual = moe_hidden_states = hidden_states = hidden_states.float()
+            validate_input(
+                fused_residual,
+                self.config.hidden_size,
+                self.config.wide_residual.num_streams,
+                inference=not torch.is_grad_enabled(),
+            )
+
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            moe_hidden_states = self._read_shortcut_hidden(
-                moe_hidden_states, recompute_context=attn_recompute_context
-            )
+            if not shortcut_add:
+                moe_hidden_states = self._read_shortcut_hidden(
+                    moe_hidden_states, recompute_context=attn_recompute_context
+                )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
                 padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 recompute_context=attn_recompute_context,
+                # Only the fused shortcut add passes it, keeping the unfused call unchanged.
+                **({"normalized": True} if shortcut_add else {}),
             )
             if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
@@ -527,6 +854,8 @@ class ShortcutMoEBlock(MegatronModule):
         # Launch the input and attn of the attention layer
         paired_state = None  # initialize variable early to make pylint happy
         with quant_context_factory(attn_config, self.attn_layer_idx):
+            if fused and not shortcut_add:
+                hidden_states = self._fused_compute_input(fused_residual)
             if inference:
                 attn_layer_output = self._forward_compute_atomic(
                     hidden_states,
@@ -575,8 +904,17 @@ class ShortcutMoEBlock(MegatronModule):
                     attn_layer_output = self.compute_layer.forward_post_core_attn(
                         *paired_state, residual_stream_recompute_context=attn_recompute_context
                     )
-                if isinstance(attn_layer_output, tuple):
+                if isinstance(attn_layer_output, tuple) and not fused:
                     attn_layer_output = attn_layer_output[0]
+
+        if fused:
+            # The flagged compute layer returns its raw output: (update, bias) for Mamba/GDN,
+            # ((update, bias), context) for attention.
+            if isinstance(attn_layer_output[0], tuple):
+                attn_layer_output = attn_layer_output[0]
+            attn_layer_output, bias = attn_layer_output
+            if bias is not None:
+                raise ValueError("shortcut kernel fusion requires a bias-free mixer projection")
 
         if cp_layout_state is not None:
             attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(
@@ -591,6 +929,7 @@ class ShortcutMoEBlock(MegatronModule):
                     padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
+                    **({"fused_residual": fused_residual} if fused else {}),
                 )
             )
             if overlap:
@@ -606,6 +945,7 @@ class ShortcutMoEBlock(MegatronModule):
                 moe_unflatten_mbs=moe_unflatten_mbs,
                 mlp_state=mlp_state,
                 recompute_context=moe_recompute_context,
+                **({"defer_shortcut_add": True} if defer_shortcut_add else {}),
             )
         if cp_layout_state is not None:
             output = cp_layout_state.finalize_layer(self.moe_local_idx, output)

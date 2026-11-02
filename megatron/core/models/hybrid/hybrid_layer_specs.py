@@ -688,6 +688,48 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 )
 
 
+def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Static split input norms, with canonical sharded checkpoint names retained."""
+    submodules, layers = stack_spec.submodules, {}
+    for name, branch_name, norm_name, projection_name in (
+        ("mamba_layer", "mixer", "norm", "in_proj"),
+        ("gdn_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("gdn2_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("attention_layer", "self_attention", "input_layernorm", "linear_qkv"),
+    ):
+        spec = getattr(submodules, name)
+        branch = getattr(spec.submodules, branch_name)
+        projection = getattr(branch.submodules, projection_name)
+        projection = {
+            TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+            InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+        }.get(projection)
+        if projection is None:
+            continue
+        branch = replace(
+            branch, submodules=replace(branch.submodules, **{projection_name: projection})
+        )
+        mapping = dict(spec.submodules.sharded_state_dict_keys_map)
+        mapping[norm_name + "."] = branch_name + "." + projection_name + ".layer_norm_"
+        layers[name] = replace(
+            spec,
+            submodules=replace(
+                spec.submodules,
+                **{branch_name: branch, norm_name: TENorm},
+                sharded_state_dict_keys_map=mapping,
+            ),
+        )
+    return replace(stack_spec, submodules=replace(submodules, **layers))
+
+
+wide_residual_shortcut_fusion_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_hybrid_stack_spec
+)
+wide_residual_shortcut_fusion_gdp_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_stack_spec
+)
+
+
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
@@ -697,3 +739,14 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 # Preserve the existing --spec import path; C/H/W use the standard static stack spec.
 hybrid_dsv4_stack_spec = hybrid_stack_spec
+
+
+def resolve_fusion_submodules(submodules):
+    """Select split input norms for the built-in training and inference stacks."""
+    for prefix in ("hybrid", "gated_delta_product"):
+        for suffix in ("", "_inference"):
+            name = f"{prefix}{suffix}_stack_spec"
+            original, wide = globals()[name], globals()["wide_residual_" + name]
+            if submodules is original.submodules or submodules is wide.submodules:
+                return _shortcut_fusion_stack_spec(wide).submodules
+    return submodules

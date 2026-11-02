@@ -430,6 +430,9 @@ def expand_wide_residual_stream(hidden_states: Tensor, num_streams: int) -> Tens
 def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
     """Return whether selective residual-stream replay is active for this forward."""
 
+    if config.moe_shortcut_wide_residual_norm_fusion:
+        # Fused stacks replay residuals through residual_replay_scope, not ordered replay.
+        return False
     return bool(
         training
         and torch.is_grad_enabled()

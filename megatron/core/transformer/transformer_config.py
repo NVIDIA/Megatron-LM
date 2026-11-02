@@ -57,6 +57,67 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def validate_shortcut_fusion_config(config):
+    """Reject incompatible numerical and scheduling features before building layers."""
+    if not config.moe_shortcut_wide_residual_norm_fusion:
+        return
+    prefix = "moe_shortcut_wide_residual_norm_fusion"
+    if not config.moe_shortcut_connection or config.wide_residual is None:
+        raise ValueError(f"{prefix} requires shortcut MoE and wide_residual")
+    streams = config.wide_residual.num_streams
+    if type(streams) is not int or not 2 <= streams <= 6:
+        raise ValueError(f"{prefix} requires 2 <= wide_residual.num_streams <= 6")
+    if not 32 <= config.hidden_size <= 10240 or config.hidden_size % 32:
+        raise ValueError(f"{prefix} requires H in [32, 10240], divisible by 32")
+    interval = config.residual_stream_recompute_num_layers
+    if type(interval) is int and interval > 1 and config.hidden_size == 32:
+        raise ValueError(
+            f"{prefix} replay intervals require a native streamwise writer; "
+            "H=32 requires residual_stream_recompute_num_layers=1"
+        )
+    if not config.fp32_residual_connection:
+        raise ValueError(
+            f"{prefix} requires fp32_residual_connection=True (--fp32-residual-connection)"
+        )
+    if config.params_dtype != torch.bfloat16:
+        raise ValueError(f"{prefix} requires BF16 branch parameters")
+    if (
+        config.normalization != "RMSNorm"
+        or config.layernorm_epsilon != 1e-5
+        or config.layernorm_zero_centered_gamma
+    ):
+        raise ValueError(f"{prefix} requires ordinary RMSNorm with epsilon 1e-5")
+    wr = config.wide_residual
+    if wr.learned_retention and wr.retention_max_forget != 0.1:
+        raise ValueError(f"{prefix} requires retention_max_forget=0.1 when retention is learned")
+    # Expert MLP offloading is owned entirely by the existing MoE leaf module.
+    # It does not offload tensors saved by the fused residual boundaries.
+    expert_only_offload = set(config.offload_modules or ()) == {"fused_group_mlp"}
+    recompute_modules = set(config.recompute_modules or ())
+    unsupported = {
+        "hidden_dropout": config.hidden_dropout != 0,
+        "add_bias_linear": config.add_bias_linear,
+        "moe_shortcut_post_norm": config.moe_shortcut_post_norm,
+        "moe_shared_expert_overlap": config.moe_shared_expert_overlap,
+        "recompute_granularity": config.recompute_granularity not in (None, "selective"),
+        # Fused seams own the shortcut norm and residual replay.
+        "shortcut_pre_mlp_layernorm recompute": "shortcut_pre_mlp_layernorm" in recompute_modules,
+        "residual_stream recompute": "residual_stream" in recompute_modules,
+        "fine_grained_activation_offloading": (
+            config.fine_grained_activation_offloading and not expert_only_offload
+        ),
+        "cpu_offloading": config.cpu_offloading,
+        "context_parallel_size > 1": config.context_parallel_size != 1,
+        # A fused block hands its unwritten MoE output to the next block on the same stage.
+        "pipeline_model_parallel_size > 1": config.pipeline_model_parallel_size != 1,
+    }
+    invalid = [name for name, enabled in unsupported.items() if enabled]
+    if invalid:
+        raise ValueError(f"{prefix} does not support: {', '.join(invalid)}")
+    if not config.moe_shared_expert_intermediate_size:
+        raise ValueError(f"{prefix} requires a shared expert")
+
+
 @dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
@@ -1442,6 +1503,16 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Wide Residual Configuration
     ####################
+    moe_shortcut_wide_residual_norm_fusion: bool = False
+    """Fuse wide-residual Mamba/GDN shortcut-MoE write/read/RMSNorm seams.
+
+    Requires shortcut MoE, 2--6 wide streams, BF16 branches, ordinary RMSNorm,
+    bias-free/dropout-free eager execution, FP32 residuals, and a shared expert.
+    Training requires local flattened tokens divisible by 1024; no-grad inference
+    accepts any positive count (MXFP8 handoffs require multiples of 32).
+    Hidden size must be divisible by 32 and <=10240.
+    """
+
     wide_residual: Optional[WideResidualConfig] = None
     """Optional streamwise wide-residual architecture configuration.
 
@@ -1450,9 +1521,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     residual_stream_recompute_num_layers: Optional[int] = None
-    """Number of local layers per ordered residual-stream replay block.
+    """Number of local layers between residual-stream checkpoints.
 
-    ``None`` places all local layers in one block. This setting requires selective
+    With shortcut kernel fusion, ``None`` or 1 keeps each layer's residual;
+    larger values share reconstructed residuals backward without forward replay
+    or another recompute flag.
+    Complete shortcut pairs stay in the same block. Without fusion, ``None``
+    places all local layers in one block and this setting requires selective
     recomputation with ``"residual_stream"`` in ``recompute_modules``.
     """
 
@@ -1820,6 +1895,8 @@ class TransformerConfig(ModelParallelConfig):
         # downstream reads a plain bool.
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
+
+        validate_shortcut_fusion_config(self)
 
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
@@ -3118,7 +3195,10 @@ class TransformerConfig(ModelParallelConfig):
                 "'residual_stream' in recompute_modules requires "
                 "recompute_granularity='selective'."
             )
-        if use_residual_stream_recompute:
+        if use_residual_stream_recompute or (
+            self.moe_shortcut_wide_residual_norm_fusion
+            and self.residual_stream_recompute_num_layers is not None
+        ):
             if self.wide_residual is None:
                 raise ValueError(
                     "'residual_stream' recomputation requires a configured wide residual stream."
