@@ -162,10 +162,6 @@ class T5Model(LanguageModule):
     ):
 
         if pg_collection is not None:
-            if 'embd' not in vars(pg_collection):
-                raise ValueError(
-                    "T5Model pg_collection must have embd; explicitly set it to None when unused"
-                )
             if (
                 share_embeddings_and_output_weights
                 and config.pipeline_model_parallel_size > 1
