@@ -932,6 +932,8 @@ def validate_args(args, defaults={}):
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        assert args.ckpt_format in ('torch_dist', 'torch_dcp'), \
+            '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-torch-fsdp2 is not supported with pipeline parallelism'
         assert args.expert_model_parallel_size == 1, \
@@ -1026,6 +1028,9 @@ def validate_args(args, defaults={}):
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
+
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
         if args.megatron_fsdp_version == 2:
             assert not args.use_distributed_optimizer, \
@@ -1221,6 +1226,8 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    if args.save is not None and args.save_params_interval is not None:
+        assert not args.overlap_param_gather
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1526,23 +1533,19 @@ def validate_args(args, defaults={}):
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
 
-    # The checkpoint rules that need another section's value, for every CLI entry point whatever
-    # container it builds: the inference container has no ddp or optimizer section to check the
-    # FSDP pairings from, so a CLI run checks them here, from the arguments, as before.
-    checkpoint_config_from_args(args).validate_run(
-        use_distributed_optimizer=getattr(args, 'use_distributed_optimizer', False),
-        use_torch_fsdp2=getattr(args, 'use_torch_fsdp2', False),
-        use_megatron_fsdp=getattr(args, 'use_megatron_fsdp', False),
-        use_gloo_process_groups=getattr(args, 'use_gloo_process_groups', True),
-        overlap_param_gather=getattr(args, 'overlap_param_gather', False),
-    )
-
-    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks. The CLI checks the
+    # checkpoint format against the FSDP wrappers here, for every entry point whatever container
+    # it builds; the containers check the same pairings from their own sections.
     if args.ckpt_format == "torch_dcp":
+        assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
         assert args.tensor_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
         assert args.pipeline_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
+
+    # fsdp_dtensor checkpointing format checks.
+    if args.ckpt_format == "fsdp_dtensor":
+        assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
     # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
     # because they are mutually-exclusive top-level dataset selectors that both
@@ -1704,8 +1707,17 @@ def validate_args(args, defaults={}):
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
     )
 
-    # Without Gloo process groups the distributed optimizer needs a distributed checkpoint
-    # format: checked by CheckpointConfig.validate_run() against the owning sections.
+    # Make sure all functionality that requires Gloo process groups is disabled.
+    if not args.use_gloo_process_groups:
+        if args.use_distributed_optimizer:
+            # If using distributed optimizer, must use distributed checkpointing.
+            # Legacy checkpointing uses Gloo process groups to collect full distributed
+            # optimizer state in the CPU memory of DP rank 0.
+            assert args.use_dist_ckpt
+
+            if args.dist_ckpt_optim_fully_reshardable:
+                assert not args.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."

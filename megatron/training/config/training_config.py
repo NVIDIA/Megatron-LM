@@ -784,7 +784,7 @@ class CheckpointConfig:
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
         # The effective async policy: without a persistent worker a distributed async save is
-        # disabled at finalize (finalize_checkpoint_config), so the capability is only required
+        # disabled when the container finalizes, so the capability is only required
         # when the save stays asynchronous.
         if (
             self.async_save
@@ -887,69 +887,6 @@ class CheckpointConfig:
                 "--replication requires args.non_persistent_ckpt_type == 'local', but got: "
                 f"{self.non_persistent_ckpt_type}"
             )
-
-    def validate_run(
-        self,
-        *,
-        use_distributed_optimizer: bool | None = None,
-        use_torch_fsdp2: bool | None = None,
-        use_megatron_fsdp: bool | None = None,
-        use_gloo_process_groups: bool | None = None,
-        overlap_param_gather: bool | None = None,
-    ) -> None:
-        """Check this section against the sections of the run that own the other side.
-
-        Keyword form, as ``SchedulerConfig.validate_run``. ``None`` means the container has no
-        section owning that value and the check is skipped: the inference container passes its
-        ``dist`` values only.
-        """
-        if use_torch_fsdp2:
-            assert self.ckpt_format in ('torch_dist', 'torch_dcp'), \
-                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
-        if use_torch_fsdp2 is not None and self.ckpt_format == "torch_dcp":
-            assert use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
-        if use_megatron_fsdp:
-            assert self.ckpt_format == "fsdp_dtensor", \
-                "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-        if use_megatron_fsdp is not None and self.ckpt_format == "fsdp_dtensor":
-            assert use_megatron_fsdp, \
-                "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
-        if use_gloo_process_groups is False and use_distributed_optimizer:
-            # Legacy checkpointing uses Gloo process groups to collect the full distributed
-            # optimizer state in the CPU memory of DP rank 0.
-            assert self.use_dist_ckpt
-            if self.dist_ckpt_optim_fully_reshardable:
-                assert not self.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
-        if overlap_param_gather and self.save is not None:
-            assert self.save_params_interval is None
-
-    def finalize_checkpoint_config(
-        self, *, skip_train: bool = False, perform_rl_step: bool = False
-    ) -> None:
-        """Apply the derivations ``validate_args`` applies to the arguments, once, at finalize.
-
-        The conditions are the legacy ones. Each warning fires only when a value changes, so a
-        CLI run, whose arguments ``validate_args`` already normalized, stays silent. Idempotent.
-        """
-        from megatron.training.utils import warn_rank_0
-
-        if self.ckpt_convert_format is not None:
-            self.exit_on_missing_checkpoint = True
-        if self.use_dist_ckpt and self.async_save and not self.use_persistent_ckpt_worker:
-            # A legacy torch save keeps async_save and reaches the unsupported-async error in
-            # save_checkpoint, as before.
-            warn_rank_0(
-                '--async-save is not supported without --use-persistent-ckpt-worker. '
-                'Disabling --async-save.'
-            )
-            self.async_save = False
-        if not self.replication and self.replication_jump:
-            warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
-            self.replication_jump = None
-        if skip_train and not perform_rl_step and self.load_optim:
-            warn_rank_0('enabling --no-load-optim when skipping training.')
-            self.load_optim = False
 
 
 @dataclass(kw_only=True)

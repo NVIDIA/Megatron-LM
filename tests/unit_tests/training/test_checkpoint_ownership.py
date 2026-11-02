@@ -350,21 +350,28 @@ def test_finalize_applies_the_legacy_flips_once(monkeypatch, run_config, warning
     assert checkpoint.replication_jump is None
     assert checkpoint.load_optim is inference
     assert len(warnings_log) == (2 if inference else 3)
-    # Already derived: nothing changes and nothing is repeated.
-    checkpoint.finalize_checkpoint_config(skip_train=not inference)
+    # Already derived: a second finalize changes nothing and repeats no warning.
+    cfg.finalize()
     assert len(warnings_log) == (2 if inference else 3)
 
 
-def test_the_flips_keep_their_legacy_conditions(warnings_log):
-    legacy_torch = CheckpointConfig(async_save=True, ckpt_format="torch")
-    legacy_torch.finalize_checkpoint_config()
-    assert legacy_torch.async_save is True
-    zero_jump = CheckpointConfig(replication_jump=0)
-    zero_jump.finalize_checkpoint_config()
-    assert zero_jump.replication_jump == 0
-    rl = CheckpointConfig()
-    rl.finalize_checkpoint_config(skip_train=True, perform_rl_step=True)
-    assert rl.load_optim is True
+def test_the_flips_keep_their_legacy_conditions(monkeypatch, run_config, warnings_log):
+    # The async flip applies to distributed formats only: a legacy torch save keeps async_save.
+    legacy_torch = _inference_container(async_save=True, ckpt_format="torch")
+    legacy_torch.finalize()
+    assert legacy_torch.checkpoint.async_save is True
+    # A zero jump is not "a jump": nothing to clear.
+    zero_jump = _inference_container(replication_jump=0)
+    zero_jump.finalize()
+    assert zero_jump.checkpoint.replication_jump == 0
+    # --skip-train keeps the optimizer load under an RL step.
+    run_config.validation.skip_train = True
+    run_config.rl.perform_rl_step = True
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
+    monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
+    run_config.finalize()
+    assert run_config.checkpoint.load_optim is True
     assert warnings_log == []
 
 
@@ -589,3 +596,19 @@ def test_consumers_read_no_checkpoint_name_from_args():
 def test_validate_args_keeps_the_cross_section_checks_for_every_entry_point(argv, defaults, match):
     with pytest.raises(AssertionError, match=match):
         _validated(*argv, defaults=defaults)
+
+
+def test_the_cli_gloo_check_sees_the_rewritten_distributed_optimizer(monkeypatch):
+    """validate_args turns the distributed optimizer on for Megatron-FSDP v1 before it checks the
+    gloo-less optimizer rules, as on main; a check placed earlier would miss the rewrite."""
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    argv = [
+        "--use-megatron-fsdp",
+        "--ckpt-format",
+        "fsdp_dtensor",
+        "--disable-gloo-process-groups",
+        "--dist-ckpt-optim-fully-reshardable",
+        "--distrib-optim-fully-reshardable-mem-efficient",
+    ]
+    with pytest.raises(AssertionError, match="requires -enable-gloo-process-groups"):
+        _validated(*argv)

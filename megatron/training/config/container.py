@@ -273,6 +273,30 @@ class ConfigContainerBase:
 
         return result
 
+
+def _derive_checkpoint_policy(checkpoint: CheckpointConfig) -> None:
+    """The checkpoint derivations both containers apply at finalize: the ones ``validate_args``
+    applies to the arguments (a conversion exits on a missing checkpoint; an asynchronous
+    distributed save needs the persistent worker; a replication jump without replication is
+    dropped). Each warning fires only when a value changes, so a CLI run stays silent; a second
+    finalize changes nothing. The training container adds the ``skip_train`` rule inline."""
+    from megatron.training.utils import warn_rank_0
+
+    if checkpoint.ckpt_convert_format is not None:
+        checkpoint.exit_on_missing_checkpoint = True
+    if checkpoint.use_dist_ckpt and checkpoint.async_save and not checkpoint.use_persistent_ckpt_worker:
+        # A legacy torch save keeps async_save and reaches the unsupported-async error in
+        # save_checkpoint, as before.
+        warn_rank_0(
+            '--async-save is not supported without --use-persistent-ckpt-worker. '
+            'Disabling --async-save.'
+        )
+        checkpoint.async_save = False
+    if not checkpoint.replication and checkpoint.replication_jump:
+        warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
+        checkpoint.replication_jump = None
+
+
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
@@ -386,15 +410,35 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
-        self.checkpoint.validate_run(
-            use_distributed_optimizer=self.optimizer.use_distributed_optimizer,
-            use_torch_fsdp2=self.dist.use_torch_fsdp2,
-            use_megatron_fsdp=self.ddp.use_megatron_fsdp,
-            use_gloo_process_groups=self.dist.use_gloo_process_groups,
-            overlap_param_gather=self.ddp.overlap_param_gather,
-        )
+        self._validate_checkpoint()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
+
+    def _validate_checkpoint(self) -> None:
+        """Check the checkpoint format and optimizer policy against the sections that own the
+        other side (ddp, dist, optimizer). Read-only; the CLI runs the same checks from the
+        arguments in ``validate_args``."""
+        checkpoint, ddp, dist = self.checkpoint, self.ddp, self.dist
+        if dist.use_torch_fsdp2:
+            assert checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
+                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
+        if checkpoint.ckpt_format == "torch_dcp":
+            assert dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+        if ddp.use_megatron_fsdp:
+            assert checkpoint.ckpt_format == "fsdp_dtensor", \
+                "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+        if checkpoint.ckpt_format == "fsdp_dtensor":
+            assert ddp.use_megatron_fsdp, \
+                "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+        if not dist.use_gloo_process_groups and self.optimizer.use_distributed_optimizer:
+            # Legacy checkpointing uses Gloo process groups to collect the full distributed
+            # optimizer state in the CPU memory of DP rank 0.
+            assert checkpoint.use_dist_ckpt
+            if checkpoint.dist_ckpt_optim_fully_reshardable:
+                assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if ddp.overlap_param_gather and checkpoint.save is not None:
+            assert checkpoint.save_params_interval is None
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -420,10 +464,15 @@ class PretrainConfigContainer(ConfigContainerBase):
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
         from megatron.training import get_args
 
-        # Checkpoint derivations first: the RL check below reads the derived load_optim.
-        self.checkpoint.finalize_checkpoint_config(
-            skip_train=self.validation.skip_train, perform_rl_step=self.rl.perform_rl_step
-        )
+        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
+        # conditions are validate_args', and each warning fires only when a value changes, so a
+        # CLI run, whose arguments validate_args already normalized, stays silent.
+        _derive_checkpoint_policy(self.checkpoint)
+        if self.validation.skip_train and not self.rl.perform_rl_step and self.checkpoint.load_optim:
+            from megatron.training.utils import warn_rank_0
+
+            warn_rank_0('enabling --no-load-optim when skipping training.')
+            self.checkpoint.load_optim = False
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
@@ -501,8 +550,17 @@ class InferenceConfigContainer(ConfigContainerBase):
     def validate(self) -> None:
         """Validate each section, then the checkpoint format against the sections inference owns."""
         super().validate()
-        self.checkpoint.validate_run(use_torch_fsdp2=self.dist.use_torch_fsdp2)
+        self._validate_checkpoint()
+
+    def _validate_checkpoint(self) -> None:
+        """The torch_dcp / FSDP2 pairing, the one cross-section checkpoint rule inference can
+        express: it has no ddp or optimizer section (the CLI checks those from the arguments)."""
+        if self.dist.use_torch_fsdp2:
+            assert self.checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
+                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
+        if self.checkpoint.ckpt_format == "torch_dcp":
+            assert self.dist.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
 
     def _finalize(self) -> None:
         super()._finalize()
-        self.checkpoint.finalize_checkpoint_config()
+        _derive_checkpoint_policy(self.checkpoint)
