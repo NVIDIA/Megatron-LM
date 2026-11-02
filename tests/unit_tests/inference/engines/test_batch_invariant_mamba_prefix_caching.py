@@ -51,6 +51,12 @@ from tests.unit_tests.models.test_gpt_model_batch_invariant import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+# Production lets FA4 choose a KV split count, but the installed FA4 cannot split KV
+# on SM90. Speculative refit runs leave batch-invariant mode, so FA4 picks a split there.
+_FA4_SPLIT_KV_UNSUPPORTED = (
+    HAVE_FA4 and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+)
+
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -365,6 +371,7 @@ class TestBatchInvariantMambaPrefixCaching:
             )
         assert cached == baseline
 
+    @pytest.mark.skipif(_FA4_SPLIT_KV_UNSUPPORTED, reason="FA4 cannot split long KV on SM90")
     @pytest.mark.parametrize("kv_cache_management_mode", [KVCacheManagementMode.RECOMPUTE])
     @pytest.mark.parametrize("chunked", [False, True])
     @torch.inference_mode()
