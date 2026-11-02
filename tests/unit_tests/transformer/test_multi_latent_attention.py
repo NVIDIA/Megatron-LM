@@ -1,7 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import functools
-import importlib.metadata
 import math
 import os
 import subprocess
@@ -2788,6 +2787,9 @@ class TestMLALatentCacheDecode:
             (10, 0), True, True, None, (512, 64), 24, torch.bfloat16, "flashinfer", id="sm100-24h"
         ),
         pytest.param(
+            (10, 0), True, True, None, (512, 64), 48, torch.bfloat16, "flashinfer", id="sm100-48h"
+        ),
+        pytest.param(
             (10, 0), True, True, None, (512, 64), 64, torch.bfloat16, "flashinfer", id="sm100-64h"
         ),
         pytest.param(
@@ -2844,7 +2846,7 @@ def test_absorbed_mla_decode_kernel_follows_device(
         mock.patch.object(attention_module, "HAVE_FMLA", have_flash_mla),
         mock.patch.object(attention_module, "HAVE_FLASHINFER_MLA", have_flashinfer),
         mock.patch.object(
-            attention_module, "_missing_flashinfer_prebuilt_kernels", return_value=missing_prebuilt
+            attention_module, "_missing_flashinfer_mla_kernels", return_value=missing_prebuilt
         ),
     ):
         kernel, reason = attention_module.resolve_absorbed_mla_decode_kernel(config, num_heads)
@@ -2853,49 +2855,6 @@ def test_absorbed_mla_decode_kernel_follows_device(
     assert bool(reason) is (expected is None)
     if missing_prebuilt is not None:
         assert missing_prebuilt in reason
-
-
-@pytest.mark.parametrize(
-    ("installed", "expected"),
-    [
-        pytest.param(
-            {
-                "flashinfer-python": "0.7.2.post1",
-                "flashinfer-cubin": "0.7.2.post1",
-                "flashinfer-jit-cache": "0.7.2.post1+cu130",
-            },
-            None,
-            id="matching",
-        ),
-        pytest.param(
-            {"flashinfer-python": "0.7.2.post1", "flashinfer-jit-cache": "0.7.2.post1+cu130"},
-            "flashinfer-cubin==0.7.2.post1",
-            id="no-cubin",
-        ),
-        pytest.param(
-            {
-                "flashinfer-python": "0.7.2.post1",
-                "flashinfer-cubin": "0.7.0",
-                "flashinfer-jit-cache": "0.7.2+cu130",
-            },
-            "flashinfer-cubin==0.7.2.post1, flashinfer-jit-cache==0.7.2.post1",
-            id="other-version",
-        ),
-    ],
-)
-def test_flashinfer_prebuilt_kernels_match_flashinfer_version(installed, expected):
-    """FlashInfer's MLA decode counts as prebuilt only with flashinfer-cubin and
-    flashinfer-jit-cache at flashinfer-python's version: FlashInfer ignores a mismatched copy and
-    downloads and compiles instead."""
-
-    def version(package):
-        if package not in installed:
-            raise importlib.metadata.PackageNotFoundError(package)
-        return installed[package]
-
-    with mock.patch.object(importlib.metadata, "version", side_effect=version):
-        missing = attention_module._missing_flashinfer_prebuilt_kernels.__wrapped__()
-    assert missing == expected
 
 
 def _absorbed_decode_reference(q, latents, block_table, seqlens_k, scale, softmax_offset=None):
@@ -2970,8 +2929,10 @@ def _latent_decode_inputs(lengths, tokens_per_request, num_heads, unwritten=None
 
 # FlashInfer's TRTLLM-GEN MLA decode picks its kernel family by head count: up to 32 heads per
 # rank a SwapsMmaAb kernel that reduces split-KV partials in-kernel, at 64 SwapsMmaAb or KeepsMmaAb
-# depending on the load, at 128 a 2-CTA KeepsMmaAb kernel with a separate reduction kernel.
-_ABSORBED_DECODE_HEADS = [16, 64, 128]
+# depending on the load, at 128 a 2-CTA KeepsMmaAb kernel with a separate reduction kernel. Head
+# counts that are not a power of two up to 64 run a padded tile (24 in Q32 SwapsMmaAb, 48 in Q64
+# KeepsMmaAb), and counts above 128 tile into 16- or 64-head CTAs without the 2-CTA kernel (192).
+_ABSORBED_DECODE_HEADS = [16, 24, 48, 64, 128, 192]
 
 
 @pytest.mark.launch_on_gb200

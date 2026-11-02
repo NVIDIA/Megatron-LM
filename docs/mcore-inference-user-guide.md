@@ -1079,7 +1079,8 @@ is the opposite of the `MegatronLLM` constructor default.
   MLA decode on Blackwell (SM100 and SM103, bf16, up to 64 or a multiple of 64
   heads per tensor-parallel rank), both for a latent rank of 512 plus a 64-dim
   RoPE part. On Blackwell, FlashInfer's prebuilt kernels must also be installed
-  at FlashInfer's version (`flashinfer-cubin` and `flashinfer-jit-cache`, which
+  at FlashInfer's version (`flashinfer-cubin` and the `flashinfer-jit-cache`
+  provider of the GPU, which `uv sync --group flashinfer_kernels` or
   `flashinfer download-kernels` installs), so that no decode step downloads
   cubins or compiles. Batch-invariant mode skips absorption, and so do layers
   neither kernel covers, with a warning when the model is built: each decode step

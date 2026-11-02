@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import importlib.metadata
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,7 +14,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import InferenceMode, missing_flashinfer_prebuilt_kernels
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -296,30 +295,22 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
-@functools.lru_cache(maxsize=None)
-def _missing_flashinfer_prebuilt_kernels() -> Optional[str]:
-    """The FlashInfer kernel wheels missing for TRTLLM-GEN MLA decode, or None if none are.
+def _missing_flashinfer_mla_kernels() -> Optional[str]:
+    """What FlashInfer lacks to run its TRTLLM-GEN MLA decode from prebuilt kernels, or None.
 
-    That decode runs prebuilt cubins (``flashinfer-cubin``) through a compiled launcher
-    (``flashinfer-jit-cache``). Both wheels ship at flashinfer-python's own version, from
-    FlashInfer's index. Without a matching copy of either, FlashInfer downloads the cubins and
-    compiles the launcher with nvcc at its first call, which fails without network access and
-    otherwise stalls the first decode step, inside CUDA-graph warmup, for minutes.
+    That decode runs the TRTLLM-GEN FMHA cubins (flashinfer-cubin) through a compiled launcher,
+    the ``fmha_gen`` module (flashinfer-jit-cache). Without them, FlashInfer downloads the cubins
+    and nvcc-compiles the launcher at its first call, inside CUDA-graph warmup: that fails
+    without network access and otherwise stalls for minutes.
     """
     try:
-        flashinfer_version = importlib.metadata.version("flashinfer-python")
-    except importlib.metadata.PackageNotFoundError:
-        return "flashinfer-python"
-    missing = []
-    for package in ("flashinfer-cubin", "flashinfer-jit-cache"):
-        try:
-            # flashinfer-jit-cache carries its CUDA version as a local label (e.g. +cu130).
-            installed = importlib.metadata.version(package).split("+")[0]
-        except importlib.metadata.PackageNotFoundError:
-            installed = None
-        if installed != flashinfer_version:
-            missing.append(f"{package}=={flashinfer_version}")
-    return ", ".join(missing) if missing else None
+        from flashinfer.artifacts import ArtifactPath
+
+        return missing_flashinfer_prebuilt_kernels(
+            aot_modules=("fmha_gen",), cubin_dirs=(ArtifactPath.TRTLLM_GEN_FMHA,)
+        )
+    except (ImportError, AttributeError):
+        return "this FlashInfer version does not lay out its prebuilt kernels as 0.7 does"
 
 
 def resolve_absorbed_mla_decode_kernel(
@@ -348,11 +339,11 @@ def resolve_absorbed_mla_decode_kernel(
             f"FlashInfer's TRTLLM-GEN MLA decode has no kernel for {num_attention_heads} heads "
             "per rank, only for up to 64 and for multiples of 64"
         )
-    missing = _missing_flashinfer_prebuilt_kernels()
+    missing = _missing_flashinfer_mla_kernels()
     if missing is not None:
         return None, (
-            f"FlashInfer's prebuilt kernels are not installed ({missing}; "
-            "`flashinfer download-kernels` installs them)"
+            f"FlashInfer's prebuilt kernels are missing: {missing} (`flashinfer download-kernels`, "
+            "or `uv sync --group flashinfer_kernels`, installs them)"
         )
     return "flashinfer", ""
 

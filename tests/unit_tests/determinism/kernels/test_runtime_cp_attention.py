@@ -551,8 +551,9 @@ def test_mla_flash_prefill_dispatch_sink_offset_replays(softmax_type):
 
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-# FlashInfer picks the kernel family, and how split-KV partials are reduced, by head count.
-@pytest.mark.parametrize("heads", [16, 64, 128])
+# FlashInfer picks the kernel family, its head tile and how split-KV partials are reduced by head
+# count, padding counts that are not a power of two.
+@pytest.mark.parametrize("heads", [16, 24, 48, 64, 128, 192])
 def test_mla_flashinfer_decode_dispatch_sink_offset_replays(heads):
     """The FlashInfer MLA decode that dynamic-inference MLA runs on SM100/SM103 replays
     bit-exactly, with the sink offset applied by the kernel."""
