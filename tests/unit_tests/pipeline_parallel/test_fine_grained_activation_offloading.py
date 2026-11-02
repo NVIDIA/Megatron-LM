@@ -283,9 +283,9 @@ def test_margin_groups_allow_prefetch_after_delayed_norm_commit(
         reload_streams = []
         original_reload = chunk.reload
 
-        def record_reload(state, non_blocking=None, stream=None):
+        def record_reload(state, *args, **kwargs):
             reload_streams.append(torch.cuda.current_stream())
-            return original_reload(state, non_blocking=non_blocking, stream=stream)
+            return original_reload(state, *args, **kwargs)
 
         monkeypatch.setattr(chunk, "reload", record_reload)
         torch.cuda.synchronize()
