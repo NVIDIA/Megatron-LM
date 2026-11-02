@@ -82,25 +82,64 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
-# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
-# not `flash_attn.__version__` (which reports the 2.x version) or
-# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
-# `is_fa_min_version` here. The floor matches pyproject.toml, which locks FA4 with the
-# quack-kernels and CuTe DSL it calls (4.0.0b25 and earlier call a quack-kernels API
-# that the locked quack-kernels removed).
-_MIN_FA4_VERSION = "4.0.0b37"
+
+def _imported_fa4_version() -> Optional[str]:
+    """Version of the flash-attn-4 that ``import flash_attn.cute`` loads, or None if none does.
+
+    The FA4 version is tracked by the `flash-attn-4` distribution metadata, not
+    `flash_attn.__version__` (which reports the 2.x version) or `flash_attn.cute.__version__`
+    (which is 0.0.0), so we cannot use `is_fa_min_version` here. FA4 installs into FlashAttention
+    2's `flash_attn` package, so with copies in layered site-packages (a venv over a base image)
+    FA2's `flash_attn/__init__.py` decides which one imports, and it need not be the first
+    `flash-attn-4` on sys.path. Read the distribution that owns the imported copy; one that owns
+    no file there (an editable install) counts only when it is the only one installed.
+    """
+    import importlib.util
+    import os
+    from importlib.metadata import distributions
+
+    dists = list(distributions(name="flash-attn-4"))
+    if not dists:
+        return None
+    try:
+        spec = importlib.util.find_spec("flash_attn.cute")
+    except ImportError:
+        return None
+    if spec is None or spec.origin is None:
+        return None
+    origin = os.path.realpath(spec.origin)
+    for dist in dists:
+        if os.path.realpath(dist.locate_file("flash_attn/cute/__init__.py")) == origin:
+            return dist.version
+    return dists[0].version if len(dists) == 1 else None
+
+
+# The floor matches pyproject.toml: the first FA4 that runs with the quack-kernels Megatron
+# requires (>= 0.6.5). 4.0.0b25 and earlier call a quack-kernels API that 0.6.5 removed, and
+# 4.0.0b26 and earlier pin an older CuTe DSL than 0.6.5 needs.
+_MIN_FA4_VERSION = "4.0.0b27"
+_FA4_VERSION = _imported_fa4_version()
+# Why FlashAttention-4 cannot be used, for the error a pinned flash_attention_version=4 raises.
+_FA4_UNAVAILABLE = "FlashAttention-4 is not installed"
+HAVE_FA4 = False
 flash_attn4_varlen_func = None
-try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _get_dist_version
+if _FA4_VERSION is not None:
+    import warnings
 
     from packaging.version import Version as _Version
 
-    HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
-    if HAVE_FA4:
-        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
-except (ImportError, PackageNotFoundError):
-    HAVE_FA4 = False
+    if _Version(_FA4_VERSION) < _Version(_MIN_FA4_VERSION):
+        _FA4_UNAVAILABLE = (
+            f"flash-attn-4 {_FA4_VERSION} is installed, but Megatron needs >= {_MIN_FA4_VERSION}"
+        )
+        warnings.warn(f"{_FA4_UNAVAILABLE}, so FlashAttention-4 will not be used")
+    else:
+        try:
+            from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+
+            HAVE_FA4 = True
+        except ImportError as e:
+            _FA4_UNAVAILABLE = f"flash-attn-4 {_FA4_VERSION} failed to import ({e})"
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -1059,9 +1098,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """
         pinned = self.flash_attention_version
         if pinned == 4:
-            assert (
-                HAVE_FA4
-            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            assert HAVE_FA4, f"flash_attention_version=4 requested but {_FA4_UNAVAILABLE}"
             return True, False
         if pinned == 3:
             assert (

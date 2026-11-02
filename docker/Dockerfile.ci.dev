@@ -172,16 +172,22 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
         --no-install-package nvidia-cusolver-cu12 \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
-        --no-install-package nvidia-nccl-cu12
+        --no-install-package nvidia-nccl-cu12 \
+        --no-install-package flash-attn-4
 
     # flash-attn-4 installs into FlashAttention 2's `flash_attn` package. The base image ships
     # both in the system site-packages, where FA2's `flash_attn/__init__.py` makes `flash_attn`
-    # resolve to that directory alone, so its flash-attn-4 would shadow the locked one in the
-    # venv and run against the venv's quack-kernels. Replace it with the locked version.
-    FA4_VERSION=$(uv pip show flash-attn-4 | sed -n 's/^Version: //p')
-    if [ -n "${FA4_VERSION}" ]; then
-        uv pip install --system --break-system-packages --no-deps "flash-attn-4==${FA4_VERSION}"
+    # resolve to that directory alone, so a venv copy would never be imported. Replace the base
+    # image's copy with the locked, hash-checked one instead (--no-config: the project's
+    # constraints are not pinned, which --require-hashes rejects).
+    uv export --frozen --no-emit-project --no-header --no-annotate \
+        --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} \
+        | awk '/^flash-attn-4==/ {p = 1} p {print; if (!/\\$/) exit}' > /tmp/flash-attn-4.txt
+    if [ -s /tmp/flash-attn-4.txt ]; then
+        uv pip install --system --break-system-packages --no-config --no-deps --require-hashes \
+            -r /tmp/flash-attn-4.txt
     fi
+    rm /tmp/flash-attn-4.txt
 
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.

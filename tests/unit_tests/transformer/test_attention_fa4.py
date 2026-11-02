@@ -7,8 +7,8 @@ FA4 calls quack-kernels, whose version Megatron's lock sets. FA4 4.0.0b25 and ea
 cannot compile against it. pyproject.toml therefore locks FA4 together with quack-kernels. FA4
 also shares FlashAttention 2's ``flash_attn`` package, so the copy that ``import flash_attn.cute``
 loads can differ from the first ``flash-attn-4`` metadata on the path when the two are installed
-in layered environments (a venv over a base image); the CI image installs the locked FA4 next to
-FA2 for that reason.
+in layered environments (a venv over a base image). Megatron gates on the copy that imports, and
+the CI image installs the locked FA4 next to FA2 so that copy is the locked one.
 """
 
 import ast
@@ -17,6 +17,7 @@ import importlib.metadata
 import importlib.util
 import math
 import pathlib
+import sys
 
 import pytest
 import torch
@@ -104,23 +105,80 @@ def _resolves(module, name):
         return False
 
 
+def _site(root, fa4_version=None, fa2=False, fa4_files=True):
+    """A site-packages directory: FA2's ``flash_attn/__init__.py``, FA4's ``flash_attn/cute``, and
+    flash-attn-4 metadata, each optional."""
+    root.mkdir()
+    if fa2:
+        (root / "flash_attn").mkdir()
+        (root / "flash_attn" / "__init__.py").write_text("")
+    if fa4_files:
+        (root / "flash_attn" / "cute").mkdir(parents=True)
+        (root / "flash_attn" / "cute" / "__init__.py").write_text("")
+    if fa4_version is not None:
+        info = root / f"flash_attn_4-{fa4_version}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Name: flash-attn-4\nVersion: {fa4_version}\n")
+    return str(root)
+
+
+@pytest.mark.parametrize(
+    "layout, imported",
+    [
+        # A venv's FA4 over a base image with FA2 and an older FA4: FA2's regular package makes
+        # flash_attn.cute import from the base image, while the first metadata is the venv's.
+        ("venv-over-fa2", "4.0.0b24"),
+        # Without FA2, flash_attn is a namespace package and the first copy on the path imports.
+        ("namespace", "4.0.0b37"),
+        # An editable install owns no file next to its metadata; it is the only one installed.
+        ("editable", "4.0.0b30"),
+    ],
+)
+def test_fa4_version_is_read_from_the_copy_that_imports(tmp_path, monkeypatch, layout, imported):
+    """Megatron gates FA4 on the version of the copy ``import flash_attn.cute`` loads."""
+    if layout == "venv-over-fa2":
+        path = [
+            _site(tmp_path / "venv", "4.0.0b37"),
+            _site(tmp_path / "base", "4.0.0b24", fa2=True),
+        ]
+    elif layout == "namespace":
+        path = [_site(tmp_path / "venv", "4.0.0b37"), _site(tmp_path / "base", "4.0.0b24")]
+    else:
+        path = [_site(tmp_path / "meta", "4.0.0b30", fa4_files=False), _site(tmp_path / "src")]
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k.split(".")[0] == "flash_attn"}
+    monkeypatch.setattr(sys, "path", path)
+    importlib.invalidate_caches()
+    try:
+        assert attention_module._imported_fa4_version() == imported
+    finally:
+        for k in [k for k in sys.modules if k.split(".")[0] == "flash_attn"]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+
+
+# The environment checks below guard the CI images, which install the locked FA4. They fail, rather
+# than skip, wherever an FA4 older than Megatron's floor is installed.
+
+
 def test_megatron_gates_on_the_fa4_that_imports():
-    """The flash-attn-4 version Megatron gates on is that of the copy flash_attn.cute loads."""
+    """Megatron gates on the FA4 that ``flash_attn.cute`` loads, and that FA4 meets the floor."""
     version, cute_dir = _imported_fa4()
-    gated = importlib.metadata.version("flash-attn-4")
-    assert gated == version, (
-        f"Megatron gates FlashAttention-4 on flash-attn-4 {gated}, but `import flash_attn.cute` "
-        f"loads {version} from {cute_dir}: an FA4 in another site-packages directory, next to "
-        "FlashAttention 2's flash_attn/__init__.py, shadows the installed one"
+    assert attention_module._FA4_VERSION == version, (
+        f"Megatron gates FlashAttention-4 on flash-attn-4 {attention_module._FA4_VERSION}, but "
+        f"`import flash_attn.cute` loads {version} from {cute_dir}"
     )
     assert attention_module.HAVE_FA4, (
-        f"flash-attn-4 {version} is installed, but below Megatron's floor "
-        f"{attention_module._MIN_FA4_VERSION}"
+        f"{attention_module._FA4_UNAVAILABLE} (loaded from {cute_dir}): in the CI image, the "
+        "locked FA4 must replace the base image's copy next to FlashAttention 2"
     )
 
 
 def test_fa4_quack_references_resolve():
-    """Every quack attribute the imported FA4 uses exists in the importable quack-kernels."""
+    """Every quack attribute the imported FA4 uses exists in the importable quack-kernels.
+
+    The scan counts every reference as required, including any a future FA4 might guard with a
+    fallback; such a release would need an exception here.
+    """
     version, cute_dir = _imported_fa4()
     refs = _quack_references(cute_dir)
     assert refs, f"found no quack references in flash-attn-4 {version} at {cute_dir}"
@@ -167,8 +225,8 @@ def test_fa4_paged_attention_on_sm100(is_decode_only):
     """
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("FA4's SM100 forward needs a Blackwell (SM100) GPU")
-    if not attention_module.HAVE_FA4:
-        pytest.skip(f"needs flash-attn-4 >= {attention_module._MIN_FA4_VERSION}")
+    # The Blackwell CI image ships FA4, so a missing or too-old one is a failure, not a skip.
+    assert attention_module.HAVE_FA4, attention_module._FA4_UNAVAILABLE
     config = TransformerConfig(
         num_layers=1,
         hidden_size=HEADS * HEAD_DIM,
