@@ -611,6 +611,8 @@ class TestMLALatentPoolUpProjection:
         Utils.destroy_model_parallel()
 
     def _attention(self, fp8_recipe):
+        # The same weights on every call, so each fill can get a fresh layer.
+        model_parallel_cuda_manual_seed(123)
         quantization = dict(fp8="e4m3", fp8_recipe=fp8_recipe) if fp8_recipe else {}
         config = MLATransformerConfig(
             num_layers=1,
@@ -653,12 +655,16 @@ class TestMLALatentPoolUpProjection:
             device="cuda",
         ).bfloat16()
         pool[self.used_blocks :] = unused_fill
-        # The context TransformerBlock runs each layer in.
-        with torch.no_grad(), get_fp8_context(attention.config):
-            key, value = attention.uncompress_kv_from_cache(pool)
+        # Two steps, each in the context TransformerBlock runs each layer in: under delayed
+        # scaling the second quantizes with the scale derived from the first one's amax.
+        for _ in range(2):
+            with torch.no_grad(), get_fp8_context(attention.config):
+                key, value = attention.uncompress_kv_from_cache(pool)
         return key[: self.used_blocks], value[: self.used_blocks]
 
-    @pytest.mark.parametrize("fp8_recipe", [None, "tensorwise"], ids=["bf16", "fp8-tensorwise"])
+    @pytest.mark.parametrize(
+        "fp8_recipe", [None, "tensorwise", "delayed"], ids=["bf16", "fp8-tensorwise", "fp8-delayed"]
+    )
     @pytest.mark.parametrize(
         "unused_fill", [1e4, float("inf"), float("nan")], ids=["large", "inf", "nan"]
     )
@@ -674,8 +680,11 @@ class TestMLALatentPoolUpProjection:
             with get_fp8_context(attention.config):
                 assert FP8GlobalStateManager.is_fp8_enabled()
 
+        # A fresh layer per fill, so that delayed scaling starts each from the same amax history.
         key, value = self._used_keys_and_values(attention, 0.0)
-        poisoned_key, poisoned_value = self._used_keys_and_values(attention, unused_fill)
+        poisoned_key, poisoned_value = self._used_keys_and_values(
+            self._attention(fp8_recipe), unused_fill
+        )
 
         assert torch.isfinite(key).all() and torch.isfinite(value).all()
         assert torch.equal(poisoned_key, key) and torch.equal(poisoned_value, value)
