@@ -880,31 +880,14 @@ _FLASHINFER_MOE_GEMM1 = "trtllm::fused_moe::gemm1"
 _FLASHINFER_MOE_GEMM2 = "trtllm::fused_moe::gemm2"
 
 
-@pytest.fixture
-def flashinfer_gemm2_tactic(monkeypatch):
+def _pin_flashinfer_gemm2_tactic(monkeypatch):
     """Stand-in for a tuned FlashInfer autotuner cache that holds a fused-MoE GEMM2 tactic.
 
     Set ``.tactic`` to an index into the runner's GEMM2 tactics, or ``None`` for FlashInfer's
     untuned default. ``.count`` is the number of GEMM2 tactics the runner offers and
     ``.fused_finalize`` whether it offers fused-finalize ones. GEMM1 keeps its default.
     """
-    fused_moe = pytest.importorskip("flashinfer.fused_moe")
-    if "use_fused_finalize" not in inspect.signature(fused_moe.cutlass_fused_moe).parameters:
-        pytest.skip("cutlass_fused_moe has no use_fused_finalize before FlashInfer 0.6.15")
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.jit import fused_moe as fused_moe_jit
-
-    major, minor = torch.cuda.get_device_capability()
-    sm = 10 * major + minor
-    gen_module = getattr(fused_moe_jit, f"gen_cutlass_fused_moe_sm{sm}_module", None)
-    if sm not in (90, 100, 103) or gen_module is None:
-        pytest.skip(f"FlashInfer has fused-finalize BF16 MoE tactics on SM90/100/103, not SM{sm}")
-    if not gen_module().is_compiled:
-        # Its first use JIT-compiles every dtype combination: tens of minutes on a CI node.
-        pytest.skip(
-            "FlashInfer's CUTLASS fused-MoE module is not built. Install flashinfer-jit-cache or "
-            f"build it once with flashinfer.fused_moe.core.get_cutlass_fused_moe_module('{sm}')."
-        )
 
     choose_one = AutoTuner.choose_one
     pin = SimpleNamespace(tactic=None, count=None, fused_finalize=None)
@@ -922,6 +905,29 @@ def flashinfer_gemm2_tactic(monkeypatch):
 
     monkeypatch.setattr(AutoTuner, "choose_one", pinned_choose_one)
     return pin
+
+
+@pytest.fixture
+def flashinfer_gemm2_tactic(monkeypatch):
+    """_pin_flashinfer_gemm2_tactic for the BF16 experts, where FlashInfer's CUTLASS fused-MoE
+    module is already built (its first use JIT-compiles every dtype combination: about 38
+    minutes on an H100 node, longer than the determinism bucket)."""
+    fused_moe = pytest.importorskip("flashinfer.fused_moe")
+    if "use_fused_finalize" not in inspect.signature(fused_moe.cutlass_fused_moe).parameters:
+        pytest.skip("cutlass_fused_moe has no use_fused_finalize before FlashInfer 0.6.15")
+    from flashinfer.jit import fused_moe as fused_moe_jit
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = 10 * major + minor
+    gen_module = getattr(fused_moe_jit, f"gen_cutlass_fused_moe_sm{sm}_module", None)
+    if sm not in (90, 100, 103) or gen_module is None:
+        pytest.skip(f"FlashInfer has fused-finalize BF16 MoE tactics on SM90/100/103, not SM{sm}")
+    if not gen_module().is_compiled:
+        pytest.skip(
+            "FlashInfer's CUTLASS fused-MoE module is not built. Install flashinfer-jit-cache or "
+            f"build it once with flashinfer.fused_moe.core.get_cutlass_fused_moe_module('{sm}')."
+        )
+    return _pin_flashinfer_gemm2_tactic(monkeypatch)
 
 
 _PROBE_ROW = 73
@@ -1423,22 +1429,29 @@ class TestMoEModules:
             tactics
         ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"
 
+    @pytest.mark.launch_on_gb200
     def test_inference_flashinfer_cutlass_mxfp8_experts_replay_for_every_gemm2_tactic(
-        self, flashinfer_gemm2_tactic
+        self, monkeypatch
     ):
         """CUTLASS MXFP8 ClampedRelu2 experts (top-4) replay bit-exactly under deterministic
         algorithms whichever GEMM2 tactic FlashInfer's autotuner holds. Their call goes through
         cutlass_fused_moe too, whose fused-finalize GEMM2 tactics sum the top-k routes with
-        atomics, so those must not be selectable."""
+        atomics, so those must not be selectable.
+
+        Blackwell is this test's hardware, so there it does not skip: a FlashInfer without
+        ClampedRelu2 or use_fused_finalize fails it, and without flashinfer-jit-cache FlashInfer
+        builds its CUTLASS fused-MoE module on first use (about 8 minutes on GB200).
+        """
         if torch.cuda.get_device_capability()[0] != 10:
             pytest.skip("FlashInfer ClampedRelu2 needs SM10x")
-        fused_moe = pytest.importorskip("flashinfer.fused_moe")
+        from flashinfer import fused_moe
         from flashinfer.fused_moe import ActivationType
 
-        if not hasattr(ActivationType, "ClampedRelu2") or "clamped_relu2_limit" not in (
-            inspect.signature(fused_moe.cutlass_fused_moe).parameters
-        ):
-            pytest.skip("FlashInfer has no ClampedRelu2 cutlass_fused_moe")
+        parameters = inspect.signature(fused_moe.cutlass_fused_moe).parameters
+        assert hasattr(ActivationType, "ClampedRelu2"), "FlashInfer has no ClampedRelu2"
+        for name in ("clamped_relu2_limit", "use_fused_finalize"):
+            assert name in parameters, f"FlashInfer's cutlass_fused_moe has no {name}"
+        flashinfer_gemm2_tactic = _pin_flashinfer_gemm2_tactic(monkeypatch)
         from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_cutlass_mxfp8_weights
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -1466,6 +1479,8 @@ class TestMoEModules:
             _flashinfer_clamp_limit=torch.full((1,), 0.5, device="cuda", dtype=torch.float32),
             _nvls_dispatcher=False,
             ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+            # Torch deterministic algorithms alone must rule out the fused finalize.
+            config=SimpleNamespace(deterministic_mode=False, batch_invariant_mode=False),
         )
 
         def forward(hidden, routing_map, probs):

@@ -98,6 +98,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
         _flashinfer_clamp_limit=torch.full((1,), clamp_scale, device="cuda", dtype=torch.float32),
         _nvls_dispatcher=False,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: ep_rank),
+        config=SimpleNamespace(deterministic_mode=False, batch_invariant_mode=False),
     )
     routing = (torch.arange(rows, device="cuda", dtype=torch.int32) % 4).view(rows, 1)
     probabilities = torch.ones(rows, 1, device="cuda", dtype=torch.float32)

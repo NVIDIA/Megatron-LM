@@ -564,6 +564,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch, clamp_s
         _flashinfer_clamp_limit=torch.tensor([16.0], dtype=torch.float32),
         _nvls_dispatcher=True,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+        config=SimpleNamespace(deterministic_mode=False, batch_invariant_mode=False),
     )
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
@@ -582,10 +583,14 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch, clamp_s
     assert "swiglu_limit" not in captured
 
 
-@pytest.mark.parametrize("mode", ["default", "deterministic", "batch_invariant"])
+@pytest.mark.parametrize(
+    "mode",
+    ["default", "deterministic", "batch_invariant", "deterministic_mode", "batch_invariant_mode"],
+)
 def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch, mode):
     """Fused-finalize GEMM2 tactics sum the top-k routes with atomics; the autotuner must not
-    be able to select them in deterministic or batch-invariant mode."""
+    be able to select them under torch deterministic algorithms or batch-invariant mode, or
+    when the config asks for either (deterministic_mode / batch_invariant_mode)."""
     from megatron.core.transformer.moe import experts
 
     captured = {}
@@ -611,6 +616,10 @@ def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch
         _activation_clamp_scale=None,
         _nvls_dispatcher=False,
         ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        config=SimpleNamespace(
+            deterministic_mode=mode == "deterministic_mode",
+            batch_invariant_mode=mode == "batch_invariant_mode",
+        ),
     )
     with deterministic_algorithms(mode == "deterministic"):
         experts.InferenceGroupedMLP._flashinfer_forward(
@@ -624,11 +633,14 @@ def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch
     assert captured.get("use_fused_finalize", True) is (mode == "default")
 
 
-@pytest.mark.parametrize("mode", ["default", "deterministic", "batch_invariant"])
+@pytest.mark.parametrize(
+    "mode",
+    ["default", "deterministic", "batch_invariant", "deterministic_mode", "batch_invariant_mode"],
+)
 def test_cutlass_mxfp8_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch, mode):
     """The CUTLASS MXFP8 experts (ClampedRelu2) call cutlass_fused_moe too, whose fused-finalize
     GEMM2 tactics sum the top-k routes with atomics; the autotuner must not be able to select
-    them in deterministic or batch-invariant mode."""
+    them in deterministic or batch-invariant mode, whether set globally or in the config."""
     from megatron.core.transformer.moe import experts
 
     monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
@@ -671,6 +683,10 @@ def test_cutlass_mxfp8_flashinfer_rules_out_fused_finalize_when_deterministic(mo
         _flashinfer_clamp_limit=None,
         _nvls_dispatcher=False,
         ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        config=SimpleNamespace(
+            deterministic_mode=mode == "deterministic_mode",
+            batch_invariant_mode=mode == "batch_invariant_mode",
+        ),
     )
     with deterministic_algorithms(mode == "deterministic"):
         experts.InferenceGroupedMLP._flashinfer_forward(

@@ -418,7 +418,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
         "Inference BF16 experts on FlashInfer cutlass_fused_moe pass use_fused_finalize=False "
-        "under deterministic algorithms or batch_invariant_mode, since fused-finalize GEMM2 "
+        "under deterministic algorithms or batch-invariant mode (global or in the config), since "
+        "fused-finalize GEMM2 "
         "tactics sum the top-k routes with BF16 atomics; every GEMM2 tactic the autotuner can "
         "select is replayed and checked for batch invariance. Needs FlashInfer >= 0.6.15 on "
         "SM90/100/103 with its CUTLASS fused-MoE module already built (flashinfer-jit-cache or "
@@ -838,8 +839,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "the routed backend is not covered by that test. Under deterministic algorithms the "
         "CUTLASS MXFP8 call passes use_fused_finalize=False, ruling out the atomic top-k "
         "finalize; test_inference_flashinfer_cutlass_mxfp8_experts_replay_for_every_gemm2_tactic "
-        "replays top-k=4 under every GEMM2 tactic the autotuner can select (Blackwell, with "
-        "FlashInfer's CUTLASS fused-MoE module already built).",
+        "(launch_on_gb200) replays top-k=4 under every GEMM2 tactic the autotuner can select. "
+        "It does not skip on Blackwell: without flashinfer-jit-cache, FlashInfer builds its "
+        "CUTLASS fused-MoE module on first use (about 8 minutes on GB200).",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",

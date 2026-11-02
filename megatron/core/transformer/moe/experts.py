@@ -149,17 +149,23 @@ def _require_te_tanh_clamp_support(config) -> None:
     )
 
 
-def _cutlass_fused_moe_finalize_kwargs() -> dict:
+def _cutlass_fused_moe_finalize_kwargs(config) -> dict:
     """Keyword arguments that keep a FlashInfer cutlass_fused_moe call deterministic.
 
     FlashInfer's autotuner may select a GEMM2 tactic with a fused finalize, which accumulates
-    each token's top-k routes with output-dtype atomics in no fixed order. Under deterministic
-    algorithms or batch-invariant mode, use_fused_finalize=False rules those tactics out; the
-    separate finalize kernel reduces each token's routes in order. FlashInfer without the option
-    is rejected when the weights are built if the config asks for determinism.
+    each token's top-k routes with output-dtype atomics in no fixed order. When the config asks
+    for deterministic or batch-invariant execution, or torch deterministic algorithms or
+    batch-invariant mode are on, use_fused_finalize=False rules those tactics out; the separate
+    finalize kernel reduces each token's routes in order. FlashInfer < 0.6.15 has no such option:
+    a deterministic config's BF16 layers are rejected when their weights are built
+    (_require_flashinfer_unfused_finalize), and the CUTLASS MXFP8 layers need ClampedRelu2,
+    which only later FlashInfer releases provide.
     """
     if HAVE_FLASHINFER_UNFUSED_FINALIZE and (
-        torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled()
+        config.deterministic_mode
+        or config.batch_invariant_mode
+        or torch.are_deterministic_algorithms_enabled()
+        or is_batch_invariant_mode_enabled()
     ):
         return {"use_fused_finalize": False}
     return {}
@@ -1803,7 +1809,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     activation_type=self._flashinfer_activation_type,
                     out=out,
                     activation_clamp_limit=self._flashinfer_clamp_limit,
-                    **_cutlass_fused_moe_finalize_kwargs(),
+                    **_cutlass_fused_moe_finalize_kwargs(self.config),
                 )
             else:
                 output = flashinfer_routed_mxfp8_moe(
@@ -1854,7 +1860,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
             # token_combine() copies it into the symmetric FP32 buffer.
             output=None,
-            **_cutlass_fused_moe_finalize_kwargs(),
+            **_cutlass_fused_moe_finalize_kwargs(self.config),
         )[0]
         return output, None
 
