@@ -151,8 +151,8 @@ class RouterInterface(Protocol):
         """Forward pass of the router.
 
         ``token_multiplicities`` (one logical token count per flattened row) is passed only when
-        a caller sets ``MoELayer._shared_prefix_token_multiplicities``; routers that never see
-        such a caller need not accept it.
+        a caller passes ``shared_prefix_token_multiplicities`` to ``MoELayer.forward``; routers
+        that never see such a caller need not accept it.
 
         Returns:
             A tuple of (probabilities, routing_map).
@@ -258,12 +258,6 @@ class MoELayer(BaseMoELayer):
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
     """
-
-    # Per-call shared-prefix token multiplicities. A shared-prefix caller sets it on the instance
-    # around one layer call and deletes it afterwards, restoring this default. Only the eager
-    # MoELayer.forward path reads it; paths that call route() directly or replay a CUDA graph
-    # ignore it, so callers must use the eager forward.
-    _shared_prefix_token_multiplicities = None
 
     def __init__(
         self,
@@ -765,6 +759,8 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        shared_prefix_token_multiplicities: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -781,6 +777,11 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            shared_prefix_token_multiplicities (torch.Tensor, optional): Logical token count per
+                flattened sequence-first row of ``hidden_states``, forwarded to the router for
+                expert-bias counts. Only the eager forward reads it; paths that call route()
+                directly or replay a CUDA graph do not, so shared-prefix callers must use the
+                eager forward. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -790,10 +791,6 @@ class MoELayer(BaseMoELayer):
                 "are enabled without also enabling sequence parallelism."
             )
         self.select_token_dispatcher()
-
-        # Keep the tensor in the checkpoint closure: the shared-prefix caller
-        # removes the scoped attribute before selective recomputation in backward.
-        token_multiplicities = self._shared_prefix_token_multiplicities
 
         if self.config.moe_megakernel_backend is not None:
             if intermediate_tensors is not None:
@@ -805,8 +802,8 @@ class MoELayer(BaseMoELayer):
             # The megakernel replaces dispatch and expert compute, not the router: forward
             # shared-prefix multiplicities to route() (only when set) for expert-bias counts.
             route_kwargs = {"packed_seq_params": packed_seq_params}
-            if token_multiplicities is not None:
-                route_kwargs["token_multiplicities"] = token_multiplicities
+            if shared_prefix_token_multiplicities is not None:
+                route_kwargs["token_multiplicities"] = shared_prefix_token_multiplicities
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
@@ -838,7 +835,7 @@ class MoELayer(BaseMoELayer):
                         padding_mask,
                         input_ids=input_ids,
                         packed_seq_params=packed_seq_params,
-                        token_multiplicities=token_multiplicities,
+                        token_multiplicities=shared_prefix_token_multiplicities,
                     )
                     hidden_states, probs = self.preprocess(
                         layer_input,
