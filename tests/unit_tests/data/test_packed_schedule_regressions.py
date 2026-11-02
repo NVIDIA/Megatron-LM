@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib
 import random
 from types import SimpleNamespace
 
@@ -12,10 +13,12 @@ from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler, DpBalancedScheduler
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
+    get_global_real_seqlen_stats,
     get_packed_sequence_length,
     pad_packed_batch_before_cp_slice,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
 def _group(size, rank=0, stride=1):
@@ -525,3 +528,173 @@ def test_dynamic_cp_schedule_preserves_samples_groups_and_capacity(world_size, p
                 seen.extend(ids)
                 rank += size
         assert sorted(seen) == list(range(len(lengths)))
+
+
+@pytest.fixture
+def single_rank_collectives(monkeypatch, cpu_batch_communication):
+    """Run the scheduler in one process, trusting the ranks of the supplied fake groups."""
+
+    def all_gather(outputs, tensor, group=None):
+        for output in outputs:
+            output.copy_(tensor)
+
+    def all_gather_into_tensor(output, tensor, group=None):
+        output.copy_(tensor.reshape(output.shape))
+
+    # get_pg_rank() reports rank 0 for every group unless torch.distributed is initialized.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", all_gather_into_tensor)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
+
+
+def _unpacked_samples(real_lengths, alignment=8):
+    samples = []
+    for real in real_lengths:
+        padded = -(-real // alignment) * alignment
+        tokens = torch.arange(padded, dtype=torch.int64)
+        samples.append(
+            {
+                "tokens": tokens,
+                "labels": tokens + 1,
+                "loss_mask": (tokens < real).float(),
+                "position_ids": tokens.clone(),
+                "original_seq_len": torch.tensor([real], dtype=torch.int32),
+                "padded_seq_len": torch.tensor([padded], dtype=torch.int32),
+            }
+        )
+    return samples
+
+
+def _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size, tp_rank=0):
+    last_vp_stage = None if vp_size is None else vp_size - 1
+
+    def is_first_stage(ignore_virtual=True, vp_stage=None):
+        return pp_rank == 0 and (ignore_virtual or vp_stage == 0)
+
+    def is_last_stage(ignore_virtual=True, vp_stage=None):
+        return pp_rank == pp_size - 1 and (ignore_virtual or vp_stage == last_vp_stage)
+
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(parallel_state, "is_pipeline_first_stage", is_first_stage)
+    monkeypatch.setattr(parallel_state, "is_pipeline_last_stage", is_last_stage)
+
+
+@pytest.mark.parametrize("script_name", ["pretrain_gpt", "pretrain_hybrid"])
+@pytest.mark.parametrize(
+    "vp_size,layout,mtp_stage",
+    [
+        (None, None, None),
+        (None, "Et|tt|m|L", (2, 0)),
+        (2, None, None),
+        (2, "Et|t|t|t|t|t|m|L", (2, 1)),
+    ],
+    ids=["pp", "mtp", "vpp", "vpp-mtp"],
+)
+def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
+    single_rank_collectives, monkeypatch, script_name, vp_size, layout, mtp_stage
+):
+    """Every PP stage schedules the global batch from the iterators the dataset placement gives it.
+
+    Each stage keeps only the fields of its virtual stages, including a standalone MTP stage.
+    FLOPs statistics count real tokens, not padding.
+    """
+    from megatron.training import arguments, global_vars
+
+    script = importlib.import_module(script_name)
+    pp_size = 4
+    real_lengths = [5, 13, 8, 30, 2, 17, 9, 24]
+    pipeline_layout = None
+    mtp_num_layers = None
+    if layout is not None:
+        pipeline_layout = PipelineParallelLayerLayout(layout, pp_size)
+        mtp_num_layers = 1
+        pipeline_layout.validate_layer_layout(layout.count("t"), mtp_num_layers)
+    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
+    # the arguments and the transformer config at call time from these two modules.
+    monkeypatch.setattr(
+        global_vars, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+    )
+    monkeypatch.setattr(
+        arguments,
+        "core_transformer_config_from_args",
+        lambda args: SimpleNamespace(
+            pipeline_model_parallel_layout=pipeline_layout, mtp_num_layers=mtp_num_layers
+        ),
+    )
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=vp_size,
+        pipeline_model_parallel_layout=pipeline_layout,
+        mtp_num_layers=mtp_num_layers,
+    )
+    vp_stages = [None] if vp_size is None else list(range(vp_size))
+
+    scheduled_counts = []
+    for pp_rank in range(pp_size):
+        _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size, tp_rank=1)
+        assert not any(
+            script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+            for vp_stage in vp_stages
+        )
+        _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size)
+        built = [
+            script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+            for vp_stage in vp_stages
+        ]
+        # The scheduler reads the first iterator of a stage, so every stage needs one.
+        assert any(built), f"{pp_rank=} {built=}"
+        iterators = [
+            iter(_unpacked_samples(real_lengths)) if is_built else None for is_built in built
+        ]
+
+        scheduler = DpBalancedScheduler(32, 1, 1, None if vp_size is None else pp_size)
+        data_iterator, num_microbatches, real_tokens, real_token_squares = scheduler.run(
+            iterators[0] if vp_size is None else iterators,
+            len(real_lengths),
+            _group(1),
+            _group(1),
+            _group(pp_size, pp_rank),
+            _group(1),
+            torch.device("cpu"),
+            config,
+        )
+        scheduled_counts.append(num_microbatches)
+        assert real_tokens == sum(real_lengths)
+        assert real_token_squares == sum(length * length for length in real_lengths)
+
+        stage_iterators = [data_iterator] if vp_size is None else data_iterator
+        for vp_stage, stage_iterator in enumerate(stage_iterators):
+            packed = next(stage_iterator)
+            owns_input = pp_rank == 0 and vp_stage == 0
+            owns_loss = pp_rank == pp_size - 1 and vp_stage == len(stage_iterators) - 1
+            owns_mtp = (pp_rank, vp_stage) == mtp_stage
+            assert ("tokens" in packed) == (owns_input or owns_mtp), f"{pp_rank=} {vp_stage=}"
+            assert ("labels" in packed) == (owns_loss or owns_mtp), f"{pp_rank=} {vp_stage=}"
+            assert "cu_seqlens" in packed and "cu_seqlens_padded" in packed
+
+    assert len(set(scheduled_counts)) == 1
+
+
+def test_real_seqlen_stats_cover_every_dp_rank(monkeypatch):
+    """Each DP rank holds different sub-samples, and the statistics count all of them once."""
+    local_lengths, peer_lengths = [5, 13, 8], [30, 2]
+    dp_group = _group(2)
+    reduced_groups = []
+
+    def all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None):
+        # Add the real lengths of the other DP rank.
+        reduced_groups.append(group)
+        tensor += torch.tensor(
+            [sum(peer_lengths), sum(length * length for length in peer_lengths)], dtype=tensor.dtype
+        )
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    real_tokens, real_token_squares = get_global_real_seqlen_stats(
+        _unpacked_samples(local_lengths), dp_group, torch.device("cpu")
+    )
+
+    lengths = local_lengths + peer_lengths
+    assert real_tokens == sum(lengths)
+    assert real_token_squares == sum(length * length for length in lengths)
+    assert len(reduced_groups) == 1 and reduced_groups[0] is dp_group

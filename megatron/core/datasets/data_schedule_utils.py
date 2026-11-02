@@ -595,8 +595,8 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
             rank.
         seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
             DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
-            ``global_id_seqlens[gid][1]``). Handy for global-batch token counts such as
-            the FLOPs accounting.
+            ``global_id_seqlens[gid][1]``). These lengths size the schedule; FLOPs
+            accounting counts real tokens with :func:`get_global_real_seqlen_stats`.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]
@@ -626,6 +626,29 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     )
 
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
+
+def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
+    """Sum the real (unpadded) sub-sample lengths of the global batch and their squares.
+
+    Args:
+        batch: This DP rank's sub-samples as returned by :func:`get_batch_and_global_seqlens`.
+        dp_group: The DP group whose padded lengths were gathered for scheduling.
+        dev: Device for the reduction.
+
+    Returns:
+        ``(sum_i L_i, sum_i L_i**2)`` over the real lengths ``L_i`` of every sub-sample in
+        ``dp_group``, as expected by ``num_floating_point_operations``.
+    """
+    seqlens = [sample["original_seq_len"].reshape(-1) for sample in batch]
+    seqlens = (torch.cat(seqlens) if seqlens else torch.zeros(0)).to(
+        device=dev, dtype=torch.float64
+    )
+    stats = torch.stack((seqlens.sum(), seqlens.square().sum()))
+    if dp_group.size() > 1:
+        torch.distributed.all_reduce(stats, group=dp_group)
+    seqlen_sum, seqlen_squared_sum = stats.tolist()
+    return seqlen_sum, seqlen_squared_sum
 
 
 # =============================================================================

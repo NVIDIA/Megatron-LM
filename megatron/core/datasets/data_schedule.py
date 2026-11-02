@@ -15,6 +15,7 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_global_real_seqlen_stats,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
     next_hdp_group_packing_aware,
@@ -257,8 +258,8 @@ class DpBalancedScheduler(BasePackingScheduler):
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
             num_micro_batches: Number of micro batches after scheduling.
-            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
-            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
+            seqlen_sum_this_global_batch: Total real (unpadded) tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared real seqlens for FLOPs.
         """
 
         is_first_pp = pp_group.rank() == 0
@@ -316,7 +317,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
             # Step 1: Gather global sequence lengths for the fetched batches
-            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
+            batch, global_id_seqlens, global_ids_this_rank, offsets, _ = (
                 get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
             )
 
@@ -374,10 +375,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 is_dynamic_cp=self.is_dynamic_cp,
             )
 
-            # Step 6: Calculate FLOPs info
-            seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
-            seqlen_squared_sum_this_global_batch = float(
-                sum(seqlen**2 for seqlen in seqlens_gathered)
+            # Step 6: Calculate FLOPs info from real tokens. Padded lengths only size
+            # the schedule and the packed buffers.
+            seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
+                get_global_real_seqlen_stats(batch, dp_group, dev)
             )
         else:
             (
