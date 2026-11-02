@@ -98,23 +98,38 @@ def _snapshot_torch_settings():
 
 
 def _restore_torch_settings(settings):
-    # Determinism tests freeze bare backend-flag assignment during package import. Teardown
-    # still has to restore the captured state, so perform these fixture-owned writes under
-    # PyTorch's mutation guard (the same mechanism the backend flag contexts use).
+    mode, warn_only = settings["deterministic"]
+    torch.use_deterministic_algorithms(mode, warn_only=warn_only)
+    torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
+    # PyTorch's common_utils freezes bare cuDNN assignments on import. Restore
+    # the snapshot in the same scoped mutation context used by cudnn.flags(),
+    # preserving the caller's frozen/unfrozen state when the context exits.
     with torch.backends.__allow_nonbracketed_mutation():
-        mode, warn_only = settings["deterministic"]
-        torch.use_deterministic_algorithms(mode, warn_only=warn_only)
-        torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
         (
             torch.backends.cudnn.deterministic,
             torch.backends.cudnn.benchmark,
             torch.backends.cudnn.allow_tf32,
         ) = settings["cudnn"]
-        (
-            torch.backends.cuda.matmul.allow_tf32,
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
-        ) = settings["matmul"]
+    (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+    ) = settings["matmul"]
+
+
+def test_restore_torch_settings_with_frozen_backend_flags():
+    original = _snapshot_torch_settings()
+    with torch.backends.__allow_nonbracketed_mutation():
+        try:
+            torch.backends.cudnn.deterministic = not original["cudnn"][0]
+            torch.backends.cudnn.benchmark = not original["cudnn"][1]
+            torch.backends.cudnn.allow_tf32 = not original["cudnn"][2]
+            torch.backends.disable_global_flags()
+            _restore_torch_settings(original)
+            assert _snapshot_torch_settings() == original
+            assert torch.backends.flags_frozen()
+        finally:
+            _restore_torch_settings(original)
 
 
 def snapshot_process_state():
