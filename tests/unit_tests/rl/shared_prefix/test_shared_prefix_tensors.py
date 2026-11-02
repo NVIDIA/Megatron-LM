@@ -101,6 +101,26 @@ def _padded_branch_tails():
     return result | dict(routes=(star_counts, dense_counts), mtp_mask=mtp_mask)
 
 
+def test_token_aligned_source_must_cover_every_real_token():
+    """A source narrower than the longest real row raises instead of overwriting real tokens."""
+    input_ids = tensor([[10, 11, 12, 20, 21, 22, 0], [10, 11, 12, 30, 31, 32, 33]])
+    star_rows = [
+        row(0, prompt=(10, 11, 12), completion=3),
+        row(1, prompt=(10, 11, 12), completion=4),
+    ]
+    layout = build_shared_prefix_layout(star_rows, sequence_length_pad_multiple=4)
+    lengths = tensor([6, 7])
+    tensor_bin = materialize_shared_prefix_layout(input_ids, input_lengths=lengths, layout=layout)
+    full = torch.ones_like(input_ids)
+    gathered = materialize_shared_prefix_token_aligned_tensor(full, tensor_bin=tensor_bin)
+    padding = tensor_bin.indices.physical_padding_positions
+    assert torch.equal(gathered, torch.ones_like(gathered).index_fill_(0, padding, 0))
+    # Width 6 cuts row 1's last completion token, as a [:, :-1] slice does; width 2 a prompt token.
+    for width in (6, 2):
+        with pytest.raises(ValueError, match="width"):
+            materialize_shared_prefix_token_aligned_tensor(full[:, :width], tensor_bin=tensor_bin)
+
+
 def _tp_sp_cp_padding():
     """M-aligned branches and the final star tail remain distinct metadata."""
     batch = [[10, 11, 12, 13, 20, 21, 22, 0, 0], [10, 11, 12, 13, 30, 31, 32, 33, 0]]

@@ -423,12 +423,24 @@ def materialize_shared_prefix_token_aligned_tensor(
     This is used for metadata such as MTP loss masks that must follow exactly
     the same prompt deduplication, branch padding, and row permutation as token
     IDs.  The returned tensor is global and unsharded; topology-only padding is
-    applied by the caller together with the model input.
+    applied by the caller together with the model input. ``source`` must be at
+    least as wide as the longest real row (prompt plus completion) in the
+    layout; branch padding tails past its width are filled with
+    ``padding_value``.
     """
     if source.ndim != 2:
         raise ValueError("shared-prefix token-aligned source must have shape [batch, sequence]")
     if source.shape[0] <= max(tensor_bin.layout.row_indices):
         raise ValueError("shared-prefix token-aligned source is missing a referenced row")
+    required_width = max(
+        root.prompt_length + max(root.completion_lengths)
+        for _, root in tensor_bin.layout.iter_roots()
+    )
+    if source.shape[1] < required_width:
+        raise ValueError(
+            f"shared-prefix token-aligned source has width {source.shape[1]}, but the layout "
+            f"reads real tokens up to column {required_width - 1}"
+        )
     return _gather_token_aligned_tensor(
         source, indices=tensor_bin.indices, padding_value=padding_value
     )
@@ -439,14 +451,12 @@ def _gather_token_aligned_tensor(
 ) -> torch.Tensor:
     """Apply the same physical gather and tail-padding rule to tokens and metadata.
 
-    Columns past the source width (only branch padding tails reach them) are
-    clamped for the gather and then overwritten, so no padded copy of the
-    source is made.
+    Callers have checked that every real token lies inside ``source``, so only
+    branch padding tails can reach past its width. Those columns are clamped for
+    the gather and then overwritten, so no padded copy of the source is made.
     """
-    columns = indices.token_gather_columns
-    width = source.shape[1]
-    packed = source[indices.token_gather_rows, columns.clamp_max(width - 1)]
-    packed.masked_fill_(columns >= width, padding_value)
+    columns = indices.token_gather_columns.clamp_max(source.shape[1] - 1)
+    packed = source[indices.token_gather_rows, columns]
     return packed.index_fill_(0, indices.physical_padding_positions, padding_value)
 
 
