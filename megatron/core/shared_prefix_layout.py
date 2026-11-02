@@ -129,10 +129,12 @@ class SharedPrefixLayout:
     ) -> Tensor:
         """Dense-baseline multiplicity for each physical shared-prefix token.
 
-        Prompt tokens occur once per completion in a conventional rollout batch.
-        Branch tokens, including ordinary per-sequence padding, have unit
-        multiplicity unless exclude_sequence_padding is requested. Trailing topology-only padding
-        is inert.
+        Prompt tokens occur once per completion in a conventional rollout batch, and branch
+        tokens once. ``exclude_sequence_padding`` selects the dense baseline for per-branch
+        padding rows: True matches a dense forward that passes the packed-sequence padding mask
+        (the flex dispatcher's HybridEP backend), so those rows get multiplicity 0; False matches
+        a dense forward with ``padding_mask=None``, which counts them. Trailing topology-only
+        padding is inert.
         """
         physical_len = int(physical_len)
         if physical_len < self.total_len:
@@ -151,8 +153,7 @@ class SharedPrefixLayout:
             ]
         )
         if exclude_sequence_padding:
-            # Hybridep's dense input mask excludes ordinary sequence padding.
-            # Keep the legacy unmasked convention as the default for other callers.
+            # Per-branch padding rows lie past each completion's logical length.
             logical_lengths = self.logical_completion_lens or self.completion_lens
             offset = self.prefix_len
             for logical, physical in zip(logical_lengths, self.completion_lens):
@@ -173,18 +174,16 @@ class SharedPrefixLayout:
         physical_len: int, cp_size: int, cp_rank: int, device: torch.device | str
     ) -> Tensor:
         """Global indices owned by one rank under standard two-chunk CP zigzag."""
+        # Imported here: the transformer package imports this module, so importing the package
+        # at module level would be circular.
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_zigzag_cp_local_positions,
+        )
+
         physical_len, cp_size, cp_rank = int(physical_len), int(cp_size), int(cp_rank)
         if cp_size < 1 or not 0 <= cp_rank < cp_size:
             raise ValueError(f"invalid CP geometry: {cp_size=}, {cp_rank=}")
-        if physical_len % (2 * cp_size):
-            raise ValueError(
-                f"physical length {physical_len} must be divisible by 2 * CP size {cp_size}"
-            )
-        chunk = physical_len // (2 * cp_size)
-        front = torch.arange(cp_rank * chunk, (cp_rank + 1) * chunk, device=device)
-        back_chunk = 2 * cp_size - cp_rank - 1
-        back = torch.arange(back_chunk * chunk, (back_chunk + 1) * chunk, device=device)
-        return torch.cat([front, back]).to(torch.long)
+        return build_zigzag_cp_local_positions(physical_len, cp_size, cp_rank, torch.device(device))
 
 
 @dataclass(frozen=True)
