@@ -625,6 +625,9 @@ def test_shortcut_overlap_model_validation():
 
 def test_shortcut_overlap_setup_validation():
     assert not InferenceSetupConfig().inference_shortcut_moe_overlap
+    InferenceSetupConfig(
+        inference_shortcut_moe_overlap=True, inference_dynamic_batching=True
+    ).validate()
     for overrides in (
         {"inference_dynamic_batching": False},
         {"use_legacy_static_engine": True},
@@ -633,7 +636,7 @@ def test_shortcut_overlap_setup_validation():
         settings = dict(inference_shortcut_moe_overlap=True, inference_dynamic_batching=True)
         settings.update(overrides)
         with pytest.raises(ValueError, match="Shortcut MoE overlap"):
-            InferenceSetupConfig(**settings)
+            InferenceSetupConfig(**settings).validate()
 
 
 def test_shortcut_overlap_cli_and_runtime_config():

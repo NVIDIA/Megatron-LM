@@ -296,21 +296,18 @@ class InferenceSetupConfig:
     inference_shortcut_moe_overlap: bool = False
     """Overlap Shortcut MoE routing, experts and communication during dynamic inference."""
 
-    def __post_init__(self) -> None:
-        if not self.inference_shortcut_moe_overlap:
-            return
-        if not self.inference_dynamic_batching or self.use_legacy_static_engine:
-            raise ValueError(
-                "Shortcut MoE overlap requires dynamic batching without the legacy static engine"
-            )
-        if self.num_speculative_tokens:
-            raise ValueError(
-                "Shortcut MoE overlap with speculative decoding requires further testing"
-            )
-
     def validate(self) -> None:
-        """Check the KV-cache suspend/resume policy before an engine is built from it."""
-        self.__post_init__()
+        """Check inference setup settings before an engine is built from them."""
+        if self.inference_shortcut_moe_overlap:
+            if not self.inference_dynamic_batching or self.use_legacy_static_engine:
+                raise ValueError(
+                    "Shortcut MoE overlap requires dynamic batching without the legacy static engine"
+                )
+            if self.num_speculative_tokens:
+                raise ValueError(
+                    "Shortcut MoE overlap with speculative decoding requires further testing"
+                )
+
         mode = self.kv_cache_management_mode
         static_pointers = self.static_kv_memory_pointers
         uvm = self.inference_dynamic_batching_unified_memory_level > 0
