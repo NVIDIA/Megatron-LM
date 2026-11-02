@@ -521,14 +521,14 @@ def test_composed_attention_matches_independent_reference(
         return attention.flash_composed_forest_attention(q, k, v, forest)
 
     with deterministic_algorithms(deterministic):
-        forest = run_once(operation, inputs, {"out": cotangent})
+        composed = run_once(operation, inputs, {"out": cotangent})
         baseline = run_once(
             lambda q, k, v: _dense_branches(q, k, v, forest), inputs, {"out": cotangent}
         )
-    assert all(torch.isfinite(tensor).all() for tensors in forest for tensor in tensors.values())
-    assert torch.count_nonzero(forest[0]["out"][-8:]) == 0
-    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in forest[1].values())
-    forest_errors = _relative_errors(forest, truth)
+    assert all(torch.isfinite(tensor).all() for tensors in composed for tensor in tensors.values())
+    assert torch.count_nonzero(composed[0]["out"][-8:]) == 0
+    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in composed[1].values())
+    forest_errors = _relative_errors(composed, truth)
     baseline_errors = _relative_errors(baseline, truth)
     for name, forest_error, baseline_error in zip(
         ("out", "dq", "dk", "dv"), forest_errors, baseline_errors
