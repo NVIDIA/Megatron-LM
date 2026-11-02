@@ -189,7 +189,7 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     assert _get_indexer_logging_layer_counts(args) == (6, 3)
 
 
-def test_megatron_rl_is_imported_only_for_rl_runs():
+def test_training_import_does_not_load_megatron_rl():
     """Importing the training loop must not load megatron.rl's agent and inference stack.
 
     Editable megatron-core installs expose all of megatron.rl, so the training loop must not
