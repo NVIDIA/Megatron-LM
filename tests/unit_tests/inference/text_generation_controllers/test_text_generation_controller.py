@@ -309,6 +309,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         ),
         copy_async_sched_sample_to_forward=mock.Mock(),
         agree_on_moe_decode_only=mock.Mock(),
+        end_expert_parallel_dummy_step=mock.Mock(),
         reset=mock.Mock(),
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
@@ -365,6 +366,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
+    controller._dummy_forward_done_event = mock.Mock()
     controller._async_sched_mtp_token_row_indices = None
     controller._all_logits_cuda = torch.empty(0)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
@@ -956,7 +958,7 @@ def test_run_async_sched_forward_commits_mamba_prefix_states():
     context.mamba_slot_allocator.commit_intermediate_states.assert_called_once_with()
 
 
-def test_run_dummy_async_sched_base_step_resets_without_committing_mamba_state():
+def test_run_dummy_async_sched_base_step_ends_without_committing_mamba_state():
     context = _make_async_sched_context()
     context.is_hybrid_model = True
     context.mamba_slot_allocator = SimpleNamespace(commit_intermediate_states=mock.Mock())
@@ -971,7 +973,9 @@ def test_run_dummy_async_sched_base_step_resets_without_committing_mamba_state()
     assert result is None
     controller._run_dummy_base_forward.assert_called_once_with(input_ids, position_ids)
     context.mamba_slot_allocator.commit_intermediate_states.assert_not_called()
-    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
+    # Ending the dummy step keeps requests the context still holds, unlike a reset.
+    context.end_expert_parallel_dummy_step.assert_called_once_with()
+    context.reset.assert_not_called()
 
 
 @pytest.mark.parametrize("is_valid", [False, True])
@@ -1019,7 +1023,7 @@ def test_dummy_forward_matches_mode_forward_order(mode, expected_order):
     controller.dummy_forward()
 
     assert order == expected_order
-    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
+    context.end_expert_parallel_dummy_step.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -1119,11 +1123,16 @@ def test_step_agrees_on_the_phase_it_launches_before_its_forwards(
 
 
 def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
-    """An idle rank's dummy step counts as decode-only and agrees before its collectives."""
+    """An idle rank's dummy step counts as decode-only and agrees before its collectives. Only
+    then does it wait for its previous dummy forward, before restaging the context's host
+    buffers, so it runs at most one forward ahead without delaying its peers' launches."""
     context = _make_async_sched_context()
     controller = _make_async_sched_controller(context)
     order = []
     context.agree_on_moe_decode_only.side_effect = lambda value: order.append(("agree", value))
+    controller._dummy_forward_done_event.synchronize.side_effect = lambda: order.append("wait")
+    controller._dummy_forward_done_event.record.side_effect = lambda: order.append("record")
+    context.end_expert_parallel_dummy_step.side_effect = lambda: order.append("end")
 
     def context_init(**kwargs):
         order.append("init")
@@ -1135,7 +1144,7 @@ def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
 
     controller.dummy_forward()
 
-    assert order == [("agree", True), "init", "mtp", "base"]
+    assert order == [("agree", True), "wait", "init", "mtp", "base", "record", "end"]
 
 
 @pytest.mark.parametrize("bounded", [False, True])

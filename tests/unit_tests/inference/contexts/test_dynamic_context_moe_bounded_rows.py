@@ -218,3 +218,41 @@ class TestBoundedMoeRows:
                 construct_graph_dimensions=decode, construct_graph_bounded_moe_rows=True
             )
         ctx.reset()
+
+    @pytest.mark.internal
+    def test_a_step_announced_decode_only_must_not_launch_prefill(self):
+        """If every replica, this one included, announced a decode-only step, the others bound
+        their rows; launching a prefill here would put its tokens past them, so it fails."""
+        ctx = self._context(communicator=_ScriptedCommunicator(peers_not_decode_only=False))
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 8, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            )
+        )
+        ctx.agree_on_moe_decode_only(True)
+        with pytest.raises(RuntimeError, match="announced a decode-only step"):
+            ctx.initialize_attention_state()
+        ctx.reset()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "tp, etp, ep, communicator, variants",
+        [
+            (2, 1, 2, False, (False, True)),
+            (1, 1, 2, False, (False,)),
+            (1, 1, 2, True, (False, True)),
+            (1, 2, 2, True, (False,)),
+        ],
+    )
+    def test_mtp_graphs_are_captured_for_every_bound(self, tp, etp, ep, communicator, variants):
+        """An MTP draft forward runs with the bound of the base forward before it, so its graphs
+        exist for each bound a base step can use."""
+        ctx = self._context(
+            tp=tp,
+            etp=etp,
+            ep=ep,
+            communicator=_ScriptedCommunicator(False) if communicator else None,
+        )
+        assert ctx.bounded_moe_row_mtp_graph_variants() == variants

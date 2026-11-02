@@ -239,47 +239,23 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
     assert engine._should_run_async_sched_overlap()
 
 
-@pytest.mark.parametrize(
-    "phase_agreed, can_prepare, has_import, waiting_availability, overlap, admits_prefill",
-    [
-        # Overlap steps admit nothing.
-        (True, True, False, None, True, False),
-        # A paused request or too little KV to prepare: nothing waits to be admitted.
-        (True, False, False, None, False, False),
-        # The queue head does not fit the KV cache at the step's entry.
-        (True, False, False, (True, False, True), False, False),
-        # A completed KV import enters as a decode request.
-        (True, True, True, None, False, False),
-        (True, False, False, (True, True, True), False, True),
-        # Without the per-step agreement the step admits whatever fits after its update.
-        (False, False, False, None, False, True),
-    ],
-    ids=["overlap", "paused", "short-kv", "kv-import", "admittable", "not-agreed"],
-)
-def test_async_step_admits_prefill_only_when_announced(
-    phase_agreed, can_prepare, has_import, waiting_availability, overlap, admits_prefill
-):
-    """When the replicas sharing the MoE collectives agree on each step's phase at its entry, a
-    no-overlap step admits prefill only if its queue head was admittable then, so a step that
-    announced a decode-only forward launches one; it still admits decode-ready KV imports."""
+def test_async_step_admits_kv_imports_while_announcing_decode_only():
+    """While the replicas sharing the MoE collectives agree on each step's phase, a no-overlap
+    step with no admittable prefill still admits completed KV imports: they enter as decode
+    requests, so its forward stays decode-only as announced."""
     engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
     engine._initialize_disaggregation_state()
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
-    engine.context.can_prepare_requests.return_value = can_prepare
-    engine.context.moe_step_phase_is_agreed = phase_agreed
+    engine.context.moe_step_phase_is_agreed = True
     engine.context.step_count = 0
     engine.context.prefix_cache_lru_clock = 0
     engine.context.dynamo_helper = None
-    engine.context.check_availability = mock.Mock(return_value=waiting_availability)
-    engine._cg_admission_gating_active = mock.Mock(return_value=False)
-    engine.waiting_request_ids = deque([10] if waiting_availability is not None else [])
-    engine.get_request = mock.Mock(return_value=SimpleNamespace(remaining_prompt_tokens=[1, 2]))
-    if has_import:
-        engine._pending_kv_imports.append(
-            SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
-        )
-        engine._handoff_completion_notifications[7] = (False, True)
+    engine.waiting_request_ids = deque()
+    engine._pending_kv_imports.append(
+        SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+    )
+    engine._handoff_completion_notifications[7] = (False, True)
     engine.controller.async_generate_output_tokens_dynamic_batch = mock.AsyncMock(
         return_value=DynamicBatchControllerStepResult(
             decode_only=DecodeOnly(consumed=True, launched=True), output=None
@@ -289,15 +265,117 @@ def test_async_step_admits_prefill_only_when_announced(
     asyncio.run(engine.async_forward())
 
     kwargs = engine.controller.async_generate_output_tokens_dynamic_batch.await_args.kwargs
-    assert kwargs["run_async_overlap"] is overlap
-    assert kwargs["admits_prefill"] is admits_prefill
-    if overlap:
-        expected_admission = None
-    elif admits_prefill:
-        expected_admission = engine.schedule_waiting_requests
-    else:
-        expected_admission = engine._admit_pending_kv_imports
-    assert kwargs["schedule_waiting_requests"] == expected_admission
+    assert kwargs["run_async_overlap"] is False
+    assert kwargs["admits_prefill"] is False
+    assert kwargs["schedule_waiting_requests"] == engine._admit_pending_kv_imports
+
+
+class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
+    """A real engine, context and controller under the per-step MoE phase agreement.
+
+    The model forward returns zero logits; what is checked is the scheduling. The agreement is
+    forced on (DynamicInferenceContext.moe_step_phase_is_agreed) and the tp_ep group made to span
+    two replicas, so a step that admits no prefill and has nothing left to run issues the idle
+    dummy base step. With the agreement on, each step must admit and launch exactly what it does
+    with the agreement off.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        _reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @classmethod
+    def _run(cls, agreed, prompt_lengths, **config):
+        """Run the prompts to completion and return the context's state before every step and
+        the hidden-chunk state seen by every idle dummy base step."""
+        env = cls._build_test_env(
+            _DynamicEngineTestConfig(
+                num_requests=0,
+                num_tokens_to_generate=4,
+                max_sequence_length=max(prompt_lengths) + 8,
+                context_max_requests=4,
+                context_max_tokens=64,
+                num_gap_steps=0,
+                sampling_backend="torch",
+                top_k=1,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                **config,
+            )
+        )
+        engine, context, controller = env.engine, env.engine.context, env.engine.controller
+
+        def zero_logits(inference_input):
+            tokens = inference_input["tokens"].shape[1]
+            return torch.zeros(1, tokens, controller.vocab_size, device="cuda")
+
+        controller.inference_wrapped_model.run_one_forward_step = zero_logits
+        dummy_base_steps = []
+        dummy_base_step = controller._run_dummy_async_sched_base_step
+
+        def record_dummy_base_step():
+            dummy_base_steps.append(context.chunked_prefill_request_id)
+            dummy_base_step()
+
+        controller._run_dummy_async_sched_base_step = record_dummy_base_step
+        sampling_params = SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1)
+        for request_id, length in enumerate(prompt_lengths):
+            engine.add_request(
+                request_id, (torch.arange(length) % 64 + 1).tolist(), sampling_params
+            )
+
+        trace = []
+        with (
+            mock.patch.object(
+                type(context), "moe_step_phase_is_agreed", property(lambda self: agreed)
+            ),
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers."
+                "text_generation_controller.get_moe_dp_replica_count",
+                return_value=2,
+            ),
+        ):
+            while engine.has_unfinished_requests():
+                trace.append(
+                    (
+                        context.chunked_prefill_request_id,
+                        context.total_request_count,
+                        context.active_token_count,
+                        context.num_prefill_requests,
+                        len(engine.waiting_request_ids),
+                    )
+                )
+                engine.step_modern()
+                assert len(trace) < 64, "the requests did not finish"
+        return trace, dummy_base_steps
+
+    @torch.inference_mode()
+    def test_long_prompt_chunks_in_consecutive_steps(self):
+        """A prompt of four token budgets prefills in four consecutive steps as it does without
+        the agreement. Each step after a chunk admits the next one; none admits nothing and
+        lets the idle dummy base step overwrite and reset the context holding the hidden chunk,
+        whose next chunk would then run on a block table of -1."""
+        expected, _ = self._run(False, [256], enable_chunked_prefill=True)
+        trace, dummy_base_steps = self._run(True, [256], enable_chunked_prefill=True)
+        assert trace == expected
+        assert [chunk for chunk, *_ in trace[:4]] == [-1, 0, 0, 0]
+        assert all(chunk == -1 for chunk in dummy_base_steps)
+
+    @torch.inference_mode()
+    def test_prompt_fitting_after_a_full_prefill_is_admitted_next_step(self):
+        """A prompt that fits once the previous step's prefill turns into decode rows is admitted
+        in the next step, as without the agreement, not one step later."""
+        expected, _ = self._run(False, [64, 32])
+        trace, _ = self._run(True, [64, 32])
+        assert trace == expected
+        # The 32-token prompt waits only while the 64-token one fills the token budget.
+        assert [waiting for *_, waiting in trace[:3]] == [2, 1, 0]
 
 
 @pytest.mark.parametrize(

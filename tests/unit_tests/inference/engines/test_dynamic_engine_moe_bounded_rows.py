@@ -15,23 +15,29 @@ import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 DECODE = InferenceBatchDimensions(token_count=8, prefill_req_count=0, decode_req_count=8)
 MIXED = InferenceBatchDimensions(token_count=64, prefill_req_count=1, decode_req_count=7)
 
 
-def _engine(variants):
-    """An engine whose context reports `variants` per CUDA graph, recording each capture."""
+def _engine(variants, mtp_variants=(False,)):
+    """An engine whose context reports `variants` per CUDA graph and one MTP depth, recording
+    each base capture and each MTP graph key."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.inference_cuda_graph_scope = InferenceCudaGraphScope.block
     engine.cuda_graph_impl = "local"
+    engine.capture_stats = None
     engine.context = SimpleNamespace(
         cuda_graph_batch_dimensions_list=list(variants),
         bounded_moe_row_graph_variants=variants.__getitem__,
+        bounded_moe_row_mtp_graph_variants=lambda: mtp_variants,
+        enable_mtp_kv_cache=False,
         reset=mock.Mock(),
     )
     engine.captured = []
+    engine.mtp_keys = []
 
     def context_init(**kwargs):
         engine.captured.append(
@@ -39,15 +45,29 @@ def _engine(variants):
         )
         return None, None, None
 
+    def compute_mtp_single_step(**kwargs):
+        # A captured graph fixes the bound the forward ran with; its key must say so.
+        assert kwargs["cache_key"][-1] == InferenceMode.use_bounded_mxfp8_rows()
+        engine.mtp_keys.append(kwargs["cache_key"])
+
     engine.controller = SimpleNamespace(
         inference_wrapped_model=SimpleNamespace(
             model=SimpleNamespace(
-                config=SimpleNamespace(sequence_parallel=False, moe_enable_routing_replay=False)
-            )
+                config=SimpleNamespace(
+                    sequence_parallel=False,
+                    moe_enable_routing_replay=False,
+                    hidden_size=8,
+                    params_dtype=torch.float32,
+                )
+            ),
+            tp_group=None,
         ),
-        _language_model=SimpleNamespace(),
-        num_mtp_depths=0,
-        num_speculative_tokens=0,
+        _language_model=SimpleNamespace(
+            mtp=SimpleNamespace(mtp_use_repeated_layer=True),
+            compute_mtp_single_step=compute_mtp_single_step,
+        ),
+        num_mtp_depths=1,
+        num_speculative_tokens=1,
         _sampling_backend="torch",
         _dynamic_step_context_init=context_init,
         _dynamic_step_forward_logits=mock.Mock(),
@@ -57,15 +77,32 @@ def _engine(variants):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="graph capture reads CUDA memory stats")
 def test_create_cuda_graphs_captures_each_bounded_moe_row_variant():
-    """Every variant a step can replay is captured, and the communicator adds the bounded ones."""
-    engine = _engine({MIXED: (False,), DECODE: (False, True)})
+    """Every variant a step can replay is captured: at construction the unbounded ones, and once
+    the communicator makes the agreement possible the bounded ones, for the base graphs and for
+    the MTP draft graphs of every size. MTP graph keys carry the bound, and the capture
+    statistics cover both passes."""
+    mixed = InferenceBatchDimensions(token_count=64, prefill_req_count=2, decode_req_count=2)
+    variants = {mixed: (False,), DECODE: (False,)}
+    engine = _engine(variants, mtp_variants=(False,))
 
-    engine.create_cuda_graphs()
-    assert engine.captured == [(MIXED, False), (DECODE, False), (DECODE, True)]
+    with InferenceMode.active():
+        engine.create_cuda_graphs()
+        first_pass = dict(engine.capture_stats)
+        assert engine.captured == [(mixed, False), (DECODE, False)]
+        assert engine.mtp_keys == [("mtp", 4, None, False), ("mtp", 8, None, False)]
 
-    engine.captured.clear()
-    engine.create_cuda_graphs(bounded_moe_rows_only=True)
+        # The tp_ep communicator is attached.
+        variants[DECODE] = (False, True)
+        engine.context.bounded_moe_row_mtp_graph_variants = lambda: (False, True)
+        engine.captured.clear()
+        engine.mtp_keys.clear()
+        engine.create_cuda_graphs(bounded_moe_rows_only=True)
+
     assert engine.captured == [(DECODE, True)]
+    # A primer's dummy MTP forwards take their size from its own graph, which may be mixed, and
+    # their bound from the forward before it, so every size gets a bounded MTP graph.
+    assert engine.mtp_keys == [("mtp", 8, None, True), ("mtp", 4, None, True)]
+    assert engine.capture_stats["time"] >= first_pass["time"]
 
 
 @pytest.mark.parametrize("agreed", [False, True])

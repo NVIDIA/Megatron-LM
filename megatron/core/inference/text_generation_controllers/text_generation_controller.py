@@ -427,6 +427,8 @@ class TextGenerationController(MTPControllerMixin):
         self._async_sched_sample_cpu_ready_event = torch.cuda.Event()
         self._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
         self._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
+        # Marks the last dummy forward's launch; see dummy_forward().
+        self._dummy_forward_done_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
         self._async_sched_routing_copy_stream = None
         self._async_sched_routing_buffer_slots = []
@@ -1765,6 +1767,10 @@ class TextGenerationController(MTPControllerMixin):
         """Run the mode-specific dummy step used by idle expert-parallel ranks."""
         context = self.inference_wrapped_model.inference_context
         context.agree_on_moe_decode_only(True)
+        # The engine does not wait for dummy forwards, so stay at most one ahead of the GPU:
+        # the context init below restages the host buffers the previous one's copies read.
+        # Waiting after the vote lets the active peers launch their next forward meanwhile.
+        self._dummy_forward_done_event.synchronize()
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
 
         if context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
@@ -1775,9 +1781,10 @@ class TextGenerationController(MTPControllerMixin):
             raise AssertionError(
                 f"Unexpected async scheduling mode: {context.config.async_sched_mode}"
             )
+        self._dummy_forward_done_event.record()
 
         # Clear temporary dummy state while preserving reusable prefix state and counters.
-        context.reset(preserve_prefix_cache=True, preserve_counters=True)
+        context.end_expert_parallel_dummy_step()
 
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.
@@ -2833,12 +2840,16 @@ class TextGenerationController(MTPControllerMixin):
         )
 
     def _run_dummy_async_sched_base_step(self) -> None:
-        """Run the base-forward half of an async EP step after local work finishes."""
+        """Run the base-forward half of an async EP step after local work finishes.
+
+        The context may still hold paused requests or a chunked prefill hidden between chunks;
+        the dummy step sets them aside and gives them back.
+        """
         context = self.inference_wrapped_model.inference_context
 
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
         self._run_dummy_base_forward(input_ids, position_ids)
-        context.reset(preserve_prefix_cache=True, preserve_counters=True)
+        context.end_expert_parallel_dummy_step()
 
     def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Launch the initial forward when no valid logits state exists.

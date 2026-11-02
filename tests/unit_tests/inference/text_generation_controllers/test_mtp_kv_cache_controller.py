@@ -960,7 +960,7 @@ class TestSerialMtpDraftLoop:
 
         assert len(model.mtp_step_calls) == 2
         for depth, call in enumerate(model.mtp_step_calls):
-            assert call["cache_key"] == ("mtp", 2, None if repeated_head else depth)
+            assert call["cache_key"] == ("mtp", 2, None if repeated_head else depth, False)
             assert call["eager"] is False
             # The kwarg must be ABSENT, not None: the cache-free ("mtp", ...) graph is captured
             # without it and replay requires the exact captured kwarg set, so an explicit
@@ -1042,7 +1042,7 @@ class TestMtpCudaGraphs:
         assert context._mtp_begin_decode.call_args.kwargs["graphed"] is True
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp_kv", padded_count, None)
+            assert call["cache_key"] == ("mtp_kv", padded_count, None, False)
             assert call["eager"] is False
             assert call["mtp_inference_context"] is context
 
@@ -1107,7 +1107,7 @@ class TestMtpCudaGraphs:
         assert step_mha._max_seqlen_q == 64
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp_kv", 2, None)
+            assert call["cache_key"] == ("mtp_kv", 2, None, False)
             assert call["eager"] is False
             assert call["mtp_inference_context"] is context
         metadata = context.mtp_metadata
@@ -1130,7 +1130,7 @@ class TestMtpCudaGraphs:
 
         assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
-            assert call["cache_key"] == ("mtp", 2, None)
+            assert call["cache_key"] == ("mtp", 2, None, False)
             assert "mtp_inference_context" not in call
         controller._mtp_dummy_prefill_forward.assert_not_called()
         context._mtp_setup_decode_step.assert_not_called()
@@ -1646,7 +1646,7 @@ class TestMtpKvCacheCombinations:
             padded = ((active + tp_size - 1) // tp_size) * tp_size
         keys = [kw["cache_key"] for kw in steps]
         if graphed:
-            assert keys == [("mtp_kv", padded, None)] * num_mtp_depths
+            assert keys == [("mtp_kv", padded, None, False)] * num_mtp_depths
             assert all(kw["eager"] is False for kw in steps)
         else:
             assert all(k is None for k in keys)

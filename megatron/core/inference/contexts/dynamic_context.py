@@ -4,7 +4,7 @@ import logging
 import math
 import operator
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -969,6 +969,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._moe_replicas_agree_decode_only = False
         self.use_bounded_mxfp8_rows = False
+        # Requests an expert-parallel dummy step sets aside (see
+        # add_dummy_requests_for_expert_parallel_step).
+        self._dummy_step_held_requests = None
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -2418,6 +2421,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return (False,)
         return (False, True)
 
+    def bounded_moe_row_mtp_graph_variants(self) -> Tuple[bool, ...]:
+        """Return the bounded-MoE-row settings that MTP draft CUDA graphs can be replayed with.
+
+        An MTP draft forward runs with the setting of the base forward before it. Its rows, at
+        most one per request on each rank, fit the bound whenever decode-only steps' rows do,
+        so a draft graph of any size may be bounded once any base step can be.
+
+        Returns:
+            Tuple[bool, ...]: The settings, unbounded first.
+        """
+        if not self._moe_decode_rows_fit_capacity:
+            return (False,)
+        if self._moe_decode_only_needs_agreement and self._ep_zmq_communicator is None:
+            return (False,)
+        return (False, True)
+
     @property
     def cuda_graph_key(self) -> Tuple[InferenceBatchDimensions, bool]:
         """Key of the CUDA graphs this step replays: their padded batch dimensions, and whether
@@ -2656,6 +2675,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         We setup minimal state such that initialize_attention_state and the forward
         pass can run without error.
 
+        The context may still hold requests without any active one: paused requests, or a
+        chunked prefill hidden between chunks. Their counts and the request rows the dummy
+        step writes are set aside here, and end_expert_parallel_dummy_step() restores them.
+
         Called AFTER the EP sync so graph_dimensions reflects the agreed-upon graph.
         """
         N_decode = graph_dimensions.decode_req_count
@@ -2664,6 +2687,36 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         tokens_per_decode_request = self.num_speculative_tokens + 1
         T = graph_dimensions.token_count
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
+
+        # 0. Set aside the requests the context still holds.
+        assert self.total_request_count == self.paused_request_count, (
+            "An expert-parallel dummy step runs only without active requests, but "
+            f"{self.total_request_count - self.paused_request_count} are active"
+        )
+        self._dummy_step_held_requests = None
+        if self.total_request_count > 0 or self.chunked_prefill_request_id != -1:
+            rows = slice(0, N)
+            held_rows = [
+                self.request_query_lengths,
+                self.request_kv_length_offsets,
+                self.request_to_kv_block_ids,
+                self.request_in_prefill_status_tensor,
+            ]
+            if self.mtp_metadata.enabled:
+                held_rows.append(self.mtp_metadata.request_matched_prefix_blocks)
+            if self.is_hybrid_model:
+                held_rows.append(self.mamba_metadata.request_to_mamba_state_idx)
+            self._dummy_step_held_requests = dict(
+                counts=(
+                    self.total_request_count,
+                    self.paused_request_count,
+                    self.active_token_count,
+                    self.num_prefill_requests,
+                ),
+                rows=[(tensor, tensor[rows].clone()) for tensor in held_rows],
+            )
+            self.paused_request_count = 0
+            self.request_in_prefill_status_tensor[rows] = 0
 
         # 1. Request counts and token count.
         self.total_request_count = N
@@ -2721,6 +2774,54 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     dummy_slots is not None
                 ), f"No free recurrent-state slots for {N} expert-parallel dummy request(s)"
                 self.mamba_metadata.request_to_mamba_state_idx[0:N] = dummy_slots
+
+    def end_expert_parallel_dummy_step(self) -> None:
+        """Clear an expert-parallel dummy step's state once its forward is launched.
+
+        A context without requests is reset, keeping its prefix cache and counters. Requests
+        that add_dummy_requests_for_expert_parallel_step() set aside (paused requests, or a
+        chunked prefill hidden between chunks) get their rows and counts back instead: a reset
+        would drop them and free their KV blocks.
+        """
+        held = self._dummy_step_held_requests
+        self._dummy_step_held_requests = None
+        if held is None:
+            self.reset(preserve_prefix_cache=True, preserve_counters=True)
+            return
+        if self.is_hybrid_model and self.mamba_metadata.dummy_state_idx is None:
+            # Return the recurrent-state slots the dummy rows allocated.
+            dummy_rows = self.total_request_count - self.paused_request_count
+            self.mamba_metadata.free_slots(torch.arange(dummy_rows))
+        for tensor, rows in held["rows"]:
+            tensor[: rows.shape[0]] = rows
+        (
+            self.total_request_count,
+            self.paused_request_count,
+            self.active_token_count,
+            self.num_prefill_requests,
+        ) = held["counts"]
+
+    @contextmanager
+    def counts_after_update(self):
+        """Show admission probes the token and prefill counts the pending forward's update leaves.
+
+        Assumes no request finishes and no chunked prefill is in flight: every active request
+        then continues as one decode request of num_speculative_tokens + 1 tokens. A request
+        that finishes in the update frees capacity this misses, so a prompt that fits only then
+        waits one step. A paused request that resumes, or a decode request's next KV block, take
+        capacity this misses, so admission after the update can still fail where the probe
+        passes; a step whose probe passes only stops announcing a decode-only forward.
+        """
+        assert self.chunked_prefill_request_id == -1, "A chunked prefill is in flight"
+        counts = (self.active_token_count, self.num_prefill_requests)
+        self.active_token_count = (self.total_request_count - self.paused_request_count) * (
+            self.num_speculative_tokens + 1
+        )
+        self.num_prefill_requests = 0
+        try:
+            yield
+        finally:
+            self.active_token_count, self.num_prefill_requests = counts
 
     def initialize_attention_state(
         self,
@@ -2806,6 +2907,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         else:
             decode_only = batch_dimensions.prefill_req_count == 0
             if self._moe_decode_only_needs_agreement:
+                if self._moe_replicas_agree_decode_only and not decode_only:
+                    # Every replica, this one included, announced a decode-only forward; the
+                    # others now process only the bounded rows, which miss this prefill.
+                    raise RuntimeError(
+                        "This rank announced a decode-only step to the replicas sharing the "
+                        f"MoE collectives, but launches {batch_dimensions.prefill_req_count} "
+                        "prefill request(s)."
+                    )
                 decode_only = decode_only and self._moe_replicas_agree_decode_only
                 self._moe_replicas_agree_decode_only = False
             self.use_bounded_mxfp8_rows = self._moe_decode_rows_fit_capacity and decode_only
