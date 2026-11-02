@@ -366,7 +366,10 @@ def test_block_checkpoint_preserves_cross_chunk_indices(
         return hidden_states.index_select(0, indices).square()
 
     block = SimpleNamespace(
-        config=config, num_layers_per_pipeline_rank=2, layers=[producer, consumer]
+        config=config,
+        num_layers_per_pipeline_rank=2,
+        layers=[producer, consumer],
+        pg_collection=SimpleNamespace(tp=None),  # read by precision_aware_checkpoint (#7709)
     )
     inputs, outputs = [], []
     for values in ([2.0, 3.0], [3.0, 4.0]):
