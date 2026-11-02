@@ -2017,7 +2017,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if self.config.overlap_moe_expert_parallel_comm:
                 probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                    hidden_states,
+                    probs,
+                    routing_map,
+                    kwargs.get("padding_mask"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
                 )
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
@@ -2049,7 +2053,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                    hidden_states,
+                    probs,
+                    routing_map,
+                    kwargs.get("padding_mask"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
                 )
                 return residual, hidden_states, probs, shared_expert_output
 
