@@ -198,7 +198,11 @@ def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
         pre_mlp_layernorm_output, padding_mask, packed_seq_params=node.chunk_state.packed_seq_params
     )
     local_tokens, probs = layer.mlp.preprocess(
-        pre_mlp_layernorm_output, probs, routing_map, padding_mask
+        pre_mlp_layernorm_output,
+        probs,
+        routing_map,
+        padding_mask,
+        packed_seq_params=node.chunk_state.packed_seq_params,
     )
 
     node.layer_state.residual = node.detach(residual)
