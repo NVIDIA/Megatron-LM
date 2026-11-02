@@ -1,1 +1,1 @@
-nvcr.io/nvidia/pytorch:26.09-py3
+nvcr.io/nvidian/nemo:fw-base-26.12.rc0

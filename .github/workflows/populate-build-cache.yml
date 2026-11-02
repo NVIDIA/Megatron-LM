@@ -69,6 +69,9 @@ jobs:
       id-token: write
       pull-requests: read
     uses: ./.github/workflows/_build_ci_container.yml
+    secrets:
+      NGC_API_USER: ${{ secrets.NGC_API_USER }}
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
     with:
       is-maintainer: true
       source-sha: ${{ github.sha }}
