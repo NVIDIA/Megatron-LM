@@ -1,11 +1,12 @@
 # Fused wide-residual shortcut seams
 
 For wide-residual hybrid models with shortcut-connected MoE (`--moe-shortcut-wide-residual-norm-fusion`;
-needs `--fp32-residual-connection`, BF16 parameters, RMSNorm, 2-6 wide streams, a shared expert, no
-dropout/bias, no CP/PP, and a GB300 for training), `ShortcutMoEBlock` replaces each residual seam with one
-Gluon kernel that mixes the FP32 wide-residual streams with the branch update, writes the new residual, and
-emits the RMSNorm readers that consume it — directly as MXFP8 for an exclusive TE Linear consumer under an
-MXFP8 recipe, otherwise BF16. `wide_residual_write_read_rmsnorm_quant` writes the Mamba/GDN/attention
+needs BF16 parameters, RMSNorm, 2-6 wide streams, a shared expert, no dropout/bias, no CP/PP, and a GB300
+for training; the residual stream is FP32 with `--fp32-residual-connection`, otherwise BF16, and the
+connection logits may be FP32 or BF16 — all arithmetic is FP32 either way), `ShortcutMoEBlock` replaces
+each residual seam with one Gluon kernel that mixes the wide-residual streams with the branch update,
+writes the new residual, and emits the RMSNorm readers that consume it — directly as MXFP8 for an
+exclusive TE Linear consumer under an MXFP8 recipe, otherwise BF16. `wide_residual_write_read_rmsnorm_quant` writes the Mamba/GDN/attention
 output and produces the shared expert's normalized input; `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`
 adds the routed and shared MoE outputs (the shortcut add, passed between blocks as a `PendingShortcutAdd`) and
 produces the next block's compute-layer and shortcut-routing inputs. The shortcut add is optional: a

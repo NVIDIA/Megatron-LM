@@ -97,13 +97,23 @@ SEAMS = [(1, 1), (2, 2), (2, 1)]
 
 
 def inputs(
-    streams, readers, hidden=96, tokens=1024, *, retention=True, seed=917, pad=2, updates=None
+    streams,
+    readers,
+    hidden=96,
+    tokens=1024,
+    *,
+    retention=True,
+    seed=917,
+    pad=2,
+    updates=None,
+    residual_dtype=torch.float32,
+    logit_dtype=torch.float32,
 ):
     """Seeded leaves (residual, updates, controllers, gammas).
 
     ``updates`` defaults to one per reader (two readers: a shortcut add). Controllers carry
     ``pad`` unused trailing logits; retention=False drops the retain controller (static
-    identity) after drawing it.
+    identity) after drawing it. The residual and the controller logits are FP32 or BF16.
     """
     torch.manual_seed(seed)
     bf16 = torch.bfloat16
@@ -111,9 +121,9 @@ def inputs(
     def leaf(*shape, dtype=torch.float32):
         return torch.randn(*shape, device="cuda", dtype=dtype, requires_grad=True)
 
-    residual = leaf(tokens, streams * hidden)
+    residual = leaf(tokens, streams * hidden, dtype=residual_dtype)
     updates = tuple(leaf(tokens, hidden, dtype=bf16) for _ in range(updates or readers))
-    controllers = tuple(leaf(streams + pad) for _ in range(2 + readers))
+    controllers = tuple(leaf(streams + pad, dtype=logit_dtype) for _ in range(2 + readers))
     gammas = tuple(leaf(hidden, dtype=bf16) for _ in range(readers))
     if not retention:
         controllers = (controllers[0], None, *controllers[2:])
@@ -344,7 +354,10 @@ def mxfp8_quantizer(*, rowwise=True, columnwise=True):
 
 
 def reference(raw, streams, epsilon=1e-5):
-    """Independent FP64 formula with the specified BF16 branch-sum/output boundaries."""
+    """Independent FP64 formula with the specified BF16 branch-sum/output boundaries.
+
+    The current residual is rounded to the residual's dtype; readers fold unrounded values.
+    """
     residual, updates, controllers, gammas = raw
     hidden = updates[0].shape[-1]
     r = residual.double().view(-1, streams, hidden)
@@ -361,7 +374,7 @@ def reference(raw, streams, epsilon=1e-5):
         x = (read[:streams].double().sigmoid()[None, :, None] * current).sum(1)
         rs = (x.square().mean(-1, keepdim=True) + epsilon).rsqrt()
         outputs.append(((x * rs) * gamma.double()).bfloat16())
-    return current.flatten(1).float(), *outputs
+    return current.flatten(1).to(residual.dtype), *outputs
 
 
 def folded_reader(saved, previous, reader):
@@ -413,7 +426,7 @@ def standard_backward(saved, previous, dys, carry, *, prepare_wgrad=None):
         gamma_grads.append((dy.double() * z).sum(0).float())
         normalized = (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
         columns.append(mxfp8_quantizer(rowwise=False)(normalized) if routes[reader] else None)
-    residual_grad = (total * coefficients[1][None, :, None]).flatten(1).float()
+    residual_grad = (total * coefficients[1][None, :, None]).flatten(1).to(previous.dtype)
     update_grad = (total * coefficients[0][None, :, None]).sum(1).bfloat16()
     control_values = [
         (total * update[:, None, :]).sum((0, 2)) * coefficients[4],
@@ -434,10 +447,10 @@ def standard_backward(saved, previous, dys, carry, *, prepare_wgrad=None):
 
 
 def assert_grads_close(actual, expected, first=(2e-5, 2e-5), fp32=(5e-4, 2e-4)):
-    """Residual (``first``), BF16 (1/128) and other (``fp32``; None skips) gradients."""
+    """FP32 residual (``first``), BF16 (1/128) and other (``fp32``; None skips) gradients."""
     for index, (a, b) in enumerate(zip(actual, expected)):
         bf16 = getattr(a, "dtype", None) == torch.bfloat16
-        tolerance = first if index == 0 else (1 / 128, 1 / 128) if bf16 else fp32
+        tolerance = (1 / 128, 1 / 128) if bf16 else first if index == 0 else fp32
         if tolerance:
             torch.testing.assert_close(a, b, rtol=tolerance[0], atol=tolerance[1])
 
@@ -498,6 +511,49 @@ def test_forward_and_complete_backward(
     for c in raw[2] if controllers else ():
         index = next(i for i, p in enumerate(originals) if p is c)
         assert torch.count_nonzero(ga[index][streams:]) == 0
+
+
+BF16 = torch.bfloat16
+BF16_STREAMS = [(BF16, BF16), (BF16, torch.float32), (torch.float32, BF16)]
+
+
+@GPU
+@pytest.mark.parametrize("residual_dtype,logit_dtype", BF16_STREAMS)
+@pytest.mark.parametrize("readers,updates", SEAMS)
+@pytest.mark.parametrize(
+    "streams,hidden,tokens",
+    [(3, 96, 1024), (1, 128, 2048), (3, 4096, 1024), (6, 3072, 1024), (2, 10240, 1024)],
+)
+def test_bf16_residual_and_logits(
+    residual_dtype, logit_dtype, readers, updates, streams, hidden, tokens
+):
+    """BF16 residual streams and controller logits: FP32 arithmetic, outputs in their own
+    dtypes, and every autograd gradient (in its leaf's dtype) against the FP64 formula."""
+    raw = inputs(
+        streams,
+        readers,
+        hidden,
+        tokens,
+        updates=updates,
+        residual_dtype=residual_dtype,
+        logit_dtype=logit_dtype,
+    )
+    originals = (raw[0], *raw[1], *raw[2], *raw[3])
+    cloned = tuple(t.detach().clone().requires_grad_(True) for t in originals)
+    n, u = readers, updates
+    ref_raw = (cloned[0], cloned[1 : 1 + u], cloned[1 + u : 3 + u + n], cloned[3 + u + n :])
+    actual, expected = run(raw, streams), reference(ref_raw, streams)
+    assert actual[0].dtype == residual_dtype
+    # The kernel rounds its FP32 residual once; FP64 rounds directly (at most one ulp apart).
+    exact = (2e-6, 2e-6) if residual_dtype == torch.float32 else (1 / 128, 1e-6)
+    torch.testing.assert_close(actual[0], expected[0], rtol=exact[0], atol=exact[1])
+    for a, b in zip(actual[1:], expected[1:]):
+        torch.testing.assert_close(a, b, rtol=1 / 128, atol=1 / 128)
+    dys = tuple(torch.randn_like(t) for t in actual)
+    ga = torch.autograd.grad(actual, originals, dys)
+    ge = torch.autograd.grad(expected, cloned, dys)
+    assert [g.dtype for g in ga] == [t.dtype for t in originals]
+    assert_grads_close(ga, ge, fp32=(5e-4, 5e-4))
 
 
 CONTRIBUTION_CASES = [
@@ -584,7 +640,7 @@ def test_boundary_rejects_invalid_inputs_before_backward(invalid):
     """The forward owner validates state before the trusted backward executor uses it."""
     residual, updates, controllers, gammas = inputs(3, 1, 128)
     if invalid == "residual_dtype":
-        residual = residual.bfloat16()
+        residual = residual.half()  # FP32 and BF16 streams are supported; FP16 is not
     elif invalid == "residual_layout":
         residual = residual.t().contiguous().t()
     elif invalid == "update":
@@ -1197,15 +1253,17 @@ def test_mixed_fused_native_retained_backward(prune):
 @GPU
 @pytest.mark.parametrize("depth", [1, 16, 40])
 @pytest.mark.parametrize("readers,updates", SEAMS)
-def test_deep_fused_replay_matches_saved_predecessors(depth, readers, updates):
-    """Physical intervals and short tails preserve forward states and all gradients."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_deep_fused_replay_matches_saved_predecessors(depth, readers, updates, dtype):
+    """Physical intervals and short tails preserve forward states and all gradients (FP32 or
+    BF16 residual streams and logits)."""
     torch.manual_seed(853)
     original = [
-        torch.randn(1024, 96, device="cuda"),
+        torch.randn(1024, 96, device="cuda", dtype=dtype),
         *[torch.randn(1024, 32, device="cuda", dtype=torch.bfloat16) for _ in range(updates)],
-        torch.randn(3, device="cuda"),
-        torch.full((3,), -0.8, device="cuda"),
-        *[torch.randn(3, device="cuda") for _ in range(readers)],
+        torch.randn(3, device="cuda", dtype=dtype),
+        torch.full((3,), -0.8, device="cuda", dtype=dtype),
+        *[torch.randn(3, device="cuda", dtype=dtype) for _ in range(readers)],
         *[torch.randn(32, device="cuda", dtype=torch.bfloat16) for _ in range(readers)],
     ]
 

@@ -910,10 +910,11 @@ def _fused_config(**overrides):
     return TransformerConfig(**(options | overrides))
 
 
-def _fused_blocks(streams=3, enabled=True, retention=True, pairs=2, hidden=128):
+def _fused_blocks(streams=3, enabled=True, retention=True, pairs=2, hidden=128, fp32_residual=True):
     # Bind before the fake module tests create the process-wide overlap stream.
     torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
     config = _fused_config(
+        fp32_residual_connection=fp32_residual,
         num_layers=2 * pairs,
         hidden_size=hidden,
         num_attention_heads=4,
@@ -1077,30 +1078,51 @@ def test_direct_mxfp8_handoff_always_declares_deferred_consumer(monkeypatch, che
 
 @GPU
 @pytest.mark.parametrize(
-    "streams,retention,overlap,interval,tokens,hidden",
+    "streams,retention,overlap,interval,tokens,hidden,dtype",
     [
-        (s, t, o, i, 1024, 128)
+        (s, t, o, i, 1024, 128, torch.float32)
         for s in range(2, 7)
         for t in (False, True)
         for o in (False, True)
         for i in (None, 16)
     ]
     # Production shapes with the overlapped schedule.
-    + [(3, True, True, None, m, h) for m, h in ((16384, 3072), (8192, 4096), (8192, 10240))],
+    + [
+        (3, True, True, None, m, h, torch.float32)
+        for m, h in ((16384, 3072), (8192, 4096), (8192, 10240))
+    ]
+    # A BF16 residual stream (no fp32_residual_connection) with BF16 connection logits.
+    + [
+        (s, True, o, i, m, h, torch.bfloat16)
+        for s, o, i, m, h in (
+            (3, False, None, 1024, 128),
+            (3, True, 16, 1024, 128),
+            (5, True, None, 1024, 128),
+            (3, True, None, 8192, 4096),
+        )
+    ],
 )
 def test_fused_schedule_matches_serial_oracle(
-    streams, retention, overlap, interval, tokens, hidden
+    streams, retention, overlap, interval, tokens, hidden, dtype
 ):
     """Block outputs, input gradients and every parameter gradient match bit for bit."""
     torch.manual_seed(1234)
-    blocks = _fused_blocks(streams, retention=retention, pairs=9 if interval else 2, hidden=hidden)
+    blocks = _fused_blocks(
+        streams,
+        retention=retention,
+        pairs=9 if interval else 2,
+        hidden=hidden,
+        fp32_residual=dtype == torch.float32,
+    )
+    if dtype == torch.bfloat16:
+        blocks = blocks.bfloat16()  # BF16 training casts every parameter, logits included
     blocks[0].config.residual_stream_recompute_num_layers = interval
     explicit = copy.deepcopy(blocks)
     if overlap:
         for block in blocks:
             block.overlap_mode = True
             block.route_ready_event = torch.cuda.Event()
-    r = torch.randn(tokens, 1, streams * hidden, device="cuda", requires_grad=True)
+    r = torch.randn(tokens, 1, streams * hidden, device="cuda", dtype=dtype, requires_grad=True)
     other = r.detach().clone().requires_grad_(True)
     with residual_replay_scope(blocks[0].config, True) as manager:
         actual = _run_blocks(blocks, r, manager)
@@ -1109,7 +1131,7 @@ def test_fused_schedule_matches_serial_oracle(
         assert any(not slot.resident() for slot in manager.slots.values())
     with residual_replay_scope(explicit[0].config, True) as manager:
         expected = _explicit_pairs(explicit, other, manager)
-    assert isinstance(actual, torch.Tensor) and actual.dtype == torch.float32
+    assert isinstance(actual, torch.Tensor) and actual.dtype == dtype
     assert torch.isfinite(actual).all()
     assert bytes_equal(actual, expected), "block output"
     incoming = torch.randn_like(actual)
@@ -1412,9 +1434,10 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None):
+def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual=True):
     pattern = pattern or ("GEGE" if mixer == "gdn" else "MEME") + ("*" if dynamic else "")
     config = _fused_config(
+        fp32_residual_connection=fp32_residual,
         num_layers=len(pattern),
         hidden_size=hidden,
         num_attention_heads=hidden // 64,
@@ -1581,19 +1604,28 @@ def test_hybrid_inference_prefill_decode(monkeypatch, dynamic, mixer, optimized,
 
 @GPU
 @pytest.mark.usefixtures("model_parallel")
-@pytest.mark.parametrize("hidden", [256, 3072])
-def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden):
+@pytest.mark.parametrize("hidden,fp32_residual", [(256, True), (3072, True), (3072, False)])
+def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden, fp32_residual):
     """HybridModel M -> [M E] [M E]: the lone Mamba layer's write runs in the first block's
     two-reader kernel (a single update read twice) during prefill and decode, bit for bit with
     the taped forward."""
-    model = _hybrid_model("mamba", False, hidden, False, pattern="MMEME")
+    # Without fp32_residual_connection the stream is BF16 (FP32 connection logits).
+    model = _hybrid_model("mamba", False, hidden, False, "MMEME", fp32_residual)
     lone, first = model.decoder.layers[0], model.decoder.layers[1]
     assert lone.defers_write_to_shortcut_block and isinstance(first, ShortcutMoEBlock)
     execute = _static_prefill_decode(model, keys=(1, 2, 4))
+    launch, dtypes = forward_kernel.forward, set()
+
+    def record(residual, *args, **kwargs):
+        dtypes.add(residual.dtype)
+        return launch(residual, *args, **kwargs)
+
+    monkeypatch.setattr(forward_kernel, "forward", record)
     with torch.inference_mode(), InferenceMode.active():
         (outputs, states), (taped_outputs, taped_states), calls = _inference_and_taped(
             monkeypatch, execute
         )
+    assert dtypes == {torch.float32 if fp32_residual else torch.bfloat16}
     # Per step: block 1's two-reader write of the lone update, its one-reader, then block 2's
     # shortcut add (two updates) and one-reader.
     assert calls == [1, 1, 2, 1] * 4

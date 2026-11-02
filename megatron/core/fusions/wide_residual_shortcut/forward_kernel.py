@@ -30,10 +30,11 @@ class _WriteArgs(NamedTuple):
     """Tensors the residual writer reads and writes.
 
     Attributes:
-        residual: Previous FP32 residual, ``[M, STREAMS * H]``.
+        residual: Previous FP32 or BF16 residual, ``[M, STREAMS * H]``.
         update: First BF16 branch update, ``[M, H]``.
         other_update: Second BF16 branch update of a shortcut add, or None for a single update.
-        output: Current FP32 residual written by the kernel, ``[M, STREAMS * H]``.
+        output: Current residual written by the kernel in the residual's dtype,
+            ``[M, STREAMS * H]``.
         summed_update: BF16 sum of a shortcut add's updates saved for backward, or None.
     """
 
@@ -61,7 +62,7 @@ class _ReadArgs(NamedTuple):
 
 
 class _ControllerArgs(NamedTuple):
-    """FP32 controller logits, one entry per stream.
+    """FP32 or BF16 controller logits, one entry per stream.
 
     Attributes:
         write: Write-gate logits.
@@ -111,6 +112,8 @@ class _ForwardConfig(NamedTuple):
         CLUSTER: CTAs per row in an sm_90+ cluster; each mixes H / CLUSTER columns and the
             cluster exchanges partial sums of squares (one cluster per reader with SPLIT).
             Needs LOADS_FIRST, PARTS == 1 and WIDTH dividing H / CLUSTER.
+        VECTOR: Contiguous columns per thread (4, or 8 for 16-byte BF16 residual accesses);
+            WIDTH must give every thread at least VECTOR columns.
     """
 
     WIDTH: int = 128
@@ -125,6 +128,7 @@ class _ForwardConfig(NamedTuple):
     SPLIT: bool = False
     LOADS_FIRST: bool = False
     CLUSTER: int = 1
+    VECTOR: int = 4
 
 
 # GB300 training/prefill configs for the production widths (3 streams, rows >= 2048): one
@@ -339,7 +343,9 @@ def _programmatic_launch(device):
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
-def choose_forward_config(m, h, streams, readers=1, *, mxfp8=False, inference=False, updates=None):
+def choose_forward_config(
+    m, h, streams, readers=1, *, mxfp8=False, inference=False, updates=None, bf16_residual=False
+):
     """Choose the GB300 row forward kernel schedule.
 
     Inference rows up to 1024 (hidden 3072-16384, up to 6 streams) use ``_inference_config``;
@@ -358,6 +364,7 @@ def choose_forward_config(m, h, streams, readers=1, *, mxfp8=False, inference=Fa
         mxfp8: Whether reader 0 is handed off as MXFP8.
         inference: Whether the launch skips backward state.
         updates: Branch updates written (2 for a shortcut add); None means one per reader.
+        bf16_residual: Whether the residual stream is BF16 (FP32 otherwise).
 
     Returns:
         The ``_ForwardConfig`` to launch.
@@ -424,21 +431,23 @@ def forward(
     shortcut add of two updates (two readers only). Inference skips backward state
     (coefficients, the shortcut add's BF16 update sum and reader statistics), returning
     saved=None. A shortcut add rounds its BF16 update sum before writing the residual.
-    Residuals and temporary readers use FP32.
+    The residual is FP32 or BF16 (the current residual keeps its dtype) and controller logits
+    are FP32 or BF16; every value is widened to FP32 for the arithmetic, a BF16 residual is
+    rounded only when stored, and readers fold the unrounded FP32 values.
     Operands belong to forward consumers, not the tape. The exclusive MXFP8
     handoff quantizes reader zero; every other reader returns BF16.
-    Widths divisible by four use packet loads and require a 16-byte-aligned residual base.
+    Widths divisible by four use packet loads and require a 16-byte-aligned FP32 residual base.
 
     retain=None means fixed identity retention (t=1), not zero logits (t=0.95).
     This static mode removes retention arithmetic and its parameter gradient.
     A supplied tensor always keeps the learned path, regardless of its values.
 
     Args:
-        residual: Previous FP32 residual, ``[M, num_streams * H]``.
+        residual: Previous FP32 or BF16 residual, ``[M, num_streams * H]``.
         updates: One BF16 branch update, or two summed by a shortcut add, each ``[M, H]``.
-        write: FP32 write-gate logits.
-        retain: FP32 retention logits, or None for fixed identity retention.
-        reads: FP32 mixing logits, one tensor per reader.
+        write: FP32 or BF16 write-gate logits.
+        retain: FP32 or BF16 retention logits, or None for fixed identity retention.
+        reads: FP32 or BF16 mixing logits, one tensor per reader.
         gammas: BF16 RMSNorm weights, one ``[H]`` tensor per reader.
         mxfp8_handoff: Quantize reader 0 to rowwise MXFP8.
         num_streams: Residual streams.
@@ -463,21 +472,33 @@ def forward(
     if m <= 0 or h <= 0:
         raise ValueError("forward requires positive rows and width")
     device = residual.device
-    _tensor(residual, (m, num_streams * h), torch.float32, device, "residual")
+    if residual.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("the residual must be FP32 or BF16")
+    _tensor(residual, (m, num_streams * h), residual.dtype, device, "residual")
     for u in updates:
         _tensor(u, (m, h), torch.bfloat16, device, "update")
     for controller in (write, *((retain,) if retain is not None else ()), *reads):
         if controller.ndim != 1 or controller.numel() < num_streams:
             raise ValueError(f"controllers require at least {num_streams} entries")
-        _tensor(controller, controller.shape, torch.float32, device, "controller")
+        if controller.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("controller logits must be FP32 or BF16")
+        _tensor(controller, controller.shape, controller.dtype, device, "controller")
     for gamma in gammas:
         _tensor(gamma, (h,), torch.bfloat16, device, "gamma")
     config = choose_forward_config(
-        m, h, num_streams, n, mxfp8=mxfp8_handoff, inference=inference, updates=len(updates)
+        m,
+        h,
+        num_streams,
+        n,
+        mxfp8=mxfp8_handoff,
+        inference=inference,
+        updates=len(updates),
+        bf16_residual=residual.dtype == torch.bfloat16,
     )
     c = None if inference else torch.empty((8 * num_streams,), device=device, dtype=torch.float32)
 
-    if h % 4 == 0 and type(residual).__name__ not in ("FakeTensor", "FunctionalTensor"):
+    packets = h % 4 == 0 and residual.dtype == torch.float32
+    if packets and type(residual).__name__ not in ("FakeTensor", "FunctionalTensor"):
         assert residual.data_ptr() % 16 == 0, "residual base must be 16-byte aligned"
     if mxfp8_handoff and (m % 32 or h % 32):
         raise ValueError("MXFP8 handoff requires rows and hidden width divisible by 32")
@@ -718,7 +739,7 @@ def _load_coefficient(C, INDEX: gl.constexpr):
 
 @g.jit
 def _load_residual(write_tensors, row, stream, cols, GEOMETRY: gl.constexpr, CONFIG: gl.constexpr):
-    """Load one stream's FP32 residual fragment, as 4-wide packets when H allows.
+    """Load one stream's residual fragment widened to FP32; FP32 uses 4-wide packets when H allows.
 
     Args:
         write_tensors: ``_WriteArgs``.
@@ -737,7 +758,9 @@ def _load_residual(write_tensors, row, stream, cols, GEOMETRY: gl.constexpr, CON
     residual = write_tensors.residual + row * (NUM_STREAMS * H) + stream * H + cols
 
     # Explicitly vector-load four contiguous FP32 values with inline PTX when H allows it.
-    if H % 4 == 0:
+    if write_tensors.residual.dtype.element_ty != gl.float32:
+        old = gl.load(residual, mask, 0).to(gl.float32)  # exact BF16 widening
+    elif H % 4 == 0:
         if H % CONFIG.WIDTH:
             # H and tile widths are multiples of four: each packet is wholly valid or masked.
             old = gl.inline_asm_elementwise(
@@ -870,10 +893,11 @@ def _mix_fragment(
         contracted = (stream == 0) | ((stream == 1) & (row % 32 < 12))
         value = gl.where(contracted, gl.fma(write, update, retain * old), separate)
 
+        stored = value.to(write_tensors.output.dtype.element_ty)  # RN for a BF16 residual
         if not CONFIG.STORE_LATE:
             gl.store(
                 write_tensors.output + row * (NUM_STREAMS * H) + stream * H + cols,
-                value,
+                stored,
                 mask & owner,
             )
         beta0 = _load_coefficient(coefficients, 2 * NUM_STREAMS + stream)
@@ -886,7 +910,7 @@ def _mix_fragment(
         if CONFIG.STORE_LATE:
             gl.store(
                 write_tensors.output + row * (NUM_STREAMS * H) + stream * H + cols,
-                value,
+                stored,
                 mask & owner,
             )
     x0 = gl.fma(update_mix0, update, x0)
@@ -974,16 +998,17 @@ def _prepare_coefficients(
     L: gl.constexpr = BlockedLayout([1], [32], [gl.num_warps()], [0])
     i = gl.arange(0, triton.next_power_of_2(4 * STREAMS), layout=L)
     controller, stream = i // STREAMS, i % STREAMS
-    pointer = gl.where(
-        controller == 0,
+    # One masked load per controller: each may be FP32 or BF16 and is widened exactly.
+    sources = (
         controllers.write,
-        gl.where(
-            controller == 1,
-            controllers.retain if RETENTION else controllers.write,
-            gl.where(controller == 2, controllers.read_a, controllers.read_b),
-        ),
+        controllers.retain if RETENTION else controllers.write,
+        controllers.read_a,
+        controllers.read_b,
     )
-    logit = gl.load(pointer + stream, i < 4 * STREAMS, 0)
+    logit = gl.zeros(i.shape, gl.float32, layout=L)
+    for index in gl.static_range(4):
+        selected = (controller == index) & (i < 4 * STREAMS)
+        logit += gl.load(sources[index] + stream, selected, 0).to(gl.float32)
     value = 1.0 / (1.0 + gl.exp(gl.where(controller == 1, logit, -logit)))
     value = gl.where(
         ((controller != 1) | RETENTION) & ((controller != 3) | TWO_READERS), value, 0.0
@@ -1055,7 +1080,9 @@ def _forward(
     paired: gl.constexpr = CONFIG.PAIRED_REDUCE and not CONFIG.SPLIT and K == 1
     NUM_SEGMENTS: gl.constexpr = triton.cdiv(H // K, width)
 
-    cols = gl.arange(0, width, layout=gl.constexpr(BlockedLayout([4], [32], [gl.num_warps()], [0])))
+    cols = gl.arange(
+        0, width, layout=gl.constexpr(BlockedLayout([CONFIG.VECTOR], [32], [gl.num_warps()], [0]))
+    )
     if K > 1:
         cols += (gl.program_id(0) % K) * (H // K)  # this CTA's column slice
     mixed = ()

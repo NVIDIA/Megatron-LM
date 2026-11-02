@@ -176,8 +176,8 @@ class WideResidualMambaLayer(MambaLayer):
             state[0],
             update,
             None,
-            write.write_map(return_logits=True).float(),
-            None if write.retention is None else write.retention(return_logits=True).float(),
+            write.write_map(return_logits=True),
+            None if write.retention is None else write.retention(return_logits=True),
         )
 
     def _pack_two_stage_output(

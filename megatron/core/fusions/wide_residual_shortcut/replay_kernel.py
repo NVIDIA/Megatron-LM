@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Checkpoint forward replay and reader-column materialization.
 
-Residual updates preserve the forward's row/stream RN/FMA choices. MXFP8
-columns encode the matched folded FP32 reader value, before output rounding.
+Residual updates preserve the forward's row/stream RN/FMA choices, computed in FP32 and
+rounded to the residual's dtype (FP32 or BF16) as the forward stores them. MXFP8 columns
+encode the matched folded FP32 reader value, before output rounding.
 The caller owns interval scheduling and waits for all consumers before reuse.
 """
 
@@ -35,7 +36,9 @@ def _replay_transitions(
     values = ()
     for s in gl.static_range(STREAMS):
         values += (
-            gl.load(checkpoint + row * STREAMS * H + s * H + col, mask, 0, cache_modifier=".cg"),
+            gl.load(checkpoint + row * STREAMS * H + s * H + col, mask, 0, cache_modifier=".cg").to(
+                gl.float32
+            ),
         )
     for step in gl.static_range(len(updates)):
         update = gl.load(updates[step] + row * H + col, mask, 0, cache_modifier=".cg").to(
@@ -47,8 +50,10 @@ def _replay_transitions(
             retain = gl.load(coefficients[step] + STREAMS + s) if RETENTION[step] else 1.0
             value = _forward_value(values[s], update, write, retain, row, s)
             output = outputs[step]
+            # The next transition reads the stored (rounded) residual, as the forward does.
+            value = value.to(output.dtype.element_ty)
             gl.store(output + row * STREAMS * H + s * H + col, value, mask, cache_modifier=".cs")
-            next_values += (value,)
+            next_values += (value.to(gl.float32),)
         values = next_values
 
 
@@ -80,7 +85,11 @@ def _replay_mx(
     mask = (rr[:, None] < M) & (cc[None, :] < H)
     values = ()
     for s in gl.static_range(S):
-        values += (gl.load(checkpoint + rr[:, None] * (S * H) + s * H + cc[None, :], mask, 0),)
+        values += (
+            gl.load(checkpoint + rr[:, None] * (S * H) + s * H + cc[None, :], mask, 0).to(
+                gl.float32
+            ),
+        )
     for j in gl.static_range(len(updates)):
         u = gl.load(updates[j] + rr[:, None] * H + cc[None, :], mask, 0).to(gl.float32)
         if EMIT[j]:
@@ -121,8 +130,9 @@ def _replay_mx(
                 t = gl.load(cs[j] + S + s) if RETENTION[j] else 1.0
                 value = _forward_value(values[s], u, w, t, rr[:, None], s)
                 target = outputs[j] if j < len(updates) - 1 else terminal
+                value = value.to(target.dtype.element_ty)
                 gl.store(target + rr[:, None] * (S * H) + s * H + cc[None, :], value, mask)
-                next_values += (value,)
+                next_values += (value.to(gl.float32),)
             values = next_values
 
 
@@ -132,10 +142,10 @@ def _validate(checkpoint, tapes):
     streams = tapes[0].num_streams
     if (
         checkpoint.shape != (m, streams * h)
-        or checkpoint.dtype != torch.float32
+        or checkpoint.dtype not in (torch.float32, torch.bfloat16)
         or not checkpoint.is_contiguous()
     ):
-        raise ValueError("invalid FP32 predecessor checkpoint")
+        raise ValueError("invalid FP32/BF16 predecessor checkpoint")
     for tape in tapes:
         if (
             tape.update.shape != (m, h)
@@ -252,13 +262,15 @@ def replay_interval(
     for out in targets:
         if (
             out.shape != checkpoint.shape
-            or out.dtype != torch.float32
+            or out.dtype != checkpoint.dtype
             or out.device != checkpoint.device
             or not out.is_contiguous()
             or out.storage_offset() != 0
             or out.untyped_storage().nbytes() != out.numel() * out.element_size()
         ):
-            raise ValueError("predecessor buffers require full contiguous FP32 storage")
+            raise ValueError(
+                "predecessor buffers require full contiguous storage of the checkpoint dtype"
+            )
         claim(out)
     supplied = columns is not None
     columns, data, scales = _column_inputs(checkpoint, tapes, requested, columns)

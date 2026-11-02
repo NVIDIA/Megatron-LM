@@ -351,8 +351,9 @@ class ShortcutMoEBlock(MegatronModule):
             # None selects the fixed identity branch; it is not a trainable logit.
             if connection.retention is None:
                 return None
-            return connection.retention(return_logits=True).float()
-        return getattr(connection, f"{kind}_map")(return_logits=True).float()
+            return connection.retention(return_logits=True)
+        # FP32 or BF16 parameters; the kernels widen logits to FP32 themselves.
+        return getattr(connection, f"{kind}_map")(return_logits=True)
 
     def _shortcut_add(self, pending, quant_context_factory):
         """Apply the pending write and norm this block's two inputs.
@@ -853,7 +854,10 @@ class ShortcutMoEBlock(MegatronModule):
                 pending_prev_shortcut_add, quant_context_factory
             )
         elif fused:
-            fused_residual = moe_hidden_states = hidden_states = hidden_states.float()
+            if self.config.fp32_residual_connection:
+                hidden_states = hidden_states.float()
+            # The kernels carry an FP32 or a BF16 residual stream in its own dtype.
+            fused_residual = moe_hidden_states = hidden_states
             validate_input(
                 fused_residual,
                 self.config.hidden_size,

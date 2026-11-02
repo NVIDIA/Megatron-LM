@@ -75,10 +75,6 @@ def validate_shortcut_fusion_config(config):
             f"{prefix} replay intervals require a native streamwise writer; "
             "H=32 requires residual_stream_recompute_num_layers=1"
         )
-    if not config.fp32_residual_connection:
-        raise ValueError(
-            f"{prefix} requires fp32_residual_connection=True (--fp32-residual-connection)"
-        )
     if config.params_dtype != torch.bfloat16:
         raise ValueError(f"{prefix} requires BF16 branch parameters")
     if (

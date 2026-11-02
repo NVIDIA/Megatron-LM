@@ -31,9 +31,8 @@ def validate_input(residual, hidden_size, num_streams, *, inference=False):
             f"multiple of {granularity} "
             f"and at most {maximum} for H={hidden_size}; got T={tokens}"
         )
-    expected = torch.float32
-    if residual.dtype != expected or not residual.is_contiguous():
-        raise ValueError(f"shortcut fusion requires contiguous {expected} residuals")
+    if residual.dtype not in (torch.float32, torch.bfloat16) or not residual.is_contiguous():
+        raise ValueError("shortcut fusion requires contiguous FP32 or BF16 residuals")
     if not residual.is_cuda:
         raise ValueError("shortcut fusion requires CUDA tensors")
     return tokens

@@ -86,8 +86,14 @@ class ResidualSlot:
 
     def restore(self, value, ready):
         """Reattach a full zero-offset allocation without changing tensor identity."""
-        if value.storage_offset() or value.untyped_storage().nbytes() != value.numel() * 4:
-            raise ValueError("replay restoration requires full zero-offset FP32 storage")
+        if (
+            value.storage_offset()
+            or value.dtype != self.tensor.dtype
+            or value.untyped_storage().nbytes() != value.numel() * value.element_size()
+        ):
+            raise ValueError(
+                "replay restoration requires full zero-offset storage of the slot dtype"
+            )
         from megatron.core.tensor_parallel.random import _get_share_storage
 
         with self.lock:
@@ -251,13 +257,17 @@ class ResidualReplayManager:
         ``native`` writer replayed without changing its arithmetic or contraction."""
         for tensor in (previous, current):
             if (
-                tensor.dtype != torch.float32
+                tensor.dtype not in (torch.float32, torch.bfloat16)
+                or tensor.dtype != previous.dtype
                 or not tensor.is_cuda
                 or not tensor.is_contiguous()
                 or tensor.storage_offset()
-                or tensor.untyped_storage().nbytes() != tensor.numel() * 4
+                or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()
             ):
-                raise ValueError("checkpoint replay requires full contiguous FP32 CUDA storage")
+                raise ValueError(
+                    "checkpoint replay requires full contiguous FP32 or BF16 CUDA storage "
+                    "of one dtype"
+                )
         old, new = self.slot(previous), self.slot(current, output=True)
         if old is new or (self.last is not None and old is not self.last):
             raise ValueError("replay writes must form one connected chain with distinct outputs")

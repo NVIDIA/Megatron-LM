@@ -108,6 +108,21 @@ def test_standard_boundaries_replay(streams, readers, updates, retention, rows, 
     assert_replays_bit_exact(lambda *args: run(args, streams), raw, replays=3)
 
 
+@pytest.mark.parametrize("readers,updates", SEAMS)
+@pytest.mark.parametrize(
+    "streams,rows,hidden",
+    [(3, 1024, 96), (6, 1024, 288)]
+    + [pytest.param(3, m, h, marks=QUALIFIED) for m, h in kernel_utils.FLAGSHIPS],
+)
+def test_bf16_stream_boundaries_replay(readers, updates, streams, rows, hidden):
+    """A BF16 residual stream with BF16 logits replays outputs and gradients bit for bit."""
+    bf16 = torch.bfloat16
+    raw = inputs(
+        streams, readers, hidden, rows, updates=updates, residual_dtype=bf16, logit_dtype=bf16
+    )
+    assert_replays_bit_exact(lambda *args: run(args, streams), raw, replays=3)
+
+
 @pytest.mark.parametrize("streams", [1, 2, 3, 5, 6])
 @pytest.mark.parametrize("retention", [False, True])
 @pytest.mark.parametrize("hidden", [96, 128, 288])
@@ -252,10 +267,13 @@ def test_general_forward_replay(tokens, hidden, streams, readers, updates, infer
 @pytest.mark.parametrize("hidden", [3072, 4096, 7168, 10240, 13312, 14336])
 @pytest.mark.parametrize("readers,updates", SEAMS)
 @pytest.mark.parametrize("quantized", [False, pytest.param(True, marks=QUALIFIED)])
-def test_inference_poisoned_replay(monkeypatch, tokens, hidden, readers, updates, quantized):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_inference_poisoned_replay(monkeypatch, tokens, hidden, readers, updates, quantized, dtype):
     """Replay inference launches (including split two-reader schedules) without backward
     state; every poisoned output byte is restored."""
-    raw = inputs(3, readers, hidden, tokens, updates=updates)
+    raw = inputs(
+        3, readers, hidden, tokens, updates=updates, residual_dtype=dtype, logit_dtype=dtype
+    )
     observed = forbid_backward_state(monkeypatch)
     with torch.inference_mode(), InferenceMode.active():
         expected = [t.clone() for t in buffers(invoke(raw, quantized))]
@@ -294,20 +312,39 @@ POISONED_BACKWARD = (
     ]
 )
 # Two readers of a single write: the same kernel with one update gradient.
-POISONED_BACKWARD = [(*case, 2 if case[1] == 2 else 1) for case in POISONED_BACKWARD] + [
-    (s, 2, h, m, T, grid, (T, F), 1)
+POISONED_BACKWARD = [(*case, 2 if case[1] == 2 else 1, F) for case in POISONED_BACKWARD] + [
+    (s, 2, h, m, T, grid, (T, F), 1, F)
     for s, h, m, grid in ((3, 4128, 1024, "auto"), (6, 96, 160, "auto"), (2, 3072, 1024, 24))
     + tuple((3, h, m, "auto") for m, h in kernel_utils.FLAGSHIPS)
+]
+# BF16 residual streams: BF16 TMA tiles, carries and residual gradients.
+POISONED_BACKWARD += [
+    (s, n, h, m, T, grid, (T,) + (F,) * (n - 1), u, T)
+    for s, h, m, grid in ((3, 4128, 1024, "auto"), (6, 96, 160, "auto"), (2, 3072, 1024, 24))
+    + tuple((3, h, m, "auto") for m, h in kernel_utils.FLAGSHIPS)
+    for n, u in SEAMS
 ]
 
 
 @QUALIFIED
 @pytest.mark.parametrize(
-    "streams,readers,hidden,rows,retention,grid,routes,updates", POISONED_BACKWARD
+    "streams,readers,hidden,rows,retention,grid,routes,updates,bf16", POISONED_BACKWARD
 )
-def test_poisoned_backward_replay(streams, readers, hidden, rows, retention, grid, routes, updates):
+def test_poisoned_backward_replay(
+    streams, readers, hidden, rows, retention, grid, routes, updates, bf16
+):
     """A captured backward restores its eager outputs after all scratch is poisoned."""
-    raw = inputs(streams, readers, hidden, rows, retention=retention, updates=updates)
+    dtype = torch.bfloat16 if bf16 else torch.float32
+    raw = inputs(
+        streams,
+        readers,
+        hidden,
+        rows,
+        retention=retention,
+        updates=updates,
+        residual_dtype=dtype,
+        logit_dtype=dtype,
+    )
     _, args = backward_args(raw, streams)
     options = dict(config=grid, prepare_wgrad=routes)
     execute = lambda: run_with_scratch(backward_kernel.backward, *args, **options)[1]

@@ -127,8 +127,12 @@ def backward(
         raise ValueError("backward requires one update, or two summed for two readers")
     if len(dys) != n:
         raise ValueError("backward requires one gradient slot per reader")
+    if previous.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("backward requires an FP32 or BF16 predecessor residual")
     if carry is None:
         carry = torch.zeros_like(previous)
+    if carry.dtype != previous.dtype:
+        raise ValueError("the residual gradient must have the residual's dtype")
     dys = tuple(torch.zeros_like(saved.update) if dy is None else dy for dy in dys)
     if not qualified_device(torch.cuda.get_device_properties(previous.device)):
         raise ValueError("shortcut backward requires a qualified GB300")
@@ -162,7 +166,7 @@ def backward(
     empty = saved.coefficients.new_empty
     du = empty((m, h), dtype=torch.bfloat16)
     grads = (
-        empty((m, streams * h)),
+        empty((m, streams * h), dtype=previous.dtype),
         *((du,) * updates),
         *(empty((size,)) if size else None for size in saved.controller_sizes),
         *(empty((h,)) for _ in range(n)),
@@ -546,9 +550,10 @@ def _prefetch(P, rp, cp, GEOMETRY: gl.constexpr):
     m: gl.constexpr = GEOMETRY.M
     h: gl.constexpr = GEOMETRY.H
     streams: gl.constexpr = GEOMETRY.STREAMS
-    # One thread per row warms the row's 256 columns (1024 bytes) of each stream.
+    # One thread per row warms the row's 256 columns of each stream.
     ROWS: gl.constexpr = 16
-    ROW_BYTES: gl.constexpr = 1024
+    ELEMENT: gl.constexpr = P.dtype.element_ty.primitive_bitwidth // 8
+    ROW_BYTES: gl.constexpr = 256 * ELEMENT
     i = gl.arange(0, ROWS, layout=gl.constexpr(BlockedLayout([1], [32], [4], [0])))
     rr = rp * 16 + i
     cc = cp * 256
@@ -564,7 +569,7 @@ def _prefetch(P, rp, cp, GEOMETRY: gl.constexpr):
             # Preserve the original single 128-column hint at a short final tile.
             # Full rows use one 1024-byte request instead of two 512-byte requests.
             tail = (rr < m) & (cc + 128 <= h) & (cc + 256 > h)
-            _bulk_prefetch_l2(base + stream * h, tail.to(gl.int32), 512, ROWS)
+            _bulk_prefetch_l2(base + stream * h, tail.to(gl.int32), 128 * ELEMENT, ROWS)
 
 
 @g.jit
@@ -589,7 +594,8 @@ def _refill_slice(
 ):
     """Refill consumed predecessor slice s with carry s + 1, or the next tile's last stream."""
     if s + 1 < len(residual_copies):
-        mbarrier.expect(barriers[s], 8192)
+        bits: gl.constexpr = carry_copies[s][0].dtype.primitive_bitwidth
+        mbarrier.expect(barriers[s], 16 * 128 * bits // 8)
         _copy_tiles((carry_copies[s],), row_tile, barriers[s], part)
     else:
         _copy_tiles((residual_copies[s],), next_rp, copy_barrier, part)
@@ -597,7 +603,8 @@ def _refill_slice(
 
 @g.jit
 def _load_residual(residuals, cols, part, stream: gl.constexpr, h: gl.constexpr):
-    value = residuals[stream].slice(part * 16, 16).load(_GRADIENT_LAYOUT)
+    # A BF16 residual is widened exactly; every product and sum below runs in FP32.
+    value = _widen_bf16(residuals[stream].slice(part * 16, 16).load(_GRADIENT_LAYOUT))
     if h % 256:
         value = gl.where(cols < h, value, 0)
     return value
@@ -779,7 +786,13 @@ def _backward(
     update_shared = gl.allocate_shared_memory(U_DESC.dtype, [32, 128], U_DESC.layout)
 
     COPY_BYTES: gl.constexpr = (
-        32 * 128 * (4 * streams + 2 * NREADERS * STAGE_DY + U_DESC.dtype.primitive_bitwidth // 8)
+        32
+        * 128
+        * (
+            R_DESC.dtype.primitive_bitwidth // 8 * streams
+            + 2 * NREADERS * STAGE_DY
+            + U_DESC.dtype.primitive_bitwidth // 8
+        )
     )
     copy_deps = ((ds,) if STAGE_DY else ()) + (update_shared,) + residuals
     # Stream zero's incoming carry is loaded directly into registers. Each later carry
@@ -941,8 +954,8 @@ def _backward(
             early_mask = early_rows < m
             if h % 256:
                 early_mask &= early_cols < h
-            early_incoming_zero = gl.load(
-                inputs.carry + early_rows * (streams * h) + early_cols, early_mask, 0
+            early_incoming_zero = _widen_bf16(
+                gl.load(inputs.carry + early_rows * (streams * h) + early_cols, early_mask, 0)
             )
 
         # Finish the projection reduction.
@@ -1054,9 +1067,11 @@ def _backward(
                 incoming_zero = early_incoming_zero
             elif PAIRED and m % 16 == 0 and h % 256 == 0:
                 # Every row and column of a scheduled tile is in range.
-                incoming_zero = gl.load(inputs.carry + rows * (streams * h) + cols)
+                incoming_zero = _widen_bf16(gl.load(inputs.carry + rows * (streams * h) + cols))
             else:
-                incoming_zero = gl.load(inputs.carry + rows * (streams * h) + cols, mask, 0)
+                incoming_zero = _widen_bf16(
+                    gl.load(inputs.carry + rows * (streams * h) + cols, mask, 0)
+                )
             # The dx section computes dx for each reader. Inputs:
             #     Rprev[s,j]  Predecessor residual stream s
             #     beta[s]   This reader's mixing coefficients
@@ -1187,7 +1202,7 @@ def _backward(
                     tile = carry_copies[s - 1][1]
                     mbarrier.wait(barriers[s - 1], part & 1, deps=(tile,))
                     # Load the downstream residual gradient after its transfer.
-                    incoming_dR_s = tile.slice(part * 16, 16).load(L)
+                    incoming_dR_s = _widen_bf16(tile.slice(part * 16, 16).load(L))
                 if PAIRED and s > 0 and prefetch_active:
                     # Release the consumed carry slice to the next tile's predecessor s-1.
                     gl.barrier()
@@ -1231,6 +1246,7 @@ def _backward(
                     dR_pointer = residual_grad_rows + s * h
                 else:
                     dR_pointer = outputs.residual_grad + wide
+                d_previous = d_previous.to(outputs.residual_grad.dtype.element_ty)  # RN for BF16
                 gl.store(dR_pointer, d_previous, mask, cache_modifier=OUTPUT_CACHE)
                 # Reader update terms use rounded q = sum_fma(beta * w).
                 # Accumulate only incoming carry here; add q * dx after streams.
