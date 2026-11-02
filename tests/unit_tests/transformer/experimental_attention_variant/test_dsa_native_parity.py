@@ -659,11 +659,13 @@ def test_cudnn_topk_wrapper_honors_explicit_deterministic_request(monkeypatch):
 
 
 def test_cudnn_deterministic_topk_chunking_matches_single_chunk(monkeypatch):
+    # Eight FP32 columns (32 bytes) per row, so one-row chunks keep 32-byte aligned starts;
+    # the last two columns lie past every row length.
     scores = torch.tensor(
         [
-            [9.0, 8.0, 7.0, 7.0, 7.0, 1.0],
-            [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
-            [3.0, 2.0, 1.0, 0.0, -1.0, -2.0],
+            [9.0, 8.0, 7.0, 7.0, 7.0, 1.0, 0.0, 0.0],
+            [6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
+            [3.0, 2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 0.0],
         ],
         dtype=torch.float32,
     )
@@ -685,8 +687,8 @@ def test_cudnn_deterministic_topk_chunking_matches_single_chunk(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 48)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_ROW_ALIGNMENT", 1)
+    # One row of int32 scratch: 2 x 8 columns x 4 bytes.
+    monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 64)
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
         scores, seq_lens, topk_k=4, return_topk_scores=True
