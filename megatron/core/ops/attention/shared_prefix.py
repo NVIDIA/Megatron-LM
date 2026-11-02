@@ -22,15 +22,18 @@ The passes always call FlashAttention 2 (``flash_attn_varlen_func`` and its priv
 backward), whatever ``flash_attention_version`` pins for Transformer Engine and the inference
 engine, so
 :func:`megatron.core.transformer.shared_prefix_attention.validate_shared_prefix_attention`
-rejects batch-invariant mode.
+rejects batch-invariant mode. flash-attn is checked and bound once, through
+:func:`require_shared_prefix_flash_attn`; a missing or too-old installation raises
+``ImportError``.
 """
 
+import functools
 from itertools import accumulate
 
 import torch
 
+from megatron.core.ops._backends import require
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
-from megatron.core.utils import is_fa_min_version
 
 # The exact backward calls FlashAttention 2's private ``_flash_attn_varlen_backward`` by keyword;
 # its ``window_size_left``/``window_size_right`` arguments first appear in flash-attn 2.7.0.
@@ -143,15 +146,30 @@ def _star_forest_plan_cached(forest, device):
     return plan[0], plan[1]
 
 
+@functools.cache
+def _flash_attn_interface():
+    """Return FlashAttention 2's varlen interface, imported and checked on the first call.
+
+    Raises ``ImportError`` naming this operation when flash-attn is missing, lacks either varlen
+    entry point, or is older than ``_MIN_FLASH_ATTN_VERSION``. A failed check is not cached.
+    """
+    return require(
+        "flash_attn.flash_attn_interface",
+        "flash_attn_varlen_func",
+        "_flash_attn_varlen_backward",
+        min_version=_MIN_FLASH_ATTN_VERSION,
+        dist="flash-attn",
+        needed_by="Shared-prefix forest attention",
+    )
+
+
 def _flash_attn_varlen_backward(**kwargs):
     """Call FlashAttention 2's private varlen backward with keyword arguments.
 
     Keywords make an incompatible release fail with a TypeError instead of misbinding the
-    positional arguments; :func:`flash_composed_forest_attention` checks the minimum version.
+    positional arguments; :func:`_flash_attn_interface` checks the minimum version.
     """
-    from flash_attn.flash_attn_interface import _flash_attn_varlen_backward as backward
-
-    return backward(**kwargs)
+    return _flash_attn_interface()._flash_attn_varlen_backward(**kwargs)
 
 
 class _ComposedForestAttn(torch.autograd.Function):
@@ -171,8 +189,7 @@ class _ComposedForestAttn(torch.autograd.Function):
     def forward(ctx, q, k, v, passes, scale):
         """Evaluate the causal self pass and the prompt cross pass, then merge their outputs."""
         # q: [total, np, hn]; k, v: [total, ng, hn]; scale already resolved to a float.
-        from flash_attn import flash_attn_varlen_func
-
+        flash_attn_varlen_func = _flash_attn_interface().flash_attn_varlen_func
         total, np_, hn = q.shape
         outs, lses = [], []
         for rows, k_idx, cu_q, cu_k, max_q, max_k, causal in passes:
@@ -290,11 +307,7 @@ def flash_composed_forest_attention(query, key, value, forest, scale=None):
     total, passes = _star_forest_plan_cached(forest, query.device)
     if total > sq:
         raise ValueError(f"shared-prefix forest covers {total} tokens but the sequence has {sq}")
-    if not is_fa_min_version(_MIN_FLASH_ATTN_VERSION):
-        raise RuntimeError(
-            f"shared-prefix attention requires flash-attn >= {_MIN_FLASH_ATTN_VERSION} for its "
-            "exact backward"
-        )
+    require_shared_prefix_flash_attn()
     scale = scale if scale is not None else hn**-0.5
     out = _ComposedForestAttn.apply(
         query[:total, 0], key[:total, 0], value[:total, 0], passes, scale
@@ -405,16 +418,13 @@ def _cp_kv_head_slices_for_destinations(
 
 
 def require_shared_prefix_flash_attn() -> None:
-    """Raise unless an installed flash-attn provides the exact backward this module needs."""
-    try:
-        flash_attn_supported = is_fa_min_version(_MIN_FLASH_ATTN_VERSION)
-    except ImportError:
-        flash_attn_supported = False
-    if not flash_attn_supported:
-        raise RuntimeError(
-            f"shared-prefix attention requires flash-attn >= {_MIN_FLASH_ATTN_VERSION} for its "
-            "exact backward"
-        )
+    """Bind the flash-attn interface the forest attention calls, checking it on the first call.
+
+    Raises ``ImportError`` unless flash-attn >= 2.7.0 provides ``flash_attn_varlen_func`` and the
+    private ``_flash_attn_varlen_backward`` that the exact backward calls. Once bound, later calls
+    and the kernels reuse the same module without importing again.
+    """
+    _flash_attn_interface()
 
 
 def _cp_pack_destination_head_slices(

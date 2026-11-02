@@ -167,30 +167,63 @@ def test_multiple_packed_sequences_are_rejected(attention):
         attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
 
 
-def test_old_flash_attention_is_rejected_before_attention(attention, monkeypatch):
-    """The exact backward binds FlashAttention 2.7+ private keyword arguments."""
+@pytest.fixture
+def flash_attn_install(attention, monkeypatch):
+    """Let ``require`` see a flash-attn stand-in of a given version; ``None`` is not installed.
+
+    ``install(version)`` returns the list of module names ``require`` imports. The cached binding
+    is cleared before and after, so later tests bind the installed flash-attn again.
+    """
+    from types import SimpleNamespace
+
     from packaging.version import Version
 
-    from megatron.core import utils
+    from megatron.core.ops import _backends
 
-    monkeypatch.setattr(utils, "_fa_version", Version("2.6.3"))
+    imported = []
+
+    def install(version):
+        def import_module(name):
+            imported.append(name)
+            if version is None:
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return SimpleNamespace(
+                flash_attn_varlen_func=object(), _flash_attn_varlen_backward=object()
+            )
+
+        monkeypatch.setattr(_backends, "import_module", import_module)
+        monkeypatch.setattr(_backends, "installed_version", lambda *_args: Version(version))
+        attention._flash_attn_interface.cache_clear()
+        return imported
+
+    yield install
+    attention._flash_attn_interface.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "version, match",
+    [
+        (None, r"Shared-prefix forest attention requires flash_attn\.flash_attn_interface: No"),
+        ("2.6.3", r"requires flash_attn\.flash_attn_interface>=2\.7\.0; found 2\.6\.3"),
+    ],
+)
+def test_missing_or_old_flash_attention_is_rejected(attention, flash_attn_install, version, match):
+    """The exact backward binds FlashAttention 2.7+ private keyword arguments, so a missing or
+    older flash-attn raises ImportError before the kernel runs any pass."""
+    flash_attn_install(version)
+    with pytest.raises(ImportError, match=match):
+        attention.require_shared_prefix_flash_attn()
     query = torch.zeros(8, 1, 2, 8)
-    with pytest.raises(RuntimeError, match=r"flash-attn >= 2\.7\.0"):
+    with pytest.raises(ImportError, match=match):
         attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
 
 
-@pytest.mark.parametrize("installed", [False, True])
-def test_missing_or_old_flash_attention_fails_validation(attention, monkeypatch, installed):
-    """require_shared_prefix_flash_attn reports a missing flash-attn like an old one."""
-
-    def is_fa_min_version(version):
-        if not installed:
-            raise ImportError("No module named 'flash_attn'")
-        return False
-
-    monkeypatch.setattr(attention, "is_fa_min_version", is_fa_min_version)
-    with pytest.raises(RuntimeError, match=r"flash-attn >= 2\.7\.0"):
-        attention.require_shared_prefix_flash_attn()
+def test_flash_attention_is_bound_once(attention, flash_attn_install):
+    """The first check imports flash-attn; later checks reuse the bound module."""
+    imported = flash_attn_install("2.7.0")
+    attention.require_shared_prefix_flash_attn()
+    attention.require_shared_prefix_flash_attn()
+    assert imported == ["flash_attn.flash_attn_interface"]
 
 
 def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=False, **config):
