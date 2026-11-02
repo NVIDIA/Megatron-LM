@@ -6,7 +6,6 @@
 import contextlib
 import importlib
 import importlib.util
-import inspect
 import logging
 from collections import namedtuple
 from collections.abc import Callable

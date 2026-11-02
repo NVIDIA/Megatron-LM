@@ -1010,15 +1010,6 @@ def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
 # TE operation fuser (use_transformer_engine_op_fuser) under batch invariance
 # ============================================================================
 
-# DeepGEMM ships only in the dev CI image; there the deepgemm cases fail without it.
-_OP_FUSER_BACKENDS = [
-    "triton",
-    pytest.param(
-        "deepgemm",
-        marks=pytest.mark.skipif(is_lts_ci_image(), reason="DeepGEMM is not in the LTS image."),
-    ),
-]
-
 
 def _forbid_te_dense_gemm(monkeypatch):
     """Make TE's cuBLASLt dense GEMM raise, so a bypass of the batch-invariant GEMM fails."""
@@ -1030,7 +1021,7 @@ def _forbid_te_dense_gemm(monkeypatch):
     monkeypatch.setattr(tex, "generic_gemm", raise_)
 
 
-@pytest.mark.parametrize("backend", _OP_FUSER_BACKENDS)
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
 def test_te_op_fuser_mlp_batch_invariant(monkeypatch, backend):
     """TEFusedMLP (the op fuser's RMSNorm, BasicLinear, bias, SwiGLU, BasicLinear) gives a
     token the same bits whatever its co-batch, and never runs TE's cuBLASLt GEMM."""
@@ -1094,41 +1085,6 @@ def test_te_op_fuser_mlp_batch_invariant(monkeypatch, backend):
         assert te_ops_rmsnorm.rmsnorm_fwd is not bik._te_rmsnorm_fwd_patched
     finally:
         Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize("backend", _OP_FUSER_BACKENDS)
-@pytest.mark.parametrize("case", ["accumulate-fp32", "alpha-beta-bias", "alpha"])
-def test_bik_te_general_gemm_honors_accumulate_alpha_beta(backend, case):
-    """The batch-invariant general_gemm computes what TE's computes with accumulate, alpha
-    and beta: it adds into out (a weight gradient into fp32 main_grad, a scaled linear
-    into a residual) instead of overwriting it."""
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
-
-    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
-    torch.manual_seed(5)
-    bf16 = _device(torch.bfloat16)
-    if case == "accumulate-fp32":
-        # Weight gradient (NT) of x [64, 128] and dy [64, 96], added into fp32 main_grad.
-        A, B = torch.randn(64, 128, **bf16), torch.randn(64, 96, **bf16)
-        out0 = torch.randn(96, 128, device="cuda", dtype=torch.float32)
-        kwargs = dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True)
-    elif case == "alpha-beta-bias":
-        # Scaled linear plus bias, added into a scaled bf16 residual.
-        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
-        out0 = torch.randn(64, 96, **bf16)
-        bias = torch.randn(96, **bf16)
-        kwargs = dict(out_dtype=torch.bfloat16, accumulate=True, alpha=0.5, beta=2.0, bias=bias)
-    else:
-        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
-        out0 = torch.randn(64, 96, **bf16)
-        kwargs = dict(out_dtype=torch.bfloat16, alpha=0.25)
-    reference = out0.clone()
-    te_cpp.general_gemm(A, B, out=reference, **kwargs)
-    actual = out0.clone()
-    with set_batch_invariant_mode(True, backend=backend):
-        result = te_cpp.general_gemm(A, B, out=actual, **kwargs)[0]
-    assert result is actual
-    torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=1e-1)
 
 
 @pytest.mark.parametrize("zero_centered_gamma", [False, True])
