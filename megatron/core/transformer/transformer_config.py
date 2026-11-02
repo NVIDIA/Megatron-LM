@@ -1547,10 +1547,11 @@ class TransformerConfig(ModelParallelConfig):
     The backward comes from the TE recompute pass. Requires
     transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
     batch_invariant_mode and selective 'moe' recompute. The kernel weights are built
-    from the parameters on the first value pass after an optimizer step and held until
-    the next step, a checkpoint load, or
-    training_matches_inference.release_inference_value_pass_weights(model). A caller
-    that changes the parameters outside an optimizer step must call that first."""
+    from the parameters and held until an in-place write to them, an optimizer step, a
+    checkpoint load, or training_matches_inference.release_inference_value_pass_weights(model).
+    A caller that writes the parameters outside PyTorch in-place ops, an optimizer step
+    or a load (for example TE quantizing a high-precision value into an MXFP8 parameter)
+    must call that first."""
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when

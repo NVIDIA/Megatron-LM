@@ -226,7 +226,7 @@ def _layer_pair(recipe, gen_config, train_config, max_tokens=LOCAL_TOKENS):
     Generation converts as production does: MXFP8 replaces TE's MXFP8 parameters
     with MCore ``MXFP8Tensor``s at load, NVFP4 quantizes the BF16 stacks on the
     first forward. Training keeps its parameters and the value pass derives the
-    kernel weights from them once per optimizer step.
+    kernel weights from them, rebuilt after the parameters change.
     """
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
@@ -261,7 +261,7 @@ def _elements_that_differ(got, want) -> int:
 
 
 def _optimizer_step():
-    """An optimizer step, which is what tells the value pass the parameters moved."""
+    """An optimizer step that moves nothing; the value pass drops its kernel weights on any step."""
     torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0).step()
 
 
@@ -549,6 +549,8 @@ class TestValuePassRuns:
         Each build first runs the expert linears' pre-forward hooks, which is where DDP
         finishes an overlapped parameter all-gather before the weights are read.
         """
+        from megatron.core.distributed import distributed_data_parallel
+
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
         _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
@@ -560,7 +562,12 @@ class TestValuePassRuns:
             "_build_value_pass_weights",
             lambda module: builds.append(1) or build(module),
         )
-        experts.linear_fc1.register_forward_pre_hook(lambda *_: hook_calls.append(1))
+
+        def param_gather_hook(*_):
+            hook_calls.append(1)
+
+        param_gather_hook.__module__ = distributed_data_parallel.__name__
+        experts.linear_fc1.register_forward_pre_hook(param_gather_hook)
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
             _optimizer_step()
@@ -570,6 +577,43 @@ class TestValuePassRuns:
             layer(hidden)
         assert len(builds) == 2
         assert len(hook_calls) == 2
+
+    def test_other_pre_forward_hooks_on_the_expert_linears_are_rejected(self):
+        """Only DDP's parameter all-gather hook is safe to run without the linear's forward."""
+        recipe = "nvfp4-squared_relu"
+        _skip_unless_supported(recipe)
+        gen_config, train_config = _generation_and_training_configs(recipe)
+        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        layer.experts.linear_fc2.register_forward_pre_hook(lambda *_: None)
+        with torch.no_grad(), pytest.raises(RuntimeError, match="parameter all-gather hooks"):
+            layer(_hidden(train_config, seed=0))
+
+    @pytest.mark.parametrize("recipe", list(RECIPES))
+    def test_an_in_place_copy_into_the_parameters_rebuilds_the_kernel_weights(self, recipe):
+        """NeMo-RL swaps in reference weights by copying CPU copies into ``state_dict()``.
+
+        No optimizer step or load runs, so the value pass must see the copy itself.
+        """
+        _skip_unless_supported(recipe)
+        gen_config, train_config = _generation_and_training_configs(recipe)
+        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        with _fp8_context(train_config, is_init=True):
+            reference = _build_layer(train_config).eval()
+        hidden = _hidden(train_config, seed=0)
+        with torch.no_grad(), _fp8_context(train_config):
+            want = reference(hidden)[0].clone()
+            before = layer(hidden)[0].clone()
+            state = layer.state_dict()
+            for name, value in reference.state_dict().items():
+                if isinstance(value, torch.Tensor) and state[name].shape == value.shape:
+                    state[name].copy_(value.detach().to(device="cpu", copy=True))
+            got = layer(hidden)[0]
+        assert _elements_that_differ(before, want) > 0, "the reference weights match the policy's"
+        differing = _elements_that_differ(got, want)
+        assert differing == 0, (
+            f"{recipe}: after copying the reference weights in, {differing}/{got.numel()} "
+            "elements differ from the reference; the value pass kept the policy's kernel weights"
+        )
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
     def test_release_frees_the_kernel_weights_and_the_next_pass_rebuilds_them(self, recipe):
@@ -605,9 +649,8 @@ class TestTrainGenParity:
     def test_value_pass_follows_a_weight_update(self, recipe):
         """After the parameters move, the value pass matches a refreshed generation.
 
-        The update is applied to both layers' BF16 parameters, and generation
-        requantizes as a refit would. The value pass keeps its kernel weights until
-        the next optimizer step and rebuilds them after it.
+        The update is applied in place to both layers' BF16 parameters, with no optimizer
+        step, and generation requantizes as a refit would.
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
@@ -616,7 +659,7 @@ class TestTrainGenParity:
         with torch.no_grad(), InferenceMode.active():
             stale_gen_out, _ = gen_layer(hidden)
         with torch.no_grad():
-            stale_train_out, _ = train_layer(hidden)
+            train_layer(hidden)
 
         with torch.no_grad():
             for layer in (gen_layer, train_layer):
@@ -629,14 +672,9 @@ class TestTrainGenParity:
         with torch.no_grad(), InferenceMode.active():
             gen_out, _ = gen_layer(hidden)
         with torch.no_grad():
-            same_step_out, _ = train_layer(hidden)
-            _optimizer_step()
             train_out, _ = train_layer(hidden)
 
         assert _elements_that_differ(gen_out, stale_gen_out) > 0, "the update moved nothing"
-        assert (
-            _elements_that_differ(same_step_out, stale_train_out) == 0
-        ), "the value pass rebuilt its kernel weights without an optimizer step"
         differing = _elements_that_differ(train_out, gen_out)
         assert differing == 0, (
             f"{recipe}: after a weight update, {differing}/{train_out.numel()} elements "
@@ -753,12 +791,19 @@ class TestSymmetricHeapSizing:
             group_size * (self.SMALL // 2),
         ]
 
-    def test_mxfp8_launches_keep_the_largest_kernel_tile(self, spy_on_value_pass):
+    @pytest.mark.parametrize("floor_verified", [True, False])
+    def test_mxfp8_launches_keep_the_largest_kernel_tile(
+        self, floor_verified, spy_on_value_pass, monkeypatch
+    ):
         """MXFP8 launches follow the microbatch down to the kernel's largest-tile floor.
 
         The routed MXFP8 kernel has no tile config for a launch of a few tokens per
-        rank at these shapes, so a small microbatch launches on the floor's rows.
+        rank at these shapes, so a small microbatch launches on the floor's rows. On a
+        FlashInfer release the floor was not verified on, every launch uses the whole heap.
         """
+        monkeypatch.setattr(
+            training_matches_inference, "_mxfp8_tile_floor_verified", lambda: floor_verified
+        )
         config, layer = self._heap_sized_layer("mxfp8", max_tokens=HEAP_TOKENS)
         seen = spy_on_value_pass(layer.experts)
         group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
@@ -767,10 +812,10 @@ class TestSymmetricHeapSizing:
         with torch.no_grad(), _fp8_context(config):
             layer(_hidden(config, seed=3, tokens=LOCAL_TOKENS))
             layer(_hidden(config, seed=3, tokens=HEAP_TOKENS // 2))
-        assert [routing_map.shape[0] for routing_map in seen] == [
-            floor,
-            group_size * (HEAP_TOKENS // 2),
-        ]
+        want = [floor, group_size * (HEAP_TOKENS // 2)]
+        if not floor_verified:
+            want = [group_size * HEAP_TOKENS] * 2
+        assert [routing_map.shape[0] for routing_map in seen] == want
 
     def test_a_layer_that_skips_the_metadata_sync_matches_one_that_runs_it(self):
         """Generation refreshes dispatch metadata on its first MoE layer only.

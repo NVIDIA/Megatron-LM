@@ -9,11 +9,15 @@ layer's unchanged training forward, which the activation checkpoint recomputes.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import weakref
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+from packaging.version import Version
+from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import register_optimizer_step_post_hook
 
 from megatron.core import utils
@@ -168,15 +172,20 @@ def _chunked_dispatch_and_compute(layer: MoELayer, hidden_states, probs):
 
     The routed MXFP8 kernel sizes its token tile from rows * top_k / local experts and has
     no config for small tiles at some shapes, so MXFP8 launches keep enough rows for its
-    largest tile, the one generation's full-buffer launches use.
+    largest tile, the one generation's full-buffer launches use. That floor follows
+    FlashInfer's tile selection, so on FlashInfer releases it was not verified on, MXFP8
+    launches use the whole buffer, as generation does.
     """
     dispatcher = layer.token_dispatcher
     capacity = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
     group_size = utils.get_pg_size(dispatcher.tp_ep_group)
     min_rows = 0
     if layer.experts._nvfp4_recipe is None:
-        # Above 128 routes per local expert the kernel's tile is its largest, 256.
-        min_rows = 128 * layer.num_local_experts // layer.config.moe_router_topk + 1
+        if _mxfp8_tile_floor_verified():
+            # Above 128 routes per local expert the kernel's tile is its largest, 256.
+            min_rows = 128 * layer.num_local_experts // layer.config.moe_router_topk + 1
+        else:
+            min_rows = group_size * capacity
     routing_map = dispatcher.routing_map
     num_tokens = hidden_states.shape[0]
     max_tokens = torch.tensor([num_tokens], device=hidden_states.device, dtype=torch.int64)
@@ -205,7 +214,19 @@ def _chunked_dispatch_and_compute(layer: MoELayer, hidden_states, probs):
     finally:
         NVLSAllGatherVDispatcher._real_token_count_tensor = real_token_count
         dispatcher._local_tokens = num_tokens
-    return torch.cat(outputs)
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+
+# FlashInfer releases (major, minor) on which the routed MXFP8 kernel's tile selection was
+# checked against the launch floor in _chunked_dispatch_and_compute.
+_MXFP8_TILE_FLOOR_VERIFIED_RELEASES = ((0, 7),)
+
+
+@functools.cache
+def _mxfp8_tile_floor_verified() -> bool:
+    import flashinfer
+
+    return Version(flashinfer.__version__).release[:2] in _MXFP8_TILE_FLOOR_VERIFIED_RELEASES
 
 
 def _routed_experts_compute(layer: MoELayer, hidden_states, probs):
@@ -222,8 +243,9 @@ def _routed_experts_compute(layer: MoELayer, hidden_states, probs):
     return dispatcher.combine_preprocess(output)
 
 
-# The value pass's kernel weights per experts module, kept here rather than on the
-# module. Weak keys, so a deleted model frees its entries.
+# The value pass's kernel weights per experts module, with the source versions they were
+# built from, kept here rather than on the module. Weak keys, so a deleted model frees its
+# entries.
 _value_pass_weights: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _hooked_on_load: weakref.WeakSet = weakref.WeakSet()
 _optimizer_step_hook = None
@@ -246,16 +268,20 @@ def release_inference_value_pass_weights(model: torch.nn.Module) -> None:
 def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routing_map):
     """The experts' value pass: generation's FlashInfer kernel on the training parameters.
 
-    The kernel weights are built from the parameters on the first value pass after an
-    optimizer step, and reused until the next step, a checkpoint load, or
-    ``release_inference_value_pass_weights``. A process-wide optimizer step post-hook and
-    a load_state_dict post-hook on the experts, both registered here, drop them, so
-    neither the training pipeline nor the experts module keeps any value-pass state.
+    The kernel weights are built from the parameters and reused until an in-place write
+    to them, an optimizer step, a checkpoint load, or
+    ``release_inference_value_pass_weights``. In-place writes, such as a reference-model
+    swap that copies into ``state_dict()`` tensors, show up in the source tensors'
+    versions. The optimizer step and the load are caught by a process-wide optimizer step
+    post-hook and a load_state_dict post-hook on the experts, both registered here, since
+    their writes into TE MXFP8 parameters can bypass the version counter. Neither the
+    training pipeline nor the experts module keeps any value-pass state.
     """
     global _optimizer_step_hook
     assert routing_map is not None, "routing_map is required for the training forward."
-    weights = _value_pass_weights.get(experts)
-    if weights is None:
+    versions = _source_versions(experts)
+    cached = _value_pass_weights.get(experts)
+    if cached is None or cached[0] != versions:
         if _optimizer_step_hook is None:
             _optimizer_step_hook = register_optimizer_step_post_hook(
                 lambda *_: _value_pass_weights.clear()
@@ -263,8 +289,10 @@ def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routin
         if experts not in _hooked_on_load:
             experts.register_load_state_dict_post_hook(_drop_value_pass_weights)
             _hooked_on_load.add(experts)
-        weights = _value_pass_weights[experts] = _build_value_pass_weights(experts)
-    mxfp8_weights, nvfp4_weights = weights
+        weights = _build_value_pass_weights(experts)
+        # Read again: finishing the parameter all-gather in the build can write them.
+        cached = _value_pass_weights[experts] = (_source_versions(experts), weights)
+    mxfp8_weights, nvfp4_weights = cached[1]
     kwargs = dict(
         num_experts=experts.num_local_experts * experts.ep_group.size(),
         local_expert_offset=experts.ep_group.rank() * experts.num_local_experts,
@@ -282,13 +310,64 @@ def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routin
     return output, None
 
 
+def _expert_weights(experts: InferenceGroupedMLP):
+    for linear_name, _ in type(experts)._EXPERT_WEIGHT_GROUPS:
+        linear = getattr(experts, linear_name)
+        for i in range(experts.num_local_experts):
+            yield getattr(linear, f"weight{i}")
+
+
+def _source_versions(experts: InferenceGroupedMLP) -> tuple:
+    """The address and version of every tensor the kernel weights are built from.
+
+    A TE MXFP8 parameter is represented by the FP8 data and scales it dequantizes from,
+    since ``state_dict()`` hands out a new TE tensor over them rather than a view of the
+    parameter.
+    """
+    versions = []
+    for weight in _expert_weights(experts):
+        if isinstance(weight, DTensor):
+            raise RuntimeError(
+                "moe_training_matches_inference does not support sharded (DTensor) expert "
+                "parameters, as Megatron-FSDP and torch FSDP use; use Megatron DDP."
+            )
+        te = weight if hasattr(weight, "_rowwise_data") else weight.data
+        if getattr(te, "_rowwise_data", None) is not None:
+            tensors = (te._rowwise_data, te._rowwise_scale_inv)
+        elif getattr(te, "_columnwise_data", None) is not None:
+            tensors = (te._columnwise_data, te._columnwise_scale_inv)
+        else:
+            tensors = (weight,)
+        versions.extend((tensor.data_ptr(), tensor._version) for tensor in tensors)
+    return tuple(versions)
+
+
+def _finish_param_gather(experts: InferenceGroupedMLP) -> None:
+    """Run the expert linears' pre-forward hooks, which finish DDP's parameter all-gather.
+
+    The value pass reads the weights without running linear_fc1 or linear_fc2. Only Megatron
+    DDP's hooks are known to need nothing from that forward, so any other pre-forward hook
+    on them is rejected rather than run out of context.
+    """
+    from megatron.core.distributed import distributed_data_parallel
+
+    for submodule in chain(experts.linear_fc1.modules(), experts.linear_fc2.modules()):
+        for hook_id, hook in list(submodule._forward_pre_hooks.items()):
+            if (
+                inspect.getmodule(hook) is not distributed_data_parallel
+                or hook_id in submodule._forward_pre_hooks_with_kwargs
+            ):
+                raise RuntimeError(
+                    "moe_training_matches_inference reads the expert weights without running "
+                    "the expert linears, so their only supported pre-forward hooks are Megatron "
+                    f"DDP's parameter all-gather hooks; {type(submodule).__name__} has {hook!r}."
+                )
+            hook(submodule, ())
+
+
 def _build_value_pass_weights(experts: InferenceGroupedMLP):
     """The value pass's (MXFP8, NVFP4) kernel weights, one of them None, from the parameters."""
-    # The weights are read without running linear_fc1 or linear_fc2, so their pre-forward
-    # hooks, which finish DDP's overlapped parameter all-gather, run here.
-    for submodule in chain(experts.linear_fc1.modules(), experts.linear_fc2.modules()):
-        for hook in submodule._forward_pre_hooks.values():
-            hook(submodule, None)
+    _finish_param_gather(experts)
     weight_groups = type(experts)._EXPERT_WEIGHT_GROUPS
     mxfp8_weights = nvfp4_weights = None
     with torch.no_grad():
