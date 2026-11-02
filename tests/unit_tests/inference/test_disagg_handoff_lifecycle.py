@@ -617,7 +617,7 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
         "kv_meta": {"resume_tokens": [99]},
     }
     entry = RequestEntry(record=record, future=handoff_loop.create_future())
-    finalized = record.merge() if already_finalized else None
+    finalized = prefill._finalize_request(entry) if already_finalized else None
     with mock.patch.object(record, "merge", wraps=record.merge) as merge:
         if already_finalized:
             completed = prefill._complete_request(entry, finalized)
@@ -1326,8 +1326,11 @@ def test_handoff_finishes_without_an_extra_decode_step(
     assert pending.continuation_blocks == []
 
 
-def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
-    engine = object.__new__(DynamicInferenceEngine)
+@pytest.mark.parametrize("use_coordinator", [False, True])
+def test_immediate_handoff_completion_resolves_request_future(handoff_loop, use_coordinator):
+    # The real class, so the mixin's completion resolves through the engine's reply path.
+    engine = object.__new__(StateHandoffDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
     engine.stop_word_being_finished_ids = set()
     engine.controller = SimpleNamespace(
         terminating_token_ids=lambda _, stop_token_ids=None: frozenset(stop_token_ids or ())
@@ -1341,14 +1344,18 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     request.add_event_add_engine()
     record = DynamicInferenceRequestRecord.from_request(request)
     request_future = handoff_loop.create_future()
-    engine.requests = {7: SimpleNamespace(record=record, future=request_future)}
+    engine.requests = {7: RequestEntry(record=record, future=request_future)}
     engine.finished_request_count = 0
-    engine.use_coordinator = False
-    engine.is_mp_coordinator = False
+    engine.use_coordinator = use_coordinator
+    engine.is_mp_coordinator = use_coordinator
+    engine.local_metadata_ledger_enabled = False
+    engine.payload_stager = None
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine._partial_emit_lengths = {7: 1}
     engine.context = mock.Mock()
     tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
 
-    InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, 7)
+    engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
@@ -1359,6 +1366,9 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
+    # No step follows this completion, so the coordinator reply leaves now.
+    assert engine.socket_for_receiving_requests.send_multipart.call_count == int(use_coordinator)
+    assert (7 not in engine._partial_emit_lengths) == use_coordinator
 
 
 def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
