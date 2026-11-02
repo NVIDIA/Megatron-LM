@@ -304,7 +304,9 @@ class InferenceSetupConfig:
                 "Shortcut MoE overlap requires dynamic batching without the legacy static engine"
             )
         if self.num_speculative_tokens:
-            raise ValueError("Shortcut MoE overlap does not support speculative decoding")
+            raise ValueError(
+                "Shortcut MoE overlap with speculative decoding requires further testing"
+            )
 
     def validate(self) -> None:
         """Check the KV-cache suspend/resume policy before an engine is built from it."""

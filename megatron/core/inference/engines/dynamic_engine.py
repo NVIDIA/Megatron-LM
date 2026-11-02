@@ -532,6 +532,7 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
         if inference_config.inference_shortcut_moe_overlap:
+            inference_config.validate_shortcut_moe_model(model_config)
             from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 
             for module in controller.inference_wrapped_model.model.modules():

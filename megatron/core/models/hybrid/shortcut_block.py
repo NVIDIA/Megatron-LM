@@ -482,7 +482,9 @@ class ShortcutMoEBlock(MegatronModule):
         if inference_context is None or not inference_context.is_dynamic_batching():
             raise RuntimeError("Shortcut MoE inference overlap requires dynamic batching")
         if inference_context.num_speculative_tokens:
-            raise RuntimeError("Shortcut MoE inference overlap does not support speculative decode")
+            raise RuntimeError(
+                "Shortcut MoE overlap with speculative decoding requires further testing"
+            )
         shortcut_hidden = hidden_states
         if not isinstance(self.compute_layer, (MambaLayer, TransformerLayer)):
             raise RuntimeError(

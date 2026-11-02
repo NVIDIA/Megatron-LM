@@ -854,7 +854,7 @@ class InferenceConfig:
     """Overlap routed Shortcut MoE work with the ordinary predecessor forward."""
 
     def validate_shortcut_moe_model(self, model_config) -> None:
-        """Validate model compatibility before initializing the inference context."""
+        """Validate model compatibility before engine setup and CUDA graph capture."""
         if not self.inference_shortcut_moe_overlap:
             return
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -884,14 +884,16 @@ class InferenceConfig:
             )
         if model_config.batch_invariant_mode or model_config.gdp_cutedsl_kernel:
             raise ValueError(
-                "inference_shortcut_moe_overlap does not support batch-invariant mode "
+                "inference_shortcut_moe_overlap requires further testing with batch-invariant mode "
                 "or CuTeDSL GDP kernels"
             )
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         if self.inference_shortcut_moe_overlap and self.num_speculative_tokens:
-            raise ValueError("Shortcut MoE overlap does not support speculative decoding")
+            raise ValueError(
+                "Shortcut MoE overlap with speculative decoding requires further testing"
+            )
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         # Not capped at 1: alpha stopped being a blend weight when the score became
         # cache_score - alpha * relative_load, and values above 1 are meaningful --
