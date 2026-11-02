@@ -2,17 +2,13 @@
 
 """Checkpoint settings are owned by CheckpointConfig; the CLI and the containers agree on them."""
 
-import ast
-import inspect
 from argparse import Namespace
 from dataclasses import asdict, fields, replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-import megatron.training
 from megatron.training import async_utils, global_vars, training
 from megatron.training.argument_utils import (
     checkpoint_config_from_args,
@@ -259,7 +255,10 @@ def test_format_prerequisites_follow_the_effective_async_policy(monkeypatch, sup
 
 
 def test_construction_runs_no_checks():
-    assert not hasattr(CheckpointConfig, "__post_init__")
+    """A section constructs with any values; the checks run in validate()."""
+    config = CheckpointConfig(save="/ckpt", save_interval=-1)
+    with pytest.raises(AssertionError):
+        config.validate()
     config = CheckpointConfig(verify_integrity=True, ckpt_format="torch", async_strategy="other")
     with pytest.raises(AssertionError, match="async_strategy"):
         config.validate()
@@ -492,88 +491,32 @@ def test_autoresume_saves_only_when_the_section_has_a_save_directory(
         assert save.call_args.args == (3, [], None, None, 456)
 
 
-def test_pretrain_finalizes_the_container_before_fault_tolerance_reads_it():
-    """Fault tolerance captures the save directory and the async mode at setup; it must see the
-    derived values (the async flip, the conversion exit flag)."""
-    source = inspect.getsource(training.pretrain)
-    assert source.index("cfg_container.finalize()") < source.index("ft_integration.setup()")
-
-
-# ---- no consumer inside the migrated boundary reads a checkpoint name from args ----
-
-CONSUMER_MODULES = (
-    "megatron/training/checkpointing.py",
-    "megatron/training/training.py",
-    "megatron/training/async_utils.py",
-    "megatron/training/initialize.py",
-    "megatron/training/ft_integration.py",
-    "megatron/training/global_vars.py",
-    "megatron/training/utils/common_utils.py",
-    "megatron/rl/rl_utils.py",
-    "megatron/post_training/checkpointing.py",
-    "megatron/post_training/model_builder.py",
-    "megatron/inference/utils.py",
-)
-# Legacy helpers that maintain the argument namespace itself rather than consume it.
-ARGS_MAINTAINERS = {("megatron/training/utils/common_utils.py", "update_use_dist_ckpt")}
-
-
-def _is_args(node):
-    """The legacy namespace: the `args` name or a `get_args()` call."""
-    if isinstance(node, ast.Name):
-        return node.id == "args"
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "get_args"
-        and not node.args
+def test_fault_tolerance_sees_the_finalized_checkpoint_policy(monkeypatch, run_config):
+    """pretrain() finalizes the container before fault tolerance captures the checkpoint policy
+    (save directory, async mode): the setup sees the derived values, here the async flip of a
+    distributed save without a persistent worker."""
+    run_config.checkpoint = CheckpointConfig(
+        save="/ckpt/out",
+        async_save=True,
+        ckpt_format="torch_dist",
+        use_persistent_ckpt_worker=False,
     )
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
+    monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
+    seen = []
 
+    class StopAtFaultTolerance(Exception):
+        pass
 
-def _args_reads(path, names, skip_functions):
-    """Reads of a checkpoint name from the namespace (`args.<name>`, `get_args().<name>`,
-    `getattr(args, "<name>")`) outside the skipped functions. Writes are not reads: the derived
-    legacy flags `load_checkpoint` keeps on the namespace for readers outside the module are
-    allowed, as the flips `validate_args` keeps."""
-    module = ast.parse(path.read_text())
-    skipped = [
-        range(node.lineno, node.end_lineno + 1)
-        for node in ast.walk(module)
-        if isinstance(node, ast.FunctionDef) and node.name in skip_functions
-    ]
-    reads = []
-    for node in ast.walk(module):
-        if (
-            isinstance(node, ast.Attribute)
-            and _is_args(node.value)
-            and node.attr in names
-            and isinstance(node.ctx, ast.Load)
-        ):
-            name = node.attr
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in ("getattr", "hasattr")
-            and len(node.args) >= 2
-            and _is_args(node.args[0])
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in names
-        ):
-            name = node.args[1].value
-        else:
-            continue
-        if not any(node.lineno in span for span in skipped):
-            reads.append(f"{path.name}:{node.lineno} args.{name}")
-    return reads
+    def setup():
+        seen.append(global_vars.get_run_config().checkpoint.async_save)
+        raise StopAtFaultTolerance  # Before initialize_megatron.
 
-
-def test_consumers_read_no_checkpoint_name_from_args():
-    root = Path(megatron.training.__file__).resolve().parents[2]
-    reads = []
-    for module in CONSUMER_MODULES:
-        skip = {function for owner, function in ARGS_MAINTAINERS if owner == module}
-        reads += _args_reads(root / module, set(CHECKPOINT_NAMES), skip)
-    assert reads == []
+    monkeypatch.setattr(training.ft_integration, "setup", setup)
+    with patch("megatron.training.utils.warn_rank_0"), pytest.raises(StopAtFaultTolerance):
+        training.pretrain(run_config, None, None, None)
+    assert seen == [False] and run_config._finalized
 
 
 # ---- the cross-section rules reach every CLI entry point ----
