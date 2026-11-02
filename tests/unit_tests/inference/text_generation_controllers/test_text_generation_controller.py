@@ -127,7 +127,9 @@ class TextGenerationControllerTestBase:
             num_attention_heads=4,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
-            flash_attention_version=2,
+            # FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens. The
+            # tests with smaller blocks exercise bookkeeping and never run attention.
+            flash_attention_version=2 if block_size_tokens % 256 == 0 else None,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,

@@ -446,6 +446,30 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 inference_config.block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
+        # FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens, and only with
+        # value heads as wide as query/key heads (flash-attn 2.8.3, csrc/flash_attn/flash_api.cpp).
+        # FlashAttention-3 and -4 have neither limit.
+        if model_config.flash_attention_version == 2:
+            if self.cache_mla_latent:
+                # Prefill attends over the up-projected latents.
+                qk_head_dim = model_config.qk_head_dim + model_config.qk_pos_emb_head_dim
+                v_head_dim = model_config.v_head_dim
+            else:
+                qk_head_dim = v_head_dim = model_config.kv_channels
+            if inference_config.block_size_tokens % 256 != 0 or v_head_dim != qk_head_dim:
+                # MLA's latent cache needs 64-token blocks, so only another kernel can run it.
+                hint = (
+                    "" if self.cache_mla_latent else ", or a block size that is a multiple of 256"
+                )
+                raise ValueError(
+                    "flash_attention_version=2 cannot run this dynamic-batching KV cache: "
+                    "FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens, "
+                    "with value heads as wide as query/key heads, but the blocks hold "
+                    f"{inference_config.block_size_tokens} tokens and the query/key and value "
+                    f"heads are {qk_head_dim} and {v_head_dim} wide. Use FlashAttention-3 or "
+                    f"-4{hint}."
+                )
+
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads

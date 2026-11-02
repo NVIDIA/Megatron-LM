@@ -5772,6 +5772,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
             use_cuda_graphs_for_non_decode_steps=False,
+            # The forward is mocked below, and FlashAttention-2 cannot read 16-token blocks.
+            flash_attention_version=None,
         )
 
         env = self._build_test_env(test_config)

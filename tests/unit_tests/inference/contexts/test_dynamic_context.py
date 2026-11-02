@@ -26,7 +26,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
@@ -354,6 +354,72 @@ class TestDynamicContext:
         ctx.initialize_attention_state()
         _, max_seqlen_q = ctx.cu_query_lengths()
         assert max_seqlen_q >= 2
+
+    @staticmethod
+    def _flash_attention_context(mla, flash_attention_version, block_size_tokens):
+        common = dict(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=8,
+            params_dtype=torch.bfloat16,
+            flash_attention_version=flash_attention_version,
+        )
+        if mla:
+            # Unabsorbed MLA prefill attends with 96-wide query/key and 64-wide value heads.
+            model_config = MLATransformerConfig(
+                q_lora_rank=64,
+                kv_lora_rank=64,
+                qk_head_dim=64,
+                qk_pos_emb_head_dim=32,
+                v_head_dim=64,
+                rope_type="rope",
+                cache_mla_latents=True,
+                **common,
+            )
+        else:
+            model_config = TransformerConfig(**common)
+        return DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.02,
+                paused_buffer_size_gb=0.002,
+                block_size_tokens=block_size_tokens,
+                max_tokens=256,
+                max_requests=8,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "mla, block_size_tokens",
+        [pytest.param(False, 64, id="mha-block64"), pytest.param(True, 64, id="mla")],
+    )
+    def test_pinned_flash_attention_2_rejects_unsupported_paged_kv(self, mla, block_size_tokens):
+        """FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens, with value
+        heads as wide as query/key heads. A pinned FA2 that cannot read the cache is rejected when
+        the context is built, rather than failing inside flash-attn at the first prefill."""
+        with pytest.raises(
+            ValueError, match="flash_attention_version=2 cannot run this dynamic-batching KV cache"
+        ):
+            self._flash_attention_context(mla, 2, block_size_tokens)
+
+    @pytest.mark.parametrize(
+        "mla, flash_attention_version, block_size_tokens",
+        [
+            pytest.param(False, 2, 256, id="mha-fa2-block256"),
+            pytest.param(False, 4, 64, id="mha-fa4-block64"),
+            pytest.param(False, None, 64, id="mha-auto-block64"),
+            pytest.param(True, 4, 64, id="mla-fa4"),
+        ],
+    )
+    def test_paged_kv_accepted_where_the_kernel_reads_it(
+        self, mla, flash_attention_version, block_size_tokens
+    ):
+        """FA2 with 256-token blocks, and FA3/FA4 or automatic selection with any block size."""
+        context = self._flash_attention_context(mla, flash_attention_version, block_size_tokens)
+        assert context.block_size_tokens == block_size_tokens
 
     @pytest.mark.internal
     @pytest.mark.parametrize("flash_attention_version", [2, 4])
