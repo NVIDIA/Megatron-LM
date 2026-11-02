@@ -508,6 +508,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="ssm_mamba2_replayssm_spec",
+        sources=("megatron/core/ssm/ops/mamba2/mamba_ssm_replay.py",),
+        tests=(K + "test_ssm_kernels.py",),
+        kind="triton",
+        training_path=False,
+        notes="ReplaySSM speculative decode: fused scatter + B.C precompute, verify, flush and "
+        "cursor-commit kernels. Fixed launch configs (no autotuning) and no atomics; one step "
+        "with verify, flush and padding rows is replayed and its output, SSM checkpoint, ring "
+        "caches and cursors compared.",
+    ),
+    KernelEntry(
         name="ssm_common_kernels",
         sources=(
             "megatron/core/ssm/ops/common/causal_conv1d_triton.py",
@@ -753,7 +764,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
+        "selective_state_update, ReplaySSM spec decode). Module-level replay: "
+        "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py.",
     ),
     KernelEntry(

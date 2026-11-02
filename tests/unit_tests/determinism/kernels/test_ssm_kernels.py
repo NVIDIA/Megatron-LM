@@ -6,7 +6,8 @@ gated-delta-net code paths.
 The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this module drives
 the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` kernels behind
 ``mamba_chunk_scan_combined_varlen``), the decode-time ``selective_state_update`` and
-``causal_conv1d_update``, the varlen causal conv, the Gated Delta Product varlen chunk scan
+``causal_conv1d_update``, the ReplaySSM speculative-decode kernels, the varlen causal conv,
+the Gated Delta Product varlen chunk scan
 (``gdp/*`` kernels) and its decode kernels -- single-token and speculative, where a step
 carries several draft tokens and the kernels snapshot the conv and recurrent state after
 each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
@@ -261,6 +262,140 @@ def test_selective_state_update_replays():
         replays=4,
         backward=False,
         what="selective_state_update",
+    )
+
+
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_replayssm_spec_step_replays(act_dtype):
+    """One ReplaySSM speculative step: the fused scatter + B.C precompute, the verify and flush
+    launches, and the cursor commit, with verify, flush, and padding rows in one batch."""
+    from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import (
+        commit_replayssm_spec,
+        selective_state_update_replayssm_spec,
+    )
+
+    seeded()
+    nheads, headdim, dstate, ngroups = 32, 64, 128, 4
+    window, buffer_len = 3, 16  # W, B
+    max_cache_len = buffer_len + window  # L
+    buf = 1 << (max_cache_len - 1).bit_length()
+    batch, num_slots = 64, 96
+    d_inner = nheads * headdim
+
+    # Sparse slots with padding rows, and half the live rows flushing. Fill levels follow the
+    # early-flush invariant: verify rows hold wp + W <= B, flush rows wp + 2W > L.
+    slots = torch.randperm(num_slots, device="cuda")[:batch].to(torch.int32)
+    slots[::8] = -1
+    is_flush = torch.zeros(num_slots, dtype=torch.int8, device="cuda")
+    is_flush[slots[slots >= 0].long()[::2]] = 1
+    verify_wp = torch.randint(0, buffer_len - window + 1, (num_slots,), device="cuda")
+    flush_wp = torch.randint(buffer_len - window + 1, buffer_len + 1, (num_slots,), device="cuda")
+    write_pos = torch.where(is_flush.bool(), flush_wp, verify_wp).to(torch.int32)
+    origin = torch.randint(0, buf, (num_slots,), dtype=torch.int32, device="cuda")
+
+    state = torch.randn(num_slots, nheads, headdim, dstate, device="cuda") * 0.1
+    post_conv_cache = torch.randn(
+        num_slots, buf, d_inner + ngroups * dstate, device="cuda", dtype=act_dtype
+    )
+    dt_cache = torch.randn(num_slots, nheads, buf, device="cuda") * 0.5
+    bc_pre = torch.zeros(batch, ngroups, buf, 1 << (window - 1).bit_length(), device="cuda")
+    conv_out = torch.randn(
+        batch * window, d_inner + 2 * ngroups * dstate, device="cuda", dtype=act_dtype
+    )
+    dt_spec = torch.randn(batch * window, nheads, device="cuda", dtype=act_dtype)
+    A = (
+        (-torch.rand(nheads, device="cuda") - 1.0)
+        .view(nheads, 1, 1)
+        .expand(nheads, headdim, dstate)
+    )
+    D = torch.randn(nheads, device="cuda").unsqueeze(-1).expand(nheads, headdim)
+    dt_bias = torch.rand(nheads, device="cuda") - 4.0
+    qsl = torch.arange(0, (batch + 1) * window, window, dtype=torch.int32, device="cuda")
+    accepted = torch.randint(0, window, (batch,), device="cuda")
+    prefill = torch.zeros(batch, dtype=torch.int32, device="cuda")
+
+    def fn(
+        state,
+        post_conv_cache,
+        dt_cache,
+        bc_pre,
+        write_pos,
+        origin,
+        is_flush,
+        conv_out,
+        dt_spec,
+        A,
+        D,
+        dt_bias,
+        qsl,
+        slots,
+        accepted,
+        prefill,
+    ):
+        # The per-head scalar A (TIE_HDIM) and the broadcast D are the layouts the Mamba mixer
+        # dispatches; the harness must hand them over unchanged.
+        assert A.stride(-1) == 0 and A.stride(-2) == 0 and D.stride(-1) == 0
+        out = selective_state_update_replayssm_spec(
+            state,
+            post_conv_cache,
+            dt_cache,
+            conv_out,
+            dt_spec,
+            A,
+            write_pos=write_pos,
+            post_conv_state_pos=origin,
+            is_flush=is_flush,
+            query_start_loc=qsl,
+            state_batch_indices=slots,
+            max_cache_len=max_cache_len,
+            max_spec_len=window,
+            d_inner=d_inner,
+            ngroups=ngroups,
+            dstate=dstate,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            bc_pre=bc_pre,
+        )
+        commit_replayssm_spec(
+            write_pos=write_pos,
+            post_conv_state_pos=origin,
+            is_flush=is_flush,
+            accepted_draft_counts=accepted,
+            prefill_status=prefill,
+            state_batch_indices=slots,
+            max_cache_len=max_cache_len,
+            max_spec_len=window,
+            cache_buf_len=buf,
+        )
+        # Everything the step updates in place: the flushed checkpoint, the ring caches, the
+        # B.C scratch, and the committed cursors.
+        return out, state, post_conv_cache, dt_cache, bc_pre, write_pos, origin, is_flush
+
+    assert_replays_bit_exact(
+        fn,
+        (
+            state,
+            post_conv_cache,
+            dt_cache,
+            bc_pre,
+            write_pos,
+            origin,
+            is_flush,
+            conv_out,
+            dt_spec,
+            A,
+            D,
+            dt_bias,
+            qsl,
+            slots,
+            accepted,
+            prefill,
+        ),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="replayssm_spec_step",
     )
 
 
