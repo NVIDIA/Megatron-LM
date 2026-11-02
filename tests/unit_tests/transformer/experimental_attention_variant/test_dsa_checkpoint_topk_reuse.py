@@ -271,7 +271,7 @@ def _assert_similar(actual: torch.Tensor, expected: torch.Tensor, *, label: str,
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("stash", ["used", "declined"])
 def test_checkpoint_replay_reuses_first_call_topk(
     tp, cp, deterministic, stash, indexer_call_log, monkeypatch
@@ -393,7 +393,7 @@ def _frozen_step(attention: DSAttention, inputs: dict, grad_output_seed: int, ch
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_frozen_checkpoint_replay_reuses_first_call_indices(
     tp, cp, deterministic, indexer_call_log, monkeypatch
 ):
