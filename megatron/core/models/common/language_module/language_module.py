@@ -351,7 +351,20 @@ class LanguageModule(MegatronModule):
         in_inference_mode = InferenceMode.is_active()
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         cp_group = packed_seq_params.cp_group if packed_seq_params is not None else None
-        if self.position_embedding_type == 'rope':
+        # The cos/sin tables carry the whole rotation of RoPE and YaRN (for YaRN, its interpolated
+        # frequencies and concentration factor), so FlashInfer's fused RoPE applies both exactly.
+        # Multimodal RoPE rotates by several position ids per token, which tables indexed by one
+        # position cannot express; it always takes rotary_pos_emb.
+        if self.position_embedding_type in ('rope', 'yarn'):
+            if (
+                self.position_embedding_type == 'yarn'
+                and in_inference_mode
+                and self.config.flash_decode
+            ):
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "YarnRotaryEmbedding yet."
+                )
             use_flashinfer_fused_rope = getattr(
                 inference_context, 'use_flashinfer_fused_rope', False
             )
@@ -378,19 +391,9 @@ class LanguageModule(MegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
                 )
-        elif self.position_embedding_type == 'yarn':
-            if in_inference_mode and self.config.flash_decode:
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "YarnRotaryEmbedding yet."
-                )
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding returns (emb, mscale); attention applies mscale itself.
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
-            )
+                if self.position_embedding_type == 'yarn':
+                    # YarnRotaryEmbedding returns (emb, mscale); attention applies mscale itself.
+                    rotary_pos_emb, _ = rotary_pos_emb
         elif self.position_embedding_type == 'mrope':
             if in_inference_mode and self.config.flash_decode:
                 raise NotImplementedError(

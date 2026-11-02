@@ -408,6 +408,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 "Flash decode is only applicable to static batching; set flash_decode=False "
                 "to use the dynamic inference context."
             )
+        # FlashInfer's fused RoPE rotates each token by one position from a cos/sin table;
+        # multimodal RoPE rotates by several position ids per token.
+        if (
+            inference_config.use_flashinfer_fused_rope is True
+            and model_config.mrope_section is not None
+        ):
+            raise ValueError(
+                "FlashInfer fused RoPE cannot apply multimodal RoPE (mrope_section is set); "
+                "set use_flashinfer_fused_rope=False or None."
+            )
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching

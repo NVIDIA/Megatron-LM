@@ -242,6 +242,21 @@ def test_flash_decode_is_rejected():
         )
 
 
+def test_flashinfer_fused_rope_rejects_multimodal_rope():
+    """FlashInfer's fused RoPE cannot apply multimodal RoPE, so asking for it explicitly fails
+    when the context is built. Left to its default, such a model runs the unfused RoPE."""
+    model_config = TransformerConfig(
+        num_layers=2, hidden_size=64, num_attention_heads=4, mrope_section=[4, 2, 2]
+    )
+    with pytest.raises(ValueError, match="FlashInfer fused RoPE cannot apply multimodal RoPE"):
+        DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=64, buffer_size_gb=0.01, use_flashinfer_fused_rope=True
+            ),
+        )
+
+
 class TestDynamicContext:
 
     @classmethod
