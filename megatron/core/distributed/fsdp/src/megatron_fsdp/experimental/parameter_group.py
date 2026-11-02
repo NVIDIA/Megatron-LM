@@ -118,8 +118,8 @@ class FsdpParameterGroup:
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
     grad_comm_dtype: torch.dtype
-    # Full compute storage: persistent model_weight when replicated, otherwise a
-    # temporary buffer populated by all-gather.
+    # Replicated compute-weight view: shares persistent model_weight storage when local,
+    # otherwise owns temporary storage populated by all-gather.
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
     # BF16 shares one event across phases; sharded MXFP8 has independent rowwise
     # (forward) and columnwise (backward) events. Releasing storage clears its event.
@@ -350,8 +350,8 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if can_redistribute_locally(self.mesh, self.model_weight.placements, unsharded_placements):
-            self._unsharded_model_weight = self.model_weight
+        if not self._requires_allgather:
+            self._unsharded_model_weight = self.model_weight.view(unsharded_placements)
         else:
             with self._symmetric_memory_context():
                 if isinstance(self.model_weight, DBuffer):
@@ -461,10 +461,17 @@ class FsdpParameterGroup:
         )
 
     @property
+    def _requires_allgather(self) -> bool:
+        """Whether compute weights need temporary storage to become fully replicated."""
+        return not can_redistribute_locally(
+            self.mesh, self.model_weight.placements, (Replicate(),) * self.mesh.ndim
+        )
+
+    @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight
-        if buffer is self.model_weight:
+        if not self._requires_allgather:
             return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
@@ -491,7 +498,7 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
 
-        if self._unsharded_model_weight is self.model_weight:
+        if not self._requires_allgather:
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
@@ -595,7 +602,7 @@ class FsdpParameterGroup:
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
         # but never free persistent compute weights or their padded scale copies.
-        if unsharded_model_weight is self.model_weight:
+        if not self._requires_allgather:
             return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
