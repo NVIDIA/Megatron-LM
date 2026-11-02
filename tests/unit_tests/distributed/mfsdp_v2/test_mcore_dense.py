@@ -22,18 +22,27 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
-from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import (
+    destroy_model_parallel,
+    units_unsharding_all_planes_in_backward,
+    wrap_with_fsdp_v2,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -101,6 +110,203 @@ def test_mxfp8_parameters(process_group_collection):
             for parameter in group.fsdp_parameters:
                 parameters.append(parameter.unsharded)
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+
+
+_SELECTIVE = dict(recompute_granularity="selective")
+_FULL = dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
+_MTP = dict(mtp_num_layers=1)
+_MLA = dict(
+    q_lora_rank=32,
+    kv_lora_rank=32,
+    qk_head_dim=16,
+    qk_pos_emb_head_dim=16,
+    v_head_dim=16,
+    rope_type="rope",
+)
+_MOE = dict(
+    num_moe_experts=4,
+    moe_router_topk=2,
+    moe_grouped_gemm=True,
+    moe_ffn_hidden_size=128,
+    moe_shared_expert_intermediate_size=128,
+    moe_token_dispatcher_type="alltoall",
+)
+
+
+def _build_model(kind: str, config: TransformerConfig) -> torch.nn.Module:
+    """Build a model of ``kind`` ("gpt", "mla", "moe", or "hybrid") on CUDA."""
+    if kind == "hybrid":
+        # "/" separates the decoder pattern from the MTP layer pattern.
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+            hybrid_layer_pattern="*/*",
+        )
+    else:
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            multi_latent_attention=kind == "mla",
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+        )
+        mtp_block_spec = None
+        if config.mtp_num_layers:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            mtp_block_spec=mtp_block_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+        )
+    return model.to(device="cuda", dtype=config.params_dtype)
+
+
+def _build_config(kind: str, **kwargs) -> TransformerConfig:
+    config_class = MLATransformerConfig if kind == "mla" else TransformerConfig
+    return config_class(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=256,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        **kwargs,
+    )
+
+
+_GPT_MTP_LAYERS = {"decoder.layers.0", "decoder.layers.1", "mtp.layers.0.mtp_model_layer"}
+
+
+@pytest.mark.parametrize(
+    "kind, config_kwargs, extra_fsdp_unit_modules, expected_units",
+    [
+        pytest.param("gpt", _MTP, (), set(), id="no_recompute"),
+        pytest.param(
+            "gpt",
+            dict(**_MTP, **_SELECTIVE, recompute_modules=["core_attn"]),
+            (),
+            set(),
+            id="selective_core_attn",
+        ),
+        # The root owns no MLP; each layer owns the MLP whose activations it recomputes.
+        pytest.param(
+            "gpt",
+            dict(**_MTP, **_SELECTIVE, recompute_modules=["mlp"]),
+            (),
+            _GPT_MTP_LAYERS,
+            id="selective_mlp",
+        ),
+        pytest.param(
+            "mla",
+            dict(**_MLA, **_SELECTIVE, recompute_modules=["mla_up_proj"]),
+            (),
+            {"decoder.layers.0", "decoder.layers.1"},
+            id="selective_mla_up_proj",
+        ),
+        # Only the root owns eh_proj, which the MTP checkpoint reruns.
+        pytest.param("gpt", dict(**_MTP, **_FULL), (), {""}, id="full"),
+        # The MTP layer checkpoints inside its own forward, so it needs the opt-in as a unit too.
+        pytest.param(
+            "gpt",
+            dict(**_MTP, **_FULL),
+            (MultiTokenPredictionLayer,),
+            {"mtp.layers.0"},
+            id="full_mtp_layer_unit",
+        ),
+        # Hybrid MTP layers do not checkpoint eh_proj; their inner layers are units.
+        pytest.param("hybrid", dict(**_MTP, **_FULL), (), set(), id="full_hybrid_mtp"),
+    ],
+)
+def test_unshard_all_planes_in_backward_follows_recompute(
+    process_group_collection, kind, config_kwargs, extra_fsdp_unit_modules, expected_units
+):
+    """The adapter opts in exactly the units whose weights recomputation uses without re-entry."""
+    config = _build_config(kind, **config_kwargs)
+    model = wrap_with_fsdp_v2(
+        _build_model(kind, config),
+        config,
+        process_group_collection,
+        fsdp_unit_modules=(
+            [TransformerLayer, *extra_fsdp_unit_modules] if extra_fsdp_unit_modules else None
+        ),
+    )
+    assert units_unsharding_all_planes_in_backward(model) == expected_units
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
+@pytest.mark.parametrize(
+    "kind, model_kwargs, recompute_kwargs",
+    [
+        pytest.param("gpt", {}, dict(**_SELECTIVE, recompute_modules=["mlp"]), id="selective_mlp"),
+        pytest.param("gpt", {}, _FULL, id="full"),
+        pytest.param(
+            "moe",
+            _MOE,
+            dict(**_SELECTIVE, recompute_modules=["shared_experts"]),
+            id="selective_shared_experts",
+        ),
+        pytest.param(
+            "moe", _MOE, dict(**_SELECTIVE, recompute_modules=["moe"]), id="selective_moe"
+        ),
+    ],
+)
+def test_mxfp8_recompute_matches_no_recompute(
+    process_group_collection, kind, model_kwargs, recompute_kwargs
+):
+    """MXFP8 recomputation using weights of a unit it does not re-enter matches no recompute."""
+    batch_size, sequence_length = 2, 32
+    torch.manual_seed(1234)
+    input_ids = torch.randint(0, 128, (batch_size, sequence_length), device="cuda")
+    position_ids = torch.arange(sequence_length, device="cuda").expand(batch_size, -1)
+    labels = torch.roll(input_ids, shifts=-1, dims=1)
+
+    def train(recompute_kwargs):
+        """Return the loss and the local gradient shards of one training step."""
+        # Reseed so both builds initialize identical weights.
+        torch.manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234)
+        config = _build_config(
+            kind,
+            **_MTP,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            # MXFP8 grouped GEMMs need token counts padded per expert.
+            moe_router_padding_for_quantization=kind == "moe",
+            # Selective MLP recompute with linear biases fails in TE checkpoint even without FSDP.
+            add_bias_linear=False,
+            **model_kwargs,
+            **recompute_kwargs,
+        )
+        model = wrap_with_fsdp_v2(_build_model(kind, config), config, process_group_collection)
+
+        def forward():
+            loss = model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=None, labels=labels
+            )
+            return loss.float().mean()
+
+        (loss,) = run_forward_backward_on_microbatches(model, forward)
+        grads = {
+            name: parameter.grad.to_local().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        return loss, grads
+
+    expected_loss, expected_grads = train({})
+    loss, grads = train(recompute_kwargs)
+    assert expected_grads
+    torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
 
 
 def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_group_collection):
