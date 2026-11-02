@@ -828,6 +828,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers[i] = wrapper(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
+                # Whole-param layouts publish quantized params as Q(bf16(master)) (see
+                # allgather_params); the step's master-to-model copy matches that.
+                optimizers[i].quantize_from_bf16_master = self.param_layout != 'padded'
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
@@ -999,7 +1002,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return built
 
     def _check_whole_param_gather_storage(self, optimizers, config) -> None:
-        """Reject quantized params that the whole-parameter gather cannot publish.
+        """Reject quantized params that the whole-parameter gather cannot publish, and mark
+        the ones it publishes.
 
         The compact and legacy layouts gather quantized params as BF16 staged from the owners'
         FP32 masters and requantize them on every rank, which supports plain MXFP8 and
@@ -1021,6 +1025,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         f"Quantized params on the {self.param_layout} LayerWise layout need the "
                         "bf16 FP32 master copies (OptimizerConfig.bf16=True)."
                     )
+                param.requantized_by_layer_wise_gather = True
 
     def shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):
         """Shard params across ranks according to the computed param layout.

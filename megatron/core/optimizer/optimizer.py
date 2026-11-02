@@ -46,6 +46,11 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..fp8_utils import (
+    is_blockwise_float8tensor,
+    is_mxfp8tensor,
+    requantize_whole_params_from_high_precision,
+)
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -1249,6 +1254,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
     """
 
+    # Set by LayerWiseDistributedOptimizer for its children on the compact and legacy
+    # layouts (see _copy_main_params_to_model_params_via_bf16).
+    quantize_from_bf16_master = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -1402,11 +1411,39 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        if self.quantize_from_bf16_master:
+            self._copy_main_params_to_model_params_via_bf16()
+            return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
+
+    def _copy_main_params_to_model_params_via_bf16(self):
+        """Master-to-model copy of a LayerWise child on the compact or legacy layout.
+
+        Those layouts publish plain MXFP8 / blockwise FP8 params by requantizing the gathered
+        BF16 values on every rank, owner included. The gathered params are skipped here (the
+        gather overwrites them); a param no rank gathers (a single-rank data-parallel group) gets
+        the same Q(bf16(master)) here. Other params are copied as usual.
+        """
+        model_data, main_data, quantized_params, values = [], [], [], []
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if is_mxfp8tensor(model_param) or is_blockwise_float8tensor(model_param):
+                    if not getattr(model_param, 'requantized_by_layer_wise_gather', False):
+                        quantized_params.append(model_param)
+                        values.append(main_param.detach().to(torch.bfloat16))
+                    continue
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        if model_data:
+            _multi_tensor_copy_this_to_that(
+                this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
+            )
+        if quantized_params:
+            requantize_whole_params_from_high_precision(quantized_params, values)
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
