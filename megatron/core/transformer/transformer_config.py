@@ -2620,12 +2620,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mtp_repeated_layer_shared_components requires mtp_num_layers > 1."
                 )
-            if self.recompute_granularity == "full":
-                raise ValueError(
-                    "mtp_repeated_layer_shared_components does not support full activation "
-                    "recomputation, which replays DSA after the shared state has been cleared. "
-                    "Use selective recompute without core_attn or disable repeated-layer sharing."
-                )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
@@ -3726,11 +3720,14 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
-            if self.mtp_repeated_layer_shared_components and "core_attn" in self.recompute_modules:
+            if (
+                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
+                and "core_attn" in self.recompute_modules
+            ):
                 raise ValueError(
-                    "mtp_repeated_layer_shared_components does not support core_attn recompute, "
-                    "which replays DSA after the shared state has been cleared. "
-                    "Remove core_attn from recompute_modules or disable repeated-layer sharing."
+                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
+                    "selective core_attn recompute. Use full recompute, select mla_up_proj "
+                    "instead, or disable latent_kv sharing."
                 )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
@@ -3762,17 +3759,6 @@ class TransformerConfig(ModelParallelConfig):
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
                 raise ValueError(
                     "moe_act in recompute_modules is only supported with moe_grouped_gemm."
-                )
-
-            if (
-                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
-                and "mla_up_proj" in self.recompute_modules
-            ):
-                raise ValueError(
-                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
-                    "mla_up_proj recompute: it discards the source KV storage before later "
-                    "MTP depths consume it. Remove mla_up_proj from recompute_modules "
-                    "or disable latent_kv sharing."
                 )
 
             if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
@@ -5206,10 +5192,15 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
-        if self.mtp_repeated_layer_shared_components and graph_captures_attention:
+        if (
+            self.mtp_repeated_layer_shared_components
+            and graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
             raise ValueError(
-                "mtp_repeated_layer_shared_components does not support CUDA graph capture that "
-                "includes attention. Use a MoE-only scope or disable CUDA graphs."
+                "mtp_repeated_layer_shared_components does not support per-layer CUDA graph "
+                "scopes that capture attention. Use a MoE-only scope or a full-iteration graph "
+                "that contains the complete MTP producer-consumer chain."
             )
 
         assert not (
