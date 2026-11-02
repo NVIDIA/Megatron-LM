@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 try:
     from transformers import AutoTokenizer, BatchEncoding, PreTrainedTokenizerFast
     from transformers.utils import cached_file
+    from transformers.utils.versions import require_version
 
     HAVE_TRANSFORMERS = True
 except ModuleNotFoundError:
@@ -464,6 +465,10 @@ if HAVE_TRANSFORMERS:
 
         def __init__(self, tokenizer: PreTrainedTokenizerFast) -> None:
             from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            require_version(
+                "gigatoken>=0.11.0", 'Install with: python -m pip install -U "gigatoken>=0.11.0"'
+            )
 
             # Preserve the loaded HF configuration and native decoder for DecodeStream.
             self.__dict__.update(tokenizer.__dict__)
