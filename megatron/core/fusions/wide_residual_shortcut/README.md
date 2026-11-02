@@ -6,8 +6,8 @@ for training; the residual stream is FP32 with `--fp32-residual-connection`, oth
 connection logits may be FP32 or BF16 — all arithmetic is FP32 either way), `ShortcutMoEBlock` replaces
 each residual seam with one Gluon kernel that mixes the wide-residual streams with the branch update,
 writes the new residual, and emits the RMSNorm readers that consume it — directly as MXFP8 for an
-exclusive TE Linear consumer under an MXFP8 recipe, otherwise BF16. `wide_residual_write_read_rmsnorm_quant` writes the Mamba/GDN/attention
-output and produces the shared expert's normalized input; `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`
+exclusive TE Linear consumer under an MXFP8 recipe, otherwise BF16. `wide_residual_write_read_rmsnorm_quant`
+writes the Mamba/GDN/attention output and produces the shared expert's normalized input; `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`
 adds the routed and shared MoE outputs (the shortcut add, passed between blocks as a `PendingShortcutAdd`) and
 produces the next block's compute-layer and shortcut-routing inputs. The shortcut add is optional: a
 `PendingShortcutAdd` without a shared update is a single write read twice, which a lone wide-residual Mamba
@@ -189,3 +189,12 @@ Unfused here is `streamwise_sigmoid_writeback` of the one update, then the two r
 | Ultra (10240) | 1K | 396.9 | 90.0 | 4.41x | 65% | 391.3 | 114.2 | 3.43x | 52% |
 | Ultra (10240) | 4K | 1418.8 | 298.3 | 4.76x | 78% | 1421.8 | 386.4 | 3.68x | 62% |
 | Ultra (10240) | 8K | 2784.5 | 618.7 | 4.50x | 75% | 2784.7 | 792.7 | 3.51x | 60% |
+
+### BF16 residual streams
+
+Without `--fp32-residual-connection` the stream is BF16: half the residual bytes, the same FP32 arithmetic.
+The forward then needs more rows in flight and uses its own per-shape configs (`_FORWARD_CONFIGS_BF16`,
+eight BF16 columns per thread where that helps): 82-89% of peak DRAM at 8K-16K tokens for the one-reader and
+shortcut-add seams, and 82-88% for the single write read twice with BF16 readers (76-81% with the MXFP8
+handoff). The backward runs the same FP32 arithmetic on half the bytes and becomes issue-bound (about 45-63% of
+peak DRAM at 8K, 1.1x faster than with an FP32 stream).

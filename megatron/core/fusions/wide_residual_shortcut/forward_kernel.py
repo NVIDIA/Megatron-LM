@@ -155,6 +155,39 @@ _FORWARD_CONFIGS = {
 
 # fmt: on
 
+# GB300 configs for a BF16 residual stream at the production widths (3 streams), which moves
+# half the residual bytes and needs more rows in flight than the FP32 schedules keep. Chosen
+# per shape from a sweep of the 16 recipes x LOADS_FIRST x VECTOR (4 or 8 BF16 columns per
+# thread) at 8K rows, confirmed at 4K/16K: 1.04-1.64x over the FP32 table on BF16 streams.
+# Key: (hidden size, readers, updates, MXFP8 handoff); one update read twice is its own shape.
+# Training/prefill from 2048 rows and inference from 512 rows use them.
+# fmt: off
+_FORWARD_CONFIGS_BF16 = {
+    (3072, 1, 1, False): _ForwardConfig(4096, 1, 0, False, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
+    (3072, 1, 1, True): _ForwardConfig(4096, 2, 0, False, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
+    (3072, 2, 1, False): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
+    (3072, 2, 1, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 168, True, LOADS_FIRST=True, VECTOR=8),
+    (3072, 2, 2, False): _ForwardConfig(4096, 4, 0, False, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
+    (3072, 2, 2, True): _ForwardConfig(4096, 1, 0, True, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
+    (4096, 1, 1, False): _ForwardConfig(2048, 0, 0, False, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=8),
+    (4096, 1, 1, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=8),
+    (4096, 2, 1, False): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
+    (4096, 2, 1, True): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=8),
+    (4096, 2, 2, False): _ForwardConfig(2048, 0, 0, True, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=4),
+    (4096, 2, 2, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 168, True, LOADS_FIRST=True, VECTOR=8),
+    (10240, 1, 1, False): _ForwardConfig(4096, 2, 0, False, 0, 8, 128, True, LOADS_FIRST=True, VECTOR=8),
+    (10240, 1, 1, True): _ForwardConfig(4096, 2, 0, False, 0, 8, 128, True, LOADS_FIRST=True, VECTOR=8),
+    (10240, 2, 1, False): _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=4),
+    (10240, 2, 1, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=8),
+    (10240, 2, 2, False): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=8),
+    (10240, 2, 2, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=4),
+}
+# fmt: on
+
+# BF16 residual streams of other shapes from 2048 rows: the single most robust config of the
+# same sweep (mean 1.13x of the per-shape best vs 1.23x for the FP32 tree's leaves).
+_BF16_STREAM_CONFIG = _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False, LOADS_FIRST=True)
+
 
 def _inference_leaf(m, h, streams, readers, mxfp8):
     """Return the inference decision tree's leaf for a row-kernel launch.
@@ -369,6 +402,13 @@ def choose_forward_config(
     Returns:
         The ``_ForwardConfig`` to launch.
     """
+    if bf16_residual:
+        key = (h, readers, updates or readers, mxfp8)
+        if streams == 3 and key in _FORWARD_CONFIGS_BF16 and m >= (512 if inference else 2048):
+            return _FORWARD_CONFIGS_BF16[key]
+        if not inference and m >= 2048 and 3072 <= h <= 16384 and streams <= 6:
+            cfg = _BF16_STREAM_CONFIG
+            return cfg._replace(PAIRED_REDUCE=cfg.PAIRED_REDUCE and readers == 2)
     if inference and m <= 1024 and 3072 <= h <= 16384 and streams <= 6:
         return _inference_config(m, h, streams, readers, mxfp8, updates)
     width = max(32, triton.next_power_of_2(h))
@@ -739,7 +779,7 @@ def _load_coefficient(C, INDEX: gl.constexpr):
 
 @g.jit
 def _load_residual(write_tensors, row, stream, cols, GEOMETRY: gl.constexpr, CONFIG: gl.constexpr):
-    """Load one stream's residual fragment widened to FP32; FP32 uses 4-wide packets when H allows.
+    """Load one stream's residual fragment (FP32 in 4-wide packets when H allows, or BF16).
 
     Args:
         write_tensors: ``_WriteArgs``.
@@ -759,7 +799,8 @@ def _load_residual(write_tensors, row, stream, cols, GEOMETRY: gl.constexpr, CON
 
     # Explicitly vector-load four contiguous FP32 values with inline PTX when H allows it.
     if write_tensors.residual.dtype.element_ty != gl.float32:
-        old = gl.load(residual, mask, 0).to(gl.float32)  # exact BF16 widening
+        # Stays packed BF16 (two per register) until _mix_fragment widens it at first use.
+        old = gl.load(residual, mask, 0)
     elif H % 4 == 0:
         if H % CONFIG.WIDTH:
             # H and tile widths are multiples of four: each packet is wholly valid or masked.
@@ -883,6 +924,7 @@ def _mix_fragment(
             old = olds[stream]
         else:
             old = _load_residual(write_tensors, row, stream, cols, GEOMETRY, CONFIG)
+        old = old.to(gl.float32)  # exact for BF16; a no-op for FP32
 
         write = _load_coefficient(coefficients, stream)
         retain = _load_coefficient(coefficients, NUM_STREAMS + stream) if HAS_RETENTION else 1.0

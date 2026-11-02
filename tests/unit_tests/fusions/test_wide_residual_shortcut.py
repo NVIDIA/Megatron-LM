@@ -556,6 +556,35 @@ def test_bf16_residual_and_logits(
     assert_grads_close(ga, ge, fp32=(5e-4, 5e-4))
 
 
+@pytest.mark.parametrize("key", sorted(forward_kernel._FORWARD_CONFIGS_BF16))
+def test_bf16_stream_configs(key):
+    """Every BF16-stream table entry is valid, selected for its shape, and matches FP64."""
+    hidden, readers, updates, quantized = key
+    cfg = forward_kernel._FORWARD_CONFIGS_BF16[key]
+    assert cfg.LOADS_FIRST and cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
+    assert not cfg.PAIRED_REDUCE or readers == 2
+    choose = forward_kernel.choose_forward_config
+    options = dict(mxfp8=quantized, updates=updates, bf16_residual=True)
+    assert choose(2048, hidden, 3, readers, **options) is cfg
+    assert choose(512, hidden, 3, readers, inference=True, **options) is cfg
+    assert choose(1024, hidden, 3, readers, **options) is not cfg  # short training rows
+    assert choose(2048, hidden, 3, readers, mxfp8=quantized, updates=updates) is not cfg
+    if not torch.cuda.is_available():
+        return
+    bf16 = torch.bfloat16
+    raw = inputs(3, readers, hidden, 2048, updates=updates, residual_dtype=bf16, logit_dtype=bf16)
+    with torch.no_grad():
+        current, _, outputs = fwd(raw, mxfp8_handoff=quantized)
+        expected = reference(raw, 3)
+    torch.testing.assert_close(current, expected[0], rtol=1 / 128, atol=1e-6)
+    for index, (a, b) in enumerate(zip(outputs, expected[1:])):
+        if type(a) is torch.Tensor:
+            torch.testing.assert_close(a, b, rtol=1 / 128, atol=1 / 128)
+        else:
+            relative = (a.dequantize().float() - b.float()).norm() / b.float().norm()
+            assert relative < 0.04
+
+
 CONTRIBUTION_CASES = [
     (s, n, h, t, native)
     for s, n, h in (
