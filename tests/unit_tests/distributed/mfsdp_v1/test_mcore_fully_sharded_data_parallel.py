@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import gc
 import random
@@ -1076,10 +1076,11 @@ class TestMegatronFSDPE2E:
         from megatron.training import pretrain
         from megatron.training.argument_utils import (
             gpt_config_from_args,
+            gpt_data_config_from_args,
             pretrain_cfg_container_from_args,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
-        from megatron.training.global_vars import set_global_variables, unset_global_variables
+        from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 
         # Because we are using pretrain() to test, destroy the entire global state
         # before calling pretrain() for the next test case.
@@ -1180,9 +1181,13 @@ class TestMegatronFSDPE2E:
             args.rank = int(os.getenv("RANK", "0"))
             args.world_size = int(os.getenv("WORLD_SIZE", "1"))
             validate_args(args)
-            set_global_variables(args)
+            set_args(args)
             model_cfg = gpt_config_from_args(args)
-            cfg = pretrain_cfg_container_from_args(args, model_cfg)
+            # The data section, as pretrain_gpt.py's main builds it: the GPT provider builds from it.
+            cfg = pretrain_cfg_container_from_args(
+                args, model_cfg, data_cfg=gpt_data_config_from_args(args)
+            )
+            set_run_config(cfg)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider
@@ -1363,7 +1368,7 @@ class TestFsdpNonUnitBucketPreservation:
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
         # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
-        # matches the production default in mcore_fsdp_adapter.py.
+        # matches the production default in mcore_adapter_v1.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(

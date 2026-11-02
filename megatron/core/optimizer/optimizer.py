@@ -146,7 +146,129 @@ param_group_identifier_keys = (
     'lr_mult',
     'is_expert_parallel',
     'is_decoupled_lr',
+    # DSA: indexer groups must not collide with non-indexer groups on load.
+    'is_dsa_indexer',
 )
+
+
+def get_param_group_identifier_value(param_group: Dict, key: str):
+    """Return a parameter-group identifier value with backward-compatible defaults."""
+    if key in param_group:
+        return param_group[key]
+    pre_key = f"pre_{key}"
+    if pre_key in param_group:
+        return param_group[pre_key]
+    if key == 'is_dsa_indexer':
+        # Pre-DSA checkpoints lack the key; False keeps them matching non-indexer groups.
+        return False
+    # Upstream treats missing and explicit None as equivalent when matching groups.
+    return None
+
+
+def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
+    """Return the tuple used to match optimizer parameter groups across checkpoints."""
+    return tuple(
+        get_param_group_identifier_value(param_group, key) for key in param_group_identifier_keys
+    )
+
+
+_IS_DSA_INDEXER_INDEX = param_group_identifier_keys.index('is_dsa_indexer')
+
+_PRE_SPLIT_CHECKPOINT_HINT = (
+    "\n\nThis looks like a checkpoint written before the DSA indexer was given its own "
+    "parameter group: it has one group where there are now two, so the indexer group "
+    "matches nothing. The distributed optimizer loads these by letting both of today's "
+    "groups inherit the single saved one; this optimizer cannot, because it also takes the "
+    "saved group's parameter *ordering*, and the saved ordering interleaves indexer and "
+    "backbone parameters that are now partitioned. Load with --use-distributed-optimizer, "
+    "or start from fresh optimizer state."
+)
+
+
+def _is_dsa_indexer_identifier(identifier: tuple) -> bool:
+    """Whether this identifier names the indexer half of the DSA parameter-group split."""
+    return bool(identifier[_IS_DSA_INDEXER_INDEX])
+
+
+def _missing_param_group_message(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> str:
+    """The 'no such group' error, listing what the checkpoint did contain."""
+    available_keys = '\n'.join(str(k) for k in saved_groups.keys())
+    return (
+        f"Could not find parameter group with key {identifier} in loaded checkpoint.\n"
+        f"Available keys:\n{available_keys}\n"
+        f"Parameter group key definition: {param_group_identifier_keys}"
+    )
+
+
+PRE_SPLIT_PARAM_INDEX_ATTR = 'pre_split_param_index'
+
+
+def _expand_pre_split_param_groups(
+    current_groups: List[Dict], needed_groups: List[tuple], saved_groups: Dict[tuple, Dict]
+) -> List[Dict]:
+    """Rebuild the one saved group into the several the optimizer now has.
+
+    A checkpoint written before the indexer split numbered its parameters over a grouping
+    that no longer exists, and torch matches saved state to live parameters by flattened
+    position. Handing each of today's groups the saved numbers of *its own* parameters makes
+    those positions agree again, so every parameter is given back its own state.
+
+    The numbers are read off the parameters, where ``_tag_pre_split_param_index`` put them
+    when the groups were built -- see there for why they cannot be derived at this point.
+    """
+    final_groups = []
+    for group, identifier in zip(current_groups, needed_groups):
+        source = find_saved_param_group(identifier, saved_groups)
+        if source is None:
+            message = _missing_param_group_message(identifier, saved_groups)
+            if _is_dsa_indexer_identifier(identifier):
+                message += _PRE_SPLIT_CHECKPOINT_HINT
+            raise ValueError(message)
+
+        indices = [getattr(p, PRE_SPLIT_PARAM_INDEX_ATTR, None) for p in group['params']]
+        if any(index is None for index in indices):
+            raise ValueError(
+                _missing_param_group_message(identifier, saved_groups)
+                + "\n\nThis checkpoint has fewer parameter groups than the optimizer, which "
+                "needs each parameter's index under the earlier grouping to pair the saved "
+                "state back up. These parameters were not tagged with one, so the checkpoint "
+                "cannot be matched; start from fresh optimizer state."
+            )
+        final_groups.append({**source, 'params': indices})
+
+    assigned = [index for group in final_groups for index in group['params']]
+    if sorted(assigned) != list(range(len(assigned))):
+        raise ValueError(
+            f"Pre-split parameter indices do not form a contiguous numbering "
+            f"(got {len(set(assigned))} distinct of {len(assigned)}); they do not describe "
+            "a single earlier grouping and would pair the saved state up wrongly."
+        )
+    return final_groups
+
+
+def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> Optional[Dict]:
+    """Find the saved group for ``identifier``, falling back across the DSA indexer split.
+
+    A checkpoint written before the indexer had its own parameter group holds one group where
+    there are now two. Both of today's groups were carved out of that one and had identical
+    settings by construction, so either may inherit it -- including ``step``, which the
+    distributed optimizer asserts is uniform and which a group matched to nothing would
+    otherwise restart from zero.
+
+    Returns None when there is no match even after the fallback, leaving the caller to raise;
+    the parameters themselves are never taken from here, only the group's settings.
+    """
+    group = saved_groups.get(identifier)
+    if group is not None:
+        return group
+    if _is_dsa_indexer_identifier(identifier):
+        pre_split = (
+            identifier[:_IS_DSA_INDEXER_INDEX] + (False,) + identifier[_IS_DSA_INDEXER_INDEX + 1 :]
+        )
+        return saved_groups.get(pre_split)
+    return None
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -212,6 +334,7 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self._last_dsa_split_grad_norms = None
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -223,6 +346,20 @@ class MegatronOptimizer(ABC):
                 for param in param_group['params']:
                     params.append(param)
         return params
+
+    def get_dsa_split_parameters(self) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+        """Get optimizer-owned parameters split into DSA indexer and non-indexer buckets."""
+        indexer_params = []
+        non_indexer_params = []
+        if hasattr(self.optimizer, 'param_groups'):
+            for param_group in self.optimizer.param_groups:
+                target_params = (
+                    indexer_params
+                    if param_group.get('is_dsa_indexer', False)
+                    else non_indexer_params
+                )
+                target_params.extend(param_group['params'])
+        return indexer_params, non_indexer_params
 
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage optimizer-owned model params before an explicit DDP param sync."""
@@ -272,6 +409,7 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to tensor model parallelism.
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
+
         grads_for_norm = []
         for param in params:
             if param_filter is not None and not param_filter(param):
@@ -351,6 +489,25 @@ class MegatronOptimizer(ABC):
             )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
+        """Compute pre-clip grad norms for DSA indexer and non-indexer buckets."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        indexer_grads = self._filter_grads_for_norm(indexer_params)
+        non_indexer_grads = self._filter_grads_for_norm(non_indexer_params)
+        grad_stats_parallel_group = self.get_grad_stats_parallel_group()
+        indexer_grad_norm = get_grad_norm_fp32(
+            indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+        )
+        non_indexer_grad_norm = get_grad_norm_fp32(
+            non_indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+        )
+        return indexer_grad_norm, non_indexer_grad_norm
+
+    def get_last_dsa_split_grad_norms(self) -> Optional[Tuple[float, float]]:
+        """Return the last pre-clip DSA split grad norms, if separate clipping computed them."""
+        return self._last_dsa_split_grad_norms
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -458,6 +615,42 @@ class MegatronOptimizer(ABC):
                     use_decoupled_grad=self._uses_decoupled_grad(grouped_params),
                 )
         return grad_norm
+
+    def _maybe_store_dsa_split_grad_norms(self) -> None:
+        """Store pre-clip split grad norms for consistent logging when DSA groups exist."""
+        if not hasattr(self.optimizer, 'param_groups'):
+            return
+        if any(
+            param_group.get('is_dsa_indexer', False) for param_group in self.optimizer.param_groups
+        ):
+            self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
+
+    def clip_grad_norm_separate_dsa_indexer(self, clip_grad: float) -> float:
+        """Clip non-indexer and DSA indexer gradients with independent norms."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
+        self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
+
+        indexer_clip_grad = self.config.dsa_indexer_clip_grad
+
+        # Per group: _uses_decoupled_grad reads param_list[0], so the answer belongs to the
+        # parameters rather than to the config alone.
+        if non_indexer_params and clip_grad > 0.0:
+            clip_grad_by_total_norm_fp32(
+                non_indexer_params,
+                clip_grad,
+                non_indexer_grad_norm,
+                self._uses_decoupled_grad(non_indexer_params),
+            )
+        if indexer_params and indexer_clip_grad > 0.0:
+            clip_grad_by_total_norm_fp32(
+                indexer_params,
+                indexer_clip_grad,
+                indexer_grad_norm,
+                self._uses_decoupled_grad(indexer_params),
+            )
+
+        return math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
@@ -650,8 +843,14 @@ class MegatronOptimizer(ABC):
                 elif f"pre_{key}" in group:
                     out.append(group[f"pre_{key}"])
                 else:
-                    # Treat missing and explicit None identifier values as equivalent.
-                    out.append(None)
+                    # Defer to the shared accessor, which the distributed optimizer also uses,
+                    # so the two paths cannot disagree about what a key absent from the
+                    # checkpoint means. It still treats a missing value as None in general --
+                    # but ``is_dsa_indexer`` reads as False, matching the group that has it
+                    # False. Returning None here instead meant every checkpoint written before
+                    # that key existed stopped matching on this path, including checkpoints of
+                    # models with no indexer at all, while matching fine on the other.
+                    out.append(get_param_group_identifier_value(group, key))
             return tuple(out)
 
         needed_groups = [_identifier_for(g) for g in current_groups]
@@ -664,16 +863,31 @@ class MegatronOptimizer(ABC):
         # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
+        # A pre-split checkpoint is missing one specific thing: the indexer group. Both of
+        # today's groups were carved out of a single group written before ``is_dsa_indexer``
+        # existed, so that saved group reads as False for the key and the indexer half of the
+        # split matches nothing. Ask for that group rather than comparing group counts: a
+        # count says only that something is absent, not what, and would send an unrelated
+        # mismatch down the reconstruction path.
+        if any(
+            _is_dsa_indexer_identifier(key) and key not in loaded_groups_map
+            for key in needed_groups
+        ):
+            return _expand_pre_split_param_groups(current_groups, needed_groups, loaded_groups_map)
+
+        # Every current group has to be in the checkpoint, and that is checked here rather
+        # than inside the loop below because the loop zips against the saved groups: a group
+        # missing from the checkpoint but positioned after the ones it does have would never
+        # be visited, and the short result would be rejected by torch several frames away
+        # with "loaded state dict has a different number of parameter groups" and no clue as
+        # to which group or why. A checkpoint with MORE groups is fine and intended -- the
+        # loop filters down to the ones the current optimizer has.
+        for key in needed_groups:
+            if key not in loaded_groups_map:
+                raise ValueError(_missing_param_group_message(key, loaded_groups_map))
+
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
-            if key not in loaded_groups_map:
-                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
-                raise ValueError(
-                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
-                    f"Available keys:\n{available_keys}\n"
-                    f"Parameter group key definition: {param_group_identifier_keys}"
-                )
-
             # Update group's parameters to preserve state dict ordering
             group = loaded_groups_map[key]
             group['params'] = params
@@ -864,7 +1078,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
-        if self.config.clip_grad > 0.0:
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
+        elif self.config.clip_grad > 0.0:
+            self._maybe_store_dsa_split_grad_norms()
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
@@ -1271,7 +1490,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        if step:
+        if step is not None:
             state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
@@ -1309,11 +1528,69 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
+        for group_index, (current_group, saved_group) in enumerate(
+            zip(self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key])
         ):
-            for current_param, saved_param in zip(current_group, saved_group):
-                current_param.data.copy_(saved_param.data)
+            if len(saved_group) == len(current_group):
+                for current_param, saved_param in zip(current_group, saved_group):
+                    current_param.data.copy_(saved_param.data)
+            else:
+                self._load_main_params_saved_before_fp32_marking(group_index, saved_group)
+
+    def _load_main_params_saved_before_fp32_marking(self, group_index, saved_group):
+        """Restore main params saved while some of today's native FP32 params were float16.
+
+        Checkpoints store one main param per float16 param of a group, in group order.
+        When a parameter is later kept in FP32 (see ``mark_keep_in_fp32``), its saved main
+        param is still in that list, so positional matching would shift every later entry
+        onto the wrong parameter. This walks the group in order and assigns each surplus
+        saved main param to the native FP32 parameter it was saved for. That parameter was
+        just loaded from the float16 model weights, so it must match the saved main param
+        in shape and after rounding to the float16 dtype.
+        """
+        float16_dtype = torch.float16 if self.config.fp16 else torch.bfloat16
+        main_param_ids = {id(param) for param in self.fp32_from_float16_groups[group_index]}
+        # Main params are detached copies that never require grad, so keep them by identity.
+        trainable_params = [
+            param
+            for param in self.optimizer.param_groups[group_index]['params']
+            if id(param) in main_param_ids or param.requires_grad
+        ]
+        surplus = len(saved_group) - sum(id(param) in main_param_ids for param in trainable_params)
+        saved_index = 0
+        for param in trainable_params:
+            if saved_index == len(saved_group):
+                break
+            saved_param = saved_group[saved_index]
+            if id(param) in main_param_ids:
+                if saved_param.shape != param.shape:
+                    break
+                param.data.copy_(saved_param.data)
+                saved_index += 1
+            elif (
+                surplus > 0
+                and saved_param.shape == param.shape
+                and torch.equal(
+                    saved_param.data.to(device=param.device, dtype=float16_dtype),
+                    param.data.to(float16_dtype),
+                )
+            ):
+                param.data.copy_(saved_param.data)
+                saved_index += 1
+                surplus -= 1
+        if saved_index != len(saved_group) or surplus != 0:
+            raise RuntimeError(
+                f'Cannot match the {len(saved_group)} saved main params of optimizer param '
+                f'group {group_index} to its {len(self.fp32_from_float16_groups[group_index])} '
+                'float16 params. The checkpoint was saved with different parameter dtypes; '
+                'load it without optimizer state or with a sharded checkpoint format.'
+            )
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'Optimizer param group {group_index}: restored {len(saved_group)} main params '
+            'saved before some float16 params were kept in FP32.',
+        )
 
 
 class FP32Optimizer(MegatronOptimizer):
@@ -1403,7 +1680,12 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
-        if self.config.clip_grad > 0.0:
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
+        elif self.config.clip_grad > 0.0:
+            self._maybe_store_dsa_split_grad_norms()
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
@@ -1460,7 +1742,7 @@ class FP32Optimizer(MegatronOptimizer):
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        if step:
+        if step is not None:
             state_dict['state']['common_step'] = step
         return state_dict
 
@@ -1533,6 +1815,7 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+        self._last_dsa_split_grad_norms = None
 
     @property
     def optimizer(self):
@@ -1559,6 +1842,17 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             params.extend(optimizer.get_parameters())
         return params
+
+    @override
+    def get_dsa_split_parameters(self) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+        """Get optimizer-owned parameters split into DSA indexer and non-indexer buckets."""
+        indexer_params = []
+        non_indexer_params = []
+        for optimizer in self.chained_optimizers:
+            child_indexer_params, child_non_indexer_params = optimizer.get_dsa_split_parameters()
+            indexer_params.extend(child_indexer_params)
+            non_indexer_params.extend(child_non_indexer_params)
+        return indexer_params, non_indexer_params
 
     @property
     def state(self) -> ProxyDict:
@@ -1890,6 +2184,37 @@ class ChainedOptimizer(MegatronOptimizer):
             grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
         return grad_norm
 
+    @override
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
+        if len(self.chained_optimizers) == 1:
+            return self.chained_optimizers[0].get_dsa_split_grad_norms()
+        if self.grads_states_parallel_group_is_shared():
+            indexer_grads = []
+            non_indexer_grads = []
+            for optimizer in self.chained_optimizers:
+                child_indexer_params, child_non_indexer_params = (
+                    optimizer.get_dsa_split_parameters()
+                )
+                indexer_grads += optimizer._filter_grads_for_norm(child_indexer_params)
+                non_indexer_grads += optimizer._filter_grads_for_norm(child_non_indexer_params)
+            indexer_grad_norm = get_grad_norm_fp32(
+                indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+            non_indexer_grad_norm = get_grad_norm_fp32(
+                non_indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+        else:
+            indexer_norm_sq = 0.0
+            non_indexer_norm_sq = 0.0
+            for optimizer in self.chained_optimizers:
+                child_indexer_norm, child_non_indexer_norm = optimizer.get_dsa_split_grad_norms()
+                indexer_norm_sq += child_indexer_norm**2
+                non_indexer_norm_sq += child_non_indexer_norm**2
+            indexer_grad_norm = math.sqrt(indexer_norm_sq)
+            non_indexer_grad_norm = math.sqrt(non_indexer_norm_sq)
+        return indexer_grad_norm, non_indexer_grad_norm
+
     @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
@@ -1980,7 +2305,15 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        grad_norm = self.get_grad_norm()
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
+            self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
+            grad_norm = math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
+        else:
+            if any(param_group.get('is_dsa_indexer', False) for param_group in self.param_groups):
+                self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
+            grad_norm = self.get_grad_norm()
         should_skip_update = False
 
         should_clip = any(
@@ -2008,7 +2341,24 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 or use_fsdp_decoupled_grad
             )
-
+            if optimizer.config.dsa_indexer_clip_grad is not None:
+                indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
+                indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
+                if non_indexer_params and optimizer.config.clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        non_indexer_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=non_indexer_grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+                if indexer_params and indexer_clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        indexer_params,
+                        max_norm=indexer_clip_grad,
+                        total_norm=indexer_grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+                continue
             main_params = []
             params_by_grad_norm_group = {}
             for p in parameters:

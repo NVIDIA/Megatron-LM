@@ -17,6 +17,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -96,19 +97,28 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_fwd_use_dense_attn": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
+    "dsa_indexer_kpool": 1,
+    "dsa_indexer_kpool_use_quantization": False,
+    "dsa_indexer_kpool_always_select_tail": True,
     "dsa_indexer_loss_coeff": None,
+    "dsa_indexer_mode": "standard",
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_qk_proj_use_quantization": True,
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
     "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_weights_proj_output_dtype": "bf16",
     "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
+    "dsa_reset_indexer_on_load": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
@@ -149,6 +159,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
+    "gdn_kernel_backend": "fla",
     "gdp_cutedsl_kernel": False,
     "gdp_num_chunk_states_to_recompute": 2,
     "gdp_num_householder": 3,
@@ -185,6 +196,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_num_value_heads": 32,
     "gdn_pre_gated_delta_rule_fusion": False,
     "gdn_gated_output_norm_fusion": False,
+    "gdn_conv_pad_alignment": None,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
@@ -196,6 +208,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
+    "mhc_keep_mappings_in_fp32": False,
+    "mhc_learned_output_contract": True,
+    "mhc_norm_eps_inside_sqrt": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
@@ -224,6 +239,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_num_hash_layers": 0,
     "moe_ncclep_zero_copy": False,
     "moe_pad_expert_input_to_capacity": False,
@@ -247,7 +264,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_qb_num_bins": 1000,
     "moe_router_quantile_balancing_ema": 0.0,
+    "moe_router_quantile_balancing_estimation_scope": "micro_batch",
     "moe_router_score_function": "sigmoid",
     "moe_router_skip_muon": True,
     "moe_router_topk": 6,
@@ -264,6 +283,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
     "moe_token_dropping": False,
+    "moe_virtual_expert_load_balance": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
     "mrope_section": None,
@@ -276,6 +296,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_detach_heads": False,
     "mtp_hsm": False,
     "mtp_hybrid_override_pattern": None,
+    "mtp_loss_early_backward": False,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
@@ -325,6 +346,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "tensor_parallel_num_weight_shards": 2,
+    "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
     "timers": None,
     "tp_comm_atomic_ag": False,
@@ -352,7 +374,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_mup": False,
     "use_ring_exchange_p2p": False,
     "use_te_activation_func": False,
-    "use_te_rng_tracker": False,
+    # RNGConfig now propagates the fixture's te_rng_tracker=True; the old
+    # args adapter missed this differently named field and left it False.
+    "use_te_rng_tracker": True,
     "variable_seq_lengths": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
@@ -366,8 +390,12 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
+    "fine_grained_offloading_buffer_size_gib": 0.0,
     "hybrid_context_parallel": False,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
+    "max_seq_length_per_sample": 1024,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
@@ -378,7 +406,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
     "inference_flashinfer_mxfp8_token_capacity": None,
+    "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
+    "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
@@ -392,7 +422,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = set()
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:
@@ -579,7 +609,7 @@ class TestHybridMoEModel:
         args.vocab_size = 131072
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def setup_method(self, method):

@@ -93,6 +93,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     fp32_param.grad = grad.to(fp32_param.dtype)
                     fp32_param.requires_grad = True
                 else:
+                    fp32_param.grad = None
                     fp32_param.requires_grad = False
 
         # Sync the grads from GPU to CPU.
@@ -101,6 +102,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
                 if grad is None:
+                    param.grad = None
                     param.requires_grad = False
                     continue
 
@@ -109,8 +111,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
                     )
-                    param.grad = self.cpu_copy_map_grad[param]
 
+                param.grad = self.cpu_copy_map_grad[param]
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
@@ -378,12 +380,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if fp32_param is not None:
                 fp32_param.data.copy_(v["master_param"])
 
+    @torch.no_grad()
     def update_fp32_param_by_new_param(self):
         """
-        Update the fp32 parameters by the new parameters.
+        Refresh optimizer copies after loading new model parameters.
+
+        Already-FP32 parameters can also have a separate CPU copy, even though
+        they are absent from param_to_fp32_param. Leaving that copy stale would
+        overwrite the loaded model parameter on the first optimizer step.
         """
-        for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is not param:
+                inner_param.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
