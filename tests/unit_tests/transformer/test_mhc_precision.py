@@ -10,18 +10,36 @@ HF's normalize-before-projection order (mhc_normalize_before_projection), an
 intentional deviation from PR 7521's default order.
 """
 
+import json
 import os
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    _get_precision_preserving_h_post_bda,
     native_h_aggregate,
     native_h_aggregate_into,
+    native_h_post_bda,
+    native_sinkhorn,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.models.glm53_native_reference import (
+    MHC_GROUPS,
+    MHC_RECONSTRUCTION_RTOL,
+    mhc_contributions,
+)
+from tests.unit_tests.transformer.mhc_fused_op_spy import spy_fused_mhc_ops
+
+# The fixed-launch Triton Sinkhorn needs both. The CPU test environment can have Triton without
+# CUDA, where a Triton-only mark would let these cases error instead of skipping.
+_NEEDS_CUDA_TRITON = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason="needs CUDA and Triton"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,11 +62,29 @@ def _assert_similarity(actual, expected, name, eps=1e-3):
     assert similarity > 1 - eps, f"{name}: tensor_similarity={similarity}"
 
 
-def _official_mhc(hidden, parameters, num_streams, iterations, eps):
-    """Torch-only translation preserving the pinned HF operation ordering."""
+def _similarity_values(actual, expected):
+    """_assert_similarity's (cosine, tensor similarity) without its asserts; (1.0, 1.0) for two
+    zero tensors, which _assert_similarity accepts."""
+    actual, expected = actual.flatten().double(), expected.flatten().double()
+    denominator = (actual.square() + expected.square()).sum()
+    if denominator == 0:
+        return 1.0, 1.0
+    cosine = F.cosine_similarity(actual.unsqueeze(0), expected.unsqueeze(0)).item()
+    similarity = (2 * (actual * expected).sum() / denominator).item()
+    return cosine, similarity
+
+
+def _official_mhc(hidden, parameters, num_streams, iterations, eps, capture=None):
+    """Torch-only translation preserving the pinned HF operation ordering.
+
+    With ``capture``, the mapping logits are stored there as "logits", their gradient retained.
+    """
     flat = hidden.float()
     normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
     logits = F.linear(normalized, parameters["mapping_proj.weight"])
+    if capture is not None:
+        logits.retain_grad()
+        capture["logits"] = logits
     pre_logits, post_logits, residual_logits = logits.split(
         (num_streams, num_streams, num_streams**2), dim=-1
     )
@@ -66,6 +102,82 @@ def _official_mhc(hidden, parameters, num_streams, iterations, eps):
     streams = hidden.unflatten(-1, (num_streams, -1))
     aggregated = (streams * pre.unsqueeze(-1)).sum(-2).to(hidden.dtype)
     return aggregated, post, mixing
+
+
+def _skip_unless_glm_pair_device():
+    """Skip unless the current device's capability is one the GLM projection pair accepts; read
+    after the rank's own device is bound, never at collection."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in glm.GLM_PAIR_DEVICE_CAPABILITIES:
+        pytest.skip(
+            f"the GLM projection pair is validated on {glm.GLM_PAIR_DEVICE_CAPABILITIES} only"
+        )
+
+
+def _alpha_link_readings(actual, reference):
+    """Read each alpha link (pre, post, res) as its scalar gradient and through its contributions.
+
+    ``actual`` and ``reference`` are each (projection, its gradient, parameters by name): the
+    projection is what the alphas scale (the module's ``_compute_h`` input, the official logits),
+    and the parameters' alpha_pre, alpha_post and alpha_res hold their gradients. A contribution
+    is dL/dproj / alpha * proj for one token and column of the group, in float64, so each alpha
+    gradient is the sum of its group's contributions, a sum that can cancel heavily.
+    """
+    contributions, gradients = {}, {}
+    for side, (projection, gradient, parameters) in (("actual", actual), ("reference", reference)):
+        alphas = [parameters[f"alpha_{group}"] for group, _ in MHC_GROUPS]
+        contributions[side] = mhc_contributions(
+            gradient, projection, [float(alpha.detach()) for alpha in alphas]
+        )
+        gradients[side] = [alpha.grad.detach().double().reshape(()) for alpha in alphas]
+    readings = {}
+    for index, (group, _) in enumerate(MHC_GROUPS):
+        reading = {}
+        for side in ("actual", "reference"):
+            parts, scalar = contributions[side][group], gradients[side][index]
+            reading[f"{side}_contributions"] = parts
+            reading[f"{side}_alpha_grad"] = scalar.item()
+            reading[f"{side}_reconstruction_residual"] = (scalar - parts.sum()).abs().item()
+        reading["scalar_cosine"], reading["scalar_similarity"] = _similarity_values(
+            gradients["actual"][index], gradients["reference"][index]
+        )
+        reading["contribution_cosine"], reading["contribution_similarity"] = _similarity_values(
+            reading["actual_contributions"], reading["reference_contributions"]
+        )
+        reference_sum = reading["reference_contributions"].sum().item()
+        reference_abs_sum = reading["reference_contributions"].abs().sum().item()
+        reading["kappa"] = reference_abs_sum / abs(reference_sum) if reference_sum else float("inf")
+        readings[group] = reading
+    return readings
+
+
+def _assert_alpha_links(readings, eps=1e-3):
+    """Apply the alpha links' rule to _alpha_link_readings' readings; mark how each was read.
+
+    Each side's alpha gradient must be the sum of its contributions, within
+    MHC_RECONSTRUCTION_RTOL of their absolute sum. A link passes _assert_similarity's bars on its
+    scalar; only a scalar that fails them is read by its decomposition, whose contribution
+    tensors must then pass the same bars. No bar is loosened.
+    """
+    for group, reading in readings.items():
+        link = f"alpha_{group}"
+        for side in ("actual", "reference"):
+            residual = reading[f"{side}_reconstruction_residual"]
+            abs_sum = reading[f"{side}_contributions"].abs().sum().item()
+            assert residual <= MHC_RECONSTRUCTION_RTOL * abs_sum, (
+                f"{link} {side}: the gradient {reading[f'{side}_alpha_grad']} is not the sum of "
+                f"its contributions (residual {residual}, absolute sum {abs_sum})"
+            )
+        cosine, similarity = reading["scalar_cosine"], reading["scalar_similarity"]
+        reading["read_by_decomposition"] = not (cosine > 1 - eps and similarity > 1 - eps)
+        if reading["read_by_decomposition"]:
+            parts_cosine = reading["contribution_cosine"]
+            parts_similarity = reading["contribution_similarity"]
+            assert parts_cosine > 1 - eps and parts_similarity > 1 - eps, (
+                f"{link}: the gradient fails the bars (cosine={cosine}, "
+                f"tensor_similarity={similarity}) and so do its contributions "
+                f"(cosine={parts_cosine}, tensor_similarity={parts_similarity})"
+            )
 
 
 @pytest.mark.parametrize("fp32_mixing", [False, True])
@@ -132,11 +244,35 @@ def test_mhc_precision(fp32_mixing, input_scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
+@pytest.mark.parametrize("preserve_rounding", [False, True], ids=["nopreserve", "preserve"])
 @pytest.mark.parametrize("input_scale", [1.0, 1e-3])
 @pytest.mark.parametrize("fp32_mappings", [False, True])
-def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
-    """Keep the production 4096-wide hidden state and four residual streams."""
+@pytest.mark.parametrize(
+    "fused_ops",
+    [
+        None,
+        pytest.param(["sinkhorn"], marks=_NEEDS_CUDA_TRITON),
+        pytest.param(["proj_rms"], marks=_NEEDS_CUDA_TRITON),
+        pytest.param(["proj_rms", "sinkhorn"], marks=_NEEDS_CUDA_TRITON),
+    ],
+    ids=["unfused", "sinkhorn", "proj_rms", "proj_rms_sinkhorn"],
+)
+def test_glm_mhc_official_forward_and_all_gradients(
+    monkeypatch, input_scale, fp32_mappings, fused_ops, preserve_rounding
+):
+    """Keep the production 4096-wide hidden state and four residual streams.
+
+    With ``fused_ops``, per-op mode binds those operations under the explicit ``triton`` policy,
+    so construction fails rather than testing the unfused path when Triton is missing. The
+    shape-[1] alpha links are read by _assert_alpha_links.
+    """
+    ops = fused_ops or []
+    if "proj_rms" in ops:
+        _skip_unless_glm_pair_device()
     torch.manual_seed(42)
+    fused = {}
+    if fused_ops is not None:
+        fused = dict(use_fused_mhc=True, mhc_fused_ops=fused_ops, mhc_fused_backend="triton")
     config = TransformerConfig(
         num_layers=1,
         hidden_size=4096,
@@ -149,8 +285,24 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
         mhc_keep_mappings_in_fp32=fp32_mappings,
         mhc_keep_pre_in_fp32=True,
         mhc_learned_output_contract=False,
+        mhc_preserve_activation_dtype_rounding=preserve_rounding,
+        **fused,
     )
     module = HyperConnectionModule(config, layer_number=1).cuda()
+    # Per-op mode rebinds only the listed operations; the post follows the rounding flag.
+    assert module._h_post_bda_op is (
+        _get_precision_preserving_h_post_bda() if preserve_rounding else native_h_post_bda
+    )
+    assert module._glm_proj_rms_op is (glm.glm_proj_rms_op("rn") if "proj_rms" in ops else None)
+    assert module._sinkhorn_op is (
+        glm.fixed_launch_sinkhorn if "sinkhorn" in ops else native_sinkhorn
+    )
+    assert module._fused_op_labels == {
+        "proj_rms": "glm-triton(tf32=rn)" if "proj_rms" in ops else "native",
+        "sinkhorn": "triton(num_warps=1)" if "sinkhorn" in ops else "native",
+        "h_aggregate": "native",
+        "h_post_bda": "native(emulate-casts)" if preserve_rounding else "native(compiled)",
+    }
     with torch.no_grad():
         module.mapping_proj.weight.normal_(std=0.05)
         module.bias.normal_(std=0.1)
@@ -172,17 +324,65 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
     actual_branch = branch.clone().requires_grad_()
     reference_branch = branch.clone().requires_grad_()
 
-    pre, post, mixing = module.compute_mappings(actual_input)
-    mapping_dtype = torch.float32 if fp32_mappings else hidden.dtype
-    assert pre.dtype == torch.float32
-    assert post.dtype == mixing.dtype == mapping_dtype
-    aggregated = module.aggregate(actual_input, pre)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        actual = module.fused_h_res_h_post_bda(
-            mixing, actual_input, post, (actual_branch, None), 0.0, True, False
-        )
+    # The spy counts forward calls only, so the Triton Sinkhorn's backward is counted here.
+    sinkhorn_backward_calls = []
+    sinkhorn_bwd = glm._sinkhorn_bwd
+
+    def counted_sinkhorn_bwd(*args, **kwargs):
+        sinkhorn_backward_calls.append(None)
+        return sinkhorn_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(glm, "_sinkhorn_bwd", counted_sinkhorn_bwd)
+    # The GLM projection pair's launches, through the module globals its Function calls.
+    pair_launches = {"fwd": 0, "bwd": 0}
+
+    def counted_pair(direction, launch):
+        def counted(*args, **kwargs):
+            pair_launches[direction] += 1
+            return launch(*args, **kwargs)
+
+        return counted
+
+    monkeypatch.setattr(glm, "_glm_proj_fwd", counted_pair("fwd", glm._glm_proj_fwd))
+    monkeypatch.setattr(glm, "_glm_proj_bwd", counted_pair("bwd", glm._glm_proj_bwd))
+    # The projection the alphas scale (the _compute_h input) and its gradient, for the
+    # alpha links' contributions.
+    captured = {}
+    projection_and_get_norm = HyperConnectionModule._projection_and_get_norm
+
+    def capturing_projection_and_get_norm(self, x):
+        proj, r = projection_and_get_norm(self, x)
+        assert not captured, "one projection per forward"
+        captured.update(proj=proj.detach().clone(), grad=None)
+
+        def keep(gradient):
+            assert captured["grad"] is None
+            captured["grad"] = gradient.detach().clone()
+
+        proj.register_hook(keep)
+        return proj, r
+
+    monkeypatch.setattr(
+        HyperConnectionModule, "_projection_and_get_norm", capturing_projection_and_get_norm
+    )
+    with spy_fused_mhc_ops(module) as spy:
+        pre, post, mixing = module.compute_mappings(actual_input)
+        mapping_dtype = torch.float32 if fp32_mappings else hidden.dtype
+        assert pre.dtype == torch.float32
+        assert post.dtype == mixing.dtype == mapping_dtype
+        aggregated = module.aggregate(actual_input, pre)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = module.fused_h_res_h_post_bda(
+                mixing, actual_input, post, (actual_branch, None), 0.0, True, False
+            )
+    reference_capture = {}
     expected_aggregate, expected_post, expected_mixing = _official_mhc(
-        reference_input, reference_parameters, 4, config.mhc_sinkhorn_iterations, 1e-5
+        reference_input,
+        reference_parameters,
+        4,
+        config.mhc_sinkhorn_iterations,
+        1e-5,
+        capture=reference_capture,
     )
     # The official decoder casts post and comb, but not pre, before mixing.
     # The all-FP32 profile is separately supported for actor/serving recipes.
@@ -198,6 +398,7 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
         .to(hidden.dtype)
     )
     assert aggregated.dtype == actual.dtype == hidden.dtype
+    similarities = {}
     for name, observed, reference in (
         ("aggregate", aggregated, expected_aggregate),
         ("post", post, expected_post),
@@ -205,6 +406,7 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
         ("output", actual, expected),
     ):
         _assert_similarity(observed, reference, name)
+        similarities[name] = _similarity_values(observed, reference)
 
     aggregate_grad = torch.randn_like(aggregated)
     output_grad = torch.randn_like(actual)
@@ -212,10 +414,70 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
     (
         (expected_aggregate * aggregate_grad).float().sum() + (expected * output_grad).float().sum()
     ).backward()
-    _assert_similarity(actual_input.grad, reference_input.grad, "input gradient")
-    _assert_similarity(actual_branch.grad, reference_branch.grad, "branch gradient")
-    for name, parameter in module.named_parameters():
-        _assert_similarity(parameter.grad, reference_parameters[name].grad, name)
+    gradients = [
+        ("input gradient", actual_input.grad, reference_input.grad),
+        ("branch gradient", actual_branch.grad, reference_branch.grad),
+    ]
+    # The shape-[1] alpha links go to _assert_alpha_links below.
+    gradients += [
+        (name, parameter.grad, reference_parameters[name].grad)
+        for name, parameter in module.named_parameters()
+        if not name.startswith("alpha_")
+    ]
+    for name, observed, reference in gradients:
+        _assert_similarity(observed, reference, name)
+        similarities[name] = _similarity_values(observed, reference)
+    logits = reference_capture["logits"]
+    assert captured["grad"] is not None and logits.grad is not None
+    readings = _alpha_link_readings(
+        (captured["proj"], captured["grad"], dict(module.named_parameters())),
+        (logits, logits.grad, reference_parameters),
+    )
+    _assert_alpha_links(readings)
+    if "sinkhorn" in ops:
+        # The Triton Sinkhorn ran both ways: one forward call and one backward launch.
+        spy.assert_ran("_sinkhorn_op", glm.fixed_launch_sinkhorn)
+        assert spy.calls("_sinkhorn_op") == 1
+        assert len(sinkhorn_backward_calls) == 1
+    else:
+        assert spy.targets("_sinkhorn_op") == {native_sinkhorn} and spy.calls("_sinkhorn_op") == 1
+        assert sinkhorn_backward_calls == []
+    if "proj_rms" in ops:
+        spy.assert_ran("_glm_proj_rms_op", glm.glm_proj_rms_op("rn"))
+        assert spy.calls("_glm_proj_rms_op") == 1  # one compute_mappings
+        spy.assert_no_unsupported()  # redundant under triton, which raises on a refusal
+        assert pair_launches == {"fwd": 1, "bwd": 1}
+    else:
+        assert spy.calls("_glm_proj_rms_op") == 0 and pair_launches == {"fwd": 0, "bwd": 0}
+    print(
+        "MHC_PREC_HF "
+        + json.dumps(
+            {
+                "rank": int(os.environ.get("RANK", "0")),
+                "fused_ops": fused_ops,
+                "fp32_mappings": fp32_mappings,
+                "input_scale": input_scale,
+                "preserve_activation_dtype_rounding": preserve_rounding,
+                "matmul_mode": glm._matmul_mode(),
+                "labels": module._fused_op_labels,
+                "spy_calls": {record.attribute: record.calls for record in spy.records},
+                "refusals": spy.unsupported("_glm_proj_rms_op"),
+                "launches": dict(pair_launches, sinkhorn_bwd=len(sinkhorn_backward_calls)),
+                "similarities": similarities,
+                "alpha_links": {
+                    group: {
+                        key: value for key, value in reading.items() if not torch.is_tensor(value)
+                    }
+                    for group, reading in readings.items()
+                },
+                "read_by_decomposition": any(
+                    reading["read_by_decomposition"] for reading in readings.values()
+                ),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 @pytest.mark.parametrize("fp32_mappings", [False, True])
@@ -280,3 +542,53 @@ def test_mhc_fused_rejects_unsupported_precision(flag):
     setattr(config, flag, True)
     with pytest.raises(ValueError, match="Fused mHC does not support"):
         HyperConnectionModule(config, layer_number=1)
+
+
+def test_glm_alpha_link_rule_reads_cancellation_through_contributions():
+    """The alpha links' rule on synthetic float64 readings, on CPU: a cancelled scalar is read
+    through its contributions, which must then pass the bars, and every scalar must be the sum of
+    its contributions."""
+    alphas = (0.01, 0.02, 0.03)
+    gradient = torch.cat(
+        [
+            torch.full((columns.stop - columns.start,), alpha, dtype=torch.float64)
+            for alpha, (_, columns) in zip(alphas, MHC_GROUPS)
+        ]
+    )
+
+    def side(contributions, shifts=(0.0, 0.0, 0.0)):
+        """(proj, dL/dproj, parameters) whose contributions are ``contributions``, with alpha
+        gradients equal to their sums plus ``shifts``."""
+        parameters = {}
+        for alpha, shift, (group, columns) in zip(alphas, shifts, MHC_GROUPS):
+            parameter = torch.tensor([alpha], dtype=torch.float64, requires_grad=True)
+            parameter.grad = contributions[..., columns].sum().reshape(1) + shift
+            parameters[f"alpha_{group}"] = parameter
+        return contributions, gradient.expand_as(contributions), parameters
+
+    half = torch.rand(4, 24, dtype=torch.float64, generator=torch.Generator().manual_seed(0)) + 0.5
+    reference = torch.cat([half, -half])
+    # Every column's contributions cancel to 1e-7 of their absolute sum.
+    reference[0] += 1e-7 * reference.abs().sum(0)
+
+    # (a) Contributions equal to 1e-7 relative, whose cancelled sums differ by about 2x.
+    readings = _alpha_link_readings(
+        side(reference * (1 + 1e-7 * reference.sign())), side(reference)
+    )
+    _assert_alpha_links(readings)
+    for group, reading in readings.items():
+        assert reading["scalar_similarity"] < 1 - 1e-3, group
+        assert reading["read_by_decomposition"], group
+
+    # (b) One token's contributions negated.
+    negated = reference.clone()
+    negated[5] = -negated[5]
+    with pytest.raises(AssertionError, match="contributions") as error:
+        _assert_alpha_links(_alpha_link_readings(side(negated), side(reference)))
+    assert "is not the sum" not in str(error.value)
+
+    # (c) A scalar that is not the sum of its contributions.
+    with pytest.raises(AssertionError, match="is not the sum"):
+        _assert_alpha_links(
+            _alpha_link_readings(side(reference, shifts=(0.0, 1e-3, 0.0)), side(reference))
+        )

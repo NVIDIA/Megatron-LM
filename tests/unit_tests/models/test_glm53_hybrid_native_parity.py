@@ -34,6 +34,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_glm53_stack_spec
@@ -48,6 +50,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     _get_precision_preserving_h_post_bda,
 )
+from megatron.core.transformer.mhc_fused_ops import selects_glm_projection_pair
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -77,9 +80,64 @@ BLOCK_MHC_SITES = (
     ('layers.1.hyper_connection', 'ffn_hc'),
 )
 
+# The composites' fused arm (fused mHC M4): the Triton GLM projection pair and the fixed-launch
+# Sinkhorn under the explicit triton policy, which raises on any input the pair refuses.
+GLM_FUSED_OPS = ('proj_rms', 'sinkhorn')
+FUSED_ARM = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason='needs CUDA and Triton'
+)
+
+
+def skip_unless_glm_pair_device():
+    """Skip unless the current device's capability is one the GLM projection pair accepts; read
+    after the rank's own device is bound, never at collection."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in glm.GLM_PAIR_DEVICE_CAPABILITIES:
+        pytest.skip(
+            f'the GLM projection pair is validated on {glm.GLM_PAIR_DEVICE_CAPABILITIES} only'
+        )
+
+
+def fused_selection(fused_ops):
+    """The fused arm's config keywords; none for the unfused arm (fused_ops None)."""
+    if fused_ops is None:
+        return {}
+    return dict(use_fused_mhc=True, mhc_fused_ops=list(fused_ops), mhc_fused_backend='triton')
+
+
+def count_glm_pair_launches(monkeypatch):
+    """Count the pair's forward and backward launches through their module globals.
+
+    The pair's autograd Function calls glm._glm_proj_fwd and glm._glm_proj_bwd through the
+    module, once per forward and once per backward of one mHC site. The ledger records the live
+    counts and the fp32 matmul mode the pair reads.
+    """
+    counts = {'fwd': 0, 'bwd': 0}
+    forward, backward = glm._glm_proj_fwd, glm._glm_proj_bwd
+
+    def counted_forward(*args, **kwargs):
+        counts['fwd'] += 1
+        return forward(*args, **kwargs)
+
+    def counted_backward(*args, **kwargs):
+        counts['bwd'] += 1
+        return backward(*args, **kwargs)
+
+    monkeypatch.setattr(glm, '_glm_proj_fwd', counted_forward)
+    monkeypatch.setattr(glm, '_glm_proj_bwd', counted_backward)
+    # record_details stores this same dictionary, so the receipt carries the final counts.
+    record_details('glm_pair_launches', {'counts': counts, 'matmul_mode': glm._matmul_mode()})
+    return counts
+
 
 def make_config(
-    *, deterministic=False, backend='none', sparse=False, mtp=False, trainable_indexer=False
+    *,
+    deterministic=False,
+    backend='none',
+    sparse=False,
+    mtp=False,
+    trainable_indexer=False,
+    fused_ops=None,
 ):
     """The GLM53 block config; ``trainable_indexer`` turns the sparse pool-level KL on."""
     return MLATransformerConfig(
@@ -191,6 +249,7 @@ def make_config(
         expert_model_parallel_size=1,
         context_parallel_size=1,
         sequence_parallel=False,
+        **fused_selection(fused_ops),
     )
 
 
@@ -239,6 +298,7 @@ def _record_mhc_precision(module):
             'not_applicable_reason': None if mhc_modules else 'single-stream MTP has no mHC module',
             'global_matmul_precision_unchanged': torch.get_float32_matmul_precision(),
             'kda_core_in_fp32_requested': config.kda_core_in_fp32,
+            'fused_op_labels': {name: dict(child._fused_op_labels) for name, child in mhc_modules},
         },
     )
 
@@ -704,6 +764,15 @@ def observe_mhc_projections(model, monkeypatch):
     for child in model.modules():
         if id(child) in names:
             assert child._proj_rms_compute_h_op is None, f'{names[id(child)]}: native path'
+            if selects_glm_projection_pair(child.config):
+                # Fused arm: the projection captured below is the Triton GLM pair's output.
+                assert child._glm_proj_rms_op is glm.glm_proj_rms_op(
+                    child.config.mhc_fused_tf32_rounding
+                ), f'{names[id(child)]}: GLM projection pair'
+                if 'sinkhorn' in child.config.mhc_fused_ops:
+                    assert (
+                        child._sinkhorn_op is glm.fixed_launch_sinkhorn
+                    ), f'{names[id(child)]}: fixed-launch Sinkhorn'
     captures = {}
     original = HyperConnectionModule._projection_and_get_norm
 
@@ -801,11 +870,13 @@ def apply_mutation(mutate, point, *args):
         mutate[point](*args)
 
 
-def _run_kda_dense(deterministic, expand, monkeypatch, *, compare_all_parameters, mutate=None):
+def _run_kda_dense(
+    deterministic, expand, monkeypatch, *, compare_all_parameters, mutate=None, fused_ops=None
+):
     assert gdn_common.HAVE_FLA, 'KDA production execution requires the pinned FLA dependency'
     if not deterministic:
         assert gdn_common.causal_conv1d is not None, 'the fused-convolution case must actually run'
-    config = make_config(deterministic=deterministic)
+    config = make_config(deterministic=deterministic, fused_ops=fused_ops)
     apply_mutation(mutate, 'config', config)
     real = build_stack(config, 'K-', expand=expand)
     initialize_fixture(real)
@@ -821,6 +892,7 @@ def _run_kda_dense(deterministic, expand, monkeypatch, *, compare_all_parameters
         real.set_input_tensor(actual_input)
     wires, fc1 = [], {}
     hook = capture_stream_wire(real, wires)
+    launches = None if fused_ops is None else count_glm_pair_launches(monkeypatch)
     try:
         with (
             observe_clamps(real, fc1) as clamp_records,
@@ -851,6 +923,9 @@ def _run_kda_dense(deterministic, expand, monkeypatch, *, compare_all_parameters
     gradient = torch.randn_like(actual)
     wire_gradient = torch.randn_like(wires[0])
     torch.autograd.backward((actual, wires[0]), (gradient, wire_gradient))
+    if fused_ops is not None:
+        # One forward and one backward launch of the pair per mHC site (BLOCK_MHC_SITES).
+        assert launches == {'fwd': 2, 'bwd': 2}, launches
     torch.autograd.backward((expected, native.last_streams), (gradient, wire_gradient))
     record_details('objective', 'paired contracted-output and complete-stream-wire random VJPs')
     apply_mutation(mutate, 'actual_gradients', real)
@@ -872,6 +947,18 @@ def test_glm53_kda_dense_mhc_native_forward_and_all_gradients(deterministic, mon
     Clamp decisions are replayed and the mHC scales are decomposed (module docstring).
     """
     _run_kda_dense(deterministic, False, monkeypatch, compare_all_parameters=True)
+
+
+@pytest.mark.internal
+@FUSED_ARM
+@pytest.mark.parametrize('deterministic', [False, True])
+def test_glm53_kda_dense_mhc_fused_forward_and_all_gradients(deterministic, monkeypatch):
+    """The fused twin of the KDA dense composite: the same runner and criteria, with the
+    Triton GLM projection pair and the fixed-launch Sinkhorn (GLM_FUSED_OPS) on GB300 only."""
+    skip_unless_glm_pair_device()
+    _run_kda_dense(
+        deterministic, False, monkeypatch, compare_all_parameters=True, fused_ops=GLM_FUSED_OPS
+    )
 
 
 @pytest.mark.internal
@@ -961,8 +1048,10 @@ def freeze_trained_indexer(gold, losses):
     )
 
 
-def _run_dsa_moe(backend, monkeypatch, mutate=None, *, trainable_indexer=False):
-    config = make_config(backend=backend, sparse=True, trainable_indexer=trainable_indexer)
+def _run_dsa_moe(backend, monkeypatch, mutate=None, fused_ops=None, *, trainable_indexer=False):
+    config = make_config(
+        backend=backend, sparse=True, trainable_indexer=trainable_indexer, fused_ops=fused_ops
+    )
     apply_mutation(mutate, 'config', config)
     real = build_stack(config, 'DE')
     initialize_fixture(real)
@@ -995,6 +1084,7 @@ def _run_dsa_moe(backend, monkeypatch, mutate=None, *, trainable_indexer=False):
     wires, fc1 = [], {}
     handle = record_router(real.layers[1].inner_layer.mlp.router, router_records)
     wire_hook = capture_stream_wire(real, wires)
+    launches = None if fused_ops is None else count_glm_pair_launches(monkeypatch)
     try:
         with (
             observe_dsa(monkeypatch) as records,
@@ -1010,6 +1100,9 @@ def _run_dsa_moe(backend, monkeypatch, mutate=None, *, trainable_indexer=False):
     finally:
         handle.remove()
         wire_hook.remove()
+    if fused_ops is not None:
+        # One forward and one backward launch of the pair per mHC site (BLOCK_MHC_SITES).
+        assert launches == {'fwd': 2, 'bwd': 2}, launches
     apply_mutation(mutate, 'actual_gradients', real)
     output_gold, input_gold = actual.detach().cpu(), actual_input.grad.detach().cpu()
     wire_gold = wires[0].detach().cpu()
@@ -1067,3 +1160,13 @@ def test_glm53_dsa_moe_mhc_native_forward_and_all_gradients_trainable_indexer(ba
     non-zero gradient (module docstring).
     """
     _run_dsa_moe(backend, monkeypatch, trainable_indexer=True)
+
+
+@pytest.mark.internal
+@FUSED_ARM
+@pytest.mark.parametrize('backend', ['none', 'cudnn'])
+def test_glm53_dsa_moe_mhc_fused_forward_and_all_gradients(backend, monkeypatch):
+    """The fused twin of the DSA/MoE composite: the same runner and criteria, with the
+    Triton GLM projection pair and the fixed-launch Sinkhorn (GLM_FUSED_OPS) on GB300 only."""
+    skip_unless_glm_pair_device()
+    _run_dsa_moe(backend, monkeypatch, fused_ops=GLM_FUSED_OPS)

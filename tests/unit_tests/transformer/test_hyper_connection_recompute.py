@@ -17,6 +17,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
@@ -26,11 +28,72 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    _get_precision_preserving_h_post_bda,
+)
 from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.mhc_fused_op_spy import spy_fused_mhc_ops
+
+# The fixed-launch Triton Sinkhorn needs both. The CPU test environment can have Triton without
+# CUDA, where a Triton-only mark would let these cases error instead of skipping.
+_NEEDS_CUDA_TRITON = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason="needs CUDA and Triton"
+)
+
+
+def _skip_unless_glm_pair_device():
+    """Skip unless the current device's capability is one the GLM projection pair accepts; read
+    after the rank's own device is bound, never at collection."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in glm.GLM_PAIR_DEVICE_CAPABILITIES:
+        pytest.skip(
+            f"the GLM projection pair is validated on {glm.GLM_PAIR_DEVICE_CAPABILITIES} only"
+        )
+
+
+def _count_glm_calls(monkeypatch, name):
+    """Count the calls of a module-level launcher of fused_mhc_glm_projection. The pair's and the
+    Sinkhorn's autograd Functions call it through the module, so every launch is counted."""
+    original, calls = getattr(glm, name), []
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(glm, name, counting)
+    return calls
+
+
+def _assert_bytes_equal(name, actual, expected):
+    """Same shape and dtype and identical bit patterns (signed zeros and NaN payloads included),
+    as the kernel determinism harness's bytes_equal and _describe_mismatch. Not imported from
+    there: importing tests.unit_tests.determinism.kernels pins the determinism mode and
+    environment for the whole process."""
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype, (
+        f"{name}: shape/dtype differ ({tuple(actual.shape)}/{actual.dtype} vs "
+        f"{tuple(expected.shape)}/{expected.dtype})"
+    )
+    actual_bytes, expected_bytes = (
+        t.detach().contiguous().reshape(-1).view(torch.uint8) for t in (actual, expected)
+    )
+    if not torch.equal(actual_bytes, expected_bytes):
+        bits_differ = (actual_bytes != expected_bytes).view(actual.numel(), actual.element_size())
+        count = int(bits_differ.any(dim=1).sum().item())
+        af, bf = actual.detach().reshape(-1).float(), expected.detach().reshape(-1).float()
+        value_differs = (af != bf) & ~(af.isnan() & bf.isnan())
+        diff = torch.where(value_differs, (af - bf).abs(), torch.zeros_like(af))
+        message = (
+            f"{name}: {count}/{actual.numel()} elements differ "
+            f"(max |diff| {float(diff.max().item()):.3e}"
+        )
+        bit_only = count - int(value_differs.sum().item())
+        if bit_only:
+            message += f"; {bit_only} differ only in bit pattern, e.g. signed zero or NaN payload"
+        raise AssertionError(message + ")")
 
 
 class TestHyperConnectionCheckpoint:
@@ -1042,6 +1105,156 @@ class TestCheckpointRecomputeUnderFullGraphCapture:
             assert len(replay_param_grads) == len(ref_param_grads)
             for got, want in zip(replay_param_grads, ref_param_grads):
                 torch.testing.assert_close(got, want)
+
+    @_NEEDS_CUDA_TRITON
+    @pytest.mark.parametrize("hidden_size", [32, 4096], ids=["hidden32", "hidden4096"])
+    def test_glm_fused_mhc_captured_forward_backward_matches_eager_bitwise(
+        self, monkeypatch, hidden_size
+    ):
+        """[proj_rms, sinkhorn] under the triton policy, the GLM flags and the emulate-casts post:
+        the [mhc]-recompute module step, captured whole, replays bit for bit like eager."""
+        _skip_unless_glm_pair_device()
+        # Under suppress_errors a frame past Dynamo's recompile limit would silently run eagerly.
+        torch._dynamo.reset()
+        try:
+            num_streams, seq_len, batch = 4, 8, 2
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=hidden_size,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                enable_hyper_connections=True,
+                num_residual_streams=num_streams,
+                mhc_sinkhorn_iterations=20,  # GLM's value
+                mhc_init_gating_factor=0.01,
+                layernorm_epsilon=1e-5,
+                # The GLM flags.
+                mhc_norm_eps_inside_sqrt=True,
+                mhc_normalize_before_projection=True,
+                mhc_keep_pre_in_fp32=True,
+                mhc_preserve_activation_dtype_rounding=True,
+                mhc_learned_output_contract=False,
+                use_fused_mhc=True,
+                mhc_fused_ops=["proj_rms", "sinkhorn"],
+                mhc_fused_backend="triton",
+            )
+            module = HyperConnectionModule(config=config, layer_number=1).cuda()
+            assert module._glm_proj_rms_op is glm.glm_proj_rms_op("rn")
+            assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
+            assert module._h_post_bda_op is _get_precision_preserving_h_post_bda()
+
+            # BF16 leaves, as in training: the pair refuses an FP32 input.
+            static_x = torch.randn(
+                seq_len,
+                batch,
+                num_streams * hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            static_branch = torch.randn(
+                seq_len, batch, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+
+            # The spy counts forward calls only; the backward launches are counted here.
+            launches = {
+                name: _count_glm_calls(monkeypatch, name)
+                for name in ("_glm_proj_fwd", "_glm_proj_bwd", "_sinkhorn_bwd")
+            }
+
+            def run_step(x, branch):
+                # The hybrid layer's [mhc]-recompute step: the post runs under the same manager,
+                # and h_res reaches the loss directly and through the post.
+                manager = MHCCheckpointManager()
+                aggregated, h_res, h_post, residual = module.forward(
+                    x, mhc_recompute_manager=manager, return_residual=True
+                )
+                output = module.fused_h_res_h_post_bda(
+                    h_res, residual, h_post, (branch, None), 0.0, True, False, manager=manager
+                )
+                loss = (
+                    aggregated.float().square().mean()
+                    + h_post.float().square().mean()
+                    + h_res.float().square().mean()
+                    + output.float().square().mean()
+                )
+                manager.discard_all_outputs_and_register_unified_recompute(loss)
+                loss.backward()
+                return loss
+
+            def zero_grads():
+                with torch.no_grad():
+                    for tensor in (static_x, static_branch, *module.parameters()):
+                        if tensor.grad is not None:
+                            tensor.grad.zero_()
+
+            with spy_fused_mhc_ops(module) as spy:
+                # Warmup on a side stream per the torch CUDA-graphs contract; this also
+                # materializes .grad tensors at addresses that stay fixed for capture.
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        zero_grads()
+                        run_step(static_x, static_branch)
+                torch.cuda.current_stream().wait_stream(side)
+
+                graph = torch.cuda.CUDAGraph()
+                for state in get_all_rng_states().values():
+                    if isinstance(state, torch.Generator):
+                        graph.register_generator_state(state)
+                zero_grads()
+                with torch.cuda.graph(graph):
+                    static_loss = run_step(static_x, static_branch)
+
+                for _trial in range(3):
+                    fresh_x = torch.randn_like(static_x)
+                    fresh_branch = torch.randn_like(static_branch)
+
+                    # Eager reference on new leaves, same weights, same recompute machinery.
+                    zero_grads()
+                    ref_x = fresh_x.detach().clone().requires_grad_(True)
+                    ref_branch = fresh_branch.detach().clone().requires_grad_(True)
+                    # Zeroed .grad as in the replay, so both accumulate in place (0.0 + -0.0 is
+                    # +0.0) and a signed zero cannot differ between the two.
+                    ref_x.grad = torch.zeros_like(ref_x)
+                    ref_branch.grad = torch.zeros_like(ref_branch)
+                    ref_loss = run_step(ref_x, ref_branch)
+                    expected = {
+                        "loss": ref_loss.detach().clone(),
+                        "x.grad": ref_x.grad.detach().clone(),
+                        "branch.grad": ref_branch.grad.detach().clone(),
+                    }
+                    for name, parameter in module.named_parameters():
+                        expected[f"{name}.grad"] = parameter.grad.detach().clone()
+
+                    # Captured replay on the same fresh data.
+                    zero_grads()
+                    with torch.no_grad():
+                        static_x.copy_(fresh_x)
+                        static_branch.copy_(fresh_branch)
+                    graph.replay()
+                    torch.cuda.synchronize()
+
+                    actual = {
+                        "loss": static_loss,
+                        "x.grad": static_x.grad,
+                        "branch.grad": static_branch.grad,
+                    }
+                    for name, parameter in module.named_parameters():
+                        actual[f"{name}.grad"] = parameter.grad
+                    for name, reference in expected.items():
+                        _assert_bytes_equal(name, actual[name], reference)
+
+            # Two warmup steps, the capture and three eager references; replays run no Python.
+            assert spy.calls("_glm_proj_rms_op") == 6
+            assert spy.calls("_sinkhorn_op") == 6
+            spy.assert_no_unsupported()
+            assert {name: len(calls) for name, calls in launches.items()} == dict.fromkeys(
+                launches, 6
+            )
+        finally:
+            torch._dynamo.reset()
 
 
 if __name__ == "__main__":

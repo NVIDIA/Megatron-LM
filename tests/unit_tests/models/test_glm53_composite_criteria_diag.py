@@ -15,9 +15,12 @@ import pytest
 import torch
 
 from tests.unit_tests.models.test_glm53_hybrid_native_parity import (  # noqa: F401
+    FUSED_ARM,
+    GLM_FUSED_OPS,
     _model_parallel,
     _run_dsa_moe,
     _run_kda_dense,
+    skip_unless_glm_pair_device,
 )
 
 pytestmark = [
@@ -61,12 +64,14 @@ def lower_target_clamp(config):
     config.activation_func_clamp_value = 9.5
 
 
-def kda(monkeypatch, mutate):
-    _run_kda_dense(False, False, monkeypatch, compare_all_parameters=True, mutate=mutate)
+def kda(monkeypatch, mutate, fused_ops=None):
+    _run_kda_dense(
+        False, False, monkeypatch, compare_all_parameters=True, mutate=mutate, fused_ops=fused_ops
+    )
 
 
-def dsa(monkeypatch, mutate):
-    _run_dsa_moe('none', monkeypatch, mutate=mutate)
+def dsa(monkeypatch, mutate, fused_ops=None):
+    _run_dsa_moe('none', monkeypatch, mutate=mutate, fused_ops=fused_ops)
 
 
 PARITY = ('cosine=', 'tensor_similarity=')
@@ -109,4 +114,24 @@ def test_glm53_composite_criteria_detect_mutation(case, monkeypatch):
         runner(monkeypatch, mutate)
     message = str(error.value)
     print(f'GLM53_COMPOSITE_DIAG {case} detected: {message.splitlines()[0][:300]}')
+    assert any(fragment in message for fragment in fragments), message[:300]
+
+
+@FUSED_ARM
+def test_glm53_composite_criteria_unmutated_control_fused(monkeypatch):
+    """The fused arm's KDA control (GLM_FUSED_OPS); its DSA control is the fused parity test."""
+    skip_unless_glm_pair_device()
+    kda(monkeypatch, None, GLM_FUSED_OPS)
+
+
+@FUSED_ARM
+@pytest.mark.parametrize('case', sorted(CASES))
+def test_glm53_composite_criteria_detect_mutation_fused(case, monkeypatch):
+    """The same mutations under the fused arm, each detected by the same named check."""
+    skip_unless_glm_pair_device()
+    runner, mutate, fragments = CASES[case]
+    with pytest.raises(AssertionError) as error:
+        runner(monkeypatch, mutate, GLM_FUSED_OPS)
+    message = str(error.value)
+    print(f'GLM53_COMPOSITE_DIAG fused {case} detected: {message.splitlines()[0][:300]}')
     assert any(fragment in message for fragment in fragments), message[:300]

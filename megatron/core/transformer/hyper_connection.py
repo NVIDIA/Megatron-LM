@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,7 +14,15 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+from megatron.core.transformer.mhc_fused_ops import (
+    MHC_FUSED_OPS,
+    MHC_PRECISION_FLAGS,
+    mhc_fused_ops_errors,
+    mhc_fused_ops_field_errors,
+    triton_only_ops,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -34,8 +44,15 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
     from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
+logger = logging.getLogger(__name__)
+
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+
+# What this process has already logged: each distinct fused-ops line, and each per-op fallback
+# warning (by operations and reason).
+_FUSED_OPS_LINES_LOGGED: set[str] = set()
+_PER_OP_FALLBACK_WARNED: set[Tuple[Tuple[str, ...], str]] = set()
 
 
 def _resolve_mhc_checkpoint(
@@ -507,6 +524,102 @@ def learned_output_contract(
 
 
 # ============================================================================
+# Fused-operation selection: labels and logging
+# ============================================================================
+
+# The entry of fused_mhc_kernels' backend status message that describes each operation.
+_FMK_STATUS_KEYS = {"proj_rms": "proj_rms_compute_h"}
+
+
+def _read_or_error(read: Callable[[], object]) -> str:
+    """Return ``str(read())``, or the name of the exception it raises."""
+    try:
+        return str(read())
+    except Exception as error:  # torch raises when the legacy and new TF32 APIs were mixed
+        return f"<{type(error).__name__}>"
+
+
+def _precision_fields() -> Tuple[Tuple[str, str], ...]:
+    """Return the FP32 matmul precision state that decides whether TF32 runs."""
+    # One accessor per try, so that one raising accessor does not hide the others. Never read
+    # allow_tf32: it raises in the same mixed states and does not decide TF32 by itself.
+    return (
+        ("fp32_matmul_precision", _read_or_error(torch.get_float32_matmul_precision)),
+        (
+            "cuda.matmul.fp32_precision",
+            _read_or_error(lambda: torch.backends.cuda.matmul.fp32_precision),
+        ),
+        (
+            "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+            os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "unset"),
+        ),
+        ("NVIDIA_TF32_OVERRIDE", os.environ.get("NVIDIA_TF32_OVERRIDE", "unset")),
+    )
+
+
+def _unfused_op_labels(config: TransformerConfig) -> Dict[str, str]:
+    """Return the labels of the unfused operations a module binds for ``config``."""
+    # From the flag: the default module must never call _get_precision_preserving_h_post_bda.
+    post = (
+        "native(emulate-casts)"
+        if config.mhc_preserve_activation_dtype_rounding
+        else "native(compiled)"
+    )
+    return {"proj_rms": "native", "sinkhorn": "native", "h_aggregate": "native", "h_post_bda": post}
+
+
+def _fmk_op_labels(policy: str, ops: Iterable[str]) -> Dict[str, str]:
+    """Label operations with the fused kernels' own backend resolution.
+
+    For example ``fmk(auto:fwd:triton,bwd:native)``; an entry the status message lacks prints
+    as ``?``.
+    """
+    from megatron.core.fusions import fused_mhc_kernels as fmk  # lazy: it imports this module
+
+    # The resolution that log_fused_mhc_backend_once prints. It validates the policy first.
+    message, _ = fmk._mhc_backend_status(policy)
+    resolved = dict(part.split("=", 1) for part in message.split("; ") if "=" in part)
+    return {op: f"fmk({policy}:{resolved.get(_FMK_STATUS_KEYS.get(op, op), '?')})" for op in ops}
+
+
+def _log_mhc_fused_ops_once(config: TransformerConfig, mode: str, labels: Dict[str, str]) -> None:
+    """Log which mHC operations run fused, on every rank, once per process per distinct line.
+
+    Logged when ``use_fused_mhc`` or an mHC precision flag is set. Every rank logs, because
+    the TF32 state and the backend availability are properties of each rank's process.
+    """
+    if not (config.use_fused_mhc or any(getattr(config, flag) for flag in MHC_PRECISION_FLAGS)):
+        return
+    # As log_single_rank does: without INFO, do not look up the rank, which warns in processes
+    # without torch.distributed, RANK or SLURM_PROCID.
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    fields = [
+        f"mode={mode}",
+        f"policy={config.mhc_fused_backend}",
+        f"MHC_FORCE_BACKEND={os.environ.get('MHC_FORCE_BACKEND', 'unset')}",
+    ]
+    fields += [f"{op}={labels[op]}" for op in MHC_FUSED_OPS]
+    fields += [f"{name}={value}" for name, value in _precision_fields()]
+    line = f"[rank {safe_get_rank()}] [mHC] fused ops: " + " ".join(fields)
+    if line not in _FUSED_OPS_LINES_LOGGED:
+        _FUSED_OPS_LINES_LOGGED.add(line)
+        logger.info(line)
+
+
+def _warn_per_op_fallback_once(ops: List[str], reason: str) -> None:
+    """Warn once per process that listed operations keep their unfused implementation."""
+    key = (tuple(ops), reason)
+    if key not in _PER_OP_FALLBACK_WARNED:
+        _PER_OP_FALLBACK_WARNED.add(key)
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[mHC] Falling back to the unfused path for mhc_fused_ops {list(ops)}: {reason}.",
+        )
+
+
+# ============================================================================
 # HyperConnectionModule
 # ============================================================================
 
@@ -572,9 +685,10 @@ class HyperConnectionModule(MegatronModule):
         # a trivial a+b+c) is not worth it for a pure memory-bound elementwise op.
         self._fused_add_3_op = native_fused_add_3
 
-        # The fused path computes the projection and compute_h in one op, so
-        # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
-        # reached on the unfused path.
+        # The all-operations fused mode computes the projection and compute_h in one op,
+        # so there _projection_and_get_norm — and therefore _proj_rms_op — is never
+        # reached. In per-op mode _projection_and_get_norm runs unless proj_rms binds
+        # that projection-first fused op.
         # Full recompute forwards run under no_grad and replay with gradients. Use the
         # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
         self._proj_rms_op = partial(
@@ -582,8 +696,11 @@ class HyperConnectionModule(MegatronModule):
             eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt,
             normalize_before_projection=config.mhc_normalize_before_projection,
         )
+        # The Triton GLM projection pair (fused_mhc_glm_projection), which per-op proj_rms binds
+        # with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection; None everywhere else.
+        self._glm_proj_rms_op = None
 
-        if config.use_fused_mhc:
+        if config.use_fused_mhc and config.mhc_fused_ops is None:
             if (
                 config.mhc_norm_eps_inside_sqrt
                 or config.mhc_normalize_before_projection
@@ -611,6 +728,7 @@ class HyperConnectionModule(MegatronModule):
             self._h_aggregate_into_op = partial(fused_h_aggregate_into, backend=backend)
             self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
             self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
+            fused_mode, fused_labels = "all-ops", _fmk_op_labels(backend, MHC_FUSED_OPS)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
@@ -621,8 +739,102 @@ class HyperConnectionModule(MegatronModule):
                 else native_h_post_bda
             )
             self._proj_rms_compute_h_op = None
+            fused_mode, fused_labels = "unfused", _unfused_op_labels(config)
+            if config.use_fused_mhc:
+                # Per-op mode: rebind only the operations listed in mhc_fused_ops.
+                fused_mode = "per-op"
+                fused_labels.update(self._bind_per_op_fused_ops(config))
+        self._fused_op_labels = fused_labels
+        _log_mhc_fused_ops_once(config, fused_mode, fused_labels)
 
         self._init_weights()
+
+    def _bind_per_op_fused_ops(self, config: TransformerConfig) -> Dict[str, str]:
+        """Rebind only the operations listed in ``mhc_fused_ops``; return their log labels.
+
+        Every other operation keeps the unfused object bound before this call. Under
+        ``MHC_FORCE_BACKEND=native`` or ``mhc_fused_backend="native"`` the listed operations
+        keep them too, so in per-op mode the native policy means the unfused path. The
+        all-operations mode binds the fused kernels' projection-first native op instead; the
+        difference is intended.
+
+        ``sinkhorn`` binds the fixed-launch Triton Sinkhorn of fused_mhc_glm_projection when
+        Triton is available; under ``auto`` without Triton it keeps the unfused object, with a
+        warning. Triton counts as unavailable also under ``MHC_DISABLE_TRITON=1`` and
+        ``MHC_FORCE_BACKEND=cutile``. proj_rms with ``mhc_norm_eps_inside_sqrt`` and
+        ``mhc_normalize_before_projection`` binds the Triton GLM projection pair of
+        fused_mhc_glm_projection when Triton is available, with the TF32 rounding of
+        ``mhc_fused_tf32_rounding``; under ``auto`` without Triton it keeps the unfused object,
+        with a warning. At call time the pair runs only on inputs it supports; on any other input
+        the module warns once and runs the unfused projection under ``auto``, and raises under
+        ``triton``.
+        """
+        # Configs edited after TransformerConfig validation. The table needs a well-formed
+        # list, so it runs only when the field checks pass.
+        errors = mhc_fused_ops_field_errors(config) or mhc_fused_ops_errors(config)
+        if errors:
+            raise ValueError(
+                "Fused mHC does not support this mhc_fused_ops selection: "
+                + "; ".join(errors)
+                + "."
+            )
+        from megatron.core.fusions import fused_mhc_kernels as fmk  # lazy: it imports this module
+
+        policy = config.mhc_fused_backend
+        # log_fused_mhc_backend_once would describe the fused kernels' choice for operations
+        # this module does not bind, so only validate: a deferred MHC_FORCE_BACKEND error, an
+        # unknown policy or an explicit policy whose backend is unavailable still raises here.
+        # Read the fused kernels' state through the module, so that tests can patch it.
+        fmk._validate_mhc_backend(policy)
+        if fmk._MHC_FORCED_BACKEND == "native":
+            return {op: "native(MHC_FORCE_BACKEND=native)" for op in config.mhc_fused_ops}
+        if policy == "native":
+            return {op: "native(mhc_fused_backend=native)" for op in config.mhc_fused_ops}
+
+        labels, unavailable = {}, []
+        fmk_labels = _fmk_op_labels(policy, MHC_FUSED_OPS)
+        for op in MHC_FUSED_OPS:
+            if op not in config.mhc_fused_ops:
+                continue
+            if op == "sinkhorn":
+                # Triton-only. The policy is auto or triton here: native returned above, the
+                # table rejects cutile, and triton without Triton raised in _validate_mhc_backend.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._sinkhorn_op = glm.fixed_launch_sinkhorn
+                    labels[op] = f"triton(num_warps={glm.SINKHORN_NUM_WARPS})"
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
+                continue
+            if op in triton_only_ops(config):
+                # proj_rms with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection
+                # (sinkhorn continued above): the Triton GLM projection pair, Triton-only like the
+                # Sinkhorn. The policy is auto or triton here.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._glm_proj_rms_op = glm.glm_proj_rms_op(config.mhc_fused_tf32_rounding)
+                    labels[op] = self._glm_proj_rms_op.label
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
+                continue
+            if op == "proj_rms":
+                self._proj_rms_compute_h_op = partial(fmk.fused_proj_rms_compute_h, backend=policy)
+            elif op == "h_aggregate":
+                self._h_aggregate_op = partial(fmk.fused_h_aggregate, backend=policy)
+                self._h_aggregate_into_op = partial(fmk.fused_h_aggregate_into, backend=policy)
+            else:  # h_post_bda
+                self._h_post_bda_op = partial(fmk.fused_h_post_bda, backend=policy)
+            labels[op] = fmk_labels[op]
+
+        if unavailable:
+            _warn_per_op_fallback_once(unavailable, "Triton is unavailable")
+        return labels
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
@@ -656,6 +868,14 @@ class HyperConnectionModule(MegatronModule):
         # mapping_proj is read here, not called, so its forward pre-hook never publishes it.
         ensure_params_ready([self.mapping_proj.weight])
         weight = self.mapping_proj.weight
+        glm_op = self._glm_proj_rms_op
+        if glm_op is not None:
+            # Before the checkpoint below, so that a full-recompute forward under no_grad and its
+            # replay run the same op; asked through the attribute, so that the spy counts refusals.
+            if glm_op.supported(x_2d, weight):
+                proj, r = glm_op(x_2d, weight, self.norm_eps)
+                return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
+            self._refuse_glm_proj_rms(glm_op.refusal(x_2d, weight))
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
             proj, r = checkpoint(
                 self._proj_rms_op,
@@ -668,6 +888,16 @@ class HyperConnectionModule(MegatronModule):
         else:
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
+
+    def _refuse_glm_proj_rms(self, reason: str) -> None:
+        """An explicit triton policy fails; auto warns once per reason and runs the unfused
+        projection."""
+        message = f"the Triton GLM projection pair does not support this input: {reason}"
+        if self.config.mhc_fused_backend == "triton":
+            raise RuntimeError(
+                f"mHC fused backend 'triton' was requested for ['proj_rms'], but {message}."
+            )
+        _warn_per_op_fallback_once(["proj_rms"], message)
 
     # Static shapes: see _compute_h_one_specialization.
     @torch.compile(dynamic=False)
