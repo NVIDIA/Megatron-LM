@@ -342,6 +342,7 @@ def _silu_mul_bounded_kernel(
     OFFSET: tl.constexpr,
     INTERLEAVE: tl.constexpr,
     SQUARED_RELU_GATE: tl.constexpr,
+    BOUNDED: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
@@ -349,12 +350,16 @@ def _silu_mul_bounded_kernel(
     rows; rows beyond are left untouched.
 
     For the flat token-major FC1 layout (no permutation map): rows [0, n_rows) are
-    live. n_rows is a device scalar, so the fixed grid stays CUDA-graph compatible.
+    live. With BOUNDED, n_rows is a device scalar, so the fixed grid stays CUDA-graph
+    compatible; without it, all max_rows rows are live.
     CLAMP / OFFSET / INTERLEAVE / SQUARED_RELU_GATE apply training's GLU options and
     gate activation, as in _swiglu_kernel.
     """
     pid = tl.program_id(0)
-    n_rows = tl.load(n_rows_ptr)
+    if BOUNDED:
+        n_rows = tl.load(n_rows_ptr)
+    else:
+        n_rows = max_rows
     if pid >= n_rows:
         return
     two_N = 2 * N
@@ -377,7 +382,7 @@ def _silu_mul_bounded_kernel(
 
 def bounded_silu_mul(
     x: torch.Tensor,
-    n_rows: torch.Tensor,
+    n_rows: Optional[torch.Tensor],
     glu_options: GLUOptions = GLUOptions(),
     squared_relu_gate: bool = False,
 ) -> torch.Tensor:
@@ -389,7 +394,8 @@ def bounded_silu_mul(
             glu_options.interleave_size, as interleaved gate and up blocks (see glu_columns).
             The kernel reads either layout directly; do not de-interleave beforehand.
         n_rows: scalar int32/int64 CUDA tensor with the number of live rows
-            (e.g. valid_tokens * topk). Rows >= n_rows are skipped, not zeroed.
+            (e.g. valid_tokens * topk), or None when all M rows are live. Rows >= n_rows
+            are skipped, not zeroed.
         glu_options: clamp, linear offset and FC1 interleaving of the gated activation.
         squared_relu_gate: gate with squared ReLU instead of SiLU (relu(gate)^2 * up), for
             gated squared-ReLU experts.
@@ -401,15 +407,19 @@ def bounded_silu_mul(
     N = two_N // 2
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
-    NUM_BLOCKS = min(M, 512)
+    # A fixed grid: programs past the live rows return at once, and a caller whose row
+    # count changes every call (the shared expert) does not compile a kernel per count.
+    NUM_BLOCKS = 512
     _silu_mul_bounded_kernel[(NUM_BLOCKS,)](
         x,
         out,
-        n_rows,
+        # Unread without a bound; any device tensor fills the pointer argument.
+        x if n_rows is None else n_rows,
         N,
         M,
         **glu_options.kernel_args(N),
         SQUARED_RELU_GATE=squared_relu_gate,
+        BOUNDED=n_rows is not None,
         BLOCK_N=BLOCK_N,
         NUM_BLOCKS=NUM_BLOCKS,
     )

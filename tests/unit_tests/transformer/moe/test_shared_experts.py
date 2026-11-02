@@ -716,18 +716,74 @@ class TestSharedExperts:
         )
 
 
+def _checkpoint_glu_rows(weight, interleave):
+    """The fused shared expert's FC1 rows in the [gate | up] layout checkpoints store,
+    converted with the checkpoint loader's own permutation."""
+    from megatron.training.ckpt.glu_checkpointing import _permute_glu_rows
+
+    return _permute_glu_rows(weight, interleave, 0, interleave=False)
+
+
+def _rel_err(actual, expected):
+    actual, expected = actual.float(), expected.float()
+    return ((actual - expected).norm() / expected.norm()).item()
+
+
+def _shared_expert_config(transformer_impl, **overrides):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_ffn_hidden_size=128,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_shared_expert_intermediate_size=256,
+        moe_token_dispatcher_type="alltoall",
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        normalization="RMSNorm",
+        moe_router_dtype="fp32",
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        transformer_impl=transformer_impl,
+        **overrides,
+    )
+
+
+def _shared_expert_builder(transformer_impl):
+    """The shared-expert builder of the MoE spec that a model of this impl uses."""
+    if transformer_impl == "inference_optimized":
+        spec = moe_module_specs.get_inference_optimized_moe_spec()
+    else:
+        spec = moe_module_specs.get_moe_module_spec(
+            use_te=True, num_experts=4, moe_grouped_gemm=True
+        )
+    return spec.keywords["submodules"].shared_experts
+
+
+def _run_overlapped(module, hidden_states):
+    """The overlapped shared-expert calls of the alltoall and flex training dispatchers."""
+    module.pre_forward_comm(hidden_states)
+    module.linear_fc1_forward_and_act()
+    module.linear_fc2_forward()
+    module.post_forward_comm()
+    return module.get_output()
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestFusedSharedExpertInference:
-    """use_grouped_gemm_for_shared_expert in an inference-optimized model.
+    """use_grouped_gemm_for_shared_expert under InferenceMode.
 
-    The shared expert built by the inference-optimized MoE spec serves any token count under
-    InferenceMode and computes the SwiGLU of its interleaved FC1 rows, the layout the
-    checkpoint loader produces for the fused ops.
+    The fused shared expert serves any token count, in its forward and in the overlapped
+    methods the training dispatchers call. It must compute what the unfused SharedExpertMLP
+    computes on the same weights stored as checkpoints store them ([gate | up], converted
+    with the checkpoint loader's permutation), so the comparison does not share the fused
+    path's reading of the interleaved FC1 rows.
     """
 
-    hidden_size = 128
-    shared_ffn = 256
     interleave = 32
 
     @classmethod
@@ -738,98 +794,134 @@ class TestFusedSharedExpertInference:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    def _shared_expert(self, **overrides):
-        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+    def _shared_experts(self, transformer_impl, clamp_value, overlap):
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 
+        builder = _shared_expert_builder(transformer_impl)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=self.hidden_size,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            moe_ffn_hidden_size=128,
-            moe_router_topk=2,
-            moe_grouped_gemm=True,
-            moe_shared_expert_intermediate_size=self.shared_ffn,
-            activation_func=F.silu,
-            gated_linear_unit=True,
-            normalization="RMSNorm",
-            moe_router_dtype="fp32",
-            add_bias_linear=False,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            transformer_impl="inference_optimized",
-            **overrides,
-        )
-        builder = get_inference_optimized_moe_spec().keywords["submodules"].shared_experts
-        return builder(config=config, pg_collection=get_default_pg_collection(), gate=False)
-
-    def _reference(self, module, hidden_states, interleave, clamp_value=None):
-        """FP32 SwiGLU of the FC1 rows, laid out as [gate | up] or interleaved blocks."""
-        w1 = module.linear_fc1.weight.detach().float()
-        w2 = module.linear_fc2.weight.detach().float()
-        if interleave is None:
-            gate_w, up_w = torch.chunk(w1, 2, dim=0)
-        else:
-            blocks = w1.view(-1, 2, interleave, w1.size(1))
-            gate_w = blocks[:, 0].reshape(-1, w1.size(1))
-            up_w = blocks[:, 1].reshape(-1, w1.size(1))
-        x = hidden_states.float().view(-1, hidden_states.size(-1))
-        gate, up = x @ gate_w.t(), x @ up_w.t()
-        if clamp_value is not None:
-            gate, up = gate.clamp(max=clamp_value), up.clamp(-clamp_value, clamp_value)
-        return (F.silu(gate) * up) @ w2.t()
-
-    @staticmethod
-    def _rel_err(actual, expected):
-        actual = actual.float().view(expected.shape)
-        return ((actual - expected).norm() / expected.norm()).item()
-
-    @pytest.mark.parametrize("num_tokens", [3, 257])
-    def test_unfused_shared_expert_serves_any_token_count(self, num_tokens):
-        module = self._shared_expert().cuda().eval()
-        assert not isinstance(module, FusedSharedExpertMLP)
-        hidden_states = torch.randn(
-            num_tokens, 1, self.hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        with torch.no_grad(), InferenceMode.active():
-            output = module(hidden_states)
-        assert self._rel_err(output, self._reference(module, hidden_states, None)) < 2e-2
-
-    @pytest.mark.parametrize("clamp_value", [None, 0.5])
-    @pytest.mark.parametrize("num_tokens", [3, 257])
-    def test_fused_shared_expert_serves_any_token_count(self, num_tokens, clamp_value):
-        import transformer_engine.pytorch as te
-
-        from megatron.core.utils import is_te_min_version
-
-        if not is_te_min_version("2.14.0"):
-            pytest.skip("FusedSharedExpertMLP requires Transformer Engine >= 2.14.0")
-        if clamp_value is not None and (
-            not is_te_min_version("2.17.0.dev0") or not hasattr(te.ops, "ScaledClampedQGeGLU")
-        ):
-            pytest.skip("The clamped fused shared expert requires TE ScaledClampedQGeGLU")
-        module = (
-            self._shared_expert(
+        fused = builder(
+            config=_shared_expert_config(
+                transformer_impl,
                 use_grouped_gemm_for_shared_expert=True,
                 moe_shared_expert_glu_interleave_size=self.interleave,
                 activation_func_clamp_value=clamp_value,
-            )
-            .cuda()
-            .eval()
+                moe_shared_expert_overlap=overlap,
+            ),
+            pg_collection=get_default_pg_collection(),
+            gate=False,
         )
-        assert isinstance(module, FusedSharedExpertMLP)
-        # FC1 outputs of std ~1, so that the clamp bites on both halves.
-        hidden_states = (
-            torch.randn(num_tokens, 1, self.hidden_size, device="cuda", dtype=torch.bfloat16) * 4
+        unfused = builder(
+            config=_shared_expert_config(transformer_impl, activation_func_clamp_value=clamp_value),
+            pg_collection=get_default_pg_collection(),
+            gate=False,
         )
-        with torch.no_grad(), InferenceMode.active():
-            output = module(hidden_states)
+        assert isinstance(fused, FusedSharedExpertMLP)
+        assert not isinstance(unfused, FusedSharedExpertMLP)
+        state = fused.state_dict()
+        stored = _checkpoint_glu_rows(state["linear_fc1.weight"], self.interleave)
+        unfused.load_state_dict({**state, "linear_fc1.weight": stored})
+        return fused.cuda().eval(), unfused.cuda().eval()
 
-        expected = self._reference(module, hidden_states, self.interleave, clamp_value)
+    @pytest.mark.parametrize("clamp_value", [None, 0.5])
+    @pytest.mark.parametrize("num_tokens", [3, 257])
+    @pytest.mark.parametrize(
+        ("transformer_impl", "overlap"),
+        [
+            ("inference_optimized", False),
+            ("transformer_engine", False),
+            ("transformer_engine", True),
+        ],
+        ids=["inference_optimized", "transformer_engine", "transformer_engine-overlap"],
+    )
+    def test_fused_shared_expert_serves_any_token_count(
+        self, transformer_impl, overlap, num_tokens, clamp_value
+    ):
+        """On the base, every case raises the fused ops' divisible-by-256 ValueError."""
+        fused, unfused = self._shared_experts(transformer_impl, clamp_value, overlap)
+        # FC1 outputs of std ~1, so that the clamp bites on both halves.
+        hidden_states = torch.randn(num_tokens, 1, 128, device="cuda", dtype=torch.bfloat16) * 4
+        with torch.no_grad(), InferenceMode.active():
+            output = _run_overlapped(fused, hidden_states) if overlap else fused(hidden_states)
+            expected = unfused(hidden_states)
+            # The comparison only discriminates if the FC1 layout matters: the same rows
+            # read as [gate | up].
+            unfused.linear_fc1.weight.copy_(fused.linear_fc1.weight)
+            misread = unfused(hidden_states)
+
         assert output.shape == hidden_states.shape
-        assert self._rel_err(output, expected) < 2e-2
-        # The comparison only discriminates if the FC1 layout matters.
-        contiguous = self._reference(module, hidden_states, None, clamp_value)
-        assert self._rel_err(contiguous, expected) > 0.2
+        assert _rel_err(output, expected) < 2e-2
+        assert _rel_err(misread, expected) > 0.2
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestFusedSharedExpertInferenceMatchesTraining:
+    """The fused shared expert's inference math is its training math.
+
+    Training runs TE's fused ops (GroupedLinear with ScaledSwiGLU or ScaledClampedQGeGLU on
+    interleaved FC1 rows); they exist only under an MXFP8 or NVFP4 recipe, which needs
+    Blackwell. Inference runs the module's TE linears under the same MXFP8 recipe with the
+    interleave-aware GLU kernel between them. The two differ by where FC1's output is
+    rounded before quantization, about 2e-2, while reading FC1 as [gate | up] or dropping
+    the clamp differs by more than 1.
+    """
+
+    tol = 5e-2
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("clamp_value", [None, 0.5])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_inference_matches_fused_training_ops(self, tp_size, clamp_value):
+        """TP 2 runs sequence parallel, so each rank interleaves its own FC1 shard."""
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("The fused shared-expert ops need an MXFP8 recipe, which needs Blackwell")
+        if Utils.world_size < tp_size:
+            pytest.skip(f"Needs {tp_size} GPUs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = _shared_expert_config(
+            "transformer_engine",
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=32,
+            activation_func_clamp_value=clamp_value,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=tp_size > 1,
+            use_cpu_initialization=False,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+        )
+        with get_fp8_context(config, is_init=True):
+            module = _shared_expert_builder("transformer_engine")(
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                gate=False,
+            )
+        module = module.cuda().eval()
+        assert isinstance(module, FusedSharedExpertMLP)
+        # 256 tokens after the sequence-parallel all-gather, the fused ops' alignment.
+        hidden_states = torch.randn(256 // tp_size, 1, 128, device="cuda", dtype=torch.bfloat16) * 4
+        glu_options = module._inference_glu_options
+
+        def inference(**misread):
+            module._inference_glu_options = dataclasses.replace(glu_options, **misread)
+            with get_fp8_context(config), InferenceMode.active():
+                return module(hidden_states)
+
+        with torch.no_grad():
+            with get_fp8_context(config):
+                training = module(hidden_states)
+            output = inference()
+            misreads = [inference(interleave_size=None)]
+            if clamp_value is not None:
+                misreads.append(inference(clamp_value=None))
+
+        assert module._fused_grouped_swiglu_ops is not None, "training did not run the fused ops"
+        assert _rel_err(output, training) < self.tol
+        for misread in misreads:
+            assert _rel_err(misread, training) > 10 * self.tol

@@ -403,8 +403,8 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     """Shared expert MLP implemented with TE GroupedLinear(num_groups=1) fused ops.
 
     The fused ops need token counts aligned to TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT, which
-    inference batches are not, so inference runs the module's own linears instead (see
-    _inference_forward).
+    inference batches are not, so under InferenceMode the forward and the overlapped methods
+    run the module's own linears instead (see _inference_glu).
     """
 
     def __init__(
@@ -632,22 +632,24 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             output = reduce_from_tensor_model_parallel_region(fc2_output, group=self.tp_group)
         return output
 
-    def _inference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Compute the fused ops' MLP with the module's linears, for any token count.
+    def _inference_glu(self, fc1_output: torch.Tensor) -> torch.Tensor:
+        """The fused ops' activation on FC1's output, for any token count.
 
-        The linears communicate over this module's TP group (the inference-optimized ones
-        through symmetric memory) and use the inference weight formats. The SwiGLU reads
-        FC1's interleaved rows directly: the fused ops train in that layout, and the
-        checkpoint loader interleaves the stored rows for them.
+        Inference runs the module's linears, which accept any token count, communicate over
+        this module's TP group (the inference-optimized ones through symmetric memory) and
+        use the inference weight formats. Between them, this SwiGLU reads FC1's interleaved
+        rows directly: the fused ops train in that layout, and the checkpoint loader
+        interleaves the stored rows for them.
         """
-        fc1_output, _ = apply_module(self.linear_fc1)(hidden_states)
         rows = fc1_output.reshape(-1, fc1_output.size(-1))
-        # Every row is live; the kernel takes the count on device (CUDA-graph safe).
-        num_rows = torch.full((1,), rows.size(0), dtype=torch.int32, device=rows.device)
-        intermediate = bounded_silu_mul(rows, num_rows, glu_options=self._inference_glu_options)
-        output, _ = apply_module(self.linear_fc2)(
-            intermediate.view(*fc1_output.shape[:-1], intermediate.size(-1))
-        )
+        # Every row is live, so the kernel needs no device row count.
+        intermediate = bounded_silu_mul(rows, None, glu_options=self._inference_glu_options)
+        return intermediate.view(*fc1_output.shape[:-1], intermediate.size(-1))
+
+    def _inference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute the fused ops' MLP with the module's linears (see _inference_glu)."""
+        fc1_output, _ = apply_module(self.linear_fc1)(hidden_states)
+        output, _ = apply_module(self.linear_fc2)(self._inference_glu(fc1_output))
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -666,17 +668,34 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
     )
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
-        """Run fused FC1, activation, and FC2 for overlapped shared experts."""
+        """Run fused FC1, activation, and FC2 for overlapped shared experts.
+
+        Under InferenceMode, run FC1 and the activation with the module's linears, as the
+        forward does (see _inference_glu), and leave FC2 to linear_fc2_forward. With the
+        overlap, the linears do not communicate: pre_forward_comm and post_forward_comm do.
+        """
         del overlapped_comm_output
         with torch.cuda.stream(self.stream):
-            self.cached_fc2_output = self._fused_grouped_swiglu_no_comm(self.cached_fc1_input)
+            if InferenceMode.is_active():
+                fc1_output, _ = apply_module(self.linear_fc1)(self.cached_fc1_input)
+                self.cached_fc2_input = self._inference_glu(fc1_output)
+            else:
+                self.cached_fc2_output = self._fused_grouped_swiglu_no_comm(self.cached_fc1_input)
             self.cached_fc1_input = None
 
     @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
     def linear_fc2_forward(self, overlapped_comm_output=None):
-        """Skip FC2 because the fused path computes FC2 during linear_fc1_forward_and_act."""
+        """Skip FC2 because the fused path computes FC2 during linear_fc1_forward_and_act.
+
+        Under InferenceMode, run FC2 with the module's linear.
+        """
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
+        if InferenceMode.is_active():
+            assert self.cached_fc2_input is not None
+            with torch.cuda.stream(self.stream):
+                self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
+                self.cached_fc2_input = None
         assert self.cached_fc2_output is not None
 
     def backward_dw(self):

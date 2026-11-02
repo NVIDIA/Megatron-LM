@@ -282,6 +282,13 @@ def test_inference_moe_activations_replay():
         backward=False,
         what="bounded_silu_mul (GLU options)",
     )
+    # Every row live, without a device row count (the fused shared expert under inference).
+    assert_replays_bit_exact(
+        lambda x: activations.bounded_silu_mul(x, None, glu_options=glu),
+        (x2,),
+        backward=False,
+        what="bounded_silu_mul (GLU options, every row live)",
+    )
     # Gated squared ReLU: the same kernels with relu(gate)^2 in place of SiLU.
     assert_replays_bit_exact(
         lambda x: live(

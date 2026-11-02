@@ -431,8 +431,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_shared_experts",
         sources=("megatron/core/transformer/moe/shared_experts.py",),
+        tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        exempt_reason="Composes TE linears and the registered activation fusions; no kernel of its own.",
+        notes="Composes TE linears and the registered activation fusions. Under InferenceMode the "
+        "fused shared expert (use_grouped_gemm_for_shared_expert) runs its linears and the "
+        "bounded_silu_mul Triton kernel; its forward and overlapped methods replay bit-exactly.",
     ),
     KernelEntry(
         name="moe_paged_stash",

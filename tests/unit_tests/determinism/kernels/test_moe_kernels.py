@@ -1303,6 +1303,60 @@ class TestMoEModules:
         finally:
             dispatcher._valid_tokens_tensor, dispatcher._host_valid_tokens_estimate = saved
 
+    @pytest.mark.skipif(not HAVE_TE, reason="FusedSharedExpertMLP needs Transformer Engine")
+    @pytest.mark.parametrize("overlap", [False, True], ids=["forward", "overlapped"])
+    def test_fused_shared_expert_inference_replays(self, overlap):
+        """use_grouped_gemm_for_shared_expert under InferenceMode: the module's linears and the
+        interleave-aware GLU kernel, through the forward and the overlapped methods, at a
+        token count the fused training ops reject."""
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+        from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    if not overlap:
+                        return self.module(hidden)
+                    self.module.pre_forward_comm(hidden)
+                    self.module.linear_fc1_forward_and_act()
+                    self.module.linear_fc2_forward()
+                    self.module.post_forward_comm()
+                    return self.module.get_output()
+
+        self._init(ep=1)
+        seeded()
+        config = _moe_config(
+            bias_activation_fusion=False,
+            moe_token_dispatcher_type="alltoall",
+            moe_shared_expert_intermediate_size=2048,
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=32,
+            activation_func_clamp_value=0.5,
+            moe_shared_expert_overlap=overlap,
+        )
+        spec = get_moe_module_spec(
+            use_te=True, num_experts=config.num_moe_experts, moe_grouped_gemm=True
+        )
+        module = spec.keywords["submodules"].shared_experts(
+            config=config, pg_collection=ProcessGroupCollection.use_mpu_process_groups(), gate=False
+        )
+        assert isinstance(module, FusedSharedExpertMLP)
+        hidden = torch.randn(333, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            assert_module_replays_bit_exact(
+                _InInferenceMode(module.cuda().eval()),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"FusedSharedExpertMLP inference ({'overlapped' if overlap else 'forward'})",
+            )
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
         "offload_modules,offloaded_group",
