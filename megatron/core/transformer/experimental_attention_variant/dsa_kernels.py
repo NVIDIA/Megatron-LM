@@ -190,6 +190,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -385,6 +386,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -418,7 +420,13 @@ def run_fused_absorbed_sparse_attention(
         softmax_scale,
         v_channels,
         topk_length,
-        **filter_kwargs_for_callable(fn, {"all_topk_rows_nonempty": all_topk_rows_nonempty}),
+        **filter_kwargs_for_callable(
+            fn,
+            {
+                "all_topk_rows_nonempty": all_topk_rows_nonempty,
+                "deterministic": _deterministic_dsa_requested(config),
+            },
+        ),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
@@ -462,6 +470,12 @@ def run_fused_dsa_attention(
     Packed-layout backend kwargs are CP-only; CP-independent facts use optional,
     signature-filtered kwargs.
     """
+    if _deterministic_dsa_requested(config):
+        # The combined autograd function precomputes indexer gradients and runs sparse-attention
+        # backward internally. Keep deterministic mode on the split route so each backward can
+        # independently select a bitwise-repeatable implementation.
+        _log_declined_hook(config, "run_fused_dsa_attention", "deterministic mode")
+        return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None

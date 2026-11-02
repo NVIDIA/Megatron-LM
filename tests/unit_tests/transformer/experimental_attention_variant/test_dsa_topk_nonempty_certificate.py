@@ -592,6 +592,13 @@ def cudnn_certificates(monkeypatch):
     return seen
 
 
+def _skip_if_deterministic_sparse_backward_unavailable(config, tp: int) -> None:
+    """Deterministic mode declines cuDNN sparse attention without a deterministic backward."""
+    query = torch.empty(0, 0, config.num_attention_heads // tp, 0, device="cuda")
+    if not dsa_cudnn_kernels._supports_deterministic_sparse_attention_backward(query):
+        pytest.skip("installed cuDNN DSA has no deterministic sparse-attention backward")
+
+
 def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_certificate: bool):
     """Train the producer and its consumers for one step; return outputs, loss and grads."""
     producer = calls[0]
@@ -688,7 +695,7 @@ def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_cer
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
-@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(
     ("consumer", "recompute"),
     [
@@ -712,6 +719,8 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
         config = _make_gpu_config(
             tp=tp, cp=cp, deterministic=deterministic, consumer=consumer, recompute=recompute
         )
+        if deterministic:
+            _skip_if_deterministic_sparse_backward_unavailable(config, tp)
         calls = _make_gpu_calls(config, pg_collection, consumer)
         inputs = _make_inputs(
             config, tp_rank=pg_collection.tp.rank(), cp_rank=pg_collection.cp.rank(), cp=cp
