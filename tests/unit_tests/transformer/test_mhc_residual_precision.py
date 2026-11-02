@@ -15,6 +15,7 @@ compiled specialization shared by the grad-mode, no-grad and replayed passes.
 
 import json
 import os
+import re
 from argparse import ArgumentParser
 
 import pytest
@@ -22,7 +23,11 @@ import torch
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 from torch._inductor import list_options
+from torch.autograd import DeviceType
+from torch.profiler import ProfilerActivity
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.tensor_parallel.random import (
     MHCCheckpointManager,
     checkpoint,
@@ -31,6 +36,10 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer import hyper_connection as hc
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+_NEEDS_CUDA_TRITON = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason="needs CUDA and Triton"
+)
 
 
 def _config(**overrides):
@@ -160,6 +169,9 @@ _POST_DTYPES = {
     "fp32": (torch.float32, torch.float32),
     "bf16_fp32_mappings": (torch.float32, torch.bfloat16),
 }
+# GLM5Next keeps the post and residual mixing in the activation dtype
+# (mhc_keep_mappings_in_fp32=False).
+_GLM_POST_DTYPES = {"bf16": (torch.bfloat16, torch.bfloat16)}
 _GEMMS = {
     torch.ops.aten.bmm,
     torch.ops.aten.mm,
@@ -218,7 +230,11 @@ class _AtenGraphRecorder:
 
 @pytest.mark.parametrize("preserve_rounding", [False, True])
 @pytest.mark.parametrize("n", [2, 4])
-@pytest.mark.parametrize("dtypes", list(_POST_DTYPES.values()), ids=list(_POST_DTYPES))
+@pytest.mark.parametrize(
+    "dtypes",
+    list({**_POST_DTYPES, **_GLM_POST_DTYPES}.values()),
+    ids=[*_POST_DTYPES, *_GLM_POST_DTYPES],
+)
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_h_post_bda_compiles_once_without_gemm(
     monkeypatch, preserve_rounding, n, dtypes, with_bias
@@ -333,16 +349,84 @@ def _model_parallel():
         Utils.destroy_model_parallel()
 
 
+_B1_CONFIGS = {
+    "plain": {},
+    "glm_fused": dict(
+        mhc_norm_eps_inside_sqrt=True,
+        mhc_normalize_before_projection=True,
+        mhc_keep_pre_in_fp32=True,
+        mhc_learned_output_contract=False,
+        use_fused_mhc=True,
+        mhc_fused_ops=["proj_rms", "sinkhorn"],
+        mhc_fused_backend="triton",
+    ),
+}
+_GEMM_KERNEL_NAMES = re.compile("gemm|nvjet|cutlass|xmma|wmma|cublas")
+
+
+def _kernel_names_at_s17(module, fixture, gradient):
+    """CUDA kernel names of one more forward and backward of each side on fresh S17 clones.
+
+    A record only: the post holds no GEMM and the reference's matmul runs eagerly, so nothing
+    is asserted. A profiler exception is recorded by its class name and fails nothing; an
+    exception of the extra run itself fails the test.
+    """
+
+    def module_post(comb, residual, post, branch):
+        return module.fused_h_res_h_post_bda(comb, residual, post, (branch, None), 0.0, True, False)
+
+    record = {}
+    for side, function in (("official", _official_residual), ("module", module_post)):
+        leaves = [value.clone().requires_grad_() for value in fixture]
+        started = finished = False
+        try:
+            with torch.profiler.profile(activities=[ProfilerActivity.CUDA]) as profile:
+                started = True
+                function(*leaves).backward(gradient)
+                torch.cuda.synchronize()
+                finished = True
+            names = sorted(
+                {
+                    event.name
+                    for event in profile.events()
+                    if event.device_type == DeviceType.CUDA and not event.is_user_annotation
+                }
+            )
+        except Exception as error:
+            if started and not finished:
+                raise
+            record[side] = {"profiler_error": type(error).__name__}
+            continue
+        record[side] = {
+            "kernels": names,
+            "gemm_kernels": [name for name in names if _GEMM_KERNEL_NAMES.search(name)],
+        }
+    return record
+
+
 @pytest.mark.internal
+@pytest.mark.parametrize(
+    "b1_config", ["plain", pytest.param("glm_fused", marks=_NEEDS_CUDA_TRITON)]
+)
 @pytest.mark.parametrize("recompute", ["none", "mhc", "full"])
 def test_public_mhc_residual_preserves_hf_rounding_and_all_operand_gradients(
-    recompute, _model_parallel
+    recompute, b1_config, _model_parallel
 ):
     assert "emulate_precision_casts" in list_options(), "strict compiler support is required"
     module = hc.HyperConnectionModule(
-        _config(mhc_preserve_activation_dtype_rounding=True), layer_number=1
+        _config(mhc_preserve_activation_dtype_rounding=True, **_B1_CONFIGS[b1_config]),
+        layer_number=1,
     ).cuda()
     assert module._h_post_bda_op is hc._get_precision_preserving_h_post_bda()
+    if b1_config == "glm_fused":
+        assert module._glm_proj_rms_op is glm.glm_proj_rms_op("rn")
+        assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
+        assert module._fused_op_labels == {
+            "proj_rms": "glm-triton(tf32=rn)",
+            "sinkhorn": "triton(num_warps=1)",
+            "h_aggregate": "native",
+            "h_post_bda": "native(emulate-casts)",
+        }
     # Preserve the exact fixture draw order of the preceding microdiagnostic.
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
@@ -389,6 +473,7 @@ def test_public_mhc_residual_preserves_hf_rounding_and_all_operand_gradients(
             _assert_exact_and_similarity(observed.grad, reference.grad, name + " gradient")
         )
     assert all(parameter.grad is None for parameter in module.parameters())
+    kernel_names = _kernel_names_at_s17(module, fixture, gradient)
     print(
         "MHC_RESIDUAL_PRECISION "
         + json.dumps(
@@ -397,8 +482,10 @@ def test_public_mhc_residual_preserves_hf_rounding_and_all_operand_gradients(
                 "preserve_activation_dtype_rounding": True,
                 "compile_options": {"emulate_precision_casts": True},
                 "recompute": recompute,
+                "b1_config": b1_config,
                 "global_float32_matmul_precision": torch.get_float32_matmul_precision(),
                 "comparisons": comparisons,
+                "s17_kernel_names": kernel_names,
             },
             sort_keys=True,
         ),

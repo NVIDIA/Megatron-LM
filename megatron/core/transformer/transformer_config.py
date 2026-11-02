@@ -38,6 +38,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
     LayerType,
 )
+from megatron.core.transformer.mhc_fused_ops import mhc_fused_ops_errors, mhc_fused_ops_field_errors
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import experimental_api
@@ -2086,8 +2087,9 @@ class TransformerConfig(ModelParallelConfig):
     mhc_normalize_before_projection: bool = False
     """Feed the RMS-normalized residual to the FP32 mHC mapping projection, as HF GLM5Next
     does, instead of scaling the projection by the norm afterwards. The norm is the one
-    mhc_norm_eps_inside_sqrt selects. Incompatible with use_fused_mhc. False preserves the
-    projection-before-normalization path.
+    mhc_norm_eps_inside_sqrt selects. Incompatible with the all-operations use_fused_mhc mode; in
+    mhc_fused_ops, proj_rms accepts it only together with mhc_norm_eps_inside_sqrt (the GLM
+    projection pair). False preserves the projection-before-normalization path.
     """
 
     mhc_keep_mappings_in_fp32: bool = False
@@ -2103,8 +2105,9 @@ class TransformerConfig(ModelParallelConfig):
     """Preserve eager activation-dtype intermediate rounding in compiled mHC residual updates.
     Uses the opt-in Inductor emulate_precision_casts option for the native no-dropout
     post-multiply/residual-add operator, including backward and checkpoint replay.
-    Requires compiler support and is incompatible with use_fused_mhc. False preserves
-    the existing compiler precision policy; this does not change global matmul precision.
+    Requires compiler support and is incompatible with the all-operations use_fused_mhc
+    mode and with h_post_bda in mhc_fused_ops. False preserves the existing compiler
+    precision policy; this does not change global matmul precision.
     """
 
     mhc_learned_output_contract: bool = True
@@ -2117,6 +2120,28 @@ class TransformerConfig(ModelParallelConfig):
     With the default ``auto`` backend policy, selection is operation-specific
     and unavailable accelerated implementations fall back to native torch.
     Set ``mhc_fused_backend`` to request an explicit backend policy.
+    Set ``mhc_fused_ops`` to fuse only selected operations.
+    """
+
+    mhc_fused_ops: Optional[List[Literal["proj_rms", "sinkhorn", "h_aggregate", "h_post_bda"]]] = (
+        None
+    )
+    """Fuse only the listed mHC operations (per-op mode); requires use_fused_mhc.
+
+    None keeps the all-operations mode, which rejects every mHC precision flag. In per-op mode,
+    each listed operation must implement the selected precision flags
+    (megatron/core/transformer/mhc_fused_ops.py); with the GLM5Next flags only proj_rms and
+    sinkhorn qualify. Operations that are not listed keep their unfused implementation. Per-op
+    mode is validated at four residual streams, without the attention CUDA-graph split and
+    without Transformer Engine per-layer graphs.
+    """
+
+    mhc_fused_tf32_rounding: Literal["rn", "rz"] = "rn"
+    """TF32 operand rounding of the fused GLM projection pair when fp32 matmuls run in TF32.
+
+    "rn" rounds operands to nearest even, as cuBLAS TF32 GEMMs do. "rz" truncates (diagnostic
+    only) and requires proj_rms in mhc_fused_ops with mhc_norm_eps_inside_sqrt and
+    mhc_normalize_before_projection.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
@@ -2173,7 +2198,9 @@ class TransformerConfig(ModelParallelConfig):
     mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
     """Backend policy for fused mHC operations.
 
-    ``auto`` selects the fastest available implementation for each operation.
+    ``auto`` selects the fastest available implementation for each operation,
+    except that h_aggregate runs its cuTile kernels only under ``cutile``
+    (``auto`` with ``MHC_FORCE_BACKEND=cutile`` runs native h_aggregate).
     Explicit policies require the requested dependency and device support, and
     never select a different accelerated backend. Operations without an
     implementation in the selected backend retain their native implementation.
@@ -5389,7 +5416,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
-            if (
+            # The all-operations mode. Per-op mode (mhc_fused_ops set) checks the precision
+            # flags per operation, once the CUDA graph flags below are settled.
+            if self.mhc_fused_ops is None and (
                 self.mhc_norm_eps_inside_sqrt
                 or self.mhc_normalize_before_projection
                 or self.mhc_keep_mappings_in_fp32
@@ -5411,6 +5440,9 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
+        errors = mhc_fused_ops_field_errors(self)
+        if errors:
+            raise ValueError("; ".join(errors) + ".")
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
@@ -6606,6 +6638,17 @@ class TransformerConfig(ModelParallelConfig):
                         f"captured attention. Drop {sorted(attn_scope_offload)} from "
                         f"offload_modules, or clear mhc_recompute_attn_cuda_graph_split."
                     )
+
+        if self.use_fused_mhc and self.mhc_fused_ops is not None:
+            # Below the deprecated enable_cuda_graph/external_cuda_graph migration, so that
+            # external_cuda_graph=True already reads as cuda_graph_impl='transformer_engine'.
+            errors = mhc_fused_ops_errors(self)
+            if errors:
+                raise ValueError(
+                    "use_fused_mhc does not support this mhc_fused_ops selection: "
+                    + "; ".join(errors)
+                    + "."
+                )
 
         graph_captures_attention = cuda_graph_captures_attention(self)
 

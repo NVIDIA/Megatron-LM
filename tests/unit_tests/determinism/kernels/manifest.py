@@ -425,6 +425,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
     KernelEntry(
+        name="fused_mhc_glm_projection",
+        sources=("megatron/core/fusions/fused_mhc_glm_projection.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-launch Triton Sinkhorn (num_warps=1) over fused_mhc_kernels' JIT kernels, "
+        "and the GLM projection pair (GP-1..GP-4 with GP-4p and GP-4r: fixed-config Triton "
+        "kernels, index-order chain reductions from zero, no atomics); forward and backward "
+        "replay, eager and under CUDA-graph capture.",
+    ),
+    KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
         tests=(K + "test_streamwise_residual_ops.py",),

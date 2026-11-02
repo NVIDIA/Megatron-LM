@@ -247,6 +247,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "memory_efficient_layer_norm": False,
     "mhc_recompute_attn_cuda_graph_split": False,
     "mhc_fused_backend": "auto",
+    "mhc_fused_ops": None,
+    "mhc_fused_tf32_rounding": "rn",
     "mhc_init_gating_factor": 0.01,
     "mhc_keep_mappings_in_fp32": False,
     "mhc_keep_pre_in_fp32": False,

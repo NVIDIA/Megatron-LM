@@ -82,11 +82,14 @@ from tests.unit_tests.models.glm53_native_reference import (
 )
 from tests.unit_tests.models.test_glm53_hybrid_native_parity import (
     BLOCK_MHC_SITES,
+    FUSED_ARM,
+    GLM_FUSED_OPS,
     assert_clamp_coverage,
     assert_sparse_observations,
     bind_moe_replay,
     block_links,
     capture_stream_wire,
+    count_glm_pair_launches,
     dsa_links,
     initialize_fixture,
     make_config,
@@ -100,6 +103,7 @@ from tests.unit_tests.models.test_glm53_hybrid_native_parity import (
     process_groups,
     record_router,
     release_cuda,
+    skip_unless_glm_pair_device,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -358,8 +362,24 @@ def test_glm53_real_hybrid_mtp_contract_vjp_and_all_gradients(monkeypatch):
     fused hook declines and the absorbed PyTorch core runs. Clamp decisions are
     replayed and the decoder mHC scales are decomposed (module docstring).
     """
+    _run_real_hybrid_mtp(monkeypatch)
+
+
+@pytest.mark.internal
+@FUSED_ARM
+def test_glm53_real_hybrid_mtp_contract_fused_vjp_and_all_gradients(monkeypatch):
+    """The fused twin of the real HybridModel MTP composite: the same runner and criteria,
+    with the Triton GLM projection pair and the fixed-launch Sinkhorn (GLM_FUSED_OPS) in the
+    K- decoder's two mHC sites (MTP has none), on GB300 only."""
+    skip_unless_glm_pair_device()
+    _run_real_hybrid_mtp(monkeypatch, fused_ops=GLM_FUSED_OPS)
+
+
+def _run_real_hybrid_mtp(monkeypatch, fused_ops=None):
     backend = 'cudnn'
-    config = make_config(deterministic=True, backend=backend, sparse=True, mtp=True)
+    config = make_config(
+        deterministic=True, backend=backend, sparse=True, mtp=True, fused_ops=fused_ops
+    )
     real = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_glm53_stack_spec(config),
@@ -405,6 +425,7 @@ def test_glm53_real_hybrid_mtp_contract_vjp_and_all_gradients(monkeypatch):
         record_router(actual_router(real), router_records),
         capture_stream_wire(real.decoder, wires),
     ]
+    launches = None if fused_ops is None else count_glm_pair_launches(monkeypatch)
     try:
         with (
             observe_dsa(monkeypatch) as records,
@@ -430,6 +451,9 @@ def test_glm53_real_hybrid_mtp_contract_vjp_and_all_gradients(monkeypatch):
     finally:
         for hook in hooks:
             hook.remove()
+    if fused_ops is not None:
+        # One forward and one backward launch of the pair per decoder mHC site (K-); MTP has none.
+        assert launches == {'fwd': 2, 'bwd': 2}, launches
     assert len(heads) == 2 and len(mtp_outputs) == 1 and norm_calls == [1]
     input_gold, loss_gold = actual_input.grad.detach().cpu(), loss.detach().cpu()
     wire_gold = wires[0].detach().cpu()

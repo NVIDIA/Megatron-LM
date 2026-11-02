@@ -1,10 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
+import os
 from contextlib import nullcontext
 
 import pytest
 import torch
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
@@ -19,6 +23,10 @@ from megatron.core.pipeline_parallel.schedules import custom_backward, deallocat
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    _get_precision_preserving_h_post_bda,
+)
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -28,6 +36,13 @@ from megatron.core.transformer.multi_token_prediction import MultiTokenPredictio
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+# The GLM projection pair and the fixed-launch Triton Sinkhorn need both. The CPU test environment
+# can have Triton without CUDA, where a Triton-only mark would let these cases error instead of
+# skipping.
+_NEEDS_CUDA_TRITON = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason="needs CUDA and Triton"
+)
 
 
 class _DummyHybridLayer(MegatronModule):
@@ -755,6 +770,57 @@ def _stack(config):
     ).cuda()
 
 
+def _skip_unless_glm_pair_device():
+    """Skip unless the current device's capability is one the GLM projection pair accepts; read
+    after the rank's own device is bound, never at collection."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in glm.GLM_PAIR_DEVICE_CAPABILITIES:
+        pytest.skip(
+            f"the GLM projection pair is validated on {glm.GLM_PAIR_DEVICE_CAPABILITIES} only"
+        )
+
+
+def _same_bits(actual, expected):
+    """Equal dtype, shape and bit patterns (+0.0 and -0.0 differ); two Nones are equal."""
+    if actual is None or expected is None:
+        return actual is expected
+    return (
+        actual.dtype == expected.dtype
+        and actual.shape == expected.shape
+        and torch.equal(
+            actual.detach().reshape(-1).view(torch.uint8),
+            expected.detach().reshape(-1).view(torch.uint8),
+        )
+    )
+
+
+_GLM_RECOMPUTE = {
+    "full_uniform-nodsa": dict(
+        recompute_granularity="full", recompute_method="uniform", recompute_num_layers=2
+    ),
+    "full_uniform-dsa": dict(
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=2,
+        distribute_saved_activations=True,
+    ),
+    "full_block-nodsa": dict(
+        recompute_granularity="full", recompute_method="block", recompute_num_layers=2
+    ),
+    "full_block-dsa": dict(
+        recompute_granularity="full",
+        recompute_method="block",
+        recompute_num_layers=2,
+        distribute_saved_activations=True,
+    ),
+    "selective_mhc": dict(
+        recompute_granularity="selective",
+        recompute_modules=["core_attn", "mhc"],
+        mhc_recompute_layer_num=2,
+    ),
+}
+
+
 @pytest.mark.internal
 class TestHybridMHCContraction:
     def setup_method(self):
@@ -870,6 +936,119 @@ class TestHybridMHCContraction:
             torch.testing.assert_close(
                 parameter.grad, baseline.get_parameter(name).grad, msg=name, **grad_close_kwargs
             )
+
+    @_NEEDS_CUDA_TRITON
+    @pytest.mark.parametrize("recompute", list(_GLM_RECOMPUTE))
+    def test_glm_fused_pair_recompute_matches_forward_and_all_gradients(
+        self, monkeypatch, recompute
+    ):
+        """GLM's flags with [proj_rms, sinkhorn] under the triton policy: model-level full and
+        selective [mhc] recompute match the stack without recompute, and the projection pair
+        reruns only in the layers that full recompute replays."""
+        _skip_unless_glm_pair_device()
+        config_kwargs = dict(
+            mhc_learned_output_contract=False,
+            mhc_norm_eps_inside_sqrt=True,
+            mhc_normalize_before_projection=True,
+            mhc_keep_mappings_in_fp32=False,
+            mhc_keep_pre_in_fp32=True,
+            mhc_preserve_activation_dtype_rounding=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_fused_mhc=True,
+            mhc_fused_ops=["proj_rms", "sinkhorn"],
+            mhc_fused_backend="triton",
+        )
+        baseline = _stack(_config(**config_kwargs))
+        checkpointed = _stack(_config(**config_kwargs, **_GLM_RECOMPUTE[recompute]))
+        for stack in (baseline, checkpointed):
+            hyper_connections = [
+                module for module in stack.modules() if isinstance(module, HyperConnectionModule)
+            ]
+            assert len(hyper_connections) == 3
+            for hyper_connection in hyper_connections:
+                assert hyper_connection._glm_proj_rms_op is glm.glm_proj_rms_op("rn")
+                assert hyper_connection._sinkhorn_op is glm.fixed_launch_sinkhorn
+                assert hyper_connection._h_post_bda_op is _get_precision_preserving_h_post_bda()
+            convert_module_to_dtype_except_fp32_marked(stack, torch.bfloat16)
+        checkpointed.load_state_dict(baseline.state_dict(), strict=True)
+        # The pair's launchers, counted through the module globals its autograd Function calls,
+        # and the [mhc] recompute path's entries (selective_mhc's non-vacuity check, below).
+        calls, launches, mhc_checkpoint_calls = [], {}, {}
+
+        def counting(kind, launcher):
+            def launch(*args, **kwargs):
+                calls.append(kind)
+                return launcher(*args, **kwargs)
+
+            return launch
+
+        def end_phase(phase):
+            launches[phase] = {kind: calls.count(kind) for kind in ("fwd", "bwd")}
+            mhc_checkpoint_calls[phase] = calls.count("mhc")
+            calls.clear()
+
+        monkeypatch.setattr(glm, "_glm_proj_fwd", counting("fwd", glm._glm_proj_fwd))
+        monkeypatch.setattr(glm, "_glm_proj_bwd", counting("bwd", glm._glm_proj_bwd))
+        monkeypatch.setattr(
+            HyperConnectionModule,
+            "_forward_with_checkpoint",
+            counting("mhc", HyperConnectionModule._forward_with_checkpoint),
+        )
+        hidden = torch.randn(8, 2, 32, device="cuda", dtype=torch.bfloat16)
+        reference_input, actual_input = (hidden.clone().requires_grad_() for _ in range(2))
+        expected = baseline(reference_input, attention_mask=None)
+        end_phase("baseline_forward")
+        actual = checkpointed(actual_input, attention_mask=None)
+        end_phase("checkpointed_forward")
+        bitwise = {"output": _same_bits(actual, expected)}
+        grad = torch.randn_like(actual)
+        expected.backward(grad)
+        end_phase("baseline_backward")
+        actual.backward(grad)
+        end_phase("checkpointed_backward")
+        # Printed before the parity asserts, so that a failing id still records its readings.
+        bitwise["input_grad"] = _same_bits(actual_input.grad, reference_input.grad)
+        for name, parameter in checkpointed.named_parameters():
+            bitwise[name + ".grad"] = _same_bits(parameter.grad, baseline.get_parameter(name).grad)
+        print(
+            "HMHC_GLM_RECOMPUTE "
+            + json.dumps(
+                {
+                    "rank": int(os.environ.get("RANK", "0")),
+                    "recompute": recompute,
+                    "launches": launches,
+                    "mhc_forward_with_checkpoint": mhc_checkpoint_calls,
+                    "bitwise": bitwise,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
+        for name, parameter in checkpointed.named_parameters():
+            torch.testing.assert_close(parameter.grad, baseline.get_parameter(name).grad, msg=name)
+        # MODELED: one forward and one backward launch per layer and stack; full recompute
+        # replays the forward of every checkpointed layer (uniform: chunks [0, 1] and [2];
+        # block: layers 0 and 1), and [mhc] recompute does not checkpoint compute_mappings.
+        replays = {"full_uniform": 3, "full_block": 2, "selective_mhc": 0}[recompute.split("-")[0]]
+        assert launches == {
+            "baseline_forward": {"fwd": 3, "bwd": 0},
+            "checkpointed_forward": {"fwd": 3, "bwd": 0},
+            "baseline_backward": {"fwd": 0, "bwd": 3},
+            "checkpointed_backward": {"fwd": replays, "bwd": 3},
+        }
+        # Non-vacuity of selective_mhc (MODELED; CPU dry run 3 / 0): [mhc] recompute enters
+        # _forward_with_checkpoint once per layer in the checkpointed forward, and never in the
+        # baseline, in a backward phase or in the four full ids.
+        engaged = 3 if recompute.split("-")[0] == "selective_mhc" else 0
+        assert mhc_checkpoint_calls == {
+            "baseline_forward": 0,
+            "checkpointed_forward": engaged,
+            "baseline_backward": 0,
+            "checkpointed_backward": 0,
+        }
 
     @pytest.mark.parametrize("mtp_hyper_connections", [None, False, True])
     def test_mean_contraction_preserves_multistream_mtp_handoff(self, mtp_hyper_connections):
