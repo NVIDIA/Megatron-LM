@@ -130,7 +130,7 @@ TE key mapping); it does not duplicate checkpoint locations. The teacher's own c
 
 Post-training CLI entry points use `modelopt_inference_config_from_args(args)`
 once, before runtime initialization. After tokenizer setup,
-`resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)` finalizes the same
+`resolve_tokenizer_vocab_size(cfg)` finalizes the same
 model config. Call `build_inference_models(cfg)` to construct it without DDP.
 CPU export passes `device="cpu"`; conversion disables the precision wrapper with
 `mixed_precision=False`.

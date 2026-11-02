@@ -115,7 +115,8 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     cfg = mc.modelopt_inference_config_from_args(make_modelopt_test_args())
     model = cfg.model
     model.vocab_size = None
-    resolve_tokenizer_vocab_size(cfg, 32768)
+    cfg.tokenizer.padded_vocab_size = 32768
+    resolve_tokenizer_vocab_size(cfg)
     with (
         patch("megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"),
         patch.object(GPTModelBuilder, "build_distributed_models") as build,
@@ -203,7 +204,7 @@ def test_inference_uses_config_without_cli_enable_flag():
     loaded = []
     with (
         patch.object(utils, "get_args", return_value=args),
-        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
+        patch.object(utils, "get_run_config", return_value=cfg),
         patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
         patch.object(utils, "build_inference_models", return_value=[stage]) as build,
         patch.object(utils, "get_model_builder") as legacy_builder,
@@ -241,7 +242,7 @@ def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hy
 
     with (
         patch.object(utils, "get_args", return_value=args),
-        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
+        patch.object(utils, "get_run_config", return_value=cfg),
         patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
         patch.object(utils, "should_use_modelopt_config", return_value=True),
         patch.object(mc, "build_inference_models", return_value=[stage]) as build,

@@ -258,15 +258,15 @@ class TestModelOptModelConfigFromArgs:
 
     def test_architecture_options_come_from_core_arguments(self):
         # The --export- spellings are deprecated aliases of the core flags.
+        # The helper pins position_embedding_type to rope, so yarn goes through overrides.
         args = make_modelopt_test_args(
             [
                 "--export-qk-l2-norm",
-                "--position-embedding-type",
-                "yarn",
                 "--rotary-scaling-factor",
                 "32.0",
                 "--no-yarn-correction-range-round-to-int",
-            ]
+            ],
+            position_embedding_type="yarn",
         )
 
         config = mc.modelopt_model_config_from_args(args)
@@ -780,10 +780,7 @@ class TestConfigurationDrivenKDLoss:
             "logits_loss": torch.tensor(3.0),
             "intermediate_loss": torch.tensor(4.0),
         }
-        with (
-            patch("megatron.post_training.loss_func.unwrap_model", return_value=model),
-            patch("megatron.post_training.loss_func.get_args", return_value=Namespace()),
-        ):
+        with patch("megatron.post_training.loss_func.unwrap_model", return_value=model):
             loss, tokens, report = loss_func(torch.ones(2), torch.tensor([1.0, 2.0]), model)
         assert loss.item() == (7.0 if training else 3.0)
         assert tokens.item() == 2
