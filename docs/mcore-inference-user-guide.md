@@ -389,8 +389,8 @@ asyncio.run(main())
 | `num_tokens_total` | Cap on prompt + generated length. Mutually exclusive with `num_tokens_to_generate` |
 | `temperature` | Softmax temperature (`1.0` = unmodified) |
 | `seed` | Optional nonnegative int64 request seed; dynamic Torch sampling only |
-| `top_k` | Keep top-k logits (`0` = disabled) |
-| `top_p` | Nucleus sampling threshold (`0.0` = disabled) |
+| `top_k` | Keep top-k logits (`0` = disabled; `1` = greedy, the lowest-index maximum) |
+| `top_p` | Nucleus sampling threshold (`0.0` = disabled); applied after `top_k` when both are set |
 | `termination_id` | Token id that stops generation (commonly the EOD token) |
 | `stop_words` | List of strings that stop generation when produced |
 | `detokenize_stop_sequence` | Keep the stop word and EOD in `generated_text` |

@@ -109,3 +109,21 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
 
     assert result is output
     torch.testing.assert_close(result, logits[gather].argmax(dim=-1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_temperature_scaling_runs_in_fp32(dtype):
+    """The sampler scales fp32(logits) / T whatever the logits' dtype.
+
+    Logits reach the sampler in bf16 with CUDA graphs, PP > 1 or an unwrapped model. Divided in
+    bf16, LM-head-like rows (max logit 15-30) at T = 0.7 move ~2% of the sampling mass.
+    """
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn(8, 32000, generator=generator, dtype=torch.float64) * 2.5
+    logits[:, :50] = 8 + 17 * torch.rand(8, 50, generator=generator, dtype=torch.float64)
+    logits = logits.to(dtype)
+
+    scaled = TorchSampling.filter_logits(logits, 0.7, 0, 0.0)
+
+    assert scaled.dtype == torch.float32
+    assert torch.equal(scaled, logits.float() / 0.7)

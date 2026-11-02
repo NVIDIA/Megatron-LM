@@ -66,7 +66,8 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
+from megatron.core.inference.sampling_params import MIN_SAMPLING_TEMPERATURE, SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -3764,6 +3765,64 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert serialized_event_tokens == merged.generated_tokens
 
 
+# Fixed logits for the sampling tests: ids 0..9 carry 10 - 0.25 i (exact in bf16), all others -30.
+_SAMPLING_LOGITS = [10.0 - 0.25 * i for i in range(10)]
+
+
+def _sampling_support(temperature: float, top_k: int, top_p: float) -> set:
+    """Token ids of the fp64 top-k-then-top-p distribution over the fixed sampling logits."""
+    logits = torch.full((DynamicEngineTestConfig.vocab_size,), -30.0, dtype=torch.float64)
+    logits[: len(_SAMPLING_LOGITS)] = torch.tensor(_SAMPLING_LOGITS, dtype=torch.float64)
+    logits /= max(temperature, MIN_SAMPLING_TEMPERATURE)
+    order = torch.argsort(logits, descending=True, stable=True)
+    kept = order[:top_k] if top_k > 0 else order
+    probs = torch.softmax(logits[kept], dim=-1)
+    if 0.0 < top_p < 1.0:
+        kept = kept[torch.cumsum(probs, 0) - probs <= top_p]
+    return set(kept.tolist())
+
+
+def _use_fixed_sampling_logits(env: DynamicEngineTestEnv) -> None:
+    """Make the model return the fixed sampling logits for every token."""
+    context = env.engine.context
+
+    def forward(*args, **kwargs):
+        tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+        logits = torch.full(
+            (*tokens.shape, env.config.vocab_size), -30.0, dtype=torch.bfloat16, device="cuda"
+        )
+        logits[..., : len(_SAMPLING_LOGITS)] = torch.tensor(
+            _SAMPLING_LOGITS, dtype=torch.bfloat16, device="cuda"
+        )
+        if env.config.materialize_only_last_token_logits:
+            logits = context.last_token_logits(logits).unsqueeze(0)
+        return logits
+
+    env.engine.controller.inference_wrapped_model.model.forward = forward
+
+
+def _serve_requests(
+    env: DynamicEngineTestEnv, prompts: List[List[int]], sampling_params: List[SamplingParams]
+) -> Dict[int, DynamicInferenceRequest]:
+    """Add one request per prompt and step the engine until all finish; return them by id."""
+    for request_id, (prompt, params) in enumerate(zip(prompts, sampling_params)):
+        env.engine._add_request(
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.tensor(prompt, dtype=torch.int64, device="cuda"),
+                sampling_params=params,
+            )
+        )
+    finished = {}
+    for _ in range(200):
+        if not env.engine.has_unfinished_requests():
+            break
+        for request in env.engine.step_modern()["finished_requests"]:
+            finished[request.request_id] = request
+    assert not env.engine.has_unfinished_requests()
+    return finished
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
@@ -4748,6 +4807,175 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert (
             generated_tokens[AsyncScheduleMode.ASYNC] == generated_tokens[AsyncScheduleMode.LEGACY]
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize(
+        "top_k, top_p", [(4, 0.0), (4, 0.7), (1, 0.7)], ids=["top-k", "top-k-top-p", "greedy-top-p"]
+    )
+    @torch.inference_mode()
+    def test_filtered_request_is_served_next_to_plain_request(self, sampling_backend, top_k, top_p):
+        """Top-k and top-p together sample top-p over the renormalized top-k set, on any backend.
+
+        Top-4 then top-0.7 keeps {0, 1, 2} of the fixed logits; the plain request in the same
+        batch must finish too.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=3,
+                max_prompt_length=3,
+                num_tokens_to_generate=8,
+                sampling_backend=sampling_backend,
+            )
+        )
+        _use_fixed_sampling_logits(env)
+        params = [
+            SamplingParams(num_tokens_to_generate=8, termination_id=-1),
+            SamplingParams(num_tokens_to_generate=8, termination_id=-1, top_k=top_k, top_p=top_p),
+        ]
+
+        finished = _serve_requests(env, [[1, 2, 3], [4, 5, 6]], params)
+
+        assert _sampling_support(1.0, 4, 0.7) == {0, 1, 2}
+        for request_id, request_params in enumerate(params):
+            request = finished[request_id]
+            assert request.status == Status.COMPLETED
+            assert len(request.generated_tokens) == 8
+            support = _sampling_support(1.0, request_params.top_k, request_params.top_p)
+            assert set(request.generated_tokens) <= support
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "generation_config, filters",
+        [
+            pytest.param({"temperature": 0.6, "top_p": 0.95}, (0, 0.95), id="top-p"),
+            pytest.param(
+                {"temperature": 0.6, "top_p": 0.95, "top_k": 20}, (20, 0.95), id="top-k-top-p"
+            ),
+            pytest.param({"do_sample": False, "top_p": 0.9}, (1, 0.9), id="do-sample-false-top-p"),
+        ],
+    )
+    def test_generation_config_sampling_defaults_are_served(self, generation_config, filters):
+        """A request that omits its filters gets the model card's, and the engine serves them.
+
+        `/v1/completions` resolves Qwen-style `generation_config.json` defaults to both top-k and
+        top-p, and `do_sample: false` to top-k 1 next to a declared top-p.
+        """
+        pytest.importorskip("quart")
+        from tests.unit_tests.inference.test_endpoints_common import (
+            COMPLETIONS_PATH,
+            ReplyingClient,
+            Tokenizer,
+            build_app,
+        )
+
+        tokenizer = Tokenizer()
+        tokenizer.generation_config = generation_config
+        client = ReplyingClient()
+        app = build_app(COMPLETIONS_PATH, client, tokenizer=tokenizer)
+        # A private loop: asyncio.run() would also clear the loop the engine was built on.
+        loop = asyncio.new_event_loop()
+        try:
+            response = loop.run_until_complete(
+                app.test_client().post(COMPLETIONS_PATH, json={"prompt": "hi", "max_tokens": 8})
+            )
+        finally:
+            loop.close()
+        assert response.status_code == 200
+        (params,) = client.sampling_params
+        assert (params.top_k, params.top_p) == filters
+
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0, min_prompt_length=2, max_prompt_length=4, num_tokens_to_generate=8
+            )
+        )
+        _use_fixed_sampling_logits(env)
+        with torch.inference_mode():
+            finished = _serve_requests(env, client.prompt_tokens, [params])
+
+        assert finished[0].status == Status.COMPLETED
+        assert finished[0].generated_tokens
+        support = _sampling_support(params.temperature, params.top_k, params.top_p)
+        assert set(finished[0].generated_tokens) <= support
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "num_cuda_graphs, float16_module",
+        [
+            pytest.param(None, True, id="float16-module"),
+            pytest.param(None, False, id="unwrapped-model"),
+            pytest.param(1, True, id="cuda-graphs"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_torch_sampling_scales_logits_in_fp32(
+        self, monkeypatch, num_cuda_graphs, float16_module
+    ):
+        """The torch backend divides fp32(logits) by the temperature, whatever dtype arrives.
+
+        `Float16Module` upcasts the logits of an eager step, but the local CUDA-graph logits
+        buffer (like PP > 1 and an unwrapped model) hands the sampler bf16.
+        """
+        graph_config = dict(
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=True,
+            context_max_requests=32,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                sampling_backend="torch",
+                **(graph_config if num_cuda_graphs else {}),
+            )
+        )
+        controller = env.engine.controller
+        assert controller._enable_cuda_graph == bool(num_cuda_graphs)
+        if float16_module:
+            # Float16Module's last-stage upcast of the model output.
+            model = controller.inference_wrapped_model.model
+            forward = model.forward
+            model.forward = lambda *args, **kwargs: forward(*args, **kwargs).float()
+
+        records = []
+        filter_logits = TorchSampling.filter_logits
+
+        def recording_filter_logits(logits, temperature, top_k, top_p, **kwargs):
+            scaled = filter_logits(logits, temperature, top_k, top_p, **kwargs)
+            records.append((logits.clone(), temperature, scaled.clone()))
+            return scaled
+
+        monkeypatch.setattr(TorchSampling, "filter_logits", staticmethod(recording_filter_logits))
+        params = [
+            SamplingParams(num_tokens_to_generate=4, termination_id=-1, temperature=0.7)
+            for _ in range(2)
+        ]
+
+        finished = _serve_requests(env, [[1, 2, 3, 4], [2, 3, 4, 5]], params)
+
+        assert len(finished) == 2 and records
+        logits_dtype = torch.float32 if float16_module and not num_cuda_graphs else torch.bfloat16
+        for logits, temperature, scaled in records:
+            assert logits.dtype == logits_dtype
+            assert temperature == pytest.approx(0.7)
+            assert scaled.dtype == torch.float32
+            assert torch.equal(scaled, logits.float() / temperature)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

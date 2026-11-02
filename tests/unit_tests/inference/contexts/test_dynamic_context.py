@@ -4823,12 +4823,16 @@ def test_flashinfer_sample_kernel_dispatch(
         getattr(fake.sampling, name).return_value = torch.zeros(n, dtype=torch.int32)
     monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
 
+    metadata = {
+        "temperature": torch.ones(n),
+        "top_k": torch.tensor(top_k, dtype=torch.int32),
+        "top_p": torch.tensor(top_p),
+    }
     context = SimpleNamespace(
-        gpu_view=SimpleNamespace(
-            temperature=torch.ones(n),
-            top_k=torch.tensor(top_k, dtype=torch.int32),
-            top_p=torch.tensor(top_p),
-        )
+        gpu_view=SimpleNamespace(**metadata),
+        active_request_metadata=metadata,
+        total_request_count=n,
+        paused_request_count=0,
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
