@@ -682,6 +682,19 @@ class OptimizerConfig:
                 'distributed checkpointing yet'
             )
 
+        if ckpt_format == "torch" and self.uses_layer_wise_distributed_optimizer():
+            # Imported here: the distributed package imports the optimizer package.
+            from ..distributed.distributed_data_parallel_config import (
+                resolve_layer_wise_param_layout,
+            )
+
+            if resolve_layer_wise_param_layout(ddp_config.layer_wise_param_layout) != "legacy":
+                raise ValueError(
+                    "--ckpt-format torch does not save the state of the DistributedOptimizer that "
+                    "the padded and compact LayerWise layouts chain next to the layer-wise "
+                    "optimizer. Use --ckpt-format torch_dist, or the legacy layout."
+                )
+
     def validate_model(
         self, *, moe_single_grouped_weight: bool, virtual_pipeline_model_parallel_size: int | None
     ) -> None:
