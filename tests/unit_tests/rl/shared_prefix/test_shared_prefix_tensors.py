@@ -53,9 +53,13 @@ from tests.unit_tests.rl.shared_prefix.shared_prefix_oracles import (
 VOCAB, WIDTH, MAX_POSITION = 50, 8, 128
 
 
-def _cp_shards(tensor_bin, cp_size, **kwargs):
-    shard = shard_shared_prefix_tensor_bin_for_context_parallel
-    return [shard(tensor_bin, cp_rank=rank, cp_size=cp_size, **kwargs) for rank in range(cp_size)]
+def _cp_shards(tensor_bin, cp_size, *, tp_size=1, padding_multiple=None):
+    shard = partial(
+        shard_shared_prefix_tensor_bin_for_context_parallel,
+        tp_size=tp_size,
+        padding_multiple=padding_multiple,
+    )
+    return [shard(tensor_bin, cp_rank=rank, cp_size=cp_size) for rank in range(cp_size)]
 
 
 def _unshard(shards):

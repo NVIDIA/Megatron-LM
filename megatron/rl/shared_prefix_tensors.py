@@ -204,16 +204,18 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     *,
     cp_rank: int,
     cp_size: int,
-    tp_size: int = 1,
+    tp_size: int,
+    padding_multiple: int | None,
     padding_token_id: int = 0,
-    padding_multiple: int | None = None,
 ) -> SharedPrefixContextParallelShard:
     """Pad and shard a materialized star for MCore context parallelism.
 
     The logical layout remains unpadded.  Padding is appended after all real
     branches, so causality guarantees that it cannot influence a real token;
     a model backend must mask padded queries/keys, and the caller never selects
-    their logits for the loss.
+    their logits for the loss. ``tp_size`` and ``padding_multiple`` have no
+    defaults because the padded length depends on both; ``padding_multiple=None``
+    selects the topology quantum of ``tp_size`` and ``cp_size``.
     """
     total_length = tensor_bin.layout.physical_total_length
     resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
