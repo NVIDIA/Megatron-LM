@@ -9,9 +9,10 @@ forked, differentiably, into every completion branch, including at CP>1 through
 sequence-to-head collectives. ``NRL_SP_MAMBA_IMPL`` selects the implementation; the default,
 ``ragged_state_fork``, uses the ragged forest kernels in :mod:`megatron.core.ssm.mamba_ragged`.
 
-The layer runs through its normal module call: a per-call :class:`MambaSharedPrefixCall` on its
-``MambaMixer`` makes ``MambaMixer.forward`` run the shared-prefix scan, and ``MambaLayer.forward``
-keeps the norm, residual and bias-dropout-add, so module hooks fire as on the dense path.
+The layer runs through its normal module call: a per-call :class:`MambaSharedPrefixCall`, passed
+as the ``shared_prefix_call`` argument of ``MambaLayer.forward`` and on to ``MambaMixer.forward``,
+makes the mixer run the shared-prefix scan, and ``MambaLayer.forward`` keeps the norm, residual
+and bias-dropout-add, so module hooks fire as on the dense path.
 
 :func:`validate_mamba_layer_shared_prefix` rejects unsupported layers; callers run it for every
 Mamba layer before any layer executes.
@@ -313,8 +314,9 @@ def _scan_mamba_shared_prefix_root(
 class MambaSharedPrefixCall:
     """One shared-prefix request that ``MambaMixer.forward`` serves in place of its dense scan.
 
-    :func:`forward_mamba_layer_shared_prefix` attaches it to ``MambaMixer._shared_prefix_call``
-    for a single ``MambaLayer`` call. ``consumed`` records that the mixer served it.
+    :func:`forward_mamba_layer_shared_prefix` passes it as the ``shared_prefix_call`` argument of
+    a single ``MambaLayer`` call, which hands it to ``MambaMixer.forward``. ``consumed`` records
+    that the mixer served it.
     """
 
     layout: SharedPrefixLayout | SharedPrefixForestLayout
@@ -329,7 +331,7 @@ def forward_mamba_mixer_shared_prefix(
 ) -> tuple[Tensor, Tensor | None]:
     """Run the mixer half of a TP/SP/CP Mamba star: input projection, scan, gated norm, output.
 
-    ``MambaMixer.forward`` calls this when ``call`` is attached; ``MambaLayer.forward`` applies
+    ``MambaMixer.forward`` calls this when it receives ``call``; ``MambaLayer.forward`` applies
     the pre-norm, residual and bias-dropout-add around it exactly as on the dense path.
 
     The input projection first gathers sequence-parallel TP shards, then the CP adapter converts
@@ -396,7 +398,7 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
 ) -> Tensor:
     """Run one Mamba star through ``MambaLayer.__call__`` and ``MambaMixer.__call__``.
 
-    The request rides on ``MambaMixer._shared_prefix_call`` for this one call, so the layer and
+    The request is the ``shared_prefix_call`` argument of this one layer call, so the layer and
     mixer module hooks (Megatron FSDP unshard, prefetch and reshard, per-module parameter
     gathers) run as on the dense path. :func:`forward_mamba_mixer_shared_prefix` does the mixer
     half.
@@ -405,25 +407,18 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
         raise ValueError("Ragged state forking cannot use prefix replay")
     if packed_recurrence and replay_prefix:
         raise ValueError("Packed recurrence and per-root replay are separate modes")
-    mixer = layer.mixer
-    if getattr(mixer, "_shared_prefix_call", None) is not None:
-        raise RuntimeError("nested shared-prefix Mamba dispatch is not supported")
     call = MambaSharedPrefixCall(
         layout,
         replay_prefix=replay_prefix,
         packed_recurrence=packed_recurrence,
         ragged_state_fork=ragged_state_fork,
     )
-    mixer._shared_prefix_call = call
-    try:
-        output = layer(hidden_states=hidden_states, attention_mask=None)
-    finally:
-        del mixer._shared_prefix_call
-    # A mixer or layer forward that never reads the request would silently run dense Mamba.
+    output = layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_call=call)
+    # A forward that accepts the request but never serves it would silently run dense Mamba.
     if not call.consumed:
         raise RuntimeError(
-            f"{type(layer).__name__} with {type(mixer).__name__} ignored the shared-prefix "
-            "request; its forward must dispatch MambaMixer._shared_prefix_call"
+            f"{type(layer).__name__} with {type(layer.mixer).__name__} ignored the shared-prefix "
+            "request; its forward must pass shared_prefix_call to MambaMixer.forward"
         )
     return output[0] if isinstance(output, tuple) else output
 

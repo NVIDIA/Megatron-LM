@@ -4,8 +4,9 @@
 
 Module hooks, such as Megatron FSDP's unshard, prefetch and reshard hooks and its per-module
 parameter gathers, fire only on module calls, so the shared-prefix forward must reach the mixer
-through the layer as the dense forward does. The CPU tests use bare modules and a stubbed mixer
-half; the GPU test runs each differentiable backend on a real layer.
+through the layer as the dense forward does. The request travels as the ``shared_prefix_call``
+argument of both calls. The CPU tests use bare modules and a stubbed mixer half; the GPU test
+runs each differentiable backend on a real layer.
 """
 
 import pytest
@@ -69,15 +70,16 @@ def _select_impl(monkeypatch, impl):
         monkeypatch.setenv("NRL_SP_MAMBA_IMPL", impl)
 
 
-def _record_module_calls(layer, events):
+def _record_module_calls(layer, events, call_kwargs):
+    """Record hook order, and the ``shared_prefix_call`` each module call received."""
     for name, module in (("layer", layer), ("mixer", layer.mixer)):
-        module.register_forward_pre_hook(lambda m, args, name=name: events.append(f"{name}_pre"))
+
+        def pre_hook(module, args, kwargs, name=name):
+            events.append(f"{name}_pre")
+            call_kwargs[name] = kwargs.get("shared_prefix_call")
+
+        module.register_forward_pre_hook(pre_hook, with_kwargs=True)
         module.register_forward_hook(lambda m, args, out, name=name: events.append(f"{name}_post"))
-
-
-def _assert_request_removed(layer):
-    assert "_shared_prefix_call" not in vars(layer.mixer)
-    assert layer.mixer._shared_prefix_call is None
 
 
 @pytest.mark.parametrize("impl", list(_SET_FLAGS))
@@ -93,7 +95,8 @@ def test_shared_prefix_forward_runs_layer_and_mixer_module_calls(monkeypatch, im
     monkeypatch.setattr(mamba_shared_prefix, "forward_mamba_mixer_shared_prefix", mixer_half)
     _select_impl(monkeypatch, impl)
     layer = _layer()
-    _record_module_calls(layer, events)
+    call_kwargs = {}
+    _record_module_calls(layer, events, call_kwargs)
     hidden_states = torch.randn(_LAYOUT.total_len, 1, _HIDDEN)
 
     output = mamba_shared_prefix.forward_mamba_layer_shared_prefix(layer, hidden_states, _LAYOUT)
@@ -102,23 +105,35 @@ def test_shared_prefix_forward_runs_layer_and_mixer_module_calls(monkeypatch, im
     (request,) = requests
     assert request.layout is _LAYOUT
     assert {flag for flag in _FLAGS if getattr(request, flag)} == _SET_FLAGS[impl]
+    assert call_kwargs == {"layer": request, "mixer": request}
     # MambaLayer.forward adds the residual to the mixer output.
     torch.testing.assert_close(output, 3 * hidden_states)
-    _assert_request_removed(layer)
 
 
-def test_request_is_removed_when_the_layer_raises(monkeypatch):
-    def mixer_half(mixer, hidden_states, call):
-        raise RuntimeError("boom")
+class _RecordingMixer(torch.nn.Module):
+    """A mixer stand-in that records the keyword arguments of each call."""
 
-    monkeypatch.setattr(mamba_shared_prefix, "forward_mamba_mixer_shared_prefix", mixer_half)
-    monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, hidden_states, **kwargs):
+        self.calls.append(kwargs)
+        return hidden_states, None
+
+
+def test_layer_passes_shared_prefix_call_to_the_mixer_only_when_set():
     layer = _layer()
-    with pytest.raises(RuntimeError, match="boom"):
-        mamba_shared_prefix.forward_mamba_layer_shared_prefix(
-            layer, torch.zeros(_LAYOUT.total_len, 1, _HIDDEN), _LAYOUT
-        )
-    _assert_request_removed(layer)
+    layer.mixer = _RecordingMixer()
+    hidden_states = torch.zeros(_LAYOUT.total_len, 1, _HIDDEN)
+    call = mamba_shared_prefix.MambaSharedPrefixCall(_LAYOUT)
+
+    layer(hidden_states=hidden_states, attention_mask=None)
+    layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_call=call)
+
+    dense, shared = layer.mixer.calls
+    assert "shared_prefix_call" not in dense
+    assert shared["shared_prefix_call"] is call
 
 
 class _DenseOnlyMixer(MambaMixer):
@@ -135,24 +150,22 @@ def test_forward_that_ignores_the_request_fails_closed(monkeypatch):
         mamba_shared_prefix.forward_mamba_layer_shared_prefix(
             layer, torch.zeros(_LAYOUT.total_len, 1, _HIDDEN), _LAYOUT
         )
-    _assert_request_removed(layer)
 
 
-def test_nested_dispatch_is_rejected(monkeypatch):
-    layer = _layer()
+class _NoRequestMixer(MambaMixer):
+    """A mixer whose forward does not take the shared-prefix request."""
 
-    def mixer_half(mixer, hidden_states, call):
-        call.consumed = True
-        inner = mamba_shared_prefix.forward_mamba_layer_shared_prefix(layer, hidden_states, _LAYOUT)
-        return inner, None
+    def forward(self, hidden_states, inference_context=None, *, packed_seq_params=None):
+        return hidden_states, None
 
-    monkeypatch.setattr(mamba_shared_prefix, "forward_mamba_mixer_shared_prefix", mixer_half)
+
+def test_forward_without_the_request_argument_fails(monkeypatch):
     monkeypatch.delenv("NRL_SP_MAMBA_IMPL", raising=False)
-    with pytest.raises(RuntimeError, match="nested shared-prefix Mamba dispatch"):
+    layer = _layer(_NoRequestMixer)
+    with pytest.raises(TypeError, match="shared_prefix_call"):
         mamba_shared_prefix.forward_mamba_layer_shared_prefix(
             layer, torch.zeros(_LAYOUT.total_len, 1, _HIDDEN), _LAYOUT
         )
-    _assert_request_removed(layer)
 
 
 @pytest.mark.parametrize(
@@ -160,9 +173,9 @@ def test_nested_dispatch_is_rejected(monkeypatch):
 )
 def test_mixer_rejects_packed_or_inference_inputs_with_a_request(kwargs):
     mixer = _layer().mixer
-    mixer._shared_prefix_call = mamba_shared_prefix.MambaSharedPrefixCall(_LAYOUT)
+    call = mamba_shared_prefix.MambaSharedPrefixCall(_LAYOUT)
     with pytest.raises(NotImplementedError, match="static, unpacked training"):
-        mixer(torch.zeros(_LAYOUT.total_len, 1, _HIDDEN), **kwargs)
+        mixer(torch.zeros(_LAYOUT.total_len, 1, _HIDDEN), shared_prefix_call=call, **kwargs)
 
 
 @pytest.mark.skipif(
@@ -210,4 +223,3 @@ class TestSharedPrefixMambaModuleCalls:
         assert output.shape == hidden_states.shape
         assert hidden_states.grad is not None
         assert all(parameter.grad is not None for parameter in layer.parameters())
-        _assert_request_removed(layer)

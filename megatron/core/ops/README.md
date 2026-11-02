@@ -42,7 +42,8 @@ megatron/core/ops/
     ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
     ├── csa/               modules.py
     ├── mla.py             absorbed MLA
-    └── dsv4.py            DeepSeek-v4 hybrid attention
+    ├── dsv4.py            DeepSeek-v4 hybrid attention
+    └── shared_prefix.py   shared-prefix forest attention
 ```
 
 A family gains `backends.py` and `reference.py` when it adopts the selector pattern
@@ -60,6 +61,7 @@ below; until then its module carries the availability checks it had before the m
 | `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
 | `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
 | `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
+| `attention/shared_prefix.py` | Shared-prefix forest attention: FlashAttention 2 varlen passes with an exact backward, and its context-parallel transforms |
 
 Within a family the file roles are fixed:
 

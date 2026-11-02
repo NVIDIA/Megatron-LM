@@ -8,7 +8,8 @@ reference; their error must stay within twice the error of ordinary FlashAttenti
 the dense, unshared ``[prompt, completion]`` branches. CP1/2/4 tests use real NCCL
 exchanges and real FlashAttention forward/backward. No CUDA compute or communication
 implementation is substituted. The pass-plan, validation and cache tests run on CPU. One
-replay drives the shared-prefix branch of ``SelfAttention.forward`` at CP1 and CP2.
+replay drives the shared-prefix branch of ``SelfAttention.forward`` at CP1 and CP2 and checks
+that the forest kernel, not core attention, runs.
 """
 
 import itertools
@@ -26,6 +27,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     run_once,
     seeded,
 )
+from tests.unit_tests.determinism.kernels.test_runtime_cp_attention import _zigzag_shard
 from tests.unit_tests.determinism.utils import RacingStreams
 
 _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native CUDA")
@@ -33,11 +35,11 @@ _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires nativ
 
 @pytest.fixture
 def attention(monkeypatch):
-    """Return the attention module with an empty plan cache."""
-    from megatron.core.transformer import shared_prefix_attention
+    """Return the forest attention module with an empty plan cache."""
+    from megatron.core.ops.attention import shared_prefix
 
-    monkeypatch.setattr(shared_prefix_attention, "_PLAN_CACHE", {})
-    return shared_prefix_attention
+    monkeypatch.setattr(shared_prefix, "_PLAN_CACHE", {})
+    return shared_prefix
 
 
 def _stars(*stars):
@@ -135,58 +137,102 @@ def test_plan_attends_each_visible_pair_exactly_once(attention, forest):
 
 
 @pytest.mark.parametrize(
-    "forest,match",
+    "forest, batch, match",
     [
-        ([], "at least one star"),
-        ([(1, 4, [2])], "contiguously from token 0"),
-        ([(0, 4, [2]), (7, 3, [1])], "contiguously from token 0"),
-        ([(0, 0, [2])], "empty prompt or completion"),
-        ([(0, 3, [2, 0])], "empty prompt or completion"),
-        ([(0, 40, [50, 30])], "covers 120 tokens but the sequence has 100"),
+        ([], 1, "at least one star"),
+        ([(1, 4, [2])], 1, "contiguously from token 0"),
+        ([(0, 4, [2]), (7, 3, [1])], 1, "contiguously from token 0"),
+        ([(0, 0, [2])], 1, "empty prompt or completion"),
+        ([(0, 3, [2, 0])], 1, "empty prompt or completion"),
+        ([(0, 40, [50, 30])], 1, "covers 120 tokens but the sequence has 100"),
+        ([(0, 4, [4])], 2, "single packed sequence"),
     ],
 )
-def test_invalid_forest_is_rejected_before_attention(attention, forest, match):
-    """Malformed forests raise before any attention kernel runs."""
-    query = torch.zeros(100, 1, 2, 8)
+def test_invalid_inputs_are_rejected_before_attention(attention, forest, batch, match):
+    """Malformed forests and batched inputs raise before any attention kernel runs."""
+    query = torch.zeros(100, batch, 2, 8)
     with pytest.raises(ValueError, match=match):
         attention.flash_composed_forest_attention(query, query, query, forest)
 
 
-def test_multiple_packed_sequences_are_rejected(attention):
-    """Shared-prefix attention takes one packed sequence."""
-    query = torch.zeros(8, 2, 2, 8)
-    with pytest.raises(ValueError, match="single packed sequence"):
-        attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
+@pytest.fixture
+def flash_attn_install(attention, monkeypatch):
+    """Let ``require`` see a flash-attn stand-in of a given version; ``None`` is not installed.
 
+    ``install(version)`` returns the list of module names ``require`` imports. The cached binding
+    is cleared before and after, so later tests bind the installed flash-attn again.
+    """
+    from types import SimpleNamespace
 
-def test_old_flash_attention_is_rejected_before_attention(attention, monkeypatch):
-    """The exact backward binds FlashAttention 2.7+ private keyword arguments."""
     from packaging.version import Version
 
-    from megatron.core import utils
+    from megatron.core.ops import _backends
 
-    monkeypatch.setattr(utils, "_fa_version", Version("2.6.3"))
+    imported = []
+
+    def install(version):
+        def import_module(name):
+            imported.append(name)
+            if version is None:
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return SimpleNamespace(
+                flash_attn_varlen_func=object(), _flash_attn_varlen_backward=object()
+            )
+
+        monkeypatch.setattr(_backends, "import_module", import_module)
+        monkeypatch.setattr(_backends, "installed_version", lambda *_args: Version(version))
+        attention._flash_attn_interface.cache_clear()
+        return imported
+
+    yield install
+    attention._flash_attn_interface.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "version, match",
+    [
+        (None, r"Shared-prefix forest attention requires flash_attn\.flash_attn_interface: No"),
+        ("2.6.3", r"requires flash_attn\.flash_attn_interface>=2\.7\.0; found 2\.6\.3"),
+    ],
+)
+def test_missing_or_old_flash_attention_is_rejected(attention, flash_attn_install, version, match):
+    """The exact backward binds FlashAttention 2.7+ private keyword arguments, so a missing or
+    older flash-attn fails the validation and the kernel before any pass runs."""
+    from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
+
+    flash_attn_install(version)
+    with pytest.raises(ImportError, match=match):
+        attention.require_shared_prefix_flash_attn()
+    with pytest.raises(ImportError, match=match):
+        validate_shared_prefix_attention(_validated_attention(), tp_size=1, cp_size=1)
     query = torch.zeros(8, 1, 2, 8)
-    with pytest.raises(RuntimeError, match=r"flash-attn >= 2\.7\.0"):
+    with pytest.raises(ImportError, match=match):
         attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
 
 
-@pytest.mark.parametrize("installed", [False, True])
-def test_missing_or_old_flash_attention_fails_validation(attention, monkeypatch, installed):
-    """require_shared_prefix_flash_attn reports a missing flash-attn like an old one."""
-
-    def is_fa_min_version(version):
-        if not installed:
-            raise ImportError("No module named 'flash_attn'")
-        return False
-
-    monkeypatch.setattr(attention, "is_fa_min_version", is_fa_min_version)
-    with pytest.raises(RuntimeError, match=r"flash-attn >= 2\.7\.0"):
-        attention.require_shared_prefix_flash_attn()
+def test_flash_attention_is_bound_once(attention, flash_attn_install):
+    """The first check imports flash-attn; later checks reuse the bound module."""
+    imported = flash_attn_install("2.7.0")
+    attention.require_shared_prefix_flash_attn()
+    attention.require_shared_prefix_flash_attn()
+    assert imported == ["flash_attn.flash_attn_interface"]
 
 
-def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=False, **config):
-    """A SelfAttention stand-in with the attributes the validation reads, and its config."""
+def _validated_attention(
+    *,
+    spec=None,
+    core_attention=None,
+    tp=1,
+    cp=1,
+    kv_heads=1,
+    checkpoint_core_attention=False,
+    **config,
+):
+    """A SelfAttention stand-in with the attributes, including ``config``, the validation reads.
+
+    ``spec`` replaces the SelfAttention class and ``core_attention`` the DotProductAttention
+    class of the stand-in.
+    """
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -196,8 +242,8 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
     def group(size):
         return SimpleNamespace(size=lambda: size)
 
-    module = Mock(spec=SelfAttention)
-    module.core_attention = Mock(spec=DotProductAttention)
+    module = Mock(spec=spec or SelfAttention)
+    module.core_attention = Mock(spec=core_attention or DotProductAttention)
     module.checkpoint_core_attention = checkpoint_core_attention
     module.pg_collection = SimpleNamespace(tp=group(tp), cp=group(cp))
     module.num_query_groups_per_partition = kv_heads
@@ -211,13 +257,41 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         attn_logit_softcapping=None,
         batch_invariant_mode=False,
         flash_attention_version=None,
+        fp8_dot_product_attention=False,
+        fp8_multi_head_attention=False,
+        cuda_graph_impl="none",
     )
-    return module, SimpleNamespace(**{**defaults, **config})
+    module.config = SimpleNamespace(**{**defaults, **config})
+    return module
+
+
+@pytest.fixture
+def validate(flash_attn_install):
+    """Validate a stand-in built from keyword overrides, with flash-attn 2.7.0 installed.
+
+    The caller's TP and CP sizes are the stand-in's group sizes unless ``caller_tp`` or
+    ``caller_cp`` overrides them.
+    """
+    from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
+
+    flash_attn_install("2.7.0")
+
+    def run(**overrides):
+        tp_size = overrides.pop("caller_tp", overrides.get("tp", 1))
+        cp_size = overrides.pop("caller_cp", overrides.get("cp", 1))
+        attention = _validated_attention(**overrides)
+        validate_shared_prefix_attention(attention, tp_size=tp_size, cp_size=cp_size)
+
+    return run
 
 
 @pytest.mark.parametrize(
-    "overrides, error, message",
+    "overrides, error, match",
     [
+        # Attention subclasses that override forward (for example MLA) take no forest.
+        ({"spec": torch.nn.Module}, NotImplementedError, "supports only SelfAttention"),
+        # A SelfAttention variant with its own core attention (e.g. DSA over GQA).
+        ({"core_attention": torch.nn.Module}, NotImplementedError, "dot-product core attention"),
         ({"checkpoint_core_attention": True}, NotImplementedError, "core-attention recomputation"),
         ({"qk_clip": True}, NotImplementedError, "QK-clipping/max-logit"),
         ({"log_max_attention_logit": True}, NotImplementedError, "QK-clipping/max-logit"),
@@ -230,57 +304,82 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
             NotImplementedError,
             "batch-invariant mode",
         ),
-        ({"tp": 2}, RuntimeError, "attention TP helper"),
-        ({"cp": 2}, RuntimeError, "attention CP helper"),
+        ({"fp8_dot_product_attention": True}, NotImplementedError, "FP8 attention"),
+        ({"fp8_multi_head_attention": True}, NotImplementedError, "FP8 attention"),
+        ({"cuda_graph_impl": "local"}, NotImplementedError, "CUDA graphs"),
+        ({"cuda_graph_impl": "transformer_engine"}, NotImplementedError, "CUDA graphs"),
+        ({"cuda_graph_impl": "full_iteration"}, NotImplementedError, "CUDA graphs"),
+        ({"tp": 2, "caller_tp": 1}, RuntimeError, "attention TP helper"),
+        ({"cp": 2, "caller_cp": 1}, RuntimeError, "attention CP helper"),
+        ({"tp": 3, "cp": 2}, NotImplementedError, "divisible by TP size"),
+        (
+            {"cp": 2, "num_attention_heads": 6, "kv_heads": 3},
+            NotImplementedError,
+            "cannot express this Q/KV grouping",
+        ),
     ],
 )
-def test_attention_validation_rejects_unsupported_modules(attention, overrides, error, message):
-    """Unsupported attention features and mismatched process groups fail before any layer runs."""
-    module, config = _validated_attention(**overrides)
-    with pytest.raises(error, match=message):
-        attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+def test_attention_validation_rejects_unsupported_modules(validate, overrides, error, match):
+    """Unsupported modules, features and topologies fail before any layer runs."""
+    with pytest.raises(error, match=match):
+        validate(**overrides)
 
 
-def test_attention_validation_rejects_non_dense_core_attention(attention):
-    """A SelfAttention variant with its own core attention (e.g. DSA over GQA) is not bypassed."""
-    from unittest.mock import Mock
-
-    module, config = _validated_attention()
-    module.core_attention = Mock()
-    with pytest.raises(NotImplementedError, match="requires dot-product core attention"):
-        attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
-
-
-def test_attention_validation_rejects_other_attention_modules(attention):
-    """Attention subclasses that override forward (for example MLA) never read the slot."""
-    from types import SimpleNamespace
-
-    _, config = _validated_attention()
-    other = SimpleNamespace(checkpoint_core_attention=False)
-    with pytest.raises(NotImplementedError, match="supports only SelfAttention"):
-        attention.validate_shared_prefix_attention(other, config, tp_size=1, cp_size=1)
-
-
-@pytest.mark.parametrize("window_size", [None, (-1, -1), [-1, -1]])
-def test_attention_validation_accepts_full_attention_windows(attention, window_size):
-    module, config = _validated_attention(window_size=window_size)
-    attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Full-attention windows.
+        {"window_size": None},
+        {"window_size": (-1, -1)},
+        {"window_size": [-1, -1]},
+        # Without batch-invariant mode the pin selects TE and inference kernels, not the forest.
+        {"flash_attention_version": 2},
+        {"flash_attention_version": 3},
+        {"flash_attention_version": 4},
+        # CP2 destinations that share one KV head, or own one or two KV heads each.
+        {"cp": 2, "num_attention_heads": 8, "kv_heads": 1},
+        {"cp": 2, "num_attention_heads": 8, "kv_heads": 2},
+        {"cp": 2, "num_attention_heads": 8, "kv_heads": 4},
+        # TP2 x CP2: each TP rank's 8 query and 4 KV heads split over its CP destinations.
+        {"tp": 2, "cp": 2, "num_attention_heads": 16, "kv_heads": 4},
+    ],
+)
+def test_attention_validation_accepts_supported_modules(validate, overrides):
+    validate(**overrides)
 
 
-@pytest.mark.parametrize("version", [None, 2, 3, 4])
-def test_attention_validation_accepts_any_pinned_flash_version(attention, version):
-    """Without batch-invariant mode the pin selects TE and inference kernels, not the forest."""
-    module, config = _validated_attention(flash_attention_version=version)
-    attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+@pytest.mark.parametrize(
+    "query_heads, kv_heads, cp_size, expected",
+    [
+        (4, 2, 2, ((0, 1), (1, 2))),
+        (8, 4, 2, ((0, 2), (2, 4))),
+        (16, 8, 4, ((0, 2), (2, 4), (4, 6), (6, 8))),
+        (8, 8, 4, ((0, 2), (2, 4), (4, 6), (6, 8))),
+        # Fewer KV heads than destinations: each KV head is replicated.
+        (8, 2, 4, ((0, 1), (0, 1), (1, 2), (1, 2))),
+        (4, 1, 2, ((0, 1), (0, 1))),
+    ],
+)
+def test_cp_kv_head_slices_for_destinations(attention, query_heads, kv_heads, cp_size, expected):
+    """Each CP destination receives the KV heads its Q-head block reads, in equal widths."""
+    slices = attention._cp_kv_head_slices_for_destinations(query_heads, kv_heads, cp_size)
+    assert tuple((head_slice.start, head_slice.stop) for head_slice in slices) == expected
 
 
-def test_attention_validation_checks_cp_head_split(attention):
-    """At CP>1 the heads must split over TP and the KV heads over CP destinations."""
-    module, config = _validated_attention(cp=2, kv_heads=2)
-    attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=2)
-    module, config = _validated_attention(tp=3, cp=2, kv_heads=1)
-    with pytest.raises(NotImplementedError, match="divisible by TP size"):
-        attention.validate_shared_prefix_attention(module, config, tp_size=3, cp_size=2)
+@pytest.mark.parametrize(
+    "query_heads, kv_heads, cp_size, match",
+    [
+        (6, 3, 2, "cannot express this Q/KV grouping"),
+        (12, 3, 2, "boundary cuts unequal portions"),
+        (6, 2, 3, "equal KV-head widths"),
+        (6, 1, 4, "divisible by cp_size"),
+    ],
+)
+def test_cp_kv_head_slices_reject_groupings_local_gqa_cannot_express(
+    attention, query_heads, kv_heads, cp_size, match
+):
+    with pytest.raises(NotImplementedError, match=match):
+        attention._cp_kv_head_slices_for_destinations(query_heads, kv_heads, cp_size)
 
 
 def test_plan_cache_evicts_least_recently_used_plans_by_bytes(attention, monkeypatch):
@@ -350,6 +449,14 @@ def _reference(q, k, v, forest):
     return torch.cat(blocks).reshape(q.shape[0], 1, heads * dim)
 
 
+def _reference_and_grads(inputs, forest, cotangent, dtype):
+    """The reference output and its Q/K/V gradients, computed in ``dtype``."""
+    reference_inputs = tuple(tensor.detach().to(dtype).requires_grad_() for tensor in inputs)
+    output = _reference(*reference_inputs, forest)
+    grads = torch.autograd.grad(output, reference_inputs, cotangent.to(dtype))
+    return (output.detach(), *grads)
+
+
 def _dense_branches(q, k, v, forest):
     """Ordinary causal FlashAttention over every unshared ``[prompt, completion]`` branch."""
     from flash_attn import flash_attn_varlen_func
@@ -382,20 +489,24 @@ def _dense_branches(q, k, v, forest):
 
 
 def _relative_errors(result, truth):
-    """Relative Frobenius error of the output and of each input gradient against fp64 truth."""
+    """Relative Frobenius errors of the output and the Q/K/V gradients against ``truth``."""
     outputs, grads = result
     observed = (outputs["out"], grads["in[0]"], grads["in[1]"], grads["in[2]"])
     return [
-        ((actual.double() - expected).norm() / expected.norm()).item()
+        ((actual.double() - expected.double()).norm() / expected.double().norm()).item()
         for actual, expected in zip(observed, truth)
     ]
 
 
-def _truth(inputs, forest, cotangent):
-    reference_inputs = tuple(tensor.detach().double().requires_grad_() for tensor in inputs)
-    output = _reference(*reference_inputs, forest)
-    grads = torch.autograd.grad(output, reference_inputs, cotangent.double())
-    return (output.detach(), *grads)
+def _assert_finite_and_inert(result, pad=0):
+    """The output and Q/K/V gradients are finite, and the ``pad`` rows past the forest are 0."""
+    outputs, grads = result
+    assert set(outputs) == {"out"}
+    assert set(grads) == {"in[0]", "in[1]", "in[2]"}
+    tensors = (*outputs.values(), *grads.values())
+    assert all(torch.isfinite(tensor).all() for tensor in tensors)
+    if pad:
+        assert all(torch.count_nonzero(tensor[-pad:]) == 0 for tensor in tensors)
 
 
 @_CUDA
@@ -414,7 +525,7 @@ def test_composed_attention_replays(attention, dtype, kind, strided):
         return attention.flash_composed_forest_attention(q, k, v, forest)
 
     with deterministic_algorithms(True):
-        outputs, grads = assert_replays_bit_exact(
+        result = assert_replays_bit_exact(
             operation,
             inputs,
             grad_outputs={"out": cotangent},
@@ -422,32 +533,7 @@ def test_composed_attention_replays(attention, dtype, kind, strided):
             contention=True,
             what=f"shared-prefix {kind}/{dtype}, deterministic algorithms",
         )
-    assert set(grads) == {"in[0]", "in[1]", "in[2]"}
-    assert all(
-        torch.isfinite(tensor).all() for tensors in (outputs, grads) for tensor in tensors.values()
-    )
-    assert torch.count_nonzero(outputs["out"][-8:]) == 0
-    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in grads.values())
-
-
-@_CUDA
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("deterministic", [False, True])
-def test_backward_follows_torch_deterministic_algorithms(attention, monkeypatch, deterministic):
-    """``--deterministic-mode`` selects FlashAttention's deterministic backward."""
-    selected = []
-    backward = attention._flash_attn_varlen_backward
-
-    def recording_backward(**kwargs):
-        selected.append(kwargs["deterministic"])
-        return backward(**kwargs)
-
-    monkeypatch.setattr(attention, "_flash_attn_varlen_backward", recording_backward)
-    forest = _FORESTS["multi-star"]
-    inputs = _qkv(_total(forest), torch.bfloat16)
-    with deterministic_algorithms(deterministic):
-        attention.flash_composed_forest_attention(*inputs, forest).sum().backward()
-    assert selected == [deterministic, deterministic]
+    _assert_finite_and_inert(result, pad=8)
 
 
 @_CUDA
@@ -458,66 +544,43 @@ def test_backward_follows_torch_deterministic_algorithms(attention, monkeypatch,
 # 100 is not a multiple of 8: FlashAttention pads the head dim, and the backward must too.
 @pytest.mark.parametrize("dim", [64, 100])
 def test_composed_attention_matches_independent_reference(
-    attention, dtype, kind, deterministic, dim
+    attention, monkeypatch, dtype, kind, deterministic, dim
 ):
-    """Fused error vs fp64 stays within 2x of dense unshared FlashAttention's error."""
+    """Forest error vs fp64 stays within 2x of dense unshared FlashAttention's error, and
+    ``--deterministic-mode`` selects FlashAttention's deterministic backward for every pass."""
     seeded()
     forest = _FORESTS[kind]
     inputs = _qkv(_total(forest) + 8, dtype, dim=dim)
     cotangent = torch.randn(inputs[0].shape[0], 1, 8 * dim, device="cuda", dtype=dtype)
-    truth = _truth(inputs, forest, cotangent)
+    truth = _reference_and_grads(inputs, forest, cotangent, torch.float64)
+    selected = []
+    backward = attention._flash_attn_varlen_backward
+
+    def recording_backward(**kwargs):
+        selected.append(kwargs["deterministic"])
+        return backward(**kwargs)
 
     def operation(q, k, v):
         return attention.flash_composed_forest_attention(q, k, v, forest)
 
+    monkeypatch.setattr(attention, "_flash_attn_varlen_backward", recording_backward)
     with deterministic_algorithms(deterministic):
-        fused = run_once(operation, inputs, {"out": cotangent})
+        composed = run_once(operation, inputs, {"out": cotangent})
         baseline = run_once(
             lambda q, k, v: _dense_branches(q, k, v, forest), inputs, {"out": cotangent}
         )
-    assert all(torch.isfinite(tensor).all() for tensors in fused for tensor in tensors.values())
-    assert torch.count_nonzero(fused[0]["out"][-8:]) == 0
-    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in fused[1].values())
-    fused_errors = _relative_errors(fused, truth)
+    _, passes = attention._star_forest_plan_cached(forest, inputs[0].device)
+    assert selected == [deterministic] * len(passes)
+    _assert_finite_and_inert(composed, pad=8)
+    forest_errors = _relative_errors(composed, truth)
     baseline_errors = _relative_errors(baseline, truth)
-    for name, fused_error, baseline_error in zip(
-        ("out", "dq", "dk", "dv"), fused_errors, baseline_errors
+    for name, forest_error, baseline_error in zip(
+        ("out", "dq", "dk", "dv"), forest_errors, baseline_errors
     ):
-        assert fused_error <= 2 * baseline_error, (
-            f"{kind}/{dtype}/hn{dim} {name}: fused relative error {fused_error:.3e} exceeds twice "
-            f"the dense-branch FlashAttention error {baseline_error:.3e}"
+        assert forest_error <= 2 * baseline_error, (
+            f"{kind}/{dtype}/hn{dim} {name}: forest relative error {forest_error:.3e} exceeds "
+            f"twice the dense-branch FlashAttention error {baseline_error:.3e}"
         )
-
-
-def _check_reference(result, reference_inputs, reference_output, cotangent, *, shard=None):
-    reference_grads = torch.autograd.grad(reference_output, reference_inputs, cotangent.float())
-    expected = reference_output.detach()
-    if shard is not None:
-        expected = shard(expected)
-        reference_grads = tuple(shard(gradient) for gradient in reference_grads)
-    outputs, grads = result
-    assert set(outputs) == {"out"}
-    assert set(grads) == {"in[0]", "in[1]", "in[2]"}
-    # Normwise error within twice the input precision (measured: about half of it). A fixed
-    # elementwise tolerance fails on single elements: bf16 gradients near magnitude 8 round
-    # in steps of 0.03, and GQA KV heads replicated over CP ranks sum their per-rank
-    # gradients in the input dtype. Focused operator checks, not full-model acceptance.
-    bound = 2 * torch.finfo(outputs["out"].dtype).eps
-    observed = (outputs["out"], grads["in[0]"], grads["in[1]"], grads["in[2]"])
-    for name, actual, truth in zip(
-        ("out", "dq", "dk", "dv"), observed, (expected, *reference_grads)
-    ):
-        error = ((actual.float() - truth).norm() / truth.norm()).item()
-        assert error <= bound, f"{name}: relative error {error:.2e} exceeds {bound:.2e}"
-    assert all(torch.isfinite(tensor).all() for tensors in result for tensor in tensors.values())
-
-
-def _zigzag_shard(tensor, lengths, size, rank):
-    parts = []
-    for sequence in tensor.split(lengths):
-        chunks = sequence.chunk(2 * size)
-        parts.extend((chunks[rank], chunks[2 * size - rank - 1]))
-    return torch.cat(parts).contiguous()
 
 
 def _collective_check(check):
@@ -556,7 +619,11 @@ def _collective_replays(operation, inputs, cotangent, what):
 
 @contextmanager
 def _cp_groups():
-    """Create CP1 plus every CP2/CP4 group size that divides the world."""
+    """Create CP1 plus every CP2/CP4 group size that divides the world.
+
+    Unlike the groups in ``test_runtime_cp_attention``, a size that does not divide the world is
+    skipped, so a two-GPU run still covers CP2.
+    """
     from tests.unit_tests.test_utilities import Utils
 
     if Utils.world_size % 2:
@@ -583,15 +650,20 @@ def _cp_groups():
 @_CUDA
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("heads,kv_heads", [(8, 2), (8, 8)])
+@pytest.mark.parametrize("heads,kv_heads", [(8, 2), (8, 4), (8, 8)])
 def test_shared_prefix_cp_replays_and_matches_reference(attention, dtype, heads, kv_heads):
-    """CP4 GQA replicates KV heads; compare its summed dK/dV against the global reference."""
+    """GQA KV heads are split over CP destinations, or replicated when there are fewer KV heads
+    than destinations; compare the summed dK/dV against the global reference."""
     seeded()
     forest = _stars((64, [80, 80]), (32, [32, 32]))
     inputs = _qkv(320, dtype, heads=heads, kv_heads=kv_heads)
-    reference_inputs = tuple(tensor.detach().float().requires_grad_() for tensor in inputs)
-    reference_output = _reference(*reference_inputs, forest)
-    cotangent = torch.randn_like(reference_output).to(dtype)
+    cotangent = torch.randn(320, 1, heads * 64, device="cuda", dtype=dtype)
+    truth = _reference_and_grads(inputs, forest, cotangent, torch.float32)
+    # Normwise error within twice the input precision (measured: about half of it). A fixed
+    # elementwise tolerance fails on single elements: bf16 gradients near magnitude 8 round
+    # in steps of 0.03, and GQA KV heads replicated over CP ranks sum their per-rank
+    # gradients in the input dtype. Focused operator checks, not full-model acceptance.
+    bound = 2 * torch.finfo(dtype).eps
     with _cp_groups() as groups, deterministic_algorithms(True):
         for size, group in groups.items():
 
@@ -606,25 +678,29 @@ def test_shared_prefix_cp_replays_and_matches_reference(attention, dtype, heads,
             result = _collective_replays(
                 operation, local, shard(cotangent), what=f"shared-prefix CP{size}/{dtype}"
             )
-            # Each comparison needs a fresh reference autograd graph.
-            reference_output = _reference(*reference_inputs, forest)
-            _collective_check(
-                lambda: _check_reference(
-                    result, reference_inputs, reference_output, cotangent, shard=shard
-                )
-            )
+
+            def check():
+                _assert_finite_and_inert(result)
+                errors = _relative_errors(result, [shard(tensor) for tensor in truth])
+                for name, error in zip(("out", "dq", "dk", "dv"), errors):
+                    assert error <= bound, f"{name}: relative error {error:.2e} exceeds {bound:.2e}"
+
+            _collective_check(check)
 
 
 @_CUDA
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("cp_size", [1, 2])
-def test_self_attention_shared_prefix_branch_replays(cp_size):
+def test_self_attention_shared_prefix_branch_replays(attention, monkeypatch, cp_size):
     """Replay SelfAttention.forward's shared-prefix branch with real projections and RoPE.
 
-    A shared-prefix caller attaches the forest to ``Attention._shared_prefix_forest`` around each
-    layer call; the branch then runs the fused forest attention (CP all-to-all at CP2) between the
-    TE QKV and output projections. Inputs, RoPE positions (restarting at the prompt length for each
-    completion) and zigzag CP shards are built here as a model-level caller would build them.
+    The caller passes the forest as ``shared_prefix_forest``; the branch then runs the forest
+    attention (CP all-to-all at CP2) between the TE QKV and output projections. Inputs, RoPE
+    positions (restarting at the prompt length for each completion) and zigzag CP shards are built
+    here as a model-level caller would build them. Core attention is disabled during the replays
+    and the forest kernel must run on every forward. At CP1 the output must also match the same
+    layer run on each dense ``[prompt, completion]`` row, which a causal pass over the packed
+    forest would not.
     """
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -632,6 +708,7 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
     )
     from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import attention as attention_layer
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.enums import AttnMaskType
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -679,19 +756,41 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
             hidden_states=hidden.detach().requires_grad_(True),
             attention_mask=None,
             rotary_pos_emb=rotary_table.index_select(0, positions),
+            shared_prefix_forest=layout,
         )
-        module._shared_prefix_forest = layout.forest
-        try:
-            with deterministic_algorithms(True):
-                outputs, grads = assert_module_replays_bit_exact(
-                    module,
-                    inputs,
-                    replays=3,
-                    contention=True,
-                    what=f"SelfAttention shared-prefix branch CP{cp_size}",
-                )
-        finally:
-            del module._shared_prefix_forest
+
+        # The layer calls the CP entry point, which runs the base kernel at every CP size.
+        cp_calls, kernel_calls = [], []
+        cp_kernel = attention_layer.flash_composed_forest_attention_cp
+        kernel = attention.flash_composed_forest_attention
+
+        def recording_cp_kernel(*args, **kwargs):
+            cp_calls.append(kwargs["cp_group"])
+            return cp_kernel(*args, **kwargs)
+
+        def recording_kernel(*args, **kwargs):
+            kernel_calls.append(args[3])
+            return kernel(*args, **kwargs)
+
+        def core_attention(*args, **kwargs):
+            raise AssertionError("the shared-prefix branch ran core attention")
+
+        monkeypatch.setattr(
+            attention_layer, "flash_composed_forest_attention_cp", recording_cp_kernel
+        )
+        monkeypatch.setattr(attention, "flash_composed_forest_attention", recording_kernel)
+        with monkeypatch.context() as patch, deterministic_algorithms(True):
+            patch.setattr(module.core_attention, "forward", core_attention)
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                inputs,
+                replays=3,
+                contention=True,
+                what=f"SelfAttention shared-prefix branch CP{cp_size}",
+            )
+        # assert_module_replays_bit_exact runs `replays` forwards, the first one the reference.
+        assert cp_calls == [cp_group] * 3
+        assert kernel_calls == [layout.forest] * 3
         assert "in.hidden_states" in grads
         assert any("linear_qkv" in name for name in grads)
         assert any("linear_proj" in name for name in grads)
@@ -700,5 +799,24 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
             for tensors in (outputs, grads)
             for tensor in tensors.values()
         )
+
+        if cp_size == 1:
+            # Run every dense row through the same layer with core attention. Both sides round
+            # in bf16; a causal pass over the packed forest, where completions 2..G also attend
+            # completion 1, differs by O(1) on those rows.
+            bound = 4 * torch.finfo(torch.bfloat16).eps
+            with torch.no_grad(), deterministic_algorithms(True):
+                for row, branch in enumerate(layout.dense_branch_indices("cuda")):
+                    dense, _ = module(
+                        hidden_states=hidden.index_select(0, branch),
+                        attention_mask=None,
+                        rotary_pos_emb=rotary_table[: branch.numel()],
+                    )
+                    forest_rows = outputs["out[0]"].index_select(0, branch).float()
+                    error = ((forest_rows - dense.float()).norm() / dense.float().norm()).item()
+                    assert error <= bound, (
+                        f"dense row {row}: the forest output differs by {error:.2e} "
+                        f"(bound {bound:.2e})"
+                    )
     finally:
         Utils.destroy_model_parallel()
