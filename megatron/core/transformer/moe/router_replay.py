@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from contextlib import contextmanager
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -163,6 +164,9 @@ class RouterReplay:
         self.replay_backward_list: List[torch.Tensor] = (
             []
         )  # List of tensors for backward pass replay
+        # Indices of the current router call, replayed in place of the micro-batch's
+        # (set by ``replay_indices_for_call``, see ``ChunkedRouterReplay``)
+        self.call_topk_idx: Optional[torch.Tensor] = None
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
         self.static_buffer_index: Optional[torch.Tensor] = None
         self.static_layer_index: Optional[torch.Tensor] = None
@@ -183,6 +187,31 @@ class RouterReplay:
         self.recorded_topk_idx = None
         self.target_topk_idx = None
         self.replay_backward_list = []
+
+    @staticmethod
+    @contextmanager
+    def replay_indices_for_call(
+        router_replay: Optional['RouterReplay'], topk_indices: Optional[torch.Tensor]
+    ) -> Iterator[None]:
+        """Make the replaying router calls inside the context use ``topk_indices``.
+
+        These take the place of the micro-batch's target (``REPLAY_FORWARD``) and of a
+        ``replay_backward_list`` entry (``REPLAY_BACKWARD``, nothing is popped). A no-op when
+        ``router_replay`` or ``topk_indices`` is None.
+
+        Args:
+            router_replay (Optional[RouterReplay]): The router's replay state.
+            topk_indices (Optional[torch.Tensor]): Indices of the call's tokens,
+                ``[num_tokens, topk]``.
+        """
+        if router_replay is None or topk_indices is None:
+            yield
+            return
+        router_replay.call_topk_idx = topk_indices
+        try:
+            yield
+        finally:
+            router_replay.call_topk_idx = None
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """Sets the router replay action for this layer."""
@@ -221,6 +250,13 @@ class RouterReplay:
                 scores, topk, num_groups=num_groups, group_topk=group_topk
             )
             self.record_indices(top_indices)
+            return probs, top_indices
+        elif self.call_topk_idx is not None and self.router_replay_action in (
+            RouterReplayAction.REPLAY_FORWARD,
+            RouterReplayAction.REPLAY_BACKWARD,
+        ):
+            top_indices = self.call_topk_idx.to(scores.device)
+            probs = scores.gather(1, top_indices)
             return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             top_indices = self.target_topk_idx
@@ -294,3 +330,107 @@ class RouterReplay:
             self.recorded_topk_idx = self.static_buffer[:num_tokens]
         else:
             self.recorded_topk_idx = topk_indices
+
+
+class ChunkedRouterReplay:
+    """Routing replay for an MoE layer that is called once per sequence chunk.
+
+    ``RouterReplay`` assumes one router call per micro-batch. ``target_topk_idx`` and each
+    ``replay_backward_list`` entry hold the top-k of the whole micro-batch (``[s * b, topk]``),
+    and ``get_replay_topk`` gathers the call's scores with them, so a call over a chunk
+    (``[chunk_tokens, num_experts]`` scores) fails with a size mismatch. Recompute pops one entry
+    per call, and recording keeps only the last call's indices.
+
+    This gives each chunk its slice of the micro-batch's indices, which the caller passes to the
+    chunk's MoE call (``MoELayer.forward(replay_topk_idx=...)``), and records the concatenated
+    indices of all chunks once the last chunk is done. Passing the slice as an argument binds it
+    to the call: with ``recompute_modules=["moe"]``, backward reruns each chunk's checkpointed
+    MoE call on its own (not this loop), in whatever order autograd picks, and the rerun replays
+    the same slice.
+
+    Usage, around the per-chunk calls::
+
+        replay = ChunkedRouterReplay(router_replay, chunk_tokens, pad_tokens, chunks_recompute)
+        for i, chunk in enumerate(chunks):
+            outputs.append(mlp(chunk, replay_topk_idx=replay.chunk_indices(i)))
+            replay.after_chunk()
+        replay.finish()
+    """
+
+    def __init__(
+        self,
+        router_replay: Optional[RouterReplay],
+        chunk_tokens: List[int],
+        pad_tokens: int = 0,
+        chunks_recompute: bool = False,
+    ) -> None:
+        """
+        Args:
+            router_replay (Optional[RouterReplay]): The layer's replay state, or None when
+                routing replay is disabled (every method is then a no-op).
+            chunk_tokens (List[int]): Number of tokens (``s_chunk * b``) of each chunk, in order.
+            pad_tokens (int): Number of dummy tokens appended after the real tokens to even out
+                the chunk count. They replay the first real token's experts, and are excluded
+                from the recorded indices.
+            chunks_recompute (bool): Whether each chunk's MoE call is checkpointed on its own
+                (selective ``"moe"`` recompute). Its rerun replays the chunk's slice of the
+                forward target, so the micro-batch's ``replay_backward_list`` entry, which no
+                rerun would pop, is dropped.
+        """
+        self.replay = router_replay
+        self.action = router_replay.router_replay_action if router_replay is not None else None
+        self.bounds = [0]
+        for n in chunk_tokens:
+            self.bounds.append(self.bounds[-1] + n)
+        self.real_tokens = self.bounds[-1] - pad_tokens
+        self.recorded: List[torch.Tensor] = []
+        self.indices: Optional[torch.Tensor] = None
+        if self.action == RouterReplayAction.REPLAY_FORWARD:
+            target = self.replay.target_topk_idx
+            backward_list = self.replay.replay_backward_list
+            # set_target_indices appended the target as this micro-batch's entry.
+            if chunks_recompute and backward_list and backward_list[-1] is target:
+                backward_list.pop()
+            self._check_num_rows(target)
+            self.indices = self._pad(target, pad_tokens)
+        elif self.action == RouterReplayAction.REPLAY_BACKWARD and self.replay.replay_backward_list:
+            entry = self.replay.replay_backward_list.pop(0)
+            self._check_num_rows(entry)
+            self.indices = self._pad(entry, pad_tokens)
+
+    def _check_num_rows(self, indices: Optional[torch.Tensor]) -> None:
+        """Require one replay row per real (non-dummy) token, as the unchunked gather does.
+
+        Slicing per chunk would otherwise ignore extra rows without an error.
+        """
+        if indices is not None and indices.shape[0] != self.real_tokens:
+            raise ValueError(
+                f"Routing replay indices have {indices.shape[0]} rows, but this MoE layer routes "
+                f"{self.real_tokens} tokens."
+            )
+
+    @staticmethod
+    def _pad(indices: Optional[torch.Tensor], pad_tokens: int) -> Optional[torch.Tensor]:
+        """Append ``pad_tokens`` rows of valid, distinct expert indices for the dummy tokens."""
+        if not pad_tokens or indices is None:
+            return indices
+        if indices.shape[0] == 0:
+            dummy = torch.arange(indices.shape[1], dtype=indices.dtype, device=indices.device)
+            return dummy.expand(pad_tokens, -1)
+        return torch.cat([indices, indices[:1].expand(pad_tokens, -1)], dim=0)
+
+    def chunk_indices(self, i: int) -> Optional[torch.Tensor]:
+        """Chunk ``i``'s replay indices, or None when not replaying."""
+        if self.indices is None:
+            return None
+        return self.indices[self.bounds[i] : self.bounds[i + 1]]
+
+    def after_chunk(self) -> None:
+        """Keep the indices the last chunk recorded (a static buffer is reused by the next)."""
+        if self.action == RouterReplayAction.RECORD and self.replay.recorded_topk_idx is not None:
+            self.recorded.append(self.replay.recorded_topk_idx.clone())
+
+    def finish(self) -> None:
+        """Record the indices of all real tokens."""
+        if self.action == RouterReplayAction.RECORD and self.recorded:
+            self.replay.record_indices(torch.cat(self.recorded, dim=0)[: self.real_tokens])
