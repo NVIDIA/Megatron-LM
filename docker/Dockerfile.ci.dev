@@ -210,6 +210,15 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     trap - EXIT
 EOF
 
+# FLA 0.5.1 lists a nonexistent autotune key that Triton 3.9 rejects at import.
+# Patch after dependency installation so this compatibility fix reuses native builds.
+RUN --mount=type=bind,source=docker/patches/fla-triton-autotune.patch,target=/opt/fla-triton-autotune.patch \
+    bash -ex <<"EOF"
+    FLA_SITE_PACKAGES=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+    patch --batch --forward --fuzz=0 -d "${FLA_SITE_PACKAGES}" -p1 < /opt/fla-triton-autotune.patch
+    python -c 'from fla.ops.cp.chunk_delta_h import merge_fwd_bwd_kernel'
+EOF
+
 # Reuse the wheel without copying a second archive into the final image.
 RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-wheels \
     bash -ex <<"EOF"
