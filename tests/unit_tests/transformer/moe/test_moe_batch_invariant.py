@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for batch-invariant MoE grouped GEMM."""
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -253,3 +254,82 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
         f"MoE output not invariant to batch permutation; max abs diff: "
         f"{(y_ref.float() - y_unperm.float()).abs().max().item()}"
     )
+
+
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_tegroupedlinear_runs_batch_invariant_grouped_gemm(_moe_env, monkeypatch, backend):
+    """A TE expert linear built from an accepted config runs DeepGEMM's grouped GEMM, never
+    TE's GroupedTensor grouped GEMM (config validation rejects that path for this backend)."""
+    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
+
+    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import init_method_normal
+
+    num_experts, k, n = 4, 512, 256
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=k,
+        ffn_hidden_size=n,
+        moe_ffn_hidden_size=n,
+        num_attention_heads=4,
+        num_moe_experts=num_experts,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        batch_invariant_mode=True,
+        batch_invariant_backend=backend,
+    )
+    calls = {"deepgemm": 0, "grouped_tensor": 0}
+
+    def counted(name, fn):
+        def wrapper(*args, **kwargs):
+            calls[name] += 1
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        bik.deep_gemm,
+        "m_grouped_bf16_gemm_nt_contiguous",
+        counted("deepgemm", bik.deep_gemm.m_grouped_bf16_gemm_nt_contiguous),
+    )
+    if hasattr(te_grouped_linear, "general_grouped_gemm_for_grouped_tensor"):
+        monkeypatch.setattr(
+            te_grouped_linear,
+            "general_grouped_gemm_for_grouped_tensor",
+            counted("grouped_tensor", te_grouped_linear.general_grouped_gemm_for_grouped_tensor),
+        )
+    module = TEGroupedLinear(
+        num_experts,
+        k,
+        n,
+        parallel_mode=None,
+        config=config,
+        init_method=init_method_normal(0.02),
+        bias=False,
+        skip_bias_add=False,
+        is_expert=True,
+    ).cuda()
+    splits = [256, 512, 0, 256]
+    torch.manual_seed(3)
+    x = torch.randn(sum(splits), k, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
+        out, _ = module(x, splits)
+    assert calls["deepgemm"] > 0 and calls["grouped_tensor"] == 0, calls
+    reference = torch.cat(
+        [
+            x_i.double() @ getattr(module, f"weight{i}").double().t()
+            for i, x_i in enumerate(torch.split(x, splits))
+        ]
+    )
+    torch.testing.assert_close(out.double(), reference, atol=0.05, rtol=0.02)
