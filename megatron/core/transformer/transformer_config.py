@@ -1505,6 +1505,13 @@ class TransformerConfig(ModelParallelConfig):
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
 
+    batch_invariant_moe_combine_ep_size: Optional[int] = None
+    """EP size of the MoE combine that the batch-invariant training combine reproduces.
+    Under batch_invariant_mode each EP rank rounds the sum over its contiguous shard of
+    experts to one fp32 partial before the cross-rank reduction, so the bits depend on
+    the EP size. RL sets it to the EP size of its rollout model. None uses the layer's
+    own EP size."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 

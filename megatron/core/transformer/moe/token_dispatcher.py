@@ -903,6 +903,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             The final MoE layer output reshaped to its original dimensions.
         """
 
+        batch_invariant_ep_size = None
+        if self.batch_invariant_inverse_permutation_mapping is not None:
+            # Reproduce the combine the rollouts ran, which may use another EP size.
+            batch_invariant_ep_size = (
+                self.config.batch_invariant_moe_combine_ep_size or self.ep_size
+            )
+
         # Unpermutation 1: AlltoAll output to output
         output = unpermute(
             permutated_local_input_tokens,
@@ -912,6 +919,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
+            batch_invariant_ep_size=batch_invariant_ep_size,
         )
 
         # Reshape the output tensor

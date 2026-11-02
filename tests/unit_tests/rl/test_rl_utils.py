@@ -159,6 +159,52 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     assert callback.ref_state_dict == ({"w": 1} if loop_runs else None)
 
 
+@pytest.mark.parametrize("rollout_ep", [None, 8])
+def test_setup_callback_sets_batch_invariant_combine_ep(monkeypatch, rollout_ep):
+    """The training forward reproduces the rollouts' batch-invariant MoE combine, which rounds
+    once per rollout EP rank. So every training model chunk, and the rollout model config copied
+    from the first one, carries the rollout EP size."""
+    seen = {}
+    chunk_configs = {
+        chunk: TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            num_moe_experts=8,
+            expert_model_parallel_size=2,
+        )
+        for chunk in ("chunk0", "chunk1")
+    }
+
+    def build_inference_model(rl_config, args, config, model_provider, model_type):
+        seen["config"] = config
+        seen["combine_ep"] = config.batch_invariant_moe_combine_ep_size
+
+    monkeypatch.setattr(training_setup, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        training_setup,
+        "get_run_config",
+        lambda: SimpleNamespace(validation=SimpleNamespace(skip_train=True)),
+    )
+    monkeypatch.setattr(training_setup, "get_model_config", chunk_configs.__getitem__)
+    monkeypatch.setattr(training_setup, "build_rl_inference_model", build_inference_model)
+    callback = training_setup.RLSetupCallback(
+        RLConfig(rl_inference_expert_model_parallel_size=rollout_ep),
+        model_provider="provider",
+        model_type="type",
+    )
+
+    callback.on_data_init_start(
+        CallbackContext(model=["chunk0", "chunk1"], optimizer=None, checkpointing_context={})
+    )
+
+    assert seen["config"] is chunk_configs["chunk0"]
+    assert seen["combine_ep"] == rollout_ep
+    for config in chunk_configs.values():
+        assert config.expert_model_parallel_size == 2
+        assert config.batch_invariant_moe_combine_ep_size == rollout_ep
+
+
 @pytest.mark.parametrize(
     "optimizer, packing, correction, offload",
     [(None, True, False, True), ("optimizer", False, True, False)],

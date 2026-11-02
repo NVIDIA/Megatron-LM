@@ -2384,6 +2384,8 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # internal/derived: RL sets it from --rl-inference-expert-model-parallel-size
+        "batch_invariant_moe_combine_ep_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
         # Parsed manually as a JSON object below.

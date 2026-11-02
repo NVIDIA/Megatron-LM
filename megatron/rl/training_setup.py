@@ -195,6 +195,13 @@ class RLSetupCallback(Callback):
         cfg = get_run_config()
         self.model = context.model
         self.optimizer = context.optimizer
+        rollout_ep_size = self._rl_config.rl_inference_expert_model_parallel_size
+        if rollout_ep_size is not None:
+            # Under batch-invariant mode the training forward reproduces the rollouts' MoE
+            # combine, whose rounding points depend on the rollout EP size. Set it before the
+            # rollout model's config is copied from the training model's.
+            for model_chunk in self.model:
+                get_model_config(model_chunk).batch_invariant_moe_combine_ep_size = rollout_ep_size
         self.inference_model = build_rl_inference_model(
             self._rl_config,
             args,
