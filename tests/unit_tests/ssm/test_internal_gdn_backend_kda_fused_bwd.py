@@ -16,9 +16,12 @@ def _fused_kda_bwd_available() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(
-    not _fused_kda_bwd_available(), reason="needs SM100, FLA and the CuTe DSL runtime"
-)
+pytestmark = [
+    pytest.mark.launch_on_gb200,
+    pytest.mark.skipif(
+        not _fused_kda_bwd_available(), reason="needs SM100, FLA and the CuTe DSL runtime"
+    ),
+]
 
 _HEADS = 4
 _DIM = 128

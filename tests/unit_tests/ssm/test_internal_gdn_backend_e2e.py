@@ -459,21 +459,24 @@ def _build_kda_cp_context(device, cp_size, *, ragged, request):
 @pytest.mark.parametrize("cp_size", [2, 4], ids=["cp2", "cp4"])
 def test_internal_kda_cute_cp_preprocess_matches_fla(monkeypatch, cp_size, ragged, request):
     """Strict ``cute`` mode at the Kimi head geometry (K == V == 128): the CuTe CP pre-processing
-    must launch in both directions, never fall back, and match FLA's own CP path on the output
-    and all seven gradients."""
+    must launch in both directions, never fall back, hand its terminal gradient to the fused
+    CuTe DSL KDA backward, and match FLA's own CP path on the output and all seven gradients."""
     device = _cutedsl_cp_device(cp_size)
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend import chunk_kda
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as kda_adapter
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
 
     cp_context, rank = _build_kda_cp_context(device, cp_size, ragged=ragged, request=request)
     inputs, grad_output = _make_kda_inputs(device, head_dim=_HEAD_DIM, seed=1234 + rank)
 
+    monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
     monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "0")
     reference = _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
 
     forward_before = fused_gdr_cp_cute.get_cutedsl_fused_launch_count()
     backward_before = fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count()
+    fused_kda_bwd_before = kda_adapter.get_fused_kda_bwd_launch_count()
     fused_gdr_cp_cute.reset_cutedsl_fallback_reasons()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
     monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "1")
@@ -482,6 +485,7 @@ def test_internal_kda_cute_cp_preprocess_matches_fla(monkeypatch, cp_size, ragge
     # fallback-reason map is the second witness that the dispatcher never declined.
     assert fused_gdr_cp_cute.get_cutedsl_fused_launch_count() == forward_before + 1
     assert fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count() == backward_before + 1
+    assert kda_adapter.get_fused_kda_bwd_launch_count() == fused_kda_bwd_before + 1
     assert fused_gdr_cp_cute.get_cutedsl_fallback_reasons() == {}
 
     torch.testing.assert_close(actual[0], reference[0], atol=1e-2, rtol=1e-2)
