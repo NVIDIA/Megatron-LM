@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import contextlib
 import importlib
 import os
 
@@ -27,7 +28,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_lts_ci_image
 
 try:
     import flash_attn_3
@@ -147,6 +148,117 @@ def _random_splits(total, num_parts):
             delta -= 1
         i = (i + 1) % len(lens)
     return lens
+
+
+# DeepGEMM ships only in the dev CI image; there the deepgemm cases fail without it.
+_BI_GEMM_BACKENDS = [
+    "triton",
+    pytest.param(
+        "deepgemm",
+        marks=pytest.mark.skipif(is_lts_ci_image(), reason="DeepGEMM is not in the LTS image."),
+    ),
+]
+
+
+@pytest.mark.parametrize("layer_type", ["linear", "layernorm_linear"])
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+def test_te_linear_fused_wgrad_accumulates_over_microbatches(backend, layer_type):
+    """With gradient_accumulation_fusion, a TE linear adds each microbatch's weight gradient
+    into main_grad under batch-invariant mode, as it does without it."""
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            flash_attention_version=_BIK_FA_VERSION,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            attention_backend=AttnBackend.flash,
+            gradient_accumulation_fusion=True,
+        )
+        layer_cls = (
+            TEColumnParallelLinear if layer_type == "linear" else TELayerNormColumnParallelLinear
+        )
+        layer = layer_cls(
+            input_size=cfg.hidden_size,
+            output_size=512,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        torch.manual_seed(9)
+        inputs = [torch.randn(48, 1, cfg.hidden_size, **_device(torch.bfloat16)) for _ in range(2)]
+        grads = [torch.randn(48, 1, 512, **_device(torch.bfloat16)) for _ in range(2)]
+
+        def main_grad_after_two_microbatches(batch_invariant):
+            layer.weight.main_grad = torch.zeros(
+                layer.weight.shape, device="cuda", dtype=torch.float32
+            )
+            layer.is_first_microbatch = True
+            mode = (
+                set_batch_invariant_mode(True, backend=backend)
+                if batch_invariant
+                else contextlib.nullcontext()
+            )
+            with mode:
+                for x, dy in zip(inputs, grads):
+                    out, _ = layer(x)
+                    out.backward(dy)
+            return layer.weight.main_grad.clone()
+
+        reference = main_grad_after_two_microbatches(batch_invariant=False)
+        actual = main_grad_after_two_microbatches(batch_invariant=True)
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=5e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+@pytest.mark.parametrize("case", ["accumulate-fp32", "alpha-beta-bias", "alpha"])
+def test_bik_te_general_gemm_honors_accumulate_alpha_beta(backend, case):
+    """The batch-invariant general_gemm computes what TE's computes with accumulate, alpha
+    and beta: it adds into out (a weight gradient into fp32 main_grad, a scaled linear
+    into a residual) instead of overwriting it."""
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    torch.manual_seed(5)
+    bf16 = _device(torch.bfloat16)
+    if case == "accumulate-fp32":
+        # Weight gradient (NT) of x [64, 128] and dy [64, 96], added into fp32 main_grad.
+        A, B = torch.randn(64, 128, **bf16), torch.randn(64, 96, **bf16)
+        out0 = torch.randn(96, 128, device="cuda", dtype=torch.float32)
+        kwargs = dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True)
+    elif case == "alpha-beta-bias":
+        # Scaled linear plus bias, added into a scaled bf16 residual.
+        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
+        out0 = torch.randn(64, 96, **bf16)
+        bias = torch.randn(96, **bf16)
+        kwargs = dict(out_dtype=torch.bfloat16, accumulate=True, alpha=0.5, beta=2.0, bias=bias)
+    else:
+        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
+        out0 = torch.randn(64, 96, **bf16)
+        kwargs = dict(out_dtype=torch.bfloat16, alpha=0.25)
+    reference = out0.clone()
+    te_cpp.general_gemm(A, B, out=reference, **kwargs)
+    actual = out0.clone()
+    with set_batch_invariant_mode(True, backend=backend):
+        result = te_cpp.general_gemm(A, B, out=actual, **kwargs)[0]
+    assert result is actual
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=1e-1)
 
 
 # ============================================================================

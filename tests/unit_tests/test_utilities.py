@@ -2,9 +2,11 @@
 import os
 from argparse import Namespace
 from datetime import timedelta
+from pathlib import Path
 from typing import Literal
 
 import torch
+from packaging.version import Version
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
@@ -173,6 +175,21 @@ def reset_transient_process_state():
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
+
+
+def is_lts_ci_image() -> bool:
+    """Whether the tests run in the LTS CI image, which lacks the dev image's extra packages.
+
+    Like the LTS skips elsewhere in the suite, this compares the NGC PyTorch release
+    (``NVIDIA_PYTORCH_VERSION``, unset outside the NGC containers) with the LTS one, read
+    from its pin in ``docker/.ngc_version.lts`` so the check follows base-image bumps. The
+    LTS image installs only the ``mlm`` and ``ssm`` extras, so packages such as DeepGEMM
+    exist only in the dev image, where a test that needs them must fail when they are
+    missing rather than skip.
+    """
+    pin = (Path(__file__).resolve().parents[2] / "docker" / ".ngc_version.lts").read_text()
+    lts_release = pin.strip().rsplit(":", 1)[1].split("-")[0]
+    return Version(os.getenv("NVIDIA_PYTORCH_VERSION", "0")) <= Version(lts_release)
 
 
 def is_nccl_ep_available():
