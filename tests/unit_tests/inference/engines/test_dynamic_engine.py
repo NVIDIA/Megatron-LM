@@ -4451,12 +4451,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             future = engine.add_request(request_id, prompt, params, **media_kwargs)
             active_request[0] = engine.get_request(request_id)
-            assert active_request[0].image_embeddings.is_cuda
-            assert torch.isfinite(active_request[0].image_embeddings).all()
-            assert int((active_request[0].image_token_mask >= 0).sum()) == (
-                active_request[0].image_embeddings.shape[0]
-                * active_request[0].image_embeddings.shape[1]
-            )
+            # Waiting images are encoded together before prefill; video is encoded on submission.
+            assert (active_request[0].image_embeddings is None) == (modality == "image")
             partial_history = []
             first_partial_live = False
             refit_delivered = False
