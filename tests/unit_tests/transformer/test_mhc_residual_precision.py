@@ -9,6 +9,8 @@ HF eagerly rounds BF16 post*branch before adding the BF16 mixed residual.
 Keep production H4096/n4, S17/B1 and diagnostic seed1234; compare the output and
 all four operand gradients exactly and with both similarities strictly>0.999.
 This tests the residual operator, not complete mHC mappings or hybrid parity.
+The test_h_post_bda_* cases also cover FP32 mappings: mixing without GEMMs, and one
+compiled specialization shared by the grad-mode, no-grad and replayed passes.
 """
 
 import json
@@ -17,6 +19,8 @@ from argparse import ArgumentParser
 
 import pytest
 import torch
+from functorch.compile import make_boxed_func
+from torch._dynamo.backends.common import aot_autograd
 from torch._inductor import list_options
 
 from megatron.core.tensor_parallel.random import (
@@ -90,11 +94,12 @@ def test_default_module_keeps_legacy_callable_without_strict_factory(monkeypatch
 
 def test_strict_factory_is_cached_and_preserves_raw_implementation(monkeypatch):
     calls = []
-    compiled = object()
+    compiled = []
 
     def compile_spy(function, **kwargs):
         calls.append((function, kwargs))
-        return compiled
+        compiled.append(object())
+        return compiled[-1]
 
     hc._get_precision_preserving_h_post_bda.cache_clear()
     try:
@@ -103,9 +108,13 @@ def test_strict_factory_is_cached_and_preserves_raw_implementation(monkeypatch):
         module = hc.HyperConnectionModule(
             _config(mhc_preserve_activation_dtype_rounding=True), layer_number=1
         )
-        assert module._h_post_bda_op is hc._get_precision_preserving_h_post_bda() is compiled
+        post = module._h_post_bda_op
+        assert post is hc._get_precision_preserving_h_post_bda()
+        # The raw forward and backward, each compiled with the option, behind one Function.
+        assert post.func == hc.NativeHPostBDA.apply and post.args == tuple(compiled)
         assert calls == [
-            (hc._native_h_post_bda_impl, {"options": {"emulate_precision_casts": True}})
+            (hc._native_h_post_bda_impl, {"options": {"emulate_precision_casts": True}}),
+            (hc._native_h_post_bda_bwd_impl, {"options": {"emulate_precision_casts": True}}),
         ]
     finally:
         hc._get_precision_preserving_h_post_bda.cache_clear()
@@ -143,6 +152,172 @@ def test_strict_factory_propagates_compiler_rejection_without_fallback(monkeypat
 def test_fused_mhc_rejects_rounding_contract():
     with pytest.raises(ValueError, match="use_fused_mhc does not support"):
         _config(use_fused_mhc=True, mhc_preserve_activation_dtype_rounding=True)
+
+
+# FP32 mixing (fp32 models, or bf16 activations with mhc_keep_mappings_in_fp32): mapping
+# dtype, activation dtype.
+_POST_DTYPES = {
+    "fp32": (torch.float32, torch.float32),
+    "bf16_fp32_mappings": (torch.float32, torch.bfloat16),
+}
+_GEMMS = {
+    torch.ops.aten.bmm,
+    torch.ops.aten.mm,
+    torch.ops.aten.addmm,
+    torch.ops.aten.baddbmm,
+    torch.ops.aten.matmul,
+}
+
+
+def _post_inputs(n, dtypes, with_bias, device):
+    """h_res, residual, h_post, x, bias and an output gradient, as the module passes them."""
+    mapping_dtype, activation_dtype = dtypes
+    generator = torch.Generator().manual_seed(1234)
+    s, b, hidden = 8, 2, 32
+
+    def draw(*shape, dtype=activation_dtype):
+        return torch.randn(*shape, generator=generator).to(device=device, dtype=dtype)
+
+    h_res = torch.randn(s, b, n, n, generator=generator).softmax(-1)
+    h_post = 2 * torch.randn(s, b, n, generator=generator).sigmoid()
+    inputs = (
+        h_res.to(device=device, dtype=mapping_dtype),
+        draw(s, b, n, hidden),
+        h_post.to(device=device, dtype=mapping_dtype),
+        draw(s, b, hidden),
+        draw(hidden) if with_bias else None,
+    )
+    return inputs, draw(s, b, n, hidden)
+
+
+def _leaves(inputs):
+    return [None if t is None else t.clone().requires_grad_() for t in inputs]
+
+
+class _AtenGraphRecorder:
+    """torch.compile backend that keeps the ATen graph of every compilation and runs it."""
+
+    def __init__(self):
+        self.graphs = []
+
+    def __call__(self, graph_module, example_inputs):
+        def record(aten_module, _):
+            self.graphs.append(aten_module)
+            return make_boxed_func(aten_module.forward)
+
+        return aot_autograd(fw_compiler=record, bw_compiler=record)(graph_module, example_inputs)
+
+    def ops(self):
+        return {
+            node.target.overloadpacket
+            for graph in self.graphs
+            for node in graph.graph.nodes
+            if node.op == "call_function" and hasattr(node.target, "overloadpacket")
+        }
+
+
+@pytest.mark.parametrize("preserve_rounding", [False, True])
+@pytest.mark.parametrize("n", [2, 4])
+@pytest.mark.parametrize("dtypes", list(_POST_DTYPES.values()), ids=list(_POST_DTYPES))
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_h_post_bda_compiles_once_without_gemm(
+    monkeypatch, preserve_rounding, n, dtypes, with_bias
+):
+    """The reference, a checkpoint's no-grad forward and its replay share one GEMM-free entry.
+
+    Each grad mode and set of requires_grad flags used to be a separate specialization of a
+    compiled bmm, which TF32 and Inductor's GEMM padding could split into two precisions.
+    Both public entry points run here with their compiled functions on a recording backend.
+    """
+    recorders = []
+    compile_with_inductor = torch.compile
+
+    def compile_recording(function, **_):
+        recorders.append(_AtenGraphRecorder())
+        return compile_with_inductor(function, backend=recorders[-1])
+
+    hc._get_precision_preserving_h_post_bda.cache_clear()
+    torch._dynamo.reset()
+    try:
+        if preserve_rounding:
+            monkeypatch.setattr(torch, "compile", compile_recording)
+            post = hc._get_precision_preserving_h_post_bda()
+        else:
+            for name in ("_native_h_post_bda_forward", "_native_h_post_bda_backward"):
+                compiled = getattr(hc, name)
+                monkeypatch.setattr(hc, name, compile_recording(compiled.__wrapped__))
+            post = hc.native_h_post_bda
+        inputs, gradient = _post_inputs(n, dtypes, with_bias, "cpu")
+        reference = post(*_leaves(inputs))
+        # A checkpoint's no-grad forward sees inputs that require grad; inference sees none.
+        with torch.no_grad():
+            recomputed = [post(*_leaves(inputs)), post(*inputs)]
+        replay = post(*_leaves(inputs))
+        replay.backward(gradient)
+        reference.backward(gradient)
+    finally:
+        torch._dynamo.reset()
+        hc._get_precision_preserving_h_post_bda.cache_clear()
+
+    assert reference.grad_fn.name() == "NativeHPostBDABackward"
+    assert all(torch.equal(output, reference) for output in [*recomputed, replay])
+    forward, backward = recorders
+    assert len(forward.graphs) == 1 and len(backward.graphs) == 1
+    assert not (forward.ops() | backward.ops()) & _GEMMS, forward.ops() | backward.ops()
+
+
+@pytest.mark.parametrize("preserve_rounding", [False, True])
+@pytest.mark.parametrize("n", [2, 4])
+@pytest.mark.parametrize("dtypes", list(_POST_DTYPES.values()), ids=list(_POST_DTYPES))
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
+        ),
+    ],
+)
+def test_h_post_bda_no_grad_matches_grad_mode_bitwise(
+    monkeypatch, preserve_rounding, n, dtypes, with_bias, device
+):
+    """Bitwise forward/recompute parity, and gradients equal to FP64 within output rounding."""
+    if device == "cuda":
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+        # The compiled bmm split into TF32 and FP32 specializations only with TF32 allowed.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    post = hc._get_precision_preserving_h_post_bda() if preserve_rounding else hc.native_h_post_bda
+    inputs, gradient = _post_inputs(n, dtypes, with_bias, device)
+    torch._dynamo.reset()
+    try:
+        reference_leaves, replay_leaves = _leaves(inputs), _leaves(inputs)
+        reference = post(*reference_leaves)
+        # A checkpoint's no-grad forward sees inputs that require grad; inference sees none.
+        with torch.no_grad():
+            recomputed = [post(*_leaves(inputs)), post(*inputs)]
+        replay = post(*replay_leaves)
+        reference.backward(gradient)
+        replay.backward(gradient)
+    finally:
+        torch._dynamo.reset()
+
+    assert reference.dtype == inputs[1].dtype
+    assert reference.grad_fn.name() == "NativeHPostBDABackward"
+    assert all(torch.equal(output, reference) for output in [*recomputed, replay])
+    fp64_leaves = [None if t is None else t.double().requires_grad_() for t in inputs]
+    h_res, residual, h_post, x, bias = fp64_leaves
+    branch = x if bias is None else x + bias
+    expected = h_res.transpose(-1, -2) @ residual + h_post.unsqueeze(-1) * branch.unsqueeze(-2)
+    expected.backward(gradient.double())
+    torch.testing.assert_close(reference, expected.to(reference.dtype))
+    for actual, again, fp64 in zip(reference_leaves, replay_leaves, fp64_leaves):
+        if actual is None:
+            continue
+        assert actual.grad.dtype == actual.dtype
+        assert torch.equal(actual.grad, again.grad)
+        torch.testing.assert_close(actual.grad, fp64.grad.to(actual.dtype))
 
 
 @pytest.fixture

@@ -214,15 +214,33 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     return NativeHAggregateInto.apply(x, h_pre, out)
 
 
+def _h_res_mix(h_res: Tensor, residual: Tensor) -> Tensor:
+    """H_res.T @ residual as multiply-adds over the streams, rounded once to h_res.dtype.
+
+    mixed[..., i, :] = sum_j h_res[..., j, i] * residual[..., j, :] for h_res [..., n, n] and
+    residual [..., n, C], accumulated in FP32 (FP64 for FP64 inputs) in ascending j, as the
+    fused forward kernel does. With n <= 4 streams a GEMM buys nothing, and its precision
+    depends on the TF32 policy and on how Inductor pads and lowers each compiled
+    specialization: such a split made full-recompute forwards differ from the reference.
+    """
+    with torch.autocast(device_type=h_res.device.type, enabled=False):
+        acc_dtype = torch.promote_types(h_res.dtype, torch.float32)
+        h_res_acc = h_res.to(acc_dtype)
+        # Upcast one residual row per product and accumulate in place: an uncompiled call
+        # (Dynamo disabled or out of recompiles) then holds two FP32 copies of the residual,
+        # not four.
+        mixed = h_res_acc[..., 0, :, None] * residual[..., 0:1, :].to(acc_dtype)
+        for j in range(1, h_res.shape[-1]):
+            mixed += h_res_acc[..., j, :, None] * residual[..., j : j + 1, :].to(acc_dtype)
+    return mixed.to(h_res.dtype)
+
+
 def _native_h_post_bda_impl(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
-    s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
-    with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
-        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    C = original_residual.shape[-1]
+    mixed = _h_res_mix(h_res, original_residual.to(h_res.dtype))
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -230,18 +248,148 @@ def _native_h_post_bda_impl(
     return (x_expanded + mixed).to(original_residual.dtype)
 
 
-# Preserve the legacy compiled entry point and its default compiler options.
+def _native_h_post_bda_bwd_impl(
+    grad_output: Tensor,
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """Gradients of _native_h_post_bda_impl, in the dtypes autograd gives them.
+
+    Each term receives the output gradient in its own dtype and each input gradient is
+    rounded to its input's dtype, as autograd through the forward does. The mixing gradients
+    are FP32 multiply-adds like the forward, not GEMMs.
+    """
+    C = original_residual.shape[-1]
+    h_post_expanded = h_post.unsqueeze(-1)
+    x_dtype = torch.promote_types(h_post.dtype, x.dtype)
+    sum_dtype = torch.promote_types(x_dtype, h_res.dtype)
+    if bias is not None:
+        bias_dtype = torch.promote_types(h_post.dtype, bias.dtype)
+        sum_dtype = torch.promote_types(sum_dtype, bias_dtype)
+    with torch.autocast(device_type=h_res.device.type, enabled=False):
+        grad_sum = grad_output.to(sum_dtype)
+        grad_mixed = grad_sum.to(h_res.dtype)
+        # grad_h_res[j, i] = sum_c residual[j, c] * grad_mixed[i, c]: FP32 products (the residual
+        # promotes to the upcast gradient row) reduced over C. One gradient row at a time, so an
+        # uncompiled call (Dynamo disabled or out of recompiles) never holds an n x n x C product.
+        acc_dtype = torch.promote_types(h_res.dtype, torch.float32)
+        residual = original_residual.to(h_res.dtype)
+        grad_h_res = torch.stack(
+            [
+                (residual * grad_mixed[..., i : i + 1, :].to(acc_dtype)).sum(dim=-1)
+                for i in range(h_res.shape[-1])
+            ],
+            dim=-1,
+        )
+        # grad_residual[j, :] = sum_i h_res[j, i] * grad_mixed[i, :]
+        grad_residual = _h_res_mix(h_res.transpose(-1, -2), grad_mixed)
+        grad_x_expanded = grad_sum.to(x_dtype)
+        grad_h_post = (grad_x_expanded * x.unsqueeze(2)).sum(dim=-1).to(h_post.dtype)
+        grad_x = (grad_x_expanded * h_post_expanded).sum(dim=2).to(x.dtype)
+        grad_bias = None
+        if bias is not None:
+            grad_bias_expanded = grad_sum.to(bias_dtype)
+            grad_h_post_bias = (grad_bias_expanded * bias.view(1, 1, 1, C)).sum(dim=-1)
+            grad_h_post = grad_h_post + grad_h_post_bias.to(h_post.dtype)
+            grad_bias = (grad_bias_expanded * h_post_expanded).sum(dim=(0, 1, 2)).to(bias.dtype)
+    return (
+        grad_h_res.to(h_res.dtype),
+        grad_residual.to(original_residual.dtype),
+        grad_h_post,
+        grad_x,
+        grad_bias,
+    )
+
+
+class NativeHPostBDA(torch.autograd.Function):
+    """Native mHC residual update whose compiled forward serves every pass.
+
+    Full recompute runs the forward under no_grad and replays it with gradients. As one
+    compiled function, each grad mode and set of requires_grad flags was a separate Dynamo
+    specialization that Inductor could lower differently, so a recomputed output could differ
+    from the reference, and the specializations exhausted the recompile limit, after which
+    calls mixed compiled and eager arithmetic. The compiled forward runs on detached inputs, as
+    in SinkhornKnopp; unlike SinkhornKnopp, a compiled backward computes the gradients from the
+    saved inputs without recomputing the output.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        forward_impl: Callable,
+        backward_impl: Callable,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+    ) -> Tensor:
+        """Run ``forward_impl`` on detached inputs and save them for ``backward_impl``."""
+        output = forward_impl(
+            h_res.detach(),
+            original_residual.detach(),
+            h_post.detach(),
+            x.detach(),
+            None if bias is None else bias.detach(),
+        )
+        ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
+        ctx.backward_impl = backward_impl
+        return output
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: Tensor):
+        """Return every input's gradient from one compiled call on detached tensors."""
+        saved = [None if t is None else t.detach() for t in ctx.saved_tensors]
+        return (None, None, *ctx.backward_impl(grad_output.detach(), *saved))
+
+
 @torch.compile
+def _native_h_post_bda_forward(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """native_h_post_bda's compiled forward, with the default compiler options."""
+    return _native_h_post_bda_impl(h_res, original_residual, h_post, x, bias)
+
+
+@torch.compile
+def _native_h_post_bda_backward(
+    grad_output: Tensor,
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """native_h_post_bda's compiled backward, with the default compiler options."""
+    return _native_h_post_bda_bwd_impl(grad_output, h_res, original_residual, h_post, x, bias)
+
+
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Legacy compiled mHC residual update."""
-    return _native_h_post_bda_impl(h_res, original_residual, h_post, x, bias)
+    """Compiled mHC residual update (NativeHPostBDA with the default compiler options)."""
+    return NativeHPostBDA.apply(
+        _native_h_post_bda_forward,
+        _native_h_post_bda_backward,
+        h_res,
+        original_residual,
+        h_post,
+        x,
+        bias,
+    )
 
 
 @lru_cache(maxsize=1)
 def _get_precision_preserving_h_post_bda():
-    """Lazily compile HF's activation-dtype rounding, without changing global settings."""
+    """Lazily compile HF's activation-dtype rounding, without changing global settings.
+
+    The backward is compiled with the same option, so the gradients round the
+    activation-dtype products as eager autograd does.
+    """
     message = (
         "mhc_preserve_activation_dtype_rounding requires torch.compile support for "
         "emulate_precision_casts; no eager or reduced-precision fallback is supported."
@@ -252,10 +400,13 @@ def _get_precision_preserving_h_post_bda():
         raise RuntimeError(message) from error
     if "emulate_precision_casts" not in list_options():
         raise RuntimeError(message)
+    options = {"emulate_precision_casts": True}
     try:
-        return torch.compile(_native_h_post_bda_impl, options={"emulate_precision_casts": True})
+        forward = torch.compile(_native_h_post_bda_impl, options=options)
+        backward = torch.compile(_native_h_post_bda_bwd_impl, options=options)
     except (RuntimeError, TypeError) as error:
         raise RuntimeError(message) from error
+    return partial(NativeHPostBDA.apply, forward, backward)
 
 
 def _proj_rms_impl(
@@ -518,8 +669,8 @@ class HyperConnectionModule(MegatronModule):
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
-    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    # Static shapes: see _compute_h_one_specialization.
+    @torch.compile(dynamic=False)
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -554,6 +705,43 @@ class HyperConnectionModule(MegatronModule):
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
+
+    def _compute_h_one_specialization(
+        self, proj: Tensor, r: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Run the compiled ``_compute_h`` in its grad-mode specialization only.
+
+        Dynamo specializes ``_compute_h`` on grad mode and on whether its inputs
+        require grad. Full activation recompute runs the forward under no_grad and
+        replays it with gradients enabled; with two specializations, a full Dynamo
+        cache makes the missing one run eagerly, and the replay no longer reproduces
+        the forward's mappings bit for bit. Both halves therefore run the grad-mode
+        specialization on inputs that require grad. A grad-mode call that needs a
+        gradient runs it directly, so autograd uses its compiled backward; an input
+        that does not require grad is replaced by a detached one that does. Every
+        other call, under no_grad or with nothing to differentiate, runs it under
+        enable_grad on detached inputs and returns detached outputs.
+
+        ``_compute_h`` is compiled with static shapes because a dynamic-shape entry
+        compiled from the view inputs of a grad-mode call guards on their view base,
+        which detached inputs lack: the two halves of one recompute would then use
+        different entries. With static shapes they share the entry for their shape,
+        or, once Dynamo's cache is full, both run eagerly.
+        """
+        params = (self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        if torch.is_grad_enabled() and (
+            proj.requires_grad or r.requires_grad or any(p.requires_grad for p in params)
+        ):
+            if not proj.requires_grad:
+                proj = proj.detach().requires_grad_(True)
+            if not r.requires_grad:
+                r = r.detach().requires_grad_(True)
+            return self._compute_h(proj, r)
+        with torch.enable_grad():
+            outputs = self._compute_h(
+                proj.detach().requires_grad_(True), r.detach().requires_grad_(True)
+            )
+        return tuple(output.detach() for output in outputs)
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -597,7 +785,7 @@ class HyperConnectionModule(MegatronModule):
             with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
                 proj, r = self._projection_and_get_norm(x)
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-                h_pre, h_post, h_res = self._compute_h(proj, r)
+                h_pre, h_post, h_res = self._compute_h_one_specialization(proj, r)
             h_res = h_res.view(s, b, self.n, self.n)
 
         h_res = self._sinkhorn_op(
@@ -726,14 +914,11 @@ class HyperConnectionModule(MegatronModule):
         n = self.n
         C = self.hidden_size
 
-        # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
-        h_res_batched = h_res.view(s * b, n, n)
-        # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
+        # [s, b, n*C] -> [s, b, n, C]
+        residual_streams = residual.view(s, b, n, C).to(h_res.dtype)
 
-        # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
-        with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
-            mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+        # FP32 multiply-adds, not a GEMM: [s, b, n, n].T @ [s, b, n, C] -> [s, b, n, C]
+        mixed = _h_res_mix(h_res.view(s, b, n, n), residual_streams)
 
         return mixed.view(s, b, n * C)
 

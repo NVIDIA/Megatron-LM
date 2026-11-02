@@ -2842,8 +2842,20 @@ def _torch_h_post_bda_bwd(
     hp = h_post.reshape(sb, n)
     x_flat = x.reshape(sb, C)
 
-    g_hr = torch.bmm(orig, go.transpose(1, 2)).view(s, b, n, n)
-    g_res = torch.bmm(hr, go).view(s, b, n, C)
+    # FP32 (FP64 for FP64 inputs) multiply-adds instead of GEMMs, as in the native backward:
+    # no TF32 policy or Inductor GEMM lowering decides their precision. One gradient row at a
+    # time, so an uncompiled call (Dynamo disabled or out of recompiles) never holds an
+    # n x n x C product.
+    acc_dtype = torch.promote_types(go.dtype, torch.float32)
+    go_rows = [go[:, i : i + 1].to(acc_dtype) for i in range(n)]
+    # g_hr[j, i] = sum_c orig[j, c] * go[i, c]
+    g_hr = torch.stack([(orig * go_i).sum(dim=-1) for go_i in go_rows], dim=-1).view(s, b, n, n)
+    # g_res[j, c] = sum_i hr[j, i] * go[i, c], in ascending i
+    hr_acc = hr.to(acc_dtype)
+    g_res = hr_acc[:, :, 0:1] * go_rows[0]
+    for i in range(1, n):
+        g_res += hr_acc[:, :, i : i + 1] * go_rows[i]
+    g_res = g_res.view(s, b, n, C)
     g_x = torch.sum(go * hp.unsqueeze(-1), dim=1).view(s, b, C)
     xb = x_flat if bias is None else x_flat + bias.view(1, C)
     g_hp = torch.sum(go * xb.unsqueeze(1), dim=2).view(s, b, n)
