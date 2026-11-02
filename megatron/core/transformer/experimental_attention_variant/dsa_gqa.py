@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -23,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    _apply_rope_at_positions,
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
     dsa_min_memory_gqa_forward_only,
@@ -30,6 +32,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+# pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -466,6 +470,46 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             self._apply_rope(k, use_rope=use_rope, packed_seq_params=packed_seq_params),
         )
 
+    def _apply_rope_dynamic(
+        self, q: torch.Tensor, inference_context, *, indexer_key: bool = False
+    ) -> torch.Tensor:
+        """Apply indexer RoPE using each dynamic token's absolute request position."""
+        if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
+            return q
+
+        n = q.size(0)
+        gpu_view = inference_context.gpu_view
+        # Both positions and padding can change while replaying the same padded graph.
+        valid = (
+            gpu_view.token_to_block_idx[:n] != inference_context.kv_block_allocator.dummy_block_idx
+        )
+        positions = (
+            gpu_view.token_to_position_in_request[:n]
+            if indexer_key
+            else gpu_view.token_to_pos_ids[:n]
+        ).masked_fill(~valid, 0)
+
+        q = _apply_rope_at_positions(
+            q,
+            positions,
+            self.index_head_dim,
+            self.index_rotary_dim,
+            self.rotary_pos_emb,
+            self.config.rotary_interleaved,
+        )
+        return q.masked_fill(~valid[:, None, None, None], 0)
+
+    def forward_qk_dynamic(
+        self, hidden_states: torch.Tensor, use_rope: bool, inference_context
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project dynamic tokens to indexer Q/K with absolute-position RoPE."""
+        q, k = self.forward_qk(hidden_states, use_rope=False)
+        if not use_rope:
+            return q, k
+        return self._apply_rope_dynamic(q, inference_context), self._apply_rope_dynamic(
+            k, inference_context, indexer_key=True
+        )
+
 
 class _DSAZeroParamDependency(torch.autograd.Function):
     """Attach zero indexer grads without reading overlap-gathered parameter storage."""
@@ -673,6 +717,58 @@ class DSGQACoreAttention(MegatronModule):
         )
         return unfused_grouped_dsa_fn(
             query, key, value, topk_indices, self.softmax_scale, mask=sparse_attention_mask
+        )
+
+    def forward_dynamic(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inference_context: DynamicInferenceContext,
+        packed_seq_params: Optional[PackedSeqParams],
+        provider_layer_number: int,
+        block_table: torch.Tensor,
+        use_indexer_rope: bool = False,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Run paged Triton prefill and Gluon/Triton decode."""
+        from .dsa_gqa_inference import dynamic_sparse_attention
+
+        assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
+        if self.config.dsa_fwd_use_dense_attn:
+            raise NotImplementedError("Dynamic DSA-GQA requires sparse indexer routing.")
+        if self.config.dsa_indexer_mode != "simplified":
+            raise NotImplementedError("Dynamic DSA-GQA supports the simplified indexer only.")
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+        elif query.dim() != 4:
+            raise ValueError(f"Dynamic DSA-GQA expected THD/SBHD query, got {query.shape}.")
+
+        _, batch_size, _, _ = query.shape
+        assert batch_size == 1, "Dynamic DSA-GQA expects packed tokens with batch=1."
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+
+        index_q, current_index_key = self.indexer.forward_qk_dynamic(
+            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        )
+        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
+
+        return dynamic_sparse_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_q,
+            index_key_cache=index_key_cache,
+            block_table=block_table,
+            inference_context=inference_context,
+            index_topk=self.indexer.index_topk,
+            softmax_scale=self.softmax_scale,
         )
 
     def _forward_min_memory(
@@ -888,3 +984,33 @@ class DSGroupedSelfAttention(SelfAttention):
             ),
             "indexer_input_norm": indexer_input_norm,
         }
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context,
+        block_table: torch.Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
+        provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
+        return self.core_attention.forward_dynamic(
+            query=query,
+            key_cache=key,
+            value_cache=value,
+            hidden_states=hidden_states,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            provider_layer_number=provider_layer_number,
+            block_table=block_table,
+            use_indexer_rope=use_indexer_rope,
+            indexer_input_norm=indexer_input_norm,
+        )

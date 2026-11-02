@@ -27,7 +27,7 @@ DeepEP), and torch ops with a non-deterministic accumulation (``scatter_add_``,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 # PR label that lets a kernel change merge without touching its determinism test
@@ -970,6 +970,35 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",
+    ),
+    KernelEntry(
+        name="dsa_triton_decode",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_decode_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_topk.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py",
+        ),
+        kind="triton",
+        training_path=False,
+        notes="TMA/tcgen05 score, CuTe DSL exact top-k with a PyTorch fallback, and Triton sparse attention "
+        "replay bit-exactly; compares simplified training/decode forward kernels and covers "
+        "empty/ragged requests, causal masks, and graph page-table refresh.",
+    ),
+    KernelEntry(
+        name="dsa_triton_inference",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py",
+        ),
+        kind="triton",
+        training_path=False,
+        notes="Paged Triton prefill and native decode replay with refreshed inputs.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
