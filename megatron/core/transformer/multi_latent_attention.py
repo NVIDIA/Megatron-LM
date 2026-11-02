@@ -330,7 +330,15 @@ class MultiLatentAttention(Attention):
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
-        self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
+        self.softmax_scale = (
+            mscale
+            * mscale
+            * (
+                (1 / math.sqrt(self.q_head_dim))
+                if self.config.softmax_scale is None
+                else self.config.softmax_scale
+            )
+        )
         self.cache_mla_latents = self.config.cache_mla_latents
 
         if self.config.rope_type == "rope":

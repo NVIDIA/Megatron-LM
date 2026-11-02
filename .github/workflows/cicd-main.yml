@@ -970,10 +970,6 @@ jobs:
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -981,9 +977,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: ${{ fromJSON(needs.configure.outputs.h100_gpu_runs_on) }}
-    timeout-minutes: 60
-    name: "${{ matrix.bucket }} - latest"
+    name: Unit tests (H100)
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
@@ -998,34 +992,21 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: 1
-      PIP_NO_PYTHON_VERSION_WARNING: 1
-      PIP_ROOT_USER_ACTION: ignore
-      PIP_DEFAULT_TIMEOUT: 120
-      PIP_RETRIES: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.configure.outputs.sha }}
-      - name: main
-        uses: ./.github/actions
-        with:
-          test_case: ${{ matrix.bucket }}
-          tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
-          container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
-          sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    uses: ./.github/workflows/_unit-tests.yml
+    with:
+      buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
+      runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
+      container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
+      sha: ${{ needs.configure.outputs.sha }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
     outputs:
       unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+      container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -1058,10 +1039,6 @@ jobs:
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest-gb200:
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200) }}
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -1069,9 +1046,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests-gb200
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
-    timeout-minutes: 60
-    name: "${{ matrix.bucket }} - gb200 latest"
+    name: Unit tests (GB200)
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
@@ -1088,30 +1063,16 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: 1
-      PIP_NO_PYTHON_VERSION_WARNING: 1
-      PIP_ROOT_USER_ACTION: ignore
-      PIP_DEFAULT_TIMEOUT: 120
-      PIP_RETRIES: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.configure.outputs.sha }}
-      - name: main
-        uses: ./.github/actions
-        with:
-          test_case: ${{ matrix.bucket }}
-          tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: "true"
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
-          platform: dgx_gb200
-          sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    uses: ./.github/workflows/_unit-tests.yml
+    with:
+      buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
+      runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
+      container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
+      platform: dgx_gb200
+      sha: ${{ needs.configure.outputs.sha }}
+      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -1548,14 +1509,12 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test]
+    needs: [Nemo_CICD_Test, pre-flight]
     if: |
-      (
-        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-        || success()
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.Nemo_CICD_Test.result == 'success'
+      && needs.pre-flight.outputs.docs_only != 'true'
+      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
@@ -1574,12 +1533,22 @@ jobs:
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
+      # GPU selection emits a coverage database even when no tests are selected.
+      - name: Require unit-test coverage
+        id: coverage
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          if not any(Path.cwd().glob("coverage-unit-test-*/.coverage")):
+              raise SystemExit("Missing unit-test coverage artifacts")
+          PY
+
       - name: List coverage files
         run: find . -type f -name "*.xml" -o -name "*.lcov"
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: always()
         run: |
           pip install coverage
 

@@ -32,7 +32,7 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -193,14 +193,14 @@ class ShortcutMoEBlock(MegatronModule):
                 layer_number=moe_layer.layer_number,
                 branch_name="shortcut_routed",
             )
-            outer_connection = moe_layer._get_mlp_residual_connection()
-            if outer_connection is None:
+            outer_read = moe_layer._get_mlp_residual_connection(operation="read")
+            if outer_read is None:
                 raise ValueError(
                     "A wide-residual shortcut read requires an outer MoE residual connection."
                 )
             if (
                 self.shortcut_residual_read.residual_stream_hidden_size
-                != outer_connection.residual_stream_hidden_size
+                != outer_read.residual_stream_hidden_size
             ):
                 raise ValueError(
                     "The shortcut read and outer MoE residual connection must consume the "
@@ -278,7 +278,9 @@ class ShortcutMoEBlock(MegatronModule):
         probs, routing_map = self.moe_layer.mlp.route(
             shortcut_input, padding_mask, packed_seq_params=packed_seq_params
         )
-        return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map, padding_mask)
+        return self.moe_layer.mlp.preprocess(
+            shortcut_input, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+        )
 
     def _moe_shared_experts(
         self,
@@ -380,6 +382,20 @@ class ShortcutMoEBlock(MegatronModule):
         dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
 
+    def _dispatch_and_compute_routed_experts(
+        self, route_input: torch.Tensor, route_probs: torch.Tensor, overlap: bool
+    ) -> torch.Tensor:
+        """Dispatch tokens and compute local experts within one ownership scope."""
+        dispatched_input, dispatched_probs = self._launch_dispatch(
+            route_input, route_probs, async_op=overlap
+        )
+        if overlap:
+            dispatched_input, dispatched_probs = self._wait_dispatch(
+                dispatched_input, dispatched_probs
+            )
+        output, _ = self.moe_layer.mlp.routed_experts_compute(dispatched_input, dispatched_probs)
+        return output
+
     def _launch_combine(self, output: torch.Tensor, async_op: bool = False) -> torch.Tensor:
         """Launch combine on the current stream or the shortcut side stream."""
         if not async_op:
@@ -444,6 +460,7 @@ class ShortcutMoEBlock(MegatronModule):
         packed_sequence_cp_metadata=None,
         attn_recompute_context: ResidualStreamRecomputeContext | None = None,
         moe_recompute_context: ResidualStreamRecomputeContext | None = None,
+        padding_mask_by_layout=None,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
@@ -484,9 +501,13 @@ class ShortcutMoEBlock(MegatronModule):
             )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
+        moe_padding_mask = padding_mask
         if cp_layout_state is not None:
             moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
                 self.moe_local_idx, moe_hidden_states
+            )
+            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
+                self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
         # Launch the moe_router
@@ -496,7 +517,7 @@ class ShortcutMoEBlock(MegatronModule):
             )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
-                padding_mask=padding_mask,
+                padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 recompute_context=attn_recompute_context,
             )
@@ -504,6 +525,7 @@ class ShortcutMoEBlock(MegatronModule):
                 self.route_ready_event.record(torch.cuda.current_stream())
 
         # Launch the input and attn of the attention layer
+        paired_state = None  # initialize variable early to make pylint happy
         with quant_context_factory(attn_config, self.attn_layer_idx):
             if inference:
                 attn_layer_output = self._forward_compute_atomic(
@@ -535,17 +557,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            dispatched_input, dispatched_probs = self._launch_dispatch(
-                route_input, route_probs, async_op=overlap
-            )
-            if overlap:
-                dispatched_input, dispatched_probs = self._wait_dispatch(
-                    dispatched_input, dispatched_probs
-                )
-
-            output, _ = self.moe_layer.mlp.routed_experts_compute(
-                dispatched_input, dispatched_probs
-            )
+            output = self._dispatch_and_compute_routed_experts(route_input, route_probs, overlap)
             combined_output = self._launch_combine(output, async_op=overlap)
             if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
                 self.shortcut_pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(
@@ -555,6 +567,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the output layer of the attention layer
         if not inference:
+            assert paired_state is not None
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
                     attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
@@ -575,7 +588,7 @@ class ShortcutMoEBlock(MegatronModule):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
                 self._moe_shared_experts(
                     hidden_states=attn_layer_output,
-                    padding_mask=padding_mask,
+                    padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
                 )

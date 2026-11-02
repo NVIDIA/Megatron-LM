@@ -3,9 +3,10 @@ import json
 import os
 import sys
 import types
-import torch
 
+import torch
 from utils import initialize_checkpoint_converter_fake_process_groups, print_memory_usage
+
 
 class MegatronCheckpointLoaderBase:
     """Orchestrates loading a Megatron checkpoint and sending
@@ -119,7 +120,6 @@ class MegatronCheckpointLoaderBase:
         self.check_for_arg('max_position_embeddings')
         self.check_for_arg('position_embedding_type')
         self.check_for_arg('tokenizer_type')
-        self.check_for_arg('iteration')
         self.check_for_arg('bert_binary_head')
         self.check_for_arg('disable_bias_linear', False)
         self.check_for_arg('params_dtype')
@@ -132,9 +132,9 @@ class MegatronCheckpointLoaderBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
+            from megatron.core import mpu
             from megatron.training.argument_utils import inference_cfg_container_from_args
             from megatron.training.global_vars import set_global_variables
-            from megatron.core import mpu
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             self.queue.put("exit")
@@ -183,8 +183,10 @@ class MegatronCheckpointLoaderBase:
           - consumed_train_samples, consumed_valid_samples
         """
         from megatron.core import mpu
+        from megatron.training import get_train_state
         from megatron.training.checkpointing import load_checkpoint
 
+        train_state = get_train_state()
         consumed_train_samples = None
         consumed_valid_samples = None
         tp_size = self.margs.tensor_model_parallel_size
@@ -210,8 +212,8 @@ class MegatronCheckpointLoaderBase:
                     model_list.append(this_model)
 
                 # Each time we load, we set counters to 0, pass None for optimizer/ LR
-                self.margs.consumed_train_samples = 0
-                self.margs.consumed_valid_samples = 0
+                train_state.consumed_train_samples = 0
+                train_state.consumed_valid_samples = 0
                 self.margs.exit_on_missing_checkpoint = True
                 # Preserve training progress in the converted checkpoint.
                 load_checkpoint(model_list, None, None, restore_training_state=True)
@@ -219,14 +221,14 @@ class MegatronCheckpointLoaderBase:
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples
                 if consumed_train_samples is not None:
-                    assert self.margs.consumed_train_samples == consumed_train_samples
+                    assert train_state.consumed_train_samples == consumed_train_samples
                 else:
-                    consumed_train_samples = self.margs.consumed_train_samples
+                    consumed_train_samples = train_state.consumed_train_samples
 
                 if consumed_valid_samples is not None:
-                    assert self.margs.consumed_valid_samples == consumed_valid_samples
+                    assert train_state.consumed_valid_samples == consumed_valid_samples
                 else:
-                    consumed_valid_samples = self.margs.consumed_valid_samples
+                    consumed_valid_samples = train_state.consumed_valid_samples
 
                 for vp_rank in range(vp_size):
                     local_models_for_stage[vp_rank].append(model_list[vp_rank])
@@ -245,7 +247,11 @@ class MegatronCheckpointLoaderBase:
         return all_models, consumed_train_samples, consumed_valid_samples
     
     def send_metadata_over_queue(self):
+        from megatron.training import get_train_state
+
         # Let the consumer know the overall metadata:
+        # Iteration is available in TrainState after loading the model shards.
+        self.md.iteration = get_train_state().iteration
         self.md.consumed_train_samples = self.consumed_train_samples
         self.md.consumed_valid_samples = self.consumed_valid_samples
         self.queue.put(self.md)
@@ -443,7 +449,6 @@ class MegatronCheckpointLoaderBase:
         md.num_attention_heads = self.margs.num_attention_heads
         md.max_position_embeddings = self.margs.max_position_embeddings
         md.tokenizer_type = self.margs.tokenizer_type
-        md.iteration = self.margs.iteration
         md.params_dtype = self.margs.params_dtype
         md.bert_binary_head = self.margs.bert_binary_head
         md.output_layer = self.margs.untie_embeddings_and_output_weights

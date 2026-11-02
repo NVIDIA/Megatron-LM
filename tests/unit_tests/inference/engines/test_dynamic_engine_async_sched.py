@@ -22,7 +22,10 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamoHelper
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import (
+    DisaggDynamicInferenceEngine,
+    StateHandoffDynamicInferenceEngine,
+)
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -31,6 +34,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState, _get_dec
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -222,8 +226,10 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
     engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
     engine._initialize_disaggregation_state()
     engine.waiting_request_ids = deque()
-    engine._pending_kv_imports.append(SimpleNamespace(request_id=7, resume_tokens=[55]))
-    engine._handoff_completion_notifications[7] = False
+    engine._pending_kv_imports.append(
+        SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+    )
+    engine._handoff_completion_notifications[7] = (False, True)
 
     assert not engine._should_run_async_sched_overlap()
 
@@ -676,7 +682,11 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "mtp-depth-one",
         "speculation:mtp-depth-one",
-        config={"num_speculative_tokens": 1},
+        config={
+            "num_speculative_tokens": 1,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+        },
         signals=("mtp",),
     ),
     _pair_scenario(
@@ -688,6 +698,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
             "materialize_only_last_token_logits": False,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
         },
         sampling=(
             {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
@@ -770,8 +782,14 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
     _pair_scenario(
         "recompute-suspend-resume",
         "kv:recompute",
-        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
-        signals=("recompute", "suspend-resume"),
+        config={
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=({"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 3},),
+        signals=("recompute", "suspend-resume", "full-logits", "logprobs", "top-n"),
     ),
 )
 
@@ -1113,6 +1131,39 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     controller = env.engine.controller
     context = env.engine.context
     _instrument_async_phases(controller, runtime)
+
+    if "mtp" in scenario.signals and "cuda-graph" in scenario.signals:
+        model = controller._unwrapped_model
+        manager = getattr(model, "_mtp_cudagraph_manager", None)
+        assert manager is not None
+        wrapped_runners = set()
+        original_get_runner = manager.get_cudagraph_runner
+
+        def traced_get_runner(*args, **kwargs):
+            runner = original_get_runner(*args, **kwargs)
+            if id(runner) not in wrapped_runners:
+                original_replay = runner.replay_graph_capture
+
+                def traced_replay(*replay_args, _real=original_replay, **replay_kwargs):
+                    runtime["mtp-cuda-graph-replays"] += 1
+                    return _real(*replay_args, **replay_kwargs)
+
+                runner.replay_graph_capture = traced_replay
+                wrapped_runners.add(id(runner))
+            return runner
+
+        manager.get_cudagraph_runner = traced_get_runner
+        original_mtp = model.compute_mtp_single_step
+
+        def traced_mtp(*args, **kwargs):
+            result = original_mtp(*args, **kwargs)
+            eager = kwargs.get("eager", False)
+            cache_key = kwargs.get("cache_key")
+            if context.using_cuda_graph_this_step() and not eager and cache_key is not None:
+                runtime["mtp-cuda-graph-invocations"] += 1
+            return result
+
+        model.compute_mtp_single_step = traced_mtp
 
     original_forward = controller._dynamic_step_forward_logits
 
@@ -1747,6 +1798,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "mtp" in signals:
             assert env.engine._spec_steps > 0
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+            if "cuda-graph" in signals:
+                assert runtime["mtp-cuda-graph-invocations"] > 0
+                assert runtime["mtp-cuda-graph-replays"] == runtime["mtp-cuda-graph-invocations"]
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
@@ -2177,7 +2231,10 @@ def test_post_process_enforces_per_request_logprob_policy():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
     engine.requests = {
-        request.request_id: SimpleNamespace(record=[request]) for request in requests
+        request.request_id: SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+        for request in requests
     }
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -2254,12 +2311,8 @@ def test_base_engine_rejects_kv_handoff_commands():
 
 
 def test_disagg_engine_resolves_handoff_methods_from_mixin():
-    assert DisaggDynamicInferenceEngine.mro()[:3] == [
-        DisaggDynamicInferenceEngine,
-        InferenceStateHandoffMixin,
-        DynamicInferenceEngine,
-    ]
-    assert (
-        DisaggDynamicInferenceEngine.add_request_with_kv_handoff
-        is InferenceStateHandoffMixin.add_request_with_kv_handoff
-    )
+    for engine_cls in (StateHandoffDynamicInferenceEngine, DisaggDynamicInferenceEngine):
+        assert (
+            engine_cls.add_request_with_kv_handoff
+            is InferenceStateHandoffMixin.add_request_with_kv_handoff
+        )

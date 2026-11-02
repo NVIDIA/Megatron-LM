@@ -1,0 +1,73 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Unit tests
+
+on:
+  workflow_call:
+    inputs:
+      buckets:
+        description: JSON-encoded recipe bucket list
+        type: string
+        required: true
+      platform:
+        type: string
+        default: dgx_h100
+      runner:
+        description: JSON-encoded runner label or object with group and labels
+        type: string
+        required: true
+      container-image:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      unit_testmon_mode:
+        type: string
+        default: full
+      unit_testmon_target_branch:
+        type: string
+        default: ""
+      unit_test_pr_files_artifact_id:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    name: ${{ matrix.bucket }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.buckets) }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Run unit-test bucket
+        uses: ./.github/actions
+        with:
+          script: ""
+          test_case: ${{ matrix.bucket }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "true"
+          container-image: ${{ inputs.container-image }}
+          platform: ${{ inputs.platform }}
+          sha: ${{ inputs.sha }}
+          # Select and execute on the same GPU workers using main's baseline.
+          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
+          unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}

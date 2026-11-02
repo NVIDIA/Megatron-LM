@@ -7,17 +7,16 @@ import os
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
-    StreamwiseSigmoidWideResidualConnection,
-    WideResidualTransformerLayer,
-)
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -65,6 +64,8 @@ def _build_layer(config: TransformerConfig) -> WideResidualTransformerLayer:
     submodules.input_layernorm = IdentityOp
     submodules.self_attention = IdentityOp
     submodules.self_attn_bda = IdentityFuncOp
+    if config.sequence_parallel:
+        submodules.pre_mlp_layernorm = TENorm
     layer_spec = ModuleSpec(module=WideResidualTransformerLayer, submodules=submodules)
     return build_module(
         layer_spec,
@@ -80,11 +81,15 @@ def _assert_branchwise_geometry(
     layer: WideResidualTransformerLayer, config: TransformerConfig
 ) -> None:
     wide_hidden_size = config.wide_residual.num_streams * config.hidden_size
-    connection = layer.residual_connection_mlp
-    assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+    reader = layer.residual_read_mlp
+    writer = layer.residual_write_mlp
+    assert isinstance(reader, StreamwiseSigmoidWideResidualConnection)
+    assert isinstance(writer, StreamwiseSigmoidWideResidualConnection)
+    assert (reader.operation, writer.operation) == ("read", "write")
     assert layer.residual_stream_hidden_size == wide_hidden_size
-    assert connection.residual_stream_hidden_size == wide_hidden_size
-    assert connection.branch_hidden_size == config.hidden_size
+    for operation in (reader, writer):
+        assert operation.residual_stream_hidden_size == wide_hidden_size
+        assert operation.branch_hidden_size == config.hidden_size
     assert layer.mlp.router.weight.shape[-1] == config.hidden_size
     assert layer.mlp.shared_experts.config.hidden_size == config.hidden_size
 
@@ -114,9 +119,9 @@ def test_branchwise_wide_moe_keeps_all_moe_paths_at_backbone_width():
         assert any(
             parameter.grad is not None for parameter in layer.mlp.shared_experts.parameters()
         )
-        assert layer.residual_connection_mlp.read_map.logit.grad is not None
-        assert layer.residual_connection_mlp.write_map.logit.grad is not None
-        assert layer.residual_connection_mlp.retention.retention_logit.grad is not None
+        assert layer.residual_read_mlp.read_map.logit.grad is not None
+        assert layer.residual_write_mlp.write_map.logit.grad is not None
+        assert layer.residual_write_mlp.retention.retention_logit.grad is not None
     finally:
         Utils.destroy_model_parallel()
 
@@ -155,8 +160,8 @@ def test_branchwise_wide_moe_runs_with_tensor_and_expert_parallelism():
         _assert_branchwise_geometry(layer, config)
         output.float().square().mean().backward()
         assert residual_stream.grad is not None
-        assert layer.residual_connection_mlp.read_map.logit.grad is not None
-        assert layer.residual_connection_mlp.write_map.logit.grad is not None
-        assert layer.residual_connection_mlp.retention.retention_logit.grad is not None
+        assert layer.residual_read_mlp.read_map.logit.grad is not None
+        assert layer.residual_write_mlp.write_map.logit.grad is not None
+        assert layer.residual_write_mlp.retention.retention_logit.grad is not None
     finally:
         Utils.destroy_model_parallel()

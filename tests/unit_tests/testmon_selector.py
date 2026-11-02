@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Generate a rank-zero Testmon baseline or select tests from a private copy."""
+"""Record Testmon baselines and collect affected tests on distributed GPU workers."""
 
 from __future__ import annotations
 
@@ -130,6 +130,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     args = _parser().parse_args(argv)
     try:
         return _run(args)

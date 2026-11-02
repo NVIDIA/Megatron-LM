@@ -231,6 +231,10 @@ def test_muon_qkv_split_shapes():
         [128, 64] * 4,
     )
 
+    mla_nope_layout = QKVLayout.from_mla_head_components(4, (128, 0))
+    assert _get_qkv_split_shapes(mla_nope_layout) == ([128], [128] * 4)
+    assert _get_qkv_split_shapes(mla_nope_layout, split_qkv_per_head=True) == ([128] * 4, [128] * 4)
+
 
 def test_muon_qkv_query_group_layout_localization():
     """Projection splitting detects query groups fragmented by TP row ranges."""
@@ -252,7 +256,7 @@ def test_muon_qkv_split_shapes_config_without_attention_output_gate():
     assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == ([2] * 8, [2] * 8)
 
 
-@pytest.mark.parametrize("layout_kind", ["gqa", "gated_gqa", "mla"])
+@pytest.mark.parametrize("layout_kind", ["gqa", "gated_gqa", "mla", "mla_nope"])
 @pytest.mark.parametrize("split_per_head", [False, True])
 def test_muon_qkv_split_sentinel_contents(layout_kind, split_per_head):
     """NS receives the intended components and its outputs return to their original rows."""
@@ -262,6 +266,12 @@ def test_muon_qkv_split_sentinel_contents(layout_kind, split_per_head):
         # across heads; per-head NS handles the four components independently.
         component_specs = [("c0", 1, 3), ("r0", 2, 1), ("c1", 1, 3), ("r1", 2, 1)]
         projection_names = [("c0", "c1"), ("r0", "r1")]
+    elif layout_kind == "mla_nope":
+        layout = QKVLayout.from_mla_head_components(2, (2, 0))
+        # NoPE has no positional rows: aggregate both content heads in projection
+        # mode, or orthogonalize the two content heads independently in per-head mode.
+        component_specs = [("c0", 1, 2), ("c1", 1, 2)]
+        projection_names = [("c0", "c1")]
     else:
         gated = layout_kind == "gated_gqa"
         layout = QKVLayout.from_transformer_config(

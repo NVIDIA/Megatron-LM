@@ -134,6 +134,7 @@ def nemotron_language_config(
 ) -> TransformerConfig:
     """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
+    gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
     config.variable_seq_lengths = True
     config.expert_model_parallel_size = ep_size
@@ -158,7 +159,8 @@ def nemotron_language_config(
         )
     )
     config.sequence_parallel = tp_size > 1
-    config.position_embedding_type = "none"
+    config.tensor_parallel_num_sequence_shards = tp_size * gtp_remat_num_sequence_shards
+    config.position_embedding_type = args.position_embedding_type
     return config
 
 
@@ -202,6 +204,7 @@ def nemotron_projection_config(
     if base_config is None:
         _disable_gtp(config)
     config.sequence_parallel = False
+    config.tensor_parallel_num_sequence_shards = None
     return config
 
 
@@ -243,7 +246,9 @@ def language_model_spec(
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
-        cp_size = get_grid_dim_size(llm_grid, "cp")
+        cp_size = get_grid_dim_size(llm_grid, "cp") * get_grid_dim_size(
+            llm_grid, "gtp_remat_sequence_shards"
+        )
         ep_size = getattr(args, "mimo_llm_ep", 1)
         expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
@@ -277,7 +282,10 @@ def language_model_spec(
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
-            "position_embedding_type": "none",
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_base": args.rotary_base,
+            "rotary_percent": args.rotary_percent,
+            "seq_len_interpolation_factor": args.rotary_seq_len_interpolation_factor,
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
             "logit_dtype": args.logit_dtype,
