@@ -587,9 +587,12 @@ def plan_shared_prefix_bins(
             continue
 
         prompt_length = exact_rows[0].prompt_length
-        # Spread a group past the branch limit evenly (17 -> 9+8, not a
-        # 16-star plus an unshared singleton), as split_rows_evenly does.
-        branch_limit = -(-len(exact_rows) // -(-len(exact_rows) // max_completions_per_bin))
+        # Spread a group past the branch limit over the fewest stars with sizes
+        # that differ by at most one, as split_rows_evenly does: ``extra`` stars
+        # of ``base + 1`` rows and the rest of ``base`` (17 -> 9+8 and
+        # 49 -> 13+12+12+12, not a full star plus a short or unshared remainder).
+        base, extra = divmod(len(exact_rows), -(-len(exact_rows) // max_completions_per_bin))
+        large_bins = 0
         physical_bins: list[list[SharedPrefixRow]] = []
         bin_completion_tokens: list[int] = []
         rows_by_size = sorted(
@@ -603,7 +606,9 @@ def plan_shared_prefix_bins(
         for row in rows_by_size:
             destination: int | None = None
             for bin_index, bin_rows in enumerate(physical_bins):
-                has_branch_slot = len(bin_rows) < branch_limit
+                has_branch_slot = len(bin_rows) < base or (
+                    len(bin_rows) == base and large_bins < extra
+                )
                 has_token_space = (
                     prompt_length
                     + bin_completion_tokens[bin_index]
@@ -617,6 +622,7 @@ def plan_shared_prefix_bins(
                 physical_bins.append([row])
                 bin_completion_tokens.append(physical_completion_length(row))
             else:
+                large_bins += len(physical_bins[destination]) == base
                 physical_bins[destination].append(row)
                 bin_completion_tokens[destination] += physical_completion_length(row)
 

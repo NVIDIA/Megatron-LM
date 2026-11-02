@@ -951,8 +951,18 @@ def _dense_training_bins(count):
     return {"sizes": sizes, "rows": list(unit.row_indices), "units": units, **observed}
 
 
-BRANCH_LIMIT_SIZES = {0: (), 3: (3,), 16: (16,), 17: (9, 8), 32: (16, 16), 33: (11, 11, 11)}
-_COUNTS = (3, 16, 17, 32, 33)
+BRANCH_LIMIT_SIZES = {
+    0: (),
+    3: (3,),
+    16: (16,),
+    17: (9, 8),
+    32: (16, 16),
+    33: (11, 11, 11),
+    # Sizes differ by at most one: not 13+13+13+10, and not fifteen 16-row stars plus one row.
+    49: (13, 12, 12, 12),
+    241: (16,) + (15,) * 15,
+}
+_COUNTS = (3, 16, 17, 32, 33, 49, 241)
 BRANCH_LIMIT_PLANNERS = {
     "split_rows_evenly": (_split_rows_evenly, (0, *_COUNTS)),
     "plan_shared_prefix_bins": (_plan_shared_prefix_bins, (0, *_COUNTS)),

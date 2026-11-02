@@ -146,30 +146,33 @@ def _pack_full_length_group(
     only shorten it; if exact-prompt validation later fails, the same slot
     still fits as one ordinary block-diagonal packed microbatch.
 
-    A group larger than ``max_rows_per_slot`` is spread evenly over the fewest
-    slots that respect it (17 -> 9+8 with the default 16, not a 16-row slot
-    plus an unshared singleton), as ``plan_shared_prefix_bins`` does. Each slot
-    lists its source row indices in input order. Every row must fit
-    ``bin_capacity`` on its own.
+    A group larger than ``max_rows_per_slot`` is spread over the fewest slots
+    that respect it, with sizes that differ by at most one (17 -> 9+8 with the
+    default 16, not a 16-row slot plus an unshared singleton), as
+    ``plan_shared_prefix_bins`` does. Each slot lists its source row indices in
+    input order. Every row must fit ``bin_capacity`` on its own.
     """
     padded_lengths = [_round_up(row.total_length, padding_multiple) for row in rows]
     num_bins = -(-len(rows) // max_rows_per_slot)
-    max_rows_per_bin = -(-len(rows) // num_bins) if num_bins else max_rows_per_slot
+    # ``extra`` slots of ``base + 1`` rows and the rest of ``base``.
+    base, extra = divmod(len(rows), num_bins) if num_bins else (max_rows_per_slot, 0)
+    large_bins = 0
     bins: list[list[int]] = []
     bin_work: list[int] = []
     for position in sorted(range(len(rows)), key=lambda index: (-padded_lengths[index], index)):
         destination: int | None = None
         for bin_index, bin_positions in enumerate(bins):
-            if (
-                len(bin_positions) < max_rows_per_bin
-                and bin_work[bin_index] + padded_lengths[position] <= bin_capacity
-            ):
+            has_row_slot = len(bin_positions) < base or (
+                len(bin_positions) == base and large_bins < extra
+            )
+            if has_row_slot and bin_work[bin_index] + padded_lengths[position] <= bin_capacity:
                 destination = bin_index
                 break
         if destination is None:
             bins.append([position])
             bin_work.append(padded_lengths[position])
         else:
+            large_bins += len(bins[destination]) == base
             bins[destination].append(position)
             bin_work[destination] += padded_lengths[position]
     return [tuple(rows[position].row_index for position in sorted(positions)) for positions in bins]
