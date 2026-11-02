@@ -121,11 +121,15 @@ class WideResidualMambaLayer(MambaLayer):
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
+        # Block finalization discards checkpointed outputs. Keep the final write eager
+        # so its output stays live for the next forward operation and backward replay hook.
         write_recompute_context = (
             recompute_context
             if recompute_context is not None and not recompute_context.is_block_end
             else None
         )
+        # Preserve the eager grad handler. Checkpointing must see the caller's grad mode
+        # so an outer no_grad() still disables replay registration.
         grad_scope = (
             self.bias_dropout_add_exec_handler()
             if write_recompute_context is None

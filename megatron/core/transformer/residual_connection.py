@@ -48,12 +48,9 @@ class ResidualConnection(nn.Module, ABC):
 
     ``operation`` fixes an instance to one operation at construction.
 
-    Both modes call this module once per logical operation. Replay runs the computation
-    without repeating this module's ``forward`` or hooks. Subclasses must keep eager and
-    checkpointed computations equivalent.
-
-    Hooks and forward overrides must not modify checkpoint-owned output storage in place:
-    replay restores the original values.
+    Each operation enters this module once; replay skips its ``forward`` and hooks.
+    Eager and checkpointed computations must be equivalent. Hooks and forward overrides
+    must not mutate checkpoint-owned output storage: replay restores the original values.
     """
 
     def __init__(
@@ -126,9 +123,8 @@ class ResidualConnection(nn.Module, ABC):
         ``branch_input_dtype`` is read-only. ``None`` preserves the connection's natural read
         dtype; otherwise compatible connections may produce that dtype directly in a fused read.
 
-        ``execution_context`` supplies per-call dependencies, such as mHC's parameter-owning
-        module and fusion setting. Supplied modules remain registered with their caller;
-        this connection uses them without registering them as children.
+        ``execution_context`` supplies modules and options for this call, such as mHC's mixing
+        module and fusion flag. Module ownership and registration stay with the caller.
 
         ``recompute_context=None`` selects eager execution. Otherwise, the connection uses
         its checkpoint implementation, which chooses what to replay.
