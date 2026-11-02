@@ -77,6 +77,7 @@ def _make_gpt_args(
     args.mtp_num_layers = None
     args.mtp_use_repeated_layer = False
     args.mtp_detach_heads = False
+    args.mtp_repeated_layer_shared_components = None
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -2069,6 +2070,75 @@ class TestDSA:
 
         assert observed_indexer_executions == [expected_indexer_executions]
 
+    def test_repeated_mtp_component_sharing(self):
+        """Each selected component removes only its own later-depth work."""
+        args = _make_dsa_args()
+        args.mtp_num_layers = 3
+        args.mtp_use_repeated_layer = True
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        args.mtp_repeated_layer_shared_components = []
+        unshared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["latent_kv"]
+        latent_shared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["sparse_attention_index"]
+        index_shared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["latent_kv", "sparse_attention_index"]
+        both_shared = num_floating_point_operations(args, batch_size)
+
+        num_consumer_depths = args.mtp_num_layers - 1
+        expected_latent_savings = (
+            total_tokens
+            * 3
+            * 2
+            * num_consumer_depths
+            * (
+                args.hidden_size * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                + args.kv_lora_rank
+            )
+        )
+        index_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+        index_token_term = (
+            2
+            * 2
+            * (
+                args.q_lora_rank * index_dim
+                + args.hidden_size * args.dsa_indexer_head_dim
+                + args.hidden_size * args.dsa_indexer_n_heads
+            )
+        )
+        index_core_term = 3 * 2 * index_dim / 2
+        expected_index_savings = num_consumer_depths * (
+            total_tokens * index_token_term + sum_sq * index_core_term
+        )
+
+        assert unshared - latent_shared == expected_latent_savings
+        assert unshared - index_shared == expected_index_savings
+        assert unshared - both_shared == expected_latent_savings + expected_index_savings
+
+    def test_repeated_mtp_uses_one_global_layer_number_for_index_schedule(self):
+        """A repeated skip layer must not be counted as fictitious later MTP layers."""
+        from megatron.training.training import _num_dsa_indexer_layers
+
+        # Decoder layers 1..3 compute. Repeated MTP layer 4 is a skip layer at
+        # every depth; fictitious global layers 5..8 must not enter the count.
+        assert (
+            _num_dsa_indexer_layers(
+                3,
+                skip_topk_offset=3,
+                topk_freq=4,
+                mtp_num_layers=5,
+                mtp_use_repeated_layer=True,
+                mtp_shares_sparse_attention_index=False,
+            )
+            == 3
+        )
+
     def test_topk_caps_long_context_growth(self):
         """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.
 
@@ -2090,7 +2160,7 @@ class TestDSA:
 
 
 class TestDSAHelperEdgeCases:
-    """Direct coverage of the helper guards and the hybrid rejection."""
+    """Direct coverage of the helper guards and the hybrid rejections."""
 
     def test_indexer_flops_zero_layers(self):
         """No indexer layers contribute nothing."""
@@ -2146,12 +2216,13 @@ class TestDSAHelperEdgeCases:
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
 
-    def test_hybrid_dsa_rejected(self):
-        """A hybrid layer pattern with DSA must fail loud, not fall through
-        to the dense full-MLA estimate (which overcounts core attention and
-        drops the indexer)."""
+    def test_hybrid_implicit_dsa_rejected(self):
+        """A model-wide 'dsa' variant without explicit 'D' layers binds DSA to
+        other attention layers through a custom spec (e.g. DSA over GQA), which
+        has no FLOPs model on the hybrid path. It must fail loud rather than
+        be counted as dense attention."""
         args = _make_dsa_args()
-        args.hybrid_layer_pattern = "D-D-"
+        args.hybrid_layer_pattern = "+-+-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
@@ -2160,21 +2231,18 @@ class TestDSAHelperEdgeCases:
         with pytest.raises(AssertionError, match="hybrid-model path"):
             num_floating_point_operations(args, 2)
 
-    def test_hybrid_dsa_rejected_without_variant_attribute(self):
-        """The guard must key off the 'D' symbols in the layer pattern, not
-        just ``args.experimental_attention_variant``: on the hybrid path a
-        'D' pattern sets the variant only in the config kwargs (never back
-        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
-        reaches this code with the attribute still ``None``."""
+    def test_hybrid_dsa_conflicting_variant_rejected(self):
+        """Explicit 'D' layers must not be silently counted under a
+        conflicting model-wide attention variant."""
         args = _make_dsa_args()
-        args.experimental_attention_variant = None
+        args.experimental_attention_variant = "gdn"
         args.hybrid_layer_pattern = "D-D-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
         args.mamba_num_heads = 128
 
-        with pytest.raises(AssertionError, match="hybrid-model path"):
+        with pytest.raises(ValueError, match="Hybrid DSA FLOPs"):
             num_floating_point_operations(args, 2)
 
 
@@ -2570,3 +2638,95 @@ class TestDSAKPool:
             )
             == 0
         )
+
+
+def _as_dsa_hybrid(args, pattern):
+    """Express a standard-path DSA model through an explicit hybrid layer pattern."""
+    hybrid = SimpleNamespace(**vars(args))
+    hybrid.hybrid_layer_pattern = pattern
+    hybrid.num_layers = len(pattern.split("/")[0].replace("|", ""))
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
+    return hybrid
+
+
+class TestHybridDSA:
+    """Explicit hybrid 'D' layers are counted with the standard-path DSA terms."""
+
+    @pytest.mark.parametrize("variant", [None, "dsa"])
+    @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
+    @pytest.mark.parametrize("sparse_loss", [False, True])
+    @pytest.mark.parametrize("mtp_num_layers", [None, 1])
+    def test_explicit_d_matches_standard_pool_one(
+        self, variant, loss_coeff, sparse_loss, mtp_num_layers
+    ):
+        """Each standard DSA layer is one 'D' plus one '-' hybrid layer.
+
+        A real hybrid launch leaves ``experimental_attention_variant`` unset on
+        ``args``; an explicit 'dsa' must give the same count.
+        """
+        standard = _make_dsa_args(loss_coeff, sparse_loss)
+        standard.mtp_num_layers = mtp_num_layers
+        pattern = "D-" * standard.num_layers + ("/D-" if mtp_num_layers else "")
+        hybrid = _as_dsa_hybrid(standard, pattern)
+        hybrid.experimental_attention_variant = variant
+        assert num_floating_point_operations(hybrid, 2) == num_floating_point_operations(
+            standard, 2
+        )
+        stats = dict(total_real_tokens_in_batch=384, seqlen_squared_sum_in_batch=32768)
+        assert num_floating_point_operations(hybrid, 2, **stats) == num_floating_point_operations(
+            standard, 2, **stats
+        )
+
+    @pytest.mark.parametrize("select_tail", [False, True])
+    @pytest.mark.parametrize("lengths", [(256, 256), (17, 19, 25)])
+    def test_standard_and_hybrid_kpool_match(self, select_tail, lengths):
+        """KPool selection, gate and pool compression match the standard path."""
+        args = _make_dsa_args(dsa_indexer_loss_coeff=0.0)
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_kpool_always_select_tail = select_tail
+        hybrid = _as_dsa_hybrid(args, "D-" * args.num_layers)
+        stats = dict(
+            total_real_tokens_in_batch=sum(lengths),
+            seqlen_squared_sum_in_batch=sum(length**2 for length in lengths),
+        )
+        assert num_floating_point_operations(hybrid, 2, **stats) == num_floating_point_operations(
+            args, 2, **stats
+        )
+
+    def test_indexer_uses_physical_main_and_mtp_layer_numbers(self, monkeypatch):
+        """Indexer executions follow DSAttention's layer numbers.
+
+        Main 'D' layers sit at pattern positions 1, 3 and 5 (pipes stripped);
+        the MTP 'D' layer is number ``num_layers + 1 = 7`` at both depths. With
+        frequency four only layers 1 and 5 compute their own top-k. Restarting
+        the MTP numbering at 1 would wrongly add one execution per depth.
+        """
+        args = _as_dsa_hybrid(_make_dsa_args(0.0), "D-DE|DE/DE/DE")
+        args.dsa_indexer_topk_freq = 4
+        args.mtp_num_layers = 2
+        counts = []
+        original = training_module._dsa_indexer_flops
+
+        def capture(**kwargs):
+            counts.append(kwargs["num_indexer_layers"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(training_module, "_dsa_indexer_flops", capture)
+        num_floating_point_operations(args, 2)
+        assert counts == [2]
+
+    @pytest.mark.parametrize(
+        "topk, loss_coeff, error",
+        [(6, 0.0, "positive top-k divisible"), (8, 0.1, "indexer loss to be disabled")],
+    )
+    def test_invalid_kpool_is_not_silently_estimated(self, topk, loss_coeff, error):
+        """KPool without a pool-aligned top-k, or with the indexer loss, is rejected."""
+        args = _as_dsa_hybrid(_make_dsa_args(loss_coeff), "D-")
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_topk = topk
+        with pytest.raises(ValueError, match=error):
+            num_floating_point_operations(args, 2)
