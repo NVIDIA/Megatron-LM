@@ -409,7 +409,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices).
-        # rotary_pos_cos_sin is used exclusively for FlashInfer's fused RoPE.
+        # rotary_pos_cos_sin is used exclusively for FlashInfer's fused RoPE, which has not been
+        # validated with MTP: models with MTP layers take the unfused RoPE instead.
         rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin = (
             self._rotary_pos_emb_inputs(
                 inference_context,
@@ -417,10 +418,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params,
                 position_ids,
                 decoder_uses_mla=self.config.multi_latent_attention,
+                allow_fused_rope=not self.mtp_process,
             )
         )
-        if rotary_pos_cos_sin is not None:
-            assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
 
         if (
             in_inference_mode

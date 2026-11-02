@@ -244,17 +244,22 @@ def test_flash_decode_is_rejected():
         )
 
 
-def test_flashinfer_fused_rope_rejects_multimodal_rope():
-    """FlashInfer's fused RoPE cannot apply multimodal RoPE, so asking for it explicitly fails
-    when the context is built. Left to its default, such a model runs the unfused RoPE."""
+@pytest.mark.parametrize("use_flashinfer_fused_rope", [False, None, True])
+def test_multimodal_rope_is_rejected(use_flashinfer_fused_rope):
+    """Multimodal RoPE needs three position ids per token, which the dynamic context does not
+    track, so building the context fails with a clear message whatever the fused-RoPE flag."""
     model_config = TransformerConfig(
         num_layers=2, hidden_size=64, num_attention_heads=4, mrope_section=[4, 2, 2]
     )
-    with pytest.raises(ValueError, match="FlashInfer fused RoPE cannot apply multimodal RoPE"):
+    with pytest.raises(
+        ValueError, match="Multimodal RoPE .* is not supported by dynamic inference"
+    ):
         DynamicInferenceContext(
             model_config=model_config,
             inference_config=InferenceConfig(
-                max_sequence_length=64, buffer_size_gb=0.01, use_flashinfer_fused_rope=True
+                max_sequence_length=64,
+                buffer_size_gb=0.01,
+                use_flashinfer_fused_rope=use_flashinfer_fused_rope,
             ),
         )
 

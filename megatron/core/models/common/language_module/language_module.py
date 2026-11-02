@@ -327,6 +327,7 @@ class LanguageModule(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         position_ids: Optional[Tensor] = None,
         decoder_uses_mla: bool = False,
+        allow_fused_rope: bool = True,
     ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """RoPE inputs of this model's attention layers for one forward.
 
@@ -343,6 +344,8 @@ class LanguageModule(MegatronModule):
             position_ids (Tensor, optional): position ids, for multimodal RoPE.
             decoder_uses_mla (bool): whether the decoder uses MLA, which applies its own RoPE
                 and takes no tables.
+            allow_fused_rope (bool): whether attention may apply FlashInfer's fused RoPE; if not,
+                it takes rotary_pos_emb even when the context uses fused RoPE.
         """
         rotary_pos_emb = rotary_pos_cos = rotary_pos_sin = rotary_pos_cos_sin = None
         if not hasattr(self, 'rotary_pos_emb'):
@@ -372,7 +375,7 @@ class LanguageModule(MegatronModule):
                 in_inference_mode
                 and inference_context is not None
                 and not decoder_uses_mla
-                and (self.config.flash_decode or use_flashinfer_fused_rope)
+                and (self.config.flash_decode or (allow_fused_rope and use_flashinfer_fused_rope))
             ):
                 max_sequence_length = inference_context.max_sequence_length_for_model
                 if max_sequence_length not in self.rotary_pos_emb_cache:

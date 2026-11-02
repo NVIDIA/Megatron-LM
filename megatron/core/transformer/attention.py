@@ -728,6 +728,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 query, key = inference_context.apply_fused_qk_rotary_emb(
                     query, key, rotary_pos_cos_sin, self.config
                 )
+                rotary_pos_emb = None  # query and key are rotated; never rotate them twice
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
@@ -1444,8 +1445,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
         )
         if no_rope:
-            rotary_pos_emb = None
-            rotary_pos_cos_sin = None
+            rotary_pos_emb = rotary_pos_cos = rotary_pos_sin = rotary_pos_cos_sin = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

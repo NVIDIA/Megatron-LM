@@ -496,6 +496,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
@@ -504,9 +505,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         elif self.position_embedding_type == 'yarn' and (
             self.hybrid_layer_config_list is None or list_section_needs_standard_rope
         ):
+            # YaRN rejects rotary_interleaved, which it does not implement.
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),

@@ -338,7 +338,7 @@ def test_dynamic_fused_rope_dispatch_replays(no_rope):
 
     A prefill replays bit-exactly under side-stream contention. A layer in no_rope_freq takes no
     RoPE: given rotary_pos_cos_sin it matches running without it bit for bit, while a RoPE layer
-    differs.
+    differs. A rotary_pos_emb passed next to the cache is not applied on top of it.
     """
     from megatron.core.inference.config import InferenceConfig
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -407,14 +407,16 @@ def test_dynamic_fused_rope_dispatch_replays(no_rope):
                 dtype=torch.bfloat16,
             ),
             rotary_pos_cos_sin=torch.cat((freqs.cos(), freqs.sin()), dim=-1),
+            rotary_pos_emb=None,
         )
 
-        def fn(hidden_states, rotary_pos_cos_sin):
+        def fn(hidden_states, rotary_pos_cos_sin, rotary_pos_emb):
             with torch.no_grad(), InferenceMode.active():
                 output, _ = module(
                     hidden_states,
                     attention_mask=None,
                     inference_context=context,
+                    rotary_pos_emb=rotary_pos_emb,
                     rotary_pos_cos_sin=rotary_pos_cos_sin,
                 )
             return output
@@ -432,6 +434,13 @@ def test_dynamic_fused_rope_dispatch_replays(no_rope):
         assert bytes_equal(fused, unrotated) == no_rope, (
             "the no-RoPE layer was rotated" if no_rope else "the RoPE layer was not rotated"
         )
+        both = assert_replays_bit_exact(
+            fn,
+            dict(inputs, rotary_pos_emb=torch.cat((freqs, freqs), dim=-1)[:, None, None, :]),
+            backward=False,
+            what=f"fused RoPE dispatch with rotary_pos_emb too, {layer} layer",
+        )[0]["out"]
+        assert bytes_equal(both, fused), "rotary_pos_emb was applied on top of fused RoPE"
     finally:
         Utils.destroy_model_parallel()
 

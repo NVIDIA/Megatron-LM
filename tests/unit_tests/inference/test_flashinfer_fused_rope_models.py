@@ -19,7 +19,10 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -180,6 +183,24 @@ class TestGPTModelFusedRope:
             model, rope_layers=config.num_layers - sum(no_rope_freq or [])
         )
 
+    def test_mtp_model_takes_unfused_rope(self):
+        """FlashInfer's fused RoPE is not validated with MTP, so a YaRN model with MTP layers
+        runs the unfused RoPE with the context's fused RoPE on, instead of failing."""
+        config = _with_yarn(_config(mtp_num_layers=1))
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=VOCAB_SIZE,
+            max_sequence_length=MAX_SEQUENCE_LENGTH,
+            position_embedding_type="yarn",
+            mtp_block_spec=get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=True
+            ),
+        )
+        model = Float16Module(config, model).cuda().eval()
+        _assert_fused_rope_matches_unfused(model, rope_layers=0)
+
 
 class TestHybridModelFusedRope:
     def setup_method(self, method):
@@ -189,9 +210,13 @@ class TestHybridModelFusedRope:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-    def test_fused_rope_matches_unfused(self, position_embedding_type):
-        config = _config()
+    @pytest.mark.parametrize(
+        "position_embedding_type,rotary_interleaved",
+        [("rope", False), ("rope", True), ("yarn", False)],
+        ids=["rope", "rope-interleaved", "yarn"],
+    )
+    def test_fused_rope_matches_unfused(self, position_embedding_type, rotary_interleaved):
+        config = _config(rotary_interleaved=rotary_interleaved)
         if position_embedding_type == "yarn":
             _with_yarn(config)
         model = HybridModel(
@@ -204,3 +229,16 @@ class TestHybridModelFusedRope:
         )
         model = Float16Module(config, model).cuda().eval()
         _assert_fused_rope_matches_unfused(model, rope_layers=1)
+
+    def test_yarn_rejects_interleaved_layout(self):
+        """YaRN does not implement rotary_interleaved; HybridModel rejects it when built, as
+        GPTModel does, instead of applying a non-rotation on the unfused path."""
+        with pytest.raises(AssertionError, match="Yarn RoPE does not support interleaved"):
+            HybridModel(
+                config=_with_yarn(_config(rotary_interleaved=True)),
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=VOCAB_SIZE,
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+                hybrid_layer_pattern="*-",
+                position_embedding_type="yarn",
+            )
