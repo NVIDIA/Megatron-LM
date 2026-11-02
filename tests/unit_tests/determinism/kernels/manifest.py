@@ -707,11 +707,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="bincount / scatter_add_ / index_add_ on integer counts: exact regardless of order.",
     ),
     KernelEntry(
+        name="inference_nvls_fused_rs_add_norm_ag",
+        sources=("megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",),
+        tests=(K + "test_nvls_fused_collectives.py",),
+        kind="triton",
+        training_path=False,
+        notes="Fused multimem reduce-scatter + residual add + RMSNorm + all-gather, one block "
+        "per token. On an NVLink multicast group its outputs replay bit-exactly and equal the "
+        "shard-sized launch it replaced; the launch geometry is checked without a GPU.",
+    ),
+    KernelEntry(
         name="inference_nvls_symmetric_memory_collectives",
         sources=(
             "megatron/core/inference/communication/torch_symm_triton/barrier.py",
             "megatron/core/inference/communication/torch_symm_triton/collectives.py",
-            "megatron/core/inference/communication/torch_symm_triton/fused_collectives.py",
             "megatron/core/inference/communication/torch_symm_triton/kernel_config.py",
             "megatron/core/inference/communication/torch_symm_triton/multimem_asm.py",
             "megatron/core/inference/communication/torch_symm_triton/utils.py",
