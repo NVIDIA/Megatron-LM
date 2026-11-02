@@ -1521,12 +1521,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _resolve_mcore_activation_type(self):
         """Map megatron activation config to mcore_fused_moe ActivationType."""
         func = self.config.activation_func
+        gated = self.config.gated_linear_unit
         if func == squared_relu:
+            # relu(gate)^2 * up with a gated linear unit, as in training's GLU.
+            if gated:
+                return McoreActivationType.GATED_SQUARED_RELU
             return McoreActivationType.SQUARED_RELU
-        if func == F.silu and self.config.gated_linear_unit:
+        if func == F.silu and gated:
             # gated SiLU -> SwiGLU (padded_swiglu / vllm silu_and_mul path)
             return McoreActivationType.SWIGLU
-        raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
+        raise ValueError(
+            f"No mcore_fused_moe ActivationType mapping for activation_func={func} "
+            f"with gated_linear_unit={gated}"
+        )
 
     @staticmethod
     def _unwrap_mxfp8_weight(weight: object) -> MXFP8Tensor | None:

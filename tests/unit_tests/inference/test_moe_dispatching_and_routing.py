@@ -136,6 +136,34 @@ def test_config_rejects_flashinfer_probs_on_input():
         )
 
 
+@pytest.mark.parametrize("backend", ["torch", "vllm"])
+@pytest.mark.parametrize(
+    ("activation", "error"),
+    [
+        (dict(activation_func=torch.nn.functional.gelu), "supports only squared-ReLU"),
+        (dict(activation_func=torch.nn.functional.silu), "supports only squared-ReLU"),
+        (
+            dict(activation_func=torch.nn.functional.gelu, gated_linear_unit=True),
+            "supports only squared-ReLU",
+        ),
+        (
+            dict(
+                activation_func=torch.nn.functional.silu,
+                gated_linear_unit=True,
+                activation_func_tanh_clamp_scale=2.0,
+            ),
+            "SiTU-GLU",
+        ),
+    ],
+    ids=["gelu", "silu", "geglu", "situ_glu"],
+)
+def test_config_rejects_activations_without_inference_kernel(backend, activation, error):
+    """Activations InferenceGroupedMLP cannot compute fail at config time, not at
+    construction or at the first forward."""
+    with pytest.raises(ValueError, match=error):
+        _make_base_config(inference_grouped_gemm_backend=backend, **activation)
+
+
 @pytest.mark.parametrize("grouped_tensor", [False, True])
 def test_config_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0" if grouped_tensor else "1")
@@ -843,8 +871,7 @@ class TestNVLSAllGatherVDispatcher:
         torch.cuda.manual_seed(2028)
         config_overrides = config_overrides or {}
 
-        config = _make_base_config(
-            **config_overrides,
+        settings = dict(
             expert_model_parallel_size=Utils.world_size,
             inference_grouped_gemm_backend=inference_grouped_gemm_backend,
             inference_moe_token_dispatcher_type="nvls",
@@ -869,6 +896,8 @@ class TestNVLSAllGatherVDispatcher:
             use_cpu_initialization=not mxfp8_swiglu,
             batch_invariant_backend="te_native",
         )
+        # Overrides win, so a caller can also change the activation.
+        config = _make_base_config(**{**settings, **config_overrides})
         # Symmetric buffers are cached by name and sized on first use, so a buffer
         # left by a smaller-hidden case cannot hold this case's tokens.
         NVLSAllGatherVDispatcher._delete_buffers()
@@ -953,6 +982,34 @@ class TestNVLSAllGatherVDispatcher:
                     inference_output, _ = layer(hidden_states.clone())
 
         torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("glu_options", [False, True], ids=["plain", "glu_options"])
+    @pytest.mark.parametrize("inference_grouped_gemm_backend", ["torch", "vllm"])
+    def test_batch_invariant_gated_squared_relu_moe_matches_training(
+        self, inference_grouped_gemm_backend, glu_options
+    ):
+        """Gated squared ReLU trains only through TEGroupedMLP's unfused GLU, which rounds
+        each step to BF16; the batch-invariant inference kernels reproduce it bit for bit.
+
+        The clamp value is not a BF16 number, so the BF16 bound torch.clamp uses matters,
+        and the offset makes linear + offset round.
+        """
+        options = dict(
+            activation_func_clamp_value=0.3, glu_linear_offset=0.7, moe_mlp_glu_interleave_size=32
+        )
+        self.test_batch_invariant_moe_matches_training(
+            inference_grouped_gemm_backend,
+            None,
+            False,
+            False,
+            config_overrides=dict(
+                activation_func=squared_relu,
+                gated_linear_unit=True,
+                # The fused weighted squared ReLU is the non-gated training activation.
+                use_fused_weighted_squared_relu=False,
+                **(options if glu_options else {}),
+            ),
+        )
 
     @staticmethod
     def _make_nvfp4_inference_layer(**overrides):
@@ -1183,6 +1240,13 @@ _EXPERT_OPTIONS = {
     "glu_linear_offset": {"glu_linear_offset": 1.0},
     "moe_mlp_glu_interleave_size": {"moe_mlp_glu_interleave_size": 32},
     "moe_apply_probs_on_input": {"moe_apply_probs_on_input": True, "moe_router_topk": 1},
+    "gated_squared_relu": {"activation_func": squared_relu},
+    "gated_squared_relu_glu_options": {
+        "activation_func": squared_relu,
+        "activation_func_clamp_value": 0.5,
+        "glu_linear_offset": 1.0,
+        "moe_mlp_glu_interleave_size": 32,
+    },
 }
 
 
@@ -1291,9 +1355,11 @@ class TestInferenceGroupedMLPMatchesTraining:
     @pytest.mark.parametrize("option", list(_EXPERT_OPTIONS))
     @pytest.mark.parametrize("backend", ["vllm", "torch"])
     def test_inference_matches_training(self, backend, option, batch_invariant):
-        """With batch_invariant, inference runs the batch-invariant kernels. Training applies
-        the linear offset and the interleave in its unfused GLU, whose BF16 roundings those
-        kernels do not reproduce, so the comparison stays a tolerance check."""
+        """With batch_invariant, inference runs the batch-invariant kernels. Training runs
+        outside batch-invariant mode and applies the SwiGLU linear offset and interleave in
+        its unfused GLU, whose BF16 roundings the SwiGLU kernels do not reproduce, so the
+        comparison stays a tolerance check. TestNVLSAllGatherVDispatcher checks the
+        batch-invariant cases that match training bit for bit."""
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             set_batch_invariant_mode,
         )
@@ -1312,9 +1378,13 @@ class TestInferenceGroupedMLPMatchesTraining:
 
         assert actual.shape == expected.shape
         assert self._rel_err(actual, expected) <= self.tol
-        if overrides:
+        if overrides.keys() - {"activation_func"}:
             # The comparison only discriminates if the option matters at this scale.
-            plain = self._make_experts(backend, moe_router_topk=overrides.get("moe_router_topk", 2))
+            plain = self._make_experts(
+                backend,
+                activation_func=overrides.get("activation_func", torch.nn.functional.silu),
+                moe_router_topk=overrides.get("moe_router_topk", 2),
+            )
             plain.load_state_dict(experts.state_dict())
             plain_expected = self._training_forward(plain, hidden, probs, routing_map)
             assert self._rel_err(plain_expected, expected) >= self.min_option_effect

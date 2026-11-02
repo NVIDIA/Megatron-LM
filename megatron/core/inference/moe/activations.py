@@ -102,6 +102,29 @@ def glu_inputs(gate, linear, clamp_value, linear_offset, CLAMP: tl.constexpr, OF
 
 
 @triton.jit
+def squared_relu_glu(
+    gate, linear, clamp_value, linear_offset, CLAMP: tl.constexpr, OFFSET: tl.constexpr
+):
+    """Gated squared ReLU, relu(gate)^2 * (linear + offset), on FP32 values of BF16 inputs.
+
+    Training has one path for this activation, the unfused GLU of TEGroupedMLP, which
+    runs each step as a BF16 torch op. This reproduces its roundings: the clamp (whose
+    bound torch rounds to BF16; rounding after the FP32 clamp gives the same value),
+    relu(gate)^2, linear + offset and their product are each rounded to BF16. Like
+    torch.clamp and F.relu, it keeps NaN inputs NaN. Returns the BF16 product as FP32.
+    """
+    if CLAMP:
+        gate, linear = glu_inputs(gate, linear, clamp_value, linear_offset, True, False)
+        gate = gate.to(tl.bfloat16).to(tl.float32)
+        linear = linear.to(tl.bfloat16).to(tl.float32)
+    if OFFSET:
+        linear = (linear + linear_offset).to(tl.bfloat16).to(tl.float32)
+    act = tl.maximum(gate, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    act = (act * act).to(tl.bfloat16).to(tl.float32)
+    return (act * linear).to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
 def _clamped_relu(x, clamp_scale, CLAMP: tl.constexpr):
     """ReLU, optionally tanh soft-clamped to ``(0, clamp_scale)``.
 
@@ -212,11 +235,13 @@ def _swiglu_kernel(
     CLAMP: tl.constexpr,
     OFFSET: tl.constexpr,
     INTERLEAVE: tl.constexpr,
+    SQUARED_RELU_GATE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
 ):
-    """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
+    """GLU: SiLU(gate) * up (SwiGLU) or, with SQUARED_RELU_GATE, relu(gate)^2 * up (see
+    squared_relu_glu), skipping rows beyond n_used and padding rows (perm_map == -1).
 
     Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention),
     or interleaved blocks (see glu_columns). CLAMP / OFFSET apply training's GLU options.
@@ -239,11 +264,14 @@ def _swiglu_kernel(
                     row_ptr = input_ptr + row.to(tl.int64) * two_N
                     gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
                     up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
-                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
-                    silu = gate * tl.sigmoid(gate)
-                    tl.store(
-                        output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m
-                    )
+                    if SQUARED_RELU_GATE:
+                        value = squared_relu_glu(
+                            gate, up, clamp_value, linear_offset, CLAMP, OFFSET
+                        )
+                    else:
+                        gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                        value = gate * tl.sigmoid(gate) * up
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, value.to(tl.bfloat16), mask=m)
             elif ZERO_PADDING:
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
@@ -256,8 +284,10 @@ def padded_swiglu(
     n_used: torch.Tensor,
     zero_padding: bool = False,
     glu_options: GLUOptions = GLUOptions(),
+    squared_relu_gate: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
+    """GLU activation, SiLU(gate) * up or relu(gate)^2 * up (``squared_relu_gate``); skips
+    rows beyond n_used and alignment-padding rows.
 
     Gated counterpart of padded_squared_relu: FC1 output is 2x wide, so the output width
     is half the input.
@@ -272,6 +302,8 @@ def padded_swiglu(
             undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
             ``permutation_map``. Rows beyond n_used remain undefined.
         glu_options: clamp, linear offset and FC1 interleaving of the gated activation.
+        squared_relu_gate: gate with squared ReLU instead of SiLU (relu(gate)^2 * up), for
+            gated squared-ReLU experts.
     Returns:
         [output_size, ffn_hidden] BF16.
     """
@@ -289,6 +321,7 @@ def padded_swiglu(
         N,
         M,
         **glu_options.kernel_args(N),
+        SQUARED_RELU_GATE=squared_relu_gate,
         BLOCK_N=BLOCK_N,
         NUM_BLOCKS=NUM_BLOCKS,
         ZERO_PADDING=zero_padding,
@@ -308,14 +341,17 @@ def _silu_mul_bounded_kernel(
     CLAMP: tl.constexpr,
     OFFSET: tl.constexpr,
     INTERLEAVE: tl.constexpr,
+    SQUARED_RELU_GATE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
-    """SiLU(gate) * up on the first n_rows rows; rows beyond are left untouched.
+    """SiLU(gate) * up, or relu(gate)^2 * up with SQUARED_RELU_GATE, on the first n_rows
+    rows; rows beyond are left untouched.
 
     For the flat token-major FC1 layout (no permutation map): rows [0, n_rows) are
     live. n_rows is a device scalar, so the fixed grid stays CUDA-graph compatible.
-    CLAMP / OFFSET / INTERLEAVE apply training's GLU options, as in _swiglu_kernel.
+    CLAMP / OFFSET / INTERLEAVE / SQUARED_RELU_GATE apply training's GLU options and
+    gate activation, as in _swiglu_kernel.
     """
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr)
@@ -331,15 +367,22 @@ def _silu_mul_bounded_kernel(
                 row_ptr = input_ptr + row.to(tl.int64) * two_N
                 gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
                 up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
-                gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
-                silu = gate * tl.sigmoid(gate)
-                tl.store(output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m)
+                if SQUARED_RELU_GATE:
+                    value = squared_relu_glu(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                else:
+                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                    value = gate * tl.sigmoid(gate) * up
+                tl.store(output_ptr + row.to(tl.int64) * N + o, value.to(tl.bfloat16), mask=m)
 
 
 def bounded_silu_mul(
-    x: torch.Tensor, n_rows: torch.Tensor, glu_options: GLUOptions = GLUOptions()
+    x: torch.Tensor,
+    n_rows: torch.Tensor,
+    glu_options: GLUOptions = GLUOptions(),
+    squared_relu_gate: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU (SiLU(gate) * up) over the first n_rows rows of a flat [M, 2N] tensor.
+    """GLU, SiLU(gate) * up or relu(gate)^2 * up (``squared_relu_gate``), over the first
+    n_rows rows of a flat [M, 2N] tensor.
 
     Args:
         x: [M, 2 * ffn_hidden] BF16 FC1 output, laid out as (gate | up) or, with
@@ -348,6 +391,8 @@ def bounded_silu_mul(
         n_rows: scalar int32/int64 CUDA tensor with the number of live rows
             (e.g. valid_tokens * topk). Rows >= n_rows are skipped, not zeroed.
         glu_options: clamp, linear offset and FC1 interleaving of the gated activation.
+        squared_relu_gate: gate with squared ReLU instead of SiLU (relu(gate)^2 * up), for
+            gated squared-ReLU experts.
     Returns:
         [M, ffn_hidden] BF16 (rows >= n_rows undefined).
     """
@@ -358,7 +403,15 @@ def bounded_silu_mul(
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _silu_mul_bounded_kernel[(NUM_BLOCKS,)](
-        x, out, n_rows, N, M, **glu_options.kernel_args(N), BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        n_rows,
+        N,
+        M,
+        **glu_options.kernel_args(N),
+        SQUARED_RELU_GATE=squared_relu_gate,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
     )
     return out
 

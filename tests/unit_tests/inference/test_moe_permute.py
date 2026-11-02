@@ -151,13 +151,15 @@ def test_batch_invariant_squared_relu_without_probs():
     assert torch.equal(actual, squared_relu_with_probs(x, permutation_map, _vt(rows), ones))
 
 
+@pytest.mark.parametrize("squared_relu_gate", [False, True], ids=["silu", "squared_relu"])
+@pytest.mark.parametrize("clamp_value", [None, 0.5], ids=["unclamped", "clamped"])
 @pytest.mark.parametrize(
     "kernel",
     ["padded_swiglu", "bounded_silu_mul", "swiglu_with_probs", "weighted_silu_mul_bounded"],
 )
-def test_swiglu_clamp_value_propagates_nan(kernel):
-    """activation_func_clamp_value keeps NaN FC1 outputs NaN, as training's torch.clamp does,
-    instead of clamping them to a finite value."""
+def test_glu_propagates_nan(kernel, clamp_value, squared_relu_gate):
+    """NaN FC1 outputs stay NaN, as in training's torch.clamp, SiLU and F.relu, instead of
+    being clamped or ReLU'd to a finite value."""
     from megatron.core.inference.moe import activations, batch_invariant
     from megatron.core.inference.moe.activations import GLUOptions
 
@@ -170,16 +172,18 @@ def test_swiglu_clamp_value_propagates_nan(kernel):
     expected_nan[0, 3] = expected_nan[1, 5] = True
     perm = torch.arange(rows, device="cuda", dtype=torch.int32)
     probs = torch.rand(rows, device="cuda", dtype=torch.float32)
-    glu = GLUOptions(clamp_value=0.5)
+    kwargs = dict(
+        glu_options=GLUOptions(clamp_value=clamp_value), squared_relu_gate=squared_relu_gate
+    )
 
     run = {
-        "padded_swiglu": lambda: activations.padded_swiglu(x, perm, _vt(rows), glu_options=glu),
-        "bounded_silu_mul": lambda: activations.bounded_silu_mul(x, _vt(rows), glu_options=glu),
+        "padded_swiglu": lambda: activations.padded_swiglu(x, perm, _vt(rows), **kwargs),
+        "bounded_silu_mul": lambda: activations.bounded_silu_mul(x, _vt(rows), **kwargs),
         "swiglu_with_probs": lambda: batch_invariant.swiglu_with_probs(
-            x, perm, _vt(rows), probs, glu_options=glu
+            x, perm, _vt(rows), probs, **kwargs
         ),
         "weighted_silu_mul_bounded": lambda: batch_invariant.weighted_silu_mul_bounded(
-            x, probs, _vt(rows * ffn), glu_options=glu
+            x, probs, _vt(rows * ffn), **kwargs
         ),
     }[kernel]
     assert torch.equal(run().isnan(), expected_nan)

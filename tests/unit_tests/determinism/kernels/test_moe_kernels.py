@@ -1240,11 +1240,13 @@ class TestMoEModules:
                 moe_router_topk=1,
                 moe_router_pre_softmax=True,
             ),
+            dict(activation_func=squared_relu, moe_mlp_glu_interleave_size=64),
         ],
-        ids=["clamp+interleave", "offset+probs-on-input"],
+        ids=["clamp+interleave", "offset+probs-on-input", "gated-squared-relu+interleave"],
     )
     def test_inference_grouped_mlp_glu_options_replay(self, backend, options):
-        """Inference experts with SwiGLU options and input-side routing probabilities."""
+        """Inference experts with GLU options, a squared-ReLU gate and input-side routing
+        probabilities."""
         from megatron.core.inference.moe.fused_moe import HAVE_GROUPED_MM
         from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec

@@ -52,6 +52,13 @@ class ActivationType(Enum):
 
     SQUARED_RELU = "squared_relu"
     SWIGLU = "swiglu"
+    # relu(gate)^2 * up: activation_func=squared_relu with gated_linear_unit.
+    GATED_SQUARED_RELU = "gated_squared_relu"
+
+    @property
+    def is_gated(self) -> bool:
+        """Whether FC1 produces gate and linear halves that the activation combines."""
+        return self in (ActivationType.SWIGLU, ActivationType.GATED_SQUARED_RELU)
 
 
 def _bf16_grouped_mm(
@@ -90,7 +97,7 @@ def _get_activation_func(
         fused_quant: if True, return the fused activation + MXFP8 quantize kernel.
         activation_kwargs: activation-specific options, extracted per activation below.
             ``clamp_scale`` (squared ReLU): soft-clamp the pre-activation first.
-            ``glu_options`` (SwiGLU): clamp, linear offset and FC1 interleaving.
+            ``glu_options`` (gated activations): clamp, linear offset and FC1 interleaving.
 
     Returns:
         The kernel, partially applied with whichever options the activation consumes.
@@ -100,16 +107,20 @@ def _get_activation_func(
         clamp_scale = activation_kwargs.get("clamp_scale")
         func = squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
-    elif activation_type == ActivationType.SWIGLU:
+    elif activation_type.is_gated:
         if fused_quant:
-            raise NotImplementedError("SWIGLU requires separate activation and MXFP8 quantization")
+            raise NotImplementedError(
+                f"{activation_type.name} requires separate activation and MXFP8 quantization"
+            )
         if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
         return partial(
-            padded_swiglu, glu_options=activation_kwargs.get("glu_options", GLUOptions())
+            padded_swiglu,
+            glu_options=activation_kwargs.get("glu_options", GLUOptions()),
+            squared_relu_gate=activation_type == ActivationType.GATED_SQUARED_RELU,
         )
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
@@ -176,7 +187,7 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
-        glu_options: SwiGLU clamp, linear offset and FC1 interleaving
+        glu_options: Gated-activation clamp, linear offset and FC1 interleaving
             (activation_func_clamp_value, glu_linear_offset, moe_mlp_glu_interleave_size).
         apply_probs_on_input: config.moe_apply_probs_on_input. Scale each expert input row
             by its routing probability instead of weighting the expert output.
@@ -278,7 +289,7 @@ def mcore_fused_moe(
     n_used = offs[-1:]
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
-        if activation_type == ActivationType.SWIGLU:
+        if activation_type.is_gated:
             assert activation_clamp_scale is None, (
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
@@ -290,6 +301,7 @@ def mcore_fused_moe(
                 permuted_probs,
                 zero_padding=use_mxfp8,
                 glu_options=glu_options,
+                squared_relu_gate=activation_type == ActivationType.GATED_SQUARED_RELU,
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
