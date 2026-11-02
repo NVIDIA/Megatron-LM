@@ -100,6 +100,64 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert assigned[:pool_size] == assigned[pool_size:]
 
 
+@pytest.mark.parametrize("has_te_modules", [False, True])
+@pytest.mark.parametrize("failure_phase", ["before_capture", "capture", "warmup", None])
+def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failure_phase):
+    """Propagate capture errors while restoring only the state started by this call."""
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_CAPTURING", False)
+    monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_WARMUP", False)
+    monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_te_capture_started", False)
+    te_events = []
+    monkeypatch.setattr(
+        cuda_graphs_module, "te_set_capture_start", lambda: te_events.append("start")
+    )
+    monkeypatch.setattr(cuda_graphs_module, "te_set_capture_end", lambda: te_events.append("end"))
+    # Configuration alone must not cause the outer cleanup to unfreeze GC.
+    monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", True)
+    gc_events = []
+    monkeypatch.setattr(gc, "unfreeze", lambda: gc_events.append("unfreeze"))
+    original_save = torch.autograd.function.FunctionCtx.save_for_backward
+    capture_error = RuntimeError("injected capture failure")
+
+    def capture(cls):
+        cls._enable_saved_tensors_observer()
+        if failure_phase == "before_capture":
+            raise capture_error
+        cuda_graphs_module._set_capture_start()
+        if has_te_modules:
+            cuda_graphs_module.te_set_capture_start()
+            cls._te_capture_started = True
+        if failure_phase == "warmup":
+            cuda_graphs_module._set_warmup_start()
+        if failure_phase is not None:
+            raise capture_error
+        cuda_graphs_module._set_capture_end()
+        if has_te_modules:
+            cuda_graphs_module.te_set_capture_end()
+            cls._te_capture_started = False
+        return "captured"
+
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_create_cudagraphs", classmethod(capture))
+    if failure_phase is None:
+        assert create_cudagraphs() == "captured"
+    else:
+        with pytest.raises(RuntimeError, match="injected capture failure") as exc_info:
+            create_cudagraphs()
+        assert exc_info.value is capture_error
+
+    assert not cuda_graphs_module.is_graph_capturing()
+    assert not cuda_graphs_module.is_graph_warmup()
+    expected_te_events = (
+        ["start", "end"] if has_te_modules and failure_phase != "before_capture" else []
+    )
+    assert te_events == expected_te_events
+    assert not _CudagraphGlobalRecord._te_capture_started
+    assert gc_events == []
+    assert _CudagraphGlobalRecord._saved_tensors_observer is None
+    assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
 
@@ -688,8 +746,31 @@ class TestPackedSeqCudagraphs:
             return attention_forward(module, *args, **kwargs)
 
         monkeypatch.setattr(TEDotProductAttention, "forward", recording_forward)
-        # This is the primary function under test.
-        create_cudagraphs()
+
+        # Reproduce the stale AccumulateGrad stream failure without inheriting an override
+        # enabled by an earlier test. Keep the eager graph alive through backward capture.
+        set_override = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+        if set_override is None:
+            create_cudagraphs()
+        else:
+            override_calls = []
+
+            def tracked_override(enabled):
+                override_calls.append(enabled)
+                return set_override(enabled)
+
+            set_override(False)
+            try:
+                with monkeypatch.context() as capture_patch:
+                    capture_patch.setattr(
+                        torch.autograd.graph, "set_override_stale_capture_stream", tracked_override
+                    )
+                    create_cudagraphs()
+                assert override_calls == [True]
+            finally:
+                # Preserve MCore's enabled policy even if this regression test fails.
+                set_override(True)
+
         assert warmup_offsets
         for cu_seqlens, cu_seqlens_padded in warmup_offsets:
             assert torch.equal(cu_seqlens, packed_seq_params.cu_seqlens_q)

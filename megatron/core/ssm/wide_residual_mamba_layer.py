@@ -6,14 +6,17 @@ from torch import Tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.residual_connection import ResidualConnectionState
+from megatron.core.transformer.residual_connection import (
+    ResidualBranchInput,
+    ResidualConnectionState,
+)
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
     checkpoint_residual_write,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
 )
@@ -90,7 +93,7 @@ class WideResidualMambaLayer(MambaLayer):
         self,
         hidden_states: Tensor,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-    ) -> tuple[Tensor, Tensor, ResidualConnectionState, ResidualStreamRecomputeContext | None]:
+    ) -> tuple[ResidualBranchInput[ResidualConnectionState], ResidualStreamRecomputeContext | None]:
         """Read the wide stream and optionally replay its connected input normalization."""
 
         recompute_context = residual_stream_recompute_context
@@ -108,31 +111,31 @@ class WideResidualMambaLayer(MambaLayer):
                 fp32_residual_connection=self.config.fp32_residual_connection,
                 branch_input_dtype=self.config.params_dtype,
             )
-        residual = self.residual_read.residual_stream(connection_state)
+        # Validate the carried state before normalization can consume a hook-modified read.
+        self.residual_read.residual_stream(connection_state)
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         if recompute_context is not None and not isinstance(self.norm, IdentityOp):
             hidden_states = recompute_context.checkpoint(apply_module(self.norm), hidden_states)
         else:
             hidden_states = apply_module(self.norm)(hidden_states)
-        return hidden_states, residual, connection_state, recompute_context
+        return ResidualBranchInput(hidden_states, connection_state), recompute_context
 
     def _apply_mixer_update(
         self,
         mixer_out_with_bias,
-        residual: Tensor,
-        connection_state: ResidualConnectionState | None = None,
+        state: ResidualConnectionState,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
         """Write the mixer update, replaying only nonterminal residual writes."""
 
-        if connection_state is None:
+        if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
         if recompute_context is not None and not recompute_context.is_block_end:
             return checkpoint_residual_write(
                 self.residual_write,
                 mixer_out_with_bias,
-                connection_state,
+                state,
                 recompute_context,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
@@ -140,10 +143,17 @@ class WideResidualMambaLayer(MambaLayer):
         with self.bias_dropout_add_exec_handler():
             return apply_module(self.residual_write)(
                 mixer_out_with_bias,
-                state=connection_state,
+                state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
             )
+
+    def _pack_two_stage_output(
+        self, ssm_output: Tensor, state: ResidualConnectionState
+    ) -> tuple[Tensor, Tensor, ResidualConnectionState]:
+        """Keep WR's existing two-stage tuple for ShortcutMoE callers."""
+
+        return ssm_output, state[0], state
 
     def forward_post_core_attn(
         self,
@@ -158,7 +168,6 @@ class WideResidualMambaLayer(MambaLayer):
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
         return self._apply_mixer_update(
             mixer_out_with_bias,
-            residual,
             connection_state,
             recompute_context=residual_stream_recompute_context,
         )

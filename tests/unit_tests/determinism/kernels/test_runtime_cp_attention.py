@@ -16,6 +16,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
     bytes_equal,
     seeded,
 )
@@ -225,5 +226,122 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     )
                     _assert_same_replay(result, recovered)
                     assert_restored()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("path", ["prefill", "decode"])
+def test_flash_decode_dispatch_config_softmax_scale_replays(path):
+    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
+    from megatron.core.transformer import attention as attention_module
+
+    if (
+        attention_module.flash_attn_varlen_func is None
+        or attention_module.flash_attn_with_kvcache is None
+    ):
+        pytest.skip("requires flash-attn")
+
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        heads, kv_heads, head_dim = 4, 2, 128
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=kv_heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
+            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        module = SelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        module.eval()
+        scale_probe = torch.empty(1, heads, head_dim, device="cuda")
+        assert module.get_softmax_scale(scale_probe) == 0.25
+
+        # Paged KV cache: two requests with 24 and 32 cached tokens. Flash-attn requires the block
+        # size to be divisible by 256, so each request gets one 256-token page.
+        page_size, num_pages = 256, 2
+        lengths_k = (24, 32)
+        inputs = dict(
+            k=torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+            ),
+            v=torch.randn(
+                num_pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+            ),
+            cu_seqlens_k=torch.tensor(
+                [0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32
+            ),
+            seqlens_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+            block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            max_seqlen_k=max(lengths_k),
+        )
+        if path == "prefill":
+            tokens_per_request = 8
+            inputs.update(
+                # q: [total_tokens, 1, heads, head_dim] — squeezed to [total, heads, head_dim].
+                q=torch.randn(
+                    2 * tokens_per_request, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16
+                ),
+                cu_seqlens_q=torch.tensor(
+                    [0, tokens_per_request, 2 * tokens_per_request],
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+                max_seqlen_q=tokens_per_request,
+            )
+            is_decode_only = False
+        else:
+            inputs.update(
+                # q: [num_requests * tokens_per_request, 1, heads, head_dim] with one token each.
+                q=torch.randn(2, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16),
+                cu_seqlens_q=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+                max_seqlen_q=1,
+            )
+            is_decode_only = True
+
+        def fn(**call):
+            return module.flash_decode_and_prefill(**call, is_decode_only=is_decode_only)
+
+        scaled = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=3,
+            backward=False,
+            contention=True,
+            what=f"flash_decode_and_prefill[{path}, config softmax_scale]",
+        )
+        assert torch.isfinite(scaled[0]["out"]).all()
+
+        # Drop back to the default scale; the kernel output must change, proving the config-driven
+        # value actually reached the kernel.
+        module.config.softmax_scale = None
+        assert module.get_softmax_scale(scale_probe) == head_dim**-0.5
+        default = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=2,
+            backward=False,
+            what=f"flash_decode_and_prefill[{path}, default softmax_scale]",
+        )
+        assert not bytes_equal(scaled[0]["out"], default[0]["out"])
     finally:
         Utils.destroy_model_parallel()

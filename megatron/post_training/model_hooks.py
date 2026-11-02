@@ -179,7 +179,7 @@ def lsq_hook(scale_lr: float | None) -> PreWrapHook:
         for model in models:
             _propagate_expert_allreduce_to_lsq_params(model)
         if scale_lr is not None:
-            install_lsq_optimizer_overrides()
+            install_lsq_optimizer_overrides(scale_lr)
         return models
 
     return hook
@@ -249,7 +249,7 @@ def kd_convert_hook(student_model_config, distillation, remap_te_layernorm: bool
         converted = []
         for model in models:
             distill_cfg = mtd_mcore.setup_distillation_config(
-                mtd_mcore.DistillationConfig(**distillation.loss_kwargs()),
+                mtd_mcore.DistillationConfig(**distillation.loss),
                 student_cfg=model.config,
                 teacher_cfg=teacher_transformer,
             )

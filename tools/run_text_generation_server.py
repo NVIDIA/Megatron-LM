@@ -156,7 +156,7 @@ def main(model_type: str = "gpt"):
             # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
             model = build_inference_models(cfg)
         else:
-            builder = get_model_builder(args, provider=model_type)
+            builder = get_model_builder(args, cfg.tokenizer, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             model = builder.build_distributed_models(
                 pg_collection=pg_collection, wrap_with_ddp=False

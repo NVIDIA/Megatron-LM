@@ -18,15 +18,19 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
+    ShardLayout,
     TensorAtomic,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -184,8 +188,11 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
     ids=["no_shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
 def test_fully_shard_sgd_losses_match_baseline(
-    distributed_setup, num_microbatches, placements_factory
+    distributed_setup, num_microbatches, placements_factory, shard_layout
 ):
     """Every supported sharding strategy should match gradient-averaged SGD."""
     rank = distributed_setup.rank
@@ -201,9 +208,9 @@ def test_fully_shard_sgd_losses_match_baseline(
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    with fully_shard_context(device=device) as context:
-        fully_shard(model.fc1, mesh=mesh, placements=placements)
-        fully_shard(model.fc2, mesh=mesh, placements=placements)
+    with fully_shard_context(FsdpContext(device=device)) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=placements, shard_layout=shard_layout)
+        fully_shard(model.fc2, mesh=mesh, placements=placements, shard_layout=shard_layout)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
@@ -288,7 +295,7 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
 
     torch.manual_seed(1234)
     model = TinySharedMTP(width, vocab_size).to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -313,13 +320,13 @@ def test_rejects_delayed_te_weight_gradient(distributed_setup):
         delay_wgrad_compute=True,
         fuse_wgrad_accumulation=False,
     )
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     model(x).float().square().mean().backward()
     assert model.weight.grad is None
-    assert model.phase is FsdpModule.Phase.BACKWARD
+    assert model.phase is Phase.BACKWARD
 
     with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
         model.backward_dw()
@@ -346,7 +353,7 @@ def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     with (
-        fully_shard_context(device=device),
+        fully_shard_context(FsdpContext(device=device)),
         pytest.raises(ValueError, match="Transformer Engine does not accumulate their gradients"),
     ):
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -366,7 +373,7 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -382,101 +389,40 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model.phase is FsdpModule.Phase.RESTING
-    assert model.fc1.phase is FsdpModule.Phase.RESTING
-    assert model.fc2.phase is FsdpModule.Phase.RESTING
+    assert model.phase is Phase.RESTING
+    assert model.fc1.phase is Phase.RESTING
+    assert model.fc2.phase is Phase.RESTING
 
 
+@pytest.mark.parametrize(
+    "placements_factory", [_hsdp_placements, _hfsdp_placements], ids=["hsdp", "hfsdp"]
+)
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_losses_match_baseline(
+    distributed_setup, num_microbatches, set_to_none, overlap, placements_factory, shard_layout
+):
+    """HSDP/HFSDP training should match single-rank SGD, with and without DP-outer overlap.
 
-    Gradients reduce-scatter within DP-inner every backward and accumulate into
-    main_grad; the DP-outer all-reduce runs only on the last microbatch, scoped
-    via ``microbatch(...)``. Every rank sees identical data, so the averaged
-    gradient equals the single-rank gradient and losses must match. Both
-    ``zero_grad`` modes are covered: ``set_to_none=True`` overwrites main_grad,
-    ``set_to_none=False`` accumulates into a zeroed main_grad.
+    Gradients reduce-scatter within DP-inner every backward and accumulate into main_grad;
+    the DP-outer reduction (all-reduce for HSDP, reduce-scatter for HFSDP) runs only on the
+    last microbatch. overlap_outer_communication moves that reduction to its own stream,
+    which changes where it executes, not what it computes -- so losses stay bit-identical to
+    the serialized path. Both zero_grad modes are covered.
     """
-    rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 4 or world_size % 2 != 0:
-        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
-
-    outer_size = 2
-    inner_size = world_size // outer_size
-    mesh = init_device_mesh(
-        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
-    )
-    torch.manual_seed(1234)
-    dim = 8
-    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
-    model = MultiChildModel(dim=dim, num_children=2).to(device)
-    model.load_state_dict(baseline.state_dict())
-
-    with fully_shard_context(device=device) as context:
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
-    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-
-    micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    microbatches = tuple(zip(x.unbind(), target.unbind()))
-
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
-        losses = []
-        for step in range(5):
-            optimizer.zero_grad(set_to_none=set_to_none)
-
-            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                is_last = microbatch_index == num_microbatches - 1
-                with microbatch(context, is_last=is_last):
-                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                    (loss / num_microbatches).backward()
-                losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch_index,
-                    loss,
-                )
-
-            optimizer.step()
-        return losses
-
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "HSDP")
-
-    torch.testing.assert_close(
-        torch.stack(sharded_losses),
-        torch.stack(baseline_losses),
-        msg="HSDP losses did not match baseline losses.",
-    )
-
-
-@pytest.mark.parametrize("set_to_none", [True, False])
-@pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    # world_size=2 gives a 2x1 mesh: DP-inner is trivial but the DP-outer
-    # reduce-scatter finalize and the fresh-buffer reset still run and converge.
     if world_size % 2 != 0:
         pytest.skip("This test requires an even number of ranks for a 2-D DP mesh.")
 
@@ -485,24 +431,25 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     mesh = init_device_mesh(
         device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
     )
+    placements = placements_factory()
     torch.manual_seed(1234)
     dim = 8
     baseline = MultiChildModel(dim=dim, num_children=2).to(device)
     model = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    # Shard the child layers, then the model, so the children share a root context
-    # and reduce through the overlap path instead of as independent roots.
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=overlap)
+        )
+    ) as context:
         for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hfsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
+            fully_shard(layer, mesh=mesh, placements=placements, shard_layout=shard_layout)
+        fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement
-    # [Replicate, Shard(0)], so main_weight and model_weight are distinct buffers and the
-    # compute weight is stale until the step post-hook registered here refreshes it.
-    # HSDP needs no wrapper: its two placements match, so the buffers alias.
+    # A no-op for HSDP (aliased weights) and required for HFSDP, so wrap unconditionally
+    # to refresh the compute weight after each optimizer step.
     fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
@@ -510,36 +457,26 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+    def train(model, optimizer) -> list[torch.Tensor]:
         losses = []
-        for step in range(5):
+        for _ in range(5):
             optimizer.zero_grad(set_to_none=set_to_none)
-
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
                 with microbatch(context, is_last=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch_index,
-                    loss,
-                )
-
             optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "HFSDP")
+    baseline_losses = train(baseline, baseline_optimizer)
+    sharded_losses = train(model, optimizer)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
-        msg="HFSDP losses did not match baseline losses.",
+        msg="Losses did not match baseline losses.",
     )
 
 
@@ -565,7 +502,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     dim = 8
     num_children = 2
     model = MultiChildModel(dim=dim, num_children=num_children).to(device)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
         fully_shard(model, mesh=mesh, placements=_hsdp_placements())
@@ -629,7 +566,7 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     dim = 8
     num_children = 2
     model = MultiChildModel(dim=dim, num_children=num_children).to(device)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_hfsdp_placements())
         fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
@@ -682,7 +619,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     model = nn.Linear(1, world_size, bias=False).to(device)
     nn.init.constant_(model.weight, 1.0)
 
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
@@ -707,7 +644,7 @@ def test_rejects_optimizer_placements_larger_than_model_weight_placements(distri
         dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Replicate()]
     )
     with pytest.raises(ValueError, match="DBuffer.view"):
-        with fully_shard_context(device=device):
+        with fully_shard_context(FsdpContext(device=device)):
             fully_shard(
                 model,
                 mesh=mesh,
@@ -727,7 +664,7 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
     baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     model.load_state_dict(baseline.state_dict())
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
 
@@ -768,7 +705,7 @@ def test_fully_shard_shares_class_stream(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     layers = [LinearWithStream(4, 4, device=device) for _ in range(2)]
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in layers:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
@@ -781,7 +718,7 @@ def test_fully_shard_keeps_instance_state_separate(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     layers = [nn.Linear(4, 4, device=device) for _ in range(2)]
     for layer in layers:
-        with fully_shard_context(device=device):
+        with fully_shard_context(FsdpContext(device=device)):
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
     assert type(layers[0]) is type(layers[1])
@@ -795,11 +732,11 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Linear(8, 8, bias=False, device=device)
-    attributes = {"use_muon": False}
+    attributes = {"use_muon": False, "is_wide_residual_retention_parameter": True}
     for name, value in attributes.items():
         setattr(model.weight, name, value)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     for name, value in attributes.items():
@@ -818,7 +755,7 @@ def test_fully_shard_validates_tensor_atomic_owner_mapping(distributed_setup):
     def shard(owner_mapping, placements=_TENSOR_ATOMIC_ZERO3_PLACEMENTS) -> nn.Linear:
         linear = nn.Linear(4, 4).to(device)
         parameter_to_owner = owner_mapping(linear) if owner_mapping is not None else None
-        with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner):
+        with fully_shard_context(FsdpContext(device=device, parameter_to_owner=parameter_to_owner)):
             fully_shard(linear, mesh=mesh, placements=placements)
         return linear
 
@@ -869,7 +806,7 @@ def _tensor_atomic_buffer_shapes(distributed_setup, placements):
         model.fc2.weight: 2,
         model.fc2.bias: 0,
     }
-    with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner):
+    with fully_shard_context(FsdpContext(device=device, parameter_to_owner=parameter_to_owner)):
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
 
@@ -947,7 +884,9 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
     if not mixed_placements:
         parameter_to_owner |= {model.fc2.weight: 0, model.fc2.bias: 1}
 
-    with fully_shard_context(device=device, parameter_to_owner=parameter_to_owner) as context:
+    with fully_shard_context(
+        FsdpContext(device=device, parameter_to_owner=parameter_to_owner)
+    ) as context:
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(
             model.fc2,
