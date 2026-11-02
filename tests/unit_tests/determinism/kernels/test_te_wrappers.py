@@ -46,7 +46,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars, is_lts_ci_image
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
@@ -612,6 +612,10 @@ class TestTEWrappers:
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
         )
 
+    @pytest.mark.skipif(
+        is_lts_ci_image(),
+        reason="DeepGEMM and cuBLASLt >= 13.4 (TE's grouped-tensor path) are not in the LTS image.",
+    )
     @pytest.mark.parametrize("backend", ["deepgemm", "triton"])
     def test_te_grouped_linear_grouped_tensor_batch_invariant_replays(self, backend):
         """The GroupedTensor path under deepgemm/triton runs DeepGEMM's grouped GEMMs."""
@@ -623,7 +627,8 @@ class TestTEWrappers:
             HAVE_DEEPGEMM_BF16,
         )
 
-        assert HAVE_DEEPGEMM_BF16, "the CI image ships DeepGEMM with bf16 bindings"
+        # In the dev image both exist; there a missing one fails rather than skips.
+        assert HAVE_DEEPGEMM_BF16, "the dev CI image ships DeepGEMM with bf16 bindings"
         assert is_module_grouped_tensor_path_supported(None, torch.bfloat16)
         seeded()
         m_splits = [256, 13, 0, 300]

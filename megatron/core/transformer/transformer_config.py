@@ -4827,7 +4827,12 @@ class TransformerConfig(ModelParallelConfig):
                     not self.gated_linear_unit and self.activation_func == squared_relu
                 ) or (self.gated_linear_unit and self.activation_func == F.silu)
                 if self.transformer_impl == "inference_optimized":
-                    mxfp8_supported = mxfp8_params_enabled and (
+                    # Outside inference mode (colocated RL training and log-prob forwards)
+                    # these experts run TE GroupedLinear, whose MXFP8 GEMMs only te_native
+                    # leaves native; the deepgemm/triton grouped GEMMs take BF16 only.
+                    mxfp8_supported = (
+                        mxfp8_params_enabled and self.batch_invariant_backend == "te_native"
+                    ) and (
                         (
                             self.inference_grouped_gemm_backend
                             in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
@@ -4852,7 +4857,8 @@ class TransformerConfig(ModelParallelConfig):
                 assert mxfp8_supported or not (self.fp8 or self.fp4), (
                     "Batch-invariant MoE supports BF16; TE MXFP8 squared-ReLU/SwiGLU "
                     "training experts; and Torch/vLLM MXFP8 squared-ReLU/SwiGLU "
-                    "or FlashInfer MXFP8 squared-ReLU inference experts."
+                    "or FlashInfer MXFP8 squared-ReLU inference experts. MXFP8 experts "
+                    "require batch_invariant_backend='te_native'."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "

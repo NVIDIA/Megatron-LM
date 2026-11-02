@@ -154,8 +154,9 @@ workload rather than generalizing from any single comparison.
 > does not imply bitwise parity with TE training. Use Torch/vLLM for exact
 > training-policy comparisons. Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case. MXFP8 training uses
-> `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
+> attention dropout are not supported in either case. MXFP8 experts require
+> `batch_invariant_backend="te_native"`, in training and under `inference_optimized`, whose
+> experts run TE GroupedLinear outside inference mode. Legacy TE GroupedLinear remains the
 > default. Under `te_native`, on SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True`
 > opts into TE device-metadata grouped GEMM and its required 256-row expert padding.
 > This requires a TE build exposing `GroupedLinear(use_grouped_tensor=...)`;
