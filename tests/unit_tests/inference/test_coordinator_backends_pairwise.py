@@ -11,11 +11,13 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.inference import coordinator_pairwise_utils as utils
 from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference.engines import test_dynamic_engine as engines
+from tests.unit_tests.test_utilities import is_flash_mla_dense_decode_available
 
 # Decide hardware support at collection so every rank skips the same rows.
 MXFP8, NVFP4 = check_mxfp8_support(), check_nvfp4_support()
 # The mla row requires FlashMLA's dense decode kernel, which exists only for SM90: FlashMLA's
-# SM100 kernels are sparse-only, so Blackwell needs another MLA decode kernel.
+# SM100 kernels are sparse-only, so Blackwell needs another MLA decode kernel. Whether the
+# installed FlashMLA has its SM90 kernels is probed in the test, not here.
 FLASH_MLA = (
     attention.HAVE_FMLA
     and torch.cuda.is_available()
@@ -91,6 +93,10 @@ async def test_routed_native_model_modes_match_direct(monkeypatch, mode):
     )
     options = dict(hidden_size=256, context_max_requests=128, context_max_tokens=128)
     if mode == "mla":
+        # A FlashMLA built without its SM90 kernels would exit the process at the first decode
+        # step. Fail this row instead: the dev image builds them.
+        if not is_flash_mla_dense_decode_available():
+            pytest.fail("flash_mla was built without its SM90 dense decode kernels")
         overrides.update(
             multi_latent_attention=True,
             cache_mla_latents=True,
