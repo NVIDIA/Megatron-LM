@@ -131,6 +131,7 @@ def _swiglu_with_probs_kernel(
     CLAMP: tl.constexpr,
     OFFSET: tl.constexpr,
     INTERLEAVE: tl.constexpr,
+    SQUARED_RELU_GATE: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
@@ -141,7 +142,8 @@ def _swiglu_with_probs_kernel(
     computed in FP32 with a single BF16 round at the end. The hard clamp (CLAMP)
     precedes it in FP32, as in training's fused clamped weighted-swiglu. Input row
     width is 2*ffn_size: gate = first half, up = second half (megatron chunk
-    convention), or interleaved blocks (see glu_columns). Fixed NUM_BLOCKS CTAs
+    convention), or interleaved blocks (see glu_columns). SQUARED_RELU_GATE gates with
+    relu(gate)^2 instead of SiLU, in the same FP32 sequence. Fixed NUM_BLOCKS CTAs
     iterating rows -> CUDA-graph safe.
     """
     pid = tl.program_id(0)
@@ -165,9 +167,14 @@ def _swiglu_with_probs_kernel(
                     )
                     up = tl.load(input_ptr + row_i64 * two_n + up_cols, mask=mask).to(tl.float32)
                     gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
-                    # Match training's fused SiLU instruction order. Multiplying
-                    # by sigmoid can round differently before MXFP8 quantization.
-                    value = (gate / (1.0 + libdevice.exp(-gate))) * up * prob
+                    if SQUARED_RELU_GATE:
+                        act = tl.maximum(gate, 0.0)
+                        act = act * act
+                    else:
+                        # Match training's fused SiLU instruction order. Multiplying
+                        # by sigmoid can round differently before MXFP8 quantization.
+                        act = gate / (1.0 + libdevice.exp(-gate))
+                    value = act * up * prob
                     tl.store(
                         output_ptr + row_i64 * ffn_size + cols, value.to(tl.bfloat16), mask=mask
                     )
@@ -184,6 +191,7 @@ def swiglu_with_probs(
     probs: torch.Tensor,
     zero_padding: bool = False,
     glu_options: GLUOptions = GLUOptions(),
+    squared_relu_gate: bool = False,
 ) -> torch.Tensor:
     """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models).
 
@@ -191,7 +199,8 @@ def swiglu_with_probs(
     grouped GEMM have no permutation map with which to skip them. ``glu_options``
     holds the clamp, linear offset and FC1 interleaving of the gated activation; ``x``
     stays in the FC1 layout (gate | up, or interleaved blocks), which the kernel reads
-    directly.
+    directly. ``squared_relu_gate`` gates with relu(gate)^2 instead of SiLU (gated
+    squared-ReLU experts).
     """
     num_rows, two_ffn = x.shape
     ffn_size = two_ffn // 2
@@ -207,6 +216,7 @@ def swiglu_with_probs(
         ffn_size,
         num_rows,
         **glu_options.kernel_args(ffn_size),
+        SQUARED_RELU_GATE=squared_relu_gate,
         ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
@@ -226,6 +236,7 @@ def _weighted_silu_mul_bounded_kernel(
     CLAMP: tl.constexpr,
     OFFSET: tl.constexpr,
     INTERLEAVE: tl.constexpr,
+    SQUARED_RELU_GATE: tl.constexpr,
     APPLY_WEIGHTS: tl.constexpr,
     HALF_N: tl.constexpr,
     XBLOCK: tl.constexpr,
@@ -245,7 +256,8 @@ def _weighted_silu_mul_bounded_kernel(
     The GLU options (glu_columns, glu_inputs) only select and transform the FP32
     inputs of that sequence, as training's fused clamped weighted-swiglu does. Without
     APPLY_WEIGHTS the weight is 1 (it was applied to the expert input), which the
-    multiply would leave exact.
+    multiply would leave exact. SQUARED_RELU_GATE replaces the SiLU with relu(gate)^2
+    (gated squared-ReLU experts) and keeps the rest of the sequence.
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
@@ -260,11 +272,15 @@ def _weighted_silu_mul_bounded_kernel(
         tmp8 = tl.load(in_ptr0 + (up_cols + 2 * HALF_N * x1), xmask).to(tl.float32)
         tmp0, tmp8 = glu_inputs(tmp0, tmp8, clamp_value, linear_offset, CLAMP, OFFSET)
         tmp1 = tmp0.to(tl.float32)
-        tmp2 = -tmp1
-        tmp3 = libdevice.exp(tmp2)
-        tmp4 = tl.full([1], 1.0, tl.float32)
-        tmp5 = tmp3 + tmp4
-        tmp6 = tmp1 / tmp5
+        if SQUARED_RELU_GATE:
+            tmp6 = tl.maximum(tmp1, 0.0)
+            tmp6 = tmp6 * tmp6
+        else:
+            tmp2 = -tmp1
+            tmp3 = libdevice.exp(tmp2)
+            tmp4 = tl.full([1], 1.0, tl.float32)
+            tmp5 = tmp3 + tmp4
+            tmp6 = tmp1 / tmp5
         tmp7 = tmp6.to(tl.float32)
         tmp9 = tmp7 * tmp8
         tmp10 = tmp9.to(tl.float32)
@@ -285,6 +301,7 @@ def weighted_silu_mul_bounded(
     num_programs: Optional[int] = None,
     xblock: int = 1024,
     glu_options: GLUOptions = GLUOptions(),
+    squared_relu_gate: bool = False,
 ) -> torch.Tensor:
     """SwiGLU with routing weights applied at the activation (training parity).
 
@@ -293,7 +310,8 @@ def weighted_silu_mul_bounded(
     the kernel reads either layout directly, so do not de-interleave beforehand);
     weights_flat: [rows] fp32 routing probabilities, or None when they were applied to
     the expert input; bound_elems: device scalar = live_rows * half_n; glu_options:
-    clamp, linear offset and FC1 interleaving of the gated activation.
+    clamp, linear offset and FC1 interleaving of the gated activation;
+    squared_relu_gate: gate with relu(gate)^2 instead of SiLU (gated squared-ReLU experts).
     Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
 
     num_programs defaults to SMs * 8 waves (Inductor's persistent-grid sizing;
@@ -317,6 +335,7 @@ def weighted_silu_mul_bounded(
         bound_elems,
         rows * half_n,
         **glu_options.kernel_args(half_n),
+        SQUARED_RELU_GATE=squared_relu_gate,
         APPLY_WEIGHTS=weights_flat is not None,
         HALF_N=half_n,
         XBLOCK=xblock,

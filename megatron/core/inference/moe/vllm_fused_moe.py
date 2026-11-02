@@ -543,6 +543,13 @@ def _invoke_fused_moe_kernel(
     `tl.range`.  The full launch config (tile sizes, warps, stages) is picked
     host-side by ``_get_default_config`` from M = num_tokens_hint.
     """
+    # The kernel takes N and K from B and never reads past them, so a mismatched A or C
+    # (e.g. a gated FC1 output reaching FC2 un-reduced) would silently drop columns.
+    if A.size(1) != B.size(2) or C.size(1) != B.size(1):
+        raise ValueError(
+            f"Fused MoE GEMM shape mismatch: input {tuple(A.shape)} and output "
+            f"{tuple(C.shape)} must have the K and N of weight {tuple(B.shape)} [E, N, K]."
+        )
     M = A.size(0)
     num_tokens = M * top_k
 
@@ -756,7 +763,7 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
-        glu_options: SwiGLU clamp, linear offset and FC1 interleaving
+        glu_options: Gated-activation clamp, linear offset and FC1 interleaving
             (activation_func_clamp_value, glu_linear_offset, moe_mlp_glu_interleave_size).
         apply_probs_on_input: config.moe_apply_probs_on_input. FC1 scales each input row
             by its routing probability, and the expert output is left unweighted.
@@ -817,16 +824,17 @@ def vllm_fused_moe(
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
     # batch-invariant mode, SQUARED_RELU fuses into the GEMM epilogue while
-    # SwiGLU runs separately. Batch-invariant mode runs both activations
-    # separately so their probability application and BF16 rounding match the
-    # training TEGroupedMLP path exactly.
-    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
-    is_swiglu = activation_type == ActivationType.SWIGLU
-    assert not (is_swiglu and activation_clamp_scale is not None), (
+    # the gated activations (SwiGLU, gated squared ReLU) run separately.
+    # Batch-invariant mode runs all activations separately so their
+    # probability application and BF16 rounding match the training
+    # TEGroupedMLP path exactly.
+    is_gated = activation_type.is_gated
+    squared_relu_gate = activation_type == ActivationType.GATED_SQUARED_RELU
+    assert not (is_gated and activation_clamp_scale is not None), (
         "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; the "
         "gated form (SiTU-GLU) has no inference kernel yet."
     )
-    fuse_squared_relu = not is_swiglu
+    fuse_squared_relu = not is_gated
     if batch_invariant_mode:
         # Apply the activation separately below to match training-side rounding.
         fuse_squared_relu = False
@@ -852,7 +860,7 @@ def vllm_fused_moe(
     )
     if batch_invariant_mode:
         live_rows = (valid_tokens * topk).to(torch.int32)
-        if is_swiglu:
+        if is_gated:
             # Match training: routing probabilities multiply at the activation
             # (before FC2), with the training kernel's exact rounding sequence
             # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
@@ -860,7 +868,11 @@ def vllm_fused_moe(
             # valid_tokens*topk prefix; CUDA-graph safe.
             bound_elems = valid_tokens.to(torch.int64) * (topk * (intermediate1.shape[1] // 2))
             intermediate1 = batch_invariant.weighted_silu_mul_bounded(
-                intermediate1, output_weights_flat, bound_elems, glu_options=glu_options
+                intermediate1,
+                output_weights_flat,
+                bound_elems,
+                glu_options=glu_options,
+                squared_relu_gate=squared_relu_gate,
             )
         else:
             # Nemotron-style weighted squared-ReLU rounds the squared BF16
@@ -874,11 +886,14 @@ def vllm_fused_moe(
                 output_weights_flat,
                 activation_clamp_scale,
             )
-    elif is_swiglu:
+    elif is_gated:
         # intermediate1 is [num_valid, 2N] (gate | up, or interleaved blocks); reduce to
-        # [num_valid, N] via SiLU(gate) * up over the valid_tokens*topk live rows only.
+        # [num_valid, N] via act(gate) * up over the valid_tokens*topk live rows only.
         intermediate1 = bounded_silu_mul(
-            intermediate1, (valid_tokens * topk).to(torch.int32), glu_options=glu_options
+            intermediate1,
+            (valid_tokens * topk).to(torch.int32),
+            glu_options=glu_options,
+            squared_relu_gate=squared_relu_gate,
         )
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Ordinary inference

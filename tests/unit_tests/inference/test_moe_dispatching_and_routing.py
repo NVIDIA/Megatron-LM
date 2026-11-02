@@ -1183,6 +1183,13 @@ _EXPERT_OPTIONS = {
     "glu_linear_offset": {"glu_linear_offset": 1.0},
     "moe_mlp_glu_interleave_size": {"moe_mlp_glu_interleave_size": 32},
     "moe_apply_probs_on_input": {"moe_apply_probs_on_input": True, "moe_router_topk": 1},
+    "gated_squared_relu": {"activation_func": squared_relu},
+    "gated_squared_relu_glu_options": {
+        "activation_func": squared_relu,
+        "activation_func_clamp_value": 0.5,
+        "glu_linear_offset": 1.0,
+        "moe_mlp_glu_interleave_size": 32,
+    },
 }
 
 
@@ -1312,9 +1319,13 @@ class TestInferenceGroupedMLPMatchesTraining:
 
         assert actual.shape == expected.shape
         assert self._rel_err(actual, expected) <= self.tol
-        if overrides:
+        if overrides.keys() - {"activation_func"}:
             # The comparison only discriminates if the option matters at this scale.
-            plain = self._make_experts(backend, moe_router_topk=overrides.get("moe_router_topk", 2))
+            plain = self._make_experts(
+                backend,
+                activation_func=overrides.get("activation_func", torch.nn.functional.silu),
+                moe_router_topk=overrides.get("moe_router_topk", 2),
+            )
             plain.load_state_dict(experts.state_dict())
             plain_expected = self._training_forward(plain, hidden, probs, routing_map)
             assert self._rel_err(plain_expected, expected) >= self.min_option_effect

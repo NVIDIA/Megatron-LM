@@ -282,6 +282,21 @@ def test_inference_moe_activations_replay():
         backward=False,
         what="bounded_silu_mul (GLU options)",
     )
+    # Gated squared ReLU: the same kernels with relu(gate)^2 in place of SiLU.
+    assert_replays_bit_exact(
+        lambda x: live(
+            activations.padded_swiglu(x, perm, n_used_t, glu_options=glu, squared_relu_gate=True)
+        ),
+        (x2,),
+        backward=False,
+        what="padded_swiglu (squared-ReLU gate)",
+    )
+    assert_replays_bit_exact(
+        lambda x: activations.bounded_silu_mul(x, n_used_t, squared_relu_gate=True)[:n_used],
+        (x2,),
+        backward=False,
+        what="bounded_silu_mul (squared-ReLU gate)",
+    )
     if hasattr(torch, "float8_e8m0fnu"):
 
         def quant(x):
@@ -426,6 +441,25 @@ def test_batch_invariant_inference_activations_replay():
         (x1,),
         backward=False,
         what="squared_relu_with_probs (no probabilities)",
+    )
+    # Gated squared ReLU: the same kernels with relu(gate)^2 in place of SiLU.
+    assert_replays_bit_exact(
+        lambda x: live(
+            batch_invariant.swiglu_with_probs(
+                x, perm, n_used_t, probs, glu_options=glu, squared_relu_gate=True
+            )
+        ),
+        (x2,),
+        backward=False,
+        what="swiglu_with_probs (squared-ReLU gate)",
+    )
+    assert_replays_bit_exact(
+        lambda x: batch_invariant.weighted_silu_mul_bounded(
+            x, probs, bound_elems, squared_relu_gate=True
+        )[:n_used],
+        (x2,),
+        backward=False,
+        what="weighted_silu_mul_bounded (squared-ReLU gate)",
     )
 
 
@@ -827,8 +861,9 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         )
 
 
-def test_vllm_fused_moe_glu_options_replay():
-    """SwiGLU options and input-side routing weights (moe_apply_probs_on_input, top-1)."""
+@pytest.mark.parametrize("activation", ["SWIGLU", "GATED_SQUARED_RELU"])
+def test_vllm_fused_moe_glu_options_replay(activation):
+    """GLU options and input-side routing weights (moe_apply_probs_on_input, top-1)."""
     from megatron.core.inference.moe.fused_moe import ActivationType
     from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
 
@@ -848,7 +883,7 @@ def test_vllm_fused_moe_glu_options_replay():
             p,
             fc1,
             fc2,
-            ActivationType.SWIGLU,
+            ActivationType[activation],
             experts,
             0,
             valid,
@@ -863,7 +898,7 @@ def test_vllm_fused_moe_glu_options_replay():
         (hidden_states, probs),
         replays=4,
         backward=False,
-        what="vllm_fused_moe (GLU options, probabilities on input)",
+        what=f"vllm_fused_moe ({activation}, GLU options, probabilities on input)",
     )
 
 
