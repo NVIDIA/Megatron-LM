@@ -761,6 +761,12 @@ class CheckpointConfig:
     `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
     unchanged either way."""
 
+    enable_msc: bool = False
+    """Use the Multi-Storage Client (MSC) for checkpoint and data paths. Applied to the
+    process-wide feature flag when the run's services are initialized (a CLI run applies it in
+    ``parse_args`` already, before any path is read); the CLI flag is ``--enable-msc``
+    (``--disable-msc`` is deprecated and forces it off)."""
+
     @property
     def use_dist_ckpt(self) -> bool:
         """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).

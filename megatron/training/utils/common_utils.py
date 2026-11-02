@@ -15,7 +15,7 @@ import torch
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -577,6 +577,26 @@ def warn_rank_0(message, rank=None):
     else:
         if _safe_get_rank() == 0:
             warnings.warn(message)
+
+
+def setup_multi_storage_client(enable_msc: bool) -> None:
+    """Apply the run's MSC policy (``CheckpointConfig.enable_msc``) to the process-wide feature
+    flag: enable it when requested, disable it otherwise (a process does not inherit the flag
+    from an earlier run in the same interpreter), and fail early when it is requested but the
+    package is missing. Warns once, when the flag turns on."""
+    if not enable_msc:
+        MultiStorageClientFeature.disable()
+        return
+    was_enabled = MultiStorageClientFeature.is_enabled()
+    MultiStorageClientFeature.enable()
+    if not MultiStorageClientFeature.is_enabled():
+        MultiStorageClientFeature.disable()
+        raise RuntimeError(
+            "--enable-msc (CheckpointConfig.enable_msc) was requested but the multistorageclient "
+            "package is not installed. Install it with `pip install multi-storage-client`."
+        )
+    if not was_enabled:
+        warn_rank_0('The MSC feature is enabled.')
 
 
 def is_rank0():

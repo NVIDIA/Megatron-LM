@@ -197,6 +197,13 @@ def initialize_runtime_services(
     from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 
     cfg = get_run_config()
+    # Storage access follows the checkpoint section for every entry point, before the tokenizer
+    # or any checkpoint path is read; a CLI run applied the same value in parse_args. Imported
+    # here, as elsewhere in this module: megatron.training.utils imports back into
+    # megatron.training, which imports this module.
+    from megatron.training.utils import setup_multi_storage_client
+
+    setup_multi_storage_client(cfg.checkpoint.enable_msc)
     if build_tokenizer:
         _build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)

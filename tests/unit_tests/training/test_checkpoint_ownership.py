@@ -612,3 +612,69 @@ def test_the_cli_gloo_check_sees_the_rewritten_distributed_optimizer(monkeypatch
     ]
     with pytest.raises(AssertionError, match="requires -enable-gloo-process-groups"):
         _validated(*argv)
+
+
+# ---- the MSC policy is the section's, applied for every entry point ----
+
+
+@pytest.fixture
+def msc_installed(monkeypatch):
+    """A stand-in for the multistorageclient package; the flag starts and ends disabled."""
+    from megatron.core import msc_utils
+
+    monkeypatch.setattr(msc_utils, "msc", object())
+    monkeypatch.setattr(msc_utils.MultiStorageClientFeature, "_enabled", False)
+    return msc_utils.MultiStorageClientFeature
+
+
+@pytest.mark.parametrize(
+    "argv, enabled",
+    [([], False), (["--enable-msc"], True), (["--enable-msc", "--disable-msc"], False)],
+)
+def test_the_cli_applies_the_msc_policy_it_parses(msc_installed, argv, enabled):
+    """``--enable-msc`` fills the field and turns the flag on at parse time; the deprecated
+    ``--disable-msc`` still wins."""
+    with patch("megatron.training.arguments.warn_rank_0"):
+        args = _validated(*argv)
+    assert checkpoint_config_from_args(args).enable_msc is enabled
+    assert msc_installed.is_enabled() is enabled
+
+
+def test_the_runtime_services_apply_the_sections_msc_policy(monkeypatch, msc_installed):
+    """A native container turns MSC on when its services are initialized, before the tokenizer
+    or a checkpoint path is read; applying the same policy again is silent, and a run without
+    MSC turns the flag off."""
+    args = _validated()
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    cfg.checkpoint.enable_msc = True
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG"):
+        monkeypatch.setattr(global_vars, name, None)
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    for name in ("_set_wandb_writer", "_set_telemetry"):
+        monkeypatch.setattr(global_vars, name, Mock())
+    assert msc_installed.is_enabled() is False  # parse_args applied the CLI's value: off
+    with patch("megatron.training.utils.common_utils.warn_rank_0") as warn:
+        global_vars.initialize_runtime_services(args, build_tokenizer=False)
+    assert msc_installed.is_enabled() is True
+    warn.assert_called_once()
+    with patch("megatron.training.utils.common_utils.warn_rank_0") as warn:
+        global_vars.initialize_runtime_services(args, build_tokenizer=False)
+        assert msc_installed.is_enabled() is True
+        cfg.checkpoint.enable_msc = False
+        global_vars.initialize_runtime_services(args, build_tokenizer=False)
+    warn.assert_not_called()
+    assert msc_installed.is_enabled() is False
+
+
+def test_msc_requested_without_the_package_fails_early(monkeypatch):
+    from megatron.core import msc_utils
+    from megatron.training.utils import setup_multi_storage_client
+
+    monkeypatch.setattr(msc_utils, "msc", None)
+    monkeypatch.setattr(msc_utils.MultiStorageClientFeature, "_enabled", False)
+    with pytest.raises(RuntimeError, match="multistorageclient package is not installed"):
+        setup_multi_storage_client(True)
+    assert msc_utils.MultiStorageClientFeature._enabled is False  # left as it was found
+    setup_multi_storage_client(False)
+    assert msc_utils.MultiStorageClientFeature.is_enabled() is False

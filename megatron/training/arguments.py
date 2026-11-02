@@ -13,7 +13,6 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
-from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
@@ -43,6 +42,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
+    setup_multi_storage_client,
     update_use_dist_ckpt,
     warn_rank_0,
 )
@@ -178,18 +178,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         # Preserve legacy semantics: --disable-msc forces MSC off, even if
         # --enable-msc was also passed.
         args.enable_msc = False
-
-    if args.enable_msc:
-        MultiStorageClientFeature.enable()
-        if not MultiStorageClientFeature.is_enabled():
-            raise RuntimeError(
-                "--enable-msc was passed but the multistorageclient package is not "
-                "installed. Install it with `pip install multi-storage-client`."
-            )
-        warn_rank_0('The MSC feature is enabled.')
-    else:
-        MultiStorageClientFeature.disable()
-        assert MultiStorageClientFeature.is_enabled() is False
+    # Applied here, before any path is read; the runtime-services setup applies the checkpoint
+    # section's value again for every entry point (a no-op for a CLI run).
+    setup_multi_storage_client(args.enable_msc)
 
     return args
 
@@ -2917,7 +2908,8 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
+    # --enable-msc keeps its own group (_add_msc_args) next to the deprecated --disable-msc.
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng", "enable_msc"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
