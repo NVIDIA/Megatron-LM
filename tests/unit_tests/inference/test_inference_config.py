@@ -89,6 +89,15 @@ class TestInferenceConfig:
         with pytest.raises(NotImplementedError, match="GDN2"):
             MambaInferenceStateConfig.from_model(model)
 
+    @pytest.mark.parametrize(
+        "layer_type_list", [[Symbols.KDA, Symbols.ATTENTION], [Symbols.MAMBA, Symbols.KDA]]
+    )
+    def test_mamba_inference_state_config_rejects_kda_in_decoder(self, layer_type_list):
+        """KDA rejects every inference context, so an engine over a decoder with KDA fails when
+        it is built rather than at its first forward."""
+        with pytest.raises(NotImplementedError, match="KDA"):
+            MambaInferenceStateConfig.from_model(self._hybrid_model(layer_type_list))
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and

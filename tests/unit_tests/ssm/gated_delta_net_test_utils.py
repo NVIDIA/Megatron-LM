@@ -23,6 +23,18 @@ from tests.unit_tests.test_utilities import Utils
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
 
 
+def followed_by_nan(values: torch.Tensor) -> torch.Tensor:
+    """``values`` as a contiguous view at the start of a NaN-filled buffer.
+
+    A kernel that reads past the end of ``values`` then reads NaN, which shows in its output.
+    """
+    buffer = torch.full(
+        (values.numel() + 1024,), float("nan"), dtype=values.dtype, device=values.device
+    )
+    buffer[: values.numel()] = values.flatten()
+    return buffer[: values.numel()].view(values.shape)
+
+
 def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
     unpacked_x = []
     cu_seqlens_list = cu_seqlens.tolist()

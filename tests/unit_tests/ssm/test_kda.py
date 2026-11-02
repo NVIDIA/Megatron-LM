@@ -18,13 +18,13 @@ from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_confi
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA, KimiDeltaAttention
-from megatron.core.ssm.gated_delta_net import kda as kda_module
 from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
+from tests.unit_tests.ssm.gated_delta_net_test_utils import followed_by_nan
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -291,11 +291,11 @@ def test_kda_single_token_sequences_in_cuda_graph(monkeypatch, two_stage_gates, 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("two_stage_gates", [False, True])
-def test_kda_single_token_sequences_keep_g_reads_in_bounds(monkeypatch, two_stage_gates):
-    """FLA's recurrent KDA kernel before 0.6.0 loads every row of g next_power_of_2(K) wide
-    without a mask, so with a head dim of 96 it reads 32 elements past the last row. The
-    single-token path hands it a g followed by that many zeros, laid out with row stride K, and
-    every token still gets the output it has as a sequence of its own."""
+def test_kda_single_token_sequences_read_only_g(monkeypatch, two_stage_gates):
+    """FLA's recurrent KDA kernel tiles the head dim K to next_power_of_2(K) and reads each row of
+    g that wide. With K = 96 and g followed by NaN, every token of a single-token pack, as an MTP
+    draft step without a context packs its requests, still gets the output it has alone. FLA
+    before 0.6.0 reads the last row unmasked, past the end of g, and that head's output is NaN."""
     head_dim = 96
     Utils.initialize_model_parallel(1, 1)
     try:
@@ -317,26 +317,22 @@ def test_kda_single_token_sequences_keep_g_reads_in_bounds(monkeypatch, two_stag
         packed_seq_params = PackedSeqParams.single_token_sequences(
             num_tokens, device=hidden_states.device
         )
-        decay_gates = []
-        fused_recurrent_kda = kda_module.fused_recurrent_kda
+        pre_gated_delta_rule = kda.pre_gated_delta_rule
 
-        def record_decay_gate(q, k, v, g, *args, **kwargs):
-            decay_gates.append(g)
-            return fused_recurrent_kda(q, k, v, g, *args, **kwargs)
+        def g_followed_by_nan(*args, **kwargs):
+            query, key, value, gate, beta, raw_g, A_log, dt_bias = pre_gated_delta_rule(
+                *args, **kwargs
+            )
+            raw_g = followed_by_nan(raw_g)
+            return query, key, value, gate, beta, raw_g, A_log, dt_bias
 
         with torch.inference_mode(), InferenceMode.active():
             alone_output = torch.cat(
                 [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
             )
-            monkeypatch.setattr(kda_module, "fused_recurrent_kda", record_decay_gate)
+            monkeypatch.setattr(kda, "pre_gated_delta_rule", g_followed_by_nan)
             packed_output = kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
-
-            (g,) = decay_gates
-            assert g.shape[-1] == head_dim and g.is_contiguous()
-            overrun = 128 - head_dim
-            g_end = g.storage_offset() + g.numel()
-            assert g.untyped_storage().nbytes() // g.element_size() - g_end >= overrun
-            assert not g.as_strided((overrun,), (1,), g_end).any()
+        assert torch.isfinite(packed_output).all()
         torch.testing.assert_close(
             packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
         )

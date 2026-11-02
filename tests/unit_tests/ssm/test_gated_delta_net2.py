@@ -17,6 +17,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA, HAVE_FLA_GDN2
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleTestCases
+from tests.unit_tests.ssm.gated_delta_net_test_utils import followed_by_nan
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -31,6 +32,40 @@ class TestGatedDeltaNet(GatedDeltaNetModuleTestCases):
     """GDN2 module correctness across the original parallel layouts."""
 
 
+def _build_gdn2(backend, key_head_dim=64):
+    """A bf16 GDN2 layer on the given kernel backend, at TP 1."""
+    config = TransformerConfig(
+        hidden_size=512,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=key_head_dim,
+        linear_value_head_dim=64,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        num_attention_heads=4,
+        activation_func=F.silu,
+        bf16=True,
+        experimental_attention_variant="gdn2",
+        gdn_kernel_backend=backend,
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+    )
+    spec = get_experimental_attention_variant_module_spec(config=config)
+    gdn2 = spec.module(
+        config,
+        submodules=spec.submodules,
+        layer_number=1,
+        conv_init=1.0,
+        pg_collection=ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        ),
+    )
+    return gdn2.cuda().bfloat16()
+
+
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
 @pytest.mark.internal
 @pytest.mark.parametrize("backend", ["fla", "torch"])
@@ -41,39 +76,10 @@ def test_gdn2_single_token_sequences_match_each_token_alone(backend):
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(123)
-        config = TransformerConfig(
-            hidden_size=512,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=64,
-            linear_value_head_dim=64,
-            linear_num_key_heads=4,
-            linear_num_value_heads=8,
-            num_layers=1,
-            normalization="RMSNorm",
-            use_cpu_initialization=True,
-            num_attention_heads=4,
-            activation_func=F.silu,
-            bf16=True,
-            experimental_attention_variant="gdn2",
-            gdn_kernel_backend=backend,
-            linear_attention_freq=[1],
-            transformer_impl="transformer_engine",
-        )
-        spec = get_experimental_attention_variant_module_spec(config=config)
-        gdn2 = spec.module(
-            config,
-            submodules=spec.submodules,
-            layer_number=1,
-            conv_init=1.0,
-            pg_collection=ProcessGroupCollection(
-                tp=parallel_state.get_tensor_model_parallel_group(),
-                cp=parallel_state.get_context_parallel_group(),
-            ),
-        )
-        gdn2 = gdn2.cuda().bfloat16()
+        gdn2 = _build_gdn2(backend)
         num_tokens = 6
         hidden_states = torch.randn(
-            (num_tokens, 1, config.hidden_size),
+            (num_tokens, 1, gdn2.config.hidden_size),
             device=torch.cuda.current_device(),
             dtype=torch.bfloat16,
         )
@@ -110,6 +116,48 @@ def test_gdn2_single_token_sequences_match_each_token_alone(backend):
                 graph.replay()
 
         # The recurrent and chunked kernels round their bf16 intermediates differently.
+        torch.testing.assert_close(
+            packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
+@pytest.mark.internal
+def test_gdn2_single_token_sequences_read_only_g(monkeypatch):
+    """FLA's recurrent GDN2 kernel tiles the key head dim K to next_power_of_2(K) and reads each
+    row of the log decay g that wide. With K = 96 and g followed by NaN, every token of a
+    single-token pack, as an MTP draft step without a context packs its requests, still gets the
+    output it has alone. FLA before 0.6.0 reads the last row unmasked, past the end of g, and
+    that head's output is NaN."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        gdn2 = _build_gdn2("fla", key_head_dim=96)
+        num_tokens = 6
+        hidden_states = torch.randn(
+            (num_tokens, 1, gdn2.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+        prepare_input = gdn2._prepare_input_for_gated_delta_rule
+
+        def g_followed_by_nan(*args, **kwargs):
+            kernel_inputs = prepare_input(*args, **kwargs)
+            kernel_inputs["g"] = followed_by_nan(kernel_inputs["g"])
+            return kernel_inputs
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone_output = torch.cat(
+                [gdn2(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
+            )
+            monkeypatch.setattr(gdn2, "_prepare_input_for_gated_delta_rule", g_followed_by_nan)
+            packed_output, _ = gdn2(hidden_states, None, packed_seq_params=packed_seq_params)
+        assert torch.isfinite(packed_output).all()
         torch.testing.assert_close(
             packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
         )

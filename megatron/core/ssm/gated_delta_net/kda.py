@@ -488,11 +488,6 @@ class KimiDeltaAttention(_GDNBase):
             raw_g=raw_g,
             gate=gate,
         )
-        # FLA before 0.6.0 loads each row of g next_power_of_2(K) wide without a mask, so the
-        # last row reads past the end of g when K is not a power of two. Give it zeros to read.
-        g_overrun = (1 << (self.key_head_dim - 1).bit_length()) - self.key_head_dim
-        if g_overrun:
-            raw_g = F.pad(raw_g.flatten(), (0, g_overrun))[: raw_g.numel()].view_as(raw_g)
         core_attn_out, _ = fused_recurrent_kda(
             query,
             key,
