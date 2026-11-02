@@ -11,12 +11,17 @@ from megatron.core import parallel_state, process_groups_config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.multimodal.context_parallel import (
     gather_from_context_parallel_ranks,
+    gather_from_context_parallel_ranks_dynamic_res,
     split_to_context_parallel_ranks,
+    split_to_context_parallel_ranks_dynamic_res,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -24,7 +29,10 @@ from megatron.core.process_groups_config import (
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    mtp_on_this_rank,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -195,6 +203,46 @@ class TestGlobalProcessGroupFallbacks:
             with pytest.raises(ValueError, match="requires pg_collection.hcp"):
                 build()
 
+    @pytest.mark.skipif(not HAVE_TE, reason="TEDotProductAttention needs Transformer Engine")
+    def test_te_attention_without_collection_uses_global_groups(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+        )
+        with pytest.warns(FutureWarning) as record:
+            attention = TEDotProductAttention(
+                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+            )
+        _fallback_warning(record, "TEDotProductAttention")
+        assert attention._tp_group is parallel_state.get_tensor_model_parallel_group()
+        assert attention.cp_group is parallel_state.get_context_parallel_group()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="context parallelism needs TEDotProductAttention")
+    def test_mtp_block_without_collection_uses_global_groups(self):
+        Utils.initialize_model_parallel(context_parallel_size=2)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            context_parallel_size=2,
+        )
+        spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            use_transformer_engine=True,
+        )
+        with pytest.warns(FutureWarning) as record:
+            mtp = MultiTokenPredictionBlock(config=config, spec=spec)
+        _fallback_warning(record, "MultiTokenPredictionBlock")
+        assert mtp.cp_group is parallel_state.get_context_parallel_group()
+        assert mtp.tp_group is parallel_state.get_tensor_model_parallel_group()
+
     def test_mtp_placement_without_pp_group_uses_global_group(self):
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
         with pytest.warns(FutureWarning) as record:
@@ -221,3 +269,45 @@ class TestGlobalProcessGroupFallbacks:
         # The fallback runs inside an autograd Function, reached through torch's apply().
         _fallback_warning(record, "GatherFromContextParallelRanks", "cp_group")
         assert torch.equal(gathered, global_s)
+
+    def test_dynamic_res_context_parallel_helpers_without_cp_group_use_global_group(self):
+        Utils.initialize_model_parallel(context_parallel_size=2)
+        cp_rank = parallel_state.get_context_parallel_rank()
+
+        # Two images of one patch grid each, so each of the two CP ranks owns one image.
+        patch_dim = 16
+        per_img_seq = patch_dim * patch_dim
+        hidden = 3 * patch_dim * patch_dim
+        global_t = torch.cat(
+            [torch.full((per_img_seq, hidden), float(i), device="cuda") for i in range(2)]
+        ).unsqueeze(0)
+        global_imgs_sizes = torch.tensor(
+            [[patch_dim, patch_dim]] * 2, dtype=torch.int32, device="cuda"
+        )
+        cu_seqlens = torch.tensor(
+            [0, per_img_seq, 2 * per_img_seq], dtype=torch.int32, device="cuda"
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=per_img_seq,
+            max_seqlen_kv=per_img_seq,
+        )
+
+        with pytest.warns(FutureWarning) as record:
+            local_t, local_imgs_sizes, *_ = split_to_context_parallel_ranks_dynamic_res(
+                global_t, global_imgs_sizes, packed_seq_params, patch_dim=patch_dim
+            )
+        _fallback_warning(record, "split_to_context_parallel_ranks_dynamic_res", "cp_group")
+        assert local_imgs_sizes.shape == (1, 2)
+        assert torch.all(local_t == float(cp_rank))
+
+        with pytest.warns(FutureWarning) as record:
+            gathered = gather_from_context_parallel_ranks_dynamic_res(
+                local_t.permute(1, 0, 2).contiguous()
+            )
+        _fallback_warning(record, "gather_from_context_parallel_ranks_dynamic_res", "cp_group")
+        torch.testing.assert_close(gathered, global_t.permute(1, 0, 2).contiguous(), rtol=0, atol=0)
