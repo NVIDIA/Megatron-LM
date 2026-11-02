@@ -86,7 +86,6 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.moe_shared_expert_overlap = False
     config.moe_shortcut_connection = False
     config.moe_shortcut_parallel = False
-    config.inference_shortcut_moe_overlap = False
     config.moe_shortcut_post_norm = False
     config.is_hybrid_model = False
     config.use_fused_weighted_squared_relu = False

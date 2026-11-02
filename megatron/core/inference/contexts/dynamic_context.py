@@ -400,6 +400,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ),
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
+        inference_config.validate_shortcut_moe_model(model_config)
         super().__init__(inference_config=inference_config)
 
         # Prefix caching configuration

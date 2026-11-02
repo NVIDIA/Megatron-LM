@@ -36,7 +36,6 @@ def shortcut_norm(monkeypatch):
 )
 def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, failure, message):
     config = _shortcut_config()
-    config.inference_shortcut_moe_overlap = True
     config.transformer_impl = "inference_optimized"
     config.mlp_chunks_for_prefill = 1
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
@@ -49,9 +48,13 @@ def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, fail
     if failure != "unsupported":
         monkeypatch.setattr(shortcut_module, "TransformerLayer", _FakeCompute)
     block = ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False).eval()
+    block.setup_inference_overlap()
     block.moe_layer.mlp.token_dispatcher = Dispatcher() if failure == "unsupported" else object()
     context = SimpleNamespace(
-        is_dynamic_batching=lambda: True, is_decode_only=lambda: True, num_speculative_tokens=0
+        config=SimpleNamespace(inference_shortcut_moe_overlap=True),
+        is_dynamic_batching=lambda: True,
+        is_decode_only=lambda: True,
+        num_speculative_tokens=0,
     )
     calls = []
     monkeypatch.setattr(block, "_launch_dispatch", lambda *args, **kwargs: calls.append(1))
@@ -82,7 +85,6 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     checkpoint replay verifier.
     """
     config = _shortcut_config()
-    config.inference_shortcut_moe_overlap = True
     config.transformer_impl = "inference_optimized"
     config.mlp_chunks_for_prefill = 1
     rows = 8
@@ -92,7 +94,10 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     cache = torch.zeros_like(hidden)
     updates = torch.zeros_like(live_rows)
     context = SimpleNamespace(
-        is_dynamic_batching=lambda: True, is_decode_only=lambda: True, num_speculative_tokens=0
+        config=SimpleNamespace(inference_shortcut_moe_overlap=True),
+        is_dynamic_batching=lambda: True,
+        is_decode_only=lambda: True,
+        num_speculative_tokens=0,
     )
 
     class Compute(_FakeCompute):
@@ -114,6 +119,7 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     )
     monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
     block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
+    block.setup_inference_overlap()
     block.moe_layer.mlp.token_dispatcher = Dispatcher()
     side = torch.cuda.Stream()
     monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", side)
@@ -179,13 +185,13 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
             saved_hidden, saved_padding = hidden.clone(), padding.clone()
             cache.zero_()
             updates.zero_()
-            block.inference_overlap = False
+            context.config.inference_shortcut_moe_overlap = False
             serial = block(**kwargs)
             serial_cache = cache.clone()
             torch.testing.assert_close(updates, live_rows)
             cache.zero_()
             updates.zero_()
-            block.inference_overlap = True
+            context.config.inference_shortcut_moe_overlap = True
             graph.replay()
             torch.testing.assert_close(captured, serial, atol=0, rtol=0)
             torch.testing.assert_close(cache, serial_cache, atol=0, rtol=0)

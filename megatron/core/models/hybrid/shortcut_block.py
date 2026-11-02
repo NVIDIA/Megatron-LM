@@ -157,7 +157,6 @@ class ShortcutMoEBlock(MegatronModule):
         super().__init__(compute_layer.config)
 
         self.overlap_mode = overlap_a2a
-        self.inference_overlap = self.config.inference_shortcut_moe_overlap
         self.layer_number = compute_layer.layer_number
         self.attn_layer_idx = compute_layer.layer_number - 1
         self.attn_local_idx = attn_local_idx
@@ -238,9 +237,12 @@ class ShortcutMoEBlock(MegatronModule):
             if self.config.moe_shortcut_post_norm
             else IdentityOp()
         )
-        self.route_ready_event = (
-            torch.cuda.Event() if self.overlap_mode or self.inference_overlap else None
-        )
+        self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+
+    def setup_inference_overlap(self) -> None:
+        """Create synchronization state before inference CUDA graph capture."""
+        if self.route_ready_event is None:
+            self.route_ready_event = torch.cuda.Event()
 
     def _read_shortcut_hidden(
         self,
@@ -582,7 +584,11 @@ class ShortcutMoEBlock(MegatronModule):
                 "Shortcut-MoE received an inference context outside inference mode; the two-stage "
                 "schedule does not update KV-cache or recurrent inference state."
             )
-        if inference and self.inference_overlap:
+        if (
+            inference
+            and inference_context is not None
+            and inference_context.config.inference_shortcut_moe_overlap
+        ):
             return self._forward_inference_overlap(
                 hidden_states,
                 attention_mask=attention_mask,

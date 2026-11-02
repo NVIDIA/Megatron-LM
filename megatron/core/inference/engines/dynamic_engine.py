@@ -531,6 +531,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
+        if inference_config.inference_shortcut_moe_overlap:
+            from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+
+            for module in controller.inference_wrapped_model.model.modules():
+                if isinstance(module, ShortcutMoEBlock):
+                    module.setup_inference_overlap()
 
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection

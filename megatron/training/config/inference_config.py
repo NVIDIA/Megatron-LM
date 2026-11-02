@@ -251,7 +251,6 @@ class InferenceSetupConfig:
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
 
-
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with
     shards separated by ``+`` or ``;``. Keys are ``tp``, ``pp``, ``ep``, ``expt_tp``,
@@ -294,8 +293,22 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
+    inference_shortcut_moe_overlap: bool = False
+    """Overlap Shortcut MoE routing, experts and communication during dynamic inference."""
+
+    def __post_init__(self) -> None:
+        if not self.inference_shortcut_moe_overlap:
+            return
+        if not self.inference_dynamic_batching or self.use_legacy_static_engine:
+            raise ValueError(
+                "Shortcut MoE overlap requires dynamic batching without the legacy static engine"
+            )
+        if self.num_speculative_tokens:
+            raise ValueError("Shortcut MoE overlap does not support speculative decoding")
+
     def validate(self) -> None:
         """Check the KV-cache suspend/resume policy before an engine is built from it."""
+        self.__post_init__()
         mode = self.kv_cache_management_mode
         static_pointers = self.static_kv_memory_pointers
         uvm = self.inference_dynamic_batching_unified_memory_level > 0
@@ -399,6 +412,7 @@ class InferenceSetupConfig:
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
         return InferenceConfig(
+            inference_shortcut_moe_overlap=self.inference_shortcut_moe_overlap,
             verbose=verbose,
             block_size_tokens=self.inference_dynamic_batching_block_size,
             buffer_size_gb=self.inference_dynamic_batching_buffer_size_gb,

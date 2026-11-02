@@ -850,8 +850,48 @@ class InferenceConfig:
     only when model weights are guaranteed not to change across those boundaries.
     """
 
+    inference_shortcut_moe_overlap: bool = False
+    """Overlap routed Shortcut MoE work with the ordinary predecessor forward."""
+
+    def validate_shortcut_moe_model(self, model_config) -> None:
+        """Validate model compatibility before initializing the inference context."""
+        if not self.inference_shortcut_moe_overlap:
+            return
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
+        if not model_config.moe_shortcut_connection:
+            raise ValueError("inference_shortcut_moe_overlap requires Shortcut MoE")
+
+        if model_config.transformer_impl != "inference_optimized":
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires "
+                "transformer_impl='inference_optimized' for the language model"
+            )
+        if model_config.params_dtype != torch.bfloat16 or model_config.fp8 or model_config.fp4:
+            raise ValueError("inference_shortcut_moe_overlap requires BF16 without FP8 or FP4")
+        if model_config.tensor_model_parallel_size != 1 or model_config.context_parallel_size != 1:
+            raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
+        if model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM:
+            raise ValueError("inference_shortcut_moe_overlap requires the vllm expert backend")
+        if model_config.inference_moe_token_dispatcher_type != "nvls":
+            raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
+        if model_config.inference_disable_triton_nvls_kernels:
+            raise ValueError("inference_shortcut_moe_overlap requires Triton NVLS kernels")
+        if model_config.fine_grained_activation_offloading:
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires "
+                "fine_grained_activation_offloading=False"
+            )
+        if model_config.batch_invariant_mode or model_config.gdp_cutedsl_kernel:
+            raise ValueError(
+                "inference_shortcut_moe_overlap does not support batch-invariant mode "
+                "or CuTeDSL GDP kernels"
+            )
+
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        if self.inference_shortcut_moe_overlap and self.num_speculative_tokens:
+            raise ValueError("Shortcut MoE overlap does not support speculative decoding")
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         # Not capped at 1: alpha stopped being a blend weight when the score became
         # cache_score - alpha * relative_load, and values above 1 are meaningful --
