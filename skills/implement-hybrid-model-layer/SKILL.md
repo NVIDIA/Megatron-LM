@@ -16,7 +16,7 @@ To implement a new layer for the [`HybridModel`](../../megatron/core/models/hybr
 5. Implement the layer itself. Check out the [`parallelism-guide.md`](../../docs/user-guide/parallelism-guide.md) for settings to consider for highly parallel workloads. Consult documentation in the [`docs/user-guide/features`](../../docs/user-guide/features) directory for more in-depth feature documentation. Put kernel implementations into [`megatron/core/ops`](../../megatron/core/ops).
 6. Integrate the new layer into the [`HybridStackSubmodules`](../../megatron/core/models/hybrid/hybrid_block.py) class and the various [`ModuleSpec` setups that are provided for `HybridModel`](../../megatron/core/models/hybrid/hybrid_layer_specs.py).
 7. Integrate the new layer into the [`HybridStack.__init__`](../../megatron/core/models/hybrid/hybrid_block.py) method.
-8. Add a new symbol and mapping for the layer to the [`Symbols`](../../megatron/core/models/hybrid/layers/utils.py) class.
+8. Do **not** add a new symbol and/or mapping for the layer to the [`Symbols`](../../megatron/core/models/hybrid/layers/utils.py) class. Instantiating models using patterns based on `Symbols` can be considered deprecated, so the functionality shouldn't be extended.
 9. Write tests for the new functionality. Include at least one integration test that builds and executes an actual model. Be sure to check the various permutations of parallelism settings that the layer supports.
 
 Deviate as necessary; this recipe isn't set in stone, but it should provide guidance and resources for successful integration of a new layer.
