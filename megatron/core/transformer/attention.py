@@ -19,6 +19,10 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.ops.attention.shared_prefix import (
+    flash_composed_forest_attention,
+    flash_composed_forest_attention_cp,
+)
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -1724,11 +1728,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 )
             if query.dtype not in (torch.float16, torch.bfloat16):
                 raise TypeError("shared-prefix fused attention requires fp16 or bf16 Q/K/V")
-
-            from megatron.core.ops.attention.shared_prefix import (
-                flash_composed_forest_attention,
-                flash_composed_forest_attention_cp,
-            )
 
             softmax_scale = self.get_softmax_scale(query)
             with core_attn_manager as query:
