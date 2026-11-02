@@ -600,6 +600,8 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
     Each stage keeps only the fields of its virtual stages, including a standalone MTP stage.
     FLOPs statistics count real tokens, not padding.
     """
+    from megatron.training import arguments, global_vars
+
     script = importlib.import_module(script_name)
     pp_size = 4
     real_lengths = [5, 13, 8, 30, 2, 17, 9, 24]
@@ -609,11 +611,13 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
         pipeline_layout = PipelineParallelLayerLayout(layout, pp_size)
         mtp_num_layers = 1
         pipeline_layout.validate_layer_layout(layout.count("t"), mtp_num_layers)
+    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
+    # the arguments and the transformer config at call time from these two modules.
     monkeypatch.setattr(
-        script, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+        global_vars, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
     )
     monkeypatch.setattr(
-        script,
+        arguments,
         "core_transformer_config_from_args",
         lambda args: SimpleNamespace(
             pipeline_model_parallel_layout=pipeline_layout, mtp_num_layers=mtp_num_layers
