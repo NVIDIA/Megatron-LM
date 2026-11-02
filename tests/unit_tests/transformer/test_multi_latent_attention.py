@@ -1775,6 +1775,195 @@ class TestFusedMLAPreMLPResidualNorm:
         self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
 
 
+class TestDynamicInferencePaddingRows:
+    """Under FP8/FP4, dynamic batching zeroes the padding-token rows of the attention output
+    before linear_proj, in MLA as in standard attention.
+
+    Padded requests have zero query length, so attention kernels leave their output rows
+    unwritten, and linear_proj's per-tensor input scale would read them. The kernel is stubbed
+    with fixed real rows and a chosen fill in the padding rows. Each comparison of two fills
+    runs one layer on fresh contexts, so that both runs share weights.
+    """
+
+    prompt_length = 16  # padded to 64 tokens
+    hidden_size = 256
+    poison = 1.0e4  # finite, so a per-tensor amax picks it up
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def _config_kwargs(self, fp8):
+        return dict(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=8,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **(dict(fp8="e4m3", fp8_recipe="tensorwise") if fp8 else {}),
+        )
+
+    def _build_mla(self, fp8):
+        config = MLATransformerConfig(
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            rope_type="rope",
+            rotary_base=10000,
+            cache_mla_latents=True,
+            **self._config_kwargs(fp8),
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True, qk_layernorm=True
+        ).self_attention.submodules
+        attention = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        )
+        return attention.cuda().eval(), config.v_head_dim, 64
+
+    def _build_standard(self, fp8):
+        import megatron.core.transformer.attention as attention_module
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        # Dynamic standard attention requires a FlashAttention install, even with its kernel
+        # stubbed.
+        if not (
+            attention_module.HAVE_FA3
+            or attention_module.HAVE_FA4
+            or attention_module.is_fa_min_version("2.7.3")
+        ):
+            pytest.skip("dynamic batching needs flash-attn >= 2.7.3, FA3 or FA4")
+        config = TransformerConfig(use_cpu_initialization=True, **self._config_kwargs(fp8))
+        attention = attention_module.SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        return attention.cuda().eval(), config.kv_channels, 256
+
+    @staticmethod
+    def _require_fp8():
+        from transformer_engine.pytorch.fp8 import check_fp8_support
+
+        fp8_available, reason = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason)
+
+    def _context(self, config, block_size_tokens):
+        from megatron.core.inference.config import InferenceConfig
+        from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                buffer_size_gb=0.01,
+                paused_buffer_size_gb=0.002,
+                block_size_tokens=block_size_tokens,
+                max_tokens=128,
+                max_requests=8,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+        context.memory_buffer.zero_()  # keep stale pool contents out of the up-projection
+        context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(1, self.prompt_length + 1, device="cpu"),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+        context.initialize_attention_state()
+        assert context.padded_active_token_count > self.prompt_length
+        return context
+
+    def _forward(self, built, fill, fp8_autocast):
+        """Run one dynamic prefill step; return the linear_proj input and the layer output."""
+        from contextlib import nullcontext
+
+        from megatron.core.inference.utils import InferenceMode
+
+        attention, v_head_dim, block_size_tokens = built
+        context = self._context(attention.config, block_size_tokens)
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        hidden_states = torch.randn(
+            context.padded_active_token_count,
+            1,
+            self.hidden_size,
+            generator=generator,
+            device="cuda",
+        ).to(torch.bfloat16)
+        hidden_states[self.prompt_length :] = 0  # the model zeroes padded embeddings
+
+        def kernel(query, *args, **kwargs):
+            generator = torch.Generator(device="cuda").manual_seed(99)
+            num_heads = attention.num_attention_heads_per_partition
+            output = torch.randn(
+                query.shape[0], 1, num_heads, v_head_dim, generator=generator, device="cuda"
+            ).to(query.dtype)
+            output[self.prompt_length :] = fill
+            return output
+
+        linear_proj_inputs = []
+        hook = attention.linear_proj.register_forward_pre_hook(
+            lambda module, args: linear_proj_inputs.append(args[0].clone())
+        )
+        fp8_context = get_fp8_context(attention.config) if fp8_autocast else nullcontext()
+        try:
+            with mock.patch.object(attention, "flash_decode_and_prefill", side_effect=kernel):
+                with torch.no_grad(), fp8_context, InferenceMode.active():
+                    output, _ = attention(
+                        hidden_states, attention_mask=None, inference_context=context
+                    )
+        finally:
+            hook.remove()
+        (linear_proj_input,) = linear_proj_inputs
+        return linear_proj_input, output
+
+    def _assert_padding_rows_zeroed(self, built):
+        linear_proj_input, _ = self._forward(built, fill=float("nan"), fp8_autocast=False)
+        rows = linear_proj_input.reshape(linear_proj_input.shape[0], -1)
+        assert torch.isfinite(rows[: self.prompt_length]).all()
+        assert torch.count_nonzero(rows[self.prompt_length :]) == 0
+
+    def _assert_real_rows_ignore_padding(self, built, fp8_autocast):
+        _, output = self._forward(built, fill=0.0, fp8_autocast=fp8_autocast)
+        _, poisoned = self._forward(built, fill=self.poison, fp8_autocast=fp8_autocast)
+        assert torch.isfinite(output[: self.prompt_length]).all()
+        assert torch.equal(output[: self.prompt_length], poisoned[: self.prompt_length])
+
+    def test_standard_attention_zeroes_padding_rows(self):
+        self._assert_padding_rows_zeroed(self._build_standard(fp8=True))
+
+    def test_standard_attention_real_rows_ignore_padding_under_fp8(self):
+        self._require_fp8()
+        self._assert_real_rows_ignore_padding(self._build_standard(fp8=True), fp8_autocast=True)
+
+    def test_mla_real_rows_ignore_padding_in_bf16(self):
+        self._assert_real_rows_ignore_padding(self._build_mla(fp8=False), fp8_autocast=False)
+
+    def test_mla_zeroes_padding_rows(self):
+        self._assert_padding_rows_zeroed(self._build_mla(fp8=True))
+
+    def test_mla_real_rows_ignore_padding_under_fp8(self):
+        self._require_fp8()
+        self._assert_real_rows_ignore_padding(self._build_mla(fp8=True), fp8_autocast=True)
+
+
 class TestMLAUpProjectionInput:
 
     @pytest.fixture(scope='function', autouse=True)

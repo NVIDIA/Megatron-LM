@@ -609,6 +609,7 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
+                self._zero_padding_token_outputs(core_attn_out, inference_context)
             forced = [
                 t
                 for t in [query, key, value]
