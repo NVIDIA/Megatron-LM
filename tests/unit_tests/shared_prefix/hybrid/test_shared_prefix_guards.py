@@ -548,6 +548,54 @@ def test_layer_calls_carry_their_shared_prefix_arguments(forest):
     torch.testing.assert_close(multiplicities, expected, rtol=0, atol=0)
 
 
+def test_full_recompute_replays_each_layer_call_with_its_arguments(monkeypatch):
+    """Backward recomputation calls every layer again with the same shared-prefix arguments."""
+    config = _config(
+        moe=True,
+        moe_router_enable_expert_bias=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+    )
+    moe = Mock(spec=TransformerLayer)
+    moe.self_attention = IdentityOp()
+    moe.is_moe_layer = True
+    layers = {"attention": _attention_layer(config), "moe": moe}
+    calls = {name: [] for name in layers}
+    for name, layer in layers.items():
+
+        def forward(*, name=name, **kwargs):
+            calls[name].append(kwargs)
+            return 2 * kwargs["hidden_states"]
+
+        layer.side_effect = forward
+    # Megatron's checkpoint needs the CUDA RNG tracker; torch's replays the callable the same way.
+    monkeypatch.setattr(
+        shared_prefix.tensor_parallel,
+        "checkpoint",
+        lambda function, distribute_saved_activations, *args: torch.utils.checkpoint.checkpoint(
+            function, *args, use_reentrant=True
+        ),
+    )
+    hidden_states = torch.ones(12, 1, 8, dtype=torch.bfloat16, requires_grad=True)
+
+    output = forward_hybrid_stack_shared_prefix(
+        _stack(config, list(layers.values())),
+        hidden_states,
+        _PADDED_LAYOUT,
+        position_embedding_type="none",
+        validated_physical_len=12,
+    )
+    assert [len(layer_calls) for layer_calls in calls.values()] == [1, 1]
+    output.float().sum().backward()
+
+    for (forward_call, replay), argument in zip(
+        calls.values(), ("shared_prefix_forest", "shared_prefix_token_multiplicities")
+    ):
+        assert replay.keys() == forward_call.keys()
+        assert replay[argument] is forward_call[argument]
+
+
 def test_hybrid_model_rejects_config_list_before_any_preprocessing():
     """Shared-prefix guards read the model-level config, not config-list per-layer configs."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
