@@ -44,6 +44,11 @@ class KDALayerConfig(TransformerConfig):
                 "kda_lower_bound must be in the safe range [-5, 0) when kda_safe_gate=True, "
                 f"got {self.kda_lower_bound}."
             )
+        if self.kda_two_stage_gates and self.normalization != "RMSNorm":
+            raise ValueError(
+                "kda_two_stage_gates requires normalization='RMSNorm': its output norm and gate "
+                f"run as one fused gated RMSNorm, got normalization={self.normalization!r}."
+            )
         required_positive = (
             "linear_conv_kernel_dim",
             "linear_key_head_dim",

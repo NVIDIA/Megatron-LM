@@ -245,10 +245,12 @@ class KimiDeltaAttention(_GDNBase):
         x = x.reshape(-1, self.value_head_dim)
         gate = gate.reshape(-1, self.value_head_dim)
         if self.two_stage_gates:
-            # Round only after both normalization and sigmoid gating.
+            # Round only after both normalization and sigmoid gating. validate_kda requires an
+            # RMSNorm out_norm, which has no bias.
             weight = self.out_norm.weight
             if self.config.layernorm_zero_centered_gamma:
-                weight = weight + 1
+                # Add the 1 in FP32, as TE's norms do: in BF16, w + 1 keeps 7 fraction bits.
+                weight = weight.float() + 1
             return rms_norm_gated(
                 x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
             )
