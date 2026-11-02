@@ -706,9 +706,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         torch.ones_like(hidden_states),
         torch.ones_like(hidden_states, dtype=torch.bool),
     )
-    mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
-        hidden_states,
-        probs,
+    mlp.preprocess = (
+        lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
+            hidden_states,
+            probs,
+        )
     )
     mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
     mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)

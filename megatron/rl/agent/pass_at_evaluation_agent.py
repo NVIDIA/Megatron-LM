@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from ..__init__ import GenericGenerationArgs
+from .. import GenericGenerationArgs
 from ..inference import LLMChatMessage
 from .api import EvaluationAgent, EvaluationRequest, EvaluationResponse, RewardEvaluationResult
 
@@ -31,6 +31,7 @@ class PassAtEvaluationResult(RewardEvaluationResult):
     greedy_reward: float
 
 
+@EvaluationResponse.register_subclass
 class PassAtEvaluationResponse(EvaluationResponse[PassAtEvaluationResult]):
     type_name: str = 'PassAtEvaluationResponse'
 
