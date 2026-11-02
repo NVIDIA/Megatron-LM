@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel.utils import ContextParallelBatch
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_model import (
@@ -16,8 +18,10 @@ from megatron.core.models.hybrid.hybrid_model import (
     _validate_hash_moe_pipeline_placement,
 )
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe import router as router_module
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -308,6 +312,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     )
     model = SimpleNamespace(
         config=config,
+        hybrid_layer_config_list=None,
         decoder=decoder,
         position_embedding_type='none',
         pre_process=True,
@@ -350,6 +355,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
         fake_scatter,
     )
     model = SimpleNamespace(
+        hybrid_layer_config_list=None,
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
@@ -387,6 +393,144 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     else:
         assert decoder.kwargs["input_ids"] is None
     assert torch.equal(decoder.kwargs["padding_mask"], padding_mask[:, :2])
+
+
+def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
+    decoder = RecordingDecoder()
+    tp_group = object()
+    embeddings = torch.randn(4, 2, 8)
+    local_embeddings = embeddings[:2].contiguous()
+    embedding = mock.Mock(return_value=embeddings)
+    embedding.scatter_to_sequence_parallel = False
+    inference_context = SimpleNamespace(
+        is_dynamic_batching=mock.Mock(return_value=True),
+        num_speculative_tokens=0,
+        zero_padding_tokens=mock.Mock(),
+    )
+
+    def fake_scatter(tensor, group):
+        assert tensor is embeddings
+        assert group is tp_group
+        return local_embeddings
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        fake_scatter,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.InferenceMode.is_active", lambda: True
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.is_using_quantization_scales",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.get_pg_rank",
+        lambda group: 3 if group is tp_group else None,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=True,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        embedding=embedding,
+        hybrid_layer_config_list=None,
+        position_embedding_type="none",
+        pre_process=True,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        vocab_size=128,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+    position_ids = torch.arange(4).repeat(2, 1)
+
+    output = HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=None,
+        inference_context=inference_context,
+        runtime_gather_output=True,
+    )
+
+    embedding.assert_called_once_with(input_ids=input_ids, position_ids=position_ids)
+    inference_context.zero_padding_tokens.assert_called_once_with(
+        local_embeddings, sequence_parallel_rank=3
+    )
+    assert output is decoder.kwargs["hidden_states"]
+    assert output.unwrap() is local_embeddings
+
+
+@pytest.mark.parametrize("pre_process", [True, False])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_hybrid_model_shards_each_layout_padding_mask(
+    monkeypatch, pre_process, tp_rank, sequence_parallel
+):
+    decoder = RecordingDecoder()
+    tp_group = object()
+
+    def scatter(tensor, group):
+        assert group is tp_group
+        return tensor.chunk(2, dim=0)[tp_rank].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        scatter,
+    )
+    masks = {
+        "contiguous": torch.tensor([[False, True, False, False, True, True, False, True]]),
+        # A padded zigzag view may be longer than the contiguous view.
+        "zigzag": torch.tensor(
+            [[True, False, True, True, False, False, True, False, True, True, True, True]]
+        ),
+    }
+    cp_batch = ContextParallelBatch(
+        boundary_layout="contiguous",
+        batches_by_layout={layout: {"padding_mask": mask} for layout, mask in masks.items()},
+        packed_seq_params_by_layout={layout: None for layout in masks},
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=sequence_parallel,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        hybrid_layer_config_list=None,
+        position_embedding_type="none",
+        pre_process=pre_process,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    hidden_states = torch.randn(4 if sequence_parallel else 8, 1, 8)
+    decoder.input_tensor = hidden_states
+    HybridModel.forward(
+        model,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        decoder_input=hidden_states if pre_process else None,
+        padding_mask=masks["contiguous"],
+        cp_batch=cp_batch,
+    )
+    for layout, mask in masks.items():
+        expected = mask.chunk(2, dim=1)[tp_rank] if sequence_parallel else mask
+        torch.testing.assert_close(decoder.kwargs["padding_mask_by_layout"][layout], expected)
+        # MTP and other consumers still need the original CP-only views.
+        assert cp_batch.get_batch(layout)["padding_mask"] is mask
 
 
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
@@ -484,6 +628,25 @@ def test_hash_moe_threshold_rejects_count_larger_than_pattern():
         _get_hash_moe_layer_threshold("-E-E", 3)
 
 
+def test_hash_moe_config_list_threshold_and_placement():
+    config = TransformerConfig(
+        num_layers=8, hidden_size=8, num_attention_heads=2, num_moe_experts=2
+    )
+    mlp = MLPLayerConfig.from_config(config)
+    moe = MoELayerConfig.from_config(config)
+    layers = [mlp, moe, PipelineSplit] * 4
+    assert _get_hash_moe_layer_threshold(layers, 3) == 6
+    with pytest.raises(ValueError, match="exceeds the 4 MoE layers"):
+        _get_hash_moe_layer_threshold(layers, 5)
+    _validate_hash_moe_pipeline_placement(
+        [mlp, moe], layer_offset=6, hash_moe_layer_threshold=6, pre_process=False
+    )
+    with pytest.raises(ValueError, match="non-embedding stage contains hash MoE"):
+        _validate_hash_moe_pipeline_placement(
+            [mlp, moe], layer_offset=4, hash_moe_layer_threshold=6, pre_process=False
+        )
+
+
 def test_hash_moe_pipeline_placement_allows_later_learned_moe_stage():
     _validate_hash_moe_pipeline_placement(
         [LayerSymbols.MOE], layer_offset=6, hash_moe_layer_threshold=4, pre_process=False
@@ -538,7 +701,6 @@ def test_hybrid_stack_marks_mtp_moe_and_propagates_mtp_depth(monkeypatch):
 
 def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
     import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
-    import megatron.core.models.hybrid.hybrid_layer_allocation as allocation_module
     import megatron.core.transformer.multi_token_prediction as mtp_module
 
     captured_stack_kwargs = {}
@@ -557,9 +719,6 @@ def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
             self.layers = torch.nn.ModuleList([torch.nn.Identity()])
 
     monkeypatch.setattr(hybrid_block_module, "HybridStack", _RecordingHybridStack)
-    monkeypatch.setattr(
-        allocation_module, "validate_segment_layers", lambda _pattern, _config: [LayerSymbols.MOE]
-    )
     monkeypatch.setattr(mtp_module, "build_module", lambda *_args, **_kwargs: torch.nn.Identity())
 
     config = TransformerConfig(

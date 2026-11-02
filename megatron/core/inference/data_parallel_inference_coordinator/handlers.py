@@ -143,7 +143,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         preparer and payload stager, None when the client sent none. It is
         unbounded, so it is forwarded verbatim and never decoded here.
 
-    Returns True (stopping the loop) if no engines are reachable.
+    If no engines are reachable, resolves the request as failed and leaves the
+    loop running so a replacement engine can register.
     """
     # Message from a known client
     if sender_identity not in coordinator.known_clients:
@@ -194,6 +195,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
@@ -260,12 +262,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         ):
             break
     else:
-        # If all engines have died, we are in an abnormal state, and must exit cleanly.
         logging.error("Coordinator: no reachable engines for request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -347,6 +348,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
@@ -361,10 +363,10 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
             break
     else:
         logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -583,13 +585,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 sender_identity,
             )
             continue
-        client_identity, client_request_id = coordinator._forget_client_request(fid)
-        assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
-        if assigned_rank is not None:
-            idx = coordinator.identity_to_rank_index.get(assigned_rank)
-            if idx is not None:
-                assert coordinator._pending_counts[idx] >= 1
-                coordinator._pending_counts[idx] -= 1
+        client_identity, client_request_id, _ = coordinator._cleanup_request(fid)
         if coordinator.is_disaggregated_inference():
             coordinator.disaggregated_runtime.handle_decode_done(fid)
 

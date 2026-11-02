@@ -8,6 +8,8 @@ from typing import Optional, Sequence, Union
 
 import torch
 
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -218,6 +220,7 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
         self.frozen_expert_bias = False
+        self.qb_estimation_scope = self.config.moe_router_quantile_balancing_estimation_scope
         self.mtp_layer_number: Optional[int] = None
         self.is_hash_layer = False
         self.register_buffer('tid2eid', None)
@@ -235,6 +238,12 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+        else:
+            self.local_tokens_per_expert = None
+
+        if self.enable_expert_bias or (
+            self.routing_type == "quantile_balancing" and self.qb_estimation_scope == "global_batch"
+        ):
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -244,7 +253,6 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
 
         # Initialize global tokens per expert for global aux loss
@@ -267,10 +275,32 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
+        if self.routing_type == "quantile_balancing" and self.qb_estimation_scope == "global_batch":
+            assert not self.is_aux_loss_enabled(), (
+                "Quantile balancing handles load balance via the bias update; "
+                "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
+            )
+            self.qb_beta = None
+            self.qb_beta_accum = None
+            self.qb_beta_count = None
+            self.register_buffer(
+                'qb_histogram',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    self.config.moe_router_qb_num_bins,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_bin_bounds',
+                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+            )
         # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
         # and reset each global batch.
-        if self.routing_type == "quantile_balancing":
+        elif self.routing_type == "quantile_balancing":
             assert not self.is_aux_loss_enabled(), (
                 "Quantile balancing handles load balance via the bias update; "
                 "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
@@ -297,10 +327,14 @@ class TopKRouter(Router):
                 torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
                 persistent=False,
             )
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
         else:
             self.qb_beta = None
             self.qb_beta_accum = None
             self.qb_beta_count = None
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
@@ -364,6 +398,9 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -403,9 +440,10 @@ class TopKRouter(Router):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply quantile-balancing (QB) routing to the logits tensor.
 
-        Selects top-k experts per token using a dual coordinate-descent update on
-        a per-expert bias ``qb_beta``. Load balance is handled entirely by the bias
-        update; auxiliary losses must be disabled when QB is active.
+        ``micro_batch`` uses the existing exact estimator and ``qb_beta`` state.
+        ``global_batch`` accumulates Kimi K3 margin histograms and updates the shared
+        router ``expert_bias`` at the global-batch boundary. Auxiliary losses must be
+        disabled for either estimator.
 
         Args:
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
@@ -416,6 +454,24 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and either a boolean
             map or compact expert IDs, according to ``dense_output``.
         """
+        if self.qb_estimation_scope == "global_batch":
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_histogram = (
+                self.training and torch.is_grad_enabled() and not self.frozen_expert_bias
+            )
+            return topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+                qb_histogram=self.qb_histogram if accumulate_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+            )
+
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."
@@ -503,6 +559,9 @@ class TopKRouter(Router):
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
         config = self.config
+        # Megakernels adapt the boolean routing map independently of native dispatchers.
+        if config.moe_megakernel_backend is not None:
+            return None
         fused_dense_routing = (
             config.moe_token_dispatcher_type == "flex"
             and config.moe_expert_capacity_factor is None
@@ -1386,6 +1445,35 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
 
+    def _uses_sigmoid_topk_kernel(
+        self, logits: torch.Tensor, precomputed_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether this inference call uses the fused sigmoid top-k kernel.
+
+        It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
+        scores with an expert bias, fp32 logits and supported shapes, without
+        group-limited routing, router replay, precomputed indices or TE's fused
+        router; batch-invariant mode keeps its uncompiled reference path. forward()
+        only reaches this path while InferenceMode is active, whether or not
+        gradients are enabled, and the kernel's outputs carry no autograd graph.
+        Expert selection matches the compiled path; for top-k of eight or more a
+        probability can differ from it in the last bit.
+        """
+        return (
+            self.config.inference_moe_router_backend == 'triton'
+            and HAVE_SIGMOID_TOPK_KERNEL
+            and logits.is_cuda
+            and logits.dtype == torch.float32
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and is_sigmoid_topk_supported(logits.shape[-1], self.topk)
+            and precomputed_indices is None
+            and self.config.moe_router_group_topk is None
+            and not self.config.moe_router_fusion
+            and self.router_replay is None
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def _forward(
         self,
         input: torch.Tensor,
@@ -1405,7 +1493,8 @@ class InferenceTopKRouter(TopKRouter):
         # Preserve the compiled inference router's established single-batch layout.
         logits = logits.squeeze(1)  # [num_tokens, num_experts]
 
-        # QB selects on (logits - qb_beta); at inference qb_beta is fixed, so it's per-token.
+        # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
+        # fixed additive bias through the normal score-function route.
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
@@ -1415,6 +1504,13 @@ class InferenceTopKRouter(TopKRouter):
             if is_batch_invariant_mode_enabled()
             else self._compiled_topk_routing
         )
+        if self._uses_sigmoid_topk_kernel(logits, precomputed_indices):
+            return sigmoid_topk_routing(
+                logits.contiguous(),
+                self.expert_bias.float(),
+                self.topk,
+                self.config.moe_router_topk_scaling_factor,
+            )
         probs, top_indices = routing(
             logits,
             self.topk,
