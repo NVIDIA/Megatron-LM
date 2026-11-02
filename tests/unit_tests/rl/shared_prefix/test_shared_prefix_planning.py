@@ -250,6 +250,16 @@ def _odd_row(siblings, odd, *, prompt, completion, multiple, capacity):
     return _worker_modes(plan_rows, capacity, padding_multiple=multiple)
 
 
+def _placeholder_dense_bin(placeholder):
+    """One aligned dense bin: 15 siblings with 100-token prompts, optionally a placeholder."""
+    plan_rows = rows(15, group="g", prompt=tuple(range(1, 101)), completion=20)
+    plan_rows += [SharedPrefixRow(15, "g", (), 1)] if placeholder else []
+    costs = [_round_up(plan_row.total_length, 16) for plan_row in plan_rows]
+    dense = (SharedPrefixExecutionUnit(tuple(range(len(plan_rows))), None, sum(costs)),)
+    kwargs = dict(costs=costs, padding_multiple=16, bin_capacity=4096)
+    return _summary(share_prefixes_in_dense_training_bins(plan_rows, dense, **kwargs))
+
+
 def _packer_called_twice():
     seen, kwargs = [], dict(costs=(4, 4), bin_capacity=8)
     units = plan_dense_training_bins(dense_packer=lambda c: seen.append(c) or [(1, 0)], **kwargs)
@@ -481,6 +491,13 @@ PLANNING_EXAMPLES = {
             "slots": [(tuple(range(16)), "dense", 1936)],
             "forest, forest_dense": ([((15,), "dense", 16), (tuple(range(15)), "star", 520)],) * 2,
         },
+    ),
+    # An aligned dense bin is one forward, and a reassembler placeholder (prompt length 0, one
+    # pad token) cannot be a forest root, so the bin that holds it stays dense: 1936 tokens
+    # instead of the 520-token root its 15 siblings form alone.
+    "dense-bins-placeholder-keeps-bin-dense": (
+        lambda: [_placeholder_dense_bin(placeholder) for placeholder in (True, False)],
+        {"0": [(tuple(range(16)), "dense", 1936)], "1": [(tuple(range(15)), (1,), 520)]},
     ),
     # Called twice to enforce determinism.
     "dense-bins-packer-called-twice": (

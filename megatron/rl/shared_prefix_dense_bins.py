@@ -81,9 +81,12 @@ def share_prefixes_in_dense_training_bins(
     """Share exact prompts in aligned dense bins without changing MTP groups.
 
     Each output bin retains one auxiliary-loss normalization group, source-row
-    coverage, and independent causal boundaries. Ineligible bins stay dense.
-    An exact-prompt group with more than ``max_completions_per_bin`` rows is
-    split evenly into several roots.
+    coverage, and independent causal boundaries. Rows that do not share a
+    prompt run as single-row causal roots next to the stars. A bin that holds a
+    row without a group ID, prompt or completion stays dense: the aligned bin
+    is one forward, and such a row cannot be a forest root, whose prompt and
+    completion must both be nonempty. An exact-prompt group with more than
+    ``max_completions_per_bin`` rows is split evenly into several roots.
     """
     multiple = padding_multiple
     _validate_dense_partition(units, costs, bin_capacity)
