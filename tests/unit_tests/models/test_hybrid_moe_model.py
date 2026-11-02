@@ -395,6 +395,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dynamic_context_parallel": False,
     "min_dynamic_context_parallel_size": 1,
     "max_seqlen_per_dp_cp_rank": None,
+    "max_seq_length_per_sample": 1024,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
@@ -407,6 +408,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_flashinfer_mxfp8_token_capacity": None,
     "inference_moe_nvfp4_recipe": None,
     "inference_moe_disable_fused_quant_kernels": False,
+    "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
