@@ -25,6 +25,11 @@ engine, so
 rejects batch-invariant mode. flash-attn is checked and bound once, through
 :func:`require_shared_prefix_flash_attn`; a missing or too-old installation raises
 ``ImportError``.
+
+The pass plan, including the varlen offsets and maximum lengths, is built on the host for every
+forest, so the kernel cannot be captured in a CUDA graph: the validation rejects any
+``cuda_graph_impl`` other than ``"none"``, and the attention branch refuses to run during stream
+capture.
 """
 
 import functools

@@ -1726,6 +1726,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 )
             if query.dtype not in (torch.float16, torch.bfloat16):
                 raise TypeError("shared-prefix forest attention requires fp16 or bf16 Q/K/V")
+            if torch.cuda.is_current_stream_capturing():
+                raise NotImplementedError(
+                    "shared-prefix forest attention cannot be captured in a CUDA graph: its "
+                    "pass plan is built on the host for every forest"
+                )
 
             softmax_scale = self.get_softmax_scale(query)
             with core_attn_manager as query:

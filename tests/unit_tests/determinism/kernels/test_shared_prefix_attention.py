@@ -258,6 +258,9 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         attn_logit_softcapping=None,
         batch_invariant_mode=False,
         flash_attention_version=None,
+        fp8_dot_product_attention=False,
+        fp8_multi_head_attention=False,
+        cuda_graph_impl="none",
     )
     module.config = SimpleNamespace(**{**defaults, **config})
     return module
@@ -278,6 +281,11 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
             NotImplementedError,
             "batch-invariant mode",
         ),
+        ({"fp8_dot_product_attention": True}, NotImplementedError, "FP8 attention"),
+        ({"fp8_multi_head_attention": True}, NotImplementedError, "FP8 attention"),
+        ({"cuda_graph_impl": "local"}, NotImplementedError, "CUDA graphs"),
+        ({"cuda_graph_impl": "transformer_engine"}, NotImplementedError, "CUDA graphs"),
+        ({"cuda_graph_impl": "full_iteration"}, NotImplementedError, "CUDA graphs"),
         ({"tp": 2}, RuntimeError, "attention TP helper"),
         ({"cp": 2}, RuntimeError, "attention CP helper"),
     ],

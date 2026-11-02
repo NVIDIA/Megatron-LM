@@ -81,6 +81,18 @@ def validate_shared_prefix_attention(attention, *, tp_size: int, cp_size: int) -
             "shared-prefix forest attention does not support batch-invariant mode: it runs "
             "FlashAttention 2 passes whatever flash_attention_version selects"
         )
+    # Under FP8 the dense path would run Transformer Engine FP8 attention; the forest would not.
+    if config.fp8_dot_product_attention or config.fp8_multi_head_attention:
+        raise NotImplementedError(
+            "shared-prefix forest attention does not support FP8 attention: it runs "
+            "FlashAttention 2 in fp16/bf16"
+        )
+    # A captured graph would replay one forest's host-built pass plan for every later forest.
+    if config.cuda_graph_impl != "none":
+        raise NotImplementedError(
+            "shared-prefix forest attention does not support CUDA graphs: its pass plan is "
+            "built on the host for every forest"
+        )
     if attention.pg_collection.tp.size() != tp_size:
         raise RuntimeError(
             f"shared-prefix attention TP helper size {attention.pg_collection.tp.size()} does "

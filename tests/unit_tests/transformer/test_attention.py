@@ -119,6 +119,10 @@ class TestParallelAttention:
                 packed_seq_params=make_test_packed_seq_params(cu_seqlens=[0, 12, layout.total_len]),
                 shared_prefix_forest=layout,
             )
+        # The pass plan is built on the host for every forest, so stream capture is refused.
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(NotImplementedError, match="captured in a CUDA graph"):
+            attention(hidden_states, None, shared_prefix_forest=layout)
         assert len(calls) == 1
 
     def test_cpu_forward(self):
