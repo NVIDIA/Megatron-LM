@@ -2323,10 +2323,15 @@ class TransformerConfig(ModelParallelConfig):
                         if self.moe_ffn_hidden_size is not None
                         else self.ffn_hidden_size
                     )
-                    if expert_hidden % 128 or expert_ffn % 128:
+                    # Each expert tensor-parallel rank holds an FFN shard of expert_ffn / ETP.
+                    etp = self.expert_tensor_parallel_size
+                    if expert_hidden % 128 or expert_ffn % (128 * etp):
                         raise ValueError(
-                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
-                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
+                            "FlashInfer CUTLASS MXFP8 requires expert hidden and per-rank FFN "
+                            "dimensions divisible by 128 (each expert tensor-parallel rank holds "
+                            "moe_ffn_hidden_size / expert_tensor_parallel_size); got hidden "
+                            f"{expert_hidden}, FFN {expert_ffn} over {etp} expert "
+                            "tensor-parallel ranks."
                         )
                 if self.add_bias_linear:
                     raise ValueError(
