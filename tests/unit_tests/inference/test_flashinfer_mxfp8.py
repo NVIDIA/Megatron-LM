@@ -262,10 +262,14 @@ def test_expert_hands_bounded_policy_and_fp32_nvls_buffer_to_routed_kernel(monke
     monkeypatch.setattr(
         experts.NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(lambda cls: rsv)
     )
+    # The expert dispatches on the weights' FlashInfer layout; these select the routed kernel.
+    routed_weight = flashinfer_mxfp8_module.FlashInferRoutedMXFP8Weight(
+        torch.empty(0), torch.empty(0), 0, 0, 0, 0
+    )
     grouped_mlp = SimpleNamespace(
         _uses_mxfp8_weights=True,
-        _fc1_weight=object(),
-        _fc2_weight=object(),
+        _fc1_weight=routed_weight,
+        _fc2_weight=routed_weight,
         _activation_clamp_scale=None,
         _flashinfer_activation_type=SimpleNamespace(value=6),
         _nvls_dispatcher=True,
