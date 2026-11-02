@@ -3573,7 +3573,8 @@ def setup_model_and_optimizer(
                 # reading -- that the flag was meant to apply and silently did not -- is the
                 # dangerous one.
                 print_rank_0(
-                    f'> skipping DSA indexer reset: resuming at iteration {args.iteration}. '
+                    f'> skipping DSA indexer reset: resuming at iteration '
+                    f'{train_state.iteration}. '
                     'Load with --finetune (or --pretrained-checkpoint) to initialize the '
                     'indexer from a checkpoint that carries a non-zero iteration.'
                 )
@@ -4396,14 +4397,14 @@ def training_log(
             writer.add_scalar(
                 'non-indexer-grad-norm vs samples',
                 non_indexer_grad_norm,
-                args.consumed_train_samples,
+                train_state.consumed_train_samples,
             )
             if wandb_writer:
                 wandb_writer.log({'non-indexer-grad-norm': non_indexer_grad_norm}, iteration)
         if indexer_grad_norm is not None:
             writer.add_scalar('indexer-grad-norm', indexer_grad_norm, iteration)
             writer.add_scalar(
-                'indexer-grad-norm vs samples', indexer_grad_norm, args.consumed_train_samples
+                'indexer-grad-norm vs samples', indexer_grad_norm, train_state.consumed_train_samples
             )
             if wandb_writer:
                 wandb_writer.log({'indexer-grad-norm': indexer_grad_norm}, iteration)
@@ -4419,7 +4420,7 @@ def training_log(
             writer.add_scalar(
                 'non-indexer-num-zeros vs samples',
                 non_indexer_num_zeros_in_grad,
-                args.consumed_train_samples,
+                train_state.consumed_train_samples,
             )
             if wandb_writer:
                 wandb_writer.log(
@@ -4430,7 +4431,7 @@ def training_log(
             writer.add_scalar(
                 'indexer-num-zeros vs samples',
                 indexer_num_zeros_in_grad,
-                args.consumed_train_samples,
+                train_state.consumed_train_samples,
             )
             if wandb_writer:
                 wandb_writer.log({'indexer-num-zeros': indexer_num_zeros_in_grad}, iteration)
@@ -6006,7 +6007,7 @@ def train(
             # training_log skips these metrics when they stay None.
             dsa_split_stats = getattr(args, 'experimental_attention_variant', None) == 'dsa'
             if dsa_split_stats and grad_norm is not None and (
-                iteration % args.tensorboard_log_interval == 0
+                iteration % cfg.logger.tensorboard_log_interval == 0
             ):
                 # The optimizer already computed these while clipping; reuse them rather
                 # than walking every parameter a second time.
@@ -6026,7 +6027,7 @@ def train(
                     non_indexer_grad_norm
                 )
             if dsa_split_stats and num_zeros_in_grad is not None and (
-                iteration % args.tensorboard_log_interval == 0
+                iteration % cfg.logger.tensorboard_log_interval == 0
             ):
                 indexer_num_zeros_in_grad, non_indexer_num_zeros_in_grad = (
                     calc_dsa_split_grad_num_zeros(model, optimizer)
