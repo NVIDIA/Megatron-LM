@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from megatron.core.activations import situ_glu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -41,6 +43,50 @@ else:
     te = None
     TELinear, set_save_original_input = None, None
     get_cuda_rng_tracker = None
+
+
+def get_shared_expert_alignment(config: TransformerConfig) -> int:
+    """Token-count alignment the shared expert needs for a quantized forward.
+
+    TE's FP8/FP4 GEMMs require the product of all dimensions except the last to be a
+    multiple of the recipe alignment (16 for blockwise/hybrid FP8, 32 for MXFP8, 128 for
+    FP4), and THD packing leaves the per-microbatch token count arbitrary. The routed
+    experts are aligned by the token dispatcher; the shared expert runs per-token TE
+    linears on the full token set, so it pads itself. Only the GEMM alignment applies here,
+    not the 256-token grouping alignment of the routed experts' grouped kernels. Returns 1
+    without FP8 or FP4, which keeps the BF16 path a no-op.
+    """
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    if config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 1
+
+
+def pad_shared_expert_tokens(hidden_states: torch.Tensor, align: int) -> tuple[torch.Tensor, int]:
+    """Zero-pad the token (dim 0) axis of ``hidden_states`` to a multiple of ``align``.
+
+    Only the sequence axis is padded, so any batch size keeps working; the rows added are
+    zeros and are sliced off again by :func:`unpad_shared_expert_tokens`, so they never
+    affect the result. Returns the (possibly padded) tensor together with the original
+    token count. A no-op when ``align <= 1`` or the count is already a multiple.
+    """
+    num_tokens = hidden_states.shape[0]
+    remainder = num_tokens % align if align > 1 else 0
+    if remainder == 0:
+        return hidden_states, num_tokens
+    pad = align - remainder
+    # F.pad takes the per-axis corrections from the last axis backwards, so the token axis
+    # (axis 0) is the final pair of the tuple.
+    pad_tuple = (0, 0) * (hidden_states.dim() - 1) + (0, pad)
+    return F.pad(hidden_states, pad_tuple), num_tokens
+
+
+def unpad_shared_expert_tokens(output: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Slice a padded shared-expert output back to the original token count."""
+    if output.shape[0] == num_tokens:
+        return output
+    return output[:num_tokens]
 
 
 class SharedExpertState(Enum):
@@ -190,6 +236,8 @@ class SharedExpertMLP(MLP):
             self.cached_fc2_output = None
             self.cached_output = None
             self.gate_score = None
+            # Token count before the FP8/FP4 padding of linear_fc1, to unpad linear_fc2.
+            self.cached_fc1_num_tokens = None
 
             # State machine to ensure correct calling order of overlapped forward methods
             self._overlap_state = SharedExpertState.IDLE
@@ -200,7 +248,14 @@ class SharedExpertMLP(MLP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
-        output, _ = super().forward(hidden_states)
+        # The shared expert sees the full, unpadded THD token set, so it pads the sequence
+        # dimension itself when quantization requires it; the gate is computed on the
+        # unpadded input and applied after the padding is sliced off.
+        padded_input, num_tokens = pad_shared_expert_tokens(
+            hidden_states, get_shared_expert_alignment(self.config)
+        )
+        output, _ = super().forward(padded_input)
+        output = unpad_shared_expert_tokens(output, num_tokens)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
@@ -265,9 +320,11 @@ class SharedExpertMLP(MLP):
         """
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
-                self.cached_fc1_input
+            fc1_input, num_tokens = pad_shared_expert_tokens(
+                self.cached_fc1_input, get_shared_expert_alignment(self.config)
             )
+            self.cached_fc1_num_tokens = num_tokens
+            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(fc1_input)
             self.cached_fc1_input = None
 
             if self.config.use_te_activation_func:
@@ -349,6 +406,12 @@ class SharedExpertMLP(MLP):
             # [s, b, h]
             self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
+            # Drop the rows linear_fc1 was padded with so the following TP comm and the
+            # gated output see the original, unpadded token count.
+            self.cached_fc2_output = unpad_shared_expert_tokens(
+                self.cached_fc2_output, self.cached_fc1_num_tokens
+            )
+            self.cached_fc1_num_tokens = None
 
     @overlap_state_check(
         SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE
@@ -586,7 +649,12 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return output.view(*orig_shape[:-1], output.size(-1))
 
     def _fused_grouped_swiglu_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
+        """Run the fused shared expert MLP with the same TP comms as the dense MLP path.
+
+        Unlike the per-token TE linears of :class:`SharedExpertMLP`, this path feeds TE's
+        grouped-linear ops, which split and quantize per group and therefore accept an
+        arbitrary token count; it does not need the shared-expert FP8 token padding.
+        """
         if self.config.sequence_parallel:
             fc1_input = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=True

@@ -1231,6 +1231,8 @@ def get_updated_expert_bias(
         torch.Tensor: The updated expert bias.
     """
     with torch.no_grad():
+        if expert_bias_update_rate == 0.0:
+            return expert_bias
         if tp_dp_cp_group is None:
             # TODO(Hepteract): delete the usage of the global parallel_state.
             tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(

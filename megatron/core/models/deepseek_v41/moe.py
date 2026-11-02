@@ -2,10 +2,13 @@
 
 """Modality-specific auxiliary-loss-free routing using the standard MoE dispatcher."""
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.core import tensor_parallel
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
@@ -31,8 +34,14 @@ class ModalityBalance(nn.Module):
 class ModalityRouter(Router):
     """Select using modality biases, but weight experts using unbiased sqrt-softplus scores."""
 
-    def __init__(self, config, pg_collection, is_mtp_layer=False) -> None:
-        super().__init__(config, pg_collection, is_mtp_layer)
+    def __init__(
+        self,
+        config,
+        pg_collection,
+        is_mtp_layer=False,
+        hash_moe_layer_threshold: Optional[int] = None,
+    ) -> None:
+        super().__init__(config, pg_collection, is_mtp_layer, hash_moe_layer_threshold)
         if config.moe_router_score_function != "sqrtsoftplus":
             raise ValueError("V4.1 modality routing requires sqrtsoftplus scores")
         if config.moe_aux_loss_coeff:
@@ -58,15 +67,30 @@ class ModalityRouter(Router):
         if self.config.moe_router_topk > 1:
             weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
         weights = weights * self.config.moe_router_topk_scaling_factor
+        if padding_mask is not None:
+            valid = ~padding_mask.reshape(-1, 1)
+            # Mask the selected experts before scatter to avoid a dense mask multiply.
+            weights = weights * valid
         probs = torch.zeros_like(scores).scatter(-1, indices, weights)
         route = torch.zeros_like(scores, dtype=torch.bool).scatter(-1, indices, True)
-        if padding_mask is not None:
-            route = route & ~padding_mask.reshape(-1, 1)
-            probs = probs * route
-        if self.training and torch.is_grad_enabled() and self.config.moe_router_enable_expert_bias:
+        # Keep routing rows for the dropless dispatcher, but exclude padded
+        # tokens from balance counters below.
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and self.config.moe_router_enable_expert_bias
+            and self.config.moe_router_bias_update_rate != 0.0
+        ):
+            counted_route = route
+            if padding_mask is not None:
+                counted_route = route & valid
             with torch.no_grad():
-                self.text_balance.local_tokens_per_expert.add_((route & ~image[:, None]).sum(0))
-                self.image_balance.local_tokens_per_expert.add_((route & image[:, None]).sum(0))
+                self.text_balance.local_tokens_per_expert.add_(
+                    (counted_route & ~image[:, None]).sum(0)
+                )
+                self.image_balance.local_tokens_per_expert.add_(
+                    (counted_route & image[:, None]).sum(0)
+                )
         return probs.to(logits.dtype), route
 
     def forward(self, hidden_states, padding_mask=None, image_mask=None):
@@ -78,16 +102,25 @@ def multimodal_moe_forward(moe, hidden_states, image_mask, padding_mask=None):
     """Compose standard dispatch/expert/combine operations with explicit modality inputs.
 
     The mask is never placed on a module, so overlapping forwards cannot overwrite
-    another microbatch's routing metadata.
+    another microbatch's routing metadata. Apply the same selective-recompute
+    checkpoint used by the regular MoE path when enabled.
     """
-    shared = moe.shared_experts_compute(hidden_states)
-    padding = None if padding_mask is None else padding_mask.transpose(0, 1)
-    probs, route = moe.router(hidden_states, padding, image_mask.transpose(0, 1))
-    hidden_states, probs = moe.preprocess(hidden_states, probs, route)
-    dispatched, probs = moe.dispatch(hidden_states, probs)
-    output, bias = moe.routed_experts_compute(dispatched, probs)
-    output = moe.combine(output)
-    return moe.postprocess(output, shared), bias
+
+    def custom_forward(hidden_states):
+        shared = moe.shared_experts_compute(hidden_states)
+        padding = None if padding_mask is None else padding_mask.transpose(0, 1)
+        probs, route = moe.router(hidden_states, padding, image_mask.transpose(0, 1))
+        hidden_states, probs = moe.preprocess(hidden_states, probs, route)
+        dispatched, probs = moe.dispatch(hidden_states, probs)
+        output, bias = moe.routed_experts_compute(dispatched, probs)
+        output = moe.combine(output)
+        return moe.postprocess(output, shared), bias
+
+    if moe.training and moe.moe_layer_recompute:
+        outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+    else:
+        outputs = custom_forward(hidden_states)
+    return outputs
 
 
 class ModalityMoELayer(MoELayer):
