@@ -6,11 +6,11 @@ FlashInfer is adding the matching `num_active_tokens` argument to the two kernel
 - `cutlass_fused_moe` (bf16 experts): flashinfer-ai/flashinfer#6783
 - `trtllm_fp8_block_scale_routed_moe` (MXFP8 experts): flashinfer-ai/flashinfer#6784
 
-Until a FlashInfer release ships them, this module exports both kernels under their own names
-and signatures. When the installed FlashInfer accepts `num_active_tokens` the call is
-forwarded unchanged. Otherwise the kernel runs without its own finalize and a persistent Triton
-kernel finalizes the live rows into `output`; rows at or beyond the count are left untouched,
-as the real argument guarantees.
+Until a FlashInfer release ships them, this module exports both kernels under their own names,
+taking the arguments Megatron passes them. When the installed FlashInfer accepts
+`num_active_tokens` the call is forwarded unchanged. Otherwise the kernel runs without its own
+finalize and a persistent Triton kernel finalizes the live rows into `output`; rows at or beyond
+the count are left untouched, as the real argument guarantees.
 
 UNWIND, once `pyproject.toml` requires a FlashInfer release that ships both changes:
 
@@ -25,6 +25,7 @@ UNWIND, once `pyproject.toml` requires a FlashInfer release that ships both chan
 
 from __future__ import annotations
 
+import functools
 import inspect
 
 import torch
@@ -214,11 +215,13 @@ def cutlass_fused_moe(
     fc2_expert_weights: torch.Tensor,
     output_dtype: torch.dtype,
     *,
-    output: torch.Tensor | None = None,
-    num_active_tokens: torch.Tensor | None = None,
+    activation_type: int,
+    quant_scales: list[torch.Tensor] | None = None,
+    clamped_relu2_limit: torch.Tensor | None = None,
     ep_size: int = 1,
     ep_rank: int = 0,
-    **kwargs,
+    output: torch.Tensor | None = None,
+    num_active_tokens: torch.Tensor | None = None,
 ):
     """`flashinfer.fused_moe.cutlass_fused_moe` with `num_active_tokens`.
 
@@ -229,22 +232,25 @@ def cutlass_fused_moe(
     """
     if _cutlass_fused_moe is None:
         raise RuntimeError("flashinfer-python is required for cutlass_fused_moe.")
-    operands = (
+    kernel = functools.partial(
+        _cutlass_fused_moe,
         input,
         token_selected_experts,
         token_final_scales,
         fc1_expert_weights,
         fc2_expert_weights,
+        quant_scales=quant_scales,
+        activation_type=activation_type,
+        clamped_relu2_limit=clamped_relu2_limit,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
     )
-    common = dict(kwargs, ep_size=ep_size, ep_rank=ep_rank)
     if num_active_tokens is None:
-        return _cutlass_fused_moe(*operands, output_dtype, output=output, **common)
+        return kernel(output_dtype, output=output)
     if CUTLASS_MOE_HAS_ACTIVE_TOKENS:
-        return _cutlass_fused_moe(
-            *operands, output_dtype, output=output, num_active_tokens=num_active_tokens, **common
-        )
+        return kernel(output_dtype, output=output, num_active_tokens=num_active_tokens)
     assert output is not None, "the emulated num_active_tokens needs an fp32 output buffer"
-    kernel_rows = _cutlass_fused_moe(*operands, input.dtype, enable_alltoall=True, **common)[0]
+    kernel_rows = kernel(input.dtype, enable_alltoall=True)[0]
     num_local_experts = fc1_expert_weights.shape[0]
     combine_valid_rows(
         kernel_rows,
@@ -260,10 +266,30 @@ def cutlass_fused_moe(
 def trtllm_fp8_block_scale_routed_moe(
     *,
     topk_ids: torch.Tensor,
+    routing_bias: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int | None,
+    topk_group: int | None,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: float | None,
+    fp8_quantization_type: int,
+    activation_type: int,
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    tune_max_num_tokens: int = 8192,
     do_finalize: bool = True,
     output: torch.Tensor | None = None,
     num_active_tokens: torch.Tensor | None = None,
-    **kwargs,
 ):
     """`flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe` with `num_active_tokens`.
 
@@ -274,19 +300,39 @@ def trtllm_fp8_block_scale_routed_moe(
     """
     if _trtllm_fp8_block_scale_routed_moe is None:
         raise RuntimeError("flashinfer-python is required for trtllm_fp8_block_scale_routed_moe.")
-    forwarded = dict(kwargs, topk_ids=topk_ids, do_finalize=do_finalize)
-    if output is not None:
-        forwarded["output"] = output
+    kernel = functools.partial(
+        _trtllm_fp8_block_scale_routed_moe,
+        topk_ids=topk_ids,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        tune_max_num_tokens=tune_max_num_tokens,
+        fp8_quantization_type=fp8_quantization_type,
+        activation_type=activation_type,
+    )
     if num_active_tokens is None:
-        return _trtllm_fp8_block_scale_routed_moe(**forwarded)
+        return kernel(do_finalize=do_finalize, output=output)
     if ROUTED_MOE_HAS_ACTIVE_TOKENS:
-        return _trtllm_fp8_block_scale_routed_moe(num_active_tokens=num_active_tokens, **forwarded)
+        return kernel(do_finalize=do_finalize, output=output, num_active_tokens=num_active_tokens)
     assert (
         do_finalize and output is not None
     ), "the emulated num_active_tokens needs do_finalize=True and an fp32 output buffer"
     # do_finalize=False returns [gemm2_output, expert_weights, expanded_idx_to_permuted_idx].
-    gemm2_output, _, expanded_idx = _trtllm_fp8_block_scale_routed_moe(
-        **dict(kwargs, topk_ids=topk_ids, do_finalize=False)
-    )
+    gemm2_output, _, expanded_idx = kernel(do_finalize=False)
     finalize_routed_rows(gemm2_output, expanded_idx, topk_ids, num_active_tokens, output)
     return output
