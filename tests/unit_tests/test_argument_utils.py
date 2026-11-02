@@ -100,6 +100,15 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_local_synchronization_flag_defaults_to_disabled():
+    """Local process-group synchronization must remain opt-in."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    assert parser.parse_args([]).use_local_synchronization is False
+    assert parser.parse_args(["--use-local-synchronization"]).use_local_synchronization is True
+
+
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
     from megatron.training.training import get_megatron_ddp_config
@@ -1592,6 +1601,14 @@ class TestRerunStateMachineConfigMapping:
         result = pretrain_cfg_container_from_args(args)
         assert result.rerun_state_machine.error_injection_rate == 500
         assert result.rerun_state_machine.rerun_mode == "report_stats"
+
+
+class TestDistributedInitConfigMapping:
+    """Test direct CLI namespace to distributed-init config mapping."""
+
+    def test_local_synchronization_from_args(self, patch_training_helpers):
+        result = pretrain_cfg_container_from_args(_make_args(use_local_synchronization=True))
+        assert result.dist.use_local_synchronization is True
 
 
 class TestTrainingConfigMapping:

@@ -2569,6 +2569,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
                 timeout=timeout,
+                use_local_synchronization=cfg.dist.use_local_synchronization,
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
