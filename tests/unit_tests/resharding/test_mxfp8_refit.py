@@ -311,7 +311,7 @@ class TestMXFP8ReshardTransform:
     def test_flashinfer_moe_buffers_refresh_in_place(
         self, clamp_scale, rows, prepare_weights, monkeypatch
     ):
-        """Refit refreshes derived FlashInfer weights without changing graph addresses."""
+        """Refit updates FlashInfer weights in place without changing graph addresses."""
         from megatron.core.inference.moe import InferenceGroupedGemmBackend
         from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -401,7 +401,7 @@ class TestMXFP8ReshardTransform:
         ops = []
         for task_id, (name, buffer) in enumerate(buffers.items()):
             linear_name, weight_name = name.split(".")
-            value = torch.randn(*buffer.data.shape, dtype=torch.bfloat16, device="cuda")
+            value = torch.randn(*buffer.shape, dtype=torch.bfloat16, device="cuda")
             getattr(source, linear_name).register_parameter(weight_name, torch.nn.Parameter(value))
             full_slice = (slice(None), slice(None))
             ops.append((name, task_id, full_slice))
@@ -412,12 +412,12 @@ class TestMXFP8ReshardTransform:
         execute_reshard_plan(
             plan, source, torch.nn.Module(), LoopbackCopyService(), transform=transform
         )
-        source_parameters = dict(source.named_parameters())
-        for name, buffer in buffers.items():
-            reference = MXFP8Tensor.from_bf16(source_parameters[name], backend="triton")
-            assert torch.equal(buffer.data, reference.data)
-            assert torch.equal(buffer.scale, reference.scale)
-            if clamp_scale is not None:
+        new_values = dict(source.named_parameters())
+        if clamp_scale is not None:
+            for name, buffer in buffers.items():
+                reference = MXFP8Tensor.from_bf16(new_values[name], backend="triton")
+                assert torch.equal(buffer.data, reference.data)
+                assert torch.equal(buffer.scale, reference.scale)
                 linear_name, expert_name = name.split(".")
                 stack = getattr(
                     grouped_mlp, "_fc1_weight" if linear_name == "linear_fc1" else "_fc2_weight"
@@ -429,14 +429,14 @@ class TestMXFP8ReshardTransform:
                     reference.scale.view(torch.uint8),
                 )
 
-        # CUTLASS refits must be visible immediately, without restacking or refresh copies.
+        # Refits must be visible immediately, without restacking or refresh copies: CUTLASS
+        # shares the canonical storage and routed weights are written through.
         with monkeypatch.context() as patch:
-            if clamp_scale is not None:
 
-                def forbidden_stack(*args, **kwargs):
-                    pytest.fail("CUTLASS refit must not restack shared weights")
+            def forbidden_stack(*args, **kwargs):
+                pytest.fail("refit must not restack FlashInfer weights")
 
-                patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
+            patch.setattr(grouped_mlp, "_stack_mxfp8_linear_weight", forbidden_stack)
             assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is (
                 clamp_scale is None
             )
@@ -446,10 +446,20 @@ class TestMXFP8ReshardTransform:
             ("linear_fc1", grouped_mlp._fc1_weight),
             ("linear_fc2", grouped_mlp._fc2_weight),
         ):
-            canonical = InferenceGroupedMLP._stack_mxfp8_linear_weight(
-                grouped_mlp, linear_name, "triton"
+            if clamp_scale is None:
+                # Canonical storage is released; only the routed copy holds the weights.
+                assert buffers[f"{linear_name}.weight0"].data.untyped_storage().nbytes() == 1
+            canonical = [
+                MXFP8Tensor.from_bf16(new_values[f"{linear_name}.weight{i}"], backend="triton")
+                for i in range(num_local_experts)
+            ]
+            expected = prepare_weights(
+                MXFP8Tensor(
+                    data=torch.stack([w.data for w in canonical]),
+                    scale=torch.stack([w.scale for w in canonical]),
+                    backend="triton",
+                )
             )
-            expected = prepare_weights(canonical)
             references[linear_name] = expected
             assert torch.equal(flashinfer_weight.data, expected.data)
             assert torch.equal(flashinfer_weight.scale, expected.scale)
