@@ -15,7 +15,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    RowAtomic,
+    TensorAtomic,
+)
 
 pytest.importorskip("emerging_optimizers")
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
@@ -59,6 +62,7 @@ def _train(
     return torch.stack(losses)
 
 
+@pytest.mark.parametrize("placement", ["row", "tensor"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
@@ -78,12 +82,14 @@ def _train(
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
+    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options, placement
 ):
     """FSDP and unsharded Muon should produce identical loss curves.
 
     Each linear layer is its own FSDP group, so several groups' communication is in flight at once.
     """
+    if placement == "tensor" and weight_decay_method != "decoupled":
+        pytest.skip("TensorAtomic only needs one weight decay method.")
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
@@ -95,16 +101,19 @@ def test_muon_matches_reference(
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
-    with fully_shard_context(device=device):
+    atomic = RowAtomic() if placement == "row" else TensorAtomic()
+    # Whole tensors alternate between the two ranks of the DP mesh.
+    owners = {p: i % 2 for i, p in enumerate(model.parameters())} if placement == "tensor" else None
+    with fully_shard_context(device=device, parameter_to_owner=owners):
         for layer in (m for m in model.modules() if isinstance(m, nn.Linear)):
             fully_shard(
                 layer,
                 mesh=mesh,
                 placements=Placements(
                     dp_axes=[0],
-                    parameter=[RowAtomic()],
-                    gradient=[RowAtomic()],
-                    optimizer=[RowAtomic()],
+                    parameter=[atomic],
+                    gradient=[atomic],
+                    optimizer=[atomic],
                 ),
             )
     params = dict(model.named_parameters())

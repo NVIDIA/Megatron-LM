@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+import os
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -272,6 +273,8 @@ class FsdpParameterGroup:
             shapes,
             dp_size=self.mesh.size(),
             tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+            # Experiment knob: align tensors so vectorized kernels see aligned addresses.
+            alignment=int(os.environ.get("MFSDP_TENSOR_ATOMIC_ALIGN", "1")),
         )
 
     def _initialize_buffers(
