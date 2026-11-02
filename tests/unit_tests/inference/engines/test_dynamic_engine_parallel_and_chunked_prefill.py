@@ -1279,7 +1279,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         This is the combination the MTP KV cache is most exposed in: the MTP head's MLP is a
         MoE layer, so every draft forward carries an EP all-to-all, and the commit pass has to
         repoint the NVLS routing mask at its own token count
-        (`NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp`).
+        (`DynamicInferenceContext.set_forward_real_token_count`).
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:

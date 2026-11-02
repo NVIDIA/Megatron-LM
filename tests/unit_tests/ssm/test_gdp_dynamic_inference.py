@@ -256,6 +256,10 @@ def test_decode_ssm_preserves_token_padding(
         mamba_metadata=types.SimpleNamespace(batch_indices_decode=batch_indices),
         padding_slice=slice(metadata_token_count, padded_token_count),
     )
+    # The mixer is not quantized, so the context's padding-row zeroing must leave its output.
+    context.zero_padding_tokens_for_quantization = types.MethodType(
+        DynamicInferenceContext.zero_padding_tokens_for_quantization, context
+    )
 
     if padded_token_count > metadata_token_count and not (
         batch_invariant_mode or global_batch_invariant_mode
@@ -307,6 +311,10 @@ def test_decode_ssm_flattens_non_contiguous_output(num_speculative_tokens):
         ),
         padding_slice=slice(token_count, token_count),
     )
+    # The mixer is not quantized, so the context's padding-row zeroing must leave its output.
+    context.zero_padding_tokens_for_quantization = types.MethodType(
+        DynamicInferenceContext.zero_padding_tokens_for_quantization, context
+    )
 
     output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
 
@@ -344,7 +352,7 @@ def test_decode_ssm_zeroes_padding_rows_on_cuda_graph_replay():
             batch_indices_decode=torch.arange(num_requests, dtype=torch.int32, device="cuda")
         ),
         padding_slice=slice(num_requests, num_requests),
-        zero_padding_tokens=counts.zero_padding_tokens,
+        zero_padding_tokens_for_quantization=counts.zero_padding_tokens_for_quantization,
     )
 
     stream = torch.cuda.Stream()

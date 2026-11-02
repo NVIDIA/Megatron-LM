@@ -60,7 +60,6 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
-from megatron.core.utils import is_using_quantization_scales
 
 
 class SSMChunking(NamedTuple):
@@ -298,7 +297,6 @@ class SSMDynamicInferenceMixin:
             y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
-        if is_using_quantization_scales(self.config):
-            context.zero_padding_tokens(y)
+        context.zero_padding_tokens_for_quantization(y, self.config)
 
         return self.out_proj(y)

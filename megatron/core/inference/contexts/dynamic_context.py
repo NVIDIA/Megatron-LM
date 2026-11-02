@@ -54,7 +54,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
+from megatron.core.utils import get_pg_rank, get_pg_size, internal_api, is_using_quantization_scales
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -1899,6 +1899,36 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.gpu_view.real_token_count,
             first_token_idx=sequence_parallel_rank * tensor.shape[0],
         )
+
+    def zero_padding_tokens_for_quantization(
+        self, tensor: Tensor, config: TransformerConfig, sequence_parallel_rank: int = 0
+    ) -> None:
+        """Zero, in place, a mixer output's padding-token rows if ``config`` quantizes (FP8 or
+        FP4), see `zero_padding_tokens`.
+
+        Padding tokens form zero-length requests, so attention and SSM kernels leave their
+        output rows unwritten, possibly NaN. The next layer's quantization scale reads every
+        row and would make real tokens' outputs depend on them. Every dynamic-batching mixer
+        (attention, MLA, SSM) calls this on its output, so that this method alone decides
+        which configurations need it.
+
+        Args:
+            tensor: Mixer output whose first dimension is the padded token dimension.
+            config: The mixer's config.
+            sequence_parallel_rank: See `zero_padding_tokens`.
+        """
+        if is_using_quantization_scales(config):
+            self.zero_padding_tokens(tensor, sequence_parallel_rank)
+
+    def set_forward_real_token_count(self, real_token_count: int) -> None:
+        """Set the real (unpadded) token count of the forwards that follow, on device.
+
+        `zero_padding_tokens` and the NVLS MoE routing mask read it from
+        ``gpu_view.real_token_count``. transfer_bookkeeping_to_gpu() publishes the main
+        forward's count; MTP forwards are shaped by request count instead, so the MTP
+        controller sets theirs before running them.
+        """
+        self.gpu_view.real_token_count.fill_(real_token_count)
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""

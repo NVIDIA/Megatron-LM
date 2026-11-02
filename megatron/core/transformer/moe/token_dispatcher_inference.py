@@ -323,7 +323,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
     # [1] int32 view onto context.gpu_view.real_token_count. Fixed GPU address;
-    # written each step by the context's transfer_bookkeeping_to_gpu(). Holds the
+    # written each step by the context's transfer_bookkeeping_to_gpu(), and before
+    # each MTP forward by its set_forward_real_token_count(). Holds the
     # real (unpadded) local token count so the dispatcher can mask routing for
     # CUDA-graph padding tokens. Wired once by the context after gpu_view init.
     _real_token_count_tensor: Optional[torch.Tensor] = None
@@ -350,21 +351,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         each step by transfer_bookkeeping_to_gpu().
         """
         cls._real_token_count_tensor = tensor
-
-    @classmethod
-    def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
-        """Override the routing-mask token count for an MTP forward.
-
-        Each step the context publishes batch_dimensions.token_count into the
-        bound tensor. MTP forwards are request-count shaped, so the controller
-        calls this before an MTP forward to point the mask at the MTP row count
-        instead.
-        """
-        assert cls._real_token_count_tensor is not None, (
-            "real-token-count tensor not wired; DynamicInferenceContext must "
-            "call set_real_token_count_tensor first"
-        )
-        cls._real_token_count_tensor.fill_(mtp_token_count)
 
     @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:

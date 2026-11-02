@@ -45,7 +45,6 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
-    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -1368,18 +1367,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         return output_total
 
-    def _zero_padding_token_outputs(
-        self, core_attn_out: Tensor, inference_context: BaseInferenceContext
-    ) -> None:
-        """Zero, in place, the padding-token rows of a dynamic-batching attention output.
-
-        Padding tokens form zero-length requests, so the attention kernels leave their output
-        rows unwritten (possibly NaN). Under FP8/FP4, linear_proj's input scaling reads every
-        row, which would make real tokens' outputs depend on those rows.
-        """
-        if is_using_quantization_scales(self.config):
-            inference_context.zero_padding_tokens(core_attn_out)
-
     def _dynamic_core_attention_forward(
         self,
         query: Tensor,
@@ -1782,7 +1769,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_offset=self._get_inference_softmax_offset(),
                     )
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-                    self._zero_padding_token_outputs(core_attn_out, inference_context)
+                inference_context.zero_padding_tokens_for_quantization(core_attn_out, self.config)
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]

@@ -1891,14 +1891,13 @@ class TestDynamicInferencePaddingRows:
         assert context.padded_active_token_count > self.prompt_length
         return context
 
-    def _forward(self, built, fill, fp8_autocast):
-        """Run one dynamic prefill step; return the linear_proj input and the layer output."""
+    def _step(self, attention, context, real_rows, width, fill, fp8_autocast):
+        """Run one dynamic step with the attention kernel stubbed: its first ``real_rows`` rows
+        hold fixed values and the rest ``fill``. Return the linear_proj input and the output."""
         from contextlib import nullcontext
 
         from megatron.core.inference.utils import InferenceMode
 
-        attention, v_head_dim, block_size_tokens = built
-        context = self._context(attention.config, block_size_tokens)
         generator = torch.Generator(device="cuda").manual_seed(3)
         hidden_states = torch.randn(
             context.padded_active_token_count,
@@ -1907,15 +1906,15 @@ class TestDynamicInferencePaddingRows:
             generator=generator,
             device="cuda",
         ).to(torch.bfloat16)
-        hidden_states[self.prompt_length :] = 0  # the model zeroes padded embeddings
+        hidden_states[real_rows:] = 0  # the model zeroes padded embeddings
 
         def kernel(query, *args, **kwargs):
             generator = torch.Generator(device="cuda").manual_seed(99)
             num_heads = attention.num_attention_heads_per_partition
             output = torch.randn(
-                query.shape[0], 1, num_heads, v_head_dim, generator=generator, device="cuda"
+                query.shape[0], 1, num_heads, width, generator=generator, device="cuda"
             ).to(query.dtype)
-            output[self.prompt_length :] = fill
+            output[real_rows:] = fill
             return output
 
         linear_proj_inputs = []
@@ -1934,17 +1933,48 @@ class TestDynamicInferencePaddingRows:
         (linear_proj_input,) = linear_proj_inputs
         return linear_proj_input, output
 
-    def _assert_padding_rows_zeroed(self, built):
-        linear_proj_input, _ = self._forward(built, fill=float("nan"), fp8_autocast=False)
-        rows = linear_proj_input.reshape(linear_proj_input.shape[0], -1)
-        assert torch.isfinite(rows[: self.prompt_length]).all()
-        assert torch.count_nonzero(rows[self.prompt_length :]) == 0
+    def _start_decode(self, attention, context, v_head_dim, fp8_autocast):
+        """Prefill the context's request, then set up its first decode step: decode-only, with
+        one real token padded to a full token block, which MLA runs as absorbed attention."""
+        self._step(attention, context, self.prompt_length, v_head_dim, 0.0, fp8_autocast)
+        context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32),
+            new_tokens=torch.zeros(1, dtype=torch.int64),
+        )
+        context.initialize_attention_state()
+        assert context.is_decode_only() and context.padded_active_token_count > 3
 
-    def _assert_real_rows_ignore_padding(self, built, fp8_autocast):
-        _, output = self._forward(built, fill=0.0, fp8_autocast=fp8_autocast)
-        _, poisoned = self._forward(built, fill=self.poison, fp8_autocast=fp8_autocast)
-        assert torch.isfinite(output[: self.prompt_length]).all()
-        assert torch.equal(output[: self.prompt_length], poisoned[: self.prompt_length])
+    def _forward(self, built, fill, fp8_autocast, decode=False):
+        """Run a dynamic prefill step, or with ``decode`` a decode step after it, on a fresh
+        context. Return the number of real rows, the linear_proj input and the layer output."""
+        attention, v_head_dim, block_size_tokens = built
+        context = self._context(attention.config, block_size_tokens)
+        if not decode:
+            return (self.prompt_length,) + self._step(
+                attention, context, self.prompt_length, v_head_dim, fill, fp8_autocast
+            )
+        self._start_decode(attention, context, v_head_dim, fp8_autocast)
+        # Absorbed decode attends over latents: the kernel output is kv_lora_rank wide.
+        width = attention.config.kv_lora_rank
+        return (1,) + self._step(attention, context, 1, width, fill, fp8_autocast)
+
+    def _assert_padding_rows_zeroed(self, built, decode=False):
+        real_rows, linear_proj_input, _ = self._forward(
+            built, fill=float("nan"), fp8_autocast=False, decode=decode
+        )
+        rows = linear_proj_input.reshape(linear_proj_input.shape[0], -1)
+        assert torch.isfinite(rows[:real_rows]).all()
+        assert torch.count_nonzero(rows[real_rows:]) == 0
+
+    def _assert_real_rows_ignore_padding(self, built, fp8_autocast, decode=False):
+        real_rows, _, output = self._forward(
+            built, fill=0.0, fp8_autocast=fp8_autocast, decode=decode
+        )
+        _, _, poisoned = self._forward(
+            built, fill=self.poison, fp8_autocast=fp8_autocast, decode=decode
+        )
+        assert torch.isfinite(output[:real_rows]).all()
+        assert torch.equal(output[:real_rows], poisoned[:real_rows])
 
     def test_standard_attention_zeroes_padding_rows(self):
         self._assert_padding_rows_zeroed(self._build_standard(fp8=True))
@@ -1962,6 +1992,76 @@ class TestDynamicInferencePaddingRows:
     def test_mla_real_rows_ignore_padding_under_fp8(self):
         self._require_fp8()
         self._assert_real_rows_ignore_padding(self._build_mla(fp8=True), fp8_autocast=True)
+
+    def test_mla_absorbed_decode_zeroes_padding_rows(self):
+        """Decode-only steps run absorbed attention: the kernel output, padding slots included,
+        is zeroed before the value up-projection, so linear_proj gets zero padding rows."""
+        self._assert_padding_rows_zeroed(self._build_mla(fp8=True), decode=True)
+
+    def test_mla_absorbed_decode_real_rows_ignore_padding_under_fp8(self):
+        self._require_fp8()
+        self._assert_real_rows_ignore_padding(
+            self._build_mla(fp8=True), fp8_autocast=True, decode=True
+        )
+
+    def test_mla_absorbed_decode_zeroes_padding_rows_on_cuda_graph_replay(self):
+        """Captured in a CUDA graph, a decode step zeroes the rows past the real token count
+        published at replay, not the count at capture."""
+        from megatron.core.inference.utils import InferenceMode
+
+        attention, v_head_dim, block_size_tokens = self._build_mla(fp8=False)
+        context = self._context(attention.config, block_size_tokens)
+        self._start_decode(attention, context, v_head_dim, fp8_autocast=False)
+        padded = context.padded_active_token_count
+        kernel_output = torch.ones(
+            padded,
+            1,
+            attention.num_attention_heads_per_partition,
+            attention.config.kv_lora_rank,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        hidden_states = torch.zeros(
+            padded, 1, self.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        linear_proj_inputs = []
+        hook = attention.linear_proj.register_forward_pre_hook(
+            lambda module, args: linear_proj_inputs.append(args[0].clone())
+        )
+        try:
+            # The zeroing runs under FP8/FP4 only; BF16 keeps FP8 scaling out of the graph.
+            with (
+                mock.patch(
+                    "megatron.core.inference.contexts.dynamic_context."
+                    "is_using_quantization_scales",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    attention, "flash_decode_and_prefill", return_value=kernel_output
+                ),
+                torch.no_grad(),
+                InferenceMode.active(),
+            ):
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    attention(hidden_states, attention_mask=None, inference_context=context)
+                torch.cuda.current_stream().wait_stream(stream)
+                linear_proj_inputs.clear()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    attention(hidden_states, attention_mask=None, inference_context=context)
+        finally:
+            hook.remove()
+        (linear_proj_input,) = linear_proj_inputs
+
+        for real_rows in (1, 3):
+            kernel_output.fill_(self.poison)
+            context.gpu_view.real_token_count.fill_(real_rows)
+            graph.replay()
+            rows = linear_proj_input.reshape(padded, -1)
+            assert (rows[:real_rows].abs().sum(dim=1) > 0).all()
+            assert torch.count_nonzero(rows[real_rows:]) == 0
 
 
 class TestMLAUpProjectionInput:
