@@ -102,6 +102,9 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         _moe_router_preprocess=route,
         _moe_shared_experts=shared,
         _launch_dispatch=lambda value, probs, **kwargs: (value, probs),
+        _dispatch_and_compute_routed_experts=lambda value, probs, overlap: (
+            ShortcutMoEBlock._dispatch_and_compute_routed_experts(block, value, probs, overlap)
+        ),
         _launch_combine=lambda value, **kwargs: value,
         _postprocess=lambda residual, *args, **kwargs: residual,
     )

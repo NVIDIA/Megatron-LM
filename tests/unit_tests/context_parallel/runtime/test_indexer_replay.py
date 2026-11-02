@@ -19,6 +19,20 @@ pytestmark = [
 ]
 
 
+class _FakeCPGroup:
+    """Provide hashable process-group geometry without distributed communication."""
+
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
 @pytest.mark.parametrize("fused_rope", [False, True])
 @pytest.mark.parametrize("last_rank", [False, True])
 def test_dsa_indexer_runtime_cp_rope_replays(fused_rope, last_rank):
@@ -29,7 +43,7 @@ def test_dsa_indexer_runtime_cp_rope_replays(fused_rope, last_rank):
 
     seeded()
     # RoPE only reads group geometry; no communication is needed to cover every CP rank.
-    static_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    static_group = _FakeCPGroup(size=1, rank=0)
     indexer = SimpleNamespace(
         pg_collection=SimpleNamespace(cp=static_group),
         use_rope=True,
@@ -47,7 +61,7 @@ def test_dsa_indexer_runtime_cp_rope_replays(fused_rope, last_rank):
     reference = None
     for size in (1, 2, 4, 1):
         rank = size - 1 if last_rank else 0
-        group = SimpleNamespace(size=lambda size=size: size, rank=lambda rank=rank: rank)
+        group = _FakeCPGroup(size=size, rank=rank)
         local = _zigzag_shard(hidden, (128, 192), size, rank).detach().requires_grad_()
 
         def run(value):
