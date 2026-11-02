@@ -21,6 +21,7 @@ from megatron.core.transformer.moe.router import (
 )
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -179,6 +180,86 @@ def test_topk_router_expert_bias_counts_logical_tokens(with_padding):
         expected = (routing_map.bool() * weights).sum(dim=0)
         assert router.local_tokens_per_expert.dtype == torch.int64
         assert torch.equal(router.local_tokens_per_expert, expected)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
+        {"mlp_chunks_for_training": 2},
+    ],
+    ids=["eager", "moe_recompute", "chunked"],
+)
+def test_transformer_layer_routes_multiplicities_to_moe_layer(overrides):
+    """TransformerLayer hands the multiplicities to MoELayer.forward, not to attention."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_topk=2,
+            add_bias_linear=False,
+            **overrides,
+        )
+        submodules = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False)
+        layer = TransformerLayer(config, submodules, layer_number=1).cuda()
+        hidden_states = torch.randn(6, 2, 12, device="cuda", requires_grad=True)
+        multiplicities = torch.tensor(
+            [4, 1, 1, 3, 1, 1, 2, 1, 1, 0, 1, 1], dtype=torch.float32, device="cuda"
+        )
+        router = layer.mlp.router
+        router.local_tokens_per_expert.zero_()
+        with patch.object(layer.mlp, "forward", wraps=layer.mlp.forward) as moe_forward:
+            output, _ = layer(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                shared_prefix_token_multiplicities=multiplicities,
+            )
+            # With MoE recompute the router counts on the backward replay, which must still see
+            # the multiplicities of this call.
+            output.sum().backward()
+        forwarded = [
+            call.kwargs["shared_prefix_token_multiplicities"] for call in moe_forward.call_args_list
+        ]
+        if "mlp_chunks_for_training" in overrides:
+            assert torch.equal(torch.cat(forwarded), multiplicities)
+        else:
+            assert len(forwarded) == 1 and forwarded[0] is multiplicities
+        expected = config.moe_router_topk * int(multiplicities.sum())
+        assert int(router.local_tokens_per_expert.sum()) == expected
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_transformer_layer_rejects_multiplicities_for_dense_mlp():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            add_bias_linear=False,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_local_submodules(), layer_number=1).cuda()
+        hidden_states = torch.randn(6, 2, 12, device="cuda")
+        with pytest.raises(ValueError, match="requires an MoE MLP"):
+            layer(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                shared_prefix_token_multiplicities=torch.ones(12, device="cuda"),
+            )
     finally:
         Utils.destroy_model_parallel()
 
