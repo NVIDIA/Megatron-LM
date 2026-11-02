@@ -792,6 +792,20 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             softmax_scale = query_tensor.size(head_dim_index) ** -0.5
         return softmax_scale
 
+    def _flash_attn_window_size(self) -> Tuple[int, int]:
+        """The sliding window that this layer's flash-attention kernels take.
+
+        `config.window_size` is a (left, right) tuple, where -1 means infinite
+        window in that direction (i.e. full attention). When SWA is not active
+        for this layer (either globally disabled, or the layer is a "full
+        attention" layer per `window_attn_skip_freq`), fall back to (-1, -1).
+        """
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            return self.config.window_size
+        return (-1, -1)
+
     def flash_decode(
         self,
         sequence_len_offset: Tensor,
@@ -839,6 +853,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
             softmax_scale=self.get_softmax_scale(q),
+            window_size=self._flash_attn_window_size(),
         )
         # This path bypasses self.core_attention and calls flash-attention directly, so the
         # configured cap has to be passed here too. Only when set, so runs without softcapping
@@ -1113,17 +1128,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         assert not self.training
         assert block_table is not None
 
-        # Resolve sliding-window-attention size for this layer.
-        # `config.window_size` is a (left, right) tuple, where -1 means infinite
-        # window in that direction (i.e. full attention). When SWA is not active
-        # for this layer (either globally disabled, or the layer is a "full
-        # attention" layer per `window_attn_skip_freq`), fall back to (-1, -1).
-        if is_layer_window_attention(
-            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
-        ):
-            window_size = self.config.window_size
-        else:
-            window_size = (-1, -1)
+        window_size = self._flash_attn_window_size()
 
         # Whether we need to retrieve LSE from the flash-attn kernels to apply
         # the sink (off-by-one / learnable) softmax correction post-hoc.
@@ -1540,38 +1545,22 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             and InferenceMode.is_active()
         )
 
-        # This branch only runs in the decode phase of flash decoding and returns after the linear
-        # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
-        nvtx_range_push(suffix="adjust_key_value")
-        if in_decode_mode and self.config.flash_decode:
-            assert self.layer_number in inference_context.key_value_memory_dict
-            assert inference_context.sequence_len_offset is not None
-            inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
-                self.layer_number
-            ]
-            output = self.flash_decode(
-                sequence_len_offset=sequence_len_offset,
-                query_layer=query,
-                key_layer=key,
-                value_layer=value,
-                inference_key_memory=inference_key_memory,
-                inference_value_memory=inference_value_memory,
-                rotary_cos=rotary_pos_cos,
-                rotary_sin=rotary_pos_sin,
-                rotary_interleaved=self.config.rotary_interleaved,
-            )
-            out = output.transpose(0, 1).contiguous()
-            context_layer = out.view(out.size(0), out.size(1), -1)
-            return context_layer
+        # In the decode phase of static flash decoding, one flash_attn_with_kvcache call applies
+        # RoPE, appends this step's key and value to the KV cache and computes attention (see
+        # flash_decode). It replaces the KV-cache update here and the core-attention kernel below;
+        # every other step, such as the output gate, is shared with the other paths.
+        use_flash_decode_kernel = in_decode_mode and self.config.flash_decode
 
+        nvtx_range_push(suffix="adjust_key_value")
         if (
             in_decode_mode
+            and not use_flash_decode_kernel
             and self.config.cuda_graph_impl == "local"
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
-        if split_qkv:
+        if split_qkv and not use_flash_decode_kernel:
             query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
                 self._adjust_key_value_for_inference(
                     inference_context,
@@ -1722,7 +1711,31 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
-            if inference_context is None or inference_context.is_static_batching():
+            if use_flash_decode_kernel:
+                # flash_attn_with_kvcache computes standard attention only.
+                assert not core_attention_extra_kwargs, (
+                    f"flash_decode cannot run the core attention of {type(self).__name__}, "
+                    "which takes extra inputs."
+                )
+                assert self.layer_number in inference_context.key_value_memory_dict
+                assert inference_context.sequence_len_offset is not None
+                inference_key_memory, inference_value_memory = (
+                    inference_context.key_value_memory_dict[self.layer_number]
+                )
+                core_attn_out = self.flash_decode(
+                    sequence_len_offset=sequence_len_offset,
+                    query_layer=query,
+                    key_layer=key,
+                    value_layer=value,
+                    inference_key_memory=inference_key_memory,
+                    inference_value_memory=inference_value_memory,
+                    rotary_cos=rotary_pos_cos,
+                    rotary_sin=rotary_pos_sin,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+                core_attn_out = core_attn_out.transpose(0, 1).contiguous()
+                core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
+            elif inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
                     core_attn_out = apply_module(self.core_attention)(

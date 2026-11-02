@@ -1008,6 +1008,7 @@ class TestFlashMLASoftcapRejected:
         attn.softmax_scale = 1.0
         attn.training = False
         attn._resolve_flash_version.return_value = (False, False)
+        attn._flash_attn_window_size.return_value = (-1, -1)
 
         with pytest.raises(AssertionError, match="does not support attention logit softcapping"):
             Attention.flash_decode_and_prefill(

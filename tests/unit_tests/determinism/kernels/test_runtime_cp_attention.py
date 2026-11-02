@@ -177,6 +177,95 @@ def test_core_attention_offload_replays_bit_exact(input_layout, fraction, monkey
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+def test_static_flash_decode_dispatch_replays():
+    """The static flash_decode step (flash_attn_with_kvcache, then the output gate) replays."""
+    from megatron.core.transformer import attention as attention_module
+
+    if attention_module.flash_attn_with_kvcache is None:
+        pytest.skip("requires flash-attn")
+
+    from megatron.core.inference.contexts.static_context import StaticInferenceContext
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        heads, kv_heads, head_dim, batch, cached, max_length = 4, 2, 128, 2, 40, 64
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=kv_heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            flash_decode=True,
+            window_size=(16, 0),
+            attention_output_gate=True,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        module = SelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        module.eval()
+
+        # The kernel appends this step's key and value at position `cached`; every replay writes
+        # the same values there, so the cache is identical input to each.
+        cache_shape = (max_length, batch, kv_heads, head_dim)
+        inputs = dict(
+            hidden_states=torch.randn(
+                1, batch, heads * head_dim, device="cuda", dtype=torch.bfloat16
+            ),
+            key_memory=torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16),
+            value_memory=torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16),
+        )
+        sequence_len_offset = torch.full((batch,), cached, device="cuda", dtype=torch.int32)
+
+        def fn(hidden_states, key_memory, value_memory):
+            context = StaticInferenceContext(batch, max_length)
+            context.sequence_len_offset = cached
+            context.enable_decode_mode()
+            context.key_value_memory_dict[module.layer_number] = (key_memory, value_memory)
+            with torch.no_grad(), InferenceMode.active():
+                return module.forward_pre_attn_and_core_attn(
+                    hidden_states,
+                    None,
+                    inference_context=context,
+                    sequence_len_offset=sequence_len_offset,
+                )
+
+        windowed = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=3,
+            backward=False,
+            contention=True,
+            what="static flash_decode step[window, output gate]",
+        )
+        assert torch.isfinite(windowed[0]["out"]).all()
+
+        # Without the window the step attends to all cached keys, so the output must change,
+        # proving the layer's window reached the kernel.
+        module.config.window_size = None
+        full = assert_replays_bit_exact(
+            fn, inputs, replays=2, backward=False, what="static flash_decode step[output gate]"
+        )
+        assert not bytes_equal(windowed[0]["out"], full[0]["out"])
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
 @pytest.mark.parametrize("build_cp_size", [1, 2])
 @pytest.mark.parametrize("fused_rope", [False, True])

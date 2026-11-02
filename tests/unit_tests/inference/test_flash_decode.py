@@ -1,14 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
 import megatron.core.transformer.attention as attention_module
+from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestRotaryEmbeddingWithPrecomputedCosSin:
@@ -98,3 +105,142 @@ def test_decode_attention_preserves_batch_invariant_token_padding(
     assert output.shape == q.shape
     assert torch.equal(output[:metadata_token_count], q[:metadata_token_count])
     assert torch.count_nonzero(output[metadata_token_count:]) == 0
+
+
+@pytest.mark.skipif(
+    attention_module.flash_attn_with_kvcache is None, reason="flash decode needs flash-attn 2"
+)
+class TestStaticFlashDecodeStep:
+    """A static flash_decode decode step must compute what every other path computes.
+
+    flash_decode's kernel stands in for the KV-cache update and core attention only: the layer's
+    sliding window must reach it, and the steps after core attention, such as the output gate,
+    must still run.
+    """
+
+    batch, heads, groups, hidden = 2, 4, 2, 128  # head dim 32
+    cached = 12  # tokens already in the KV cache; this step's token is at position 12
+    max_sequence_length = 32
+    window = (4, 0)
+
+    # A bf16 kernel against an fp32 reference on the same bf16 q/k/v/gate. Flash-attention rounds
+    # the probabilities and the output to bf16, and the gated product is rounded once more: each
+    # a relative error of at most 2**-9 per element. Over 13 keys that bounds the relative L2
+    # error at about 1e-2 (2e-3 measured on H100). A missing window or gate costs 0.7 to 1.
+    rel_tol = 2e-2
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _attention(self, window_size, attention_output_gate):
+        pytest.importorskip("transformer_engine")
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_submodules,
+        )
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden,
+            num_attention_heads=self.heads,
+            num_query_groups=self.groups,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            flash_decode=True,
+            window_size=window_size,
+            attention_output_gate=attention_output_gate,
+        )
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        return attention.cuda().eval()
+
+    def _decode_step(self, attention):
+        """Run one decode step over a seeded KV cache.
+
+        Returns the core-attention output, the step's q/k/v (and gate) and the cached K/V.
+        """
+        dim = attention.hidden_size_per_attention_head
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        cache_shape = (self.max_sequence_length, self.batch, self.groups, dim)
+        key_memory = torch.zeros(cache_shape, device="cuda", dtype=torch.bfloat16)
+        value_memory = torch.zeros_like(key_memory)
+        for memory in (key_memory, value_memory):
+            memory[: self.cached] = torch.randn(
+                self.cached, *cache_shape[1:], generator=generator, device="cuda"
+            )
+        cached_keys = key_memory[: self.cached].clone()
+        cached_values = value_memory[: self.cached].clone()
+
+        context = StaticInferenceContext(self.batch, self.max_sequence_length)
+        context.sequence_len_offset = self.cached
+        context.enable_decode_mode()
+        context.key_value_memory_dict[attention.layer_number] = (key_memory, value_memory)
+
+        hidden_states = torch.randn(
+            1, self.batch, self.hidden, generator=generator, device="cuda"
+        ).bfloat16()
+        sequence_len_offset = torch.full(
+            (self.batch,), self.cached, dtype=torch.int32, device="cuda"
+        )
+        projected = []
+        get_query_key_value_tensors = attention.get_query_key_value_tensors
+
+        def capture(*args, **kwargs):
+            outputs = get_query_key_value_tensors(*args, **kwargs)
+            projected.extend(t.detach().clone() for t in outputs)
+            return outputs
+
+        with (
+            mock.patch.object(attention, "get_query_key_value_tensors", side_effect=capture),
+            torch.no_grad(),
+            InferenceMode.active(),
+        ):
+            output = attention.forward_pre_attn_and_core_attn(
+                hidden_states,
+                None,
+                inference_context=context,
+                sequence_len_offset=sequence_len_offset,
+            )
+        return output, projected, cached_keys, cached_values
+
+    def _reference(self, projected, cached_keys, cached_values, window_size):
+        """fp32 attention of the step's query over the keys its window allows, then the gate."""
+        query, key, value = projected[:3]
+        heads, dim = query.shape[2], query.shape[3]
+        repeats = heads // key.shape[2]
+        keys = torch.cat([cached_keys, key]).float().repeat_interleave(repeats, dim=2)
+        values = torch.cat([cached_values, value]).float().repeat_interleave(repeats, dim=2)
+        scores = torch.einsum("bhd,kbhd->bhk", query[0].float(), keys) * dim**-0.5
+        if window_size is not None:
+            positions = torch.arange(self.cached + 1, device=scores.device)
+            scores = scores.masked_fill(positions < self.cached - window_size[0], float("-inf"))
+        output = torch.einsum("bhk,kbhd->bhd", torch.softmax(scores, dim=-1), values)
+        output = output.reshape(1, self.batch, heads * dim)
+        if len(projected) == 4:
+            output = output * torch.sigmoid(projected[3].float().reshape(output.shape))
+        return output
+
+    @pytest.mark.parametrize("window_size", [None, window], ids=["full", "window"])
+    @pytest.mark.parametrize("attention_output_gate", [False, True], ids=["ungated", "gated"])
+    def test_decode_step_matches_reference(self, window_size, attention_output_gate):
+        attention = self._attention(window_size, attention_output_gate)
+        output, projected, cached_keys, cached_values = self._decode_step(attention)
+        assert len(projected) == (4 if attention_output_gate else 3)
+        reference = self._reference(projected, cached_keys, cached_values, window_size)
+        error = ((output.float() - reference).norm() / reference.norm()).item()
+        assert error <= self.rel_tol, (
+            f"static flash_decode step (window_size={window_size}, "
+            f"attention_output_gate={attention_output_gate}) differs from the reference by "
+            f"rel {error:.3g}"
+        )
