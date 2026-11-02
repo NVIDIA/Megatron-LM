@@ -200,7 +200,9 @@ _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
 # cuDNN radix top-k allocates an int32 scratch of ``rows x 2 x num_cols`` per launch, twice the
-# FP32 scores of those rows. Launches are sized to this transient budget: 256 rows at 1M keys.
+# FP32 scores of those rows. Launches are sized to a transient budget, the configured
+# ``dsa_cudnn_topk_scratch_gib`` (IndexerScorerOptions.topk_scratch_bytes) or else this
+# default, which matches the config default: 256 rows at 1M keys.
 _TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
 _TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
 # The frontend indexes that scratch with int32: one launch may hold at most 2**31 elements, so
@@ -291,12 +293,16 @@ class IndexerScorerOptions:
             MXFP8 scorer. It changes only which kernel selects: the selected scores returned
             for the indexer loss follow ``precision`` (recomputed from the BF16 Q/K/weights
             for ``'mxfp8'``, :func:`_selected_scores_for_indexer_loss`) whichever ran.
+        topk_scratch_bytes: Per-launch int32 scratch budget of every cuDNN top-k the indexer
+            runs, in bytes (``dsa_cudnn_topk_scratch_gib``); ``None`` uses
+            ``_TOPK_WRAPPER_MAX_SCRATCH_BYTES``. See :func:`_topk_wrapper_chunk_rows`.
     """
 
     skip_masked_score_fill: bool = False
     precision: str = "bf16"
     topk_backend: str = "cudnn"
     scorer_backend: str = "cudnn"
+    topk_scratch_bytes: Optional[int] = None
 
 
 def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> IndexerScorerOptions:
@@ -306,7 +312,16 @@ def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> Indexe
         precision=str(getattr(config, "dsa_indexer_precision", "bf16")),
         topk_backend=getattr(config, "dsa_indexer_topk_backend", "cudnn") or "cudnn",
         scorer_backend=getattr(config, "dsa_indexer_scorer_backend", "cudnn") or "cudnn",
+        topk_scratch_bytes=_topk_scratch_bytes_from_config(config),
     )
+
+
+def _topk_scratch_bytes_from_config(config: Optional["TransformerConfig"]) -> Optional[int]:
+    """``dsa_cudnn_topk_scratch_gib`` in bytes, or None (the module default) when absent."""
+    scratch_gib = getattr(config, "dsa_cudnn_topk_scratch_gib", None)
+    if scratch_gib is None:
+        return None
+    return int(scratch_gib * 1024 * 1024 * 1024)
 
 
 def _indexer_forward_wrapper_with_warning(
@@ -1004,8 +1019,12 @@ def _indexer_top_k_wrapper_chunked(
     return_topk_scores: bool,
     deterministic: bool = False,
     topk_backend: str = "cudnn",
+    topk_scratch_bytes: Optional[int] = None,
 ) -> dict:
     """Run cuDNN top-k in row chunks to bound wrapper scratch allocation.
+
+    Each launch's scratch fits ``topk_scratch_bytes`` (``_TOPK_WRAPPER_MAX_SCRATCH_BYTES`` when
+    None) and the frontend's int32 limit (:func:`_topk_wrapper_chunk_rows`).
 
     Deterministic mode returns the canonical membership and order of
     :func:`_canonicalize_deterministic_topk_membership`. With a frontend that supports
@@ -1042,7 +1061,9 @@ def _indexer_top_k_wrapper_chunked(
             f"DSA indexer top-k backend must be one of {dsa_deepselect_topk.TOPK_BACKENDS}, "
             f"got {topk_backend!r}."
         )
-    chunk_rows = _topk_wrapper_chunk_rows(n_rows, sk, scores_flat.element_size())
+    chunk_rows = _topk_wrapper_chunk_rows(
+        n_rows, sk, scores_flat.element_size(), max_scratch_bytes=topk_scratch_bytes
+    )
     use_frontend_tie_break = deterministic and _supports_lowest_index_topk_tie_break()
     if deterministic and not use_frontend_tie_break:
         # Bound the masks, prefix ranks, and K-wide gather buffers used by the
@@ -1257,6 +1278,7 @@ def _indexer_topk_from_score_chunks(
     bottom_right_key_start: Optional[int] = None,
     deterministic: bool = False,
     topk_backend: str = "cudnn",
+    topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
@@ -1332,6 +1354,7 @@ def _indexer_topk_from_score_chunks(
             return_topk_scores=return_topk_scores,
             deterministic=deterministic,
             topk_backend=topk_backend,
+            topk_scratch_bytes=topk_scratch_bytes,
         )
         topk_indices = tk_result["indices"].view(b, row_end - row_start, chunk_topk_k)
         topk_values = None
@@ -1713,6 +1736,7 @@ def _indexer_topk_packed_thd_cudnn(
         return_topk_scores=return_topk_scores,
         deterministic=deterministic,
         topk_backend=scorer_options.topk_backend,
+        topk_scratch_bytes=scorer_options.topk_scratch_bytes,
     )
     topk_indices = tk_result["indices"].view(1, sq, score_topk)
     topk_scores = None
@@ -1963,7 +1987,11 @@ def _deepgemm_row_chunks(n_rows: int, num_heads: int) -> list[tuple[int, int]]:
 
 
 def _deepgemm_logits_topk(
-    logits: Tensor, lengths: Tensor, topk_k: int, topk_backend: str
+    logits: Tensor,
+    lengths: Tensor,
+    topk_k: int,
+    topk_backend: str,
+    topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Local top-k indices (int32) and BF16 values of DeepGEMM logits ``[rows, width]``.
 
@@ -1988,6 +2016,7 @@ def _deepgemm_logits_topk(
         return_topk_scores=True,
         deterministic=False,
         topk_backend=backend,
+        topk_scratch_bytes=topk_scratch_bytes,
     )
     if result["values"] is None:
         raise RuntimeError("the DSA top-k did not return the selected values.")
@@ -2067,7 +2096,11 @@ def _indexer_topk_packed_thd_deepgemm(
             chunk_indices, chunk_values = None, logits
         else:
             chunk_indices, chunk_values = _deepgemm_logits_topk(
-                logits, lengths[rows], score_topk, scorer_options.topk_backend
+                logits,
+                lengths[rows],
+                score_topk,
+                scorer_options.topk_backend,
+                scorer_options.topk_scratch_bytes,
             )
         del logits
         if len(chunks) == 1:
@@ -2326,6 +2359,7 @@ def _indexer_topk_single_packed_cp_segments(
     local_packed_cp_query_len: Optional[int] = None,
     deterministic: bool = False,
     topk_backend: str = "cudnn",
+    topk_scratch_bytes: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Fast cuDNN top-k for one packed THD sequence split into CP front/back slices."""
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -2396,6 +2430,7 @@ def _indexer_topk_single_packed_cp_segments(
             bottom_right_key_start=key_start + rel_start,
             deterministic=deterministic,
             topk_backend=topk_backend,
+            topk_scratch_bytes=topk_scratch_bytes,
         )
         topk_indices, topk_scores = _pad_topk_result(topk_indices, topk_scores, topk_k)
         indices_chunks.append(topk_indices)
@@ -2936,10 +2971,13 @@ def _indexer_topk_bshd(
     sequence-local top-k indices to the global packed key coordinate space.
 
     ``scorer_options`` carries the config-level scorer opt-ins: the skipped prefill applies
-    to the general packed THD executor only, the top-k backend to every executor.
+    to the general packed THD executor only, the top-k backend and scratch budget to every
+    executor.
     """
     _ensure_dsa_namespace()
-    topk_backend = (scorer_options or IndexerScorerOptions()).topk_backend
+    topk_options = scorer_options or IndexerScorerOptions()
+    topk_backend = topk_options.topk_backend
+    topk_scratch_bytes = topk_options.topk_scratch_bytes
 
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bsd.shape[1]
@@ -3040,6 +3078,7 @@ def _indexer_topk_bshd(
                 return_topk_scores,
                 deterministic=deterministic,
                 topk_backend=topk_backend,
+                topk_scratch_bytes=topk_scratch_bytes,
             )
         else:
             # (b, sq, sk) fp32, -inf on masked positions
@@ -3059,6 +3098,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_query_len,
                 deterministic=deterministic,
                 topk_backend=topk_backend,
+                topk_scratch_bytes=topk_scratch_bytes,
             )
         elif not return_scores and plan is IndexerScoringPlan.PACKED_THD_GENERAL:
             topk_indices, topk_scores = _indexer_topk_packed_thd(
@@ -3095,6 +3135,7 @@ def _indexer_topk_bshd(
                 score_seq_lens=ends,
                 deterministic=deterministic,
                 topk_backend=topk_backend,
+                topk_scratch_bytes=topk_scratch_bytes,
             )
         else:
             # This branch runs only when ``starts`` is set; normalize_varlen_bounds then
@@ -3130,6 +3171,7 @@ def _indexer_topk_bshd(
             return_topk_scores=return_topk_scores,
             deterministic=deterministic,
             topk_backend=topk_backend,
+            topk_scratch_bytes=topk_scratch_bytes,
         )
         del scores_for_topk, scores_flat
         if not return_scores:
