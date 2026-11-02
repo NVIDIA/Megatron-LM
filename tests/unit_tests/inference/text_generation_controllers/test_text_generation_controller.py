@@ -756,6 +756,7 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
 
     context.initialize_attention_state.assert_called_once_with(
         construct_graph_dimensions=None,
+        construct_graph_bounded_moe_rows=None,
         is_expert_parallel_dummy_cuda_graph_step=False,
         transfer_bookkeeping_to_gpu=True,
         record_bookkeeping_done_event=True,
@@ -1063,22 +1064,35 @@ def test_async_sched_primer_matches_dummy_mtp_order(
 
 
 @pytest.mark.parametrize(
-    "mode, run_async_overlap, has_pending_logits, num_prefill_requests, decode_only",
+    "mode, run_async_overlap, has_pending_logits, num_prefill_requests, admits_prefill, "
+    "decode_only",
     [
         # The engine admits a legacy step's requests before the step starts.
-        (AsyncScheduleMode.LEGACY, True, False, 0, True),
-        (AsyncScheduleMode.LEGACY, True, False, 1, False),
-        # Overlap steps launch decode-only forwards; a no-overlap step admits requests later.
-        (AsyncScheduleMode.ASYNC, True, True, 0, True),
-        (AsyncScheduleMode.ASYNC, False, True, 0, False),
-        (AsyncScheduleMode.ASYNC, True, False, 0, False),
+        (AsyncScheduleMode.LEGACY, True, False, 0, True, True),
+        (AsyncScheduleMode.LEGACY, True, False, 1, True, False),
+        # Overlap steps launch decode-only forwards.
+        (AsyncScheduleMode.ASYNC, True, True, 0, False, True),
+        # No-overlap steps that admit no prefill launch their pending forward's requests, all
+        # decoding after the update: a paused request, too little KV to prepare, an admittable
+        # KV import (imports enter as decode requests), or the first decode after a prefill.
+        (AsyncScheduleMode.ASYNC, False, True, 0, False, True),
+        (AsyncScheduleMode.ASYNC, False, True, 1, False, True),
+        # A no-overlap step that may admit prefill does not count as decode-only.
+        (AsyncScheduleMode.ASYNC, False, True, 0, True, False),
+        # A primer launches the context's requests as they are.
+        (AsyncScheduleMode.ASYNC, False, False, 0, False, True),
+        (AsyncScheduleMode.ASYNC, False, False, 1, False, False),
+        (AsyncScheduleMode.ASYNC, False, False, 0, True, False),
+        (AsyncScheduleMode.ASYNC, True, False, 0, False, True),
+        (AsyncScheduleMode.ASYNC, True, False, 1, False, False),
     ],
 )
-def test_step_agrees_on_moe_decode_only_before_its_forwards(
-    mode, run_async_overlap, has_pending_logits, num_prefill_requests, decode_only
+def test_step_agrees_on_the_phase_it_launches_before_its_forwards(
+    mode, run_async_overlap, has_pending_logits, num_prefill_requests, admits_prefill, decode_only
 ):
     """The replicas sharing the MoE collectives agree on the step's phase before any of them
-    issues a collective, so none bounds its MoE rows while another is not decode-only."""
+    issues a collective, so none bounds its MoE rows while another is not decode-only. Each rank
+    announces the phase of the forward it will launch, so no decode-only step goes unbounded."""
     context = _make_async_sched_context()
     context.config.async_sched_mode = mode
     context.num_prefill_requests = num_prefill_requests
@@ -1094,7 +1108,11 @@ def test_step_agrees_on_moe_decode_only_before_its_forwards(
     controller._run_async_sched_step_overlap_mtp = step
 
     asyncio.run(
-        controller.async_generate_output_tokens_dynamic_batch(run_async_overlap=run_async_overlap)
+        controller.async_generate_output_tokens_dynamic_batch(
+            run_async_overlap=run_async_overlap,
+            schedule_waiting_requests=None if run_async_overlap else mock.Mock(),
+            admits_prefill=admits_prefill,
+        )
     )
 
     assert order == [("agree", decode_only), "step"]
@@ -2073,15 +2091,27 @@ def test_async_sched_no_overlap_updates_before_admission(
     context.commit_sampled_tokens.assert_not_called()
 
 
-def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
+@pytest.mark.parametrize(
+    "tp_size, etp_size, ep_size, matches_peer",
+    [
+        (1, 1, 2, True),
+        # ETP > TP: the expert-TP peer is another data-parallel replica.
+        (1, 2, 1, True),
+        # The MoE collectives stay inside one attention TP group: no other replica to match.
+        (2, 2, 1, False),
+    ],
+)
+def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward(
+    tp_size, etp_size, ep_size, matches_peer
+):
     """A rank that resolves its last request still matches the peer base collective."""
     context = _make_async_sched_context(total_request_count=1)
     context.num_prefill_requests = 1
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
-        tensor_model_parallel_size=1,
-        expert_tensor_parallel_size=1,
-        expert_model_parallel_size=2,
+        tensor_model_parallel_size=tp_size,
+        expert_tensor_parallel_size=etp_size,
+        expert_model_parallel_size=ep_size,
         num_moe_experts=4,
         moe_enable_routing_replay=False,
     )
@@ -2127,7 +2157,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
     )
 
     assert result.output["finished_request_ids"].tolist() == [10]
-    controller._run_dummy_async_sched_base_step.assert_called_once_with()
+    assert controller._run_dummy_async_sched_base_step.call_count == int(matches_peer)
     controller._run_async_sched_forward.assert_not_called()
 
 

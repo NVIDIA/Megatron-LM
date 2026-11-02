@@ -18,28 +18,32 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+import zmq
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
-    MTPControllerMixin,
-)
 from megatron.core.inference.utils import get_moe_dp_replica_count
 from megatron.core.parallel_state import get_expert_tensor_and_model_parallel_group
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.text_generation_controllers.test_mtp_kv_cache_controller import (
+    VOCAB_SIZE,
+    _build_step,
+    _make_context,
+    _make_controller,
+    _make_model,
+)
 from tests.unit_tests.test_utilities import Utils
 
 HIDDEN = 128
 TOPK = 2
 NUM_EXPERTS = 4
-NUM_SPECULATIVE_TOKENS = 1  # one MTP depth; the MTP layer has one MoE sublayer
-ACTIVE_TOKENS = 4
 
 
 @pytest.mark.parametrize(
@@ -64,6 +68,19 @@ def test_moe_dp_replica_count(tp, etp, ep, replicas):
         expert_model_parallel_size=ep,
     )
     assert get_moe_dp_replica_count(config) == replicas
+
+
+@pytest.mark.parametrize("tp, etp, ep", [(4, 1, 3), (2, 1, 3), (4, 3, 2), (4, 2, 3)])
+def test_moe_dp_replica_count_rejects_tp_ep_groups_straddling_tp_groups(tp, etp, ep):
+    """With TP 4 and EP 3 the tp_ep group [3, 4, 5] holds parts of the TP groups {0..3} and
+    {4..7}, whose ranks would join different engine consensus groups."""
+    config = SimpleNamespace(
+        tensor_model_parallel_size=tp,
+        expert_tensor_parallel_size=etp,
+        expert_model_parallel_size=ep,
+    )
+    with pytest.raises(ValueError, match="must divide one another"):
+        get_moe_dp_replica_count(config)
 
 
 def _require_rank_pairs():
@@ -124,51 +141,51 @@ def _mtp_config(etp, ep):
     )
 
 
-class _CountingMtpLayer:
-    """Stands in for `compute_mtp_single_step`: one call is one MTP layer forward, so one MoE
-    dispatch and combine over tp_ep (optionally run for real by `moe_step`)."""
+def _route_mtp_forwards(model, moe_step):
+    """Run `moe_step(token_count)` for every MTP layer forward of the stub model, as the MTP
+    layer's MoE sublayer would dispatch and combine its tokens over tp_ep."""
+    draft_step, layer = model.compute_mtp_single_step, model.mtp.layers[0]
+    commit_step = layer.forward_single_position
 
-    def __init__(self, moe_step=None):
-        self.calls = 0
-        self.moe_step = moe_step
+    def compute_mtp_single_step(**kwargs):
+        moe_step(kwargs["hidden_states"].shape[0])
+        return draft_step(**kwargs)
 
-    def __call__(self, *, hidden_states, next_token_ids, position_ids, depth, **kwargs):
-        self.calls += 1
-        if self.moe_step is not None:
-            self.moe_step(hidden_states)
-        return hidden_states, torch.zeros(hidden_states.shape[0], 1, 8, device="cuda")
+    def forward_single_position(**kwargs):
+        moe_step(kwargs["hidden_states"].shape[0])
+        return commit_step(**kwargs)
 
-
-def _idle_replica_mtp_phase(config, mtp_layer):
-    """The idle replica: the dummy MTP half of `controller.dummy_forward()`."""
-    model = SimpleNamespace(
-        mtp=SimpleNamespace(mtp_use_repeated_layer=False), compute_mtp_single_step=mtp_layer
-    )
-    context = SimpleNamespace(_mtp_forward_phase=lambda **kwargs: contextlib.nullcontext())
-    controller = SimpleNamespace(
-        num_speculative_tokens=NUM_SPECULATIVE_TOKENS,
-        num_mtp_depths=min(NUM_SPECULATIVE_TOKENS, config.mtp_num_layers),
-        _is_last_pp_stage=True,
-        _language_model=model,
-        model_is_pipeline_parallel=False,
-        _mtp_resolved_padded_count=None,
-        _sp_enabled=False,
-        _tp_size=1,
-        inference_wrapped_model=SimpleNamespace(inference_context=context),
-        model_config=config,
-    )
-    MTPControllerMixin._run_dummy_serial_mtp_forward(controller)
+    model.compute_mtp_single_step = compute_mtp_single_step
+    layer.forward_single_position = forward_single_position
 
 
-def _active_replica_mtp_phase(config, mtp_layer):
-    """The active replica: `_compute_serial_mtp_and_sample_impl` runs the MTP layer once per
-    depth."""
-    hidden = torch.zeros(ACTIVE_TOKENS, 1, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    ids = torch.zeros(1, ACTIVE_TOKENS, device="cuda", dtype=torch.long)
-    for depth in range(min(NUM_SPECULATIVE_TOKENS, config.mtp_num_layers)):
-        hidden, _ = mtp_layer(
-            hidden_states=hidden, next_token_ids=ids, position_ids=ids, depth=depth
-        )
+def _active_replica_mtp_forwards(etp, ep, moe_step):
+    """The active replica: the real `_compute_serial_mtp_and_sample` (commit pass and draft
+    loop) on a stub model. Returns the MTP layer forwards it issued."""
+    controller, model, _, _ = _build_step(num_decode_requests=2, accepted=(2, 1))
+    _route_mtp_forwards(model, moe_step)
+    controller._compute_serial_mtp_and_sample(base_position=torch.tensor([10, 12], device="cuda"))
+    return model.all_forwards
+
+
+def _idle_replica_mtp_forwards(etp, ep, moe_step):
+    """The idle replica: the dummy MTP half of `controller.dummy_forward()`, with this layout.
+    Returns the MTP layer forwards it issued."""
+    context = _make_context(num_decode_requests=0)
+    model = _make_model()
+
+    def compute_mtp_single_step(**kwargs):
+        model.all_forwards.append(("mtp_step", kwargs))
+        hidden = kwargs["hidden_states"]
+        return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device="cuda")
+
+    model.compute_mtp_single_step = compute_mtp_single_step
+    controller = _make_controller(context, model)
+    controller.model_config.expert_tensor_parallel_size = etp
+    controller.model_config.expert_model_parallel_size = ep
+    _route_mtp_forwards(model, moe_step)
+    controller._run_dummy_serial_mtp_forward()
+    return model.all_forwards
 
 
 def _real_moe_step(config):
@@ -184,8 +201,7 @@ def _real_moe_step(config):
         runs_metadata_sync=True,
     )
 
-    def step(hidden_states):
-        n = hidden_states.shape[0]
+    def step(n):
         x = torch.ones(n, 1, HIDDEN, device="cuda", dtype=torch.bfloat16)
         routing = torch.arange(TOPK, device="cuda").repeat(n, 1)
         probs = torch.full((n, TOPK), 1.0 / TOPK, device="cuda")
@@ -200,18 +216,17 @@ def _real_moe_step(config):
 @pytest.mark.parametrize("etp, ep", [(1, 2), (2, 1)], ids=["ep", "etp-gt-tp"])
 def test_idle_replica_dummy_step_issues_its_peers_mtp_moe_collectives(etp, ep):
     """With ETP > TP and EP = 1 the expert-TP peers are separate replicas, so the idle one's
-    dummy step must issue the MTP MoE collectives its active peer issues."""
+    dummy step must issue the MTP MoE collectives that its active peer's real MTP phase issues."""
     _require_rank_pairs()
     config = _mtp_config(etp, ep)
     with _tp_ep_pairs(etp, ep) as tp_ep:
         is_active = dist.get_rank(tp_ep) == 0
-        mtp_phase = _active_replica_mtp_phase if is_active else _idle_replica_mtp_phase
+        mtp_forwards = _active_replica_mtp_forwards if is_active else _idle_replica_mtp_forwards
 
         # Count first: a mismatched NVLS collective would never complete.
-        layer = _CountingMtpLayer()
-        mtp_phase(config, layer)
+        calls = len(mtp_forwards(etp, ep, moe_step=lambda n: None))
         counts = [None, None]
-        dist.all_gather_object(counts, (is_active, layer.calls), group=tp_ep)
+        dist.all_gather_object(counts, (is_active, calls), group=tp_ep)
         (active,) = [calls for peer_active, calls in counts if peer_active]
         (idle,) = [calls for peer_active, calls in counts if not peer_active]
         assert _on_all_ranks(idle == active), (
@@ -220,18 +235,12 @@ def test_idle_replica_dummy_step_issues_its_peers_mtp_moe_collectives(etp, ep):
         )
 
         # The same paths with real NVLS collectives over tp_ep then complete.
-        try:
-            NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=16, topk=TOPK, hidden_size=HIDDEN, tp_ep_group=tp_ep
-            )
-            handle = NVLSAllGatherVDispatcher._symm_rsv["handle"]
-            nvls = bool(getattr(handle, "multicast_ptr", 0))
-        except RuntimeError:
-            nvls = False
-        if _on_all_ranks(nvls):
-            mtp_phase(config, _CountingMtpLayer(moe_step=_real_moe_step(config)))
-            torch.cuda.synchronize()
-            dist.barrier()
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=16, topk=TOPK, hidden_size=HIDDEN, tp_ep_group=tp_ep
+        )
+        mtp_forwards(etp, ep, moe_step=_real_moe_step(config))
+        torch.cuda.synchronize()
+        dist.barrier()
 
 
 # --------------------------------------------------------------------------------------------
@@ -284,23 +293,14 @@ def _bounded_rows_context(communicator):
 )
 def test_replicas_agree_on_bounded_moe_rows(phases, bounded):
     """A decode-only replica bounds its MoE rows only when its tp_ep peer is decode-only too;
-    otherwise the peer's prefill tokens sit past the capacity in the gathered rows."""
+    otherwise the peer's prefill tokens sit past the capacity in the gathered rows. Either way
+    it replays a decode-only CUDA graph, captured with or without the bound."""
     _require_rank_pairs()
-    zmq = pytest.importorskip("zmq")
-    from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
-
     with _tp_ep_pairs(etp=1, ep=2) as tp_ep:
         zmq_context = zmq.Context()
         communicator = AsyncZMQCommunicator(zmq_context, process_group=tp_ep)
         try:
-            try:
-                context = _bounded_rows_context(communicator)
-                error = None
-            except RuntimeError as exc:
-                error = str(exc)
-            if not _on_all_ranks(error is None):
-                pytest.skip(f"NVLS symmetric memory unavailable on a rank (this rank: {error})")
-
+            context = _bounded_rows_context(communicator)
             phase = phases[dist.get_rank(tp_ep)]
             if phase == "decode":
                 # An idle replica's dummy step is decode-only.
@@ -316,13 +316,15 @@ def test_replicas_agree_on_bounded_moe_rows(phases, bounded):
                 )
                 context.agree_on_moe_decode_only(context.num_prefill_requests == 0)
                 context.initialize_attention_state()
-            # Decode-only CUDA graphs are captured bounded, so an unbounded decode step is eager.
-            graphed = context.using_cuda_graph_this_step() if phase == "decode" else None
-            outcome = (phase, context.use_bounded_mxfp8_rows, graphed)
+            # A decode rank replays a graph whose key says whether it bounds the rows.
+            graph = None
+            if phase == "decode":
+                graph = (context.using_cuda_graph_this_step(), context.cuda_graph_key[1])
+            outcome = (phase, context.use_bounded_mxfp8_rows, graph)
             outcomes = [None, None]
             dist.all_gather_object(outcomes, outcome, group=tp_ep)
             expected = [
-                (phase, bounded, bounded) if phase == "decode" else (phase, False, None)
+                (phase, bounded, (True, bounded)) if phase == "decode" else (phase, False, None)
                 for phase in phases
             ]
             assert _on_all_ranks(outcomes == expected), f"{outcomes} != {expected}"

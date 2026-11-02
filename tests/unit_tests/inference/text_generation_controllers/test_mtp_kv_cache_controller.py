@@ -1393,7 +1393,9 @@ class TestExpertParallelForwardParity:
     """Idle EP ranks must issue the same MoE forwards as real ranks, or the all-to-all hangs."""
 
     @staticmethod
-    def _dummy_rank_forwards(num_mtp_depths, graphed, kv_cache_on, sp_enabled=False, tp_size=1):
+    def _dummy_rank_forwards(
+        num_mtp_depths, graphed, kv_cache_on, sp_enabled=False, tp_size=1, etp_size=1, ep_size=2
+    ):
         """Run the idle-rank path in isolation and return its forward log."""
         context = _make_context(num_decode_requests=0)
         context.enable_mtp_kv_cache = kv_cache_on
@@ -1412,7 +1414,8 @@ class TestExpertParallelForwardParity:
 
         controller = _make_controller(context, model, sp_enabled=sp_enabled, tp_size=tp_size)
         controller.num_mtp_depths = num_mtp_depths
-        controller.model_config.expert_model_parallel_size = 2
+        controller.model_config.expert_tensor_parallel_size = etp_size
+        controller.model_config.expert_model_parallel_size = ep_size
         controller._mtp_resolved_padded_count = (tp_size if sp_enabled else 2) if graphed else None
 
         patches = _identity_sp_patches()
@@ -1423,8 +1426,10 @@ class TestExpertParallelForwardParity:
     @pytest.mark.parametrize("num_mtp_depths", [1, 2, 3])
     @pytest.mark.parametrize("graphed", [False, True])
     @pytest.mark.parametrize("kv_cache_on", [False, True])
+    # With ETP > TP = 1 and EP = 1 the expert-TP peers are separate replicas too.
+    @pytest.mark.parametrize("etp_size, ep_size", [(1, 2), (2, 1)], ids=["ep", "etp-gt-tp"])
     def test_real_and_dummy_ranks_match_forward_count_and_graph_mode(
-        self, num_mtp_depths, graphed, kv_cache_on
+        self, num_mtp_depths, graphed, kv_cache_on, etp_size, ep_size
     ):
         """Real and idle ranks must match both forward count and eager/graph mode."""
         controller, model, context, _ = _build_step(
@@ -1439,7 +1444,9 @@ class TestExpertParallelForwardParity:
         )
         real_forwards = list(model.all_forwards)
 
-        dummy_forwards = self._dummy_rank_forwards(num_mtp_depths, graphed, kv_cache_on)
+        dummy_forwards = self._dummy_rank_forwards(
+            num_mtp_depths, graphed, kv_cache_on, etp_size=etp_size, ep_size=ep_size
+        )
 
         expected = num_mtp_depths + (1 if kv_cache_on else 0)
         assert len(real_forwards) == expected

@@ -817,6 +817,7 @@ class TextGenerationController(MTPControllerMixin):
         is_dummy_forward: bool = False,
         transfer_bookkeeping_to_gpu: bool = True,
         record_bookkeeping_done_event: bool = False,
+        construct_graph_bounded_moe_rows: Optional[bool] = None,
     ) -> Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]:
         """Initializes the inference context for dynamic batching.
 
@@ -828,6 +829,9 @@ class TextGenerationController(MTPControllerMixin):
                 CPU bookkeeping snapshot to GPU before returning.
             record_bookkeeping_done_event (bool): Whether to record an event
                 after the bookkeeping H2D transfer.
+            construct_graph_bounded_moe_rows (Optional[bool]): Whether the constructed
+                cuda graph bounds the FlashInfer MoE rows; see
+                DynamicInferenceContext.bounded_moe_row_graph_variants().
 
         Returns:
             Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]: The active input
@@ -844,6 +848,7 @@ class TextGenerationController(MTPControllerMixin):
         range_push("initialize_attention_state")
         bookkeeping_done_event = context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
+            construct_graph_bounded_moe_rows=construct_graph_bounded_moe_rows,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
             transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
             record_bookkeeping_done_event=record_bookkeeping_done_event,
@@ -3585,6 +3590,7 @@ class TextGenerationController(MTPControllerMixin):
         *,
         run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        admits_prefill: bool = True,
         finalize_requests: Optional[Callable[..., None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
@@ -3594,7 +3600,10 @@ class TextGenerationController(MTPControllerMixin):
                 on the legacy path.
             run_async_overlap (bool): Whether to run the overlap ordering.
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                used by the no-overlap path to admit eligible prefill requests.
+                used by the no-overlap path to admit eligible requests.
+            admits_prefill (bool): Whether `schedule_waiting_requests` may admit
+                prefill requests. When False it admits only decode-ready requests,
+                so the step knows at its entry whether its forward is decode-only.
             finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
@@ -3614,10 +3623,21 @@ class TextGenerationController(MTPControllerMixin):
 
         assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
         self._validate_async_sched_support_for_step(run_async_overlap)
-        # Agree before the step's MTP forwards, which an idle peer's dummy step joins only after
-        # its own agreement. Overlap steps launch decode-only forwards; a no-overlap step admits
-        # its requests later, so it does not count as decode-only.
-        context.agree_on_moe_decode_only(run_async_overlap and self._async_sched_forward.is_valid)
+        # Agree on the phase of the forward this step launches before its MTP forwards, which an
+        # idle peer's dummy step joins only after its own agreement. Overlap steps launch
+        # decode-only forwards. A no-overlap step that admits no prefill launches decode-only
+        # work unless it primes a batch that is still prefilling: the update turns every
+        # request of a pending forward into a decode request, and a chunked prefill
+        # continues only by admission.
+        has_pending_forward = self._async_sched_forward.is_valid
+        if run_async_overlap and has_pending_forward:
+            launches_decode_only = True
+        else:
+            admits_prefill = admits_prefill and schedule_waiting_requests is not None
+            launches_decode_only = not admits_prefill and (
+                has_pending_forward or context.num_prefill_requests == 0
+            )
+        context.agree_on_moe_decode_only(launches_decode_only)
 
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0:

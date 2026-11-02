@@ -116,6 +116,18 @@ class TestConstructorValidation:
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)._use_coordinator is False
         )
 
+    def test_moe_group_straddling_tp_groups_is_rejected(
+        self, mock_pipeline, fake_model_and_tokenizer
+    ):
+        """With TP 4 and EP 3 some tp_ep groups hold parts of two attention TP groups, which
+        no engine consensus keeps in lockstep. (With the coordinator, the inference context
+        rejects the layout when the engine builds it.)"""
+        model, tok = fake_model_and_tokenizer
+        model.config.tensor_model_parallel_size = 4
+        model.config.expert_model_parallel_size = 3
+        with pytest.raises(ValueError, match="must divide one another"):
+            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+
 
 class TestLifecycleGuards:
     """Direct-mode lifecycle guards (``MegatronLLM`` only -- async direct is

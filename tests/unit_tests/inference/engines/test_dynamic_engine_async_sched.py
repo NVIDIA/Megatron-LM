@@ -240,6 +240,67 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
 
 
 @pytest.mark.parametrize(
+    "phase_agreed, can_prepare, has_import, waiting_availability, overlap, admits_prefill",
+    [
+        # Overlap steps admit nothing.
+        (True, True, False, None, True, False),
+        # A paused request or too little KV to prepare: nothing waits to be admitted.
+        (True, False, False, None, False, False),
+        # The queue head does not fit the KV cache at the step's entry.
+        (True, False, False, (True, False, True), False, False),
+        # A completed KV import enters as a decode request.
+        (True, True, True, None, False, False),
+        (True, False, False, (True, True, True), False, True),
+        # Without the per-step agreement the step admits whatever fits after its update.
+        (False, False, False, None, False, True),
+    ],
+    ids=["overlap", "paused", "short-kv", "kv-import", "admittable", "not-agreed"],
+)
+def test_async_step_admits_prefill_only_when_announced(
+    phase_agreed, can_prepare, has_import, waiting_availability, overlap, admits_prefill
+):
+    """When the replicas sharing the MoE collectives agree on each step's phase at its entry, a
+    no-overlap step admits prefill only if its queue head was admittable then, so a step that
+    announced a decode-only forward launches one; it still admits decode-ready KV imports."""
+    engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    engine.state = EngineState.RUNNING
+    engine.logging_step_interval = 0
+    engine.context.can_prepare_requests.return_value = can_prepare
+    engine.context.moe_step_phase_is_agreed = phase_agreed
+    engine.context.step_count = 0
+    engine.context.prefix_cache_lru_clock = 0
+    engine.context.dynamo_helper = None
+    engine.context.check_availability = mock.Mock(return_value=waiting_availability)
+    engine._cg_admission_gating_active = mock.Mock(return_value=False)
+    engine.waiting_request_ids = deque([10] if waiting_availability is not None else [])
+    engine.get_request = mock.Mock(return_value=SimpleNamespace(remaining_prompt_tokens=[1, 2]))
+    if has_import:
+        engine._pending_kv_imports.append(
+            SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+        )
+        engine._handoff_completion_notifications[7] = (False, True)
+    engine.controller.async_generate_output_tokens_dynamic_batch = mock.AsyncMock(
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=True, launched=True), output=None
+        )
+    )
+
+    asyncio.run(engine.async_forward())
+
+    kwargs = engine.controller.async_generate_output_tokens_dynamic_batch.await_args.kwargs
+    assert kwargs["run_async_overlap"] is overlap
+    assert kwargs["admits_prefill"] is admits_prefill
+    if overlap:
+        expected_admission = None
+    elif admits_prefill:
+        expected_admission = engine.schedule_waiting_requests
+    else:
+        expected_admission = engine._admit_pending_kv_imports
+    assert kwargs["schedule_waiting_requests"] == expected_admission
+
+
+@pytest.mark.parametrize(
     "mode, run_async_overlap, decode_only, primer_only, expected_schedule_calls, "
     "expected_nvtx_range",
     [
@@ -312,6 +373,7 @@ def test_async_forward_routes_one_controller_iteration(
         chunked_prefill_request_id=17,
         is_decode_only=mock.Mock(return_value=decode_only.launched),
         dynamo_helper=DynamoHelper(),
+        moe_step_phase_is_agreed=False,
     )
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(
@@ -367,6 +429,7 @@ def test_async_forward_routes_one_controller_iteration(
             schedule_waiting_requests=(
                 None if run_async_overlap else engine.schedule_waiting_requests
             ),
+            admits_prefill=not run_async_overlap,
             finalize_requests=finalize_requests,
         )
     engine.context.is_decode_only.assert_not_called()

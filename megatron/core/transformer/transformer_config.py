@@ -1569,10 +1569,16 @@ class TransformerConfig(ModelParallelConfig):
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
     NVFP4 MoE (inference_moe_nvfp4_recipe).
 
-    Decode-only dynamic-inference graphs use this fixed prefix when their
-    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer. Requires
-    the NVLS inference dispatcher and EP > 1.
+    Decode-only dynamic-inference steps process only this prefix of the tokens that
+    the NVLS dispatcher gathers over the expert tensor-and-model-parallel group, which
+    holds the decode tokens of R = max(1, ETP * EP / TP) data-parallel replicas. The
+    prefix is used only when R * max_requests * (num_speculative_tokens + 1) <= capacity
+    (e.g. TP 1, ETP 2, EP 2 and max_requests 64 need 256). With R > 1 a step uses it
+    only when every replica's step is decode-only, which the replicas agree on each step
+    through the engine's coordinator (without the coordinator they never use it), and
+    decode-only CUDA graphs are captured with and without it. Prefill, mixed,
+    static-inference and oversized decode steps process the full dispatcher buffer.
+    Requires the NVLS inference dispatcher and EP > 1.
     """
 
     inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None

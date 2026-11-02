@@ -2195,7 +2195,7 @@ class CudaGraphManager(torch.nn.Module):
                 batch_size = kwargs['hidden_states'].shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
             else:
-                cache_key = inference_context.padded_batch_dimensions
+                cache_key = inference_context.cuda_graph_key
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()

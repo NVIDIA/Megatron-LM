@@ -135,9 +135,9 @@ def get_moe_dp_replica_count(config) -> int:
 
     The inference MoE dispatchers gather and scatter tokens over the expert tensor-and-model
     parallel (tp_ep) group of expert_tensor_parallel_size * expert_model_parallel_size ranks.
-    The ranks of one attention TP group serve the same requests, and TP is the innermost
-    dimension of both the attention and the expert rank layouts, so tp_ep either lies inside one
-    attention TP group or is made of whole ones.
+    The ranks of one attention TP group serve the same requests. TP is the innermost dimension
+    of both the attention and the expert rank layouts, so tp_ep lies inside one attention TP
+    group when its size divides TP, and is made of whole TP groups when TP divides its size.
 
     With more than one replica the tp_ep ranks serve different requests: they must step in
     lockstep (an idle rank runs dummy steps that issue every MoE collective its peers issue),
@@ -148,9 +148,23 @@ def get_moe_dp_replica_count(config) -> int:
 
     Returns:
         int: The number of replicas, at least 1.
+
+    Raises:
+        ValueError: If neither size divides the other. Some tp_ep groups then hold part of an
+            attention TP group, whose ranks would join different engine consensus groups and
+            could not be kept in lockstep.
     """
+    tp_size = config.tensor_model_parallel_size
     tp_ep_size = config.expert_tensor_parallel_size * config.expert_model_parallel_size
-    return max(1, -(-tp_ep_size // config.tensor_model_parallel_size))
+    if tp_size % tp_ep_size and tp_ep_size % tp_size:
+        raise ValueError(
+            "Inference needs each expert tensor-and-model-parallel group to lie inside one "
+            "tensor-parallel group or to be made of whole ones, so tensor_model_parallel_size "
+            "and expert_tensor_parallel_size * expert_model_parallel_size must divide one "
+            f"another (got TP={tp_size}, ETP={config.expert_tensor_parallel_size}, "
+            f"EP={config.expert_model_parallel_size})."
+        )
+    return max(1, tp_ep_size // tp_size)
 
 
 def device_memory_summary() -> str:

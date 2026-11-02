@@ -1310,14 +1310,17 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError(f"Cannot wait for transient state {state}")
         await event.wait()
 
-    def create_cuda_graphs(self, reset_context: bool = True):
+    def create_cuda_graphs(self, reset_context: bool = True, bounded_moe_rows_only: bool = False):
         """Create cuda graphs.
 
         This method iterates the dynamic context's `cuda_graph_request_counts`
-        to record and capture cuda graphs.
+        to record and capture cuda graphs, once per bounded-MoE-row variant
+        (`DynamicInferenceContext.bounded_moe_row_graph_variants`).
 
         Args:
             reset_context (bool): Whether to reset the context after building cuda graphs.
+            bounded_moe_rows_only (bool): Capture only the graphs that bound the MoE rows, which
+                become usable once the replicas sharing the MoE collectives can agree.
         """
 
         if self.inference_cuda_graph_scope == InferenceCudaGraphScope.none:
@@ -1339,9 +1342,20 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pool-scoped baselines for the per-iteration deltas.
         prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
 
+        # A graph fixes whether its MoE kernels process only the bounded rows, so each variant
+        # that steps can use is captured as its own graph.
+        cuda_graphs = [
+            (graph, bounded_moe_rows)
+            for graph in context.cuda_graph_batch_dimensions_list
+            for bounded_moe_rows in context.bounded_moe_row_graph_variants(graph)
+            if bounded_moe_rows or not bounded_moe_rows_only
+        ]
+        if bounded_moe_rows_only and not cuda_graphs:
+            return
+
         logger.info("> dynamic_engine.py: building cuda graphs for ")
-        for graph in context.cuda_graph_batch_dimensions_list:
-            logger.info(graph)
+        for graph, bounded_moe_rows in cuda_graphs:
+            logger.info(f"{graph}{' (bounded MoE rows)' if bounded_moe_rows else ''}")
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
@@ -1376,21 +1390,20 @@ class DynamicInferenceEngine(AbstractEngine):
             mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
-        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+        tbar = enumerate(cuda_graphs)
         if HAVE_TQDM:
-            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
-        for tbar_idx, cuda_graph_batch_dimension in tbar:
+            tbar = tqdm(tbar, total=len(cuda_graphs))
+        for tbar_idx, (cuda_graph_batch_dimension, bounded_moe_rows) in tbar:
             input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
-                construct_graph_dimensions=cuda_graph_batch_dimension
+                construct_graph_dimensions=cuda_graph_batch_dimension,
+                construct_graph_bounded_moe_rows=bounded_moe_rows,
             )
             # Progress.
             tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:
                 tbar.set_description(tbar_str)
             else:
-                logger.info(
-                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
-                )
+                logger.info(f"{tbar_idx}/{len(cuda_graphs)}. {tbar_str}")
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
@@ -1479,7 +1492,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logger.info(
                 "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
                 tbar_idx + 1,
-                len(context.cuda_graph_batch_dimensions_list),
+                len(cuda_graphs),
                 cuda_graph_batch_dimension,
                 format_mem_bytes(pool_reserved),
                 format_mem_bytes(pool_reserved - prev_pool_reserved),
@@ -1758,13 +1771,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.tp_ep_world_size > 1:
-            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=tp_ep_group, hostname=hostname
+            self._attach_tp_ep_communicator(
+                AsyncZMQCommunicator(self.zmq_context, process_group=tp_ep_group, hostname=hostname)
             )
-            # Give the context a CPU-side MAX-reduction primitive so
-            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
-            if hasattr(self.context, "set_ep_zmq_communicator"):
-                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -4158,6 +4167,19 @@ class DynamicInferenceEngine(AbstractEngine):
             and token_capacity_available
         )
 
+    def _can_admit_waiting_request(self) -> bool:
+        """Return whether the waiting queue's head can be admitted now, without admitting it.
+
+        Returns:
+            bool: Whether the queue head would pass the admission checks.
+        """
+        if not self.waiting_request_ids:
+            return False
+        req = self.get_request(self.waiting_request_ids[0])
+        if self.enable_chunked_prefill:
+            return self._can_schedule_chunked_prefill(req)
+        return self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+
     def _should_run_async_sched_overlap(self) -> bool:
         """Return whether this step should use overlap ordering.
 
@@ -4172,13 +4194,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
         if self.has_admittable_kv_import:
             return False
-        if not self.waiting_request_ids:
-            return True
-
-        req = self.get_request(self.waiting_request_ids[0])
-        if self.enable_chunked_prefill:
-            return not self._can_schedule_chunked_prefill(req)
-        return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+        return not self._can_admit_waiting_request()
 
     def _pending_prefill_block_hashes(self) -> set[int]:
         """Return hashes reserved by work whose KV is not yet ready for reuse."""
@@ -4556,11 +4572,24 @@ class DynamicInferenceEngine(AbstractEngine):
         elif mode == AsyncScheduleMode.ASYNC:
             run_async_overlap = self._should_run_async_sched_overlap()
             step_nvtx_range = "AsyncOverlap" if run_async_overlap else "AsyncNoOverlap"
+            # When the replicas sharing the MoE collectives agree on each step's phase at its
+            # entry, a no-overlap step admits prefill only if its queue head was admittable
+            # then. Otherwise it admits only decode-ready (imported) requests, so its forward is
+            # decode-only, as it announced; a head that becomes admittable during the step's
+            # update waits for the next step.
+            admits_prefill = not run_async_overlap and (
+                not self.context.moe_step_phase_is_agreed or self._can_admit_waiting_request()
+            )
+            if run_async_overlap:
+                schedule_waiting_requests = None
+            elif admits_prefill:
+                schedule_waiting_requests = self.schedule_waiting_requests
+            else:
+                schedule_waiting_requests = self._admit_pending_kv_imports
             controller_kwargs = {
                 "run_async_overlap": run_async_overlap,
-                "schedule_waiting_requests": (
-                    None if run_async_overlap else self.schedule_waiting_requests
-                ),
+                "schedule_waiting_requests": schedule_waiting_requests,
+                "admits_prefill": admits_prefill,
             }
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
@@ -5645,6 +5674,22 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         nvtx_range_pop("world_barrier")
 
+    def _attach_tp_ep_communicator(self, communicator) -> None:
+        """Attach the ZMQ communicator over tp_ep, and capture the CUDA graphs it enables.
+
+        Args:
+            communicator: AsyncZMQCommunicator over the tp_ep process group.
+        """
+        self.expert_parallel_zmq_communicator = communicator
+        # Give the context a CPU-side MAX-reduction primitive so
+        # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+        if hasattr(self.context, "set_ep_zmq_communicator"):
+            self.context.set_ep_zmq_communicator(communicator)
+            if self.context.moe_step_phase_is_agreed:
+                # The replicas can now agree that a step is decode-only, so its CUDA graphs may
+                # bound the MoE rows.
+                self.create_cuda_graphs(bounded_moe_rows_only=True)
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -5708,12 +5753,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         if local_schedulable > 0:
                             await self.async_step()
                         else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
+                            # Dummy forward to participate in the EP collective. Its host does
+                            # not wait for it: the next dummy step's blocking bookkeeping copy
+                            # keeps it at most one forward ahead of the GPU, and its peers can
+                            # launch their next forward while this one runs.
                             nvtx_range_push("EP-dummy-forward")
                             self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
                             nvtx_range_pop("EP-dummy-forward")
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1

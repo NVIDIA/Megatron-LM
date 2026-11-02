@@ -17,6 +17,9 @@ Inputs and weights are E2M1-grid values times a power of two with one +-6 * 2**-
 MXFP8 and NVFP4 quantization of inputs and weights is exact and only the kernels' intermediate
 requantization remains (relative L2 error <= 0.041 MXFP8, <= 0.105 NVFP4). A missing expert
 contribution or a stale reduce-scatter row is far above the tolerances.
+
+The GB200 unit-test job runs this file on four SM100 ranks. There, a missing FlashInfer kernel,
+pyzmq or NVLS multicast is a failure, not a skip; other platforms skip it.
 """
 
 from datetime import timedelta
@@ -25,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+import zmq
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
@@ -55,6 +59,8 @@ LAYOUTS = {"ep4": (1, 4, 32), "etp2-ep2": (2, 2, 64)}
 
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _skip_reason():
     if not torch.cuda.is_available():
@@ -63,18 +69,26 @@ def _skip_reason():
         return f"needs exactly {WORLD_SIZE} ranks; WORLD_SIZE={Utils.world_size}"
     if torch.cuda.get_device_capability()[0] != 10:
         return "routed MXFP8 and per-token NVFP4 MoE kernels need an SM100-family GPU"
+    return None
+
+
+def _require_kernels():
+    """The hardware these kernels target must have them; the CI image pins FlashInfer 0.7."""
     from megatron.core.inference.moe.flashinfer_mxfp8 import (
         _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR,
         HAVE_FLASHINFER_ROUTED_MXFP8,
     )
+    from megatron.core.inference.moe.flashinfer_nvfp4 import (
+        _FLASHINFER_NVFP4_IMPORT_ERROR,
+        HAVE_FLASHINFER_ROUTED_NVFP4,
+    )
 
-    if not HAVE_FLASHINFER_ROUTED_MXFP8:
-        return f"FlashInfer routed MXFP8 unavailable: {_FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR!r}"
-    try:
-        import zmq  # noqa: F401
-    except ImportError:
-        return "the tp_ep communicator needs pyzmq"
-    return None
+    assert (
+        HAVE_FLASHINFER_ROUTED_MXFP8
+    ), f"FlashInfer routed MXFP8 unavailable: {_FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR!r}"
+    assert (
+        HAVE_FLASHINFER_ROUTED_NVFP4
+    ), f"FlashInfer per-token NVFP4 MoE unavailable: {_FLASHINFER_NVFP4_IMPORT_ERROR!r}"
 
 
 def _on_all_ranks(ok):
@@ -175,17 +189,16 @@ def _warm_up_kernels(env):
             activation_type=RELU2,
             **bounds,
         )
-        if env.nvfp4 is not None:
-            flashinfer_routed_nvfp4_moe(
-                x,
-                routing,
-                probs,
-                env.nvfp4,
-                num_experts=NUM_EXPERTS,
-                local_expert_offset=offset,
-                activation_type=RELU2,
-                **bounds,
-            )
+        flashinfer_routed_nvfp4_moe(
+            x,
+            routing,
+            probs,
+            env.nvfp4,
+            num_experts=NUM_EXPERTS,
+            local_expert_offset=offset,
+            activation_type=RELU2,
+            **bounds,
+        )
     torch.cuda.synchronize()
 
 
@@ -194,12 +207,11 @@ def env(request):
     reason = _skip_reason()
     if reason is not None:
         pytest.skip(reason)
-
-    import zmq
+    _require_kernels()
 
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
     from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
-    from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+    from megatron.core.inference.moe.flashinfer_nvfp4 import prepare_routed_nvfp4_weights
     from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
     from megatron.core.parallel_state import (
         get_expert_model_parallel_group,
@@ -249,12 +261,7 @@ def env(request):
         try:
             env.mx_fc1 = _prepare_mxfp8(fc1_shard, EXP_FC1)
             env.mx_fc2 = _prepare_mxfp8(fc2_shard, EXP_FC2)
-            if HAVE_FLASHINFER_ROUTED_NVFP4:
-                from megatron.core.inference.moe.flashinfer_nvfp4 import (
-                    prepare_routed_nvfp4_weights,
-                )
-
-                env.nvfp4 = prepare_routed_nvfp4_weights(fc1_shard, fc2_shard)
+            env.nvfp4 = prepare_routed_nvfp4_weights(fc1_shard, fc2_shard)
             _warm_up_kernels(env)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -284,8 +291,7 @@ def env(request):
             error = None if bool(getattr(handle, "multicast_ptr", 0)) else "no multicast pointer"
         except RuntimeError as exc:
             error = str(exc)
-        if not _on_all_ranks(error is None):
-            pytest.skip(f"NVLS symmetric memory unavailable on a rank (this rank: {error})")
+        assert _on_all_ranks(error is None), f"NVLS symmetric memory unavailable: {error}"
         env.context.set_ep_zmq_communicator(communicator)
         NVLSAllGatherVDispatcher._symm_agv_hidden["tensor"].zero_()
         NVLSAllGatherVDispatcher._symm_agv_probs["tensor"].zero_()
@@ -330,11 +336,6 @@ def _reference_moe(x, routing, probs, fc1, fc2):
 def _sync():
     torch.cuda.synchronize()
     dist.barrier()
-
-
-def _skip_unless_backend(env, backend):
-    if backend == "nvfp4" and env.nvfp4 is None:
-        pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0")
 
 
 def _run_step(env, backend, tokens_per_rank, decode_only, seed):
@@ -447,7 +448,6 @@ def _check(gathered, backend, expected_bounded, label):
 @pytest.mark.parametrize("backend", ["mxfp8", "nvfp4"])
 def test_prefill_steps_match_reference(env, backend):
     """No replica is decode-only, so no rank bounds its rows; peers' rows run past the capacity."""
-    _skip_unless_backend(env, backend)
     tokens = [DECODE_TOKENS] + [PREFILL_TOKENS] * (WORLD_SIZE - 1)
     gathered = _run_step(env, backend, tokens, [False] * WORLD_SIZE, seed=11)
     _check(gathered, backend, False, f"[{env.layout}, {backend}] all prefill")
@@ -458,7 +458,6 @@ def test_decode_steps_bound_rows_only_when_every_replica_fits(env, backend):
     """Every replica decodes max_requests tokens. The bounded rows are used when the four
     replicas' decode rows fit the capacity (EP 4: 4 x 32 = 128) and not otherwise (ETP 2 x
     EP 2: 4 x 64 = 256), and every gathered row gets every rank's expert outputs."""
-    _skip_unless_backend(env, backend)
     tokens = [env.max_requests] * WORLD_SIZE
     gathered = _run_step(env, backend, tokens, [True] * WORLD_SIZE, seed=12)
     fits = WORLD_SIZE * env.max_requests <= CAPACITY
@@ -469,7 +468,6 @@ def test_decode_steps_bound_rows_only_when_every_replica_fits(env, backend):
 def test_decode_replica_does_not_bound_rows_while_a_peer_prefills(env, backend):
     """tp_ep rank 0 runs a decode-only step whose tokens fit while its peers prefill; their
     tokens sit past the capacity in the gathered rows, so rank 0 must not bound its rows."""
-    _skip_unless_backend(env, backend)
     tokens = [DECODE_TOKENS] + [PREFILL_TOKENS] * (WORLD_SIZE - 1)
     decode_only = [True] + [False] * (WORLD_SIZE - 1)
     gathered = _run_step(env, backend, tokens, decode_only, seed=13)
