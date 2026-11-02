@@ -167,8 +167,12 @@ def test_portable_placement_flag_reaches_only_dev_latest_executors(
 @pytest.mark.parametrize(
     "overrides,expected_nonblocking",
     [
-        ({"platform": "dgx_h100"}, True),
+        ({"platform": "dgx_h100", "test_case": "tests/unit_tests/transformer/**/*.py"}, True),
         ({"platform": "dgx_gb200"}, True),
+        ({"platform": "dgx_h100"}, False),
+        ({"test_case": "tests/unit_tests/transformer/**/*.py"}, False),
+        ({"test_case": "tests/unit_tests/transformer/moe/**/*.py"}, False),
+        ({"test_case": "tests/unit_tests/**/*.py"}, False),
         ({"platform": "dgx_a100"}, False),
         ({"scope": "mr-github"}, False),
         ({"environment": "lts"}, False),
@@ -180,7 +184,7 @@ def test_transformer_lanes_preserve_nonblocking_nccl_finalization(
     monkeypatch, launch_workload, overrides, expected_nonblocking
 ):
     monkeypatch.setenv("UNIT_TEST_GB200_ENABLED", "true")
-    kwargs = {"test_case": "tests/unit_tests/transformer/**/*.py", **overrides}
+    kwargs = {"test_case": "tests/unit_tests/transformer/test_*.py", **overrides}
 
     _, executor_env = launch_workload(**kwargs)
 

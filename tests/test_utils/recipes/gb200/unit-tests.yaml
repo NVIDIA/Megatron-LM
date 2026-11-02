@@ -235,7 +235,9 @@ products:
         scope: [unit-tests-github-portable]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/transformer/**/*.py]
+  # Keep existing MoE tests in the catch-all process: NCCL-EP bootstrap requires
+  # blocking communicators, while the transformer bucket needs nonblocking NCCL.
+  - test_case: [tests/unit_tests/transformer/test_*.py]
     products:
       - environment: [dev]
         tag: [latest]

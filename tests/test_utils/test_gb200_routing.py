@@ -192,6 +192,22 @@ def test_gb200_files_have_exactly_one_active_bucket(monkeypatch, capsys, enabled
         expected |= gb200_placement.candidate_files()
     assert set(owners) == expected
 
+    # Existing Blackwell-only MoE tests and migrated grouped-tensor layouts must
+    # keep the catch-all's blocking NCCL environment. Only top-level transformer
+    # tests belong in the new bucket with the nonblocking finalization workaround.
+    catch_all = "tests/unit_tests/**/*.py"
+    for filename in ("test_paged_stashing.py", "test_grouped_tensor_dispatcher_numerics.py"):
+        assert owners[f"tests/unit_tests/transformer/moe/{filename}"] == [catch_all]
+    transformer_bucket = "tests/unit_tests/transformer/test_*.py"
+    assert owners["tests/unit_tests/transformer/test_cuda_graphs.py"] == [
+        transformer_bucket if enabled else catch_all
+    ]
+    migrated_file = "tests/unit_tests/transformer/test_mhc_precision.py"
+    if enabled:
+        assert owners[migrated_file] == [transformer_bucket]
+    else:
+        assert migrated_file not in owners
+
 
 def test_h100_fallback_and_migration_keep_mixed_buckets():
     recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/h100/unit-tests.yaml").read_text())

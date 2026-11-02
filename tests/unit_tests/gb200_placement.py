@@ -39,7 +39,7 @@ NEW_GB200_BUCKETS = FULL_BUCKETS + (
     PREFIX + "ssm/**/*.py",
     PREFIX + "inference/engines/test_dynamic_engine.py",
     PREFIX + "inference/engines/test_dynamic_engine_parallel_and_chunked_prefill.py",
-    PREFIX + "transformer/**/*.py",
+    PREFIX + "transformer/test_*.py",
     PREFIX + "a2a_overlap/**/*.py",
     PREFIX + "models/**/*.py",
     PREFIX + "pipeline_parallel/**/*.py",

@@ -272,15 +272,19 @@ def main(
 
     if (
         scope == "unit-tests"
-        and test_case == "tests/unit_tests/transformer/**/*.py"
         and environment == "dev"
         and tag == "latest"
-        and platform in ("dgx_h100", "dgx_gb200")
+        and (platform, test_case)
+        in (
+            ("dgx_h100", "tests/unit_tests/transformer/**/*.py"),
+            ("dgx_gb200", "tests/unit_tests/transformer/test_*.py"),
+        )
     ):
         # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
         # PyTorch start every communicator's finalization before waiting, avoiding
         # cyclic waits between the CP group's P2P and collective communicators (#7744).
-        # Preserve this setting when portable transformer tests move to GB200.
+        # Keep GB200 MoE tests in the catch-all with blocking communicators:
+        # NCCL-EP bootstrap does not handle ncclInProgress from nonblocking calls.
         executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
         executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
         executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
