@@ -21,12 +21,12 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
@@ -186,7 +186,8 @@ class TestFP8Param:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        cfg = pretrain_cfg_container_from_args(args)
+        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
+        cfg = Utils.pretrain_config_from_global_args(args, model_class)
         cfg.finalize()
         set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
@@ -296,8 +297,7 @@ class TestFP8Param:
             use_cudagraphable_rng=args.cuda_graph_impl != "none",
             force_reset_rng=True,
         )
-        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
-        cfg_container = Utils.pretrain_config_from_global_args(args, model_class)
+        cfg_container = get_run_config()
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
             model_cfg = cfg_container.model
@@ -316,7 +316,7 @@ class TestFP8Param:
                 pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
-        if getattr(args, "use_layer_wise_distributed_optimizer", False):
+        if cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
             assert has_param_layout == args.use_layer_wise_param_layout, (
                 "LayerWise test did not enter the requested parameter-layout path: "
@@ -755,7 +755,7 @@ class TestFP8Param:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         model_parallel_cuda_manual_seed(_SEED)
-        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container = get_run_config()
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             ModelType.encoder_or_decoder,
             self.model_provider,

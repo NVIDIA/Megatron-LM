@@ -16,13 +16,15 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
 class NestedModel(nn.Module):
@@ -85,14 +87,58 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-@pytest.mark.parametrize("unify_communication_stream", [False, True])
-def test_context_defaults_to_current_cuda_device(distributed_setup, unify_communication_stream):
+def test_recorded_execution_order(distributed_setup):
+    """Recorded orders follow execution when submodules are registered in reverse."""
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.second = nn.Linear(4, 4, bias=False)
+            self.first = nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.second(self.first(x))
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = Model().to(device)
+    unsharded_weights = {layer: layer.weight for layer in model.children()}
+    with fully_shard_context(
+        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+    ) as context:
+        for layer in model.children():
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 4, device=device)
+    assert context.is_recording_execution_order
+    model(inputs).sum().backward()
+    assert not context.is_recording_execution_order
+    assert list(context.forward_order) == [model, model.first, model.second]
+    assert list(context.backward_order) == [model, model.second, model.first]
+
+    def check_prefetched(layer, _args):
+        storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
+        assert storage_bytes > 0
+
+    for layer in model.children():
+        # Check before FSDP's own hooks, so on-demand unsharding cannot satisfy the assertion.
+        layer.register_forward_pre_hook(check_prefetched, prepend=True)
+        layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
+    model.zero_grad(set_to_none=True)
+    model(inputs).sum().backward()
+
+
+@pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
+def test_context_defaults_to_current_cuda_device(distributed_setup, overlap_allgather_reduction):
     """The policy controls stream sharing without changing the default device."""
     context = FsdpContext(
-        runtime_policy=RuntimePolicy(unify_communication_stream=unify_communication_stream)
+        runtime_policy=RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction)
     )
     assert context.allgather_stream.device == torch.device("cuda", torch.cuda.current_device())
-    assert (context.allgather_stream is context.reduce_scatter_stream) == unify_communication_stream
+    assert (
+        context.allgather_stream is not context.inner_reduction_stream
+    ) == overlap_allgather_reduction
 
 
 def test_context_rejects_non_cuda_device(distributed_setup):
@@ -108,7 +154,8 @@ def test_child_then_parent_share_one_context(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedModel()
 
-    with fully_shard_context(device=device) as context:
+    context = FsdpContext(device=device)
+    with fully_shard_context(context):
         fully_shard(model.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
         assert model.context is context
@@ -128,7 +175,7 @@ def test_context_does_not_keep_modules_alive(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedModel().to(device)
 
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(model.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
@@ -149,7 +196,7 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
@@ -168,7 +215,7 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
@@ -193,8 +240,10 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
     with fully_shard_context(
-        device=device,
-        runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+        )
     ) as context:
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
@@ -221,7 +270,7 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model.left, mesh=mesh, placements=_default_placements())
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
@@ -241,8 +290,13 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Identity().to(device)
 
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_default_placements(), register_hooks=False)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_default_placements(),
+            schedule_policy=SchedulePolicy(register_hooks=False),
+        )
 
     callback_modules = []
     model.register_post_backward_hook(callback_modules.append)
@@ -257,7 +311,7 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model.left, mesh=mesh, placements=_default_placements())
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
@@ -287,7 +341,7 @@ def test_forward_requires_finalized_context(distributed_setup):
     model = nn.Linear(4, 4, bias=False).to(device)
     x = torch.ones(2, 4, device=device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
         with pytest.raises(RuntimeError, match="Exit fully_shard_context"):
             model(x)
@@ -301,11 +355,11 @@ def test_fully_shard_context_rejects_nesting(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model[0], mesh=mesh, placements=_default_placements())
         outer_context = model[0].context
         with pytest.raises(RuntimeError, match="does not support nesting"):
-            with fully_shard_context(device=device):
+            with fully_shard_context(FsdpContext(device=device)):
                 pass
         fully_shard(model[1], mesh=mesh, placements=_default_placements())
 
@@ -319,10 +373,10 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedModel()
 
-    with fully_shard_context(device=device) as first_context:
+    with fully_shard_context(FsdpContext(device=device)) as first_context:
         fully_shard(model.inner, mesh=mesh, placements=_default_placements())
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         with pytest.raises(ValueError, match="another fully_shard_context"):
             fully_shard(model, mesh=mesh, placements=_default_placements())
 
@@ -336,7 +390,7 @@ def test_microbatch_scopes_context(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
@@ -344,3 +398,25 @@ def test_microbatch_scopes_context(distributed_setup):
         assert not context.is_last_microbatch
 
     assert context.is_last_microbatch
+
+
+@pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
+@pytest.mark.parametrize("overlap_outer_communication", [False, True])
+def test_communication_stream_assignment(
+    distributed_setup, overlap_allgather_reduction, overlap_outer_communication
+):
+    """All-gather/reduction and inner/outer stream separation are independent."""
+    context = FsdpContext(
+        runtime_policy=RuntimePolicy(
+            overlap_allgather_reduction=overlap_allgather_reduction,
+            overlap_outer_communication=overlap_outer_communication,
+        )
+    )
+    assert (
+        context.allgather_stream != context.inner_reduction_stream
+    ) == overlap_allgather_reduction
+    assert (
+        context.outer_reduction_stream != context.inner_reduction_stream
+    ) == overlap_outer_communication
+    if overlap_outer_communication:
+        assert context.outer_reduction_stream != context.allgather_stream

@@ -31,6 +31,7 @@ from megatron.core.ssm.gated_delta_product import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -129,6 +130,30 @@ def _assert_replay_matches(baseline, recomputed):
         torch.testing.assert_close(
             recomp_param_grads[name], base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
         )
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires GDP dependencies")
+@pytest.mark.parametrize("parameter_name", ["A_log", "dt_bias"])
+def test_decay_parameters_stay_fp32_in_float16_module(parameter_name):
+    """Preserve the initialized decay values when wrapping GDP for BF16 training."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = _make_config([])
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        mixer = _build_mixer(config)
+        parameter = getattr(mixer, parameter_name)
+        assert parameter.dtype == torch.float32
+        expected = parameter.detach().clone()
+
+        wrapped = Float16Module(config=config, module=mixer).module
+
+        parameter = getattr(wrapped, parameter_name)
+        assert parameter.dtype == torch.float32
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+        assert wrapped.in_proj.weight.dtype == torch.bfloat16
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")

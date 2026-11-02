@@ -14,8 +14,8 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import enum
 from collections.abc import Callable
-from contextvars import ContextVar, Token
 from weakref import WeakKeyDictionary
 
 import torch
@@ -24,24 +24,28 @@ from torch import nn
 from .execution_order import ExecutionOrder
 from .runtime_policy import RuntimePolicy
 
-_FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
+
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
 
 
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
     allgather_stream: torch.cuda.Stream
-    reduce_scatter_stream: torch.cuda.Stream
+    inner_reduction_stream: torch.cuda.Stream
+    # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
+    outer_reduction_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    unify_communication_stream: bool
     caller_managed_grad_sync: bool
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # parameter group tracks readiness alongside its gathered weight storage.
+    # Prefetch uses construction order unless execution-order recording is enabled.
     forward_order: ExecutionOrder[nn.Module]
     backward_order: ExecutionOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
@@ -58,6 +62,7 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -71,20 +76,26 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
+            prefetch_order: ``REGISTRATION`` uses module registration order. ``RECORDED``
+                gathers parameters on demand and records module calls until the first
+                ``post_backward()``. Subsequent passes prefetch using those orders and must
+                repeat them consistently across data-parallel ranks. Recording currently
+                requires the ordinary module hooks; combined 1F1B bypasses them. Discard
+                the context if the recorded pass raises.
         """
+        overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
+        overlap_outer_communication = runtime_policy.overlap_outer_communication
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
-            raise ValueError(
-                f"fully_shard_context/FsdpContext requires a CUDA device, got {device}."
-            )
+            raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
+        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -95,33 +106,37 @@ class FsdpContext:
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
-        self._context_token: Token[FsdpContext | None] | None = None
-        self.allgather_stream = torch.cuda.Stream(device)
-        if self.unify_communication_stream:
-            # A unified stream lets an all-gather reuse the storage released by a
-            # preceding reduce-scatter.
-            self.reduce_scatter_stream = self.allgather_stream
-        else:
-            self.reduce_scatter_stream = torch.cuda.Stream(device)
+        # The two overlap options independently split streams from the inner
+        # reduction stream. With (overlap_allgather_reduction,
+        # overlap_outer_communication), the assignments are:
+        #   (False, False): all-gather and both reductions share one stream.
+        #   (True, False):  all-gather is separate; both reductions share a stream.
+        #   (False, True):  all-gather and inner reduction share; outer is separate.
+        #   (True, True):   all-gather, inner reduction, and outer reduction each
+        #                  have a separate stream.
+        # Outer all-gather separation is not implemented yet; the outer option
+        # currently affects only reduction.
+        self.inner_reduction_stream = torch.cuda.Stream(device)
+        self.allgather_stream = (
+            torch.cuda.Stream(device)
+            if overlap_allgather_reduction
+            else self.inner_reduction_stream
+        )
+        self.outer_reduction_stream = (
+            torch.cuda.Stream(device)
+            if overlap_outer_communication
+            else self.inner_reduction_stream
+        )
 
-    def __enter__(self) -> "FsdpContext":
-        """Activate this context for FSDP module construction."""
-        if _FSDP_CONTEXT.get() is not None:
-            raise RuntimeError("fully_shard_context does not support nesting.")
-        if self._is_finalized:
-            raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
-        self._context_token = _FSDP_CONTEXT.set(self)
-        return self
+    @property
+    def is_finalized(self) -> bool:
+        """Whether construction has completed for this context."""
+        return self._is_finalized
 
-    def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
-        """Finalize successful construction and always clear the active scope."""
-        assert self._context_token is not None
-        try:
-            if exc_type is None:
-                self.finalize()
-        finally:
-            _FSDP_CONTEXT.reset(self._context_token)
-            self._context_token = None
+    @property
+    def is_recording_execution_order(self) -> bool:
+        """Whether module calls are being recorded for subsequent prefetching."""
+        return self._recording_execution_order
 
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
@@ -149,10 +164,12 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                if not self._recording_execution_order:
+                    self.forward_order.append(module)
 
-        for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+        if not self._recording_execution_order:
+            for root in reversed(list(self._roots)):
+                _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -185,7 +202,7 @@ class FsdpContext:
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use fully_shard_context(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "Use FsdpContext(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
@@ -197,11 +214,14 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
-        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.current_stream().wait_stream(self.inner_reduction_stream)
+        if self.outer_reduction_stream is not self.inner_reduction_stream:
+            self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
+        self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
@@ -235,18 +255,6 @@ class FsdpContext:
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
-
-
-def current_fully_shard_context() -> FsdpContext | None:
-    """Return the innermost active ``fully_shard_context``, or ``None``.
-
-    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
-    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
-    active. Callers that must share one context -- for example per-chunk wrappers built by
-    a single wrap call -- use it to join the caller's ambient context instead of opening a
-    second one.
-    """
-    return _FSDP_CONTEXT.get()
 
 
 def _collect_backward_order(

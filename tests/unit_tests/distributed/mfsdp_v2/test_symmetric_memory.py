@@ -13,6 +13,7 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
     RuntimePolicy,
     fully_shard,
@@ -66,7 +67,10 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         model = TinyModel().to(device=device, dtype=torch.bfloat16)
         mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
         with fully_shard_context(
-            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+            FsdpContext(
+                device=device,
+                runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory),
+            )
         ):
             fully_shard(
                 model.fc1,
@@ -198,7 +202,7 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
     with fully_shard_context(
-        device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=True)
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=True))
     ):
         fully_shard(
             model.fc1,
