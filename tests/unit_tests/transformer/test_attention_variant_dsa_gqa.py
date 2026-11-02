@@ -301,6 +301,27 @@ def test_transformer_config_accepts_min_memory_backend():
         assert config.dsa_kernel_backend == backend
 
 
+def test_transformer_config_rejects_flash_decode_with_dsa_over_gqa():
+    """flash_decode's kernel computes dense attention and cannot run DSA's sparse core attention,
+    so the combination is rejected when the config is built, not at the first decode step."""
+    with pytest.raises(ValueError, match="flash_decode is not supported by DSA over GQA"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_query_groups=1,
+            kv_channels=8,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            add_bias_linear=False,
+            dsa_indexer_topk=4,
+            dsa_kernel_backend="min-memory-torch",
+            dsa_indexer_loss_coeff=0.1,
+            dsa_indexer_use_sparse_loss=True,
+            flash_decode=True,
+        )
+
+
 def _simplified_test_indexer(hidden_size, head_dim, topk):
     indexer = SimpleNamespace(
         index_n_heads=1,

@@ -853,11 +853,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
             softmax_scale=self.get_softmax_scale(q),
-            window_size=self._flash_attn_window_size(),
         )
         # This path bypasses self.core_attention and calls flash-attention directly, so the
-        # configured cap has to be passed here too. Only when set, so runs without softcapping
-        # keep their current call signature on older flash-attention builds.
+        # layer's sliding window and the configured cap have to be passed here too. Only when
+        # set, so layers without them keep their current call signature on older flash-attention
+        # builds.
+        window_size = self._flash_attn_window_size()
+        if tuple(window_size) != (-1, -1):
+            assert is_fa_min_version("2.3.0"), "Sliding window attention requires flash-attn 2.3.0."
+            kv_kwargs["window_size"] = window_size
         softcap = self.config.attn_logit_softcapping
         if softcap is not None:
             assert is_fa_min_version(

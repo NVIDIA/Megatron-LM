@@ -115,7 +115,8 @@ class TestStaticFlashDecodeStep:
 
     flash_decode's kernel stands in for the KV-cache update and core attention only: the layer's
     sliding window must reach it, and the steps after core attention, such as the output gate,
-    must still run.
+    must still run, also with the RoPE the kernel applies and inside a CUDA graph, which static
+    CUDA graphs require flash_decode for.
     """
 
     batch, heads, groups, hidden = 2, 4, 2, 128  # head dim 32
@@ -165,10 +166,15 @@ class TestStaticFlashDecodeStep:
         )
         return attention.cuda().eval()
 
-    def _decode_step(self, attention):
+    def _decode_step(self, attention, rope=False, cuda_graph=False):
         """Run one decode step over a seeded KV cache.
 
-        Returns the core-attention output, the step's q/k/v (and gate) and the cached K/V.
+        With ``rope``, the kernel rotates the step's query and key (the cached keys stand for
+        already rotated ones). With ``cuda_graph``, the step is captured in a CUDA graph after an
+        eager run and the replayed output is returned.
+
+        Returns the core-attention output, the step's q/k/v (and gate), the cached K/V and the
+        RoPE cos/sin tables (or None).
         """
         dim = attention.hidden_size_per_attention_head
         generator = torch.Generator(device="cuda").manual_seed(0)
@@ -193,6 +199,22 @@ class TestStaticFlashDecodeStep:
         sequence_len_offset = torch.full(
             (self.batch,), self.cached, dtype=torch.int32, device="cuda"
         )
+        rotary = None
+        if rope:
+            rotary = RotaryEmbedding(kv_channels=dim, rotary_percent=1.0).get_cos_sin(
+                self.max_sequence_length
+            )
+
+        def step():
+            return attention.forward_pre_attn_and_core_attn(
+                hidden_states,
+                None,
+                inference_context=context,
+                rotary_pos_cos=None if rotary is None else rotary[0],
+                rotary_pos_sin=None if rotary is None else rotary[1],
+                sequence_len_offset=sequence_len_offset,
+            )
+
         projected = []
         get_query_key_value_tensors = attention.get_query_key_value_tensors
 
@@ -201,25 +223,35 @@ class TestStaticFlashDecodeStep:
             projected.extend(t.detach().clone() for t in outputs)
             return outputs
 
-        with (
-            mock.patch.object(attention, "get_query_key_value_tensors", side_effect=capture),
-            torch.no_grad(),
-            InferenceMode.active(),
-        ):
-            output = attention.forward_pre_attn_and_core_attn(
-                hidden_states,
-                None,
-                inference_context=context,
-                sequence_len_offset=sequence_len_offset,
-            )
-        return output, projected, cached_keys, cached_values
+        with torch.no_grad(), InferenceMode.active():
+            with mock.patch.object(attention, "get_query_key_value_tensors", side_effect=capture):
+                output = step()
+            if cuda_graph:
+                # The eager step warmed up the kernels. Replaying rewrites this step's key and
+                # value at the same cache position, so the cache stays as the reference sees it.
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = step()
+                graph.replay()
+                torch.cuda.synchronize()
+        return output, projected, cached_keys, cached_values, rotary
 
-    def _reference(self, projected, cached_keys, cached_values, window_size):
+    def _reference(self, projected, cached_keys, cached_values, window_size, rotary=None):
         """fp32 attention of the step's query over the keys its window allows, then the gate."""
         query, key, value = projected[:3]
         heads, dim = query.shape[2], query.shape[3]
         repeats = heads // key.shape[2]
-        keys = torch.cat([cached_keys, key]).float().repeat_interleave(repeats, dim=2)
+        if rotary is not None:
+            # The kernel rotates the step's query and key at its position with the bf16 tables
+            # flash_decode passes, rotating the two halves of each head (rotary_interleaved=False).
+            cos, sin = (t[self.cached].bfloat16().float() for t in rotary)
+
+            def rotate(x):
+                x1, x2 = x.float().chunk(2, dim=-1)
+                return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+            query, key = rotate(query), rotate(key)
+        keys = torch.cat([cached_keys.float(), key.float()]).repeat_interleave(repeats, dim=2)
         values = torch.cat([cached_values, value]).float().repeat_interleave(repeats, dim=2)
         scores = torch.einsum("bhd,kbhd->bhk", query[0].float(), keys) * dim**-0.5
         if window_size is not None:
@@ -231,16 +263,27 @@ class TestStaticFlashDecodeStep:
             output = output * torch.sigmoid(projected[3].float().reshape(output.shape))
         return output
 
-    @pytest.mark.parametrize("window_size", [None, window], ids=["full", "window"])
-    @pytest.mark.parametrize("attention_output_gate", [False, True], ids=["ungated", "gated"])
-    def test_decode_step_matches_reference(self, window_size, attention_output_gate):
+    def _check(self, window_size, attention_output_gate, rope=False, cuda_graph=False):
         attention = self._attention(window_size, attention_output_gate)
-        output, projected, cached_keys, cached_values = self._decode_step(attention)
+        output, projected, cached_keys, cached_values, rotary = self._decode_step(
+            attention, rope=rope, cuda_graph=cuda_graph
+        )
         assert len(projected) == (4 if attention_output_gate else 3)
-        reference = self._reference(projected, cached_keys, cached_values, window_size)
+        reference = self._reference(projected, cached_keys, cached_values, window_size, rotary)
         error = ((output.float() - reference).norm() / reference.norm()).item()
         assert error <= self.rel_tol, (
             f"static flash_decode step (window_size={window_size}, "
-            f"attention_output_gate={attention_output_gate}) differs from the reference by "
-            f"rel {error:.3g}"
+            f"attention_output_gate={attention_output_gate}, rope={rope}, "
+            f"cuda_graph={cuda_graph}) differs from the reference by rel {error:.3g}"
         )
+
+    @pytest.mark.parametrize("window_size", [None, window], ids=["full", "window"])
+    @pytest.mark.parametrize("attention_output_gate", [False, True], ids=["ungated", "gated"])
+    def test_decode_step_matches_reference(self, window_size, attention_output_gate):
+        self._check(window_size, attention_output_gate)
+
+    @pytest.mark.parametrize("cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+    def test_windowed_gated_decode_step_with_rope_matches_reference(self, cuda_graph):
+        """The window and gate hold together with the RoPE the kernel applies, eagerly and
+        replayed from a CUDA graph."""
+        self._check(self.window, True, rope=True, cuda_graph=cuda_graph)

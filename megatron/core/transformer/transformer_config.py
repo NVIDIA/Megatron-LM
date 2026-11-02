@@ -4662,6 +4662,12 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     not self.sequence_parallel
                 ), "Sequence parallelism is not supported by DSA over GQA."
+                if self.flash_decode:
+                    raise ValueError(
+                        "flash_decode is not supported by DSA over GQA: its decode kernel "
+                        "(flash_attn_with_kvcache) computes dense attention over the whole KV "
+                        "cache and cannot run DSA's sparse core attention."
+                    )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 if dense_dsa_warmup:

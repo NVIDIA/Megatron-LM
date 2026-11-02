@@ -833,11 +833,12 @@ class TestFlashDecodeSoftcapPlumbing:
     use it keep working against flash-attn builds that predate the kwarg.
     """
 
-    def _call_flash_decode(self, softcap, kernel):
+    def _call_flash_decode(self, softcap, kernel, window_size=(-1, -1)):
         """Invoke Attention.flash_decode with a stub self, returning the kernel's kwargs."""
         attn = mock.Mock()
         attn.config.attn_logit_softcapping = softcap
         attn._get_inference_softmax_offset.return_value = None
+        attn._flash_attn_window_size.return_value = window_size
         t = torch.zeros(2, 1, 4, 8)
         with (
             mock.patch("megatron.core.transformer.attention.flash_attn_with_kvcache", kernel),
@@ -866,6 +867,12 @@ class TestFlashDecodeSoftcapPlumbing:
         kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
         kwargs = self._call_flash_decode(None, kernel)
         assert "softcap" not in kwargs
+
+    def test_window_is_passed_only_on_window_layers(self):
+        """The same holds for the sliding window: passed on window layers, omitted otherwise."""
+        kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
+        assert self._call_flash_decode(None, kernel, window_size=(4, 0))["window_size"] == (4, 0)
+        assert "window_size" not in self._call_flash_decode(None, kernel)
 
 
 class TestFlashAttention3SoftcapWrapper:
