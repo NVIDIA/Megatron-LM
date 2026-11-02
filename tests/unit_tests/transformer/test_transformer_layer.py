@@ -181,6 +181,22 @@ class TestParallelTransformerLayer:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
 
+    def test_shared_prefix_forest_reaches_self_attention_only_when_set(self):
+        """Self-attention modules that take no shared_prefix_forest never receive the keyword."""
+        layer = self.parallel_transformer_layer.cuda()
+        hidden_states = torch.ones((8, 1, layer.config.hidden_size)).cuda()
+        forest = object()  # opaque to the layer
+        received = []
+
+        def self_attention(hidden_states, **kwargs):
+            received.append(kwargs.get("shared_prefix_forest", "omitted"))
+            return torch.zeros_like(hidden_states), None
+
+        with patch.object(layer.self_attention, "forward", side_effect=self_attention):
+            layer(hidden_states=hidden_states, attention_mask=None)
+            layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_forest=forest)
+        assert received == ["omitted", forest]
+
     def test_chunked_mlp(self):
         with torch.no_grad():
             num_layers = 2

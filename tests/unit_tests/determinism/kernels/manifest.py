@@ -191,9 +191,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
         "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
-        "The shared-prefix branch (a forest attached by a caller selects the forest kernel "
+        "The shared-prefix branch (a shared_prefix_forest argument selects the forest kernel "
         "in megatron/core/ops/attention/shared_prefix.py instead of core attention) is "
-        "replayed through a real SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
+        "replayed through a real SelfAttention at CP1/CP2 in test_shared_prefix_attention.py, "
+        "which asserts that the forest kernel runs on every forward.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",

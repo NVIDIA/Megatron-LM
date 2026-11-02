@@ -80,15 +80,46 @@ class TestParallelAttention:
         else:
             assert num_weights == 66304
 
-    def test_shared_prefix_forest_slot(self):
-        # A shared-prefix caller sets this per call and deletes it afterwards.
-        attention = self.parallel_attention
-        assert attention._shared_prefix_forest is None
-        forest = object()
-        attention._shared_prefix_forest = forest
-        assert attention._shared_prefix_forest is forest
-        del attention._shared_prefix_forest
-        assert attention._shared_prefix_forest is None
+    def test_shared_prefix_forest_replaces_core_attention(self, monkeypatch):
+        """A shared_prefix_forest argument runs the forest kernel on the layer's CP group."""
+        from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
+        from megatron.core.transformer import attention as attention_module
+
+        attention = self.parallel_attention.cuda()
+        layout = SharedPrefixForestLayout(
+            (SharedPrefixLayout(4, (3, 5)), SharedPrefixLayout(2, (6,)))
+        )
+        calls = []
+
+        def forest_kernel(query, key, value, forest, *, cp_group, scale):
+            calls.append((forest, cp_group, scale))
+            return query.new_zeros(query.shape[0], 1, query.shape[2] * query.shape[3])
+
+        def core_attention(*args, **kwargs):
+            raise AssertionError("core attention ran instead of the forest kernel")
+
+        monkeypatch.setattr(attention_module, "flash_composed_forest_attention_cp", forest_kernel)
+        monkeypatch.setattr(attention.core_attention, "forward", core_attention)
+        hidden_states = torch.ones(
+            (layout.total_len, 1, attention.config.hidden_size), dtype=torch.bfloat16
+        ).cuda()
+        output, _ = attention(hidden_states, None, shared_prefix_forest=layout)
+        assert output.shape == hidden_states.shape
+        head_dim = attention.config.kv_channels
+        assert calls == [(layout.forest, attention.pg_collection.cp, head_dim**-0.5)]
+
+        # The forest owns the attention mask, and a forest is not THD packing.
+        mask = torch.ones((1, 1, layout.total_len, layout.total_len), dtype=bool).cuda()
+        with pytest.raises(ValueError, match="does not accept a mask"):
+            attention(hidden_states, mask, shared_prefix_forest=layout)
+        with pytest.raises(NotImplementedError, match="static, unpacked training"):
+            attention(
+                hidden_states,
+                None,
+                packed_seq_params=make_test_packed_seq_params(cu_seqlens=[0, 12, layout.total_len]),
+                shared_prefix_forest=layout,
+            )
+        assert len(calls) == 1
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU

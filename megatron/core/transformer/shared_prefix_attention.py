@@ -3,8 +3,9 @@
 """Checks that a ``SelfAttention`` can run shared-prefix forest attention.
 
 The forest attention itself lives in :mod:`megatron.core.ops.attention.shared_prefix`. A caller
-that attaches a forest runs :func:`validate_shared_prefix_attention` for every attention layer
-before any layer executes; the attention forward does not repeat these checks.
+that passes ``shared_prefix_forest`` to attention layers runs
+:func:`validate_shared_prefix_attention` for each of them before any layer executes; the
+attention forward does not repeat these checks.
 """
 
 from megatron.core.ops.attention.shared_prefix import (
@@ -29,14 +30,14 @@ def _dense_core_attention_types() -> tuple:
 def validate_shared_prefix_attention(attention, *, tp_size: int, cp_size: int) -> None:
     """Reject a ``SelfAttention`` that the forest attention cannot run on this TP/CP topology.
 
-    A caller that attaches a forest runs this for every attention layer before any layer
-    executes; the attention forward does not repeat it. The checks read ``attention.config``;
+    A caller that passes a forest to attention layers runs this for each of them before any
+    layer executes; the attention forward does not repeat it. The checks read ``attention.config``;
     ``tp_size`` and ``cp_size`` are the caller's group sizes, which the layer's process groups
     must match. The last check binds flash-attn for the forest kernel and raises ``ImportError``
     when it is missing or older than 2.7.0.
     """
-    # Other Attention subclasses, such as multi-latent attention, override forward and never
-    # read the slot. SelfAttention (and any subclass that keeps its forward) does.
+    # Other Attention subclasses, such as multi-latent attention, override forward and do not
+    # take shared_prefix_forest. SelfAttention (and any subclass that keeps its forward) does.
     if not isinstance(attention, SelfAttention):
         raise NotImplementedError(
             "shared-prefix forest attention supports only SelfAttention, got "

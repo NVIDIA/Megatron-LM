@@ -60,6 +60,7 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.shared_prefix_layout import SharedPrefixForestLayout
 
 logger = logging.getLogger(__name__)
 
@@ -785,6 +786,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        shared_prefix_forest: Optional[SharedPrefixForestLayout] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -811,6 +813,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
+            shared_prefix_forest (SharedPrefixForestLayout, optional): Shared-prefix forest
+                stored in ``hidden_states``. It is passed to self-attention, which then runs the
+                shared-prefix forest attention, only when set.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -838,6 +843,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
+        # Only SelfAttention accepts a forest; other attention modules never see the keyword.
+        attention_kwargs = {}
+        if shared_prefix_forest is not None:
+            attention_kwargs["shared_prefix_forest"] = shared_prefix_forest
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
@@ -851,6 +860,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **attention_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 

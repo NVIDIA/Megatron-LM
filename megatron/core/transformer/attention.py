@@ -19,10 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.ops.attention.shared_prefix import (
-    flash_composed_forest_attention,
-    flash_composed_forest_attention_cp,
-)
+from megatron.core.ops.attention.shared_prefix import flash_composed_forest_attention_cp
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -36,6 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.shared_prefix_layout import SharedPrefixForestLayout
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -295,10 +293,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     This layer only contains common modules required for the "self attn" and
     "cross attn" specializations.
     """
-
-    # Per-call shared-prefix forest. A shared-prefix caller sets it on the instance around one
-    # layer call and deletes it afterwards, restoring this default.
-    _shared_prefix_forest = None
 
     def __init__(
         self,
@@ -1415,6 +1409,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
+        shared_prefix_forest: Optional[SharedPrefixForestLayout] = None,
     ) -> Tensor:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
@@ -1435,6 +1430,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
+            shared_prefix_forest (Optional[SharedPrefixForestLayout]): Shared-prefix forest
+                stored in this single packed sequence. When set, the exact shared-prefix forest
+                attention replaces core attention; the caller first checks the layer with
+                ``shared_prefix_attention.validate_shared_prefix_attention``.
 
         Return:
             Tensor consumed by the attention output projection.
@@ -1715,7 +1714,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        shared_prefix_forest = self._shared_prefix_forest
         if shared_prefix_forest is not None:
             if inference_context is not None or packed_seq_params is not None:
                 raise NotImplementedError(
@@ -1731,19 +1729,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
             softmax_scale = self.get_softmax_scale(query)
             with core_attn_manager as query:
-                if self.pg_collection.cp.size() > 1:
-                    core_attn_out = flash_composed_forest_attention_cp(
-                        query,
-                        key,
-                        value,
-                        shared_prefix_forest,
-                        cp_group=self.pg_collection.cp,
-                        scale=softmax_scale,
-                    )
-                else:
-                    core_attn_out = flash_composed_forest_attention(
-                        query, key, value, shared_prefix_forest, scale=softmax_scale
-                    )
+                core_attn_out = flash_composed_forest_attention_cp(
+                    query,
+                    key,
+                    value,
+                    shared_prefix_forest.forest,
+                    cp_group=self.pg_collection.cp,
+                    scale=softmax_scale,
+                )
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
             )

@@ -8,7 +8,8 @@ reference; their error must stay within twice the error of ordinary FlashAttenti
 the dense, unshared ``[prompt, completion]`` branches. CP1/2/4 tests use real NCCL
 exchanges and real FlashAttention forward/backward. No CUDA compute or communication
 implementation is substituted. The pass-plan, validation and cache tests run on CPU. One
-replay drives the shared-prefix branch of ``SelfAttention.forward`` at CP1 and CP2.
+replay drives the shared-prefix branch of ``SelfAttention.forward`` at CP1 and CP2 and checks
+that the forest kernel, not core attention, runs.
 """
 
 import itertools
@@ -298,7 +299,7 @@ def test_attention_validation_rejects_non_dense_core_attention(validate):
 
 
 def test_attention_validation_rejects_other_attention_modules(validate):
-    """Attention subclasses that override forward (for example MLA) never read the slot."""
+    """Attention subclasses that override forward (for example MLA) take no forest."""
     from types import SimpleNamespace
 
     other = SimpleNamespace(checkpoint_core_attention=False)
@@ -659,13 +660,16 @@ def test_shared_prefix_cp_replays_and_matches_reference(attention, dtype, heads,
 @_CUDA
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("cp_size", [1, 2])
-def test_self_attention_shared_prefix_branch_replays(cp_size):
+def test_self_attention_shared_prefix_branch_replays(attention, monkeypatch, cp_size):
     """Replay SelfAttention.forward's shared-prefix branch with real projections and RoPE.
 
-    A shared-prefix caller attaches the forest to ``Attention._shared_prefix_forest`` around each
-    layer call; the branch then runs the forest attention (CP all-to-all at CP2) between the
-    TE QKV and output projections. Inputs, RoPE positions (restarting at the prompt length for each
-    completion) and zigzag CP shards are built here as a model-level caller would build them.
+    The caller passes the forest as ``shared_prefix_forest``; the branch then runs the forest
+    attention (CP all-to-all at CP2) between the TE QKV and output projections. Inputs, RoPE
+    positions (restarting at the prompt length for each completion) and zigzag CP shards are built
+    here as a model-level caller would build them. Core attention is disabled during the replays
+    and the forest kernel must run on every forward. At CP1 the output must also match the same
+    layer run on each dense ``[prompt, completion]`` row, which a causal pass over the packed
+    forest would not.
     """
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -673,6 +677,7 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
     )
     from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import attention as attention_layer
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.enums import AttnMaskType
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -720,19 +725,41 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
             hidden_states=hidden.detach().requires_grad_(True),
             attention_mask=None,
             rotary_pos_emb=rotary_table.index_select(0, positions),
+            shared_prefix_forest=layout,
         )
-        module._shared_prefix_forest = layout.forest
-        try:
-            with deterministic_algorithms(True):
-                outputs, grads = assert_module_replays_bit_exact(
-                    module,
-                    inputs,
-                    replays=3,
-                    contention=True,
-                    what=f"SelfAttention shared-prefix branch CP{cp_size}",
-                )
-        finally:
-            del module._shared_prefix_forest
+
+        # The layer calls the CP entry point, which runs the base kernel at every CP size.
+        cp_calls, kernel_calls = [], []
+        cp_kernel = attention_layer.flash_composed_forest_attention_cp
+        kernel = attention.flash_composed_forest_attention
+
+        def recording_cp_kernel(*args, **kwargs):
+            cp_calls.append(kwargs["cp_group"])
+            return cp_kernel(*args, **kwargs)
+
+        def recording_kernel(*args, **kwargs):
+            kernel_calls.append(args[3])
+            return kernel(*args, **kwargs)
+
+        def core_attention(*args, **kwargs):
+            raise AssertionError("the shared-prefix branch ran core attention")
+
+        monkeypatch.setattr(
+            attention_layer, "flash_composed_forest_attention_cp", recording_cp_kernel
+        )
+        monkeypatch.setattr(attention, "flash_composed_forest_attention", recording_kernel)
+        with monkeypatch.context() as patch, deterministic_algorithms(True):
+            patch.setattr(module.core_attention, "forward", core_attention)
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                inputs,
+                replays=3,
+                contention=True,
+                what=f"SelfAttention shared-prefix branch CP{cp_size}",
+            )
+        # assert_module_replays_bit_exact runs `replays` forwards, the first one the reference.
+        assert cp_calls == [cp_group] * 3
+        assert kernel_calls == [layout.forest] * 3
         assert "in.hidden_states" in grads
         assert any("linear_qkv" in name for name in grads)
         assert any("linear_proj" in name for name in grads)
@@ -741,5 +768,24 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
             for tensors in (outputs, grads)
             for tensor in tensors.values()
         )
+
+        if cp_size == 1:
+            # Run every dense row through the same layer with core attention. Both sides round
+            # in bf16; a causal pass over the packed forest, where completions 2..G also attend
+            # completion 1, differs by O(1) on those rows.
+            bound = 4 * torch.finfo(torch.bfloat16).eps
+            with torch.no_grad(), deterministic_algorithms(True):
+                for row, branch in enumerate(layout.dense_branch_indices("cuda")):
+                    dense, _ = module(
+                        hidden_states=hidden.index_select(0, branch),
+                        attention_mask=None,
+                        rotary_pos_emb=rotary_table[: branch.numel()],
+                    )
+                    forest_rows = outputs["out[0]"].index_select(0, branch).float()
+                    error = ((forest_rows - dense.float()).norm() / dense.float().norm()).item()
+                    assert error <= bound, (
+                        f"dense row {row}: the forest output differs by {error:.2e} "
+                        f"(bound {bound:.2e})"
+                    )
     finally:
         Utils.destroy_model_parallel()
