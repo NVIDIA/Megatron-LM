@@ -1121,6 +1121,10 @@ def _check_dense_bins(ranks, *, capacity, multiple):
         for dense, unit in zip(aligned, shared):
             assert set(dense.row_indices) == set(unit.row_indices)
             assert expanded_length(unit, costs) == dense.physical_length
+            assert (
+                unit.shared_layout is None
+                or unit.shared_layout.dense_length == dense.physical_length
+            )
             if isinstance(unit.shared_layout, SharedPrefixForestLayout):
                 roots = unit.shared_layout.roots
                 assert unit.shared_layout.mtp_loss_group_root_counts == (len(roots),)

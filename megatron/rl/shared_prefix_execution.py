@@ -437,10 +437,7 @@ def _merge_dense_fallback_execution_units(
     for index in shared_indices:
         layout = units[index].shared_layout
         assert layout is not None
-        expanded_lengths[index] = sum(
-            len(root.row_indices) * root.prompt_length + sum(root.physical_completion_lengths)
-            for _, root in layout.iter_roots()
-        )
+        expanded_lengths[index] = layout.dense_length
     absorbed: set[int] = set()
     fallback_indices = sorted(
         (index for index, unit in enumerate(units) if unit.shared_layout is None),
