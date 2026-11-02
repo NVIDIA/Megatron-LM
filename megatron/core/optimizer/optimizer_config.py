@@ -315,6 +315,18 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Orthogonalize each head of a split QKV weight (each Q, gate, K and V head) on its own
+    instead of each projection. Requires ``muon_split_qkv``. Changes the update rule, so it is
+    off by default. Heads are cut from the full logical rows: GTP_remat shards are gathered
+    first (on every rank of the group), so the rule does not depend on the parallel layout."""
+
+    muon_split_mla_qkv: bool = False
+    """Split MLA up-projection weights (the query and key-value up-projections of MLA and
+    absorbed MLA) by head component for Muon, like fused QKV weights. Requires
+    ``muon_split_qkv``. Off by default, which keeps orthogonalizing them as whole matrices.
+    Combine with ``muon_split_qkv_per_head`` to orthogonalize each MLA head on its own."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -539,6 +551,11 @@ class OptimizerConfig:
         # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
         # value it will produce, not only the pre-finalize flag.
         will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
+
+        if self.muon_split_qkv_per_head and not self.muon_split_qkv:
+            raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True.")
+        if self.muon_split_mla_qkv and not self.muon_split_qkv:
+            raise ValueError("muon_split_mla_qkv requires muon_split_qkv=True.")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

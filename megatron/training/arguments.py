@@ -2688,6 +2688,13 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-qkv-per-head', action='store_true',
+                       help='Orthogonalize each Q, gate, K and V head of split QKV weights on its '
+                       'own instead of each projection. Changes the update rule; requires QKV '
+                       'splitting and is not supported with --muon-tp-mode layer_sharded.')
+    group.add_argument('--muon-split-mla-qkv', action='store_true',
+                       help='Also split MLA query and key-value up-projections by head component '
+                       'for Muon. Off by default: they are orthogonalized as whole matrices.')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',

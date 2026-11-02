@@ -284,6 +284,37 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     assert bytes_equal(projected[flat_unchanged], shard[flat_unchanged])
 
 
+@pytest.mark.parametrize(
+    "head_split_shapes", [(64,) * 6, (96, 32)], ids=["uniform-heads", "unequal-components"]
+)
+def test_muon_per_head_orthogonalize_replays(head_split_shapes):
+    """Per-head split-QKV Muon: batched Newton-Schulz per head width, replayed under contention."""
+    from megatron.core.optimizer import emerging_optimizers
+
+    if not emerging_optimizers.HAVE_EMERGING_OPTIMIZERS:
+        pytest.skip("requires emerging-optimizers")
+    seeded()
+    muon = emerging_optimizers.TensorParallelMuon(
+        [torch.nn.Parameter(torch.zeros(1, device="cuda"))],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: True,
+    )
+    num_groups, cols = 8, 1024
+    momentum = torch.randn(num_groups * sum(head_split_shapes), cols, device="cuda")
+    param = torch.nn.Parameter(torch.empty_like(momentum))
+    param.qkv_split_shapes = list(head_split_shapes)
+
+    assert_replays_bit_exact(
+        lambda grad: muon.orthogonalize(param, grad),
+        (momentum,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what=f"per-head Muon {head_split_shapes}",
+    )
+
+
 @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
 def test_whole_param_requantize_replays(recipe):
     """LayerWise whole-param gathers requantize BF16 into FP8 params on every rank."""

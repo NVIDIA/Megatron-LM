@@ -25,6 +25,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
+from ..transformer.qkv_layout import QKVLayout
 from .optimizer_config import ParamKey, ParamPredicate
 
 try:
@@ -54,6 +55,10 @@ logger = logging.getLogger(__name__)
 # ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
+# Newton-Schulz on a 3D [batch, rows, cols] input (one NS per matrix of the batch), and its
+# SYRK variant.
+_BATCHED_NS_MIN_EO_VERSION = "0.3.0"
+_BATCHED_SYRK_MIN_EO_VERSION = "0.5.0a0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -154,19 +159,12 @@ def _is_muon_excluded(param):
     return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
 
 
-def _get_qkv_split_shapes(model_cfg) -> list[int]:
-    """Compute QKV split shapes from model config."""
-    query_projection_size = (
-        model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
-    )
-    if getattr(model_cfg, 'attention_output_gate', False):
-        return [
-            query_projection_size,
-            query_projection_size,
-            model_cfg.kv_channels,
-            model_cfg.kv_channels,
-        ]
-    return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
+    """Split shapes of one fused QKV group of ``model_cfg``: per projection or per head."""
+    layout = QKVLayout.from_transformer_config(model_cfg)
+    if split_qkv_per_head:
+        return list(layout.per_head_split_shapes)
+    return list(layout.projection_split_shapes)
 
 
 # ===========================================================================
@@ -276,7 +274,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        split_qkv_per_head: bool = False,
     ) -> None:
+        if split_qkv_per_head and not split_qkv:
+            raise ValueError("split_qkv_per_head requires split_qkv=True")
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
@@ -326,6 +327,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
         self.split_qkv = split_qkv
+        self.split_qkv_per_head = split_qkv_per_head
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
         # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
@@ -602,6 +604,67 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             smaller_dim, reshard_rank * shard_size, shard_size
         ).contiguous()
 
+    def _orthogonalize_qkv_per_head(self, p, grad, head_split_shapes):
+        """Orthogonalize every head of a split QKV weight on its own.
+
+        ``head_split_shapes`` partitions one group (a query group, or an MLA head) of the
+        TP-local rows. TP shards hold complete groups, so heads never cross a TP boundary;
+        GTP_remat shards may, so every rank of a GTP_remat-sharded weight gathers the TP-local
+        rows first, whichever heads its own shard happens to cut. Heads of equal width are
+        orthogonalized in one batched Newton-Schulz when the installed emerging-optimizers
+        supports it. The result does not depend on TP, GTP or ``tp_mode``.
+        """
+        is_expert = getattr(p, 'expert_tp', False)
+        gtp_remat_group = (
+            resolve_gtp_remat_group(self.pg_collection, is_expert) if self.pg_collection else None
+        )
+        gtp_active = (
+            gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and getattr(p, 'is_gtp_weight_remat', False)
+        )
+        pad_length = getattr(p, 'pad_length', 0) if gtp_active else 0
+        rows = grad
+        if gtp_active:
+            rows = self._strip_pad(self._all_gather_tensor(grad, gtp_remat_group, 0), pad_length)
+
+        group_rows = sum(head_split_shapes)
+        if rows.size(0) % group_rows != 0:
+            raise RuntimeError(
+                f"Muon per-head QKV split shape mismatch: rows={rows.size(0)}, "
+                f"head_split_shapes={head_split_shapes}"
+            )
+        num_groups = rows.size(0) // group_rows
+        cols = rows.size(-1)
+        heads = torch.split(rows.view(num_groups, group_rows, cols), head_split_shapes, dim=1)
+        batched = is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION) and (
+            not self.use_syrk or is_emerging_optimizers_min_version(_BATCHED_SYRK_MIN_EO_VERSION)
+        )
+
+        def orthogonalize_heads(stacked):
+            # stacked: [num_heads, head_rows, cols]; plain NS on whole local heads.
+            if batched:
+                return self.scaled_orthogonalize_fn(stacked, None, None, "duplicated")
+            return torch.stack(
+                [self.scaled_orthogonalize_fn(h, None, None, "duplicated") for h in stacked]
+            )
+
+        orthogonalized = [None] * len(heads)
+        for width in dict.fromkeys(head_split_shapes):
+            indices = [i for i, w in enumerate(head_split_shapes) if w == width]
+            stacked = torch.stack([heads[i] for i in indices], dim=1).reshape(-1, width, cols)
+            result = orthogonalize_heads(stacked).view(num_groups, len(indices), width, cols)
+            for j, i in enumerate(indices):
+                orthogonalized[i] = result[:, j]
+        rows = torch.cat(orthogonalized, dim=1).view(-1, cols)
+
+        if gtp_active:
+            rows = self._restore_pad(rows, pad_length)
+            shard_rows = rows.size(0) // get_pg_size(gtp_remat_group)
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            rows = rows[gtp_rank * shard_rows : (gtp_rank + 1) * shard_rows]
+        return rows.contiguous()
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -636,6 +699,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 qkv_split_shapes = self.qkv_split_shapes
             if not qkv_split_shapes:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
+            if self.split_qkv_per_head:
+                return self._orthogonalize_qkv_per_head(p, grad, qkv_split_shapes)
         grad = self.scaled_orthogonalize_fn_with_gtp_remat(
             p, grad, tp_group, partition_dim, qkv_split_shapes=qkv_split_shapes
         )
@@ -694,6 +759,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        split_qkv_per_head: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -717,6 +783,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            split_qkv_per_head=split_qkv_per_head,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -775,7 +842,9 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
-    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(
+        model_chunks[0].config, split_qkv_per_head=kwargs.get("split_qkv_per_head", False)
+    )
     kwargs["pg_collection"] = pg_collection
     return kwargs
 
@@ -793,6 +862,9 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
         return kwargs
     # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
+    # Layer sharding routes whole matrices to NS homes and implements no QKV split.
+    if kwargs.pop("split_qkv_per_head", False):
+        raise ValueError("muon_tp_mode='layer_sharded' does not implement per-head split-QKV.")
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
     # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
     kwargs["tp_mode"] = "duplicated"

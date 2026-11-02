@@ -318,6 +318,51 @@ def _worker_partial_pg_collection(rank, world_size, port):
         )
 
 
+def _worker_per_head_split_is_layout_invariant(rank, world_size, port, mode, head_split):
+    """Opt-in per-head split: every padded GTP shard equals the per-head TP1 update.
+
+    Every rank gathers, including those whose own shard happens to hold whole heads, so
+    the result is the same for every tp_mode.
+    """
+    with _gtp_case(world_size):
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = TensorParallelMuon(
+            params=[torch.nn.Parameter(torch.zeros(1, device="cuda"))],
+            lr=0.01,
+            momentum=0.95,
+            weight_decay=0.0,
+            num_ns_steps=_NS_STEPS,
+            coefficient_type=_COEFFICIENT_TYPE,
+            scale_mode=_SCALE_MODE,
+            fp32_matmul_prec="highest",
+            pg_collection=pgc,
+            tp_mode=mode,
+            split_qkv=True,
+            split_qkv_per_head=True,
+            is_qkv_fn=lambda p: True,
+        )
+        w = _full_weight(_PADDED_M)
+        expected_full = torch.cat(
+            [
+                opt.scaled_orthogonalize_fn(head.clone(), None, None, "duplicated")
+                for group in w.split(_GROUP, dim=0)
+                for head in group.split(head_split, dim=0)
+            ]
+        )
+        local, pad_length = _padded_local_shard(w, pgc.gtp_remat)
+        local.qkv_split_shapes = head_split
+
+        out = opt.orthogonalize(local, local.clone())
+
+        padded = torch.nn.functional.pad(expected_full, (0, 0, 0, pad_length))
+        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
+        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
+        shard_rows = padded.size(0) // gs
+        torch.testing.assert_close(
+            out, padded[gr * shard_rows : (gr + 1) * shard_rows], atol=_ATOL, rtol=_RTOL
+        )
+
+
 class TestGTPMuonQKVSplit:
     """The [q|k|v] split happens after the all-gather, so GTP == TP1 per shard."""
 
@@ -363,3 +408,12 @@ class TestGTPMuonQKVSplit:
     def test_partial_pg_collection_matches_full(self, world_size):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_partial_pg_collection, world_size)
+
+    @pytest.mark.parametrize("world_size", _GTP_WORLD_SIZES)
+    @pytest.mark.parametrize("mode", ["duplicated", "blockwise", "distributed"])
+    @pytest.mark.parametrize(
+        "head_split", [[16] * 6, [64, 32]], ids=["uniform-heads", "unequal-components"]
+    )
+    def test_per_head_split_is_layout_invariant(self, world_size, mode, head_split):
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_per_head_split_is_layout_invariant, world_size, mode, head_split)

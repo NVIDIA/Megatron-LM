@@ -610,7 +610,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. The opt-in "
+        "per-head split-QKV Muon update (batched Newton-Schulz per head width) is replayed in "
+        "test_optimizer_kernels.py.",
     ),
     KernelEntry(
         name="tensor_metric_l2",

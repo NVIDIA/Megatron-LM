@@ -59,13 +59,13 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
+from ..transformer.qkv_layout import QKVLayout, set_mla_qkv_layouts
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
-    _get_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -878,36 +878,61 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv). A packed attention
+    # weight may declare its logical layout (``weight.qkv_layout``, a QKVLayout); a fused QKV
+    # weight without one uses the layout of its model config. MLA up-projections are split only
+    # with muon_split_mla_qkv, which attaches their layouts, and every split weight splits per
+    # head with muon_split_qkv_per_head.
+    if config.muon_split_qkv and config.muon_split_mla_qkv:
+        set_mla_qkv_layouts(model_chunks)
+    num_mla_split = 0
     for model_chunk in model_chunks:
-        qkv_split_shapes = None
+        config_qkv_layout = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                # MUST be pre-GTP-sharding rows, not param.shape[0] (this rank's shard):
-                # a shard-local test flips as the GTP degree changes, giving the SAME
-                # weight two different Muon update rules depending on parallel layout.
-                rows_before_gtp_sharding = (
-                    param._unsharded_shape[0]
-                    if getattr(param, 'is_gtp_weight_remat', False)
-                    else param.shape[0]
+            if len(param.shape) != 2:
+                continue
+            qkv_layout = getattr(param, 'qkv_layout', None)
+            if qkv_layout is None and 'linear_qkv.weight' in name:
+                if config_qkv_layout is None:
+                    config_qkv_layout = QKVLayout.from_transformer_config(model_chunk.config)
+                qkv_layout = config_qkv_layout
+            if qkv_layout is None or (qkv_layout.is_mla and not config.muon_split_mla_qkv):
+                continue
+            qkv_split_shapes = list(
+                qkv_layout.per_head_split_shapes
+                if config.muon_split_qkv_per_head
+                else qkv_layout.projection_split_shapes
+            )
+            # MUST be pre-GTP-sharding rows, not param.shape[0] (this rank's shard):
+            # a shard-local test flips as the GTP degree changes, giving the SAME
+            # weight two different Muon update rules depending on parallel layout.
+            rows_before_gtp_sharding = (
+                param._unsharded_shape[0]
+                if getattr(param, 'is_gtp_weight_remat', False)
+                else param.shape[0]
+            )
+            if rows_before_gtp_sharding % sum(qkv_split_shapes) == 0:
+                param.is_qkv = True
+                param.qkv_split_shapes = qkv_split_shapes
+                num_mla_split += int(qkv_layout.is_mla)
+            else:
+                log_single_rank(
+                    logger,
+                    logging.DEBUG,
+                    f"Emerging optimizer QKV split skipped for {name}: "
+                    f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
                 )
-                if rows_before_gtp_sharding % sum(qkv_split_shapes) == 0:
-                    param.is_qkv = True
-                    param.qkv_split_shapes = qkv_split_shapes
-                else:
-                    log_single_rank(
-                        logger,
-                        logging.DEBUG,
-                        f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
-                    )
+
+    if config.muon_split_mla_qkv and config.muon_split_qkv and num_mla_split == 0:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "muon_split_mla_qkv is set, but no MLA up-projection weight was found to split.",
+        )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
