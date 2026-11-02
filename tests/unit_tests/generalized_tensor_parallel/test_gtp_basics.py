@@ -1910,16 +1910,14 @@ class TestGTPCaptureParamReadiness:
                 self.rs_states.append(state)
 
         param = Param()
-        dummy_wgrad = object()
-        monkeypatch.setattr(gtp_module, "get_dummy_wgrad", lambda *args, **kwargs: dummy_wgrad)
 
         with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
-            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
-            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is None
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is None
             param.chain_id = GTPChain.UNGRAPHED.value
-            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is None
             param._grad_accum_hook = None
-            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is None
 
         assert capture.finalized_params == [param, param]
         assert hook_calls == [param, param, param]
