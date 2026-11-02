@@ -14,9 +14,16 @@
 
 """Align packed distributed forwards using each real source row exactly once."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
+
+from megatron.rl.shared_prefix_packing import (
+    SharedPrefixForestLayout,
+    SharedPrefixRow,
+    _round_up,
+    build_shared_prefix_layout,
+)
 
 if TYPE_CHECKING:
     from megatron.rl.shared_prefix_execution import SharedPrefixExecutionUnit
@@ -30,6 +37,19 @@ class AlignedUnit:
     # Reuse this original unit, including its shared layout. None means that
     # splitting changed its rows: construct a conventional dense fallback.
     source_unit: int | None
+
+
+def _balanced_cut(rows: Sequence[int], costs: Sequence[int]) -> int:
+    """Return the first cut in ``[1, len(rows))`` that best halves the rows' cost."""
+    total = sum(costs[row] for row in rows)
+    prefix = 0
+    best_cut, best_difference = 1, total
+    for cut, row in enumerate(rows[:-1], start=1):
+        prefix += costs[row]
+        difference = abs(total - 2 * prefix)
+        if difference < best_difference:
+            best_cut, best_difference = cut, difference
+    return best_cut
 
 
 def align_rows_to_count(
@@ -73,15 +93,7 @@ def align_rows_to_count(
         # The coverage/count preconditions guarantee a splittable real unit.
         index = max(candidates, key=lambda i: (work(result[i].row_indices), -i))
         original = result[index].row_indices
-        total = work(original)
-        prefix = 0
-        best_cut = 1
-        best_difference = total
-        for cut, row in enumerate(original[:-1], start=1):
-            prefix += costs[row]
-            difference = abs(total - 2 * prefix)
-            if difference < best_difference:
-                best_cut, best_difference = cut, difference
+        best_cut = _balanced_cut(original, costs)
         result[index : index + 1] = [
             AlignedUnit(original[:best_cut], None),
             AlignedUnit(original[best_cut:], None),
@@ -93,12 +105,6 @@ def rebuild_subset(
     unit: "SharedPrefixExecutionUnit", selected: Sequence[int], *, padding_multiple: int
 ) -> "SharedPrefixExecutionUnit":
     """Retain original source-row IDs and exact prompt identities in every root."""
-    from megatron.rl.shared_prefix_packing import (
-        SharedPrefixForestLayout,
-        SharedPrefixRow,
-        build_shared_prefix_layout,
-    )
-
     selected_rows = set(selected)
     if unit.shared_layout is None:
         raise ValueError("Rebuilding a shared subset requires a shared layout")
@@ -133,7 +139,6 @@ def align_physical_units(
     capacity: int,
     target_count: int,
     padding_multiple: int,
-    rebuild: Callable[..., "SharedPrefixExecutionUnit"] = rebuild_subset,
 ) -> tuple[tuple["SharedPrefixExecutionUnit", ...], dict[str, int]]:
     """Split real units while preserving physical bounds and prompt sharing.
 
@@ -163,7 +168,7 @@ def align_physical_units(
                 not unit.row_indices
                 or type(length) is not int
                 or length < 1
-                or (length + padding_multiple - 1) // padding_multiple * padding_multiple > capacity
+                or _round_up(length, padding_multiple) > capacity
             ):
                 raise ValueError("Physical execution unit exceeds aligned capacity")
             if unit.shared_layout is None and length != sum(costs[r] for r in unit.row_indices):
@@ -184,14 +189,7 @@ def align_physical_units(
         index = max(candidates, key=lambda i: (result[i].physical_length, -i))
         unit = result[index]
         rows = unit.row_indices
-        total = sum(costs[r] for r in rows)
-        prefix = 0
-        best_cut, best_difference = 1, total
-        for cut, row in enumerate(rows[:-1], start=1):
-            prefix += costs[row]
-            difference = abs(total - 2 * prefix)
-            if difference < best_difference:
-                best_cut, best_difference = cut, difference
+        best_cut = _balanced_cut(rows, costs)
         children = []
         for selected in (rows[:best_cut], rows[best_cut:]):
             if unit.shared_layout is None:
@@ -199,7 +197,7 @@ def align_physical_units(
                     unit, row_indices=selected, physical_length=sum(costs[r] for r in selected)
                 )
             else:
-                child = rebuild(unit, selected, padding_multiple=padding_multiple)
+                child = rebuild_subset(unit, selected, padding_multiple=padding_multiple)
             if set(child.row_indices) != set(selected):
                 raise ValueError("Rebuilt child changed its assigned source rows")
             children.append(child)
@@ -272,8 +270,6 @@ def align_training_units(
         bin_capacity=capacity,
         target_count=target_count,
     )
-    from megatron.rl.shared_prefix_packing import SharedPrefixForestLayout
-
     owners = {row: unit for unit in units for row in unit.row_indices}
     result = []
     for item in aligned:
@@ -305,10 +301,9 @@ def align_training_units(
                 )
         if child.row_indices != item.row_indices:
             raise ValueError("Training alignment changed source row order")
-        padded_physical = (
-            (child.physical_length + padding_multiple - 1) // padding_multiple * padding_multiple
-        )
-        if padded_physical > sum(costs[row] for row in item.row_indices):
+        if _round_up(child.physical_length, padding_multiple) > sum(
+            costs[row] for row in item.row_indices
+        ):
             raise ValueError("Rebuilt shared unit exceeds its expanded token budget")
         result.append(child)
     return tuple(result), sum(item.source_unit is None for item in aligned)
