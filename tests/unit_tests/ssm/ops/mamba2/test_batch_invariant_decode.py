@@ -784,6 +784,73 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 torch.equal(outs[0], outs[i]), f"determinism: run {i} differs from run 0"
             )
 
+    def test_adapter_cached_params_match_per_step_casts(self):
+        """The decode adapter reads A and dt_bias from the mixer's FP32 caches when present.
+
+        A step on the cached values must be bitwise the step on the per-step
+        ``-exp(A_log.float())`` and ``dt_bias.float()`` of BF16 parameters, outputs, SSM
+        state and replay buffers alike.
+        """
+        from types import SimpleNamespace
+
+        from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+
+        nh, p, ng, n = self.nh, self.headdim, self.ngroups, self.dstate
+        A_log = (torch.rand(nh, device=self.device) + 0.5).log().bfloat16()
+        dt_bias = (torch.randn(nh, device=self.device) * 0.01).bfloat16()
+        cp = SimpleNamespace(
+            get_A_log=lambda: A_log, get_dt_bias=lambda: dt_bias, get_D=lambda: self.D
+        )
+
+        def mixer(cached):
+            params = (-torch.exp(A_log.float()), dt_bias.float()) if cached else None
+            return SimpleNamespace(
+                rmsnorm=True,
+                headdim=p,
+                ngroups_local_tp=ng,
+                chunk_size=self.chunk_size,
+                D_has_hdim=False,
+                cp=cp,
+                _get_batch_invariant_decode_params=lambda: params,
+            )
+
+        max_requests, slot, prefill_len = 2, 1, 45
+        x, dt, B, C = self._make_seq(prefill_len + 1)
+        z = torch.randn_like(x)
+        cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
+        batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
+        ssm_state = torch.randn(max_requests, nh, p, n, device=self.device) * 0.1
+
+        results = []
+        for cached in (False, True):
+            adapter = MambaBatchInvariantDecode(mixer(cached))
+            adapter.seed(
+                x[0, :prefill_len],
+                dt[0, :prefill_len],
+                B[0, :prefill_len],
+                C[0, :prefill_len],
+                cu,
+                batch_indices,
+                max_requests,
+            )
+            state = ssm_state.clone()
+            pos = slice(prefill_len, prefill_len + 1)
+            y = adapter.step(
+                x[0, pos].reshape(1, nh * p),
+                z[0, pos].reshape(1, nh * p),
+                dt[:, pos],
+                B[0, pos].reshape(1, ng * n),
+                C[0, pos].reshape(1, ng * n),
+                batch_indices,
+                state,
+            )
+            bufs = adapter.buffers
+            results.append((y, state, bufs.x, bufs.dt, bufs.B, bufs.C, bufs.num_buffered))
+        for name, uncached, cached in zip(
+            ("y", "ssm_state", "x_buf", "dt_buf", "B_buf", "C_buf", "num_buffered"), *results
+        ):
+            self.assertTrue(torch.equal(uncached, cached), f"{name} differs with cached params")
+
 
 def _bits(t):
     """Raw bits, so signed zeros and NaN payloads compare too."""

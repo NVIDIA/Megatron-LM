@@ -1152,6 +1152,20 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
         return self._batch_invariant_decoder
 
+    def _apply(self, fn, recurse=True):
+        """Parameter conversions such as ``bfloat16()`` invalidate the inference caches.
+
+        The caches are plain tensors, so the conversion leaves them as they were. In eval
+        mode they are refreshed right away, because CUDA graph replay bypasses the lazy
+        refresh; in training mode they are refreshed at the next ``eval()``.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        if hasattr(self, "_A_neg_exp_cache"):
+            self._A_neg_exp_cache_stale = True
+            if not self.training and self.A_log.device.type != "meta":
+                self.refresh_cache()
+        return result
+
     def train(self, mode: bool = True):
         """Mark the decode cache stale in training and refresh it for evaluation."""
         if mode:

@@ -251,6 +251,58 @@ def test_causal_conv1d_update_replays():
     )
 
 
+def test_mixer_inference_param_caches_match_per_call_casts():
+    """Inference reads the FP32 conv weight/bias and A from the mixer's caches.
+
+    They must equal the per-call casts of the current parameters bit for bit, also after a
+    dtype conversion of an eval-mode module, so the conv update on FP32 conv states reads
+    the same operands and replays bit-exact.
+    """
+    from einops import rearrange
+
+    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+
+    seeded()
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        mixer.float()
+        with torch.no_grad():
+            # Values that BF16 cannot represent, so a stale FP32 cache would show.
+            for param in (mixer.conv1d_weight, mixer.conv1d_bias, mixer.A_log):
+                param.copy_(torch.randn_like(param) * 0.1 + 1.001)
+        mixer.eval()
+        mixer.bfloat16()  # converts the parameters after the caches were filled
+
+        def per_call():
+            weight = rearrange(mixer.conv1d_weight, "d 1 w -> d w").float()
+            return weight, mixer.conv1d_bias.float(), -torch.exp(mixer.A_log.float())
+
+        with torch.no_grad():
+            weight, bias = mixer._get_conv_params(
+                mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
+            )
+            assert weight.data_ptr() == mixer._conv_weight_fp32_cache.data_ptr()
+            for got, want in zip((weight, bias, mixer._A_neg_exp_cache), per_call()):
+                assert torch.equal(got, want)
+
+            batch, dim, width = 64, weight.shape[0], weight.shape[1]
+            x = torch.randn(batch, dim, device="cuda", dtype=torch.float32)
+            conv_state = torch.randn(batch, dim, width - 1, device="cuda", dtype=torch.float32)
+
+            def fn(x, conv_state):
+                return causal_conv1d_update(x, conv_state, weight, bias, True, None), conv_state
+
+            assert_replays_bit_exact(
+                fn,
+                (x, conv_state),
+                replays=4,
+                backward=False,
+                what="causal_conv1d_update on cached FP32 conv params",
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_causal_conv1d_update_spec_decode_replays():
     """Speculative decode: several tokens per request, with the rollback snapshots.
 
