@@ -48,11 +48,8 @@ from megatron.core.transformer.hyper_connection import (
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
-    build_residual_stream_recompute_plan,
-    residual_stream_recompute_enabled,
-)
-from megatron.core.transformer.residual_recompute_plan import (
     build_recompute_block_end_plan,
+    build_residual_stream_recompute_plan,
     finalize_recompute_block,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -62,9 +59,10 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
+    wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -351,16 +349,6 @@ class HybridStack(MegatronModule):
                         hash_moe_layer_threshold=hash_moe_layer_threshold,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is layer_utils.KDALayerConfig:
-                    layer = build_module(
-                        submodules.kda_layer,
-                        config=layer_config,
-                        layer_number=layer_number,
-                        pg_collection=pg_collection,
-                        add_layer_offset=False,
-                        pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
-                    )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
                     if layer_config.experimental_attention_variant == "gdn2":
@@ -373,6 +361,18 @@ class HybridStack(MegatronModule):
                         gdn_layer_spec = submodules.gdn2_layer
                     layer = build_module(
                         gdn_layer_spec,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif type(layer_config) is layer_utils.KDALayerConfig:
+                    layer = build_module(
+                        submodules.kda_layer,
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -424,14 +424,15 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.mhc_learned_output_contract:
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -715,7 +716,7 @@ class HybridStack(MegatronModule):
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
         use_residual_stream_recompute = (
             self.uses_wide_residual_stream
-            and residual_stream_recompute_enabled(self.config, self.training)
+            and wide_residual_recompute_enabled(self.config, self.training)
         )
         residual_stream_recompute_plan = (
             build_residual_stream_recompute_plan(
@@ -927,14 +928,23 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                n = self.config.mhc_num_residual_streams
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

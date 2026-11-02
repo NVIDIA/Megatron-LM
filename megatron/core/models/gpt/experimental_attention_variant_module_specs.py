@@ -29,6 +29,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -37,7 +40,6 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,

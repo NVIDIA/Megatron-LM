@@ -201,6 +201,7 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
             mtp_num_layers=1 if mtp_enabled else None,
             freeze_base_model_for_mtp=False,
         ),
+        hybrid_layer_config_list=None,
         pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),

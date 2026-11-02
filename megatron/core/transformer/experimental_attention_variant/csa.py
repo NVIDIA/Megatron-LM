@@ -14,6 +14,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_out_of_place,
 )
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
@@ -31,7 +32,6 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_co
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
-    OutputRopeParams,
     THDCompactIndexerWorkspace,
     _compact_flat_topk_idxs,
     batch_of_row,
