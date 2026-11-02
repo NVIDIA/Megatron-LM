@@ -103,6 +103,13 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
     does not implicitly inherit SFT-specific knobs."""
 
+    varlen_pretokenized_dataset: bool = False
+    """When True, :class:`VarlenDataset` reads pre-tokenized samples instead of
+    tokenizing the low-level data. ``--data-path`` is the tokens IndexedDataset
+    prefix and the assistant-only loss mask is read from the ``<prefix>.mask``
+    sidecar. Both streams are written by ``tools/preprocess_varlen_sft.py``.
+    """
+
     varlen_sbhd_validation: bool = False
     """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
     to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
