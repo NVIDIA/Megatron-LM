@@ -878,13 +878,11 @@ class _WithExpertCounts(torch.nn.Module):
         if self.moe_layer is None:
             outputs = self.module(hidden, token_multiplicities=self.multiplicities)
         else:
-            # As a shared-prefix caller scopes every MoE layer call.
-            self.moe_layer._shared_prefix_token_multiplicities = self.multiplicities
-            try:
-                with moe_utils.router_gating_token_blocks():
-                    outputs = self.module(hidden)
-            finally:
-                del self.moe_layer._shared_prefix_token_multiplicities
+            # As a shared-prefix caller passes them to every MoE layer call.
+            with moe_utils.router_gating_token_blocks():
+                outputs = self.module(
+                    hidden, shared_prefix_token_multiplicities=self.multiplicities
+                )
         return (*outputs, self.router.local_tokens_per_expert.clone())
 
 
@@ -1730,7 +1728,6 @@ class TestMoEModules:
             )
         counts = outputs["out[2]"]
         assert int(counts.sum()) == config.moe_router_topk * int(module.multiplicities.sum())
-        assert layer._shared_prefix_token_multiplicities is None
 
 
 @pytest.mark.parametrize("collective", ["ordered", "multimem"])
