@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -341,6 +342,32 @@ def test_flashinfer_cutlass_mxfp8_accepts_aligned_expert_tp_shards(
             backend="triton",
         )
         assert prepare_cutlass_mxfp8_weights(weight).logical_rows == rows
+
+
+def test_flashinfer_cutlass_mxfp8_experts_reject_a_resharded_config(monkeypatch):
+    """RL builds its inference model from a copy of the training config whose expert TP it changes
+    after validation. The experts check the shard they are built with, before any forward."""
+    from megatron.core.transformer.moe import experts as experts_module
+
+    config = _make_bounded_mxfp8_config(
+        moe_ffn_hidden_size=1920,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+    inference_config = copy.deepcopy(config)
+    inference_config.expert_tensor_parallel_size = 2
+    monkeypatch.setattr(
+        experts_module.TEGroupedMLP,
+        "__init__",
+        lambda self, *args, **kwargs: torch.nn.Module.__init__(self),
+    )
+
+    with pytest.raises(ValueError, match="per-rank FFN dimensions divisible by 128"):
+        experts_module.InferenceGroupedMLP(
+            num_local_experts=1, config=inference_config, submodules=None
+        )
+    # The training layout's 1920-wide shard is aligned.
+    config.validate_flashinfer_cutlass_mxfp8_expert_shapes()
 
 
 def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
