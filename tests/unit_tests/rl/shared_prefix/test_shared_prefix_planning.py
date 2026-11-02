@@ -220,6 +220,36 @@ def _merged_dense_fallbacks(capacity):
     return {"units": _summary(units), "expanded": [expanded_length(u, costs) for u in units]}
 
 
+def _worker_modes(plan_rows, capacity, **kwargs):
+    """Plan ``plan_rows`` in every worker mode, with a first-fit-decreasing dense packer."""
+    kwargs |= dict(bin_capacity=capacity, dense_packer=first_fit_decreasing(capacity))
+    return {
+        mode: _summary(plan_shared_prefix_execution_units(plan_rows, **kwargs, **options))
+        for mode, options in WORKER_MODES.items()
+    }
+
+
+def _ungrouped_rows():
+    """Rows 0-1 share group ``a``'s prompt; rows 2 and 3 have no group ID."""
+    plan_rows = [row(0, group="a"), row(1, group="a"), row(2, group=None), row(3, group=None)]
+    return _worker_modes(plan_rows, 16, padding_multiple=1)
+
+
+def _largest_first():
+    """Stars ``a`` (4 tokens) and ``b`` (14) plus an ungrouped 8-token row."""
+    plan_rows = [SharedPrefixRow(i, "a", (1, 2), 1) for i in (0, 1)]
+    plan_rows += [SharedPrefixRow(i, "b", tuple(range(6)), 4) for i in (2, 3)]
+    plan_rows.append(SharedPrefixRow(4, None, (9,), 7))
+    return _worker_modes(plan_rows, 20, padding_multiple=1, largest_first=True)
+
+
+def _odd_row(siblings, odd, *, prompt, completion, multiple, capacity):
+    """``siblings`` rows of group ``g`` share ``prompt``; the next row of ``g`` is ``odd``."""
+    plan_rows = rows(siblings, group="g", prompt=prompt, completion=completion)
+    plan_rows.append(SharedPrefixRow(siblings, "g", *odd))
+    return _worker_modes(plan_rows, capacity, padding_multiple=multiple)
+
+
 def _packer_called_twice():
     seen, kwargs = [], dict(costs=(4, 4), bin_capacity=8)
     units = plan_dense_training_bins(dense_packer=lambda c: seen.append(c) or [(1, 0)], **kwargs)
@@ -404,6 +434,53 @@ PLANNING_EXAMPLES = {
     "execution-merge-dense-fallbacks-cap12": (
         lambda: _merged_dense_fallbacks(12),
         {"units": [((2,), "dense", 4), ((3, 4), "dense", 6), ((0, 1), "star", 6)]},
+    ),
+    # Rows without a group ID are independent dense rows, however many there are.
+    "execution-ungrouped-rows": (
+        _ungrouped_rows,
+        {
+            "slots": [((0, 1), "star", 7), ((2,), "dense", 5), ((3,), "dense", 5)],
+            "forest": [((2,), "dense", 5), ((3,), "dense", 5), ((0, 1), "star", 7)],
+            "forest_dense": [((2, 3), "dense", 10), ((0, 1), "star", 7)],
+        },
+    ),
+    # Every mode returns stars, forests and dense units by nonincreasing physical length.
+    "execution-largest-first": (
+        _largest_first,
+        {
+            mode: [((2, 3), "star", 14), ((4,), "dense", 8), ((0, 1), "star", 4)]
+            for mode in WORKER_MODES
+        },
+    ),
+    # One odd row in a slot: with group packing the other rows still share and only the odd
+    # row runs dense; without it the slot stays one forward and runs dense.
+    "execution-partial-star-prompt-mismatch": (
+        lambda: _odd_row(
+            7, ((1, 2, 4), 2), prompt=(1, 2, 3), completion=2, multiple=1, capacity=40
+        ),
+        {
+            "slots": [(tuple(range(8)), "dense", 40)],
+            "forest, forest_dense": ([((7,), "dense", 5), (tuple(range(7)), "star", 17)],) * 2,
+        },
+    ),
+    "execution-partial-star-empty-placeholder": (
+        lambda: _odd_row(7, ((), 1), prompt=(1, 2, 3), completion=2, multiple=1, capacity=40),
+        {
+            "slots": [(tuple(range(8)), "dense", 36)],
+            "forest, forest_dense": ([((7,), "dense", 1), (tuple(range(7)), "star", 17)],) * 2,
+        },
+    ),
+    # A NeMo-RL reassembler placeholder (prompt length 0, one pad token) next to 15 siblings
+    # with 100-token prompts at padding multiple 16: a 520-token star plus a 16-token
+    # placeholder instead of 1936 dense tokens.
+    "execution-partial-star-nemo-rl-placeholder": (
+        lambda: _odd_row(
+            15, ((), 1), prompt=tuple(range(1, 101)), completion=20, multiple=16, capacity=4096
+        ),
+        {
+            "slots": [(tuple(range(16)), "dense", 1936)],
+            "forest, forest_dense": ([((15,), "dense", 16), (tuple(range(15)), "star", 520)],) * 2,
+        },
     ),
     # Called twice to enforce determinism.
     "dense-bins-packer-called-twice": (
@@ -671,19 +748,35 @@ EXECUTION = [
     ("validate-padded-length", lambda: _validate_star(physical_length=13), "length must equal"),
     ("duplicate-row", lambda: _execution([row(0), row(0)]), "unique source row indices"),
     ("branch-limit-one", lambda: _execution(max_completions_per_bin=1), "at least 2"),
+    # Flags are checked before any row, so these raise even for a batch that plans as one star.
+    (
+        "evaluation-without-group-packing",
+        lambda: _execution(evaluation_packing=True),
+        "pack_groups",
+    ),
+    (
+        "dense-repacking-without-groups",
+        lambda: _execution(pack_dense_fallbacks=True),
+        "pack_groups",
+    ),
+    (
+        "dense-repacking-without-packer",
+        lambda: _execution(pack_groups=True, pack_dense_fallbacks=True),
+        "length-only packer",
+    ),
+    (
+        "merge-without-dense-repacking",
+        lambda: _execution(pack_groups=True, merge_dense_fallbacks=True),
+        "pack_dense_fallbacks",
+    ),
     # A 3-token prompt plus 7 completion tokens exceeds the 8-token budget, in a group or alone.
+    ("row-over-capacity", lambda: _execution([row(0, completion=7)]), "execution bin"),
     (
         "group-row-over-capacity",
         lambda: _execution([row(0), row(1, completion=7)]),
         "execution bin",
     ),
-    (
-        "singleton-over-capacity",
-        lambda: _execution([row(0, completion=7)]),
-        "exceeds its bin capacity",
-        RuntimeError,
-    ),
-    ("group-row-empty", lambda: _execution([row(0), row(1, prompt=(), completion=0)]), "positive"),
+    ("row-empty", lambda: _execution([row(0), row(1, prompt=(), completion=0)]), "positive"),
     ("dense-packer-drops-row", lambda: _dense_singletons(2, 2, [[0]]), "every source row exactly"),
     ("dense-packer-over-budget", lambda: _dense_singletons(4, 6, [[0, 1, 2, 3]]), "token budget"),
 ]
@@ -940,22 +1033,29 @@ def _pipeline(rng):
                 for forward_only, evaluation in ((False, False), (True, False), (True, True)):
                     if evaluation and not options:
                         continue
+                    largest_first = iteration % 2 == 1
                     context = dict(mode=mode, forward_only=forward_only, evaluation=evaluation)
                     with note(iteration=iteration, chunk=chunk, **context):
-                        _check_rank_plans(ranks, options, forward_only, evaluation, **limits)
+                        flags = (forward_only, evaluation, largest_first)
+                        _check_rank_plans(ranks, options, *flags, **limits)
             with note(iteration=iteration, chunk=chunk, mode="dense-bins"):
                 _check_dense_bins(ranks, **limits)
 
 
-def _check_rank_plans(ranks, options, forward_only, evaluation, *, capacity, multiple):
+def _check_rank_plans(
+    ranks, options, forward_only, evaluation, largest_first, *, capacity, multiple
+):
     physical_only = forward_only and evaluation
     limits = dict(capacity=capacity, multiple=multiple, expanded_budget=not physical_only)
     kwargs = dict(bin_capacity=capacity, padding_multiple=multiple, forward_only=forward_only)
     kwargs |= dict(evaluation_packing=evaluation, dense_packer=first_fit_decreasing(capacity))
+    kwargs |= dict(largest_first=largest_first)
     plans = []
     for local_rows, costs in ranks:
         units = plan_shared_prefix_execution_units(local_rows, **kwargs, **options)
         check_units(units, costs, **limits)
+        lengths = [unit.physical_length for unit in units]
+        assert not largest_first or lengths == sorted(lengths, reverse=True)
         if not options:
             # Without group packing, every forward is one local slot of one group.
             for unit in units:
