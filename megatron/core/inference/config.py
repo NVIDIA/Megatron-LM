@@ -44,7 +44,10 @@ class MambaInferenceStateConfig:
     """The dtype to use for Mamba SSM state. Batch-invariant mode requires FP32."""
 
     mamba_chunk_size: int = 128
-    """The chunk size used by the Mamba SSM Triton kernels."""
+    """The chunk size used by the Mamba SSM Triton kernels. Dynamic prefill builds its chunk
+    boundaries at this size while each mixer runs its kernels at its own `chunk_size`, so the
+    two must agree: `from_model` copies the mixers' value, and the dynamic engine rejects a
+    config that differs from the model (see `check_chunking`)."""
 
     ssm_chunk_alignment: Optional[int] = None
     """Token quantum that a prefill chunk boundary must land on for the model's
@@ -145,6 +148,38 @@ class MambaInferenceStateConfig:
                 gdp_num_householder=gdp_num_householder,
             )
         return None
+
+    def check_chunking(self, model: MegatronModule) -> None:
+        """Raise unless this config chunks prefill the way `model`'s SSM layers run.
+
+        The dynamic context builds every prefill chunk boundary from `mamba_chunk_size`,
+        `ssm_chunk_alignment` and `gdp_num_householder`, while each SSM mixer runs its
+        kernels at its own chunk size. When they differ, prefill outputs and cached states
+        are wrong, and a context chunk larger than the mixer's reads past the kernels'
+        buffers. `from_model` derives all three from the model.
+
+        Args:
+            model: The (pipeline-stage) model the config is used with.
+        """
+        from megatron.core.ssm.ssm_inference import ssm_chunking
+
+        decoder = get_attr_wrapped_model(model, "decoder")
+        layer_type_list = getattr(decoder, "layer_type_list", None)
+        if layer_type_list is None:
+            return
+        chunking = ssm_chunking(layer_type_list, decoder.physical_layers())
+        if chunking is None:
+            # No SSM layer on this pipeline stage reads the chunk boundaries.
+            return
+        expected = (chunking.chunk_size, chunking.inference_chunk_size, chunking.num_householder)
+        actual = (self.mamba_chunk_size, self.ssm_chunk_alignment, self.gdp_num_householder)
+        if actual != expected:
+            raise ValueError(
+                "MambaInferenceStateConfig (mamba_chunk_size, ssm_chunk_alignment, "
+                f"gdp_num_householder) = {actual} does not match the model's SSM layers, "
+                f"which need {expected}. Build the config with "
+                "MambaInferenceStateConfig.from_model."
+            )
 
 
 def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:

@@ -580,3 +580,58 @@ class TestSSMChunkAlignment:
             mamba_chunk_size=64,
         )
         assert config.ssm_chunk_alignment == 64
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "mixer", [_mamba_mixer(128), _mamba_mixer(256), _gdp_mixer()], ids=["mamba", "256", "gdp"]
+    )
+    def test_config_from_model_matches_the_model_chunking(self, mixer):
+        model = _ssm_model([mixer] * 2)
+        MambaInferenceStateConfig.from_model(model).check_chunking(model)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("mixer", "chunking"),
+        [
+            pytest.param(
+                _mamba_mixer(128),
+                dict(mamba_chunk_size=256, ssm_chunk_alignment=256),
+                id="larger-context-chunk",
+            ),
+            pytest.param(
+                _mamba_mixer(128),
+                dict(mamba_chunk_size=64, ssm_chunk_alignment=64),
+                id="smaller-context-chunk",
+            ),
+            pytest.param(
+                _mamba_mixer(256),
+                dict(mamba_chunk_size=128, ssm_chunk_alignment=128),
+                id="default-chunk-for-another-mixer-chunk",
+            ),
+            pytest.param(_gdp_mixer(num_householder=2), dict(gdp_num_householder=3), id="gdp"),
+        ],
+    )
+    def test_chunking_that_differs_from_the_model_is_rejected(self, mixer, chunking):
+        """Prefill chunk boundaries come from the config, the kernels' chunk from the mixer.
+
+        A larger context chunk makes prefill outputs and states wrong and reads past the
+        kernels' buffers; a smaller one caches the wrong batch-invariant state.
+        """
+        model = _ssm_model([mixer] * 2)
+        config = dataclasses.replace(MambaInferenceStateConfig.from_model(model), **chunking)
+        with pytest.raises(ValueError, match="does not match the model's SSM layers"):
+            config.check_chunking(model)
+
+    @pytest.mark.internal
+    def test_stage_without_a_recurrent_layer_checks_no_chunking(self):
+        """No layer on a pure attention/MLP pipeline stage reads the chunk boundaries."""
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        layers = (SimpleNamespace(), SimpleNamespace())
+        model = SimpleNamespace(
+            decoder=SimpleNamespace(
+                layer_type_list=[Symbols.ATTENTION, Symbols.MLP], physical_layers=lambda: layers
+            )
+        )
+        config = MambaInferenceStateConfig.from_model(_ssm_model([_mamba_mixer(64)]))
+        config.check_chunking(model)

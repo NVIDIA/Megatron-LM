@@ -9014,3 +9014,81 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         staggered = self._run_test(**common, num_gap_steps=3)
 
         assert self._generated_tokens(staggered) == self._generated_tokens(dense)
+
+
+class TestDynamicEngineSSMChunking:
+    """Dynamic prefill chunks at the context's `mamba_chunk_size` while each Mamba mixer runs
+    its kernels at its own `chunk_size`, so the engine requires the two to agree."""
+
+    def setup_method(self, method):
+        skip_if_sequence_packing_not_available()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(321)
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_engine(context_chunk_size=None):
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=128,
+            num_attention_heads=4,
+            is_hybrid_model=True,
+            mamba_num_heads=8,
+            mamba_head_dim=32,
+            mamba_num_groups=1,
+            mamba_state_dim=16,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            normalization="RMSNorm",
+            params_dtype=torch.bfloat16,
+            bf16=True,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec_for("mamba"),
+            hybrid_layer_pattern="M*-",
+            vocab_size=128,
+            max_sequence_length=512,
+        )
+        model = model.cuda().eval()
+        assert model.decoder.layers[0].mixer.chunk_size == 128
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        if context_chunk_size is not None:
+            # A hand-built config whose prefill chunking differs from the mixer's.
+            mamba_config.mamba_chunk_size = context_chunk_size
+            mamba_config.ssm_chunk_alignment = context_chunk_size
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.25,
+                block_size_tokens=256,
+                mamba_inference_state_config=mamba_config,
+                max_requests=4,
+                max_tokens=512,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+        controller = TextGenerationController(
+            inference_wrapped_model=GPTInferenceWrapper(model, context),
+            tokenizer=types.SimpleNamespace(vocab_size=128, detokenize=lambda tokens: ""),
+        )
+        return DynamicInferenceEngine(controller, context)
+
+    def test_engine_accepts_the_chunking_from_the_model(self):
+        engine = self._build_engine()
+        assert engine.context.mamba_chunk_size == 128
+
+    @pytest.mark.parametrize("context_chunk_size", [256, 64])
+    def test_engine_rejects_chunking_that_differs_from_the_model(self, context_chunk_size):
+        """A larger context chunk gives wrong prefill outputs and states and reads past the
+        kernels' buffers; a smaller one caches the wrong state in batch-invariant mode."""
+        with pytest.raises(ValueError, match="does not match the model's SSM layers"):
+            self._build_engine(context_chunk_size)

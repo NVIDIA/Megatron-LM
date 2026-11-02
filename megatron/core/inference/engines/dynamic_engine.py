@@ -526,6 +526,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
+        if inference_config.mamba_inference_state_config is not None:
+            # The context's prefill chunk boundaries must be the ones the SSM kernels run at.
+            inference_config.mamba_inference_state_config.check_chunking(
+                controller.inference_wrapped_model.model
+            )
 
         if inference_config.pg_collection is not None:
             self.pg_collection = inference_config.pg_collection
