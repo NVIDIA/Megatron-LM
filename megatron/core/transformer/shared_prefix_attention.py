@@ -34,7 +34,7 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
     # read the slot. SelfAttention (and any subclass that keeps its forward) does.
     if not isinstance(attention, SelfAttention):
         raise NotImplementedError(
-            "shared-prefix fused attention supports only SelfAttention, got "
+            "shared-prefix forest attention supports only SelfAttention, got "
             f"{type(attention).__name__}"
         )
     # The forest replaces core attention outright, so only dense dot-product core attention can
@@ -42,36 +42,36 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
     # different core attention (DSA over GQA does), which the forest would silently bypass.
     if not isinstance(getattr(attention, "core_attention", None), _dense_core_attention_types()):
         raise NotImplementedError(
-            "shared-prefix fused attention requires dot-product core attention, got "
+            "shared-prefix forest attention requires dot-product core attention, got "
             f"{type(getattr(attention, 'core_attention', None)).__name__}"
         )
     if attention.checkpoint_core_attention:
         raise NotImplementedError(
-            'shared-prefix fused attention does not yet support selective '
+            'shared-prefix forest attention does not yet support selective '
             'core-attention recomputation'
         )
     if config.qk_clip or config.log_max_attention_logit:
         raise NotImplementedError(
-            'shared-prefix fused attention does not yet produce QK-clipping/max-logit statistics'
+            'shared-prefix forest attention does not yet produce QK-clipping/max-logit statistics'
         )
     # The forest branch replaces core attention, so it must not silently drop these settings.
     window_size = config.window_size
     if window_size is not None and tuple(window_size) != (-1, -1):
-        raise NotImplementedError("shared-prefix fused attention does not support sliding windows")
+        raise NotImplementedError("shared-prefix forest attention does not support sliding windows")
     if config.softmax_type != "vanilla":
-        raise NotImplementedError("shared-prefix fused attention supports only vanilla softmax")
+        raise NotImplementedError("shared-prefix forest attention supports only vanilla softmax")
     if config.attention_dropout != 0.0:
-        raise NotImplementedError("shared-prefix fused attention requires zero attention dropout")
+        raise NotImplementedError("shared-prefix forest attention requires zero attention dropout")
     if getattr(config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError(
-            "shared-prefix fused attention does not support logit softcapping"
+            "shared-prefix forest attention does not support logit softcapping"
         )
     # Batch-invariant mode pins FlashAttention 3 or 4 with a fixed split schedule
     # (TransformerConfig requires flash_attention_version 3 or 4). The forest always runs
     # FlashAttention 2 passes merged by log-sum-exp, so it cannot reproduce those kernels.
     if getattr(config, "batch_invariant_mode", False):
         raise NotImplementedError(
-            "shared-prefix fused attention does not support batch-invariant mode: it runs "
+            "shared-prefix forest attention does not support batch-invariant mode: it runs "
             "FlashAttention 2 passes whatever flash_attention_version selects"
         )
     if attention.pg_collection.tp.size() != tp_size:

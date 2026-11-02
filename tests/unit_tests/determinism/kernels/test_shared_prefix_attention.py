@@ -468,7 +468,7 @@ def test_backward_follows_torch_deterministic_algorithms(attention, monkeypatch,
 def test_composed_attention_matches_independent_reference(
     attention, dtype, kind, deterministic, dim
 ):
-    """Fused error vs fp64 stays within 2x of dense unshared FlashAttention's error."""
+    """Forest error vs fp64 stays within 2x of dense unshared FlashAttention's error."""
     seeded()
     forest = _FORESTS[kind]
     inputs = _qkv(_total(forest) + 8, dtype, dim=dim)
@@ -479,21 +479,21 @@ def test_composed_attention_matches_independent_reference(
         return attention.flash_composed_forest_attention(q, k, v, forest)
 
     with deterministic_algorithms(deterministic):
-        fused = run_once(operation, inputs, {"out": cotangent})
+        forest = run_once(operation, inputs, {"out": cotangent})
         baseline = run_once(
             lambda q, k, v: _dense_branches(q, k, v, forest), inputs, {"out": cotangent}
         )
-    assert all(torch.isfinite(tensor).all() for tensors in fused for tensor in tensors.values())
-    assert torch.count_nonzero(fused[0]["out"][-8:]) == 0
-    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in fused[1].values())
-    fused_errors = _relative_errors(fused, truth)
+    assert all(torch.isfinite(tensor).all() for tensors in forest for tensor in tensors.values())
+    assert torch.count_nonzero(forest[0]["out"][-8:]) == 0
+    assert all(torch.count_nonzero(gradient[-8:]) == 0 for gradient in forest[1].values())
+    forest_errors = _relative_errors(forest, truth)
     baseline_errors = _relative_errors(baseline, truth)
-    for name, fused_error, baseline_error in zip(
-        ("out", "dq", "dk", "dv"), fused_errors, baseline_errors
+    for name, forest_error, baseline_error in zip(
+        ("out", "dq", "dk", "dv"), forest_errors, baseline_errors
     ):
-        assert fused_error <= 2 * baseline_error, (
-            f"{kind}/{dtype}/hn{dim} {name}: fused relative error {fused_error:.3e} exceeds twice "
-            f"the dense-branch FlashAttention error {baseline_error:.3e}"
+        assert forest_error <= 2 * baseline_error, (
+            f"{kind}/{dtype}/hn{dim} {name}: forest relative error {forest_error:.3e} exceeds "
+            f"twice the dense-branch FlashAttention error {baseline_error:.3e}"
         )
 
 
@@ -630,7 +630,7 @@ def test_self_attention_shared_prefix_branch_replays(cp_size):
     """Replay SelfAttention.forward's shared-prefix branch with real projections and RoPE.
 
     A shared-prefix caller attaches the forest to ``Attention._shared_prefix_forest`` around each
-    layer call; the branch then runs the fused forest attention (CP all-to-all at CP2) between the
+    layer call; the branch then runs the forest attention (CP all-to-all at CP2) between the
     TE QKV and output projections. Inputs, RoPE positions (restarting at the prompt length for each
     completion) and zigzag CP shards are built here as a model-level caller would build them.
     """

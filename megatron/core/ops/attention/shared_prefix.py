@@ -335,7 +335,7 @@ def _redo_cp_zigzag(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
 def _cp_local_kv_head_slice(query_heads: int, kv_heads: int, cp_size: int, cp_rank: int) -> slice:
     """Return the global KV-head span serving one CP rank's contiguous Q-head span.
 
-    The fused flash primitive supports GQA, but its local Q-to-KV grouping must exactly
+    The forest primitive supports GQA, but its local Q-to-KV grouping must exactly
     match the global grouping after Q heads are sharded over CP.  Some valid layouts
     (including 32 Q heads / 2 KV heads / CP4) replicate a single KV head on multiple CP
     ranks.  Layouts whose CP boundary cuts unequal pieces from several KV groups fail

@@ -120,7 +120,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "flash-attn >= 2.7.0), eager online-softmax merge and FP32 K/V index_add_ "
         "accumulation. Exact output/gradient replay needs only "
         "torch.use_deterministic_algorithms(True): the backward passes "
-        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Fused "
+        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Forest "
         "errors vs FP64 are bounded by 2x the dense-branch FlashAttention error. CP1/2/4 tests "
         "use real NCCL all-to-all, including replicated GQA KV heads.",
     ),

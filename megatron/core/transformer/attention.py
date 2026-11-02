@@ -1719,15 +1719,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if shared_prefix_forest is not None:
             if inference_context is not None or packed_seq_params is not None:
                 raise NotImplementedError(
-                    "shared-prefix fused attention only supports static, unpacked training"
+                    "shared-prefix forest attention only supports static, unpacked training"
                 )
             if attention_mask is not None or attention_bias is not None:
                 raise ValueError(
-                    'shared-prefix fused attention owns its tree mask and does not accept a '
+                    'shared-prefix forest attention owns its tree mask and does not accept a '
                     'mask/bias'
                 )
             if query.dtype not in (torch.float16, torch.bfloat16):
-                raise TypeError("shared-prefix fused attention requires fp16 or bf16 Q/K/V")
+                raise TypeError("shared-prefix forest attention requires fp16 or bf16 Q/K/V")
 
             softmax_scale = self.get_softmax_scale(query)
             with core_attn_manager as query:
