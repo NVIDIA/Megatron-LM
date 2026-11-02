@@ -35,7 +35,9 @@ from megatron.core.utils import (
 )
 
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..transformer.custom_layers.batch_invariant_kernels import is_batch_invariant_mode_enabled
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from .batch_invariant_reduction import batch_invariant_all_reduce, batch_invariant_reduce_scatter
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -582,7 +584,10 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            if is_batch_invariant_mode_enabled():
+                grad_input, _ = batch_invariant_all_reduce(grad_input, ctx.tp_group)
+            else:
+                torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
         return grad_input, None, None, None, None, None
 
@@ -856,8 +861,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
+            # Asynchronous all-reduce; in batch-invariant mode the rank-ordered one, which is
+            # asynchronous only where NCCL reduces (it returns no handle otherwise).
+            if is_batch_invariant_mode_enabled():
+                grad_input, handle = batch_invariant_all_reduce(grad_input, tp_group, async_op=True)
+            else:
+                handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 
@@ -868,9 +877,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
-            handle = dist_reduce_scatter_func(
-                sub_grad_input, grad_input, group=tp_group, async_op=True
-            )
+            if is_batch_invariant_mode_enabled():
+                _, handle = batch_invariant_reduce_scatter(
+                    grad_input, tp_group, output=sub_grad_input, async_op=True
+                )
+            else:
+                handle = dist_reduce_scatter_func(
+                    sub_grad_input, grad_input, group=tp_group, async_op=True
+                )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
 
@@ -962,7 +976,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_weight = sharded_weight.wgrad_reduce_scatter(grad_weight)
 
         if ctx.sequence_parallel:
-            handle.wait()
+            if handle is not None:
+                handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
             return (
@@ -979,7 +994,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 None,
             )
 
-        if ctx.allreduce_dgrad:
+        if ctx.allreduce_dgrad and handle is not None:
             handle.wait()
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None

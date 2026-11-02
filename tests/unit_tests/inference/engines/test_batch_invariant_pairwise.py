@@ -150,7 +150,13 @@ def test_sampling_fixed_history_batch_invariance(backend, filters, mode, offset_
 
 @pytest.mark.parametrize(
     "case",
-    [Case("tp2-sp", tp=2, sp=True), Case("pp2", pp=2), Case("tp2-pp2-sp", tp=2, pp=2, sp=True)],
+    [
+        Case("tp2-sp", tp=2, sp=True),
+        # TP >= 3: NCCL's ring would give the target different bits in different chunks.
+        Case("tp4-sp", tp=4, sp=True),
+        Case("pp2", pp=2),
+        Case("tp2-pp2-sp", tp=2, pp=2, sp=True),
+    ],
     ids=lambda case: case.name,
 )
 def test_parallel_batch_invariance(case):

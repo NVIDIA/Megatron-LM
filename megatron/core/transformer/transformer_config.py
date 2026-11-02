@@ -4776,6 +4776,24 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
+            # Every TP reduce-scatter and all-reduce must sum a token's partials in rank order
+            # (megatron.core.tensor_parallel.batch_invariant_reduction), not in an order set
+            # by the token's position. Megatron routes TE's row-parallel reductions there, but
+            # Userbuffers reduce inside the GEMM and TE's operation fuser calls
+            # torch.distributed directly. With two ranks each element is one add, which has no
+            # order to get wrong.
+            if self.tensor_model_parallel_size > 2:
+                assert not self.tp_comm_overlap, (
+                    "Batch invariant mode with tensor_model_parallel_size > 2 does not support "
+                    "tp_comm_overlap: Userbuffers reduce-scatter inside the GEMM, in an order "
+                    "that depends on a token's position in the batch."
+                )
+                assert not self.use_transformer_engine_op_fuser, (
+                    "Batch invariant mode with tensor_model_parallel_size > 2 does not support "
+                    "use_transformer_engine_op_fuser: TE's fused operations reduce across the "
+                    "tensor-parallel group with NCCL directly, in an order that depends on a "
+                    "token's position in the batch."
+                )
             if (self.num_moe_experts or 0) > 0:
                 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                     HAVE_DEEPGEMM_BF16,

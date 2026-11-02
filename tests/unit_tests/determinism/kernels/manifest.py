@@ -311,9 +311,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py",
         ),
         kind="external-lib",
-        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
+        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite. "
+        "Batch-invariant mode reduces through tensor_parallel_batch_invariant_reduction instead.",
+    ),
+    KernelEntry(
+        name="tensor_parallel_batch_invariant_reduction",
+        sources=("megatron/core/tensor_parallel/batch_invariant_reduction.py",),
+        tests=(
+            K + "test_tensor_parallel_kernels.py",
+            "tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py",
+        ),
+        kind="triton",
+        notes="Batch-invariant TP reduce-scatter / all-reduce: each element is the rank-order fp32 sum "
+        "of its partials, rounded once (inline-PTX adds, so the compiler cannot reorder them). The "
+        "kernel on the all-to-all output replays bit-exactly in test_tensor_parallel_kernels.py; its "
+        "symmetric-memory reading, the NCCL fallback and NCCL's two-rank add are checked bitwise "
+        "against the rank-order reference on 4-8 GPUs in test_batch_invariant_reduction.py.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
@@ -685,6 +701,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
             "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
+            "tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py",
         ),
         kind="triton",
     ),

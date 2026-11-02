@@ -714,3 +714,32 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+def _make_batch_invariant_config(**overrides) -> TransformerConfig:
+    from megatron.core.transformer.enums import AttnBackend
+
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        batch_invariant_mode=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        attention_dropout=0.0,
+        sequence_parallel=True,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("option", ["tp_comm_overlap", "use_transformer_engine_op_fuser"])
+def test_batch_invariant_rejects_te_internal_tp_reductions_above_two_ranks(option):
+    # Userbuffers and TE's operation fuser reduce across TP inside TE, out of reach of the
+    # batch-invariant rank-order reduction; with three or more ranks the order shows in the bits.
+    with pytest.raises(AssertionError, match=f"does not support {option}"):
+        _make_batch_invariant_config(tensor_model_parallel_size=4, **{option: True})
+    # With two ranks each element is a single add.
+    config = _make_batch_invariant_config(tensor_model_parallel_size=2, **{option: True})
+    assert getattr(config, option)
