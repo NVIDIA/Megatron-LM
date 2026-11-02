@@ -2,6 +2,7 @@
 """Local state plumbing through real Mamba schedules with a small deterministic mixer."""
 
 import copy
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -293,7 +294,8 @@ class _RecordingContext:
         self.calls = []
 
     def checkpoint(self, function, *args):
-        self.calls.append(getattr(function, "__name__", type(function).__name__))
+        target = function.func if isinstance(function, partial) else function
+        self.calls.append(getattr(target, "__name__", type(target).__name__))
         return function(*args)
 
 
@@ -308,9 +310,9 @@ def test_replay_selection_stays_in_layer_binding(wide, is_block_end):
     layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state, active_context)
     assert len(context.calls) == (2 + (not is_block_end) if wide else 0)
     if wide:
-        assert context.calls[0] == "run_read"
+        assert context.calls[0] == "_compute_read"
         if not is_block_end:
-            assert context.calls[-1] == "run_write"
+            assert context.calls[-1] == "_compute_write"
 
 
 def test_wr_registration_and_legacy_load_are_unchanged():

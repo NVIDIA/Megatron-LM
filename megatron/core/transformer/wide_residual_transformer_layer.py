@@ -7,10 +7,6 @@ from typing import Optional
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.residual_connection import (
-    ResidualConnection,
-    ResidualConnectionOperation,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
@@ -122,29 +118,3 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
-
-    def _get_self_attention_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the self-attention branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_self_attn
-            case "write":
-                return self.residual_write_self_attn
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
-
-    def _get_mlp_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the MLP or MoE branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_mlp
-            case "write":
-                return self.residual_write_mlp
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
