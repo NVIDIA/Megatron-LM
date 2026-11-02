@@ -113,7 +113,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # Shared-prefix composed attention.
     KernelEntry(
         name="shared_prefix_composed_attention",
-        sources=("megatron/core/transformer/shared_prefix_attention.py",),
+        sources=("megatron/core/ops/attention/shared_prefix.py",),
         tests=(K + "test_shared_prefix_attention.py",),
         kind="external-lib",
         notes="Native FlashAttention varlen forward and private backward (called by keyword, "
@@ -191,9 +191,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
         "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
-        "The shared-prefix branch (a forest attached by a caller selects "
-        "shared_prefix_attention instead of core attention) is replayed through a real "
-        "SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
+        "The shared-prefix branch (a forest attached by a caller selects the forest kernel "
+        "in megatron/core/ops/attention/shared_prefix.py instead of core attention) is "
+        "replayed through a real SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",

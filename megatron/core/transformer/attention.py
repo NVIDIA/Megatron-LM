@@ -1725,7 +1725,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             if query.dtype not in (torch.float16, torch.bfloat16):
                 raise TypeError("shared-prefix fused attention requires fp16 or bf16 Q/K/V")
 
-            from megatron.core.transformer.shared_prefix_attention import (
+            from megatron.core.ops.attention.shared_prefix import (
                 flash_composed_forest_attention,
                 flash_composed_forest_attention_cp,
             )

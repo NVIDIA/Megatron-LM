@@ -33,11 +33,11 @@ _CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires nativ
 
 @pytest.fixture
 def attention(monkeypatch):
-    """Return the attention module with an empty plan cache."""
-    from megatron.core.transformer import shared_prefix_attention
+    """Return the forest attention module with an empty plan cache."""
+    from megatron.core.ops.attention import shared_prefix
 
-    monkeypatch.setattr(shared_prefix_attention, "_PLAN_CACHE", {})
-    return shared_prefix_attention
+    monkeypatch.setattr(shared_prefix, "_PLAN_CACHE", {})
+    return shared_prefix
 
 
 def _stars(*stars):
