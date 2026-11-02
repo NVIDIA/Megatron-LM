@@ -519,9 +519,10 @@ class CSASparseAttnFunc(torch.autograd.Function):
         # cuDNN DSA backward assumes every slot is a non-negative address when
         # ``topk_length`` is supplied, including ignored suffix slots (the
         # Path-B contract below). Without ``topk_length`` the ``-1`` sentinels are
-        # the only invalid-slot marker, so keep them.
+        # the only invalid-slot marker, so keep them. Clamp a copy: the saved
+        # indices may be shared with another consumer.
         if ctx.topk_length is not None:
-            topk_idxs.clamp_min_(0)
+            topk_idxs = topk_idxs.clamp_min(0)
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q, kv, out, dO, lse, attn_sink, topk_idxs, ctx.softmax_scale, ctx.topk_length
         )
