@@ -1812,11 +1812,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 torch.float32,
                 quant_scales=None,
                 activation_type=self._flashinfer_activation_type,
-                **(
-                    {"clamped_relu2_limit": self._flashinfer_clamp_limit}
-                    if self._activation_clamp_scale is not None
-                    else {}
-                ),
+                clamped_relu2_limit=self._flashinfer_clamp_limit,
                 ep_size=self.ep_group.size(),
                 ep_rank=self.ep_group.rank(),
                 output=rsv,
@@ -1832,11 +1828,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             hidden_states.dtype,
             quant_scales=None,
             activation_type=self._flashinfer_activation_type,
-            **(
-                {"clamped_relu2_limit": self._flashinfer_clamp_limit}
-                if self._activation_clamp_scale is not None
-                else {}
-            ),
+            clamped_relu2_limit=self._flashinfer_clamp_limit,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
             # FlashInfer's BF16 CUTLASS kernel requires a BF16 output, while the

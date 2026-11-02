@@ -685,9 +685,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Temporary stand-in for FlashInfer's num_active_tokens (flashinfer-ai/flashinfer#6783 "
-        "and #6784): persistent finalize / combine kernels over the live rows. Delete this entry "
-        "with the module once the FlashInfer floor ships the argument (unwind steps in the module "
-        "docstring).",
+        "and #6784): persistent finalize / combine kernels over the live rows, checked against "
+        "the real kernels' own finalize on Blackwell. Delete this entry with the module once the "
+        "FlashInfer floor ships the argument (unwind steps in the module docstring).",
     ),
     KernelEntry(
         name="batch_invariant_kernels",

@@ -2,19 +2,55 @@
 """Tests of the temporary stand-in for FlashInfer's `num_active_tokens`; delete with the module.
 
 The forwarding tests run on CPU against fake kernels; the emulation and replay tests need a GPU
-and Triton.
+and Triton; the parity tests run the real kernels and need Blackwell and FlashInfer.
 """
 
 import pytest
 import torch
 
 import megatron.core.inference.moe.flashinfer_active_tokens as shim
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    HAVE_FLASHINFER_ROUTED_MXFP8,
+    _unwrap_output,
+    flashinfer_routed_mxfp8_moe,
+    prepare_routed_mxfp8_weights,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 requires_cuda_triton = pytest.mark.skipif(
     not (torch.cuda.is_available() and shim.HAVE_TRITON), reason="needs a GPU and Triton"
 )
+_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+requires_blackwell_cutlass = pytest.mark.skipif(
+    not (_BLACKWELL and shim.HAVE_TRITON and shim._cutlass_fused_moe is not None),
+    reason="needs Blackwell, Triton and FlashInfer",
+)
+requires_blackwell_routed = pytest.mark.skipif(
+    not (_BLACKWELL and shim.HAVE_TRITON and HAVE_FLASHINFER_ROUTED_MXFP8),
+    reason="needs Blackwell, Triton and FlashInfer's routed MXFP8 MoE",
+)
 BF16 = dict(dtype=torch.bfloat16)
+RELU2 = 6  # flashinfer ActivationType.Relu2
+# The routed kernel's arguments that the fake-kernel tests do not look at.
+ROUTED_ARGS = dict(
+    routing_bias=None,
+    hidden_states=None,
+    hidden_states_scale=None,
+    gemm1_weights=None,
+    gemm1_weights_scale=None,
+    gemm2_weights=None,
+    gemm2_weights_scale=None,
+    num_experts=8,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=16,
+    local_expert_offset=2,
+    local_num_experts=2,
+    routed_scaling_factor=None,
+    fp8_quantization_type=1,
+    activation_type=RELU2,
+)
 
 
 def _count(n, device="cpu"):
@@ -29,13 +65,22 @@ def _cutlass(**kwargs):
     )
     fc1, fc2 = torch.empty(2, 16, 8, **BF16), torch.empty(2, 8, 16, **BF16)
     return shim.cutlass_fused_moe(
-        x, ids, probs, fc1, fc2, torch.float32, ep_size=4, ep_rank=1, **kwargs
+        x,
+        ids,
+        probs,
+        fc1,
+        fc2,
+        torch.float32,
+        activation_type=RELU2,
+        ep_size=4,
+        ep_rank=1,
+        **kwargs,
     )
 
 
 def _routed(**kwargs):
     ids = torch.zeros(4, 2, dtype=torch.int32)
-    return shim.trtllm_fp8_block_scale_routed_moe(topk_ids=ids, top_k=2, **kwargs)
+    return shim.trtllm_fp8_block_scale_routed_moe(topk_ids=ids, top_k=2, **ROUTED_ARGS, **kwargs)
 
 
 KERNELS = {
@@ -99,6 +144,7 @@ def test_cutlass_emulation_combines_the_live_rows(monkeypatch):
         fc1,
         fc2,
         torch.float32,
+        activation_type=RELU2,
         output=out,
         num_active_tokens=_count(valid, "cuda"),
         ep_size=4,
@@ -136,7 +182,11 @@ def test_routed_emulation_finalizes_the_live_rows(monkeypatch):
     out = torch.full((rows, hidden), 7.0, device="cuda")
 
     result = shim.trtllm_fp8_block_scale_routed_moe(
-        topk_ids=topk_ids, output=out, num_active_tokens=_count(valid, "cuda")
+        topk_ids=topk_ids,
+        top_k=topk,
+        output=out,
+        num_active_tokens=_count(valid, "cuda"),
+        **ROUTED_ARGS,
     )
 
     assert result is out and seen["do_finalize"] is False
@@ -169,3 +219,102 @@ def test_stand_in_kernels_replay(kernel):
             src, ids, count, out, local_expert_offset=4, num_local_experts=2
         )[:valid]
     assert_replays_bit_exact(fn, (src,), backward=False, what=kernel)
+
+
+def _routed_mxfp8_weight(weight):
+    """Quantize a bf16 expert stack per expert and repack it into TRT-LLM's routed layout."""
+    experts = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+    stacked = MXFP8Tensor(
+        data=torch.stack([expert.data for expert in experts]).contiguous(),
+        scale=torch.stack([expert.scale for expert in experts]).contiguous(),
+        backend="triton",
+        dtype=torch.bfloat16,
+    )
+    return prepare_routed_mxfp8_weights(stacked)
+
+
+@requires_blackwell_cutlass
+def test_cutlass_emulation_matches_the_kernel_finalize(monkeypatch):
+    """The real kernel's non-filling finalize plus `combine_valid_rows` equals its own filling
+    finalize on the live rows; rows beyond the count stay untouched."""
+    from flashinfer.fused_moe import ActivationType
+
+    monkeypatch.setattr(shim, "CUTLASS_MOE_HAS_ACTIVE_TOKENS", False)
+    seeded()
+    rows, valid, hidden, inter, local_experts, topk = 64, 40, 256, 256, 2, 2
+    x = torch.randn(rows, hidden, device="cuda", **BF16)
+    # ep_rank 1 of 2 owns experts [2, 4); rows 0 and 1 route only to remote experts.
+    routing = torch.randint(0, 2 * local_experts, (rows, topk), device="cuda", dtype=torch.int32)
+    routing[:2] = 0
+    probs = torch.rand(rows, topk, device="cuda")
+    fc1 = (torch.randn(local_experts, inter, hidden, device="cuda") / hidden**0.5).to(
+        torch.bfloat16
+    )
+    fc2 = (torch.randn(local_experts, hidden, inter, device="cuda") / inter**0.5).to(torch.bfloat16)
+    common = dict(activation_type=ActivationType.Relu2, ep_size=2, ep_rank=1)
+
+    reference = shim._cutlass_fused_moe(
+        x, routing, probs, fc1, fc2, torch.bfloat16, quant_scales=None, **common
+    )[0]
+    out = torch.full((rows, hidden), 7.0, device="cuda")
+    shim.cutlass_fused_moe(
+        x,
+        routing,
+        probs,
+        fc1,
+        fc2,
+        torch.float32,
+        output=out,
+        num_active_tokens=_count(valid, "cuda"),
+        **common,
+    )
+
+    # The default top-k finalize accumulates atomically, so allow bf16 rounding.
+    torch.testing.assert_close(out[:valid], reference[:valid].float(), rtol=2**-7, atol=2**-7)
+    assert not reference[:2].any() and torch.all(out[valid:] == 7.0)
+
+
+@requires_blackwell_routed
+def test_routed_emulation_matches_the_kernel_finalize(monkeypatch):
+    """The unfinalized real kernel plus `finalize_routed_rows` equals the kernel's own finalize on
+    the live rows; rows beyond the count stay untouched."""
+    monkeypatch.setattr(shim, "ROUTED_MOE_HAS_ACTIVE_TOKENS", False)
+    kernel, calls = shim._trtllm_fp8_block_scale_routed_moe, []
+    monkeypatch.setattr(
+        shim,
+        "_trtllm_fp8_block_scale_routed_moe",
+        lambda **kwargs: calls.append(kwargs) or kernel(**kwargs),
+    )
+    seeded()
+    num_experts, local_experts, hidden, inter, topk, rows, valid = 8, 2, 256, 256, 2, 512, 300
+    fc1 = _routed_mxfp8_weight(
+        (torch.randn(local_experts, inter, hidden, device="cuda") / hidden**0.5).to(torch.bfloat16)
+    )
+    fc2 = _routed_mxfp8_weight(
+        (torch.randn(local_experts, hidden, inter, device="cuda") / inter**0.5).to(torch.bfloat16)
+    )
+    x = torch.randn(rows, hidden, device="cuda", **BF16)
+    # Local experts are [2, 4); rows 0 and 1 route only to remote experts.
+    routing = torch.randint(0, num_experts, (rows, topk), device="cuda", dtype=torch.int64)
+    routing[:2] = 0
+    probs = torch.rand(rows, topk, device="cuda")
+    out = torch.full((rows, hidden), 7.0, device="cuda")
+
+    returned = flashinfer_routed_mxfp8_moe(
+        x,
+        routing,
+        probs,
+        fc1,
+        fc2,
+        num_experts=num_experts,
+        local_expert_offset=2,
+        activation_type=RELU2,
+        out=out,
+        valid_tokens=_count(valid, "cuda"),
+    )
+    (unfinalized,) = calls
+    assert returned is out and unfinalized["do_finalize"] is False
+    reference = _unwrap_output(kernel(**dict(unfinalized, do_finalize=True)))[:, :hidden]
+
+    torch.testing.assert_close(out[:valid], reference[:valid].float(), rtol=2**-7, atol=2**-7)
+    assert not reference[:2].any() and torch.all(out[valid:] == 7.0)

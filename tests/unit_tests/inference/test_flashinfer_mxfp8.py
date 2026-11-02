@@ -666,8 +666,9 @@ def test_flashinfer_forward_dispatch(
     monkeypatch, uses_mxfp8, has_rsv, ep_size, etp_size, clamp_scale
 ):
     """The kernel gets the device count and the fp32 buffer whenever the NVLS dispatcher gathers
-    across ranks (expert parallel or expert tensor parallel), and neither otherwise. The clamp
-    limit travels with the bf16 call only for a tanh-clamped activation."""
+    across ranks (expert parallel or expert tensor parallel), and neither otherwise. The bf16 call
+    always carries the clamp limit: the model-wide tensor for a tanh-clamped activation, else None.
+    """
     from megatron.core.transformer.moe import experts
 
     valid_tokens, calls, rank = torch.tensor([3], dtype=torch.int32), {}, min(1, ep_size - 1)
@@ -717,7 +718,7 @@ def test_flashinfer_forward_dispatch(
         _fc2_weight=routed_weight if uses_mxfp8 else None,
         _flashinfer_activation_type=activation,
         _activation_clamp_scale=clamp_scale,
-        _flashinfer_clamp_limit=clamp_limit,
+        _flashinfer_clamp_limit=clamp_limit if clamp_scale is not None else None,
         _nvls_dispatcher=True,
         num_local_experts=2,
         ep_group=SimpleNamespace(size=lambda: ep_size, rank=lambda: rank),
@@ -742,10 +743,7 @@ def test_flashinfer_forward_dispatch(
         set(calls) == {"cutlass"} and cutlass["ep_size"] == ep_size and cutlass["ep_rank"] == rank
     )
     assert cutlass["args"][1].dtype == torch.int32
-    if clamp_scale is not None:
-        assert cutlass["clamped_relu2_limit"] is clamp_limit
-    else:
-        assert "clamped_relu2_limit" not in cutlass
+    assert cutlass["clamped_relu2_limit"] is (clamp_limit if clamp_scale is not None else None)
     assert "swiglu_limit" not in cutlass
     if has_rsv and ep_size * etp_size > 1:
         # The kernel finalizes fp32 in place over the live rows of the reduce-scatter buffer.
