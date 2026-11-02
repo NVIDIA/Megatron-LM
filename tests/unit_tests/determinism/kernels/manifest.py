@@ -472,7 +472,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Bit-exact reduction replay through the Autotuner adapter using min-cost and "
         "JSON-table choices; every candidate of each config-invariant kernel must give "
         "bit-identical outputs; SSM replay runs the real SSM autotuners through runtime "
-        "pinning, with autotune caching on and off.",
+        "pinning, with autotune caching on and off, and the FLA kernels KDA and GDP run at "
+        "the min-cost choice (FLA's B<dim> tiles, one warpgroup) for KDA head dims 64 to 256.",
     ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
@@ -556,11 +557,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
         notes="GDN and GDN2 require gdn_kernel_backend='torch' under deterministic_mode, which "
-        "selects their torch chunk kernels over FLA (recorded non-deterministic). KDA has no "
-        "non-FLA core kernel: under deterministic_mode it still runs FLA's chunk_kda (and, with "
-        "two-stage gates, FLA's L2 norm and gated RMSNorm; single-stage gates swap in "
-        "torch_l2norm and F.conv1d), and the autotune policy pins every FLA autotuner ('fla' is "
-        "in its default modules), checked by test_kda_deterministic_mode_pins_fla_autotuners. "
+        "selects their torch chunk kernels over FLA. KDA has no non-FLA core kernel: under "
+        "deterministic_mode it still runs FLA's chunk_kda (and, with two-stage gates, FLA's L2 "
+        "norm and gated RMSNorm, the latter kept out of torch.compile so Inductor cannot time "
+        "it; single-stage gates swap in torch_l2norm and F.conv1d). The autotune policy pins "
+        "every FLA Triton autotuner ('fla' is in its default modules); FLA's TileLang KDA "
+        "backward, used when TileLang is installed, has fixed tiles. "
+        "test_kda_deterministic_mode_pins_fla_autotuners replays forward and backward, and a "
+        "no-grad forward, at head dims 64, 128 and 256. "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
@@ -766,7 +770,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/gated_delta_product.py",),
         tests=(K + "test_ssm_kernels.py",),
         kind="dispatch",
-        notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
+        notes="Dispatches FLA chunk_gated_delta_product / l2_norm (under deterministic_mode the "
+        "autotune policy pins their forward and backward autotuners, FLA's TileLang "
+        "chunk_bwd_dqkwg runs at fixed tiles on Hopper, and "
+        "test_gdp_deterministic_mode_pins_fla_autotuners replays the mixer's forward and "
+        "backward), the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
         "GDP forks (chunk_gated_delta_product_varlen, fused_recurrent_gated_delta_rule_update), all "
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "

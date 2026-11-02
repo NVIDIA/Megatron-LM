@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -101,19 +102,34 @@ def config_data(config) -> dict:
     }
 
 
-def estimate_config_cost(cfg):
-    """Estimate shared-memory cost of a config. Lower is cheaper.
+# Tile-size arguments: ``BLOCK*`` (Megatron, mamba_ssm, Transformer Engine) or, in
+# flash-linear-attention and the kernels forked from it, ``B`` plus the tiled
+# dimension (``BT``, ``BK``, ``BV``, ``BS``, ...).
+_TILE_ARG = re.compile(r"BLOCK\w*|B[A-Z]?")
 
-    Returns ``(block_cost, num_warps)`` so ties in block cost break
-    deterministically on warp count.
+# One warpgroup: the smallest launch on which Triton uses Hopper's and
+# Blackwell's warpgroup tensor-core instructions (fewer warps fall back to
+# slower ones), and too few threads to exhaust a 64K-register file even at 255
+# registers each.
+_WARPGROUP = 4
+
+
+def estimate_config_cost(cfg):
+    """Estimate the resource cost of a config. Lower is cheaper.
+
+    Returns ``(tile_cost, below_warpgroup, warp_distance)``. ``tile_cost`` is the
+    product of the tile sizes times the pipeline stages, which shared memory
+    grows with, so the cheapest config is the likeliest to fit. Among equal tile
+    costs, one warpgroup (4 warps) comes first, then the nearest larger warp
+    count, then the nearest smaller one.
     """
-    block_product = 1
+    tile_product = 1
     for key, val in cfg.kwargs.items():
-        if key.startswith('BLOCK') and isinstance(val, int):
-            block_product *= val
+        if _TILE_ARG.fullmatch(key) and isinstance(val, int) and not isinstance(val, bool):
+            tile_product *= val
     stages = getattr(cfg, 'num_stages', 1) or 1
     warps = getattr(cfg, 'num_warps', 1) or 1
-    return (block_product * stages, warps)
+    return (tile_product * stages, warps < _WARPGROUP, abs(warps - _WARPGROUP))
 
 
 def filter_configs_by_block_sizes(configs, block_sizes=()):

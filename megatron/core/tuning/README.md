@@ -82,15 +82,27 @@ pruning must be represented in the kernel's tuning key. Changing `block_sizes`
 requires installing a new policy, which invalidates cached selections.
 
 The static fallback is reproducible for identical candidates and inputs. Its
-cost estimate is not a throughput model and cannot predict every compile-time
-resource failure. Invalid selections raise; they never retry with timing.
+cost estimate ranks candidates by tile size times pipeline stages, which shared
+memory grows with. Tile sizes are the integer arguments named `BLOCK*` or, as
+flash-linear-attention and the kernels forked from it name them, `B` plus the
+tiled dimension (`BT`, `BK`, `BV`, `BS`, ...). Among equal tile costs it prefers
+one warpgroup (4 warps), the smallest launch on which Triton uses Hopper's and
+Blackwell's warpgroup tensor-core instructions, then the nearest larger warp
+count, then the nearest smaller one. The estimate is not a throughput model and cannot predict every
+compile-time resource failure. Invalid selections raise; they never retry with
+timing.
 
 By default the adapter covers `mamba_ssm`, `transformer_engine`,
 `megatron.core`, and `fla` (flash-linear-attention), including submodules, so
 every in-tree Triton autotuner (SSM ops and fusions such as the MLA RoPE and mHC
 kernels) is covered, including those imported before model configuration, and so
-are the FLA kernels that KDA runs in deterministic mode. Override `modules` to
-include another package; this replaces the default list.
+are the FLA kernels that KDA and Gated Delta Product layers run. Override
+`modules` to include another package; this replaces the default list.
+
+FLA also dispatches some backward kernels to TileLang when TileLang is
+installed. Those never reach Triton's autotuner, and need no pinning: their tile
+sizes, warps and stages are fixed by the input shapes and the GPU, not timed.
+The kernel determinism tests replay KDA and GDP through them.
 
 Some covered kernels produce the same values whatever configuration they run.
 `config_invariant` lists them by qualified name (`module.function`); they keep

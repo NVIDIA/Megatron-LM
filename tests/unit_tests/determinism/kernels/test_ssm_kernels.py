@@ -806,40 +806,105 @@ def test_kda_gate_jit_path_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
 
 
-@pytest.mark.parametrize("two_stage_gates", [False, True])
-def test_kda_deterministic_mode_pins_fla_autotuners(monkeypatch, two_stage_gates):
-    """KDA has no non-FLA core kernel, so deterministic mode runs it on FLA's autotuned kernels,
-    some of whose candidates give different bits (the L2 norm, the gated output norm and the
-    gate cumsum). The policy pins every FLA autotuner the layer reaches, without timing any."""
-    pytest.importorskip("transformer_engine")
-    import torch.nn.functional as F
+def _record_fla_autotuners(monkeypatch):
+    """Collect every multi-candidate FLA autotuner that runs, and fail on any benchmark."""
     from triton.runtime.autotuner import Autotuner
 
-    from megatron.core import parallel_state
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.gated_delta_net.kda import HAVE_FLA_KDA, KimiDeltaAttention
-    from megatron.core.ssm.kda_layer_config import KDALayerConfig
     from megatron.core.tuning import selection
-    from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
-
-    if not HAVE_FLA_KDA:
-        pytest.skip("needs FLA with KDA")
 
     reached = set()
     run = Autotuner.run
 
-    def record_fla_autotuners(tuner, *args, **kwargs):
+    def record(tuner, *args, **kwargs):
         qualified = f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}"
         if qualified.startswith("fla.") and len(tuner.configs) > 1:
             reached.add(qualified)
         return run(tuner, *args, **kwargs)
 
     def forbid_benchmark(*args, **kwargs):
-        raise AssertionError("deterministic KDA benchmarked a config")
+        raise AssertionError("deterministic execution benchmarked an FLA config")
 
-    monkeypatch.setattr(Autotuner, "run", record_fla_autotuners)
+    monkeypatch.setattr(Autotuner, "run", record)
     monkeypatch.setattr(Autotuner, "_bench", forbid_benchmark)
+    return reached
+
+
+def _assert_fla_autotuners_pinned(reached, expected):
+    """``expected`` kernels ran through Triton's autotuner, and every FLA autotuner was pinned.
+
+    Kernels are matched by function name, which FLA keeps when it moves modules (0.6 moved the
+    norms to ``fla.modules.norm``). A kernel that Dynamo traced into a compiled graph never
+    reaches the autotuner, since Inductor times its candidates itself, so it is missing here.
+    """
+    assert expected <= {qualified.rsplit(".", 1)[1] for qualified in reached}, sorted(reached)
+    for qualified in sorted(reached):
+        choices = [value for key, value in choice_log().items() if f"|{qualified}|" in key]
+        assert choices and all(value.endswith(";pinned") for value in choices), qualified
+
+
+def _record_tilelang_kernel(monkeypatch, package, module, function, backends):
+    """Record the calls of one of FLA's TileLang kernels.
+
+    Returns the call list and whether FLA dispatches to this kernel here: its TileLang backend
+    (the first of ``backends`` that ``package`` defines) is available, which FLA 0.6 also ties
+    to a usable nvcc, and enabled. The kernel module is imported lazily by the backend at each
+    call, so patching it takes effect. These kernels never reach Triton's autotuner: their
+    tiles, warps and stages follow from the input shapes and the GPU, so a bit-exact replay
+    through them is their deterministic-mode coverage.
+    """
+    import importlib
+
+    tilelang_backends = importlib.import_module(package)
+    backend = next(
+        getattr(tilelang_backends, name) for name in backends if hasattr(tilelang_backends, name)
+    )()
+    if not (backend.is_available() and backend.is_enabled()):
+        return [], False
+    kernels = importlib.import_module(f"{package}.{module}")
+    kernel = getattr(kernels, function)
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(function)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, function, record)
+    return calls, True
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize(
+    "two_stage_gates, grad",
+    [(False, True), (True, True), (True, False)],
+    ids=["single_stage", "two_stage", "two_stage_no_grad"],
+)
+def test_kda_deterministic_mode_pins_fla_autotuners(monkeypatch, two_stage_gates, grad, head_dim):
+    """KDA has no non-FLA core kernel, so deterministic mode runs it on FLA's autotuned kernels,
+    some of whose candidates give different bits (the L2 norm, the gated output norm and the
+    gate cumsum). The policy pins every FLA autotuner the layer reaches, without timing any, and
+    the pinned configs launch at every supported head dim.
+
+    The no-grad case covers evaluation and inference: the two-stage gated norm must stay out of
+    torch.compile there, where Dynamo would otherwise trace FLA's kernel and Inductor time it.
+    FLA's TileLang backward, used when TileLang is installed, must run and replay too."""
+    import torch.nn.functional as F
+
+    from megatron.core import parallel_state
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net.kda import HAVE_FLA_KDA, KimiDeltaAttention
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+    from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
+
+    assert HAVE_FLA_KDA, "KDA needs flash-linear-attention with chunk_kda"
+    reached = _record_fla_autotuners(monkeypatch)
+    tilelang_calls, tilelang_dispatched = _record_tilelang_kernel(
+        monkeypatch,
+        "fla.ops.kda.backends.tilelang",
+        "chunk_bwd_dqkg",
+        "chunk_kda_bwd_wy_dqkg_fused_tilelang",
+        backends=("KDATileLangBackend",),
+    )
     seeded()
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     try:
@@ -849,8 +914,8 @@ def test_kda_deterministic_mode_pins_fla_autotuners(monkeypatch, two_stage_gates
             num_layers=1,
             num_attention_heads=4,
             linear_conv_kernel_dim=4,
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
+            linear_key_head_dim=head_dim,
+            linear_value_head_dim=head_dim,
             linear_num_key_heads=4,
             linear_num_value_heads=4,
             kda_two_stage_gates=two_stage_gates,
@@ -876,25 +941,71 @@ def test_kda_deterministic_mode_pins_fla_autotuners(monkeypatch, two_stage_gates
             ),
         )
         hidden = torch.randn(
-            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=grad
         )
-        with deterministic_algorithms(True):
+        with deterministic_algorithms(True), torch.set_grad_enabled(grad):
             assert_module_replays_bit_exact(
-                layer, (hidden, None), replays=2, contention=True, what="deterministic KDA"
+                layer,
+                (hidden, None),
+                replays=2,
+                backward=grad,
+                contention=True,
+                what=f"deterministic KDA (head dim {head_dim})",
             )
     finally:
         Utils.destroy_model_parallel()
 
-    expected = {"fla.ops.kda.gate.kda_gate_chunk_cumsum_vector_kernel"}
+    expected = {"kda_gate_chunk_cumsum_vector_kernel"}
     if two_stage_gates:
-        expected |= {
-            "fla.modules.l2norm.l2norm_fwd_kernel",
-            "fla.modules.fused_norm_gate.layer_norm_gated_fwd_kernel",
-        }
-    assert expected <= reached, sorted(reached)
-    for qualified in sorted(reached):
-        choices = [value for key, value in choice_log().items() if f"|{qualified}|" in key]
-        assert choices and all(value.endswith(";pinned") for value in choices), qualified
+        expected |= {"l2norm_fwd_kernel", "layer_norm_gated_fwd_kernel"}
+    _assert_fla_autotuners_pinned(reached, expected)
+    assert bool(tilelang_calls) == (grad and tilelang_dispatched), tilelang_calls
+
+
+def test_gdp_deterministic_mode_pins_fla_autotuners(monkeypatch):
+    """GDP trains on FLA's chunk_gated_delta_product and L2 norm whatever deterministic_mode says.
+    The policy pins their forward and backward autotuners without timing any, FLA's TileLang
+    backward (chunk_bwd_dqkwg, which FLA dispatches to on Hopper) runs at fixed tiles, and the
+    mixer's forward and backward replay bit-exactly."""
+    from tests.unit_tests.ssm.test_gated_delta_product import HAVE_FLA, HAVE_GDP_DEPS
+    from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+    from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+    assert HAVE_GDP_DEPS and HAVE_FLA, "GDP needs mamba_ssm, causal_conv1d and FLA"
+    reached = _record_fla_autotuners(monkeypatch)
+    tilelang_calls, tilelang_dispatched = _record_tilelang_kernel(
+        monkeypatch,
+        "fla.ops.common.backends.tilelang",
+        "chunk_bwd",
+        "chunk_bwd_dqkwg_tilelang",
+        backends=("CommonTileLangBackend", "TileLangBackend"),
+    )
+    seeded()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config([])
+        config.deterministic_mode = True
+        mixer = build_gdp(config)
+        hidden = torch.randn(
+            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            mixer, (hidden,), replays=2, contention=True, what="deterministic GDP mixer"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+    _assert_fla_autotuners_pinned(
+        reached,
+        {
+            "l2norm_fwd_kernel",
+            "l2norm_bwd_kernel",
+            "chunk_gated_delta_product_fwd_kernel_h_blockdim64",
+            "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
+        },
+    )
+    assert bool(tilelang_calls) == tilelang_dispatched, tilelang_calls
 
 
 def test_kda_fp8_opt_out_scope_is_replay_safe():
@@ -910,10 +1021,10 @@ def test_kda_fp8_opt_out_scope_is_replay_safe():
     assert not _kda_fp8_disabled(GDNLayerConfig.from_config(config))
 
 
-@pytest.mark.xfail(
-    strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
-)
 def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
+    """FLA's gated delta rule replays once the default policy pins FLA's autotuners: its chunk
+    kernels reduce in a fixed order, with no atomics, so the timed choice of configs was what
+    made replays differ."""
     fla_ops = pytest.importorskip("fla.ops.gated_delta_rule")
     seeded()
     B, T, H, K = 2, 2048, 16, 128
