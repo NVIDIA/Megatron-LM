@@ -456,9 +456,14 @@ class PretrainConfigContainer(ConfigContainerBase):
         if checkpoint.ckpt_format == "fsdp_dtensor":
             assert ddp.use_megatron_fsdp, \
                 "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
-        if not dist.use_gloo_process_groups and self.optimizer.use_distributed_optimizer:
+        if (
+            not dist.use_gloo_process_groups
+            and self.optimizer.use_distributed_optimizer
+            and self.optimizer.optimizer in ("sgd", "adam")
+        ):
             # Legacy checkpointing uses Gloo process groups to collect the full distributed
-            # optimizer state in the CPU memory of DP rank 0.
+            # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
+            # the layer-wise path at finalize and save their state separately on each rank.
             assert checkpoint.use_dist_ckpt
             if checkpoint.dist_ckpt_optim_fully_reshardable:
                 assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \

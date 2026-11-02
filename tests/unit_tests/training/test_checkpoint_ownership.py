@@ -299,6 +299,24 @@ def test_training_container_checks_the_format_against_its_other_sections(run_con
         run_config.validate()
 
 
+@pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
+def test_legacy_checkpoint_gloo_requirement_follows_optimizer_kind(run_config, optimizer):
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.dist.use_gloo_process_groups = False
+    run_config.checkpoint.ckpt_format = "torch"
+
+    if optimizer in ("adam", "sgd"):
+        with pytest.raises(AssertionError):
+            run_config.validate()
+    else:
+        run_config.validate()
+        # Validation accepts the future layer-wise path without resolving it in place.
+        assert run_config.optimizer.optimizer == optimizer
+        assert run_config.optimizer.use_distributed_optimizer is True
+        assert run_config.optimizer.use_layer_wise_distributed_optimizer is False
+
+
 def test_inference_container_checks_the_format_against_dist_only():
     cfg = _inference_container(ckpt_format="torch")
     cfg.dist.use_torch_fsdp2 = True
