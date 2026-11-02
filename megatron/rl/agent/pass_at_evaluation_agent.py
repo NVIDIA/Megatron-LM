@@ -31,6 +31,7 @@ class PassAtEvaluationResult(RewardEvaluationResult):
     greedy_reward: float
 
 
+@EvaluationResponse.register_subclass
 class PassAtEvaluationResponse(EvaluationResponse[PassAtEvaluationResult]):
     type_name: str = 'PassAtEvaluationResponse'
 
