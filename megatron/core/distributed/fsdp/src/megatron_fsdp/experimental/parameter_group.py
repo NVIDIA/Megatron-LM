@@ -272,6 +272,9 @@ class FsdpParameterGroup:
             shapes,
             dp_size=self.mesh.size(),
             tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+            # Kernels with vectorized loads (e.g. Inductor's Triton) fault on tightly packed,
+            # misaligned tensors. 128 elements is also a multiple of the MXFP8 block.
+            alignment=128,
         )
 
     def _initialize_buffers(

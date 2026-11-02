@@ -17,7 +17,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    RowAtomic,
+    TensorAtomic,
+)
 
 pytest.importorskip("emerging_optimizers")
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
@@ -61,7 +64,7 @@ def _train(
     return torch.stack(losses)
 
 
-@pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp"])
+@pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp", "tensor_atomic"])
 @pytest.mark.parametrize("num_groups_in_flight", [0, 2, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
@@ -90,20 +93,23 @@ def test_muon_matches_reference(
     kernel_options,
     num_groups_in_flight,
 ):
-    """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
+    """FSDP (row- or tensor-atomic), HSDP, HFSDP, and unsharded Muon match loss curves.
 
     Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
     with 8, all four Muon groups are.
     """
+    if dp_mode == "tensor_atomic" and weight_decay_method != "decoupled":
+        pytest.skip("TensorAtomic only needs one weight decay method.")
     world_size = distributed_setup.world_size
-    if dp_mode == "fsdp":
+    if dp_mode in ("fsdp", "tensor_atomic"):
         if world_size < 2 or world_size % 2:
             pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
         # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
         mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))
         mesh = mesh["dp"]
+        atomic = TensorAtomic() if dp_mode == "tensor_atomic" else RowAtomic()
         placements = Placements(
-            dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+            dp_axes=[0], parameter=[atomic], gradient=[atomic], optimizer=[atomic]
         )
     else:
         if world_size < 4 or world_size % 4:
@@ -126,7 +132,11 @@ def test_muon_matches_reference(
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
-    with fully_shard_context(FsdpContext(device=device)):
+    # Whole tensors alternate between the two ranks of the DP mesh.
+    owners = (
+        {p: i % 2 for i, p in enumerate(model.parameters())} if dp_mode == "tensor_atomic" else None
+    )
+    with fully_shard_context(FsdpContext(device=device, parameter_to_owner=owners)):
         for layer in model.modules():
             if isinstance(layer, nn.Linear):
                 fully_shard(layer, mesh=mesh, placements=placements)

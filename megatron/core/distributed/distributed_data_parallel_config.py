@@ -281,6 +281,13 @@ class DistributedDataParallelConfig:
     nccl_ub (symmetric memory).
     """
 
+    megatron_fsdp_tensor_atomic: bool = False
+    """Megatron-FSDP v2 only. If true, keep every dense parameter whole on one rank
+    (TensorAtomic), so the Muon optimizer step needs no communication for it. Shards are
+    unequal, so forward/backward use uneven collectives. Requires optim_grads_params sharding on
+    a 1-D DP mesh, without nccl_ub.
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid

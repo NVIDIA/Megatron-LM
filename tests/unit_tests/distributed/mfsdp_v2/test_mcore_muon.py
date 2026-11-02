@@ -72,8 +72,11 @@ def pg_collection(distributed_setup):
     destroy_model_parallel()
 
 
+@pytest.mark.parametrize("tensor_atomic", [False, True], ids=["row_atomic", "tensor_atomic"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_mcore_muon_adam_losses(distributed_setup, pg_collection, dtype: torch.dtype) -> None:
+def test_mcore_muon_adam_losses(
+    distributed_setup, pg_collection, dtype: torch.dtype, tensor_atomic: bool
+) -> None:
     """Compare parameter selection, joint clipping, and losses against unsharded training."""
     config = TransformerConfig(
         num_layers=1,
@@ -118,6 +121,7 @@ def test_mcore_muon_adam_losses(distributed_setup, pg_collection, dtype: torch.d
             data_parallel_sharding_strategy="optim_grads_params",
             # FP32 gradient reduction keeps BF16 rounding from depending on the DP size.
             megatron_fsdp_grad_comm_dtype=torch.float32,
+            megatron_fsdp_tensor_atomic=tensor_atomic,
         ),
         module,
         pg_collection=pg_collection,

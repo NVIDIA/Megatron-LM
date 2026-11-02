@@ -3619,6 +3619,10 @@ def _add_experimental_args(parser):
                        "rank gets an equal shard. If set, pack each group without padding and split "
                        "it into generally unequal per-rank shards at row boundaries (32-row block "
                        "boundaries for MXFP8).")
+    group.add_argument("--megatron-fsdp-tensor-atomic", action="store_true",
+                       help="Megatron-FSDP v2 only. Keep every dense parameter whole on one "
+                       "rank (TensorAtomic), so the Muon optimizer step needs no communication "
+                       "for it.")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
