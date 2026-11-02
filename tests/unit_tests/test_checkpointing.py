@@ -1566,13 +1566,12 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     assert decisions == [expected]
 
 
-def test_the_pretrained_fallback_makes_the_load_weights_only_and_keeps_the_legacy_flag(
+def test_the_pretrained_fallback_makes_the_load_weights_only(
     init_model_parallel, monkeypatch, run_config
 ):
     """A missing --load with --pretrained-checkpoint loads the pretrained directory weights-only:
-    the base loader is called with finetune=True, the registered section is not written, and
-    the legacy namespace flag is set for the readers outside checkpointing.py
-    (examples/multimodal/dataloader_resume.py)."""
+    the base loader is called with finetune=True; neither the registered section nor the
+    namespace is written."""
     args = SimpleNamespace(
         finetune=False,
         tensor_model_parallel_size=1,
@@ -1600,7 +1599,7 @@ def test_the_pretrained_fallback_makes_the_load_weights_only_and_keeps_the_legac
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
     assert load_checkpoint([object()], None, None) == (0, 0)
     assert loads and loads[0] == ("/pretrained", True)
-    assert run_config.checkpoint.finetune is False and args.finetune is True
+    assert run_config.checkpoint.finetune is False and args.finetune is False
 
 
 def test_the_load_directory_is_the_sections_unless_passed(
@@ -1711,3 +1710,96 @@ def test_the_pretrained_reference_load_requests_the_llm_only_metadata(
             load_optim=False,
         )
     assert templates[0].get("load_from_llm_only_checkpoint", False) is cleared
+
+
+def _loader_args(**overrides):
+    values = dict(
+        finetune=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=False,
+        use_distributed_optimizer=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
+    """Stop every load right after its policy is resolved: nothing is read from storage."""
+
+    def base_load(load_dir, run_args, *a, finetune, **k):
+        if not k.get("rank0"):  # The final read; the rank-0 metadata read carries the same policy.
+            loads.append((load_dir, finetune))
+        return None, "", False, None
+
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path in existing)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+
+
+def test_only_the_primary_load_records_the_finetune_classification(
+    init_model_parallel, monkeypatch, run_config
+):
+    """The primary load writes TrainState.effective_finetune, True or False; the auxiliary loads
+    (the distillation teacher, RL's reference weights and reload) leave it alone. The namespace
+    is not written."""
+    args = _loader_args()
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.checkpoint.load = "/missing"
+    run_config.checkpoint.pretrained_checkpoint = "/pretrained"
+    loads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/pretrained", "/teacher"), loads)
+
+    # The primary load takes the pretrained fallback: weights-only.
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert train_state.effective_finetune is True
+    # A teacher load and RL's reload are not the primary load.
+    load_checkpoint([object()], None, None, load_dir="/teacher", finetune=False)
+    load_checkpoint([object()], None, None, restore_training_state=True, load_optim=False)
+    assert train_state.effective_finetune is True
+    assert loads == [("/pretrained", True), ("/teacher", False), ("/pretrained", True)]
+    assert args.finetune is False and not hasattr(args, "override_ckpt_iteration")
+
+    # A later primary resume of a saved run resets the classification.
+    run_config.checkpoint.load = "/saved"
+    monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/saved")
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert train_state.effective_finetune is False
+    assert run_config.checkpoint.finetune is False
+
+
+@pytest.mark.parametrize("progress_iteration", [0, 250])
+def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
+    init_model_parallel, monkeypatch, run_config, progress_iteration
+):
+    """--freeze-all-layers loads the model weights-only and resumes the data position from the
+    run's own progress tracker: the classification is recorded on the train state, the position
+    stays the load's own business, and the namespace receives neither."""
+    args = _loader_args(freeze_all_layers=True)
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.checkpoint.load = "/frozen"
+    run_config.checkpoint.save = "/out"
+    progress_reads = []
+
+    def read_progress(save_dir):
+        progress_reads.append(save_dir)
+        return progress_iteration
+
+    monkeypatch.setattr(checkpointing, "read_frozen_resume_iteration", read_progress)
+    loads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/frozen",), loads)
+
+    load_checkpoint([object()], None, None, restore_training_state=True, record_finetune=True)
+    assert loads == [("/frozen", True)]
+    assert progress_reads == ["/out"]
+    assert train_state.effective_finetune is True
+    assert not hasattr(args, "override_ckpt_iteration") and args.finetune is False
+    assert run_config.checkpoint.override_ckpt_iteration is None

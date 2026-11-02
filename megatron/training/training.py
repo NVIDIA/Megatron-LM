@@ -3139,6 +3139,7 @@ def setup_model_and_optimizer(
                 opt_param_scheduler,
                 checkpointing_context=checkpointing_context,
                 restore_training_state=True,
+                record_finetune=True,
                 skip_load_to_model_and_opt=HAVE_FSDP2
                 and cfg.dist.use_torch_fsdp2
                 and cfg.checkpoint.ckpt_format == "torch_dist",

@@ -2798,6 +2798,7 @@ def load_checkpoint(
     model_sharded_state_dict_modifier: Optional[Callable[[Dict], None]] = None,
     *,
     restore_training_state: bool = False,
+    record_finetune: bool = False,
     load_dir=_UNSET,
     finetune: Optional[bool] = None,
     load_optim: Optional[bool] = None,
@@ -2814,6 +2815,10 @@ def load_checkpoint(
     restore_training_state (bool): restore optimizer, scheduler, rerun and data
         progress. Defaults to False; training resume must explicitly opt in.
         RNG loading remains independently controlled.
+    record_finetune (bool): write ``TrainState.effective_finetune`` from this load: whether it
+        applied finetune semantics (--finetune, the pretrained-checkpoint fallback,
+        --freeze-all-layers). The primary training-state load passes True; auxiliary loads
+        (RL's reference weights and reload, the distillation teacher) leave the field alone.
     skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
@@ -2836,7 +2841,7 @@ def load_checkpoint(
     checkpoint = cfg.checkpoint
     # The policy of this load: the keyword arguments where given, the run's section otherwise.
     # Two derivations below may turn the load into a weights-only one; they stay local to this
-    # call (the legacy namespace keeps receiving them for the readers outside this module).
+    # call, and the primary load records the outcome on the train state (``record_finetune``).
     if load_dir is _UNSET:
         # ``load_arg`` names an argument other than --load (the distillation teacher's directory).
         load_dir = checkpoint.load if load_arg == 'load' else getattr(args, load_arg)
@@ -2868,11 +2873,6 @@ def load_checkpoint(
             progress_iteration = read_frozen_resume_iteration(checkpoint.save)
             if progress_iteration > 0:
                 override_ckpt_iteration = progress_iteration
-        # The derived flags stay on the legacy namespace for the readers outside this module
-        # (examples/multimodal/dataloader_resume.py reads args.finetune after the load), as
-        # validate_args keeps its flips; the registered section is never written.
-        args.finetune = True
-        args.override_ckpt_iteration = override_ckpt_iteration
 
     # Finetuning directories
     pretrained_dir = checkpoint.pretrained_checkpoint
@@ -2885,7 +2885,13 @@ def load_checkpoint(
             raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
         finetune = True
         loading_pretrained_checkpoint = True
-        args.finetune = True  # Legacy namespace flag, see the --freeze-all-layers note above.
+
+    if record_finetune:
+        # The classification of this run's primary load, for the readers that decide on it after
+        # the load (the multimodal dataloader resume); not checkpointed.
+        train_state = get_train_state()
+        if train_state is not None:
+            train_state.effective_finetune = finetune
 
     model = unwrap_model(ddp_model)
 
