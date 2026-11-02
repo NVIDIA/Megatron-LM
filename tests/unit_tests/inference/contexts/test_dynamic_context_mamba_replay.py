@@ -2,11 +2,11 @@
 
 """ReplaySSM bookkeeping on `DynamicInferenceContext`.
 
-  * Startup validation: `mamba_replay_ssm` is accepted only when the model's recurrent layers
-    are Mamba-2 (no Gated DeltaNet, no Gated Delta Product, and at least one Mamba layer).
-  * Ring-cursor resets: every path that binds an exact SSM state to a Mamba slot (local
-    zero/restore, disaggregated decode admission) must leave that slot with an empty ring,
-    even when the slot is recycled from a request that left its cursors mid-ring.
+* Startup validation: `mamba_replay_ssm` is accepted only when the model's recurrent layers
+  are Mamba-2 (no Gated DeltaNet, no Gated Delta Product, and at least one Mamba layer).
+* Ring-cursor resets: every path that binds an exact SSM state to a Mamba slot (local
+  zero/restore, disaggregated decode admission) must leave that slot with an empty ring,
+  even when the slot is recycled from a request that left its cursors mid-ring.
 """
 
 import pytest

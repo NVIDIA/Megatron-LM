@@ -262,7 +262,9 @@ def _fused_scatter_precompute_kernel(
         + offs_k[:, None] * stride_bc_pre_pos
         + offs_s[None, :] * stride_bc_pre_spec
     )
-    tl.store(bc_ptrs, bc.to(bc_pre_ptr.dtype.element_ty), mask=cache_valid[:, None] & spec_valid[None, :])
+    tl.store(
+        bc_ptrs, bc.to(bc_pre_ptr.dtype.element_ty), mask=cache_valid[:, None] & spec_valid[None, :]
+    )
 
 
 # ======================================================================
@@ -275,23 +277,72 @@ def _fused_scatter_precompute_kernel(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.jit
 def _replayssm_spec_nf_kernel(
-    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_src_ptr, bc_pre_ptr,
-    D_ptr, z_ptr, dt_bias_ptr, A_ptr, out_ptr, is_flush_flags_ptr, write_pos_ptr,
-    post_origin_ptr, state_batch_indices_ptr, query_start_loc_ptr, null_block_id,
-    batch, nheads, dim, dstate, max_cache_len, nheads_ngroups_ratio,
-    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-    stride_x_cache_batch, stride_x_cache_head, stride_x_cache_dim, stride_x_cache_pos,
-    stride_dt_cache_batch, stride_dt_cache_head, stride_dt_cache_pos,
-    stride_B_cache_batch, stride_B_cache_group, stride_B_cache_dstate, stride_B_cache_pos,
-    stride_C_src_tok, stride_C_src_c,
-    stride_bc_pre_batch, stride_bc_pre_group, stride_bc_pre_pos, stride_bc_pre_spec,
-    stride_D_head, stride_D_dim, stride_z_tok, stride_z_head, stride_z_dim,
-    stride_dt_bias_head, stride_A_head, stride_out_tok, stride_out_head, stride_out_dim,
+    state_ptr,
+    x_cache_ptr,
+    dt_cache_ptr,
+    B_cache_ptr,
+    C_src_ptr,
+    bc_pre_ptr,
+    D_ptr,
+    z_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    out_ptr,
+    is_flush_flags_ptr,
+    write_pos_ptr,
+    post_origin_ptr,
+    state_batch_indices_ptr,
+    query_start_loc_ptr,
+    null_block_id,
+    batch,
+    nheads,
+    dim,
+    dstate,
+    max_cache_len,
+    nheads_ngroups_ratio,
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    stride_x_cache_batch,
+    stride_x_cache_head,
+    stride_x_cache_dim,
+    stride_x_cache_pos,
+    stride_dt_cache_batch,
+    stride_dt_cache_head,
+    stride_dt_cache_pos,
+    stride_B_cache_batch,
+    stride_B_cache_group,
+    stride_B_cache_dstate,
+    stride_B_cache_pos,
+    stride_C_src_tok,
+    stride_C_src_c,
+    stride_bc_pre_batch,
+    stride_bc_pre_group,
+    stride_bc_pre_pos,
+    stride_bc_pre_spec,
+    stride_D_head,
+    stride_D_dim,
+    stride_z_tok,
+    stride_z_head,
+    stride_z_dim,
+    stride_dt_bias_head,
+    stride_A_head,
+    stride_out_tok,
+    stride_out_head,
+    stride_out_dim,
     stride_state_indices_batch,
-    DT_SOFTPLUS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_CACHE: tl.constexpr,
-    BLOCK_SIZE_SPEC: tl.constexpr, HAS_DT_BIAS: tl.constexpr, HAS_D: tl.constexpr,
-    HAS_Z: tl.constexpr, CACHE_BUF_LEN: tl.constexpr, DSTATE_TILE: tl.constexpr,
-    NDS: tl.constexpr, BLOCK_SIZE_DSTATE: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_CACHE: tl.constexpr,
+    BLOCK_SIZE_SPEC: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    CACHE_BUF_LEN: tl.constexpr,
+    DSTATE_TILE: tl.constexpr,
+    NDS: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -339,7 +390,9 @@ def _replayssm_spec_nf_kernel(
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
     C_src_ptr += bos * stride_C_src_tok + (pid_h // nheads_ngroups_ratio) * dstate * stride_C_src_c
-    bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
+    bc_pre_ptr += (
+        pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
+    )
     if HAS_D:
         D_ptr += pid_h * stride_D_head
     if HAS_Z:
@@ -383,8 +436,10 @@ def _replayssm_spec_nf_kernel(
     spec_scale = dt_blk[:, None] * tl.exp(
         tl.minimum(A_val * (spec_total[None, :] - dt_cum[:, None]), 0.0)
     )
-    causal = spec_valid_mask[None, :] & cache_valid_mask[:, None] & (
-        offs_k[:, None] <= spec_cache_pos[None, :]
+    causal = (
+        spec_valid_mask[None, :]
+        & cache_valid_mask[:, None]
+        & (offs_k[:, None] <= spec_cache_pos[None, :])
     )
     factor = tl.where(causal, bc * spec_scale, 0.0)
     spec_contrib = tl.dot(
@@ -417,7 +472,9 @@ def _replayssm_spec_nf_kernel(
 
     if HAS_D:
         x_spec_sm = tl.load(
-            x_cache_ptr + offs_m[None, :] * stride_x_cache_dim + phys_spec[:, None] * stride_x_cache_pos,
+            x_cache_ptr
+            + offs_m[None, :] * stride_x_cache_dim
+            + phys_spec[:, None] * stride_x_cache_pos,
             mask=spec_valid_mask[:, None] & (offs_m[None, :] < dim),
             other=0.0,
         ).to(tl.float32)
@@ -449,23 +506,72 @@ def _replayssm_spec_nf_kernel(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.jit
 def _replayssm_spec_fl_kernel(
-    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_src_ptr, bc_pre_ptr,
-    D_ptr, z_ptr, dt_bias_ptr, A_ptr, out_ptr, is_flush_flags_ptr, write_pos_ptr,
-    post_origin_ptr, state_batch_indices_ptr, query_start_loc_ptr, null_block_id,
-    batch, nheads, dim, dstate, max_cache_len, nheads_ngroups_ratio,
-    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-    stride_x_cache_batch, stride_x_cache_head, stride_x_cache_dim, stride_x_cache_pos,
-    stride_dt_cache_batch, stride_dt_cache_head, stride_dt_cache_pos,
-    stride_B_cache_batch, stride_B_cache_group, stride_B_cache_dstate, stride_B_cache_pos,
-    stride_C_src_tok, stride_C_src_c,
-    stride_bc_pre_batch, stride_bc_pre_group, stride_bc_pre_pos, stride_bc_pre_spec,
-    stride_D_head, stride_D_dim, stride_z_tok, stride_z_head, stride_z_dim,
-    stride_dt_bias_head, stride_A_head, stride_out_tok, stride_out_head, stride_out_dim,
+    state_ptr,
+    x_cache_ptr,
+    dt_cache_ptr,
+    B_cache_ptr,
+    C_src_ptr,
+    bc_pre_ptr,
+    D_ptr,
+    z_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    out_ptr,
+    is_flush_flags_ptr,
+    write_pos_ptr,
+    post_origin_ptr,
+    state_batch_indices_ptr,
+    query_start_loc_ptr,
+    null_block_id,
+    batch,
+    nheads,
+    dim,
+    dstate,
+    max_cache_len,
+    nheads_ngroups_ratio,
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    stride_x_cache_batch,
+    stride_x_cache_head,
+    stride_x_cache_dim,
+    stride_x_cache_pos,
+    stride_dt_cache_batch,
+    stride_dt_cache_head,
+    stride_dt_cache_pos,
+    stride_B_cache_batch,
+    stride_B_cache_group,
+    stride_B_cache_dstate,
+    stride_B_cache_pos,
+    stride_C_src_tok,
+    stride_C_src_c,
+    stride_bc_pre_batch,
+    stride_bc_pre_group,
+    stride_bc_pre_pos,
+    stride_bc_pre_spec,
+    stride_D_head,
+    stride_D_dim,
+    stride_z_tok,
+    stride_z_head,
+    stride_z_dim,
+    stride_dt_bias_head,
+    stride_A_head,
+    stride_out_tok,
+    stride_out_head,
+    stride_out_dim,
     stride_state_indices_batch,
-    DT_SOFTPLUS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_CACHE: tl.constexpr,
-    BLOCK_SIZE_SPEC: tl.constexpr, HAS_DT_BIAS: tl.constexpr, HAS_D: tl.constexpr,
-    HAS_Z: tl.constexpr, CACHE_BUF_LEN: tl.constexpr, DSTATE_TILE: tl.constexpr,
-    NDS: tl.constexpr, BLOCK_SIZE_DSTATE: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_CACHE: tl.constexpr,
+    BLOCK_SIZE_SPEC: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    CACHE_BUF_LEN: tl.constexpr,
+    DSTATE_TILE: tl.constexpr,
+    NDS: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -496,11 +602,14 @@ def _replayssm_spec_fl_kernel(
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
-    B_cache_ptr += state_batch_idx * stride_B_cache_batch + (
-        pid_h // nheads_ngroups_ratio
-    ) * stride_B_cache_group
+    B_cache_ptr += (
+        state_batch_idx * stride_B_cache_batch
+        + (pid_h // nheads_ngroups_ratio) * stride_B_cache_group
+    )
     C_src_ptr += bos * stride_C_src_tok + (pid_h // nheads_ngroups_ratio) * dstate * stride_C_src_c
-    bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
+    bc_pre_ptr += (
+        pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
+    )
     if HAS_D:
         D_ptr += pid_h * stride_D_head
     if HAS_Z:
@@ -527,9 +636,9 @@ def _replayssm_spec_fl_kernel(
     hist_scale = tl.where(
         hist_mask, dt_h * tl.exp(tl.minimum(A_val * (hist_total - hist_cum), 0.0)), 0.0
     )
-    dt_s = tl.load(dt_cache_ptr + phys_spec * stride_dt_cache_pos, mask=spec_valid_mask, other=0.0).to(
-        tl.float32
-    )
+    dt_s = tl.load(
+        dt_cache_ptr + phys_spec * stride_dt_cache_pos, mask=spec_valid_mask, other=0.0
+    ).to(tl.float32)
     dt_s = tl.where(spec_valid_mask, dt_s, 0.0)
     if HAS_DT_BIAS:
         dt_s = tl.where(spec_valid_mask, dt_s + dt_bias_val, 0.0)
@@ -551,7 +660,9 @@ def _replayssm_spec_fl_kernel(
         offs_n = i * DSTATE_TILE + offs_nt
         nmask = offs_n < dstate
         B_block = tl.load(
-            B_cache_ptr + phys_h[:, None] * stride_B_cache_pos + offs_n[None, :] * stride_B_cache_dstate,
+            B_cache_ptr
+            + phys_h[:, None] * stride_B_cache_pos
+            + offs_n[None, :] * stride_B_cache_dstate,
             mask=hist_mask[:, None] & nmask[None, :],
             other=0.0,
         )
@@ -559,7 +670,9 @@ def _replayssm_spec_fl_kernel(
             tl.where(hist_mask[:, None], B_block.to(tl.float32), 0.0) * hist_scale[:, None]
         ).to(x_cache_ptr.dtype.element_ty)
         delta = tl.dot(x_hist_ty, B_hist_scaled, input_precision="tf32x3").to(tl.float32)
-        st_ptrs = state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+        st_ptrs = (
+            state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+        )
         st = tl.load(st_ptrs, mask=(offs_m[:, None] < dim) & nmask[None, :], other=0.0)
         S1 = st.to(tl.float32) * hist_decay + delta
         if write_pos > 0:
@@ -578,12 +691,15 @@ def _replayssm_spec_fl_kernel(
 
     # Intra-spec window contribution: intra = x_spec @ factor_intra (causal T x T).
     bc_spec = tl.load(
-        bc_pre_ptr + (write_pos + offs_k)[:, None] * stride_bc_pre_pos + offs_s[None, :] * stride_bc_pre_spec,
+        bc_pre_ptr
+        + (write_pos + offs_k)[:, None] * stride_bc_pre_pos
+        + offs_s[None, :] * stride_bc_pre_spec,
         mask=(offs_k[:, None] < spec_len) & spec_valid_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     dt_k = tl.load(
-        dt_cache_ptr + ((post_origin + write_pos + offs_k) & (CACHE_BUF_LEN - 1)) * stride_dt_cache_pos,
+        dt_cache_ptr
+        + ((post_origin + write_pos + offs_k) & (CACHE_BUF_LEN - 1)) * stride_dt_cache_pos,
         mask=offs_k < spec_len,
         other=0.0,
     ).to(tl.float32)
@@ -593,8 +709,10 @@ def _replayssm_spec_fl_kernel(
     if DT_SOFTPLUS:
         dt_k = tl.where(offs_k < spec_len, tl.where(dt_k <= 20.0, softplus(dt_k), dt_k), 0.0)
     speccum_k = tl.cumsum(dt_k, axis=0)
-    causal = (offs_k[:, None] < spec_len) & spec_valid_mask[None, :] & (
-        offs_k[:, None] <= offs_s[None, :]
+    causal = (
+        (offs_k[:, None] < spec_len)
+        & spec_valid_mask[None, :]
+        & (offs_k[:, None] <= offs_s[None, :])
     )
     decay_ks = tl.exp(tl.minimum(A_val * (spec_cum[None, :] - speccum_k[:, None]), 0.0))
     factor_intra = tl.where(causal, bc_spec * dt_k[:, None] * decay_ks, 0.0)
@@ -605,14 +723,16 @@ def _replayssm_spec_fl_kernel(
         mask=(offs_m[:, None] < dim) & (offs_k[None, :] < spec_len),
         other=0.0,
     ).to(x_cache_ptr.dtype.element_ty)
-    intra = tl.dot(x_src, factor_intra.to(x_cache_ptr.dtype.element_ty), input_precision="tf32x3").to(
-        tl.float32
-    )
+    intra = tl.dot(
+        x_src, factor_intra.to(x_cache_ptr.dtype.element_ty), input_precision="tf32x3"
+    ).to(tl.float32)
     out = tl.trans(checkpoint_out + intra)
 
     if HAS_D:
         x_spec_sm = tl.load(
-            x_cache_ptr + offs_m[None, :] * stride_x_cache_dim + phys_spec[:, None] * stride_x_cache_pos,
+            x_cache_ptr
+            + offs_m[None, :] * stride_x_cache_dim
+            + phys_spec[:, None] * stride_x_cache_pos,
             mask=spec_valid_mask[:, None] & (offs_m[None, :] < dim),
             other=0.0,
         ).to(tl.float32)
@@ -768,21 +888,51 @@ def selective_state_update_replayssm_spec(
     NCX = triton.cdiv(ratio_p, BLOCK_CX)
     block_hl = max(1, triton.next_power_of_2(ratio))
     _fused_scatter_precompute_kernel[(batch, ngroups)](
-        conv_out, dt_spec, post_conv_cache, dt_cache, write_pos, post_conv_state_pos,
-        bc_pre, state_batch_indices, query_start_loc, null_block_id, batch, ngroups,
-        nheads, dstate, d_inner, conv_dim, L,
-        conv_out.stride(0), conv_out.stride(1), dt_spec.stride(0), dt_spec.stride(1),
-        post_conv_cache.stride(0), post_conv_cache.stride(1), post_conv_cache.stride(2),
-        dt_cache.stride(0), dt_cache.stride(1), dt_cache.stride(2),
-        bc_pre.stride(0), bc_pre.stride(1), bc_pre.stride(2), bc_pre.stride(3), sis,
-        RATIO=ratio, RATIO_P=ratio_p, NCX=NCX, BLOCK_CX=BLOCK_CX, CACHE_BUF_LEN=cache_buf_len,
-        BLOCK_SIZE_CACHE=pre_block, BLOCK_SIZE_SPEC=block_spec, BLOCK_HL=block_hl, num_warps=4,
+        conv_out,
+        dt_spec,
+        post_conv_cache,
+        dt_cache,
+        write_pos,
+        post_conv_state_pos,
+        bc_pre,
+        state_batch_indices,
+        query_start_loc,
+        null_block_id,
+        batch,
+        ngroups,
+        nheads,
+        dstate,
+        d_inner,
+        conv_dim,
+        L,
+        conv_out.stride(0),
+        conv_out.stride(1),
+        dt_spec.stride(0),
+        dt_spec.stride(1),
+        post_conv_cache.stride(0),
+        post_conv_cache.stride(1),
+        post_conv_cache.stride(2),
+        dt_cache.stride(0),
+        dt_cache.stride(1),
+        dt_cache.stride(2),
+        bc_pre.stride(0),
+        bc_pre.stride(1),
+        bc_pre.stride(2),
+        bc_pre.stride(3),
+        sis,
+        RATIO=ratio,
+        RATIO_P=ratio_p,
+        NCX=NCX,
+        BLOCK_CX=BLOCK_CX,
+        CACHE_BUF_LEN=cache_buf_len,
+        BLOCK_SIZE_CACHE=pre_block,
+        BLOCK_SIZE_SPEC=block_spec,
+        BLOCK_HL=block_hl,
+        num_warps=4,
     )
 
     # views into the circular post-conv cache: x | B on the channel axis
-    x_view = (
-        post_conv_cache[:, :, :d_inner].view(num_slots, buf, nheads, dim).permute(0, 2, 1, 3)
-    )
+    x_view = post_conv_cache[:, :, :d_inner].view(num_slots, buf, nheads, dim).permute(0, 2, 1, 3)
     B_view = (
         post_conv_cache[:, :, d_inner : d_inner + ngroups * dstate]
         .view(num_slots, buf, ngroups, dstate)
@@ -795,31 +945,86 @@ def selective_state_update_replayssm_spec(
     def _args(bsm):
         grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
         return grid, (
-            state_checkpoint, x_view, dt_cache, B_view, C_src, bc_pre, D, z, dt_bias, A,
-            out, is_flush, write_pos, post_conv_state_pos, state_batch_indices,
-            query_start_loc, null_block_id, batch, nheads, dim, dstate, L, nheads // ngroups,
-            state_checkpoint.stride(0), state_checkpoint.stride(1),
-            state_checkpoint.stride(2), state_checkpoint.stride(3),
-            x_view.stride(0), x_view.stride(1), x_view.stride(3), x_view.stride(2),
-            dt_cache.stride(0), dt_cache.stride(1), dt_cache.stride(2),
-            B_view.stride(0), B_view.stride(1), B_view.stride(3), B_view.stride(2),
-            C_src.stride(0), C_src.stride(1),
-            bc_pre.stride(0), bc_pre.stride(1), bc_pre.stride(2), bc_pre.stride(3),
-            D.stride(0) if D is not None else 0, D.stride(1) if D is not None else 0,
-            z_strides[0], z_strides[1], z_strides[2],
+            state_checkpoint,
+            x_view,
+            dt_cache,
+            B_view,
+            C_src,
+            bc_pre,
+            D,
+            z,
+            dt_bias,
+            A,
+            out,
+            is_flush,
+            write_pos,
+            post_conv_state_pos,
+            state_batch_indices,
+            query_start_loc,
+            null_block_id,
+            batch,
+            nheads,
+            dim,
+            dstate,
+            L,
+            nheads // ngroups,
+            state_checkpoint.stride(0),
+            state_checkpoint.stride(1),
+            state_checkpoint.stride(2),
+            state_checkpoint.stride(3),
+            x_view.stride(0),
+            x_view.stride(1),
+            x_view.stride(3),
+            x_view.stride(2),
+            dt_cache.stride(0),
+            dt_cache.stride(1),
+            dt_cache.stride(2),
+            B_view.stride(0),
+            B_view.stride(1),
+            B_view.stride(3),
+            B_view.stride(2),
+            C_src.stride(0),
+            C_src.stride(1),
+            bc_pre.stride(0),
+            bc_pre.stride(1),
+            bc_pre.stride(2),
+            bc_pre.stride(3),
+            D.stride(0) if D is not None else 0,
+            D.stride(1) if D is not None else 0,
+            z_strides[0],
+            z_strides[1],
+            z_strides[2],
             dt_bias.stride(0) if dt_bias is not None else 0,
-            A.stride(0), out.stride(0), out.stride(1), out.stride(2), sis, dt_softplus, bsm,
+            A.stride(0),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            sis,
+            dt_softplus,
+            bsm,
         )
 
     grid, base = _args(bsm_v)
     _replayssm_spec_nf_kernel[grid](
-        *base, main_block, block_spec,
-        CACHE_BUF_LEN=cache_buf_len, DSTATE_TILE=dt_v, NDS=nds_v, num_warps=nw_v, num_stages=ns_v,
+        *base,
+        main_block,
+        block_spec,
+        CACHE_BUF_LEN=cache_buf_len,
+        DSTATE_TILE=dt_v,
+        NDS=nds_v,
+        num_warps=nw_v,
+        num_stages=ns_v,
     )
     grid, base = _args(bsm_f)
     _replayssm_spec_fl_kernel[grid](
-        *base, main_block, block_spec,
-        CACHE_BUF_LEN=cache_buf_len, DSTATE_TILE=dt_f, NDS=nds_f, num_warps=nw_f, num_stages=ns_f,
+        *base,
+        main_block,
+        block_spec,
+        CACHE_BUF_LEN=cache_buf_len,
+        DSTATE_TILE=dt_f,
+        NDS=nds_f,
+        num_warps=nw_f,
+        num_stages=ns_f,
     )
     return out
 

@@ -171,9 +171,7 @@ class MambaReplayMetadata:
         buf = self.cache_buf_len
         # Circular post-conv input cache (packed x|B).
         self.conv_cache = torch.zeros(
-            (num_layers, num_slots, buf, self.cache_conv_dim),
-            dtype=self.cache_dtype,
-            device=device,
+            (num_layers, num_slots, buf, self.cache_conv_dim), dtype=self.cache_dtype, device=device
         )
         # Raw-dt cache; dt_bias and softplus are applied on read.
         self.dt_cache = torch.zeros(

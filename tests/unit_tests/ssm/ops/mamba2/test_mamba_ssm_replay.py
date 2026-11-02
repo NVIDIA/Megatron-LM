@@ -68,9 +68,7 @@ def _baseline_window(state, x, dt, A, B, C, D, dt_bias, headdim):
     # dump, which scribbles state values onto x[0, 0, 0, 0] and races other
     # programs' loads of x, corrupting the oracle.
     dstate = state.shape[-1]
-    scratch = torch.empty(
-        1, S, nheads, headdim, dstate, device=x.device, dtype=state.dtype
-    )
+    scratch = torch.empty(1, S, nheads, headdim, dstate, device=x.device, dtype=state.dtype)
     out = selective_state_update(
         state,
         x.unsqueeze(0),
@@ -101,17 +99,27 @@ def _scatter_history(conv_cache, dt_cache, slot, x_hist, B_hist, dt_hist, d_inne
 class _ReplayRig:
     """Single-layer ReplaySSM buffers + geometry for kernel-level tests."""
 
-    def __init__(self, num_slots, nheads, headdim, dstate, ngroups, buffer_len, window,
-                 state_dtype=torch.float32, act_dtype=torch.float32):
+    def __init__(
+        self,
+        num_slots,
+        nheads,
+        headdim,
+        dstate,
+        ngroups,
+        buffer_len,
+        window,
+        state_dtype=torch.float32,
+        act_dtype=torch.float32,
+    ):
         self.nheads, self.headdim, self.dstate, self.ngroups = nheads, headdim, dstate, ngroups
         self.d_inner = nheads * headdim
         self.window = window
         self.L = buffer_len + window
         self.buf = 1 << (self.L - 1).bit_length()
         self.block_spec = 1 << (window - 1).bit_length()
-        self.state = torch.randn(
-            num_slots, nheads, headdim, dstate, device=DEVICE, dtype=state_dtype
-        ) * 0.1
+        self.state = (
+            torch.randn(num_slots, nheads, headdim, dstate, device=DEVICE, dtype=state_dtype) * 0.1
+        )
         cache_conv_dim = self.d_inner + ngroups * dstate
         self.conv_cache = torch.zeros(
             num_slots, self.buf, cache_conv_dim, device=DEVICE, dtype=act_dtype
@@ -159,21 +167,27 @@ class TestReplaySpecVerify:
     @pytest.mark.parametrize("window", [2, 3, 5])
     @pytest.mark.parametrize(
         "state_dtype,act_dtype",
-        [(torch.float32, torch.float32), (torch.float32, torch.bfloat16),
-         (torch.bfloat16, torch.bfloat16)],
+        [
+            (torch.float32, torch.float32),
+            (torch.float32, torch.bfloat16),
+            (torch.bfloat16, torch.bfloat16),
+        ],
         ids=["s32_a32", "s32_a16", "s16_a16"],
     )
     def test_verify_matches_baseline(self, geometry, window, state_dtype, act_dtype):
         torch.manual_seed(0)
         nheads, headdim, dstate, ngroups = _geometry(geometry)
         buffer_len = 16
-        rig = _ReplayRig(2, nheads, headdim, dstate, ngroups, buffer_len, window,
-                         state_dtype, act_dtype)
+        rig = _ReplayRig(
+            2, nheads, headdim, dstate, ngroups, buffer_len, window, state_dtype, act_dtype
+        )
         A, dt_bias, D = _make_tied_inputs(nheads, headdim, dstate, DEVICE)
         slot = 1
         C_fill = buffer_len - window  # max non-flush committed fill
         for wp in sorted({0, C_fill // 2, C_fill}):
-            rig.write_pos.zero_(); rig.origin.zero_(); rig.is_flush.zero_()
+            rig.write_pos.zero_()
+            rig.origin.zero_()
+            rig.is_flush.zero_()
             rig.write_pos[slot] = wp
             # committed history + fresh window (round-tripped through the activation
             # dtype so oracle and kernel consume identical values)
@@ -194,15 +208,14 @@ class TestReplaySpecVerify:
 
             # Oracle: baseline over history + window from the same checkpoint.
             st = state_before[slot : slot + 1].float().clone()
-            x_all = torch.cat([x_h, x_w]); B_all = torch.cat([B_h, B_w])
+            x_all = torch.cat([x_h, x_w])
+            B_all = torch.cat([B_h, B_w])
             dt_all = torch.cat([dt_h, dt_w])
             # History C is irrelevant for the window outputs; use zeros.
             C_all = torch.cat([torch.zeros(wp, ngroups, dstate, device=DEVICE), C_w])
             ref = _baseline_window(st, x_all, dt_all, A, B_all, C_all, D, dt_bias, headdim)
             rtol, atol = _tolerances(state_dtype, act_dtype)
-            torch.testing.assert_close(
-                out[:window].float(), ref[wp:].float(), rtol=rtol, atol=atol
-            )
+            torch.testing.assert_close(out[:window].float(), ref[wp:].float(), rtol=rtol, atol=atol)
             # Non-flush verify must not touch the checkpoint (bitwise).
             assert torch.equal(rig.state, state_before)
 
@@ -303,8 +316,9 @@ class TestReplayMultiStepRollback:
         torch.manual_seed(42)
         gen = torch.Generator().manual_seed(43)
         nheads, headdim, dstate, ngroups = _geometry("small")
-        rig = _ReplayRig(2, nheads, headdim, dstate, ngroups, buffer_len, window,
-                         state_dtype, act_dtype)
+        rig = _ReplayRig(
+            2, nheads, headdim, dstate, ngroups, buffer_len, window, state_dtype, act_dtype
+        )
         A, dt_bias, D = _make_tied_inputs(nheads, headdim, dstate, DEVICE)
         slot = 1
         sbi = torch.tensor([slot], dtype=torch.int64, device=DEVICE)
@@ -340,15 +354,20 @@ class TestReplayMultiStepRollback:
 
             # Baseline consumes exactly the committed tokens.
             ref = _baseline_window(
-                state_base, x_w[:n_commit], dt_w[:n_commit], A, B_w[:n_commit],
-                C_w[:n_commit], D, dt_bias, headdim,
+                state_base,
+                x_w[:n_commit],
+                dt_w[:n_commit],
+                A,
+                B_w[:n_commit],
+                C_w[:n_commit],
+                D,
+                dt_bias,
+                headdim,
             )
             for _ in range(n_commit):
                 total_accepted += 1
             snapshots[total_accepted] = state_base.clone()
-            torch.testing.assert_close(
-                out[:n_commit].float(), ref, rtol=rtol, atol=atol
-            )
+            torch.testing.assert_close(out[:n_commit].float(), ref, rtol=rtol, atol=atol)
 
             accepted = torch.tensor([k_drafts], dtype=torch.int64, device=DEVICE)
             commit_replayssm_spec(
@@ -365,10 +384,7 @@ class TestReplayMultiStepRollback:
 
             if n_folded in snapshots:
                 torch.testing.assert_close(
-                    rig.state[slot].float(),
-                    snapshots[n_folded].squeeze(0),
-                    rtol=rtol,
-                    atol=atol,
+                    rig.state[slot].float(), snapshots[n_folded].squeeze(0), rtol=rtol, atol=atol
                 )
 
         assert n_folded > 0, "the ring never flushed; the test is vacuous"
@@ -396,7 +412,8 @@ class TestReplayMultiStepRollback:
         qsl = torch.tensor([0, window], dtype=torch.int32, device=DEVICE)
         out = rig.run_step(_pack_conv_out(x_w, B_w, C_w), dt_w, A, D, dt_bias, sbi, qsl)
         st = rig.state[slot : slot + 1].float().clone()
-        x_all = torch.cat([x_h, x_w]); B_all = torch.cat([B_h, B_w])
+        x_all = torch.cat([x_h, x_w])
+        B_all = torch.cat([B_h, B_w])
         dt_all = torch.cat([dt_h, dt_w])
         C_all = torch.cat([torch.zeros(wp, ngroups, dstate, device=DEVICE), C_w])
         ref = _baseline_window(st, x_all, dt_all, A, B_all, C_all, D, dt_bias, headdim)

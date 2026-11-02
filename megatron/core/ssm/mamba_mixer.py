@@ -1209,12 +1209,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             # commit kernel's ring-pointer move in the controller.
             replay = replay_context.mamba_replay
             A = self._get_decode_A_neg_exp()
-            assert A.stride(-1) == 0 and A.stride(-2) == 0, (
-                "mamba_replay_ssm requires a per-head scalar A (Mamba-2 / TIE_HDIM)"
-            )
-            assert seq_len == replay.window, (
-                f"ReplaySSM decode window mismatch: seq_len={seq_len}, window={replay.window}"
-            )
+            assert (
+                A.stride(-1) == 0 and A.stride(-2) == 0
+            ), "mamba_replay_ssm requires a per-head scalar A (Mamba-2 / TIE_HDIM)"
+            assert (
+                seq_len == replay.window
+            ), f"ReplaySSM decode window mismatch: seq_len={seq_len}, window={replay.window}"
             conv_out = xBC.reshape(batch_size * seq_len, -1)
             dt_raw = dt.reshape(batch_size * seq_len, self.nheads_local_tp)
             z_replay = None
