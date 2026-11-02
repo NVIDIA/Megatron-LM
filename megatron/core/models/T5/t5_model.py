@@ -161,17 +161,17 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        if pg_collection is not None:
-            if (
-                share_embeddings_and_output_weights
-                and config.pipeline_model_parallel_size > 1
-                and (pre_process or post_process)
-                and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-            ):
-                raise ValueError(
-                    "T5Model tied pipeline embedding/output stages require a usable embd group"
-                )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        if (
+            pg_collection is not None
+            and share_embeddings_and_output_weights
+            and config.pipeline_model_parallel_size > 1
+            and (pre_process or post_process)
+            and self.embd_group is None
+        ):
+            raise ValueError(
+                "T5Model tied pipeline embedding/output stages require a usable embd group"
+            )
         # LanguageModule resolves an omitted collection; build the submodules on the same groups.
         pg_collection = self.pg_collection
 

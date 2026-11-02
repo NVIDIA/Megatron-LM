@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import inspect
 import logging
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -19,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import (
+    _FALLBACK_WARNING_SKIP_PREFIXES,
     ProcessGroupCollection,
     warn_global_process_group_fallback,
 )
@@ -28,6 +30,38 @@ from megatron.core.transformer.multi_token_prediction import tie_word_embeddings
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
 from megatron.core.utils import get_pg_rank, make_tp_sharded_tensor_for_checkpoint
+
+
+def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollection) -> None:
+    """Check a caller's collection before a language model is built on it."""
+    groups = vars(pg_collection)
+    for pg_name in ('tp', 'cp', 'pp'):
+        if pg_name not in groups:
+            raise ValueError(
+                f"LanguageModule pg_collection must explicitly define {pg_name}; "
+                "use None only when that group is not needed."
+            )
+    if 'embd' not in groups:
+        warnings.warn(
+            f"{owner} was given a pg_collection without an embd field and treats it as "
+            "embd=None. Set embd explicitly, to None when it is unused; a missing embd becomes "
+            "an error in Megatron Core 0.23.",
+            FutureWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    for pg_name in ('tp', 'cp', 'pp', 'embd'):
+        if groups.get(pg_name) == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            raise ValueError(
+                f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
+                "use None for a nonparticipating embedding group."
+            )
+    if torch.distributed.is_initialized():
+        for pg_name in ('tp', 'cp', 'pp'):
+            if groups[pg_name] is None:
+                raise ValueError(
+                    f"LanguageModule requires a participating {pg_name} group when "
+                    "distributed is initialized, including for singleton dimensions."
+                )
 
 
 class LanguageModule(MegatronModule):
@@ -49,28 +83,12 @@ class LanguageModule(MegatronModule):
         super().__init__(config=config)
         if pg_collection is None:
             # The global grid is only a compatibility default: a model built on independent grids
-            # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it.
+            # (vision encoder + LLM, GTP, MIMO) would get the wrong groups from it. The deprecated
+            # path keeps main's behavior, so only a caller's collection is validated below.
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        groups = vars(pg_collection)
-        for pg_name in ('tp', 'cp', 'pp', 'embd'):
-            if pg_name not in groups:
-                raise ValueError(
-                    f"LanguageModule pg_collection must explicitly define {pg_name}; "
-                    "use None only when that group is not needed."
-                )
-            if groups[pg_name] == torch.distributed.GroupMember.NON_GROUP_MEMBER:
-                raise ValueError(
-                    f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
-                    "use None for a nonparticipating embedding group."
-                )
-        if torch.distributed.is_initialized():
-            for pg_name in ('tp', 'cp', 'pp'):
-                if groups[pg_name] is None:
-                    raise ValueError(
-                        f"LanguageModule requires a participating {pg_name} group when "
-                        "distributed is initialized, including for singleton dimensions."
-                    )
+        else:
+            _validate_supplied_collection(type(self).__name__, pg_collection)
         set_attention_backend(self.config)
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp

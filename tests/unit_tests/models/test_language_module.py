@@ -53,13 +53,36 @@ def test_omitted_collection_warns_and_uses_global_groups(mocker, explicit_groups
     assert model.tp_group is explicit_groups.tp
 
 
-@pytest.mark.parametrize('field', ['tp', 'cp', 'pp', 'embd'])
+@pytest.mark.parametrize('field', ['tp', 'cp', 'pp'])
 def test_rejects_omitted_field(explicit_groups, field):
     delattr(explicit_groups, field)
     # Declared but unset collection fields are visible to hasattr and resolve to None.
     assert hasattr(explicit_groups, field)
     with pytest.raises(ValueError, match=f'must explicitly define {field}'):
         LanguageModule(config(), pg_collection=explicit_groups)
+
+
+def test_omitted_embedding_group_warns_and_is_none(mocker, explicit_groups):
+    """A collection built without embd still works until 0.23, as if embd were None."""
+    mocker.patch('torch.distributed.is_initialized', return_value=True)
+    delattr(explicit_groups, 'embd')
+    with pytest.warns(
+        FutureWarning, match='LanguageModule was given a pg_collection without an embd'
+    ):
+        model = LanguageModule(config(), pg_collection=explicit_groups)
+    assert model.embd_group is None
+
+
+def test_fallback_collection_is_not_validated(mocker):
+    """The deprecated path keeps main's behavior when the global grid lacks a group."""
+    clear_nvte_env_vars()
+    mocker.patch.object(process_groups_config, '_warned_global_process_group_fallbacks', set())
+    mocker.patch('torch.distributed.is_initialized', return_value=True)
+    incomplete = ProcessGroupCollection(tp=None, cp=None, pp=None)
+    mocker.patch.object(ProcessGroupCollection, 'use_mpu_process_groups', return_value=incomplete)
+    with pytest.warns(FutureWarning, match='LanguageModule was called without `pg_collection`'):
+        model = LanguageModule(config())
+    assert model.pg_collection is incomplete
 
 
 @pytest.mark.parametrize('field', ['tp', 'cp', 'pp'])
