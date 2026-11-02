@@ -53,7 +53,10 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         device = torch.device(f"cuda:{local_rank}")
         # is_symm_mem_tensor() marks the current symmetric-memory backend as in use,
         # even for ordinary tensors, so select NCCL before any DBuffer test calls it.
-        symm_mem.set_backend("NCCL")
+        # The copy-engine experiment (FSDP_MUON_CE=1) needs the default CUDA backend: the NCCL
+        # backend has no barrier.
+        if os.environ.get("FSDP_MUON_CE") != "1":
+            symm_mem.set_backend("NCCL")
     else:
         device = torch.device("cpu")
 

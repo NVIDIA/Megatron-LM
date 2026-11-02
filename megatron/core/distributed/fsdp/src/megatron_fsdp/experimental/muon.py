@@ -2,6 +2,7 @@
 
 """Muon with sharded momentum and owner-compute updates for MFSDP v2."""
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -23,6 +24,7 @@ except ImportError as error:
 from emerging_optimizers import utils as eo_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
+from .ce_transfer import CopyEngineExchange
 from .dbuffer import DBuffer
 from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
@@ -171,6 +173,14 @@ class FsdpMuon(Muon):
                 )
             )
         self._validate_parameter_groups()
+        # Experiment: move gathers and scatters with peer copies on the copy engines.
+        self._exchanges: dict[FsdpParameterGroup, CopyEngineExchange] = {}
+        if os.environ.get("FSDP_MUON_CE") == "1":
+            for assignment in self._fsdp_group_assignments:
+                if assignment.has_comm:
+                    self._exchanges[assignment.fsdp_group] = CopyEngineExchange(
+                        assignment.fsdp_group.main_weight, assignment.rank_ranges
+                    )
 
     def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
@@ -282,8 +292,14 @@ class FsdpMuon(Muon):
             sharded: DBuffer | None = None
             if assignment.has_comm:
                 buffer: DBuffer = fsdp_group.main_weight
+                exchange = self._exchanges.get(fsdp_group)
                 sharded = DBuffer(
-                    buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
+                    buffer.mesh,
+                    buffer.placements,
+                    buffer.layout,
+                    buffer.dtype,
+                    buffer.device,
+                    local_buffer=None if exchange is None else exchange.source,
                 )
                 for i, local_input in inputs.items():
                     sharded.get_tensor_view(i).copy_(local_input)
@@ -295,12 +311,15 @@ class FsdpMuon(Muon):
                 }
                 for update in full_updates.values():
                     update.record_stream(compute_stream)  # Newton-Schulz reads it on that stream.
-                works = gather(
-                    sharded,
-                    full_updates,
-                    tensor_to_owner=tensor_to_owner,
-                    rank_ranges=assignment.rank_ranges,
-                )
+                if exchange is None:
+                    works = gather(
+                        sharded,
+                        full_updates,
+                        tensor_to_owner=tensor_to_owner,
+                        rank_ranges=assignment.rank_ranges,
+                    )
+                else:
+                    exchange.gather(buffer.layout, full_updates, tensor_to_owner)
             else:
                 full_updates = {i: inputs[i] for i in owned}
             return _Transfer(
@@ -320,6 +339,22 @@ class FsdpMuon(Muon):
             the updates of remote-owned tensors.
         """
         buffer: DBuffer = gathered.assignment.fsdp_group.main_weight
+        exchange = self._exchanges.get(gathered.assignment.fsdp_group)
+        if exchange is not None:
+            compute_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(self._comm_stream):
+                # Newton-Schulz, the last thing enqueued on the caller's stream, made the updates.
+                self._comm_stream.wait_stream(compute_stream)
+                local_updates = DBuffer(
+                    buffer.mesh,
+                    buffer.placements,
+                    buffer.layout,
+                    torch.float32,
+                    buffer.device,
+                    local_buffer=exchange.destination,
+                )
+                exchange.scatter(buffer.layout, gathered.full_updates, gathered.tensor_to_owner)
+                return replace(gathered, works=[], sharded=local_updates)
         local_updates: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )

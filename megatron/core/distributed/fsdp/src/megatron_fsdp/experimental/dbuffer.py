@@ -103,8 +103,9 @@ class DBuffer:
         layout: GlobalLayout,
         dtype: torch.dtype,
         device: torch.device | str,
+        local_buffer: torch.Tensor | None = None,
     ) -> None:
-        """Create a DBuffer and allocate its local buffer.
+        """Create a DBuffer and allocate its local buffer, or use the given one.
 
         Args:
             mesh: Device mesh whose dimensions correspond to ``placements``.
@@ -112,6 +113,7 @@ class DBuffer:
             layout: Global shapes, offsets, and allocation size for this buffer.
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
+            local_buffer: Preallocated local buffer of the right size and dtype, if any.
         """
         placements = tuple(placements)
         if len(placements) != mesh.ndim:
@@ -126,7 +128,11 @@ class DBuffer:
         self.layout = layout
         local_range = self.layout.get_local_range(self.mesh, self.placements)
         self.offset = local_range.start
-        self.local_buffer = torch.empty(local_range.numel, dtype=dtype, device=device)
+        if local_buffer is None:
+            local_buffer = torch.empty(local_range.numel, dtype=dtype, device=device)
+        elif local_buffer.numel() != local_range.numel or local_buffer.dtype != dtype:
+            raise ValueError("local_buffer must match the local range's size and dtype.")
+        self.local_buffer = local_buffer
 
     @classmethod
     def empty(
