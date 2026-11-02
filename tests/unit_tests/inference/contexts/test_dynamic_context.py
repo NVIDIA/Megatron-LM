@@ -4951,10 +4951,20 @@ def test_flashinfer_fused_rope_supports():
         assert not dynamic_context.flashinfer_fused_rope_supports(*shape), _rope_id(shape)
 
 
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and dynamic_context.HAVE_FLASHINFER),
-    reason="FlashInfer fused RoPE needs CUDA and FlashInfer",
-)
+def _flashinfer_rope_shapes():
+    """Every shape the predicate sends to FlashInfer: head dims up to 256 in steps of 8 and
+    512, at rotary_percent 1, 0.5 and 0.25, in both layouts."""
+    shapes = []
+    for head_dim in [*range(8, 257, 8), 512]:
+        for rotary_dim in sorted({head_dim, head_dim // 2, head_dim // 4}):
+            for interleaved in (False, True):
+                shape = (head_dim, rotary_dim, interleaved)
+                if rotary_dim % 2 == 0 and dynamic_context.flashinfer_fused_rope_supports(*shape):
+                    shapes.append(shape)
+    return shapes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer fused RoPE needs CUDA")
 @pytest.mark.parametrize(
     "shape",
     _FUSED_ROPE_KERNEL_SHAPES + _FUSED_ROPE_SILENT_SHAPES + _FUSED_ROPE_RACY_SHAPES,
@@ -4962,6 +4972,7 @@ def test_flashinfer_fused_rope_supports():
 )
 def test_flashinfer_fused_rope_matches_fp64_rotation(shape):
     """Every head shape is rotated exactly: by FlashInfer where it can, in fp32 otherwise."""
+    assert dynamic_context.HAVE_FLASHINFER, "FlashInfer is not installed"
     kernel = dynamic_context.flashinfer.rope.apply_rope_with_cos_sin_cache
     with mock.patch.object(
         dynamic_context.flashinfer.rope, "apply_rope_with_cos_sin_cache", wraps=kernel
@@ -4971,20 +4982,42 @@ def test_flashinfer_fused_rope_matches_fp64_rotation(shape):
     assert spy.call_count == int(shape in _FUSED_ROPE_KERNEL_SHAPES)
 
 
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and dynamic_context.HAVE_FLASHINFER),
-    reason="FlashInfer fused RoPE needs CUDA and FlashInfer",
-)
-@pytest.mark.parametrize("shape", _FUSED_ROPE_FAULT_SHAPES, ids=_rope_id)
-def test_flashinfer_fused_rope_fault_shapes_run(shape):
-    """Shapes FlashInfer would fault on run and rotate exactly (each in its own process)."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer fused RoPE needs CUDA")
+def test_flashinfer_fused_rope_kernel_shapes_match_fp64_rotation():
+    """FlashInfer rotates every shape the predicate sends it exactly.
+
+    The predicate encodes one FlashInfer release's vector widths and kernel dispatch; a release
+    that changes either breaks some of these shapes.
+    """
+    assert dynamic_context.HAVE_FLASHINFER, "FlashInfer is not installed"
+    shapes = _flashinfer_rope_shapes()
+    kernel = dynamic_context.flashinfer.rope.apply_rope_with_cos_sin_cache
+    with mock.patch.object(
+        dynamic_context.flashinfer.rope, "apply_rope_with_cos_sin_cache", wraps=kernel
+    ) as spy:
+        errors = [error for shape in shapes if (error := _fused_rope_error(*shape))]
+    assert not errors, f"FlashInfer {dynamic_context.flashinfer.__version__}:\n" + "\n".join(errors)
+    assert spy.call_count == len(shapes)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer fused RoPE needs CUDA")
+def test_flashinfer_fused_rope_fault_shapes_run():
+    """Shapes FlashInfer would fault on run and rotate exactly.
+
+    A misaligned access leaves a sticky CUDA error, so the shapes run in a child process.
+    """
+    assert dynamic_context.HAVE_FLASHINFER, "FlashInfer is not installed"
     script = (
         "import sys\n"
-        "from tests.unit_tests.inference.contexts.test_dynamic_context import _fused_rope_error\n"
-        "sys.exit(_fused_rope_error(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == 'True'))\n"
+        "from tests.unit_tests.inference.contexts.test_dynamic_context import (\n"
+        "    _FUSED_ROPE_FAULT_SHAPES,\n"
+        "    _fused_rope_error,\n"
+        ")\n"
+        "errors = [_fused_rope_error(*shape) for shape in _FUSED_ROPE_FAULT_SHAPES]\n"
+        "sys.exit('\\n'.join(error for error in errors if error) or None)\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script, *map(str, shape)],
+        [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[4],
         capture_output=True,
         text=True,
