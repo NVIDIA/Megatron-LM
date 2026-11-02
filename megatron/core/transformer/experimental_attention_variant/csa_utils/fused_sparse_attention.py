@@ -528,6 +528,13 @@ class CSASparseAttnFunc(torch.autograd.Function):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
         out, dO = undo_output_rope_for_backward(ctx.out_rope, out, dO)
+        if ctx.topk_length is not None:
+            # cuDNN DSA backward treats every slot as a non-negative address when
+            # ``topk_length`` is supplied, including the ignored suffix (the Path-B
+            # contract below). Without ``topk_length`` the ``-1`` sentinels are the only
+            # invalid-slot marker and must be kept. Clamp a copy: the saved indices may be
+            # shared with another consumer.
+            topk_idxs = topk_idxs.clamp_min(0)
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q, kv, out, dO, lse, attn_sink, topk_idxs, ctx.softmax_scale, ctx.topk_length
         )
