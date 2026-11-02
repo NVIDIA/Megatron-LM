@@ -41,7 +41,9 @@ try:
             "bf16_gemm_nn",
         )
     )
-except ImportError:
+except (ImportError, OSError, RuntimeError, AttributeError):
+    # A deep_gemm build compiled against another torch (or CUDA) can fail to load its
+    # extension with any of these; Megatron must still import, without DeepGEMM.
     deep_gemm = None
     HAVE_DEEPGEMM_BF16 = False
 
