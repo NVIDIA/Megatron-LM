@@ -12,6 +12,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
@@ -279,6 +280,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
 
+        # Per-rank token counts of the current dispatch when TP*EP ranks hold different numbers
+        # of tokens; None when every rank holds the same number.
+        self.split_sizes = None
+
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = ['routing_map']
@@ -293,26 +298,52 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.routing_map = routing_map
         return hidden_states, probs
 
+    def _unequal_inference_split_sizes(self, num_local_tokens: int) -> Optional[List[int]]:
+        """Return each TP*EP rank's token count if inference ranks hold different counts.
+
+        Training ranks hold equal token counts. Inference EP ranks need not: each batches its
+        own requests, and an idle rank runs a minimal dummy forward. Equal-size collectives
+        would then hang, so eager inference exchanges the counts. CUDA-graphed inference steps
+        are padded to EP-synced sizes, and capture cannot host-sync, so capture skips this.
+        """
+        if not InferenceMode.is_active() or torch.cuda.is_current_stream_capturing():
+            return None
+        local_count = torch.tensor(
+            [num_local_tokens], dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        counts = torch.empty(
+            utils.get_pg_size(self.tp_ep_group), dtype=torch.int64, device=local_count.device
+        )
+        torch.distributed.all_gather_into_tensor(counts, local_count, group=self.tp_ep_group)
+        counts = counts.tolist()
+        return counts if len(set(counts)) > 1 else None
+
     def token_dispatch(self, hidden_states, probs):
         """Gathers tokens from all TP*EP ranks using AllGather."""
 
         # Permute the tokens across the expert parallel devices.
         if self.tp_size > 1 or self.ep_size > 1:
+            self.split_sizes = self._unequal_inference_split_sizes(hidden_states.shape[0])
             ## local_indices calculation
             with torch.no_grad():
                 # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
                 #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
                 self.routing_map = gather_from_sequence_parallel_region(
-                    self.routing_map, group=self.tp_ep_group
+                    self.routing_map, group=self.tp_ep_group, output_split_sizes=self.split_sizes
                 )
 
             ## local_probs calculation
             # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
-            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+            probs = gather_from_sequence_parallel_region(
+                probs, group=self.tp_ep_group, output_split_sizes=self.split_sizes
+            )
             # Note that this allgather spans the communication domain of TP*EP.
             #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
             hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.tp_ep_group, use_global_buffer=True
+                hidden_states,
+                group=self.tp_ep_group,
+                output_split_sizes=self.split_sizes,
+                use_global_buffer=True,
             )
 
         return hidden_states, probs
@@ -378,7 +409,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                hidden_states.to(self.local_probs.dtype),
+                group=self.tp_ep_group,
+                input_split_sizes=self.split_sizes,
             ).to(hidden_states.dtype)
         return hidden_states
 
