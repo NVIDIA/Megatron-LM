@@ -47,6 +47,131 @@ def test_mhc_projection_matches_with_and_without_grad(device, dtype, eps_inside_
         assert torch.equal(a, e)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Inductor and eager differ on CUDA")
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_mhc_mappings_replay_matches_when_dynamo_cache_is_full(eps_inside_sqrt):
+    """A full-recompute forward must not mix compiled and eager mapping arithmetic.
+
+    Dynamo's per-function recompile limit is shared by every layer and test in the
+    process. Pin the state in which the no-grad forward of a reentrant checkpoint
+    finds the cache full after the grad-mode forward has been compiled.
+    """
+    config_names = ("recompile_limit", "cache_size_limit")
+    limit = next(name for name in config_names if hasattr(torch._dynamo.config, name))
+    torch._dynamo.reset()
+    try:
+        torch.manual_seed(10)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=4,
+            mhc_norm_eps_inside_sqrt=eps_inside_sqrt,
+            mhc_keep_mappings_in_fp32=True,
+        )
+        module = HyperConnectionModule(config, layer_number=1).cuda()
+        # Another sequence length first: with dynamic shapes, the entry it leads to
+        # would not accept the detached inputs of the no-grad forward below.
+        module.compute_mappings(torch.randn(16, 2, 128, device="cuda", requires_grad=True))
+        x = torch.randn(8, 2, 128, device="cuda", requires_grad=True)
+        expected = module.compute_mappings(x)
+        sum(t.float().square().sum() for t in expected).backward()
+        expected_grads = [x.grad.clone()] + [p.grad.clone() for p in module.parameters()]
+        module.zero_grad(set_to_none=True)
+        replay_x = x.detach().clone().requires_grad_(True)
+        with torch._dynamo.config.patch(**{limit: 1}):
+            actual = checkpoint(module.compute_mappings, replay_x, use_reentrant=True)
+            for a, e in zip(actual, expected):
+                assert torch.equal(a, e)
+            sum(t.float().square().sum() for t in actual).backward()
+        grads = [replay_x.grad] + [p.grad for p in module.parameters()]
+        for a, e in zip(grads, expected_grads):
+            assert torch.equal(a, e)
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("input_requires_grad", [True, False])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_mhc_compute_h_runs_one_specialization(device, input_requires_grad, frozen):
+    """Both halves of a full-recompute pair run the same compiled ``_compute_h`` entry.
+
+    The no-grad forward and the grad-mode replay must not need a second Dynamo
+    entry, whatever the inputs' requires_grad flags and the module's frozen
+    parameters, also after another sequence length has been compiled.
+    """
+    config_names = ("recompile_limit", "cache_size_limit")
+    limit = next(name for name in config_names if hasattr(torch._dynamo.config, name))
+    fail_names = ("fail_on_recompile_limit_hit", "fail_on_cache_limit_hit")
+    fail = next((name for name in fail_names if hasattr(torch._dynamo.config, name)), None)
+    torch._dynamo.reset()
+    try:
+        torch.manual_seed(10)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=4,
+            mhc_keep_mappings_in_fp32=True,
+        )
+        module = HyperConnectionModule(config, layer_number=1).to(device)
+        module.requires_grad_(not frozen)
+
+        def inputs(s):
+            base = torch.randn(s * 2, 24, device=device, requires_grad=input_requires_grad)
+            # Views of 2-D tensors, as _projection_and_get_norm returns them.
+            return (base * 1).view(s, 2, 24), (base[:, :1].abs() + 1).view(s, 2, 1)
+
+        module._compute_h_one_specialization(*inputs(16))
+        proj, r = inputs(8)
+        replay = module._compute_h_one_specialization(proj, r)
+        # A second entry must fail hard instead of running eagerly; the unit-test
+        # package turns Dynamo errors into eager fallbacks (suppress_errors).
+        patch = {limit: 2, "suppress_errors": False}
+        if fail is not None:
+            patch[fail] = True
+        with torch._dynamo.config.patch(**patch):
+            with torch.no_grad():
+                forward = module._compute_h_one_specialization(proj, r)
+            again = module._compute_h_one_specialization(proj, r)
+        needs_grad = input_requires_grad or not frozen
+        for f, g, a in zip(forward, replay, again):
+            assert not f.requires_grad
+            assert g.requires_grad == needs_grad
+            assert torch.equal(f, g) and torch.equal(a, g)
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mhc_mappings_under_inference_mode(device):
+    """Inference mode records no autograd; its mappings match the no-grad forward's."""
+    torch.manual_seed(10)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=4,
+        mhc_keep_mappings_in_fp32=True,
+    )
+    module = HyperConnectionModule(config, layer_number=1).to(device)
+    x = torch.randn(8, 2, 128, device=device)
+    with torch.no_grad():
+        expected = module.compute_mappings(x)
+    with torch.inference_mode():
+        actual = module.compute_mappings(x.clone())
+    for a, e in zip(actual, expected):
+        assert not a.requires_grad
+        torch.testing.assert_close(a, e)
+
+
 def _plain_proj_rms(x, weight, eps, eps_inside_sqrt):
     x = x.reshape(x.shape[0] * x.shape[1], -1).to(torch.float32)
     weight = weight.to(torch.float32)

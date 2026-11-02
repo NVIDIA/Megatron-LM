@@ -461,8 +461,8 @@ class HyperConnectionModule(MegatronModule):
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
-    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile
+    # Static shapes: see _compute_h_one_specialization.
+    @torch.compile(dynamic=False)
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -497,6 +497,43 @@ class HyperConnectionModule(MegatronModule):
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
+
+    def _compute_h_one_specialization(
+        self, proj: Tensor, r: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Run the compiled ``_compute_h`` in its grad-mode specialization only.
+
+        Dynamo specializes ``_compute_h`` on grad mode and on whether its inputs
+        require grad. Full activation recompute runs the forward under no_grad and
+        replays it with gradients enabled; with two specializations, a full Dynamo
+        cache makes the missing one run eagerly, and the replay no longer reproduces
+        the forward's mappings bit for bit. Both halves therefore run the grad-mode
+        specialization on inputs that require grad. A grad-mode call that needs a
+        gradient runs it directly, so autograd uses its compiled backward; an input
+        that does not require grad is replaced by a detached one that does. Every
+        other call, under no_grad or with nothing to differentiate, runs it under
+        enable_grad on detached inputs and returns detached outputs.
+
+        ``_compute_h`` is compiled with static shapes because a dynamic-shape entry
+        compiled from the view inputs of a grad-mode call guards on their view base,
+        which detached inputs lack: the two halves of one recompute would then use
+        different entries. With static shapes they share the entry for their shape,
+        or, once Dynamo's cache is full, both run eagerly.
+        """
+        params = (self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        if torch.is_grad_enabled() and (
+            proj.requires_grad or r.requires_grad or any(p.requires_grad for p in params)
+        ):
+            if not proj.requires_grad:
+                proj = proj.detach().requires_grad_(True)
+            if not r.requires_grad:
+                r = r.detach().requires_grad_(True)
+            return self._compute_h(proj, r)
+        with torch.enable_grad():
+            outputs = self._compute_h(
+                proj.detach().requires_grad_(True), r.detach().requires_grad_(True)
+            )
+        return tuple(output.detach() for output in outputs)
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -538,7 +575,7 @@ class HyperConnectionModule(MegatronModule):
             with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
                 proj, r = self._projection_and_get_norm(x)
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-                h_pre, h_post, h_res = self._compute_h(proj, r)
+                h_pre, h_post, h_res = self._compute_h_one_specialization(proj, r)
             h_res = h_res.view(s, b, self.n, self.n)
 
         h_res = self._sinkhorn_op(
