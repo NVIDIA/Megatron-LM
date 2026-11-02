@@ -198,6 +198,7 @@ class _StubCoordinator:
         self.request_id_to_client_request_id = {}
         self.client_request_to_request_id = {}
         self.request_id_to_rank = {}
+        self.request_id_to_sampling_params = {}
         self.identities_of_data_parallel_ranks = [identity]
         self.identity_to_rank_index = {identity: 0}
         self._pending_counts = np.zeros(1, dtype=np.int64)

@@ -11,8 +11,8 @@ include-package-data = true
 # lazy megatron.rl.Request exports and needs pydantic (not a declared dependency).
 # The RL runtime (rl_utils, agent, inference, server) needs undeclared
 # dependencies and stays out of built wheels. An editable install maps the whole
-# megatron/rl directory, so megatron.training imports the RL runtime only for RL
-# runs.
+# megatron/rl directory, so megatron.training does not import the RL runtime;
+# the RL entry point (train_rl.py) does.
 py-modules = [
     "megatron.rl.generation_api",
     "megatron.rl.shared_prefix_alignment",
@@ -217,7 +217,7 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 managed = true
 default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
-constraint-dependencies = ["quack-kernels>=0.6.5"]
+constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",
