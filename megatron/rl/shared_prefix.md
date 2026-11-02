@@ -49,7 +49,7 @@ The test-only `build_tree_attention_allow_mask` in
 `tests/unit_tests/rl/shared_prefix/shared_prefix_oracles.py` is a correctness
 oracle for these deeper trees. It permits real ancestor tokens and causal tokens
 within the same node, and isolates sibling branches and unrelated roots. Its use
-does **not** qualify deeper fused attention or recurrent execution. A
+does **not** qualify any attention or recurrent kernel for deeper trees. A
 model-execution adapter (NeMo RL's, for example) should call
 `iter_star_roots()`, which rejects deeper trees, interleaved star storage and
 padded prompt roots, before lowering to a star-only backend. Future generalized
