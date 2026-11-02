@@ -389,6 +389,32 @@ class TestTEWrappers:
             )
             assert outputs["out"].dtype is torch.float32
 
+    @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])
+    def test_dsa_indexer_fp32_carrier_index_scores_replays(self, use_relu):
+        """Replay index scoring on FP32 q/k carriers (as dsa_indexer_rope_fp32 produces).
+
+        dsa_indexer_rope_fp32 keeps the indexer query/key in FP32 end-to-end; this covers the
+        determinism of scoring those FP32 carriers rather than the BF16 inputs above.
+        """
+        seeded()
+        sq, batch, n_heads, head_dim, sk = 9, 2, 4, 8, 7
+        q = torch.randn(sq, batch, n_heads, head_dim, device="cuda", dtype=torch.float32)
+        k = torch.randn(sk, batch, head_dim, device="cuda", dtype=torch.float32)
+        weights = torch.randn(sq, batch, n_heads, device="cuda", dtype=torch.bfloat16)
+
+        def score(query, head_w, key):
+            return _compute_index_scores(query, head_w, key, use_relu=use_relu)
+
+        outputs, _ = assert_replays_bit_exact(
+            score,
+            (q, weights, k),
+            replays=3,
+            backward=False,
+            contention=True,
+            what=f"DSA FP32-carrier index scores[relu={use_relu}]",
+        )
+        assert outputs["out"].dtype is torch.float32
+
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])

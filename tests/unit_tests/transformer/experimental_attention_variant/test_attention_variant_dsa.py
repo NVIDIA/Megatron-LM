@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -58,6 +59,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
+    _make_config,
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -2693,6 +2697,136 @@ class TestDSAIndexer:
         for b in range(batch_size):
             for i in range(seqlen):
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
+
+    def test_scoring_precision_config_contract(self, seqlen):
+        """Defaults plus the fp8 gating contract (cuDNN backend, zero indexer loss)."""
+        base = _make_config(
+            use_sparse_loss=False, calculate_per_token_loss=False, dsa_kernel_backend="none"
+        )
+        assert base.dsa_indexer_rope_fp32 is False
+        assert base.dsa_indexer_scoring_precision == "bf16"
+        # rope_fp32 is orthogonal and does not force a backend.
+        assert dataclasses.replace(base, dsa_indexer_rope_fp32=True).dsa_indexer_rope_fp32
+        # fp8 requires the cuDNN backend...
+        for backend in ("none", "tilelang"):
+            with pytest.raises(ValueError, match="requires dsa_kernel_backend='cudnn'"):
+                dataclasses.replace(
+                    base, dsa_kernel_backend=backend, dsa_indexer_scoring_precision="fp8"
+                )
+        # ...and a zero indexer loss (the loss path would silently stay BF16).
+        with pytest.raises(ValueError, match="requires dsa_indexer_loss_coeff=0"):
+            dataclasses.replace(
+                base,
+                dsa_kernel_backend="cudnn",
+                dsa_indexer_scoring_precision="fp8",
+                dsa_indexer_loss_coeff=0.1,
+            )
+
+    def test_scoring_precision_cli_contract(self, seqlen):
+        """The two switches derive the expected CLI flags and reject bad values."""
+        from argparse import ArgumentParser
+
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        from megatron.training.argument_utils import ArgumentGroupFactory
+
+        fields = {"dsa_indexer_rope_fp32", "dsa_indexer_scoring_precision"}
+        exclude = [f.name for f in dataclasses.fields(TransformerConfig) if f.name not in fields]
+        parser = ArgumentParser()
+        ArgumentGroupFactory(TransformerConfig, exclude=exclude).build_group(parser)
+        explicit = parser.parse_args(
+            ["--dsa-indexer-rope-fp32", "--dsa-indexer-scoring-precision", "fp8"]
+        )
+        assert explicit.dsa_indexer_rope_fp32 is True
+        assert explicit.dsa_indexer_scoring_precision == "fp8"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--dsa-indexer-scoring-precision", "int4"])
+
+    @staticmethod
+    def _scoring_skip():
+        if torch.cuda.get_device_capability() < (9, 0):
+            pytest.skip("cuDNN DSA scoring requires SM90+ (Hopper or later)")
+        try:
+            from cudnn import DSA  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"cuDNN DSA bindings unavailable: {exc}")
+
+    @staticmethod
+    def _scoring_operands():
+        torch.manual_seed(0)
+        q = torch.randn(1, 128, 32, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(1, 128, 32, device="cuda", dtype=torch.bfloat16)
+        return q, k, w
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_scoring_bf16_matches_stock_cudnn(self, seqlen):
+        """The default (bf16) scoring path is byte-identical to the stock cuDNN call."""
+        self._scoring_skip()
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_cudnn_kernels as kern,
+        )
+
+        kern._ensure_dsa_namespace()
+        q, k, w = self._scoring_operands()
+        raw = kern._cudnn_dsa.indexer_forward_wrapper(
+            q, k, w, ratio=kern._INDEXER_RATIO, sm_scale=kern._INDEXER_SOFTMAX_SCALE
+        )["scores"]
+        mine = kern._indexer_forward(
+            q,
+            k,
+            w,
+            ratio=kern._INDEXER_RATIO,
+            sm_scale=kern._INDEXER_SOFTMAX_SCALE,
+            scoring_precision="bf16",
+        )["scores"]
+        assert torch.equal(raw.nan_to_num(), mine.nan_to_num())
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_scoring_fp8_matches_e4m3_reference(self, seqlen):
+        """FP8 scoring reproduces an E4M3-quantized score reference and differs from BF16."""
+        self._scoring_skip()
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_cudnn_kernels as kern,
+        )
+
+        kern._ensure_dsa_namespace()
+        q, k, w = self._scoring_operands()
+
+        def ref(qq, kk, ww):
+            s = torch.einsum("bqhd,btd->bqht", qq.float(), kk.float().squeeze(2))
+            return (torch.relu(s) * ww.float().unsqueeze(-1)).sum(dim=2)
+
+        def topk_overlap(a, b, kk=64):
+            m = torch.triu(torch.ones(128, 128, device=a.device, dtype=torch.bool), diagonal=1)
+            a = a.masked_fill(m.unsqueeze(0), float("-inf"))
+            b = b.masked_fill(m.unsqueeze(0), float("-inf"))
+            ia, ib = a.topk(kk, dim=-1).indices, b.topk(kk, dim=-1).indices
+            inter = total = 0
+            for qi in range(128):
+                valid = min(qi + 1, kk)
+                inter += len(set(ia[0, qi, :valid].tolist()) & set(ib[0, qi, :valid].tolist()))
+                total += valid
+            return inter / max(total, 1)
+
+        bf16 = kern._indexer_forward(
+            q,
+            k,
+            w,
+            ratio=kern._INDEXER_RATIO,
+            sm_scale=kern._INDEXER_SOFTMAX_SCALE,
+            scoring_precision="bf16",
+        )["scores"]
+        fp8 = kern._indexer_forward(
+            q.float(),
+            k.float(),
+            w,
+            ratio=kern._INDEXER_RATIO,
+            sm_scale=kern._INDEXER_SOFTMAX_SCALE,
+            scoring_precision="fp8",
+        )["scores"]
+        ref_fp8 = ref(kern._fp8_roundtrip_last_dim(q), kern._fp8_roundtrip_last_dim(k), w)
+        assert topk_overlap(fp8, ref_fp8) > 0.98  # fp8 path == E4M3-quantized math
+        assert topk_overlap(fp8, bf16) < 1.0  # the precision switch actually changes selection
 
 
 class TestDSAttention:
