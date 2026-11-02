@@ -113,14 +113,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # Shared-prefix composed attention.
     KernelEntry(
         name="shared_prefix_composed_attention",
-        sources=("megatron/core/transformer/shared_prefix_attention.py",),
+        sources=("megatron/core/ops/attention/shared_prefix.py",),
         tests=(K + "test_shared_prefix_attention.py",),
         kind="external-lib",
         notes="Native FlashAttention varlen forward and private backward (called by keyword, "
         "flash-attn >= 2.7.0), eager online-softmax merge and FP32 K/V index_add_ "
         "accumulation. Exact output/gradient replay needs only "
         "torch.use_deterministic_algorithms(True): the backward passes "
-        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Fused "
+        "deterministic=torch.are_deterministic_algorithms_enabled() to FlashAttention. Forest "
         "errors vs FP64 are bounded by 2x the dense-branch FlashAttention error. CP1/2/4 tests "
         "use real NCCL all-to-all, including replicated GQA KV heads.",
     ),
@@ -191,9 +191,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
         "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
-        "The shared-prefix branch (a forest attached by a caller selects "
-        "shared_prefix_attention instead of core attention) is replayed through a real "
-        "SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
+        "The shared-prefix branch (a shared_prefix_forest argument selects the forest kernel "
+        "in megatron/core/ops/attention/shared_prefix.py instead of core attention) is "
+        "replayed through a real SelfAttention at CP1/CP2 in test_shared_prefix_attention.py, "
+        "which asserts that the forest kernel runs on every forward.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
