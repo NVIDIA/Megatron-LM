@@ -28,13 +28,18 @@ def process_group_collection(distributed_setup):
 
 
 @pytest.mark.parametrize("recompute_mhc", [False, True], ids=["no-recompute", "recompute"])
-def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc):
+@pytest.mark.parametrize("pattern", ["**", "*E"], ids=["attention", "moe"])
+def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc, pattern):
     """FSDP preserves the reference loss with mHC recompute on or off."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
         num_attention_heads=4,
         ffn_hidden_size=128,
+        num_moe_experts=2 if "E" in pattern else None,
+        moe_ffn_hidden_size=128,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
         add_bias_linear=False,
         params_dtype=torch.float32,
         attention_dropout=0.0,
@@ -55,7 +60,7 @@ def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc):
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern="**",
+            hybrid_layer_pattern=pattern,
             pg_collection=process_group_collection,
         ).cuda()
         for _ in range(2)
