@@ -118,7 +118,6 @@ class FsdpParameterGroup:
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
     grad_comm_dtype: torch.dtype
-    requires_inner_reduction: bool
     # Full compute storage: persistent model_weight when replicated, otherwise a
     # temporary buffer populated by all-gather.
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
@@ -373,9 +372,6 @@ class FsdpParameterGroup:
         self._main_grad_is_stale = False
         grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
-        self.requires_inner_reduction = not can_redistribute_locally(
-            self.mesh, (Partial("avg"),) * self.mesh.ndim, main_grad_placements
-        )
         if not self.requires_grad:
             return
 
@@ -619,6 +615,14 @@ class FsdpParameterGroup:
             # remains. Otherwise, remove the released plane from the tensor.
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
+
+    @property
+    def requires_inner_reduction(self) -> bool:
+        """Whether unreduced gradients need communication to reach main_grad's placements."""
+        assert self.main_grad is not None
+        return not can_redistribute_locally(
+            self.mesh, (Partial("avg"),) * self.mesh.ndim, self.main_grad.placements
+        )
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
