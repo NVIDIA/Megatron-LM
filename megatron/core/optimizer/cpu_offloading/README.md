@@ -38,8 +38,9 @@ because a parameter and all of its optimizer state are an atomic bundle. Partial
 prioritizes bundles that actually include a separate master before state-only bundles;
 precision-aware FusedAdam can own a separate master for native FP32 DistributedOptimizer shards
 too.
-Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with compact-layout
-`LayerWiseDistributedOptimizer`; BF16 and FP8 parameter gather are supported. Full-iteration and
+Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with the compact
+`LayerWiseDistributedOptimizer` layout (`--layer-wise-param-layout compact`); BF16 and FP8
+parameter gather are supported. Full-iteration and
 optimizer CUDA graphs are not supported while the fraction is nonzero. When optimizer state is
 saved, async distributed-checkpoint save is rejected: its background writer can retain references
 to the same pinned CPU buffers that the next optimizer update reuses. Synchronous distributed

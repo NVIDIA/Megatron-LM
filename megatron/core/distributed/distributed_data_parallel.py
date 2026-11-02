@@ -1,5 +1,6 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 import weakref
 from contextlib import contextmanager
@@ -21,12 +22,7 @@ except ImportError:
 
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import (
-    _ParamAndGradBucketGroup,
-    _ParamAndGradBuffer,
-    group_params_for_buffers,
-    partition_buckets,
-)
+from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
 
@@ -216,16 +212,8 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). fp8 params key to
-        # uint8 (own buffer); partition_buckets later merges the small non-fp8 bucket groups into
-        # the fp8 group to aggregate their communication.
-        buffer_groups = group_params_for_buffers(
-            all_params,
-            self.ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_fp8_grads=not getattr(
-                self.ddp_config, 'use_layer_wise_param_layout', True
-            ),
-        )
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -368,9 +356,22 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            buffer_ddp_config = self.ddp_config
+            if (
+                self.ddp_config.use_distributed_optimizer
+                and param_layout is not None
+                and not param_layout.uses_distributed_optimizer
+            ):
+                # The layout keeps this buffer replicated while the distributed optimizer shards
+                # the other buffers of this chunk (the compact LayerWise layout). Its buckets
+                # all-reduce gradients and keep parameters in their own storage. The bucket
+                # size was resolved above, so drop num_buckets to avoid revalidating it.
+                buffer_ddp_config = dataclasses.replace(
+                    self.ddp_config, use_distributed_optimizer=False, num_buckets=None
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_ddp_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
@@ -666,7 +667,13 @@ class DistributedDataParallel(_BaseDataParallel):
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.
+
+        Bucket groups whose config does not dispatch parameter sync through DDP are skipped:
+        their parameters are published by the owning optimizer (the compact LayerWise layout
+        without overlap or grad-buffer reuse gathers in ``allgather_params()``).
         """
+        if not bucket_group.ddp_config.param_sync_via_bucket_group:
+            return
         bucket_group.start_param_sync(force_sync=force_sync)
 
         if self.ddp_config.overlap_param_gather:
@@ -696,9 +703,16 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-    def reset_param_sync_dispatch_state(self):
-        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+    def reset_param_sync_dispatch_state(self, bucket_groups=None):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook.
+
+        Args:
+            bucket_groups (list, optional): the bucket groups to reset; all bucket groups of
+                this model chunk by default.
+        """
+        if bucket_groups is None:
+            bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        for bucket_group in bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a

@@ -137,6 +137,37 @@ class ParamKey:
         return False
 
 
+def resolve_layer_wise_distributed_optimizer(
+    optimizer: str, use_distributed_optimizer: bool, use_layer_wise_distributed_optimizer: bool
+) -> Tuple[str, bool]:
+    """Resolve the requested optimizer to ``(optimizer_name, use_layer_wise)``.
+
+    This is the one rule for whether an optimizer runs as
+    :class:`LayerWiseDistributedOptimizer`; the CLI, config finalization and the optimizer
+    factory all apply it:
+
+    - ``'dist_<name>'`` is the deprecated spelling of ``'<name>'`` with the layer-wise
+      distributed optimizer.
+    - An optimizer other than ``'adam'`` and ``'sgd'`` combined with
+      ``use_distributed_optimizer=True`` runs layer-wise; for example Muon with the
+      distributed optimizer is the layer-wise distributed Muon.
+    - Otherwise ``use_layer_wise_distributed_optimizer`` is kept.
+
+    Raises:
+        ValueError: If ``'adam'`` or ``'sgd'`` requests the layer-wise distributed optimizer.
+    """
+    if optimizer.startswith('dist_'):
+        return optimizer[len('dist_') :], True
+    if optimizer in ('adam', 'sgd'):
+        if use_layer_wise_distributed_optimizer:
+            raise ValueError(
+                f"use_layer_wise_distributed_optimizer is not supported with optimizer="
+                f"{optimizer!r}; use use_distributed_optimizer=True instead."
+            )
+        return optimizer, False
+    return optimizer, bool(use_layer_wise_distributed_optimizer or use_distributed_optimizer)
+
+
 @dataclass
 class OptimizerConfig:
     """Configuration object for Megatron optimizers."""
@@ -368,16 +399,11 @@ class OptimizerConfig:
 
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
-    When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
-    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
-    that the standard distributed-optimizer path is not triggered."""
-
-    use_layer_wise_param_layout: bool = False
-    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
-    the shard-aligned padded LayerWise param layout. When False (default), the compact decoupled
-    layout is selected: LayerWise-managed (Muon) buffers use a compact no-padding DDP layout with
-    all-reduce gradients and legacy whole-param ping-pong ownership + ``allgather_params``
-    param sync."""
+    An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
+    :func:`resolve_layer_wise_distributed_optimizer`); the training arguments layer sets it and
+    resets ``use_distributed_optimizer`` to False so that the standard distributed-optimizer
+    path is not triggered. The data-parallel layout of the layer-wise optimizer is
+    ``DistributedDataParallelConfig.layer_wise_param_layout``."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -483,6 +509,11 @@ class OptimizerConfig:
             0.0 <= self.optimizer_state_offload_fraction <= 1.0
         ), "optimizer_state_offload_fraction must be in [0.0, 1.0]"
 
+        if self.muon_split_qkv_per_head and not self.muon_split_qkv:
+            raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True.")
+        if self.muon_split_mla_qkv and not self.muon_split_qkv:
+            raise ValueError("muon_split_mla_qkv requires muon_split_qkv=True.")
+
         if self.chunked_optimizer_state_offload and self.optimizer_state_offload_fraction > 0.0:
             if used_deprecated_optimizer_state_offload:
                 assert self.optimizer == 'adam', (
@@ -518,14 +549,12 @@ class OptimizerConfig:
                 )
 
             if self.optimizer == 'muon':
+                # LayerWiseDistributedOptimizer also requires the compact layout
+                # (DistributedDataParallelConfig.layer_wise_param_layout='compact').
                 assert (
-                    self.use_layer_wise_distributed_optimizer
+                    self.use_layer_wise_distributed_optimizer or self.use_distributed_optimizer
                 ), "Muon optimizer state offload requires LayerWiseDistributedOptimizer"
                 assert self.bf16, "Muon optimizer state offload currently requires bf16"
-                assert not self.use_layer_wise_param_layout, (
-                    "Muon optimizer state offload requires --use-layer-wise-param-layout to be "
-                    "disabled so the decoupled compact LayerWise DDP layout is used"
-                )
             else:
                 assert not self.use_layer_wise_distributed_optimizer, (
                     "Adam optimizer state offload does not support " "LayerWiseDistributedOptimizer"

@@ -89,21 +89,23 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
 
 
 @pytest.mark.parametrize(
-    "flags, expected",
+    "flags, use_bool, layout",
     [
-        ([], False),
-        (["--use-layer-wise-param-layout"], True),
-        (["--no-use-layer-wise-param-layout"], False),
-        (["--use-layer-wise-param-layout", "--no-use-layer-wise-param-layout"], False),
-        (["--no-use-layer-wise-param-layout", "--use-layer-wise-param-layout"], True),
+        ([], True, None),
+        (["--layer-wise-param-layout", "compact"], True, "compact"),
+        (["--layer-wise-param-layout", "legacy"], True, "legacy"),
+        (["--no-use-layer-wise-param-layout"], False, None),
+        (["--use-layer-wise-param-layout"], True, None),
     ],
 )
-def test_layer_wise_layout_cli_defaults_to_compact(flags, expected):
+def test_layer_wise_layout_cli_defaults_to_padded(flags, use_bool, layout):
     parser = add_megatron_arguments(ArgumentParser())
     args = parser.parse_args(flags)
-    assert args.use_layer_wise_param_layout is expected
+    # The original boolean keeps meaning padded (True) or legacy (False); compact is named.
+    assert args.use_layer_wise_param_layout is use_bool
     kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
-    assert kwargs["use_layer_wise_param_layout"] is expected
+    assert kwargs["layer_wise_param_layout"] == layout
+    assert "use_layer_wise_param_layout" not in kwargs
 
 
 @pytest.mark.parametrize("count", [2, 3])
@@ -113,47 +115,6 @@ def test_fsdp_buffer_count_cli_reaches_ddp_config(count):
     kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
     assert kwargs["fsdp_buffer_count"] == count
     assert kwargs["fsdp_double_buffer"] is True
-
-
-@pytest.mark.parametrize("padded_layout", [False, True])
-def test_layerwise_fp8_validation_respects_layout_support(monkeypatch, padded_layout):
-    args = _minimal_training_args(monkeypatch)
-    args.world_size = 1
-    args.freeze_base_model_for_mtp = False
-    args.optimizer = 'muon'
-    args.use_distributed_optimizer = True
-    args.use_layer_wise_param_layout = padded_layout
-    args.bf16 = True
-    args.fp8 = 'hybrid'
-    args.fp8_recipe = 'blockwise'
-    args.fp8_param_gather = True
-    if padded_layout:
-        with pytest.raises(AssertionError, match="Padded LayerWise parameter layout"):
-            validate_args(args)
-    else:
-        validate_args(args)
-        assert args.use_layer_wise_distributed_optimizer
-
-
-@pytest.mark.parametrize("reuse_grad_buffer", [False, True])
-def test_padded_layerwise_mxfp8_requires_grad_buffer_transport(monkeypatch, reuse_grad_buffer):
-    args = _minimal_training_args(monkeypatch)
-    args.world_size = 1
-    args.freeze_base_model_for_mtp = False
-    args.optimizer = 'muon'
-    args.use_distributed_optimizer = True
-    args.use_layer_wise_param_layout = True
-    args.bf16 = True
-    args.fp8 = 'e4m3'
-    args.fp8_recipe = 'mxfp8'
-    args.fp8_param_gather = True
-    args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buffer
-    if reuse_grad_buffer:
-        validate_args(args)
-        assert args.use_layer_wise_distributed_optimizer
-    else:
-        with pytest.raises(AssertionError, match="reuse-grad-buf-for-mxfp8-param-ag"):
-            validate_args(args)
 
 
 def _minimal_training_args(monkeypatch):

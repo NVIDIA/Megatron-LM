@@ -406,13 +406,11 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
-            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
-                parameters for the layer-wise distributed optimizer.
-            use_layer_wise_param_layout: Optional LayerWise layout request kept for API
-                parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
-                is the single layout source (True: padded, False: compact). ``None`` defers to
-                it; with DDP and the layer-wise distributed optimizer, an explicit value that
-                disagrees with it raises ``ValueError``.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: Legacy boolean spelling of
+                ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
+                layout and ``False`` the legacy layout. ``None`` (default) defers to
+                ``ddp_config``.
 
         Returns:
             List of model stages.

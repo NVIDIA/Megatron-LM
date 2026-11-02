@@ -108,7 +108,6 @@ def test_chunked_optimizer_state_offload_config_accepts_supported_optimizers():
         optimizer='muon',
         bf16=True,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
         chunked_optimizer_state_offload=True,
     )
 
@@ -137,15 +136,9 @@ def test_chunked_optimizer_state_offload_fraction_zero_is_a_noop():
             {'use_layer_wise_distributed_optimizer': True},
             'Adam optimizer state offload does not support',
         ),
-        ({'optimizer': 'muon', 'bf16': True}, 'requires LayerWiseDistributedOptimizer'),
         (
-            {
-                'optimizer': 'muon',
-                'bf16': True,
-                'use_layer_wise_distributed_optimizer': True,
-                'use_layer_wise_param_layout': True,
-            },
-            '--use-layer-wise-param-layout to be disabled',
+            {'optimizer': 'muon', 'bf16': True, 'use_distributed_optimizer': False},
+            'requires LayerWiseDistributedOptimizer',
         ),
         ({'optimizer_cpu_offload': True}, 'optimizer_cpu_offload are mutually exclusive'),
         ({'optimizer_state_offload_chunk_size_mb': -1}, 'must be non-negative'),

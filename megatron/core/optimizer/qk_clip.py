@@ -3,26 +3,24 @@
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.transformer.attention import Attention
 
 
 def _iter_qk_clip_modules(model_chunk):
-    """Yield attention modules that need QK clipping.
+    """Yield the attention modules of a model chunk that support QK clipping.
 
-    Preserve the legacy traversal for other model types. HybridModel may own
-    nested MTP stacks, so discover its attention modules recursively.
+    HybridModel can hold attention in any layer and in nested MTP stacks, so its modules are
+    searched recursively; other models keep the decoder-layer traversal.
     """
+    # Imported here: the model modules import the optimizer package.
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.transformer.attention import Attention
 
     model_module = model_chunk.module.module
     if isinstance(model_module, HybridModel):
-        yield from (
-            module
-            for module in model_module.modules()
-            if isinstance(module, Attention) and hasattr(module, 'clip_qk')
-        )
+        for module in model_module.modules():
+            if isinstance(module, Attention) and hasattr(module, 'clip_qk'):
+                yield module
         return
-
     for transformer_layer in model_module.decoder.layers:
         if hasattr(transformer_layer.self_attention, 'clip_qk'):
             yield transformer_layer.self_attention

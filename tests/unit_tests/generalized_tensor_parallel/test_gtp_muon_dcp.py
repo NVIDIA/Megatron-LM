@@ -112,7 +112,8 @@ class TestGTPMuonDCP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_gtp_muon_moe_save_load(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
+    def test_gtp_muon_moe_save_load(self, tmp_path_dist_ckpt, use_param_layout):
         """GTP + Muon (LayerWise) optimizer-state checkpoint roundtrip.
 
         GTP-REPLICATED, Muon-managed matrix params (e.g. the MoE router, held identically on every
@@ -120,6 +121,7 @@ class TestGTPMuonDCP:
         param whole, so its optimizer-state ShardedTensor has the same key+offset on all GTP peers
         and the replica_id must distinguish them, or DCP validate_sharding_integrity reports 2
         writers ('Invalid access pattern ... [[2]]'). Adam dodges this by sharding the state.
+        Runs with the padded and the compact LayerWise layout.
         """
         import os
         from functools import partial
@@ -127,6 +129,9 @@ class TestGTPMuonDCP:
         import pytest
 
         from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+        from tests.unit_tests.dist_checkpointing.test_layer_wise_optimizer import (
+            zero_distopt_padding,
+        )
 
         if not HAVE_GTP:
             pytest.skip("GTP requires TE with hook registry")
@@ -163,7 +168,7 @@ class TestGTPMuonDCP:
                     pp=1,
                     bf16=True,
                     dist_opt=True,
-                    use_param_layout=True,
+                    use_param_layout=use_param_layout,
                     initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
                     optimizer='dist_muon',
                 )
@@ -173,6 +178,8 @@ class TestGTPMuonDCP:
 
                 model_sd_A = model_A[0].sharded_state_dict()
                 optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
+                # DistOpt saves its intra-bucket padding from torch.empty; zero it to compare.
+                zero_distopt_padding(optim_sd_A)
                 save(
                     optim_sd_A, ckpt_dir_A
                 )  # fails (2 writers) before the LayerWise replica_id fix
@@ -183,7 +190,7 @@ class TestGTPMuonDCP:
                     pp=1,
                     bf16=True,
                     dist_opt=True,
-                    use_param_layout=True,
+                    use_param_layout=use_param_layout,
                     initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
                     optimizer='dist_muon',
                 )
@@ -194,6 +201,7 @@ class TestGTPMuonDCP:
                 state_dict = load(load_sharded_sd, ckpt_dir_A)
                 optimizer_B.load_state_dict(state_dict)
                 optim_sd_B = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
+                zero_distopt_padding(optim_sd_B)
                 save(optim_sd_B, ckpt_dir_B)
 
                 Utils.destroy_model_parallel()

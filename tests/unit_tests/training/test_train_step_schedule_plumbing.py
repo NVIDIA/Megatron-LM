@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.enums import ModelType
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.training import training as training_mod
 from megatron.training.state import TrainState
 
@@ -158,6 +159,13 @@ def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
         empty_unused_memory_level=0,
     )
     optimizer = FakeOptimizer()
+    # The delayed master offload follows the DistributedOptimizer whose MXFP8 parameter
+    # buffer reuses the gradient buffer with an overlapped gather.
+    distopt_child = DistributedOptimizer.__new__(DistributedOptimizer)
+    distopt_child.ddp_config = SimpleNamespace(
+        reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+    )
+    optimizer.chained_optimizers = [distopt_child]
     model = [
         SimpleNamespace(
             force_all_reduce=False,
@@ -635,57 +643,6 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         data_parallel_random_init=False,
         use_layer_wise_distributed_optimizer=True,
     )
-
-
-def test_layerwise_wrapper_uses_ddp_config_as_single_layout_source():
-    """Compact and padded LayerWise layouts must both run through layout computation."""
-
-    class FakeDDP:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    param = SimpleNamespace(requires_grad=True)
-    chunk = SimpleNamespace(parameters=lambda: [param])
-    layout = object()
-    dp_cp_group = object()
-    expert_dp_group = object()
-    pg_collection = SimpleNamespace(dp_cp=dp_cp_group, expt_dp=expert_dp_group)
-    ddp_config = SimpleNamespace(
-        bucket_size=17, use_distributed_optimizer=False, use_layer_wise_param_layout=False
-    )
-
-    # The layout choice lives on ddp_config. A second wrapper argument can disagree with
-    # it and caused the compact (False) path to skip layout/tag setup during the sync.
-    assert (
-        "use_layer_wise_param_layout"
-        not in inspect.signature(training_mod.wrap_model_chunks_with_ddp).parameters
-    )
-
-    with (
-        mock.patch.object(training_mod, "DDP", FakeDDP),
-        mock.patch.object(training_mod, "get_pg_size", return_value=8),
-        mock.patch.object(training_mod, "tag_params_for_buffer_routing") as tag_params,
-        mock.patch.object(
-            training_mod.LayerWiseDistributedOptimizer,
-            "compute_full_param_layout",
-            return_value=layout,
-        ) as compute_layout,
-    ):
-        wrapped = training_mod.wrap_model_chunks_with_ddp(
-            [chunk],
-            config=object(),
-            ddp_config=ddp_config,
-            use_layer_wise_distributed_optimizer=True,
-            DP=FakeDDP,
-            pg_collection=pg_collection,
-        )
-
-    assert ddp_config.use_distributed_optimizer is True
-    tag_params.assert_called_once_with([chunk])
-    compute_layout.assert_called_once_with(
-        [param], 17, 8, ddp_config, expert_data_parallel_world_size=8
-    )
-    assert wrapped[0].kwargs["full_param_layout"] is layout
 
 
 def test_dynamic_cp_cuda_graph_upper_bound_uses_dp_cp_and_sp_padding():

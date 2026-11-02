@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -11,16 +11,22 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
-from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.distributed.distributed_data_parallel_config import (
+    resolve_layer_wise_param_layout,
+)
+from megatron.core.distributed.param_and_grad_buffer import (
+    _compute_default_per_buffer_param_layout,
+    _param_uses_quantized_storage,
+    group_params_for_buffers,
+)
 from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
 from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
-    is_float8tensor,
-    post_all_gather_processing,
+    is_blockwise_float8tensor,
+    is_mxfp8tensor,
+    requantize_whole_params_from_high_precision,
 )
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
@@ -79,16 +85,6 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
-def _param_sort_key(numel: int, identity: tuple) -> tuple:
-    """Rank-independent total-order key for ping-pong ownership: ``(numel, *canonical-identity)``.
-
-    ``numel`` alone is not a total order (stable sort tie-breaks by rank-local insertion order),
-    so equal-numel params would get different owners across ranks; the canonical identity
-    ``(chunk_idx, buffer_idx, global_start_index)`` makes it total and identical on every rank.
-    """
-    return (numel,) + tuple(identity)
-
-
 def tag_params_for_buffer_routing(model_chunks) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
@@ -103,6 +99,69 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
+def configure_ddp_for_layer_wise_optimizer(
+    model_chunks,
+    ddp_config,
+    *,
+    use_layer_wise_distributed_optimizer: bool,
+    use_layer_wise_param_layout: Optional[bool] = None,
+) -> Optional[Callable]:
+    """Prepare standard DDP wrapping for the selected optimizer; return its layout function.
+
+    This is the one place that maps the optimizer choice onto the DDP config, shared by the
+    ``get_model`` and ``ModelBuilder`` wrapping paths. Call it on the un-wrapped model chunks
+    before constructing :class:`DistributedDataParallel`:
+
+    - Without the layer-wise distributed optimizer, a distributed-optimizer config gets
+      :meth:`DistributedOptimizer.compute_full_param_layout` and other configs get no layout.
+    - With it, the LayerWise layout is resolved from ``ddp_config.layer_wise_param_layout`` and
+      the legacy ``use_layer_wise_param_layout`` boolean (see
+      :func:`resolve_layer_wise_param_layout`) and written back to ``ddp_config``. The
+      ``"padded"`` and ``"compact"`` layouts enable ``use_distributed_optimizer`` for the
+      buffers of the sibling DistributedOptimizer, tag the params for buffer routing and get
+      :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. The ``"legacy"`` layout
+      disables ``use_distributed_optimizer`` and gets no layout.
+
+    Args:
+        model_chunks: Un-wrapped model chunks; their params are tagged in place.
+        ddp_config: :class:`DistributedDataParallelConfig`, updated in place.
+        use_layer_wise_distributed_optimizer: Whether the model is trained with
+            :class:`LayerWiseDistributedOptimizer`.
+        use_layer_wise_param_layout: Optional legacy boolean spelling of the layout.
+
+    Returns:
+        The ``compute_full_param_layout`` callable for DDP, or ``None``.
+    """
+    from .distrib_optimizer import DistributedOptimizer
+
+    if not use_layer_wise_distributed_optimizer:
+        if ddp_config.use_distributed_optimizer:
+            return DistributedOptimizer.compute_full_param_layout
+        return None
+
+    param_layout = resolve_layer_wise_param_layout(
+        ddp_config.layer_wise_param_layout, use_layer_wise_param_layout
+    )
+    if ddp_config.num_distributed_optimizer_instances != 1:
+        raise ValueError(
+            "LayerWiseDistributedOptimizer requires num_distributed_optimizer_instances == 1: "
+            "it assigns whole parameters over the full data-parallel group."
+        )
+    ddp_config.layer_wise_param_layout = param_layout
+    if param_layout == 'legacy':
+        # Every buffer all-reduces and LayerWise owns every parameter.
+        ddp_config.use_distributed_optimizer = False
+        return None
+    # The non-LayerWise buffers are sharded by a sibling DistributedOptimizer in both layouts.
+    # Padded LayerWise buffers are sharded too; compact layouts leave them replicated.
+    ddp_config.use_distributed_optimizer = True
+    # Tag params so DDP buffer grouping routes LayerWise-managed matrices (Muon's
+    # Newton-Schulz domain) to their own buffers and routes everything else (embeddings,
+    # biases, layernorm) to DistOpt-style buffers.
+    tag_params_for_buffer_routing(model_chunks)
+    return LayerWiseDistributedOptimizer.compute_full_param_layout
 
 
 def _all_gather_param_group_metadata(param_group, pg_collection):
@@ -543,10 +602,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
-        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`
-        and produces a layerwise shard-aligned size-matching layout per buffer.
-        Every parameter stays within a single shard so the local optimizer step
-        (e.g. Newton-Schulz iteration for Muon) can run on whole tensors.
+        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`.
+        Buffers of parameters that LayerWise does not manage get DistributedOptimizer's
+        byte-level layout. LayerWise buffers follow ``ddp_config.layer_wise_param_layout``:
+
+        - ``"padded"`` (default): a shard-aligned layout in which every parameter stays within
+          a single shard, so the local optimizer step (e.g. Newton-Schulz iteration for Muon)
+          runs on whole tensors.
+        - ``"compact"``: the unpadded default layout without optimizer shards. DDP keeps these
+          buffers replicated, and LayerWise assigns whole parameters to owner ranks itself.
 
         Args:
             params: All parameters to lay out.
@@ -560,22 +624,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
-        from ..distributed.param_and_grad_buffer import _compute_default_per_buffer_param_layout
         from .distrib_optimizer import DistributedOptimizer
 
-        # Decoupled layout (use_layer_wise_param_layout=False): LayerWise (Muon) buffers use a
-        # compact no-padding DDP layout (and locally disable DistributedOptimizer semantics in
-        # DDP), so they must NOT receive the shard-aligned ``dp_size * max(shard_load)`` padded
-        # layout here. Non-LayerWise buffers keep DistOpt's byte-level layout regardless.
-        decouple_ddp_layout = not ddp_config.use_layer_wise_param_layout
-
-        # fp8 Muon grads key to uint8 (own buffer); partition_buckets later merges the non-fp8
-        # bucket groups into the fp8 group to aggregate communication.
-        buffer_groups = group_params_for_buffers(
-            params,
-            ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
+        param_layout_strategy = resolve_layer_wise_param_layout(
+            getattr(ddp_config, 'layer_wise_param_layout', None)
         )
+        if param_layout_strategy == 'legacy':
+            raise ValueError(
+                "The legacy LayerWise layout has no precomputed parameter layout; wrap the model "
+                "without full_param_layout and use_distributed_optimizer=False."
+            )
+
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -587,17 +647,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
+            # Dispatch per buffer: LayerWise (Muon) params get the selected LayerWise
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
             # get DistOpt's byte-level layout.
-            if buffer_key.is_managed_by_layer_wise_optimizer and decouple_ddp_layout:
-                # Decouple path (incl. FP8 param-gather): compact no-padding layout (DDP treats this
-                # buffer as non-DistOpt). Attach param_indices so DDP's consistency check passes.
-                per_buffer_layout = _compute_default_per_buffer_param_layout(
-                    group_params, bucket_size
-                )
-                per_buffer_layout.param_indices = param_indices
-                layouts[buffer_key] = per_buffer_layout
+            if buffer_key.is_managed_by_layer_wise_optimizer and param_layout_strategy == 'compact':
+                layout = _compute_default_per_buffer_param_layout(group_params, bucket_size)
+                layout.param_indices = param_indices
+                layouts[buffer_key] = layout
                 continue
             if buffer_key.is_managed_by_layer_wise_optimizer:
                 compute_per_buffer_layout = (
@@ -630,7 +686,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
-        self.decouple_ddp_layout = not config.use_layer_wise_param_layout
         self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
 
         # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
@@ -663,43 +718,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
 
         full_param_layouts = None
-        if model_chunks is not None and not self.decouple_ddp_layout:
+        if model_chunks is not None:
             full_param_layouts = [
                 chunk.full_param_layout
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
-        # Decouple path keeps whole-matrix ping-pong ownership (Newton-Schulz runs on whole
-        # matrices on one rank; param sync via ``allgather_params``). ``model_chunks`` lets the
-        # ping-pong fallback break equal-numel ties by a rank-independent identity (see below).
-        self.shard_params(optimizers, full_param_layouts, model_chunks)
+        # The layout DDP was built with decides who owns which parameter and who gathers it.
+        self.param_layout = self._resolve_param_layout(self.ddp_config, full_param_layouts)
+        if self.param_layout == 'padded':
+            self.shard_params(optimizers, full_param_layouts)
+        else:
+            # Compact buffers carry no optimizer shards, so whole-parameter owners are chosen
+            # here. The legacy layout keeps its historical ordering for checkpoint
+            # compatibility; compact breaks equal-numel ties by a rank-independent identity.
+            self.shard_params(
+                optimizers,
+                param_sort_keys=(
+                    self._build_param_sort_keys(model_chunks)
+                    if self.param_layout == 'compact'
+                    else None
+                ),
+            )
 
-        # Engage FP8 param sync automatically when the decouple-managed params are actually
-        # quantized (fp8_param_gather on + TE Float8/MXFP8 weights). Off -> plain bf16 path.
-        # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
-        # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
-        # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
-        # per-rank lists are all-gathered (dp_cp / expt_dp size > 1 here); non-gathered fp8 params
-        # (e.g. expt_dp == 1 experts, which are absent from these lists) still need the copy-back.
-        self.use_fp8_param_sync = False
-        if self.decouple_ddp_layout:
-            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
-                if not params_list:
-                    continue
-                for per_rank in params_list:
-                    for p in per_rank:
-                        if is_float8tensor(p):
-                            self.use_fp8_param_sync = True
-                            p._layer_wise_fp8_gathered = True
+        if self.param_layout != 'padded':
+            self._check_whole_param_gather_storage(optimizers, config)
 
-        # When a full_param_layout is available (and we are not decoupling),
-        # ddp_config.use_distributed_optimizer is True and model params are views into the
-        # DDP param buffer.  After the optimizer step copies updated fp32 main params → bf16
-        # model params, the buffer is already up-to-date in-place.  We can use DDP's
-        # buffer-based all-gather (start_param_sync) instead of the flatten/unflatten
-        # allgather_params path.  In the decouple path (incl. FP8 param-gather), Muon buffers are
-        # non-DistOpt and own whole params via ping-pong, so we use the legacy allgather_params.
-        self.use_buffer_param_sync = full_param_layouts is not None
+        # With the padded layout, ddp_config.use_distributed_optimizer is True and model
+        # params are views into the DDP param buffer. After the optimizer step copies updated
+        # fp32 main params → bf16 model params, the buffer is already up-to-date in-place, so
+        # DDP's buffer-based all-gather (start_param_sync) replaces the flatten/unflatten
+        # allgather_params path.
+        self.use_buffer_param_sync = self.param_layout == 'padded'
 
         # Fall back to OptimizerConfig only for direct construction without model chunks.
         self.overlap_param_gather = (
@@ -708,27 +758,30 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else config.overlap_param_gather
         )
         # Selects who executes LayerWise parameter synchronization. True means DDP bucket groups
-        # launch it: a full layout uses the fixed-size parameter buffer, while the variable-size
-        # path without a full layout uses grad_data. False means the optimizer calls
-        # allgather_params() synchronously after its step, using temporary flatten/receive buffers.
-        reuse_grad_buf_for_param_sync = (
-            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-            if self.ddp_config is not None
-            else config.reuse_grad_buf_for_mxfp8_param_ag
-        )
-        # The model-level DistOpt flag can belong only to sibling AdamW buffers:
-        # compact LayerWise buffers override it to False. Select our own gather path
-        # from the LayerWise layout, while retaining DDP-owned overlap/reuse policies.
-        self.layerwise_param_sync_via_bucket_group = (
-            self.use_buffer_param_sync or self.overlap_param_gather or reuse_grad_buf_for_param_sync
-        )
+        # launch it: the padded layout uses the fixed-size parameter buffer, while the
+        # variable-size compact and legacy paths use grad_data. False means the optimizer calls
+        # allgather_params() synchronously after its step, using temporary flatten/receive
+        # buffers.
+        if self.param_layout == 'compact':
+            # The model-level use_distributed_optimizer flag of a compact chunk belongs to the
+            # sibling DistributedOptimizer buffers. DDP gives the LayerWise buffers a config
+            # without it, whose param_sync_via_bucket_group reduces to this expression.
+            self.layerwise_param_sync_via_bucket_group = (
+                self.overlap_param_gather or self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            )
+        elif self.ddp_config is not None:
+            self.layerwise_param_sync_via_bucket_group = self.ddp_config.param_sync_via_bucket_group
+        else:
+            self.layerwise_param_sync_via_bucket_group = (
+                self.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+            )
 
         needs_variable_size_bucket_metadata = (
             not self.use_buffer_param_sync and self.layerwise_param_sync_via_bucket_group
         )
         if needs_variable_size_bucket_metadata:
-            # With use_layer_wise_param_layout=False, set up per-bucket param lists for
-            # variable-size all-gather.
+            # Compact and legacy layouts: set up per-bucket param lists for variable-size
+            # all-gather.
             # Overlap uses this from forward pre-hooks; synchronous MXFP8 reuse uses the same
             # path during optimizer step so both modes stage FP32 masters into BF16 grad_data.
             assert (
@@ -764,84 +817,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers[i] = wrapper(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
-                # Non-DistOpt LayerWise child has no byte-shard param buffer, so tag it to route
-                # step_with_ready_grads to copy fp32 master straight into model ``param.data`` even
-                # under reuse_grad_buf (which would otherwise call the unsupported
-                # ``_copy_main_params_to_param_buffer``); the gather staging reuses the grad buffer.
-                optimizers[i]._layer_wise_non_distopt_child = True
+                # Whole-param layouts publish quantized params as Q(bf16(master)) (see
+                # allgather_params); the step's master-to-model copy matches that.
+                optimizers[i].quantize_from_bf16_master = self.param_layout != 'padded'
 
             if (
                 config.chunked_optimizer_state_offload
                 and config.optimizer_state_offload_fraction > 0.0
             ):
-                from .emerging_optimizers import TensorParallelMuon
+                self._enable_chunked_optimizer_state_offload(optimizers)
 
-                offload_children = []
-                state_dtypes = (torch.float32,)
-                for optimizer in optimizers:
-                    if optimizer.optimizer is None:
-                        continue
-                    # The chunk planner assumes exactly the state schema of TensorParallelMuon:
-                    # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
-                    # than silently underestimating their tensor-state window.
-                    raw_optimizer = optimizer.optimizer
-                    assert type(raw_optimizer) is TensorParallelMuon, (
-                        "LayerWise chunked optimizer state offload currently supports exactly "
-                        "TensorParallelMuon with one fp32 full-size momentum tensor; got "
-                        f"{type(raw_optimizer).__name__}. Only Muon-managed parameter groups may "
-                        "be LayerWise optimizer children"
-                    )
-                    # Whole-parameter sharding can leave this rank with an optimizer object but
-                    # no locally owned Muon parameters. Preserve the no-offloader path for it.
-                    if not any(group["params"] for group in raw_optimizer.param_groups):
-                        continue
-                    master_params = [
-                        param for group in optimizer.fp32_from_float16_groups for param in group
-                    ]
-                    offload_children.append((optimizer, master_params))
-
-                assert len(offload_children) <= 1, (
-                    "LayerWise chunked optimizer state offload assumes at most one non-empty "
-                    f"TensorParallelMuon child; got {len(offload_children)}"
-                )
-                for optimizer, master_params in offload_children:
-                    optimizer.enable_chunked_optimizer_state_offload(
-                        master_params=master_params, state_dtypes=state_dtypes
-                    )
-                    # The compact FP8 gather reads fp32 main_param directly. With overlap
-                    # enabled, force that gather at the next iteration boundary before
-                    # master D2H so masters are still absent during forward/backward.
-                    offloader = optimizer._optimizer_state_offloader
-                    optimizer.set_optimizer_state_offload_deferred_lifecycle(
-                        state_prefetch_to_step=offloader is not None,
-                        master_offload_for_param_sync=(
-                            offloader is not None
-                            and bool(offloader.selected_params)
-                            and self.use_fp8_param_sync
-                            and self.overlap_param_gather
-                        ),
-                    )
-
-            # shard_params() removed non-owned params from the local optimizer groups, so the
-            # Float16 wrapping above only clears the TE high-precision init copy (a full-size CPU
-            # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
-            # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
-            # run. The per-rank ownership lists cover all gathered params (owned entries were
-            # already cleared during master creation; TE's clear is a no-op then). Scoped to
-            # LayerWise-managed params only: sibling DistOpt params must keep their init val
-            # until their own optimizer's master creation consumes it.
-            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
-                if not params_list:
-                    continue
-                for per_rank_params in params_list:
-                    for p in per_rank_params:
-                        if hasattr(p, 'clear_high_precision_init_val'):
-                            get_init = getattr(p, 'get_high_precision_init_val', None)
-                            if callable(get_init) and get_init() is None:
-                                continue
-                            p.clear_high_precision_init_val()
-
-        self.tp_group = getattr(self.pg_collection, 'tp', None)
+        self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
         # globals to fall back on there (see param_is_not_gtp_duplicate).
@@ -973,36 +959,212 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     "is_expert_parallel marker against the module's process groups."
                 )
 
-    def shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+    def _enable_chunked_optimizer_state_offload(self, optimizers) -> None:
+        """Offload the state and masters of the (at most one) non-empty Muon child."""
+        from .emerging_optimizers import TensorParallelMuon
+
+        if self.param_layout != 'compact':
+            raise ValueError(
+                "Muon chunked optimizer-state offload requires the compact LayerWise layout "
+                f"(layer_wise_param_layout='compact'); got {self.param_layout!r}."
+            )
+        offload_children = []
+        for optimizer in optimizers:
+            if optimizer.optimizer is None:
+                continue
+            # The chunk planner assumes exactly the state schema of TensorParallelMuon: one fp32
+            # full-size momentum. Reject subclasses such as AdaptiveMuon rather than silently
+            # underestimating their tensor-state window.
+            raw_optimizer = optimizer.optimizer
+            assert type(raw_optimizer) is TensorParallelMuon, (
+                "LayerWise chunked optimizer state offload supports exactly TensorParallelMuon "
+                f"with one fp32 full-size momentum tensor; got {type(raw_optimizer).__name__}."
+            )
+            # Whole-parameter sharding can leave this rank with an optimizer object but no
+            # locally owned Muon parameters. Keep the no-offloader path for it.
+            if not any(group["params"] for group in raw_optimizer.param_groups):
+                continue
+            master_params = [p for group in optimizer.fp32_from_float16_groups for p in group]
+            offload_children.append((optimizer, master_params))
+        assert len(offload_children) <= 1, (
+            "LayerWise chunked optimizer state offload assumes at most one non-empty "
+            f"TensorParallelMuon child; got {len(offload_children)}"
+        )
+        # The whole-param FP8 gather reads the owners' fp32 masters. With parameter-gather
+        # overlap it runs in the next forward, so the training loop forces it at the iteration
+        # boundary, before the masters move to the CPU.
+        gathers_quantized_params = any(
+            getattr(param, 'requantized_by_layer_wise_gather', False)
+            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list)
+            for owned in params_list or []
+            for param in owned
+        )
+        for optimizer, master_params in offload_children:
+            optimizer.enable_chunked_optimizer_state_offload(
+                master_params=master_params, state_dtypes=(torch.float32,)
+            )
+            offloader = optimizer._optimizer_state_offloader
+            optimizer.set_optimizer_state_offload_deferred_lifecycle(
+                state_prefetch_to_step=offloader is not None,
+                master_offload_for_param_sync=(
+                    offloader is not None
+                    and bool(offloader.selected_params)
+                    and gathers_quantized_params
+                    and self.overlap_param_gather
+                ),
+            )
+
+    def _managed_optimizer_state_offload_child_indices(self) -> tuple:
+        """Return child indices that execute through a chunked state offloader."""
+        if (
+            not self.config.chunked_optimizer_state_offload
+            or self.config.optimizer_state_offload_fraction == 0.0
+        ):
+            return ()
+        return self._managed_optimizer_state_offload_indices
+
+    def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
+        """Prefetch all masters and, unless an outer chain deferred it to the step, the managed
+        Muon child's first state chunk."""
+        self.prefetch_optimizer_master_weights_for_step()
+        if self._defer_optimizer_state_prefetch_to_step:
+            return
+        managed_indices = self._managed_optimizer_state_offload_child_indices()
+        if managed_indices:
+            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
+
+    def _before_child_step(self, optimizer_idx: int) -> None:
+        """Ensure the managed Muon child's state is prefetched before the child steps."""
+        managed_indices = self._managed_optimizer_state_offload_child_indices()
+        if managed_indices and optimizer_idx == 0:
+            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
+
+    @staticmethod
+    def _resolve_param_layout(ddp_config, full_param_layouts) -> str:
+        """Return the LayerWise layout (``"padded"``, ``"compact"`` or ``"legacy"``) of the
+        wrapped model chunks.
+
+        The layouts DDP was built with are authoritative: without a precomputed layout the
+        model uses the legacy layout, and LayerWise buffers with or without optimizer shards
+        are padded or compact. A layout named in ``ddp_config.layer_wise_param_layout`` must
+        agree with them.
+        """
+        layer_wise_layouts = [
+            layout
+            for full_layout in full_param_layouts or []
+            for buffer_key, layout in full_layout.layouts.items()
+            if buffer_key.is_managed_by_layer_wise_optimizer
+        ]
+        sharded = {layout.uses_distributed_optimizer for layout in layer_wise_layouts}
+        if len(sharded) > 1:
+            raise ValueError(
+                "LayerWise buffers mix padded (sharded) and compact (unsharded) layouts."
+            )
+        declared = getattr(ddp_config, 'layer_wise_param_layout', None)
+        if not full_param_layouts:
+            built = 'legacy'
+        elif sharded:
+            built = 'padded' if sharded.pop() else 'compact'
+        else:
+            # No LayerWise-managed parameter in these chunks: only the declared layout can tell
+            # padded and compact apart, and neither has anything for LayerWise to gather.
+            built = resolve_layer_wise_param_layout(declared)
+            if built == 'legacy':
+                raise ValueError(
+                    "ddp_config.layer_wise_param_layout='legacy' but DDP was built with a "
+                    "precomputed parameter layout."
+                )
+        if declared is not None and declared != built:
+            raise ValueError(
+                f"ddp_config.layer_wise_param_layout={declared!r} does not match the "
+                f"{built!r} layout that DDP was built with. Wrap the model through "
+                "configure_ddp_for_layer_wise_optimizer() so both use the same layout."
+            )
+        return built
+
+    def _check_whole_param_gather_storage(self, optimizers, config) -> None:
+        """Reject quantized params that the whole-parameter gather cannot publish, and mark
+        the ones it publishes.
+
+        The compact and legacy layouts gather quantized params as BF16 staged from the owners'
+        FP32 masters and requantize them on every rank, which supports plain MXFP8 and
+        blockwise FP8 storage only.
+        """
+        for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+            for param in (p for owned in params_list or [] for p in owned):
+                if not _param_uses_quantized_storage(param):
+                    continue
+                if not (is_mxfp8tensor(param) or is_blockwise_float8tensor(param)):
+                    raise ValueError(
+                        f"The {self.param_layout} LayerWise layout gathers quantized params as "
+                        "BF16 and supports only plain MXFP8 and blockwise FP8 params; got "
+                        f"{type(param.data).__name__}. Use the padded layout or another "
+                        "recipe."
+                    )
+                if not config.bf16:
+                    raise ValueError(
+                        f"Quantized params on the {self.param_layout} LayerWise layout need the "
+                        "bf16 FP32 master copies (OptimizerConfig.bf16=True)."
+                    )
+                param.requantized_by_layer_wise_gather = True
+
+    def shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):
         """Shard params across ranks according to the computed param layout.
 
-        Each param's shard assignment is derived from the :class:`FullParamLayout`
-        stored on the DDP model chunks.  Within each bucket the buffer is divided
-        into ``dp_size`` equal shards; a param's shard index is determined by its
-        position in the buffer.
+        With the padded layout, each param's shard assignment is derived from the
+        :class:`FullParamLayout` stored on the DDP model chunks.  Within each bucket the
+        buffer is divided into ``dp_size`` equal shards; a param's shard index is determined
+        by its position in the buffer.
 
-        Falls back to the legacy ping-pong-by-numel strategy when no layout is
-        available (e.g. ``dp_size == 1`` or no DDP wrapper).
+        Without a layout (compact and legacy layouts, ``dp_size == 1`` or no DDP wrapper),
+        whole params are assigned with the ping-pong-by-numel strategy.
 
         Args:
             optimizers: Optimizers whose param groups will be narrowed to
                 the local rank's shard.
             full_param_layouts: List of :class:`FullParamLayout` (one per model
-                chunk).  ``None`` triggers the legacy fallback.
+                chunk) of the padded layout.  ``None`` selects ping-pong assignment.
+            param_sort_keys: Optional rank-independent tie-break key per param for ping-pong
+                assignment (see :meth:`_build_param_sort_keys`).
         """
-        # Simplify when dp_cp group size is 1.
+        # Dense params shard over dp_cp and expert params over expt_dp; either group can have
+        # a single rank while the other does not (e.g. TP=2 with EP=ETP=1 on two GPUs).
         dp_cp_size = get_pg_size(self.dp_cp)
-        if dp_cp_size == 1:
+        expt_dp_size = get_pg_size(self.expt_dp)
+        if dp_cp_size == 1 and expt_dp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.expt_dp)
-
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
         else:
-            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size, model_chunks)
+            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size, param_sort_keys)
+        # A single-rank group owns all of its params; there is nothing to gather.
+        if dp_cp_size == 1:
+            self.dp_cp_params_list = None
+
+    @staticmethod
+    def _build_param_sort_keys(model_chunks) -> Optional[Dict[torch.nn.Parameter, tuple]]:
+        """Map every param in a DDP buffer to ``(chunk_idx, buffer_idx, buffer_start_index)``.
+
+        Buffer order and offsets are derived from model construction only, so the key is the
+        same on every rank of a data-parallel group. Returns ``None`` when the chunks carry no
+        DDP buffers (e.g. direct construction with plain modules).
+        """
+        if not model_chunks:
+            return None
+        sort_keys: Dict[torch.nn.Parameter, tuple] = {}
+        for chunk_idx, chunk in enumerate(model_chunks):
+            # nn.Module.buffers is a method; only DDP chunks expose a list of param buffers.
+            dense_buffers = getattr(chunk, 'buffers', [])
+            if callable(dense_buffers):
+                dense_buffers = []
+            all_buffers = list(dense_buffers) + list(getattr(chunk, 'expert_parallel_buffers', []))
+            for buffer_idx, buffer in enumerate(all_buffers):
+                for param, (start_index, _, _) in buffer.param_index_map.items():
+                    sort_keys[param] = (chunk_idx, buffer_idx, start_index)
+        return sort_keys or None
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
@@ -1068,51 +1230,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for group, local_params in zip(param_groups, param_groups_this_rank):
             group["params"] = local_params
 
-        # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        # Simplify when expt_dp group size is 1 or expert parallel is off. Rank 0 can own no
+        # expert param while other ranks do, so check every rank's list.
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
-    def _build_param_sort_keys(self, model_chunks):
-        """Build ``{param: (chunk_idx, buffer_idx, global_start_index)}`` — a rank-independent key
-        for every requires-grad param.
+    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size, param_sort_keys=None):
+        """Ping-pong-by-numel shard assignment of whole params (no padded layout available).
 
-        Both the chunk/buffer enumeration order and the ``param_index_map`` offsets come purely
-        from model construction (identical across DP ranks), so the key is the same on every rank.
-        Used to break equal-numel ties in ``_shard_params_ping_pong``. Returns ``None`` if no layout
-        info is available, so the caller falls back to legacy numel-only ordering.
-        """
-        if model_chunks is None:
-            return None
-        identity: Dict[torch.nn.Parameter, tuple] = {}
-        for chunk_idx, chunk in enumerate(model_chunks):
-            # A plain nn.Module exposes buffers() as a method, not DDP buffer metadata.
-            # Leave it on the documented no-layout fallback instead of iterating that method.
-            chunk_buffers = getattr(chunk, 'buffers', [])
-            if callable(chunk_buffers):
-                chunk_buffers = []
-            buffers = list(chunk_buffers) + list(getattr(chunk, 'expert_parallel_buffers', []))
-            for buffer_idx, buffer in enumerate(buffers):
-                param_index_map = getattr(buffer, 'param_index_map', None)
-                if param_index_map is None:
-                    continue
-                for param, (global_start, _global_end, _bucket_id) in param_index_map.items():
-                    identity[param] = (chunk_idx, buffer_idx, global_start)
-        return identity or None
+        Used by the compact and legacy layouts, and when there is no DDP wrapper.
 
-    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size, model_chunks=None):
-        """Legacy ping-pong shard assignment (no layout available).
+        List of parameters are sorted by numel and assigned to ranks in ping-pong style.
+        Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
+        will be [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
 
-        Legacy: this method is a fallback for when no ``full_param_layout``
-        is provided.  Once all call sites supply a layout, this can be removed
-        in favor of :meth:`_shard_params_from_layout`.
-
-        Parameters are sorted by a rank-independent TOTAL order and assigned ping-pong style. E.g.
-        4 ranks, 10 params p0-p9 -> [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
-
-        CRITICAL: the sort key MUST be identical across DP ranks. ``numel`` alone is not (stable
-        sort tie-breaks equal-numel params by insertion order), which would give different owners
-        per rank -> params double-owned or zero-owned on the first step. So we tie-break by the
-        canonical identity ``(chunk_idx, buffer_idx, global_start_index)``.
+        Every rank must compute the same owners. A stable sort by numel breaks ties by the
+        order of the optimizer param groups; ``param_sort_keys`` makes the order total with a
+        rank-independent identity (see :meth:`_build_param_sort_keys`). Without it the legacy
+        numel-only order is kept.
         """
         dp_cp_idx, expt_dp_idx = 0, 0
         # Create ping-pong style loop so memory is more balanced.
@@ -1125,24 +1260,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
 
-        # Sort param in all groups by a rank-independent TOTAL order, then assign to each rank.
-        identity = self._build_param_sort_keys(model_chunks)
+        # Sort param in all groups by param numel and assign to each rank evenly.
         param_list = []
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
                 param_list.append((p, group_index))
-        if identity is not None:
-            # Total order: (numel, canonical-global-identity). Identical on every DP rank.
-            missing = [p for (p, _) in param_list if p not in identity]
+        if param_sort_keys is not None:
+            missing = [p for p, _ in param_list if p not in param_sort_keys]
             assert not missing, (
-                "ping-pong ownership requires a canonical identity for every Muon param, "
-                f"but {len(missing)} param(s) were not found in any model-chunk buffer's "
-                "param_index_map. Cannot guarantee identical ownership across ranks (the "
-                "allgather_params gather assumes every rank agrees on each param's single owner)."
+                f"{len(missing)} LayerWise param(s) are not in any DDP buffer, so their owner "
+                "cannot be chosen identically on every rank."
             )
-            param_list.sort(key=lambda x: _param_sort_key(x[0].numel(), identity[x[0]]))
+            param_list.sort(key=lambda x: (x[0].numel(), param_sort_keys[x[0]]))
         else:
-            # No layout info: keep the legacy numel-only ordering.
             param_list.sort(key=lambda x: x[0].numel())
         param_groups_this_rank = [[] for g in param_groups]
 
@@ -1164,7 +1294,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             groups["params"] = params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
@@ -1223,85 +1353,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks.
 
-        Legacy: only used when ``use_buffer_param_sync=False``.  Once all
-        call sites supply a ``full_param_layout``, this can be removed — the
-        standard distributed optimizer buffer all-gather (via
-        ``start_param_sync``) replaces this flatten/unflatten path.
+        Used by the compact and legacy layouts when DDP bucket groups do not gather
+        (``layerwise_param_sync_via_bucket_group=False``); the padded layout uses the
+        standard distributed optimizer buffer all-gather (via ``start_param_sync``).
 
-        Two transport variants share the same uneven (all-gather-v) shape:
-
-        * **bf16** (``use_fp8_param_sync=False``): all-gather owned bf16 ``param.data``, copy_ into
-          non-owned params.
-        * **fp8** (``use_fp8_param_sync=True``): stage owned fp32 master->bf16, all-gather bf16,
-          requantize into EVERY rank's ``param.data`` (owned included) so all hold
-          ``Q(bf16(master))`` (== OFF/Adam). Then ``post_all_gather_processing`` rebuilds fp8
-          columnwise/transpose (blockwise/Float8; mxfp8 noop since copy-back already forced it).
+        Owners flatten their updated params into one uneven all-gather per transport dtype.
+        Quantized params (plain MXFP8 / blockwise FP8) travel as BF16 staged from the owners'
+        FP32 masters and are requantized on every rank, owner included, so all replicas hold
+        identical quantized values.
         """
-
-        # FP8-aware variant: stage bf16, uneven all-gather bf16, requantize per rank.
-        def _allgather_helper_fp8(params_list, group):
-            # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
-            # (~2x less comm) instead of bf16; mxfp8 must stay on bf16. See the matching TODO in
-            # ``_ParamAndGradBucketGroup.start_param_sync`` for the full rationale.
-            rank = get_pg_rank(group)
-            dp_size = get_pg_size(group)
-            # Device from any non-empty owned list (rank 0 may own zero params in the layout).
-            device = next((params[0].device for params in params_list if len(params) > 0), None)
-            if device is None:
-                # No rank owns any param in this buffer -> nothing to gather.
-                return
-
-            # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-            owned = params_list[rank]
-            src = (
-                _flatten_dense_tensors([_stage_param_to_bf16(p) for p in owned])
-                if len(owned) > 0
-                else torch.empty(0, device=device, dtype=torch.bfloat16)
-            )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
-            if max(flat_sizes) == 0:
-                return
-
-            gather_list = []
-            for i in range(dp_size):
-                if i == rank:
-                    gather_list.append(src)
-                else:
-                    gather_list.append(
-                        torch.empty(flat_sizes[i], device=device, dtype=torch.bfloat16)
-                    )
-
-            torch.distributed.all_gather(gather_list, src, group=group)
-
-            # Requantize the gathered bf16 into EVERY rank's params (owned included) so all ranks
-            # hold Q(bf16(master)), matching OFF/Adam. Unflatten by param shape (logical numel).
-            for idx, params in enumerate(params_list):
-                if len(params) == 0:
-                    continue
-                templates = [
-                    torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params
-                ]
-                updated_params = _unflatten_dense_tensors(gather_list[idx], templates)
-                for updated_bf16, model_p in zip(updated_params, params):
-                    copy_back_gathered_bf16_into_fp8_param(model_p, updated_bf16)
-
-            # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
-            # paths; blockwise/Float8 build it, mxfp8 is a noop). Else it'd be deferred to forward.
-            fp8_params = [p for params in params_list for p in params if is_float8tensor(p)]
-            if fp8_params:
-                post_all_gather_processing(fp8_params)
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
-        def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+        def _allgather_helper(params_list, group, quantized):
+            # Any rank, including rank 0, may own no param of this domain.
+            first_param = next((params[0] for params in params_list if params), None)
+            if first_param is None:
+                return
+            device = first_param.device
+            dtype = torch.bfloat16 if quantized else first_param.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
+            local_params = params_list[rank]
+            if quantized:
+                for param in local_params:
+                    assert (
+                        getattr(param, 'main_param', None) is not None
+                    ), "LayerWise quantized param gather needs the owner's FP32 main_param."
+                local_params = [param.main_param.to(dtype) for param in local_params]
             src = (
-                _flatten_dense_tensors(params_list[rank])
-                if len(params_list[rank]) > 0
+                _flatten_dense_tensors(local_params)
+                if len(local_params) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
             flat_sizes = [sum(p.numel() for p in params) for params in params_list]
@@ -1320,6 +1403,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             torch.distributed.all_gather(gather_list, src, group=group)
 
+            if quantized:
+                params, values = [], []
+                for idx, owned in enumerate(params_list):
+                    if not owned:
+                        continue
+                    templates = [torch.empty(p.shape, device="meta", dtype=dtype) for p in owned]
+                    params.extend(owned)
+                    values.extend(_unflatten_dense_tensors(gather_list[idx], templates))
+                requantize_whole_params_from_high_precision(params, values)
+                return
+
             # Unflatten and copy gathered params for each rank.
             for idx, params in enumerate(params_list):
                 if len(params) == 0 or idx == rank:
@@ -1328,45 +1422,42 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
+        def _allgather_by_transport(params_list, group):
+            # Flattening needs one dtype; keep e.g. FP32 params out of a BF16 transport, and
+            # quantized params apart from plain ones. The transport order follows the owner
+            # lists, which are identical on every rank.
+            transports = dict.fromkeys(
+                (_param_uses_quantized_storage(param), param.dtype)
+                for params in params_list
+                for param in params
+            )
+            for quantized, dtype in transports:
+                _allgather_helper(
+                    [
+                        [
+                            param
+                            for param in params
+                            if (_param_uses_quantized_storage(param), param.dtype)
+                            == (quantized, dtype)
+                        ]
+                        for params in params_list
+                    ],
+                    group,
+                    quantized,
+                )
+
         if self.pg_collection is None:
             return
-
-        def _dispatch(params_list, group):
-            # Split each rank's owned params by transport dtype. fp8 and bf16 params ride the
-            # bf16 transport (the fp8 helper stages master->bf16 / requantizes, a no-op in
-            # precision for bf16); native fp32 params (e.g. weights marked keep_in_fp32 such as
-            # the DeepSeek-V4 CSA ``ape``) must be gathered in fp32 -- routing them through the
-            # bf16-staged path would silently downcast them, and mixing fp32 with bf16 in one
-            # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
-            # empty and this collapses to the original single-helper dispatch.
-            staged = [
-                [p for p in owned if is_float8tensor(p) or p.dtype != torch.float32]
-                for owned in params_list
-            ]
-            native = [
-                [p for p in owned if not is_float8tensor(p) and p.dtype == torch.float32]
-                for owned in params_list
-            ]
-            if any(owned for owned in staged):
-                staged_helper = (
-                    _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
-                )
-                staged_helper(staged, group)
-            if any(owned for owned in native):
-                _allgather_helper(native, group)
-
         if self.dp_cp_params_list:
-            _dispatch(self.dp_cp_params_list, self.dp_cp)
+            _allgather_by_transport(self.dp_cp_params_list, self.dp_cp)
         if self.expt_dp_params_list:
-            _dispatch(self.expt_dp_params_list, self.expt_dp)
+            _allgather_by_transport(self.expt_dp_params_list, self.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
         """All rank broadcast updated local params."""
         # Broadcast linear layer weights to all other ranks. Kept as reference test.
-        if self.dp_cp_params_list is None:
-            return
-        for i, params in enumerate(self.dp_cp_params_list):
+        for i, params in enumerate(self.dp_cp_params_list or []):
             src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
             for p in params:
                 torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
@@ -1440,40 +1531,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             expert_gtp_group=self.expert_gtp_group,
         )
 
-    def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
-        """Return child indices that execute through a chunked state offloader."""
-
-        if (
-            not self.config.chunked_optimizer_state_offload
-            or self.config.optimizer_state_offload_fraction == 0.0
-        ):
-            return ()
-        return self._managed_optimizer_state_offload_indices
-
-    def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
-        """Prefetch all masters and, unless an outer chain deferred it to the step, the managed
-        Muon child's first state chunk."""
-
-        self.prefetch_optimizer_master_weights_for_step()
-        if self._defer_optimizer_state_prefetch_to_step:
-            return
-        managed_indices = self._managed_optimizer_state_offload_child_indices()
-        if managed_indices:
-            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
-
-    def _before_child_step(self, optimizer_idx: int) -> None:
-        """Ensure the managed Muon child's state is prefetched before child steps."""
-
-        managed_indices = self._managed_optimizer_state_offload_child_indices()
-        if not managed_indices:
-            return
-        if optimizer_idx == 0:
-            self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
-
     def _sync_unbuffered_model_params(self) -> None:
-        """Restore compact LayerWise shards using the same gather policy as a normal step."""
-        if not self.is_stub_optimizer and not self.layerwise_param_sync_via_bucket_group:
-            self.allgather_params()
+        """Gather owner-updated params when DDP bucket groups do not publish them.
+
+        Matches the gather that :meth:`step_with_ready_grads` runs for the compact and legacy
+        layouts without parameter-gather overlap or grad-buffer reuse.
+        """
+        if self.is_stub_optimizer or self.layerwise_param_sync_via_bucket_group:
+            return
+        self.allgather_params()
 
     def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
@@ -1526,9 +1592,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if len(self.chained_optimizers) == 1:
             wrapped_state_dict = {1: state_dict}
         else:
-            wrapped_state_dict = (
-                dict(enumerate(state_dict)) if isinstance(state_dict, list) else state_dict
-            )
+            wrapped_state_dict = state_dict
         for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 log_single_rank(
@@ -1602,3 +1666,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 nonempty_rank_group['params'] = local_params
                 sd['optimizer']['param_groups'][i] = nonempty_rank_group
         return sharded_state_dict
+
+    def save_state_dict_to_file(self, filename: str) -> None:
+        """Save the parameter state of the optimizer. For torch format only.
+        Args:
+            filename: The filename to save the parameter state.
+        """
+        torch.save(super().state_dict(), filename)
+
+    def load_state_dict_from_file(self, filename: str) -> None:
+        """Load the parameter state of the optimizer. For torch format only."""
+        super().load_state_dict(torch.load(filename))

@@ -194,8 +194,8 @@ class TestMuonDecoupleFP8ParamGather:
         args.exp_avg_dtype = 'fp32'
         args.exp_avg_sq_dtype = 'fp32'
         args.use_distributed_optimizer = True
-        # DECOUPLED compact LayerWise layout (the supported FP8 param-gather route).
-        args.use_layer_wise_param_layout = False
+        # Compact LayerWise layout (whole-param FP8 gathers from the owners' masters).
+        args.layer_wise_param_layout = 'compact'
         # --overlap-param-gather requires --overlap-grad-reduce (arguments.py); co-enable.
         args.overlap_param_gather = overlap
         args.overlap_grad_reduce = overlap

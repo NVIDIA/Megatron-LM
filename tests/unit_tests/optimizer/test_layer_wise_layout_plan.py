@@ -1,0 +1,197 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""CPU tests for how the layer-wise distributed optimizer plan is resolved.
+
+Covers the LayerWise data-parallel layout (padded, compact, legacy), the optimizer intent, the
+DDP wrapping decision and the rank-independent whole-parameter owners of the compact layout.
+"""
+
+import random
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+import torch
+
+from megatron.core.distributed.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+    resolve_layer_wise_param_layout,
+)
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    configure_ddp_for_layer_wise_optimizer,
+)
+from megatron.core.optimizer.optimizer_config import resolve_layer_wise_distributed_optimizer
+
+
+def _param(shape, **attrs):
+    param = torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
+    for name, value in attrs.items():
+        setattr(param, name, value)
+    return param
+
+
+def _model():
+    """Muon matrices, an embedding, a bias and an excluded matrix."""
+    model = torch.nn.Module()
+    model.embedding = _param((32, 8), is_embedding_or_output_parameter=True)
+    model.fc1 = _param((16, 8))
+    model.fc1_bias = _param((16,))
+    model.fc2 = _param((8, 16))
+    model.router = _param((4, 8), use_muon=False)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Layout and optimizer-intent resolution.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("layout", "use_bool", "expected"),
+    [
+        (None, None, "padded"),
+        ("padded", None, "padded"),
+        ("compact", None, "compact"),
+        ("legacy", None, "legacy"),
+        (None, True, "padded"),
+        (None, False, "legacy"),
+        ("padded", True, "padded"),
+        ("legacy", False, "legacy"),
+    ],
+)
+def test_resolve_layer_wise_param_layout(layout, use_bool, expected):
+    assert resolve_layer_wise_param_layout(layout, use_bool) == expected
+
+
+@pytest.mark.parametrize(
+    ("layout", "use_bool"),
+    [("compact", False), ("compact", True), ("padded", False), ("legacy", True), ("ragged", None)],
+)
+def test_resolve_layer_wise_param_layout_rejects_conflicts(layout, use_bool):
+    # The original boolean never means "compact"; a mismatch is an error, not a silent pick.
+    with pytest.raises(ValueError):
+        resolve_layer_wise_param_layout(layout, use_bool)
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "use_distopt", "use_layer_wise", "expected"),
+    [
+        ("adam", False, False, ("adam", False)),
+        ("adam", True, False, ("adam", False)),
+        ("sgd", True, False, ("sgd", False)),
+        ("muon", False, False, ("muon", False)),
+        ("muon", True, False, ("muon", True)),
+        ("muon", False, True, ("muon", True)),
+        ("dist_muon", False, False, ("muon", True)),
+        ("lion", True, False, ("lion", True)),
+        ("adaptive_muon", True, False, ("adaptive_muon", True)),
+    ],
+)
+def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_layer_wise, expected):
+    assert (
+        resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_layer_wise) == expected
+    )
+
+
+# ---------------------------------------------------------------------------
+# DDP wrapping decision shared by get_model() and the ModelBuilder path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("layout", [None, "padded", "compact"])
+def test_configure_ddp_for_sharded_layer_wise_layouts(layout):
+    model = _model()
+    # The container clears use_distributed_optimizer for the layer-wise optimizer.
+    ddp_config = DistributedDataParallelConfig(layer_wise_param_layout=layout)
+    fn = configure_ddp_for_layer_wise_optimizer(
+        [model], ddp_config, use_layer_wise_distributed_optimizer=True
+    )
+    assert fn == LayerWiseDistributedOptimizer.compute_full_param_layout
+    assert ddp_config.use_distributed_optimizer
+    assert ddp_config.layer_wise_param_layout == (layout or "padded")
+    assert model.fc1.is_managed_by_layer_wise_optimizer
+    assert model.fc2.is_managed_by_layer_wise_optimizer
+    for name in ("embedding", "fc1_bias", "router"):
+        assert not getattr(model, name).is_managed_by_layer_wise_optimizer
+
+    # Resolving again (e.g. a second wrap of the same config) is stable.
+    assert (
+        configure_ddp_for_layer_wise_optimizer(
+            [model], ddp_config, use_layer_wise_distributed_optimizer=True
+        )
+        == fn
+    )
+    assert ddp_config.layer_wise_param_layout == (layout or "padded")
+
+
+@pytest.mark.parametrize(
+    ("layout", "use_bool"), [("legacy", None), (None, False), ("legacy", False)]
+)
+def test_configure_ddp_for_legacy_layout_keeps_original_opt_out(layout, use_bool):
+    model = _model()
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, layer_wise_param_layout=layout
+    )
+    fn = configure_ddp_for_layer_wise_optimizer(
+        [model],
+        ddp_config,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=use_bool,
+    )
+    assert fn is None
+    assert not ddp_config.use_distributed_optimizer
+    assert ddp_config.layer_wise_param_layout == "legacy"
+    assert not hasattr(model.fc1, "is_managed_by_layer_wise_optimizer")
+
+
+# ---------------------------------------------------------------------------
+# Rank-independent whole-parameter owners of the compact layout.
+# ---------------------------------------------------------------------------
+
+
+def _ddp_chunk(params):
+    """Exposes the DDP buffer metadata ``_build_param_sort_keys`` reads."""
+    index_map, start = {}, 0
+    for param in reversed(params):
+        index_map[param] = (start, start + param.numel(), 0)
+        start += param.numel()
+    return SimpleNamespace(
+        buffers=[SimpleNamespace(param_index_map=index_map)], expert_parallel_buffers=[]
+    )
+
+
+def _owners(params_in_group_order, sort_keys, dp_size, rank):
+    """Run the ping-pong assignment for ``rank`` with mocked process groups."""
+    groups = [{"params": [p], "is_expert_parallel": False} for p in params_in_group_order]
+    optimizer = SimpleNamespace(param_groups=groups)
+    lwo = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    lwo.dp_cp = "dp_cp"
+    lwo.expt_dp = "expt_dp"
+    with (
+        mock.patch("megatron.core.optimizer.layer_wise_optimizer.get_pg_rank", return_value=rank),
+        mock.patch(
+            "megatron.core.optimizer.layer_wise_optimizer.get_pg_size", return_value=dp_size
+        ),
+    ):
+        lwo.shard_params([optimizer], param_sort_keys=sort_keys)
+    local = [p for group in groups for p in group["params"]]
+    return lwo.dp_cp_params_list, local
+
+
+def test_compact_owners_do_not_depend_on_param_group_order():
+    # Equal-numel params are where a numel-only stable sort could disagree across ranks.
+    params = [_param((8, 8)) for _ in range(6)] + [_param((4, 8)) for _ in range(3)]
+    sort_keys = LayerWiseDistributedOptimizer._build_param_sort_keys([_ddp_chunk(params)])
+    assert set(sort_keys) == set(params)
+
+    reference, _ = _owners(params, sort_keys, dp_size=4, rank=0)
+    rng = random.Random(1234)
+    for rank in range(4):
+        shuffled = list(params)
+        rng.shuffle(shuffled)
+        owner_lists, local = _owners(shuffled, sort_keys, dp_size=4, rank=rank)
+        assert owner_lists == reference
+        assert set(local) == set(reference[rank])
+    # Every param has exactly one owner.
+    assert sorted(id(p) for owned in reference for p in owned) == sorted(id(p) for p in params)

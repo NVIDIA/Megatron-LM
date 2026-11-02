@@ -318,11 +318,7 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if not inference and getattr(args, "use_layer_wise_distributed_optimizer", False):
-            # Full model metadata also covers sibling Adam buffers in compact mode;
-            # its presence does not identify the LayerWise storage/synchronization path.
-            assert gpt_model[0].ddp_config.use_layer_wise_param_layout == (
-                args.use_layer_wise_param_layout
-            )
+            requested_layout = gpt_model[0].ddp_config.layer_wise_param_layout
             pending = [optimizer]
             layerwise = []
             while pending:
@@ -332,8 +328,12 @@ class TestFP8Param:
                 pending.extend(getattr(current, "chained_optimizers", ()))
             assert layerwise, "The requested LayerWise optimizer must actually be constructed"
             for current in layerwise:
-                assert current.decouple_ddp_layout == (not args.use_layer_wise_param_layout)
-                assert current.use_buffer_param_sync == args.use_layer_wise_param_layout
+                # LayerWise reads back the layout DDP was built with.
+                assert current.param_layout == requested_layout, (
+                    "LayerWise test did not enter the requested parameter-layout path: "
+                    f"requested={requested_layout}, actual={current.param_layout}"
+                )
+                assert current.use_buffer_param_sync == (requested_layout == "padded")
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
@@ -730,6 +730,46 @@ class TestFP8Param:
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
+    @pytest.mark.skipif(
+        Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
+        reason="Layer-wise optimizer is not supported on LTS",
+    )
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+    @pytest.mark.parametrize("layer_wise_param_layout", ["compact", "legacy", "padded"])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
+    def test_muon_layer_wise_fp8_param_gather(
+        self, tp_size, recipe, layer_wise_param_layout, dp_overlap
+    ):
+        """Muon on each LayerWise layout trains FP8 params like BF16 params.
+
+        The compact and legacy layouts gather whole params as BF16 staged from the owners'
+        FP32 masters and requantize on every rank, so the FP8-param run must follow the
+        BF16-param run (FP8 compute in both). The padded layout keeps main's MXFP8 path;
+        its blockwise path (native FP8 transport quantized from FP32 masters) is not compared.
+
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        arch = get_device_arch_version()
+        if recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise is only supported on Hopper architecture")
+        if recipe == "mxfp8" and arch < 10:
+            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        if recipe == "blockwise" and layer_wise_param_layout == "padded":
+            pytest.skip("Padded LayerWise blockwise transport quantizes FP32 masters directly")
+        kwargs = {
+            "optimizer": "muon",
+            "muon_tp_mode": "duplicated",
+            "layer_wise_param_layout": layer_wise_param_layout,
+            "overlap_param_gather": dp_overlap[0],
+            "overlap_grad_reduce": dp_overlap[1],
+            "num_steps": 20,
+        }
+        self.run_test(tp_size=tp_size, recipe=recipe, **kwargs)
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(

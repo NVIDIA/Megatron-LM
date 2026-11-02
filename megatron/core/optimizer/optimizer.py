@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron optimizer."""
 
@@ -47,7 +47,11 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
-from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
+from ..fp8_utils import (
+    is_blockwise_float8tensor,
+    is_mxfp8tensor,
+    requantize_whole_params_from_high_precision,
+)
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -98,13 +102,54 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
+# Per-group keys used to uniquely identify a param_group during save/load matching.
+# Used by ``DistributedOptimizer.load_state_dict`` and
+# ``MegatronOptimizer._filter_and_reorder_param_groups`` to map saved param_groups
+# onto current param_groups by behavioral equivalence.
+#
+# This MUST cover every per-group field that influences scheduler or optimizer behavior;
+# otherwise two groups that differ only in a missing key (e.g. ``max_lr``) will collide
+# in the matching dict and one will silently overwrite the other on load. That's a
+# correctness bug: the load returns silently but the LR/WD applied at the next
+# optimizer step is wrong, leading to loss explosion on a converged-enough model.
+#
+# Source of truth for the user-overridable fields is
+# :class:`megatron.core.optimizer_param_scheduler.ParamGroupOverride` (the keys the
+# scheduler reads from each param_group via ``param_group.get(...)``):
+# ``max_lr``, ``min_lr``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
+# We pull those keys directly from that TypedDict's annotations so future
+# additions to ``ParamGroupOverride`` automatically extend the identifier.
+#
+# The remaining keys (``lr_mult``, ``is_expert_parallel``, ``is_decoupled_lr``) are
+# structural flags set by ``_get_param_groups`` (in this module's ``__init__.py``)
+# on every param_group at construction time. They aren't part of ``ParamGroupOverride``
+# (users don't override them directly; they're implied by ``decoupled_lr`` config and
+# expert-parallel sharding), so we list them explicitly.
 def _param_group_override_keys() -> tuple[str, ...]:
-    """Return every field declared on ``ParamGroupOverride``."""
+    """Return every field declared on ``ParamGroupOverride``.
+
+    For any TypedDict, ``__annotations__.keys() == __required_keys__ | __optional_keys__``
+    - the (required, optional) pair is just a *partition* of the declared set
+    based on the TypedDict's totality choice and any ``Required[]`` /
+    ``NotRequired[]`` wrappers. We want the whole declared set, regardless of
+    how it's partitioned, so we read ``__annotations__`` directly. Reading just
+    one side of the partition would silently miss fields if a future maintainer
+    flipped totality or introduced wrappers:
+
+        total=False (current):  optional={max_lr, min_lr, ...}, required={}
+        total=True:             required={max_lr, min_lr, ...}, optional={}
+        mixed Required/NotRequired:  fields split between the two sides
+    """
     return tuple(sorted(_ParamGroupOverride.__annotations__.keys()))
 
 
 param_group_identifier_keys = (
+    # Per-group user-overridable keys (single source of truth: ParamGroupOverride).
+    # The scheduler reads ``max_lr``/``min_lr`` in ``get_lr`` and ``start_wd``/``end_wd``
+    # in ``get_wd``; ``wd_mult`` is multiplied into ``weight_decay`` in ``step``;
+    # ``optimizer`` selects per-group optimizer class.
     *_param_group_override_keys(),
+    # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
     'lr_mult',
     'is_expert_parallel',
     'is_decoupled_lr',
@@ -350,7 +395,12 @@ class MegatronOptimizer(ABC):
         self._stage_model_params_from_main_params()
 
     def _sync_unbuffered_model_params(self) -> None:
-        """Synchronize optimizer-owned parameters not gathered by DDP bucket groups."""
+        """Gather the model params that this optimizer publishes without DDP bucket groups.
+
+        Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
+        after every member has staged its params. DDP skips the bucket groups of such params
+        (see ``DistributedDataParallelConfig.param_sync_via_bucket_group``).
+        """
         return
 
     def _filter_grads_for_norm(
@@ -721,9 +771,10 @@ class MegatronOptimizer(ABC):
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
-        """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        """Pair each current param_group with its saved counterpart by identifier tuple.
+
+        Construction order isn't part of the checkpoint, so we match by a tuple of
+        per-group config (``param_group_identifier_keys``) rather than by position.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -737,18 +788,26 @@ class MegatronOptimizer(ABC):
         """
 
         def _identifier_for(group: dict) -> tuple:
-            identifier = []
+            out = []
             for key in param_group_identifier_keys:
+                # NeMo aliases ``wd_mult``/``lr_mult`` as ``pre_wd_mult``/``pre_lr_mult``.
                 if key in group:
-                    identifier.append(group[key])
+                    out.append(group[key])
                 elif f"pre_{key}" in group:
-                    identifier.append(group[f"pre_{key}"])
+                    out.append(group[f"pre_{key}"])
                 else:
-                    identifier.append(None)
-            return tuple(identifier)
+                    # Treat missing and explicit None identifier values as equivalent.
+                    out.append(None)
+            return tuple(out)
 
-        needed_groups = [_identifier_for(group) for group in current_groups]
-        params_in_state_dict_order = [group['params'] for group in state_dict_groups]
+        needed_groups = [_identifier_for(g) for g in current_groups]
+        params_in_state_dict_order = [g['params'] for g in state_dict_groups]
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # current optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
@@ -795,9 +854,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         super().__init__(optimizer, config, init_state_fn)
         self.grad_scaler = grad_scaler
-
-        # Tagged True by LayerWiseDistributedOptimizer on its non-DistOpt children.
-        self._layer_wise_non_distopt_child = False
 
         # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
@@ -933,24 +989,17 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
         if not self.is_stub_optimizer:
             # The reuse_grad_buf (fp8-param-gather) path stages master params into the DDP
-            # param buffer, which only DistributedOptimizer owns. Non-DistOpt LayerWise
-            # children (tagged ``_layer_wise_non_distopt_child``) and optimizers without the
-            # staging method must instead copy master -> model params so the forward sees the
-            # update.
-            if (
-                self.config.reuse_grad_buf_for_mxfp8_param_ag
-                and not self._layer_wise_non_distopt_child
-                and hasattr(self, "_copy_main_params_to_param_buffer")
+            # param buffer, which only DistributedOptimizer owns. Optimizers without it
+            # (e.g. LayerWiseDistributedOptimizer's Float16 base opts) must instead copy
+            # master -> model params so the forward sees the update.
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag and hasattr(
+                self, "_copy_main_params_to_param_buffer"
             ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
                 if not self.config.overlap_param_gather:
                     self._copy_main_params_to_param_buffer()
             else:
-                # Non-DistOpt LayerWise children have no byte-shard param buffer to stage into
-                # (``_copy_main_params_to_param_buffer`` would raise), so even under reuse_grad_buf
-                # they copy fp32 master straight into model ``param.data`` (fp8 re-quantized in
-                # place, or bf16); the grad-buffer reuse applies to the later param-gather staging.
                 self._copy_main_params_to_model_params()
 
         if timers is not None:
@@ -1121,6 +1170,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
     """
 
+    # Set by LayerWiseDistributedOptimizer for its children on the compact and legacy
+    # layouts (see _copy_main_params_to_model_params_via_bf16).
+    quantize_from_bf16_master = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -1276,33 +1329,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def _copy_main_params_to_model_params(self):
         self.ensure_master_weights_for_param_sync()
         self.assert_master_weights_resident("_copy_main_params_to_model_params")
-
-        # Non-DistOpt LayerWise fp8: route master->model through bf16 (Q(bf16(master))) to match the
-        # fp8-param-gather-OFF baseline (a direct fp32->fp8 copy would write Q(fp32 master)). This
-        # also covers MoE expert weights at expt_dp==1, which are not gathered.
-        if self._layer_wise_non_distopt_child:
-            other_model_data, other_main_data = [], []
-            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
-                for model_param, main_param in zip(model_group, main_group):
-                    if is_float8tensor(model_param):
-                        # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
-                        # by the fp8 all-gather's requantize (``_allgather_helper_fp8``), which
-                        # would overwrite this copy -- so skip it for them. Non-gathered fp8 params
-                        # (e.g. MoE experts at expt_dp == 1, which the all-gather skips) are not
-                        # tagged and still get their ``Q(bf16(master))`` written here.
-                        if not getattr(model_param, '_layer_wise_fp8_gathered', False):
-                            copy_back_gathered_bf16_into_fp8_param(
-                                model_param, main_param.detach().to(torch.bfloat16)
-                            )
-                    else:
-                        other_model_data.append(model_param.data)
-                        other_main_data.append(main_param.data)
-            if other_model_data:
-                _multi_tensor_copy_this_to_that(
-                    this=other_main_data,
-                    that=other_model_data,
-                    overflow_buf=self._dummy_overflow_buf,
-                )
+        if self.quantize_from_bf16_master:
+            self._copy_main_params_to_model_params_via_bf16()
             return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
@@ -1310,15 +1338,30 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
 
-    def _copy_main_params_to_param_buffer(self):
-        """Only ``DistributedOptimizer`` has the byte-shard buffer for this; non-DistOpt LayerWise
-        children route to ``_copy_main_params_to_model_params`` instead."""
-        raise NotImplementedError(
-            "_copy_main_params_to_param_buffer is only implemented for DistributedOptimizer "
-            "(byte-shard staging). Reached it on a plain "
-            f"{type(self).__name__} with reuse_grad_buf_for_mxfp8_param_ag set, which is "
-            "unsupported."
-        )
+    def _copy_main_params_to_model_params_via_bf16(self):
+        """Master-to-model copy of a LayerWise child on the compact or legacy layout.
+
+        Those layouts publish plain MXFP8 / blockwise FP8 params by requantizing the gathered
+        BF16 values on every rank, owner included. The gathered params are skipped here (the
+        gather overwrites them); a param no rank gathers (a single-rank data-parallel group) gets
+        the same Q(bf16(master)) here. Other params are copied as usual.
+        """
+        model_data, main_data, quantized_params, values = [], [], [], []
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if is_mxfp8tensor(model_param) or is_blockwise_float8tensor(model_param):
+                    if not getattr(model_param, 'requantized_by_layer_wise_gather', False):
+                        quantized_params.append(model_param)
+                        values.append(main_param.detach().to(torch.bfloat16))
+                    continue
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        if model_data:
+            _multi_tensor_copy_this_to_that(
+                this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
+            )
+        if quantized_params:
+            requantize_whole_params_from_high_precision(quantized_params, values)
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
@@ -1949,27 +1992,18 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
+        # Optimizer-owned gathers (e.g. compact LayerWise without overlap) run after every
+        # member has staged its params; DDP below skips their bucket groups.
         self._sync_unbuffered_model_params()
         # self.model_chunks, not a walk over the members: __init__ collects chunks only from
         # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
         # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
         # super().__init__(), and recomputing here would discard that and gather nothing.
         for model_chunk in self.model_chunks:
-            bucket_groups = getattr(model_chunk, 'bucket_groups', []) + getattr(
-                model_chunk, 'expert_parallel_bucket_groups', []
-            )
-            if any(not group.ddp_config.param_sync_via_bucket_group for group in bucket_groups):
-                # Compact LayerWise may own its gather while sibling DistOpt buckets
-                # still use DDP. Never send the former through a DistOpt collective.
-                for group in bucket_groups:
-                    if group.ddp_config.param_sync_via_bucket_group:
-                        model_chunk._start_bucket_group_param_sync(group, force_sync=True)
-            else:
-                model_chunk.start_param_sync(force_sync=True)
+            model_chunk.start_param_sync(force_sync=True)
 
     @override
     def _sync_unbuffered_model_params(self) -> None:
-        """Run optimizer-owned gathers only after every member has staged its shards."""
         if self.is_stub_optimizer:
             return
         for optimizer in self.chained_optimizers:
@@ -1980,14 +2014,6 @@ class ChainedOptimizer(MegatronOptimizer):
             return self.chained_optimizers[0].state_dict()
         else:
             return [optimizer.state_dict() for optimizer in self.chained_optimizers]
-
-    def save_state_dict_to_file(self, filename: str) -> None:
-        """Save this optimizer's per-rank state for torch checkpoints."""
-        torch.save(self.state_dict(), filename)
-
-    def load_state_dict_from_file(self, filename: str) -> None:
-        """Load this optimizer's per-rank state from a torch checkpoint."""
-        self.load_state_dict(torch.load(filename))
 
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
@@ -2232,12 +2258,10 @@ class ChainedOptimizer(MegatronOptimizer):
             if not grad_norms:
                 grad_norm = 0.0
             elif any(isinstance(x, torch.Tensor) for x in grad_norms):
-                # Same arithmetic as the Python-float form ``math.sqrt(float(sum(x**2)))``: the
-                # squares are summed in the norms' dtype and the root is taken in float64, but on
-                # the device, so that an optimizer-step CUDA graph capture needs no host
-                # synchronization (``math.sqrt(tensor)`` would be one). clip_grad_by_total_norm_fp32
-                # then forms the clip coefficient with a float64 true division and rounds it once
-                # to fp32 for the scale kernel, as the Python-float path does.
+                # Same arithmetic as ``math.sqrt(float(sum(x**2)))``, but on the device, so an
+                # optimizer-step CUDA graph capture needs no host synchronization.
+                # clip_grad_by_total_norm_fp32 forms the clip coefficient in float64 and rounds it
+                # once to fp32 for the scale kernel, as the Python-float path does.
                 grad_norm = torch.sqrt(sum(x**2 for x in grad_norms).to(torch.float64))
             else:
                 grad_norm = math.sqrt(sum(x**2 for x in grad_norms))

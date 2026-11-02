@@ -10,6 +10,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedTensor
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -35,22 +36,44 @@ from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_m
 from tests.unit_tests.test_utilities import Utils
 
 
-def check_equal(input_1, input_2):
+def check_equal(input_1, input_2, path="state_dict"):
     """Check if two inputs are equal, used for checking checkpointing."""
     if isinstance(input_1, dict) and isinstance(input_2, dict):
-        assert input_1.keys() == input_2.keys()
+        assert input_1.keys() == input_2.keys(), path
         for key in input_1.keys():
-            check_equal(input_1[key], input_2[key])
+            check_equal(input_1[key], input_2[key], f"{path}.{key}")
     elif isinstance(input_1, list) and isinstance(input_2, list):
-        assert len(input_1) == len(input_2)
+        assert len(input_1) == len(input_2), path
         for i in range(len(input_1)):
-            check_equal(input_1[i], input_2[i])
+            check_equal(input_1[i], input_2[i], f"{path}[{i}]")
     elif isinstance(input_1, torch.Tensor) and isinstance(input_2, torch.Tensor):
-        assert torch.all(input_1 == input_2), f"Input 1: {input_1} != Input 2: {input_2}"
+        assert torch.all(input_1 == input_2), f"{path}: Input 1: {input_1} != Input 2: {input_2}"
     elif type(input_1) != type(input_2):
-        assert False, f"Input 1 type: {type(input_1)} != Input 2 type: {type(input_2)}"
+        assert False, f"{path}: Input 1 type: {type(input_1)} != Input 2 type: {type(input_2)}"
     else:
-        assert input_1 == input_2, f"Input 1: {input_1} != Input 2: {input_2}"
+        assert input_1 == input_2, f"{path}: Input 1: {input_1} != Input 2: {input_2}"
+
+
+def zero_distopt_padding(sharded_state_dict):
+    """Zero the intra-bucket padding entries of a DistOpt ``dp_reshardable`` state dict.
+
+    The padding is saved from fresh ``torch.empty`` tensors, so two checkpoints of equal
+    optimizer state differ there; zeroing it lets a bitwise comparison cover the real state.
+    """
+    if isinstance(sharded_state_dict, dict):
+        padding = sharded_state_dict.get('padding')
+        if isinstance(padding, LocalNonpersistentObject) and padding.obj:
+            for value in sharded_state_dict.values():
+                if isinstance(value, ShardedTensor):
+                    value.data.zero_()
+            return
+        values = sharded_state_dict.values()
+    elif isinstance(sharded_state_dict, list):
+        values = sharded_state_dict
+    else:
+        return
+    for value in values:
+        zero_distopt_padding(value)
 
 
 def initialize_real_model(
@@ -141,8 +164,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=True,
             optimizer="dist_muon",
-            use_param_layout=True,
-            use_layer_wise_param_layout=False,
+            use_param_layout='compact',
             fp8_param_gather=fp8_param_gather,
             initialize_fn=(
                 partial(initialize_quantized_gpt_model, recipe="blockwise")
@@ -155,7 +177,13 @@ class TestLayerWiseOptimizer:
             item for item in members if isinstance(item, LayerWiseDistributedOptimizer)
         )
         if fp8_param_gather:
-            assert layerwise.use_fp8_param_sync
+            # Compact FP8 params travel as BF16 staged from the masters and are requantized.
+            assert all(
+                getattr(param, 'requantized_by_layer_wise_gather', False)
+                for owned in layerwise.dp_cp_params_list
+                for param in owned
+                if is_float8tensor(param)
+            )
             assert not layerwise.layerwise_param_sync_via_bucket_group
             assert any(is_float8tensor(param) for param in model[0].parameters())
         assert len(members) > 1, "Exercise compact Muon alongside DistributedOptimizer"
@@ -220,7 +248,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=True,
                 optimizer='dist_muon',
-                use_param_layout=True,
+                use_param_layout='compact',
                 chunked_optimizer_state_offload=source_offload,
                 optimizer_state_offload_chunk_size_mb=1,
             )
@@ -235,7 +263,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=True,
                 optimizer='dist_muon',
-                use_param_layout=True,
+                use_param_layout='compact',
                 chunked_optimizer_state_offload=destination_offload,
                 optimizer_state_offload_chunk_size_mb=1,
                 initialize_optimizer_state=False,
@@ -331,12 +359,18 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('bf16', [True])
-    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, bf16):
+    @pytest.mark.parametrize('use_param_layout', [False, True, 'compact'])
+    def test_layer_wise_optimizer_save_load(
+        self, tmp_path_dist_ckpt, tp, pp, bf16, use_param_layout
+    ):
         """Test save/load of LayerWiseDistributedOptimizer checkpoints."""
         if tp * pp > 8:
             pytest.skip(f"TP*PP > 8 is larger than world size")
 
         Utils.initialize_model_parallel(tp, pp)
+        # The padded and compact layouts chain a DistOpt sibling, which needs the sharding
+        # type that training passes (see _build_sharded_state_dict_metadata).
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
 
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_layer_wise_optimizer_A', sync=True
@@ -353,11 +387,13 @@ class TestLayerWiseOptimizer:
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
                     optimizer='dist_muon',
+                    use_param_layout=use_param_layout,
                 )
 
                 # Save checkpoint A
                 model_sharded_sd_A = model_A[0].sharded_state_dict()
-                optim_sd_A = optimizer_A.sharded_state_dict(model_sharded_sd_A)
+                optim_sd_A = optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata)
+                zero_distopt_padding(optim_sd_A)
                 save(optim_sd_A, ckpt_dir_A)
 
                 # Create model and optimizer B with different seed
@@ -369,18 +405,20 @@ class TestLayerWiseOptimizer:
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
                     optimizer='dist_muon',
+                    use_param_layout=use_param_layout,
                 )
 
                 # Load checkpoint A into optimizer B
                 model_sharded_sd_B = model_B[0].sharded_state_dict()
                 load_sharded_sd = optimizer_B.sharded_state_dict(
-                    model_sharded_sd_B, is_loading=True
+                    model_sharded_sd_B, is_loading=True, metadata=metadata
                 )
                 state_dict = load(load_sharded_sd, ckpt_dir_A)
                 optimizer_B.load_state_dict(state_dict)
 
                 # Save as checkpoint B
-                optim_sd_B = optimizer_B.sharded_state_dict(model_sharded_sd_B)
+                optim_sd_B = optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=metadata)
+                zero_distopt_padding(optim_sd_B)
                 save(optim_sd_B, ckpt_dir_B)
 
                 Utils.destroy_model_parallel()
@@ -513,7 +551,8 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('ep', [1, 2, 4])
-    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep):
+    @pytest.mark.parametrize('use_param_layout', [False, True, 'compact'])
+    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep, use_param_layout):
         """Test LayerWiseDistributedOptimizer with MoE models."""
         if tp * pp * ep > 8:
             pytest.skip(f"TP*PP > 8 is larger than world size")
@@ -524,10 +563,18 @@ class TestLayerWiseOptimizer:
             expert_model_parallel_size=ep,
         )
 
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
         with TempNamedDir(tmp_path_dist_ckpt / 'test_layer_wise_moe', sync=True) as ckpt_dir:
             # Create MoE model with optimizer
             model, optimizer = setup_moe_model_and_optimizer(
-                seed=2, tp=tp, pp=pp, ep=ep, bf16=True, dist_opt=False, optimizer='dist_muon'
+                seed=2,
+                tp=tp,
+                pp=pp,
+                ep=ep,
+                bf16=True,
+                dist_opt=False,
+                optimizer='dist_muon',
+                use_param_layout=use_param_layout,
             )
 
             # Test that optimizer handles expert parallel parameters
@@ -538,16 +585,25 @@ class TestLayerWiseOptimizer:
 
             # Test save/load
             model_sharded_sd = model[0].sharded_state_dict()
-            optim_sd = optimizer.sharded_state_dict(model_sharded_sd)
+            optim_sd = optimizer.sharded_state_dict(model_sharded_sd, metadata=metadata)
             save(optim_sd, ckpt_dir)
 
             # Create new optimizer and load
             model_new, optimizer_new = setup_moe_model_and_optimizer(
-                seed=3, tp=tp, pp=pp, ep=ep, bf16=True, dist_opt=False, optimizer='dist_muon'
+                seed=3,
+                tp=tp,
+                pp=pp,
+                ep=ep,
+                bf16=True,
+                dist_opt=False,
+                optimizer='dist_muon',
+                use_param_layout=use_param_layout,
             )
 
             model_sharded_sd = model_new[0].sharded_state_dict()
-            load_sharded_sd = optimizer_new.sharded_state_dict(model_sharded_sd, is_loading=True)
+            load_sharded_sd = optimizer_new.sharded_state_dict(
+                model_sharded_sd, is_loading=True, metadata=metadata
+            )
             state_dict = load(load_sharded_sd, ckpt_dir)
             optimizer_new.load_state_dict(state_dict)
 

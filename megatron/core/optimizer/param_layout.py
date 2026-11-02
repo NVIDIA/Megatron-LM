@@ -90,6 +90,16 @@ class PerBufferParamLayout:
     param_indices: List[int] = field(default_factory=list)
     num_optimizer_shards: Optional[int] = None
 
+    @property
+    def uses_distributed_optimizer(self) -> bool:
+        """Whether the buffer is sharded by a distributed optimizer.
+
+        DDP reduce-scatters the gradients of such a buffer and all-gathers its parameters from
+        a parameter buffer. A layout without optimizer shards keeps the buffer replicated (the
+        gradients are all-reduced), even when other buffers of the same model chunk are sharded.
+        """
+        return self.num_optimizer_shards is not None
+
 
 @dataclass
 class FullParamLayout:
