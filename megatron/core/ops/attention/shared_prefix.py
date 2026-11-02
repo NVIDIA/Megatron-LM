@@ -38,6 +38,10 @@ from itertools import accumulate
 import torch
 
 from megatron.core.ops._backends import require
+from megatron.core.ssm.mamba_context_parallel import (
+    _redo_attention_load_balancing,
+    _undo_attention_load_balancing,
+)
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
 
 # The exact backward calls FlashAttention 2's private ``_flash_attn_varlen_backward`` by keyword;
@@ -322,34 +326,6 @@ def flash_composed_forest_attention(query, key, value, forest, scale=None):
     return out.reshape(sq, 1, np_ * hn).contiguous()
 
 
-def _undo_cp_zigzag(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
-    """Convert rank-major CP zigzag chunks into canonical global token order.
-
-    Standard context parallelism gives rank ``r`` chunks ``(r, 2*C-r-1)``.  An
-    all-to-all from sequence to head parallelism concatenates those rank-local pairs in
-    rank order, i.e. ``0,last,1,last-1,...``.  Mamba uses the same permutation before
-    its sequential scan; forest attention needs it for its global node offsets too.
-    """
-    if cp_size < 1 or input_.shape[0] % (2 * cp_size):
-        raise ValueError("CP zigzag sequence length must be divisible by 2 * CP size")
-    chunks = torch.chunk(input_, chunks=2 * cp_size, dim=0)
-    order = [2 * index for index in range(cp_size)] + [
-        2 * cp_size - 2 * index - 1 for index in range(cp_size)
-    ]
-    return torch.cat([chunks[index] for index in order], dim=0)
-
-
-def _redo_cp_zigzag(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
-    """Convert canonical global token order back to rank-major CP zigzag chunks."""
-    if cp_size < 1 or input_.shape[0] % (2 * cp_size):
-        raise ValueError("CP zigzag sequence length must be divisible by 2 * CP size")
-    chunks = torch.chunk(input_, chunks=2 * cp_size, dim=0)
-    order = [None] * (2 * cp_size)
-    order[::2] = range(cp_size)
-    order[1::2] = reversed(range(cp_size, 2 * cp_size))
-    return torch.cat([chunks[index] for index in order], dim=0)
-
-
 def _cp_local_kv_head_slice(query_heads: int, kv_heads: int, cp_size: int, cp_rank: int) -> slice:
     """Return the global KV-head span serving one CP rank's contiguous Q-head span.
 
@@ -498,7 +474,10 @@ def _cp_sequence_to_head_parallel(
     global_sequence = local_sequence * cp_size
     local_heads = heads // cp_size
     exchanged = exchanged.reshape(global_sequence, batch, local_heads, head_dim)
-    return _undo_cp_zigzag(exchanged, cp_size)
+    # Rank r holds zigzag chunks (r, 2*C-r-1), and the all-to-all concatenates those pairs in
+    # rank order. Restore canonical token order, as Mamba does before its scan, so the forest's
+    # global token offsets apply. The even local length makes the global one divide by 2*C.
+    return _undo_attention_load_balancing(exchanged, cp_size)
 
 
 def _cp_head_to_sequence_parallel(
@@ -511,7 +490,7 @@ def _cp_head_to_sequence_parallel(
     global_sequence, batch, local_heads, head_dim = input_.shape
     if global_sequence % (2 * cp_size):
         raise ValueError("shared-prefix CP global sequence length must be divisible by 2 * CP size")
-    rank_major = _redo_cp_zigzag(input_, cp_size)
+    rank_major = _redo_attention_load_balancing(input_, cp_size)
     exchanged = all_to_all_hp2sp(
         rank_major.reshape(global_sequence, batch, local_heads * head_dim), group=cp_group
     )
