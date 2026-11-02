@@ -300,6 +300,18 @@ def _validate_hybrid_stack(
                 "token dropping: the per-rank budget counts physical star rows, and a dropped "
                 "prompt row is lost for every completion that shares it"
             )
+        # Without THD packing, NCCL EP sizes its buffers once, from the first microbatch, and
+        # needs the same size on every rank. Shared-prefix forwards are unpacked, and their
+        # length changes with every microbatch and differs across ranks.
+        if (
+            stack.config.moe_token_dispatcher_type == "flex"
+            and stack.config.moe_flex_dispatcher_backend == "ncclep"
+        ):
+            raise NotImplementedError(
+                "shared-prefix Hybrid adapter does not support the flex dispatcher's 'ncclep' "
+                "backend: without THD packing it sizes its buffers from the first microbatch, "
+                "while shared-prefix microbatches change length"
+            )
         # Replay targets are recorded per dense row; shared-prefix routes physical star rows.
         if stack.config.moe_enable_routing_replay:
             raise NotImplementedError(

@@ -268,6 +268,11 @@ _REJECTED_MOE_CONFIGS = [
     ({"moe_z_loss_coeff": 1e-3}, "router z-loss"),
     ({"moe_input_jitter_eps": 0.1}, "input jitter"),
     ({"mlp_chunks_for_training": 2}, "MLP chunking"),
+    # NCCL EP sizes its buffers from the first unpacked microbatch.
+    (
+        {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "ncclep"},
+        "'ncclep' backend",
+    ),
     # Expert-bias accounting needs logical completion lengths; _LAYOUT has none.
     ({"moe_router_enable_expert_bias": True}, "explicit physical branch padding"),
 ]
@@ -420,8 +425,10 @@ _PADDED_LAYOUT = SharedPrefixLayout(3, (5, 1), logical_completion_lens=(3, 1), p
 
 
 # (moe_token_dispatcher_type, moe_flex_dispatcher_backend, padding excluded when unstated)
+# The backend matters only to the flex dispatcher; flex with 'ncclep' is rejected.
 _DISPATCHERS = [
     ("alltoall", "deepep", False),
+    ("alltoall", "ncclep", False),
     ("allgather", "hybridep", False),
     ("flex", "deepep", False),
     ("flex", "hybridep", True),

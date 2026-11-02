@@ -165,10 +165,11 @@ one, Mamba requires `linear_cp_layout='zigzag'`. For MoE, the adapter rejects
 load balancing that replaces top-k routing (such as sinkhorn), nonzero
 auxiliary-loss and z-loss coefficients, input jitter, randomized forced routing,
 expert-capacity token dropping, per-rank capacity token dropping
-(`moe_expert_rank_capacity_factor`), routing replay, and training MLP chunking.
-Auxiliary-loss balancing types with zero coefficients, the MCore default, are
-accepted because they leave top-k routing unchanged. See the validation
-functions for the complete runtime contract.
+(`moe_expert_rank_capacity_factor`), the flex dispatcher's `ncclep` backend,
+routing replay, and training MLP chunking. Auxiliary-loss balancing types with
+zero coefficients, the MCore default, are accepted because they leave top-k
+routing unchanged. See the validation functions for the complete runtime
+contract.
 
 The capability tokens at the end of `shared_prefix.py` name the implemented code
 paths so integrations can require the exact conjunction they use. They are
