@@ -1544,9 +1544,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_training_matches_inference: bool = False
     """Run the training MoE forward through generation's FlashInfer routed MXFP8 or
     per-token NVFP4 expert kernel, so training log-probs match generation bitwise.
-    The backward comes from the TE recompute pass. Requires
-    transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
-    batch_invariant_mode and selective 'moe' recompute. The kernel weights are built
+    Tokens go through training's all-to-all dispatcher; the backward comes from the TE
+    recompute pass. Requires transformer_impl='inference_optimized',
+    inference_grouped_gemm_backend='flashinfer', moe_token_dispatcher_type='alltoall',
+    batch_invariant_mode, selective 'moe' recompute, and generation's expert-parallel
+    size. The kernel weights are built
     from the parameters and held until an in-place write to them, an optimizer step, a
     checkpoint load, or training_matches_inference.release_inference_value_pass_weights(model).
     A caller that writes the parameters outside PyTorch in-place ops, an optimizer step
@@ -2439,6 +2441,13 @@ class TransformerConfig(ModelParallelConfig):
                     "that a token's output does not depend on how many tokens share the "
                     "kernel launch."
                 )
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    "moe_token_dispatcher_type='alltoall', whose batch-invariant combine "
+                    "adds the EP ranks as generation's does; got "
+                    f"'{self.moe_token_dispatcher_type}'."
+                )
             # moe_layer_recompute (deprecated) adds 'moe' later; None later means ["core_attn"].
             if not self.moe_layer_recompute and (
                 self.recompute_granularity != "selective"
@@ -2461,7 +2470,8 @@ class TransformerConfig(ModelParallelConfig):
                     "overlap_moe_expert_parallel_comm: the overlapped schedule does "
                     "not go through MoELayer.forward, where the value pass is chosen."
                 )
-            # The value pass runs the training router; these make it pick other experts.
+            # The recompute runs the training router; these make it pick other experts than
+            # the value pass, which routes as generation does.
             balancing = self.moe_router_load_balancing_type
             balancing = balancing if isinstance(balancing, list) else [balancing]
             unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)

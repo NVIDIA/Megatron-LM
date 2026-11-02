@@ -2,25 +2,23 @@
 
 """The training MoE forward of ``moe_training_matches_inference``.
 
-The layer's output comes from its generation forward, which runs generation's router,
-inference token dispatcher and FlashInfer expert kernel. The backward comes from the
-layer's unchanged training forward, which the activation checkpoint recomputes.
+The layer's output comes from a value pass through training's all-to-all dispatcher
+with generation's FlashInfer expert kernel and its finalize arithmetic. The backward
+comes from the layer's unchanged training forward, which the activation checkpoint
+recomputes.
 """
 
 from __future__ import annotations
 
-import functools
 import inspect
 import weakref
 from itertools import chain
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
-from packaging.version import Version
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import register_optimizer_step_post_hook
 
-from megatron.core import utils
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -36,11 +34,9 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-    NCCLAllGatherDispatcher,
-    NVLSAllGatherVDispatcher,
-)
+from megatron.core.transformer.moe.batch_invariant import unpermute_with_bf16_rank_partials
 from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.typed_torch import apply_module
 
 if TYPE_CHECKING:
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
@@ -55,11 +51,11 @@ def training_matches_inference_forward(
     padding_mask: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
 ):
-    """Forward values from the layer's generation forward, gradients from its training forward.
+    """Forward values from the value pass, gradients from the layer's training forward.
 
-    Without grad, as in the log-prob forward, only the generation forward runs. With grad,
-    the activation checkpoint runs the generation forward for the output, and its
-    recompute runs ``training_forward``, which builds the backward.
+    Without grad, as in the log-prob forward, only the value pass runs. With grad, the
+    activation checkpoint runs the value pass for the output, and its recompute runs
+    ``training_forward``, which builds the backward.
     """
     if intermediate_tensors is not None:
         raise RuntimeError(
@@ -71,7 +67,7 @@ def training_matches_inference_forward(
         # The checkpoint's first call runs without grad, its recompute with grad.
         if torch.is_grad_enabled():
             return training_forward(hidden_states, None, padding_mask)
-        return _generation_forward(layer, hidden_states, input_ids)
+        return _value_pass(layer, hidden_states, padding_mask, input_ids)
 
     if torch.is_grad_enabled():
         return precision_aware_checkpoint(
@@ -80,174 +76,88 @@ def training_matches_inference_forward(
     return forward(hidden_states, padding_mask)
 
 
-def _generation_forward(layer: MoELayer, hidden_states: torch.Tensor, input_ids):
-    """The layer's generation forward, on training's token counts."""
-    try:
-        with InferenceMode.active():
-            layer.select_token_dispatcher()
-            dispatcher = layer.token_dispatcher
-            # Normally allocated by the inference context.
-            if NCCLAllGatherDispatcher._valid_tokens_tensor is None:
-                NCCLAllGatherDispatcher.allocate_buffers()
-            chunked = _uses_nvls_buffers(dispatcher)
-            if chunked:
-                _allocate_nvls_buffers(layer, dispatcher)
+def _value_pass(layer: MoELayer, hidden_states: torch.Tensor, padding_mask, input_ids):
+    """The layer's training forward with generation's routes, expert kernel and finalize.
 
-            shared_expert_output = None
-            if not layer.run_shared_experts_after_router:
-                shared_expert_output = layer.shared_experts_compute(hidden_states)
-            probs, routing_map = _route(layer, hidden_states, input_ids)
-            dispatch_input, probs = layer.preprocess(hidden_states, probs, routing_map)
-            if layer.run_shared_experts_after_router:
-                shared_expert_output = layer.shared_experts_compute(hidden_states)
+    Training's all-to-all dispatcher sends each route as its own row and the FlashInfer
+    kernel computes every row. The batch-invariant unpermute then adds a token's rows on
+    each EP rank as the kernel's finalize does in generation, and adds the ranks as
+    generation's combine does.
+    """
+    shared_expert_output = None
+    if not layer.run_shared_experts_after_router:
+        shared_expert_output = layer.shared_experts_compute(hidden_states)
+    probs, top_indices = _route(layer, hidden_states, input_ids)
+    routing_probs = torch.zeros(
+        probs.shape[0], layer.config.num_moe_experts, dtype=probs.dtype, device=probs.device
+    ).scatter(1, top_indices, probs)
+    routing_map = torch.zeros_like(routing_probs, dtype=torch.bool).scatter(1, top_indices, True)
+    dispatch_input, routing_probs = layer.preprocess(
+        hidden_states, routing_probs, routing_map, padding_mask
+    )
+    if layer.run_shared_experts_after_router:
+        shared_expert_output = layer.shared_experts_compute(hidden_states)
 
-            if chunked:
-                output = _chunked_dispatch_and_compute(layer, dispatch_input, probs)
-            else:
-                dispatched_input, probs = layer.dispatch(dispatch_input, probs)
-                output = layer.combine(_routed_experts_compute(layer, dispatched_input, probs))
-            return layer.postprocess(output, shared_expert_output), None
-    finally:
-        # Outside InferenceMode, this restores the training dispatcher for the recompute.
-        layer.select_token_dispatcher()
+    dispatcher = layer.token_dispatcher
+    dispatched_input, routing_probs = layer.dispatch(dispatch_input, routing_probs)
+    dispatched_input, tokens_per_expert, _ = dispatcher.dispatch_postprocess(
+        dispatched_input, routing_probs
+    )
+    rows = expert_value_pass(layer.experts, dispatched_input, tokens_per_expert)
+    rows = layer.combine(dispatcher.combine_preprocess(rows))
+    # The routed MXFP8 kernel weighs routes by BF16 probabilities, per-token NVFP4 by FP32.
+    if layer.experts._nvfp4_recipe is None:
+        probs = probs.to(torch.bfloat16)
+    # The inverse map lists a token's routes in expert order; reorder it to top-k order.
+    route_rows = dispatcher.batch_invariant_inverse_permutation_mapping[0].gather(
+        1, top_indices.argsort(dim=1).argsort(dim=1)
+    )
+    output = unpermute_with_bf16_rank_partials(
+        rows,
+        route_rows,
+        top_indices,
+        probs.float(),
+        layer.config.num_moe_experts,
+        dispatcher.ep_size,
+    )
+    return _postprocess(layer, output, shared_expert_output), None
 
 
 def _route(layer: MoELayer, hidden_states: torch.Tensor, input_ids):
     """Route as generation does, returning [tokens, topk] probs and expert ids.
 
-    The FlashInfer kernel sums each token's routes in the order listed, so the value pass
-    must list them in generation's top-k order to match it bitwise. Generation's router
-    takes [tokens, 1, hidden].
+    The FlashInfer finalize sums each token's routes in the order listed, so the value
+    pass needs generation's top-k order, which training's routing map does not keep.
+    Generation's router path also leaves the training router's expert-bias token counts
+    to the recompute. It takes [tokens, 1, hidden].
     """
-    return layer.route(hidden_states.reshape(-1, 1, hidden_states.shape[-1]), input_ids=input_ids)
-
-
-def _uses_nvls_buffers(dispatcher) -> bool:
-    """Whether the dispatcher gathers through the NVLS buffers, which need EP > 1."""
-    return (
-        isinstance(dispatcher, NVLSAllGatherVDispatcher)
-        and utils.get_pg_size(dispatcher.tp_ep_group) > 1
-    )
-
-
-def _allocate_nvls_buffers(layer: MoELayer, dispatcher: NVLSAllGatherVDispatcher):
-    """Allocate the NVLS symmetric buffers as a generation context would.
-
-    Their size is the row count of the FlashInfer launch. Without a generation context in
-    this process they are sized for the default `max_tokens`; a trainer whose generation
-    sets `max_tokens` allocates them first, sized the same way.
-    """
-    tp_ep_group = dispatcher.tp_ep_group
-    if NVLSAllGatherVDispatcher._symm_rsv is not None:
-        rows = NVLSAllGatherVDispatcher._symm_rsv["tensor"].shape[0]
-        per_rank = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
-        if rows != per_rank * utils.get_pg_size(tp_ep_group):
-            raise RuntimeError(
-                "moe_training_matches_inference requires the generation expert-parallel size"
-            )
-        return
-    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-
-    NVLSAllGatherVDispatcher.allocate_buffers(
-        per_rank_worst_case_token_count=DynamicInferenceContext.round_up_tokens(
-            DynamicInferenceContext.DEFAULT_MAX_TOKENS
+    with InferenceMode.active():
+        return layer.route(
+            hidden_states.reshape(-1, 1, hidden_states.shape[-1]), input_ids=input_ids
         )
-        // utils.get_pg_size(layer.tp_group),
-        topk=layer.config.moe_router_topk,
-        hidden_size=layer.config.moe_latent_size or layer.config.hidden_size,
-        tp_ep_group=tp_ep_group,
-    )
 
 
-def _chunked_dispatch_and_compute(layer: MoELayer, hidden_states, probs):
-    """Dispatch, expert compute and combine in launches that fit the NVLS buffers.
-
-    Every rank of the dispatcher's group runs the same number of launches, since each one
-    is collective. Every launch refreshes the dispatch metadata, which generation
-    refreshes only on its first MoE layer, and none applies generation's padding mask:
-    every training row is real. Each launch hands the kernel only the gathered rows that
-    can hold tokens rather than the whole buffer; the rows past the real ones are routed
-    nowhere and are never combined. Both kernels are batch invariant in the row count, so
-    this matches generation's full-buffer launches.
-
-    The routed MXFP8 kernel sizes its token tile from rows * top_k / local experts and has
-    no config for small tiles at some shapes, so MXFP8 launches keep enough rows for its
-    largest tile, the one generation's full-buffer launches use. That floor follows
-    FlashInfer's tile selection, so on FlashInfer releases it was not verified on, MXFP8
-    launches use the whole buffer, as generation does.
-    """
+def _postprocess(layer: MoELayer, output: torch.Tensor, shared_expert_output):
+    """``layer.postprocess`` on the unpermuted output, for the all-to-all dispatcher."""
     dispatcher = layer.token_dispatcher
-    capacity = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
-    group_size = utils.get_pg_size(dispatcher.tp_ep_group)
-    min_rows = 0
-    if layer.experts._nvfp4_recipe is None:
-        if _mxfp8_tile_floor_verified():
-            # Above 128 routes per local expert the kernel's tile is its largest, 256.
-            min_rows = 128 * layer.num_local_experts // layer.config.moe_router_topk + 1
-        else:
-            min_rows = group_size * capacity
-    routing_map = dispatcher.routing_map
-    num_tokens = hidden_states.shape[0]
-    max_tokens = torch.tensor([num_tokens], device=hidden_states.device, dtype=torch.int64)
-    torch.distributed.all_reduce(
-        max_tokens, op=torch.distributed.ReduceOp.MAX, group=dispatcher.tp_ep_group
-    )
-    real_token_count = NVLSAllGatherVDispatcher._real_token_count_tensor
-    NVLSAllGatherVDispatcher._real_token_count_tensor = None
-    outputs = []
-    max_tokens = int(max_tokens.item())
-    try:
-        for start in range(0, max_tokens, capacity):
-            chunk = slice(min(start, num_tokens), min(start + capacity, num_tokens))
-            dispatcher.routing_map = routing_map[chunk]
-            dispatcher._local_tokens = chunk.stop - chunk.start
-            if not dispatcher._runs_metadata_sync:
-                dispatcher.update_metadata(dispatcher._local_tokens)
-            dispatched_input, chunk_probs = layer.dispatch(hidden_states[chunk], probs[chunk])
-            rows = group_size * min(capacity, max_tokens - start)
-            rows = min(max(rows, min_rows), dispatched_input.shape[0])
-            dispatched_input, chunk_probs = dispatched_input[:rows], chunk_probs[:rows]
-            dispatcher.routing_map = dispatcher.routing_map[:rows]
-            outputs.append(
-                layer.combine(_routed_experts_compute(layer, dispatched_input, chunk_probs))
-            )
-    finally:
-        NVLSAllGatherVDispatcher._real_token_count_tensor = real_token_count
-        dispatcher._local_tokens = num_tokens
-    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
-
-
-# FlashInfer releases (major, minor) on which the routed MXFP8 kernel's tile selection was
-# checked against the launch floor in _chunked_dispatch_and_compute.
-_MXFP8_TILE_FLOOR_VERIFIED_RELEASES = ((0, 7),)
-
-
-@functools.cache
-def _mxfp8_tile_floor_verified() -> bool:
-    import flashinfer
-
-    return Version(flashinfer.__version__).release[:2] in _MXFP8_TILE_FLOOR_VERIFIED_RELEASES
-
-
-def _routed_experts_compute(layer: MoELayer, hidden_states, probs):
-    """``MoELayer.routed_experts_compute`` on generation's dispatcher, with the experts'
-    generation forward replaced by ``expert_value_pass``.
-
-    Generation's expert weights are built from parameters it owns, which training's are
-    not, so the value pass runs the FlashInfer kernel on weights built from the training
-    parameters.
-    """
-    dispatcher = layer.token_dispatcher
-    hidden_states, _, probs = dispatcher.dispatch_postprocess(hidden_states, probs)
-    output, _ = expert_value_pass(layer.experts, hidden_states, probs, dispatcher.routing_map)
-    return dispatcher.combine_preprocess(output)
+    output = output.view(dispatcher.hidden_shape)
+    if dispatcher.shared_experts is not None:
+        output += dispatcher.shared_experts.get_output()
+    dispatcher.probs = None
+    if layer.config.moe_latent_size:
+        if layer.config.moe_use_norm_before_up_proj:
+            output = apply_module(layer.fc2_norm)(output)
+        output, _ = layer.fc2_latent_proj(output)
+    if shared_expert_output is not None:
+        output = output + shared_expert_output
+    return dispatcher.finalize_layer_output(output)
 
 
 # The value pass's kernel weights per experts module, with the source versions they were
 # built from, kept here rather than on the module. Weak keys, so a deleted model frees its
 # entries.
 _value_pass_weights: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_hooked_on_load: weakref.WeakSet = weakref.WeakSet()
+_hooked_experts: weakref.WeakSet = weakref.WeakSet()
 _optimizer_step_hook = None
 
 
@@ -265,20 +175,27 @@ def release_inference_value_pass_weights(model: torch.nn.Module) -> None:
         _drop_value_pass_weights(module)
 
 
-def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routing_map):
-    """The experts' value pass: generation's FlashInfer kernel on the training parameters.
+def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, tokens_per_expert):
+    """Generation's FlashInfer kernel, on the training parameters, for each dispatched row.
+
+    Each row is one route, sorted by local expert. The kernel gets it as a top-1 token
+    routed to that expert with probability 1.0, so its finalize returns the expert's
+    output row unchanged. The routed MXFP8 kernel has no tile config for a few rows per
+    local expert, so its launches are padded with unrouted rows to more than 128 per
+    local expert, where its tile is its largest; the row values do not depend on the
+    tile.
 
     The kernel weights are built from the parameters and reused until an in-place write
-    to them, an optimizer step, a checkpoint load, or
-    ``release_inference_value_pass_weights``. In-place writes, such as a reference-model
-    swap that copies into ``state_dict()`` tensors, show up in the source tensors'
-    versions. The optimizer step and the load are caught by a process-wide optimizer step
-    post-hook and a load_state_dict post-hook on the experts, both registered here, since
-    their writes into TE MXFP8 parameters can bypass the version counter. Neither the
-    training pipeline nor the experts module keeps any value-pass state.
+    to them, an optimizer step, a ``state_dict()`` or checkpoint load, or
+    ``release_inference_value_pass_weights``. TE writes into MXFP8 parameters, as in an
+    optimizer step or a copy into a ``state_dict()`` tensor, bypass the version counter,
+    so a process-wide optimizer step post-hook and state_dict and load_state_dict
+    post-hooks on the experts, all registered here, drop the weights; the source
+    tensors' versions catch other in-place writes. A reference-model swap that copies
+    into ``state_dict()`` tensors, as NeMo-RL's does, calls ``state_dict()`` first.
+    Neither the training pipeline nor the experts module keeps any value-pass state.
     """
     global _optimizer_step_hook
-    assert routing_map is not None, "routing_map is required for the training forward."
     versions = _source_versions(experts)
     cached = _value_pass_weights.get(experts)
     if cached is None or cached[0] != versions:
@@ -286,28 +203,48 @@ def expert_value_pass(experts: InferenceGroupedMLP, hidden_states, probs, routin
             _optimizer_step_hook = register_optimizer_step_post_hook(
                 lambda *_: _value_pass_weights.clear()
             )
-        if experts not in _hooked_on_load:
+        if experts not in _hooked_experts:
             experts.register_load_state_dict_post_hook(_drop_value_pass_weights)
-            _hooked_on_load.add(experts)
+            experts.register_state_dict_post_hook(_drop_value_pass_weights)
+            _hooked_experts.add(experts)
         weights = _build_value_pass_weights(experts)
         # Read again: finishing the parameter all-gather in the build can write them.
         cached = _value_pass_weights[experts] = (_source_versions(experts), weights)
     mxfp8_weights, nvfp4_weights = cached[1]
+
+    num_rows = hidden_states.shape[0]
+    num_local_experts = experts.num_local_experts
+    local_expert_offset = experts.ep_group.rank() * num_local_experts
+    launch_rows = num_rows
+    if mxfp8_weights is not None:
+        launch_rows = max(num_rows, 128 * num_local_experts + 1)
+    if launch_rows == 0:
+        return hidden_states
+    routes = hidden_states.new_full((launch_rows, 1), -1, dtype=torch.int64)
+    routes[:num_rows, 0] = torch.repeat_interleave(
+        torch.arange(
+            local_expert_offset,
+            local_expert_offset + num_local_experts,
+            device=hidden_states.device,
+        ),
+        torch.as_tensor(tokens_per_expert, device=hidden_states.device),
+        output_size=num_rows,
+    )
+    probs = torch.ones_like(routes, dtype=torch.float32)
+    if launch_rows > num_rows:
+        hidden_states = torch.cat(
+            [hidden_states, hidden_states.new_zeros(launch_rows - num_rows, hidden_states.shape[1])]
+        )
     kwargs = dict(
-        num_experts=experts.num_local_experts * experts.ep_group.size(),
-        local_expert_offset=experts.ep_group.rank() * experts.num_local_experts,
+        num_experts=num_local_experts * experts.ep_group.size(),
+        local_expert_offset=local_expert_offset,
         activation_type=experts._flashinfer_activation_type.value,
-        out=NVLSAllGatherVDispatcher._get_rsv_tensor() if experts._nvls_dispatcher else None,
     )
     if mxfp8_weights is not None:
-        output = flashinfer_routed_mxfp8_moe(
-            hidden_states, routing_map, probs, *mxfp8_weights, **kwargs
-        )
+        output = flashinfer_routed_mxfp8_moe(hidden_states, routes, probs, *mxfp8_weights, **kwargs)
     else:
-        output = flashinfer_routed_nvfp4_moe(
-            hidden_states, routing_map, probs, nvfp4_weights, **kwargs
-        )
-    return output, None
+        output = flashinfer_routed_nvfp4_moe(hidden_states, routes, probs, nvfp4_weights, **kwargs)
+    return output[:num_rows]
 
 
 def _expert_weights(experts: InferenceGroupedMLP):

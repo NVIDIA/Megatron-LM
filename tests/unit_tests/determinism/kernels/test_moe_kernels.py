@@ -1480,16 +1480,12 @@ class TestMoEModules:
         The value pass runs the FlashInfer kernel on weights requantized from the
         parameters and the backward comes from the TE recompute, so this covers both
         kernels and the switch between them in one fwd+bwd. NVFP4 only, whose BF16
-        parameters take gradients. EP=1 with the NCCL dispatcher: the NVLS arm depends
-        on a symmetric heap that is process-wide state, which a replay harness cannot
-        reset.
+        parameters take gradients. EP=1, so the replay harness needs no process group
+        for training's all-to-all dispatcher.
         """
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             disable_batch_invariant_mode,
             enable_batch_invariant_mode,
-        )
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceAllGatherDispatcherBase,
         )
         from tests.unit_tests.inference.test_moe_training_matches_inference import (
             _build_layer,
@@ -1502,7 +1498,6 @@ class TestMoEModules:
             pytest.skip("FlashInfer per-token NVFP4 MoE needs SM100/SM103")
         _skip_unless_supported(recipe)
         self._init(ep=1)
-        InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
         enable_batch_invariant_mode(backend="te_native")
         try:
             seeded()
@@ -1520,7 +1515,6 @@ class TestMoEModules:
                 )
         finally:
             disable_batch_invariant_mode()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])

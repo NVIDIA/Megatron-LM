@@ -18,17 +18,16 @@ cover:
    finite outputs and gradients).
 3. The value pass keeps reproducing the generation forward bitwise after the weights
    change, and independently of how many tokens share the launch.
-4. A value pass larger than the NVLS symmetric heap, which cannot grow, is split
-   into heap-sized launches with unchanged output; and without generation in its
-   process, as when the two run apart, the value pass allocates its own heap and
-   still matches generation.
+4. Without generation in its process, as when the two run apart, the value pass
+   needs none of generation's dispatcher buffers and still matches generation.
 5. The value pass widens the forward/backward mismatch of neither recipe it applies
    to, TE MXFP8 forward and backward or NVFP4 forward with a BF16 backward, beyond
    the mismatch the default TE recipe already accepts.
 
 The GPU tests run under batch-invariant mode, which the flag requires, on any GPU
 count that is a power of two and divides the expert count; the expert-parallel size
-is the world size, with the NVLS dispatcher when it is larger than one.
+is the world size. Training uses the all-to-all dispatcher, generation the NVLS
+dispatcher when the world size is larger than one.
 """
 
 import contextlib
@@ -65,17 +64,18 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 NUM_EXPERTS = 16
-# topk=8 rather than a small value: generation reads its expert indices from
-# torch.topk on the router scores, the value pass recovers them from TopKRouter's
-# boolean map, and the kernel sums routes in the order it is given. At topk=2 the
-# sum commutes exactly and cannot see an ordering difference that topk=8 can.
+# topk=8 rather than a small value: the kernel's finalize sums a token's routes on a
+# rank in top-k order, and the value pass sums training's dispatched rows in that
+# order. With two routes on a rank the sum commutes exactly and cannot see an
+# ordering difference that more routes can.
 ROUTER_TOPK = 8
 LOCAL_TOKENS = 8
 # Generation decodes a few tokens per rank while a training forward takes a whole
 # microbatch, so RL parity rests on a token's output not depending on how many
 # others shared the launch.
 GEN_TOKENS = 8
-# Per-rank NVLS heap for MXFP8 tests that would otherwise size it to LOCAL_TOKENS.
+# Per-rank NVLS heap for MXFP8 generation, whose kernel runs on the whole heap and
+# has no tile config for one sized to LOCAL_TOKENS.
 HEAP_TOKENS = 512
 TRAIN_TOKEN_COUNTS = (512, 2048)
 
@@ -180,8 +180,8 @@ def _build_layer(config, for_inference: bool = False, max_tokens: int = LOCAL_TO
 
     ``for_inference`` stands up what the dynamic inference context allocates in
     production for a generation layer: the valid-tokens scalar and, on NVLS, the
-    symmetric heap. A training-only layer deliberately leaves both unallocated,
-    which is the real situation the value pass has to handle itself.
+    symmetric heap. A training-only layer leaves both unallocated, since the value
+    pass goes through training's all-to-all dispatcher.
     """
     if for_inference:
         _allocate_dispatch_buffers(config, max_tokens)
@@ -267,13 +267,13 @@ def _optimizer_step():
 
 @pytest.fixture
 def spy_on_value_pass(monkeypatch):
-    """Record the routing map each value pass of an experts module is handed."""
+    """Record how many dispatched rows each value pass of an experts module is handed."""
     original = training_matches_inference.expert_value_pass
     seen = {}
 
-    def spy(experts, hidden_states, probs, routing_map):
-        seen.setdefault(id(experts), []).append(routing_map)
-        return original(experts, hidden_states, probs, routing_map)
+    def spy(experts, hidden_states, tokens_per_expert):
+        seen.setdefault(id(experts), []).append(hidden_states.shape[0])
+        return original(experts, hidden_states, tokens_per_expert)
 
     monkeypatch.setattr(training_matches_inference, "expert_value_pass", spy)
     return lambda experts: seen.setdefault(id(experts), [])
@@ -292,8 +292,8 @@ def _parallel_state(monkeypatch):
     # requires. Utils.initialize_model_parallel does not do this.
     model_parallel_cuda_manual_seed(123)
 
-    # Process-wide state. Leaked, one test's inference setup would mask a missing
-    # allocation in the next, which is exactly the check the NVLS arm has to make.
+    # Process-wide state. Leaked, one test's generation buffers would carry over into
+    # the next, which checks that the value pass needs none of them.
     _free_dispatch_buffers()
     yield
     _free_dispatch_buffers()
@@ -336,6 +336,7 @@ def _validated_config(**overrides):
         normalization="RMSNorm",
         inference_grouped_gemm_backend="flashinfer",
         inference_moe_nvfp4_recipe="per_token",
+        moe_token_dispatcher_type="alltoall",
         attention_backend=AttnBackend.flash,
         flash_attention_version=4,
         attention_dropout=0.0,
@@ -383,6 +384,11 @@ class TestBackendAllowList:
         """Only that spec builds the inference-capable expert module."""
         with pytest.raises(ValueError, match="inference_optimized"):
             _validated_config(transformer_impl="transformer_engine")
+
+    def test_requires_the_alltoall_dispatcher(self):
+        """Only its batch-invariant combine adds the EP ranks as generation's does."""
+        with pytest.raises(ValueError, match="moe_token_dispatcher_type='alltoall'"):
+            _validated_config(moe_token_dispatcher_type="allgather")
 
 
 class TestRecomputeRequirement:
@@ -515,7 +521,7 @@ class TestValuePassRuns:
             f"expected exactly one value pass through the FlashInfer kernel, saw {len(seen)}; "
             "0 means the layer fell back to TE, >1 means the recompute took this path too"
         )
-        assert seen[0] is not None and seen[0].shape[0] > 0
+        assert seen[0] > 0
         assert out.shape == hidden.shape
         assert torch.isfinite(out).all()
         assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
@@ -534,13 +540,37 @@ class TestValuePassRuns:
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        # The routed MXFP8 kernel runs on the whole heap and has no tile config for
-        # one sized to a few tokens per rank.
-        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
         seen = spy_on_value_pass(layer.experts)
         with torch.no_grad(), _fp8_context(train_config):
             layer(_hidden(train_config, seed=0))
         assert len(seen) == 1, "the eval forward did not take the FlashInfer kernel"
+
+    def test_mxfp8_launches_keep_the_largest_kernel_tile(self, spy_on_value_pass, monkeypatch):
+        """MXFP8 launches are padded to the kernel's largest-tile floor, and no further.
+
+        The routed MXFP8 kernel has no tile config for a few rows per local expert, so a
+        small microbatch launches on the floor's rows and a large one on its own.
+        """
+        recipe = "mxfp8"
+        _skip_unless_supported(recipe)
+        gen_config, train_config = _generation_and_training_configs(recipe)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
+        seen = spy_on_value_pass(layer.experts)
+        launched = []
+        launch = training_matches_inference.flashinfer_routed_mxfp8_moe
+        monkeypatch.setattr(
+            training_matches_inference,
+            "flashinfer_routed_mxfp8_moe",
+            lambda hidden_states, *args, **kwargs: launched.append(hidden_states.shape[0])
+            or launch(hidden_states, *args, **kwargs),
+        )
+        floor = 128 * layer.num_local_experts + 1
+        with torch.no_grad(), _fp8_context(train_config):
+            for tokens in (1, TRAIN_TOKEN_COUNTS[-1]):
+                layer(_hidden(train_config, seed=3, tokens=tokens))
+        assert seen[0] < floor < seen[1]
+        assert launched == [floor, seen[1]]
 
     @pytest.mark.parametrize("recipe", list(RECIPES))
     def test_kernel_weights_are_built_once_per_optimizer_step(self, recipe, monkeypatch):
@@ -553,7 +583,7 @@ class TestValuePassRuns:
 
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
         experts = layer.experts
         builds, hook_calls = [], []
         build = training_matches_inference._build_value_pass_weights
@@ -583,7 +613,7 @@ class TestValuePassRuns:
         recipe = "nvfp4-squared_relu"
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
         layer.experts.linear_fc2.register_forward_pre_hook(lambda *_: None)
         with torch.no_grad(), pytest.raises(RuntimeError, match="parameter all-gather hooks"):
             layer(_hidden(train_config, seed=0))
@@ -596,7 +626,7 @@ class TestValuePassRuns:
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
         with _fp8_context(train_config, is_init=True):
             reference = _build_layer(train_config).eval()
         hidden = _hidden(train_config, seed=0)
@@ -623,7 +653,7 @@ class TestValuePassRuns:
         """
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        _, layer = _layer_pair(recipe, gen_config, train_config, max_tokens=HEAP_TOKENS)
+        _, layer = _layer_pair(recipe, gen_config, train_config)
         hidden = _hidden(train_config, seed=0)
         with torch.no_grad(), _fp8_context(train_config):
             before = layer(hidden)[0].clone()
@@ -698,7 +728,7 @@ class TestTokenCountParity:
     def test_training_forward_matches_chunked_generation(self, recipe):
         _skip_unless_supported(recipe)
         gen_config, train_config = _generation_and_training_configs(recipe)
-        # Generation's wide pass needs a heap that fits it; training reuses it.
+        # Generation's wide pass needs a heap that fits it.
         gen_layer, train_layer = _layer_pair(
             recipe, gen_config, train_config, max_tokens=max(TRAIN_TOKEN_COUNTS)
         )
@@ -741,131 +771,18 @@ class TestTokenCountParity:
 
 
 @_on_flashinfer_gpu("_batch_invariant")
-class TestSymmetricHeapSizing:
-    """(4) A value pass larger than the NVLS symmetric heap is split to fit it.
-
-    The heap is allocated once and cannot grow, so a pass larger than generation's
-    runs in heap-sized launches as generation does.
-    """
-
-    SMALL, LARGE = LOCAL_TOKENS, 3 * LOCAL_TOKENS
-    RECIPE = "nvfp4-squared_relu"
-
-    def test_a_larger_pass_matches_heap_sized_passes(self):
-        _skip_unless_supported(self.RECIPE)
-        if _dispatcher() != "nvls":
-            pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
-        config = _config(self.RECIPE, moe_training_matches_inference=True)
-        layer = _build_layer(config, for_inference=True, max_tokens=self.SMALL).eval()
-        hidden = _hidden(config, seed=1, tokens=self.LARGE)
-        with torch.no_grad():
-            chunked = torch.cat(
-                [
-                    layer(hidden[start : start + self.SMALL])[0]
-                    for start in range(0, self.LARGE, self.SMALL)
-                ],
-                dim=0,
-            )
-            assert NVLSAllGatherVDispatcher._per_rank_worst_case_token_count == self.SMALL
-            wide, _ = layer(hidden)
-        assert _elements_that_differ(wide, chunked) == 0
-
-    def _heap_sized_layer(self, recipe=RECIPE, max_tokens=SMALL):
-        _skip_unless_supported(recipe)
-        if _dispatcher() != "nvls":
-            pytest.skip("the symmetric heap is only used by the NVLS dispatcher (EP > 1)")
-        config = _config(recipe, moe_training_matches_inference=True)
-        with _fp8_context(config, is_init=True):
-            layer = _build_layer(config, for_inference=True, max_tokens=max_tokens).eval()
-        return config, layer
-
-    def test_each_launch_covers_only_rows_that_hold_tokens(self, spy_on_value_pass):
-        """The kernel's cost follows the microbatch, not the generation-sized heap."""
-        config, layer = self._heap_sized_layer()
-        seen = spy_on_value_pass(layer.experts)
-        group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
-        with torch.no_grad():
-            layer(_hidden(config, seed=3, tokens=self.SMALL + self.SMALL // 2))
-        assert [routing_map.shape[0] for routing_map in seen] == [
-            group_size * self.SMALL,
-            group_size * (self.SMALL // 2),
-        ]
-
-    @pytest.mark.parametrize("floor_verified", [True, False])
-    def test_mxfp8_launches_keep_the_largest_kernel_tile(
-        self, floor_verified, spy_on_value_pass, monkeypatch
-    ):
-        """MXFP8 launches follow the microbatch down to the kernel's largest-tile floor.
-
-        The routed MXFP8 kernel has no tile config for a launch of a few tokens per
-        rank at these shapes, so a small microbatch launches on the floor's rows. On a
-        FlashInfer release the floor was not verified on, every launch uses the whole heap.
-        """
-        monkeypatch.setattr(
-            training_matches_inference, "_mxfp8_tile_floor_verified", lambda: floor_verified
-        )
-        config, layer = self._heap_sized_layer("mxfp8", max_tokens=HEAP_TOKENS)
-        seen = spy_on_value_pass(layer.experts)
-        group_size = torch.distributed.get_world_size(layer._inference_token_dispatcher.tp_ep_group)
-        floor = 128 * layer.num_local_experts // config.moe_router_topk + 1
-        assert group_size * LOCAL_TOKENS < floor < group_size * (HEAP_TOKENS // 2)
-        with torch.no_grad(), _fp8_context(config):
-            layer(_hidden(config, seed=3, tokens=LOCAL_TOKENS))
-            layer(_hidden(config, seed=3, tokens=HEAP_TOKENS // 2))
-        want = [floor, group_size * (HEAP_TOKENS // 2)]
-        if not floor_verified:
-            want = [group_size * HEAP_TOKENS] * 2
-        assert [routing_map.shape[0] for routing_map in seen] == want
-
-    def test_a_layer_that_skips_the_metadata_sync_matches_one_that_runs_it(self):
-        """Generation refreshes dispatch metadata on its first MoE layer only.
-
-        A one-token tail chunk leaves that layer's metadata stale for the next pass,
-        so every launch of the value pass must refresh it.
-        """
-        config, layer = self._heap_sized_layer()
-        hidden = _hidden(config, seed=1, tokens=self.LARGE + 1)
-        dispatcher = layer._inference_token_dispatcher
-        with torch.no_grad():
-            want, _ = layer(hidden)
-            dispatcher._runs_metadata_sync = False
-            got, _ = layer(hidden)
-        assert _elements_that_differ(got, want) == 0
-
-    @pytest.mark.parametrize("real_tokens", [0, LOCAL_TOKENS // 2])
-    def test_generation_padding_count_masks_no_training_row(self, monkeypatch, real_tokens):
-        """A colocated context binds its real-token count to the NVLS dispatcher class."""
-        config, layer = self._heap_sized_layer()
-        hidden = _hidden(config, seed=2, tokens=self.LARGE)
-        with torch.no_grad():
-            want, _ = layer(hidden)
-            monkeypatch.setattr(
-                NVLSAllGatherVDispatcher,
-                "_real_token_count_tensor",
-                torch.tensor([real_tokens], dtype=torch.int32, device="cuda"),
-            )
-            got, _ = layer(hidden)
-        assert _elements_that_differ(got, want) == 0
-
-
-@_on_flashinfer_gpu("_batch_invariant")
 class TestSeparateGeneration:
     """(4) Training without generation in its process, as when the two run apart.
 
-    Generation runs, its buffers are freed, and the value pass allocates its own:
-    either sized like generation's, as a trainer does for a generation that sets
-    ``max_tokens``, or by default. The buffer size is the row count of the FlashInfer
-    launch, so the default case also checks that it does not change the output.
+    Generation runs and its dispatcher buffers are freed; the value pass, which goes
+    through training's all-to-all dispatcher, needs none of them.
     """
 
     TOKENS = 64
 
-    @pytest.mark.parametrize("training_heap", ["generation", "default"])
     @pytest.mark.parametrize("recipe", list(RECIPES))
-    def test_value_pass_with_its_own_buffers_matches_generation(self, recipe, training_heap):
+    def test_value_pass_without_generation_buffers_matches_generation(self, recipe):
         _skip_unless_supported(recipe)
-        if _dispatcher() != "nvls":
-            pytest.skip("only the NVLS dispatcher has sized buffers (EP > 1)")
         gen_config, train_config = _generation_and_training_configs(recipe)
         gen_layer, train_layer = _layer_pair(
             recipe, gen_config, train_config, max_tokens=HEAP_TOKENS
@@ -875,32 +792,16 @@ class TestSeparateGeneration:
             gen_out, _ = gen_layer(hidden)
 
         _free_dispatch_buffers()
-        if training_heap == "generation":
-            _allocate_dispatch_buffers(train_config, HEAP_TOKENS)
         with torch.no_grad(), _fp8_context(train_config):
             train_out, _ = train_layer(hidden)
 
-        heap = NVLSAllGatherVDispatcher._per_rank_worst_case_token_count
-        assert (heap == HEAP_TOKENS) == (training_heap == "generation")
+        assert NVLSAllGatherVDispatcher._symm_rsv is None
+        assert InferenceAllGatherDispatcherBase._valid_tokens_tensor is None
         differing = _elements_that_differ(train_out, gen_out)
         assert differing == 0, (
-            f"{recipe}: with its own {heap}-token heap against generation's "
-            f"{HEAP_TOKENS}, {differing}/{train_out.numel()} elements differ"
+            f"{recipe}: without generation's buffers, {differing}/{train_out.numel()} "
+            "elements differ from generation"
         )
-
-    def test_buffers_of_another_expert_parallel_size_are_rejected(self, monkeypatch):
-        recipe = "nvfp4-squared_relu"
-        _skip_unless_supported(recipe)
-        if _dispatcher() != "nvls":
-            pytest.skip("only the NVLS dispatcher has sized buffers (EP > 1)")
-        config = _config(recipe, moe_training_matches_inference=True)
-        layer = _build_layer(config, for_inference=True, max_tokens=HEAP_TOKENS).eval()
-        # The same rows split over half the ranks: buffers of a generation at EP / 2.
-        monkeypatch.setattr(
-            NVLSAllGatherVDispatcher, "_per_rank_worst_case_token_count", 2 * HEAP_TOKENS
-        )
-        with torch.no_grad(), pytest.raises(RuntimeError, match="expert-parallel size"):
-            layer(_hidden(config, seed=4))
 
 
 # ---------------------------------------------------------------------------
