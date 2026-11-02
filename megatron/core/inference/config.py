@@ -45,9 +45,9 @@ class MambaInferenceStateConfig:
 
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels. Dynamic prefill builds its chunk
-    boundaries at this size while each mixer runs its kernels at its own `chunk_size`, so the
-    two must agree: `from_model` copies the mixers' value, and the dynamic engine rejects a
-    config that differs from the model (see `check_chunking`)."""
+    boundaries at this size while each Mamba mixer runs its kernels at its own `chunk_size`, so
+    the two must agree: `from_model` copies the mixers' value, and the inference wrapper rejects
+    a dynamic context whose chunking differs from the model's (see `check_ssm_chunking`)."""
 
     ssm_chunk_alignment: Optional[int] = None
     """Token quantum that a prefill chunk boundary must land on for the model's
@@ -149,38 +149,6 @@ class MambaInferenceStateConfig:
             )
         return None
 
-    def check_chunking(self, model: MegatronModule) -> None:
-        """Raise unless this config chunks prefill the way `model`'s SSM layers run.
-
-        The dynamic context builds every prefill chunk boundary from `mamba_chunk_size`,
-        `ssm_chunk_alignment` and `gdp_num_householder`, while each SSM mixer runs its
-        kernels at its own chunk size. When they differ, prefill outputs and cached states
-        are wrong, and a context chunk larger than the mixer's reads past the kernels'
-        buffers. `from_model` derives all three from the model.
-
-        Args:
-            model: The (pipeline-stage) model the config is used with.
-        """
-        from megatron.core.ssm.ssm_inference import ssm_chunking
-
-        decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is None:
-            return
-        chunking = ssm_chunking(layer_type_list, decoder.physical_layers())
-        if chunking is None:
-            # No SSM layer on this pipeline stage reads the chunk boundaries.
-            return
-        expected = (chunking.chunk_size, chunking.inference_chunk_size, chunking.num_householder)
-        actual = (self.mamba_chunk_size, self.ssm_chunk_alignment, self.gdp_num_householder)
-        if actual != expected:
-            raise ValueError(
-                "MambaInferenceStateConfig (mamba_chunk_size, ssm_chunk_alignment, "
-                f"gdp_num_householder) = {actual} does not match the model's SSM layers, "
-                f"which need {expected}. Build the config with "
-                "MambaInferenceStateConfig.from_model."
-            )
-
 
 def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
     """Layer types of one MTP draft-head depth, or None for a non-hybrid model.
@@ -198,6 +166,67 @@ def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
     except RuntimeError:
         return None
     return list(mtp_pattern) if mtp_pattern else None
+
+
+def check_ssm_chunking(
+    model: MegatronModule, mamba_chunk_size: int, ssm_chunk_alignment: int, gdp_num_householder: int
+) -> None:
+    """Raise unless dynamic prefill chunked by these settings is what `model`'s SSM layers run.
+
+    The dynamic context builds every prefill chunk boundary from its `mamba_chunk_size`,
+    `ssm_chunk_alignment` and `gdp_num_householder`, while each SSM mixer runs its kernels at
+    its own chunk size. A Mamba mixer chunks at its `chunk_size`, which `mamba_chunk_size` must
+    equal: otherwise prefill outputs and cached states are wrong, and a context chunk larger
+    than the mixer's reads past the kernels' buffers. The Gated Delta Product prefill kernels
+    (GDN runs them as one Householder update) chunk at a fixed size of their own, from
+    descriptors sized by `gdp_num_householder`, which must equal the mixers' count. Either way
+    `ssm_chunk_alignment` must be a multiple of the chunk the inference kernels run at, since
+    state snapshots taken on it are converted to chunk rows. `from_model` derives all three.
+
+    The decoder is found the way the inference controller finds the language model: through
+    any DDP or Float16Module wrapper, then under a multimodal wrapper's `language_model`. A
+    model without a decoder there, or a pipeline stage without SSM layers, has nothing to check.
+
+    Args:
+        model: The (pipeline-stage) model the dynamic context runs.
+        mamba_chunk_size: The context's Mamba prefill chunk size.
+        ssm_chunk_alignment: The context's chunk-alignment quantum.
+        gdp_num_householder: The context's Householder count.
+    """
+    from megatron.core.inference.utils import get_language_model
+    from megatron.core.ssm.ssm_inference import ssm_chunking
+    from megatron.core.utils import unwrap_model
+
+    decoder = getattr(get_language_model(unwrap_model(model)), "decoder", None)
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is None:
+        return
+    chunking = ssm_chunking(layer_type_list, decoder.physical_layers())
+    if chunking is None:
+        # No SSM layer on this pipeline stage reads the chunk boundaries.
+        return
+    mismatches = []
+    if gdp_num_householder != chunking.num_householder:
+        mismatches.append(
+            f"gdp_num_householder is {gdp_num_householder} but the SSM layers take "
+            f"{chunking.num_householder} Householder updates"
+        )
+    if chunking.num_householder == 0 and mamba_chunk_size != chunking.chunk_size:
+        mismatches.append(
+            f"mamba_chunk_size is {mamba_chunk_size} but the Mamba mixers chunk at "
+            f"{chunking.chunk_size}"
+        )
+    if ssm_chunk_alignment % chunking.inference_chunk_size:
+        mismatches.append(
+            f"ssm_chunk_alignment {ssm_chunk_alignment} is not a multiple of "
+            f"{chunking.inference_chunk_size}, the chunk the SSM inference kernels run at"
+        )
+    if mismatches:
+        raise ValueError(
+            "The dynamic context's prefill chunking does not match the model's SSM layers: "
+            + "; ".join(mismatches)
+            + ". Build its MambaInferenceStateConfig with MambaInferenceStateConfig.from_model."
+        )
 
 
 class PrefixCachingEvictionPolicy(str, Enum):

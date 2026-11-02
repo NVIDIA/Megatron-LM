@@ -9018,7 +9018,9 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
 class TestDynamicEngineSSMChunking:
     """Dynamic prefill chunks at the context's `mamba_chunk_size` while each Mamba mixer runs
-    its kernels at its own `chunk_size`, so the engine requires the two to agree."""
+    its kernels at its own `chunk_size`. The inference wrapper, where model and context first
+    meet, requires the two to agree, so neither an engine nor a bare controller runs prefill
+    with a context that disagrees."""
 
     def setup_method(self, method):
         skip_if_sequence_packing_not_available()
@@ -9032,7 +9034,7 @@ class TestDynamicEngineSSMChunking:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _build_engine(context_chunk_size=None):
+    def _build_model_and_context(context_chunk_size=None):
         config = TransformerConfig(
             num_layers=3,
             hidden_size=128,
@@ -9076,19 +9078,22 @@ class TestDynamicEngineSSMChunking:
                 unified_memory_level=0,
             ),
         )
+        return model, context
+
+    def test_engine_accepts_the_chunking_from_the_model(self):
+        model, context = self._build_model_and_context()
         controller = TextGenerationController(
             inference_wrapped_model=GPTInferenceWrapper(model, context),
             tokenizer=types.SimpleNamespace(vocab_size=128, detokenize=lambda tokens: ""),
         )
-        return DynamicInferenceEngine(controller, context)
-
-    def test_engine_accepts_the_chunking_from_the_model(self):
-        engine = self._build_engine()
+        engine = DynamicInferenceEngine(controller, context)
         assert engine.context.mamba_chunk_size == 128
 
     @pytest.mark.parametrize("context_chunk_size", [256, 64])
-    def test_engine_rejects_chunking_that_differs_from_the_model(self, context_chunk_size):
+    def test_wrapper_rejects_chunking_that_differs_from_the_model(self, context_chunk_size):
         """A larger context chunk gives wrong prefill outputs and states and reads past the
-        kernels' buffers; a smaller one caches the wrong state in batch-invariant mode."""
+        kernels' buffers; a smaller one caches the wrong state in batch-invariant mode. The
+        wrapper is built before any controller or engine, so every dynamic path is covered."""
+        model, context = self._build_model_and_context(context_chunk_size)
         with pytest.raises(ValueError, match="does not match the model's SSM layers"):
-            self._build_engine(context_chunk_size)
+            GPTInferenceWrapper(model, context)

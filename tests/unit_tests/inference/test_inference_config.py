@@ -20,6 +20,7 @@ from megatron.core.inference.config import (
     MediaPromptSpec,
     MultimodalPromptConfig,
     VideoProcessingConfig,
+    check_ssm_chunking,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
@@ -581,13 +582,39 @@ class TestSSMChunkAlignment:
         )
         assert config.ssm_chunk_alignment == 64
 
+    @staticmethod
+    def _check(config, model):
+        check_ssm_chunking(
+            model, config.mamba_chunk_size, config.ssm_chunk_alignment, config.gdp_num_householder
+        )
+
     @pytest.mark.internal
     @pytest.mark.parametrize(
         "mixer", [_mamba_mixer(128), _mamba_mixer(256), _gdp_mixer()], ids=["mamba", "256", "gdp"]
     )
     def test_config_from_model_matches_the_model_chunking(self, mixer):
         model = _ssm_model([mixer] * 2)
-        MambaInferenceStateConfig.from_model(model).check_chunking(model)
+        self._check(MambaInferenceStateConfig.from_model(model), model)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("mixer", "chunking"),
+        [
+            pytest.param(
+                _mamba_mixer(128), dict(ssm_chunk_alignment=256), id="coarser-mamba-alignment"
+            ),
+            pytest.param(_gdp_mixer(chunk_size=64), dict(mamba_chunk_size=128), id="gdp-default"),
+            pytest.param(_gdp_mixer(), dict(ssm_chunk_alignment=128), id="coarser-gdp-alignment"),
+        ],
+    )
+    def test_chunking_the_kernels_and_allocator_support_is_accepted(self, mixer, chunking):
+        """The alignment quantum may be any multiple of the inference kernels' chunk, as the
+        prefix-cache allocator accepts; GDP prefill chunks at its own fixed size, so
+        `mamba_chunk_size` does not matter there."""
+        model = _ssm_model([mixer] * 2)
+        self._check(
+            dataclasses.replace(MambaInferenceStateConfig.from_model(model), **chunking), model
+        )
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -608,19 +635,41 @@ class TestSSMChunkAlignment:
                 dict(mamba_chunk_size=128, ssm_chunk_alignment=128),
                 id="default-chunk-for-another-mixer-chunk",
             ),
+            pytest.param(_mamba_mixer(128), dict(ssm_chunk_alignment=192), id="mamba-alignment"),
             pytest.param(_gdp_mixer(num_householder=2), dict(gdp_num_householder=3), id="gdp"),
+            pytest.param(_gdp_mixer(), dict(ssm_chunk_alignment=96), id="gdp-alignment"),
         ],
     )
     def test_chunking_that_differs_from_the_model_is_rejected(self, mixer, chunking):
-        """Prefill chunk boundaries come from the config, the kernels' chunk from the mixer.
+        """Prefill chunk boundaries come from the context, the kernels' chunk from the mixer.
 
         A larger context chunk makes prefill outputs and states wrong and reads past the
-        kernels' buffers; a smaller one caches the wrong batch-invariant state.
+        kernels' buffers; a smaller one caches the wrong batch-invariant state. An alignment
+        off the kernels' chunk cannot be converted to a chunk row.
         """
         model = _ssm_model([mixer] * 2)
         config = dataclasses.replace(MambaInferenceStateConfig.from_model(model), **chunking)
         with pytest.raises(ValueError, match="does not match the model's SSM layers"):
-            config.check_chunking(model)
+            self._check(config, model)
+
+    @pytest.mark.internal
+    def test_language_model_of_a_multimodal_wrapper_is_checked(self):
+        """The decoder is found the way the inference controller finds the language model."""
+        language_model = _ssm_model([_mamba_mixer(128)] * 2)
+        config = dataclasses.replace(
+            MambaInferenceStateConfig.from_model(language_model),
+            mamba_chunk_size=256,
+            ssm_chunk_alignment=256,
+        )
+        with pytest.raises(ValueError, match="does not match the model's SSM layers"):
+            self._check(config, SimpleNamespace(language_model=language_model))
+
+    @pytest.mark.internal
+    def test_model_without_a_reachable_decoder_checks_no_chunking(self):
+        """A wrapper that exposes neither a decoder nor a language model has nothing to check;
+        the context's config was built from the language model the caller resolved."""
+        config = MambaInferenceStateConfig.from_model(_ssm_model([_mamba_mixer(128)]))
+        self._check(config, SimpleNamespace(config=SimpleNamespace()))
 
     @pytest.mark.internal
     def test_stage_without_a_recurrent_layer_checks_no_chunking(self):
@@ -634,4 +683,4 @@ class TestSSMChunkAlignment:
             )
         )
         config = MambaInferenceStateConfig.from_model(_ssm_model([_mamba_mixer(64)]))
-        config.check_chunking(model)
+        self._check(config, model)
