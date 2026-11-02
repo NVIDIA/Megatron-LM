@@ -514,10 +514,11 @@ class DBuffer:
         for axis in axes:
             input_placements = tuple(placements)
             placements[axis] = Replicate()
-            view = out.view(placements)
             if self.mesh.size(axis) == 1:
-                view.local_buffer.copy_(local_buffer)
-            elif self.layout.has_equal_shard_sizes:
+                # Only the placement changes; the next gather can read the same input.
+                continue
+            view = out.view(placements)
+            if self.layout.has_equal_shard_sizes:
                 # Symmetric-memory registration is scoped to the collective's process
                 # group, so rendezvous the output on the same mesh axis as the all-gather.
                 if out.is_symmetric_memory:

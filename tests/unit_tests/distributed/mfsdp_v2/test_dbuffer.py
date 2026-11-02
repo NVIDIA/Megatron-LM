@@ -806,10 +806,17 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(
 
 
 @pytest.mark.parametrize("destination", ["allocated", "separate", "aliased"])
-def test_multi_axis_view_and_allgather(distributed_setup, destination):
+@pytest.mark.parametrize("mesh_shape", ["balanced", "singleton_outer", "singleton_inner"])
+def test_multi_axis_view_and_allgather(distributed_setup, destination, mesh_shape):
     if distributed_setup.world_size % 2:
         pytest.skip("Requires an even world size.")
-    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    world_size = distributed_setup.world_size
+    shape = {
+        "balanced": (2, world_size // 2),
+        "singleton_outer": (1, world_size),
+        "singleton_inner": (world_size, 1),
+    }[mesh_shape]
+    mesh = init_device_mesh(distributed_setup.device.type, shape)
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
     sharded = replicated.redistribute([RowAtomic(), RowAtomic()])
@@ -821,7 +828,12 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination):
     out = None if destination == "allocated" else replicated
     if destination == "separate":
         out = DBuffer(mesh, replicated.placements, replicated.layout, sharded.dtype, sharded.device)
-    result = sharded.allgather((1, 0), out=out)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
+    ) as prof:
+        result = sharded.allgather((1, 0), out=out)
+    # Gathers write into output views directly. Ignore scalar mesh-metadata conversions.
+    assert not any(event.name == "aten::copy_" and event.input_shapes[0] for event in prof.events())
     if out is not None:
         assert result is out
     _assert_dbuffer_local_tensors_close(result, tensors)
