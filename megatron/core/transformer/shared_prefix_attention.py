@@ -7,7 +7,10 @@ that attaches a forest runs :func:`validate_shared_prefix_attention` for every a
 before any layer executes; the attention forward does not repeat these checks.
 """
 
-from megatron.core.ops.attention.shared_prefix import _cp_kv_head_slices_for_destinations
+from megatron.core.ops.attention.shared_prefix import (
+    _cp_kv_head_slices_for_destinations,
+    require_shared_prefix_flash_attn,
+)
 from megatron.core.transformer.attention import SelfAttention
 
 
@@ -23,12 +26,14 @@ def _dense_core_attention_types() -> tuple:
     return (DotProductAttention, TEDotProductAttention)
 
 
-def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size: int) -> None:
+def validate_shared_prefix_attention(attention, *, tp_size: int, cp_size: int) -> None:
     """Reject a ``SelfAttention`` that the forest attention cannot run on this TP/CP topology.
 
     A caller that attaches a forest runs this for every attention layer before any layer
-    executes; the attention forward does not repeat it. ``tp_size`` and ``cp_size`` are the
-    caller's group sizes.
+    executes; the attention forward does not repeat it. The checks read ``attention.config``;
+    ``tp_size`` and ``cp_size`` are the caller's group sizes, which the layer's process groups
+    must match. The last check binds flash-attn for the forest kernel and raises ``ImportError``
+    when it is missing or older than 2.7.0.
     """
     # Other Attention subclasses, such as multi-latent attention, override forward and never
     # read the slot. SelfAttention (and any subclass that keeps its forward) does.
@@ -37,6 +42,7 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
             "shared-prefix forest attention supports only SelfAttention, got "
             f"{type(attention).__name__}"
         )
+    config = attention.config
     # The forest replaces core attention outright, so only dense dot-product core attention can
     # be replaced exactly. Attention variants can keep SelfAttention's forward and plug in a
     # different core attention (DSA over GQA does), which the forest would silently bypass.
@@ -62,14 +68,14 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
         raise NotImplementedError("shared-prefix forest attention supports only vanilla softmax")
     if config.attention_dropout != 0.0:
         raise NotImplementedError("shared-prefix forest attention requires zero attention dropout")
-    if getattr(config, "attn_logit_softcapping", None) is not None:
+    if config.attn_logit_softcapping is not None:
         raise NotImplementedError(
             "shared-prefix forest attention does not support logit softcapping"
         )
     # Batch-invariant mode pins FlashAttention 3 or 4 with a fixed split schedule
     # (TransformerConfig requires flash_attention_version 3 or 4). The forest always runs
     # FlashAttention 2 passes merged by log-sum-exp, so it cannot reproduce those kernels.
-    if getattr(config, "batch_invariant_mode", False):
+    if config.batch_invariant_mode:
         raise NotImplementedError(
             "shared-prefix forest attention does not support batch-invariant mode: it runs "
             "FlashAttention 2 passes whatever flash_attention_version selects"
@@ -94,3 +100,4 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
         # ranks, SelfAttention replicates one KV head across the relevant TP ranks.
         kv_heads = attention.num_query_groups_per_partition
         _cp_kv_head_slices_for_destinations(query_heads, kv_heads, cp_size)
+    require_shared_prefix_flash_attn()

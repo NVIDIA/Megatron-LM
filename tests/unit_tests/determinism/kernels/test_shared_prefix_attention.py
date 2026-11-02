@@ -40,14 +40,6 @@ def attention(monkeypatch):
     return shared_prefix
 
 
-@pytest.fixture
-def validation():
-    """Return the module that validates a SelfAttention for the forest attention."""
-    from megatron.core.transformer import shared_prefix_attention
-
-    return shared_prefix_attention
-
-
 def _stars(*stars):
     """Pack ``(prompt_len, completion_lens)`` stars contiguously into a forest."""
     forest, offset = [], 0
@@ -209,13 +201,26 @@ def flash_attn_install(attention, monkeypatch):
 )
 def test_missing_or_old_flash_attention_is_rejected(attention, flash_attn_install, version, match):
     """The exact backward binds FlashAttention 2.7+ private keyword arguments, so a missing or
-    older flash-attn raises ImportError before the kernel runs any pass."""
+    older flash-attn fails the validation and the kernel before any pass runs."""
+    from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
+
     flash_attn_install(version)
     with pytest.raises(ImportError, match=match):
         attention.require_shared_prefix_flash_attn()
+    with pytest.raises(ImportError, match=match):
+        validate_shared_prefix_attention(_validated_attention(), tp_size=1, cp_size=1)
     query = torch.zeros(8, 1, 2, 8)
     with pytest.raises(ImportError, match=match):
         attention.flash_composed_forest_attention(query, query, query, [(0, 4, [4])])
+
+
+@pytest.fixture
+def validate(flash_attn_install):
+    """Return the SelfAttention validation, with flash-attn 2.7.0 installed for its last check."""
+    from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
+
+    flash_attn_install("2.7.0")
+    return validate_shared_prefix_attention
 
 
 def test_flash_attention_is_bound_once(attention, flash_attn_install):
@@ -227,7 +232,7 @@ def test_flash_attention_is_bound_once(attention, flash_attn_install):
 
 
 def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=False, **config):
-    """A SelfAttention stand-in with the attributes the validation reads, and its config."""
+    """A SelfAttention stand-in with the attributes, including ``config``, the validation reads."""
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -253,7 +258,8 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         batch_invariant_mode=False,
         flash_attention_version=None,
     )
-    return module, SimpleNamespace(**{**defaults, **config})
+    module.config = SimpleNamespace(**{**defaults, **config})
+    return module
 
 
 @pytest.mark.parametrize(
@@ -275,53 +281,47 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
         ({"cp": 2}, RuntimeError, "attention CP helper"),
     ],
 )
-def test_attention_validation_rejects_unsupported_modules(validation, overrides, error, message):
+def test_attention_validation_rejects_unsupported_modules(validate, overrides, error, message):
     """Unsupported attention features and mismatched process groups fail before any layer runs."""
-    module, config = _validated_attention(**overrides)
     with pytest.raises(error, match=message):
-        validation.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+        validate(_validated_attention(**overrides), tp_size=1, cp_size=1)
 
 
-def test_attention_validation_rejects_non_dense_core_attention(validation):
+def test_attention_validation_rejects_non_dense_core_attention(validate):
     """A SelfAttention variant with its own core attention (e.g. DSA over GQA) is not bypassed."""
     from unittest.mock import Mock
 
-    module, config = _validated_attention()
+    module = _validated_attention()
     module.core_attention = Mock()
     with pytest.raises(NotImplementedError, match="requires dot-product core attention"):
-        validation.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+        validate(module, tp_size=1, cp_size=1)
 
 
-def test_attention_validation_rejects_other_attention_modules(validation):
+def test_attention_validation_rejects_other_attention_modules(validate):
     """Attention subclasses that override forward (for example MLA) never read the slot."""
     from types import SimpleNamespace
 
-    _, config = _validated_attention()
     other = SimpleNamespace(checkpoint_core_attention=False)
     with pytest.raises(NotImplementedError, match="supports only SelfAttention"):
-        validation.validate_shared_prefix_attention(other, config, tp_size=1, cp_size=1)
+        validate(other, tp_size=1, cp_size=1)
 
 
 @pytest.mark.parametrize("window_size", [None, (-1, -1), [-1, -1]])
-def test_attention_validation_accepts_full_attention_windows(validation, window_size):
-    module, config = _validated_attention(window_size=window_size)
-    validation.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+def test_attention_validation_accepts_full_attention_windows(validate, window_size):
+    validate(_validated_attention(window_size=window_size), tp_size=1, cp_size=1)
 
 
 @pytest.mark.parametrize("version", [None, 2, 3, 4])
-def test_attention_validation_accepts_any_pinned_flash_version(validation, version):
+def test_attention_validation_accepts_any_pinned_flash_version(validate, version):
     """Without batch-invariant mode the pin selects TE and inference kernels, not the forest."""
-    module, config = _validated_attention(flash_attention_version=version)
-    validation.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+    validate(_validated_attention(flash_attention_version=version), tp_size=1, cp_size=1)
 
 
-def test_attention_validation_checks_cp_head_split(validation):
+def test_attention_validation_checks_cp_head_split(validate):
     """At CP>1 the heads must split over TP and the KV heads over CP destinations."""
-    module, config = _validated_attention(cp=2, kv_heads=2)
-    validation.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=2)
-    module, config = _validated_attention(tp=3, cp=2, kv_heads=1)
+    validate(_validated_attention(cp=2, kv_heads=2), tp_size=1, cp_size=2)
     with pytest.raises(NotImplementedError, match="divisible by TP size"):
-        validation.validate_shared_prefix_attention(module, config, tp_size=3, cp_size=2)
+        validate(_validated_attention(tp=3, cp=2, kv_heads=1), tp_size=3, cp_size=2)
 
 
 def test_plan_cache_evicts_least_recently_used_plans_by_bytes(attention, monkeypatch):
