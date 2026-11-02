@@ -8,13 +8,10 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.utils import is_distillation_model
-from megatron.training import get_args
 
 
 def _mask_loss(output_tensor, loss_mask):
     """Apply mask to the unreduced loss tensor."""
-    args = get_args()
-
     if isinstance(output_tensor, tuple):
         # Special distillation flags indicating whether to perform additional tensor-parallel adjustments.
         output_tensor, tp_reduce, is_sequence_parallel = output_tensor
@@ -24,7 +21,8 @@ def _mask_loss(output_tensor, loss_mask):
     if is_sequence_parallel:
         # Sequence-parallel tensor derived from intermediate activation - need to split loss mask.
         idx = parallel_state.get_tensor_model_parallel_rank()
-        loss_mask = torch.tensor_split(loss_mask, args.tensor_model_parallel_size, dim=1)[idx]
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        loss_mask = torch.tensor_split(loss_mask, tp_size, dim=1)[idx]
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.reshape(-1).float()

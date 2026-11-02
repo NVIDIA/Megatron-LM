@@ -31,7 +31,6 @@ _NON_MODELOPT_OPTION_OVERRIDES = (
     {"freeze_base_for_mtp": True},
     {"lsq_scale_lr": 1e-4},
     {"qk_l2_norm": True},
-    {"enable_gpt_oss": True},
     {"export_offline_model": True},
 )
 

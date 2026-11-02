@@ -135,6 +135,12 @@ class ModelConfig:
         """Validate transformations before allocating models or loading checkpoints."""
         if self.transformations is not None:
             self.transformations.validate()
+            transformer_impl = getattr(self.transformer, "transformer_impl", None)
+            if transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "ModelOpt transformations require the ModelOpt layer spec and cannot be "
+                    "combined with transformer_impl='inference_optimized'."
+                )
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.

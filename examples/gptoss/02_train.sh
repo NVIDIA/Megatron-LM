@@ -150,7 +150,6 @@ MODEL_ARGS=(
     --window-attn-skip-freq 2
     --activation-func-clamp-value 7.0
     --window-size 127,0
-    --enable-gpt-oss
 )
 
 MOE_ARGS=(

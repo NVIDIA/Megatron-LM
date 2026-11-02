@@ -26,7 +26,7 @@ from megatron.post_training.model_config import (
 )
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import print_rank_0
 
 REMOVE_THINK_CHAT_TEMPLATE = (
@@ -431,12 +431,25 @@ class SFTDataset(torch.utils.data.Dataset):
         return processed_data
 
 
-def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
+def _is_offline_model() -> bool:
+    """Whether the run's model is built for offline speculative-decoding training.
+
+    ``--export-offline-model`` is recorded in the model config's transformations when the
+    CLI is translated (``original_num_layers``), so the callbacks follow the run config.
+    """
+    transformations = get_run_config().model.transformations
+    return transformations is not None and transformations.original_num_layers is not None
+
+
+def train_valid_test_sft_datasets_provider(train_val_test_num_samples, offline_data_dir=None):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples
             in train test and validation.
+        offline_data_dir: Directory with the base model's features
+            (``--offline-distillation-data``), used when the model is built for offline
+            speculative-decoding training.
     """
     print_rank_0("> building train, validation, and test SFT datasets ...")
     args = get_args()
@@ -447,10 +460,12 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    if args.export_offline_model:
-        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
-        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
-        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
+    if _is_offline_model():
+        if offline_data_dir is None:
+            raise ValueError("Offline speculative-decoding training requires --offline-distillation-data.")
+        train_ds = OfflineDataset(os.path.join(offline_data_dir, "train"), train_val_test_num_samples[0])
+        valid_ds = OfflineDataset(os.path.join(offline_data_dir, "valid"), train_val_test_num_samples[1])
+        test_ds = OfflineDataset(os.path.join(offline_data_dir, "test"), train_val_test_num_samples[2])
 
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
@@ -484,13 +499,14 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     args = get_args()
+    offline = _is_offline_model()
 
     # Broadcast data since only TP rank-0 has the data_iterator.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    if not args.export_offline_model:
+    if not offline:
         keys = ["input_ids", "loss_mask"]
         datatype = torch.int64
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
@@ -519,7 +535,7 @@ def get_batch(data_iterator):
         cp_group=get_context_parallel_group(),
     )
 
-    if args.export_offline_model:
+    if offline:
         batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
@@ -529,7 +545,7 @@ def get_batch(data_iterator):
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
-    if not args.export_offline_model and args.context_parallel_size == 1:
+    if not _is_offline_model() and args.context_parallel_size == 1:
         try:
             report_draft_acceptance_length(model)
         except Exception as e:
@@ -545,8 +561,7 @@ def forward_step(data_iterator, model: GPTModel):
         model: The GPT Model
     """
     timers = get_timers()
-
-    args = get_args()
+    offline = _is_offline_model()
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
@@ -556,12 +571,12 @@ def forward_step(data_iterator, model: GPTModel):
     loss_mask = batch["loss_mask"]
     attention_mask = batch["attention_mask"]
     position_ids = batch["position_ids"]
-    if args.export_offline_model:
+    if offline:
         aux_hidden_states = batch["aux_hidden_states"]
         hidden_states = batch["hidden_states"]
     timers("batch-generator").stop()
 
-    if args.export_offline_model:
+    if offline:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -583,7 +598,10 @@ if __name__ == "__main__":
     set_run_config(full_config)
     pretrain(
         full_config,
-        train_valid_test_sft_datasets_provider,
+        partial(
+            train_valid_test_sft_datasets_provider,
+            offline_data_dir=args.offline_distillation_data,
+        ),
         ModelType.encoder_or_decoder,
         forward_step,
         non_loss_data_func=non_loss_data_func,

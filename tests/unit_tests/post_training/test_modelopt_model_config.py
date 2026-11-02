@@ -234,6 +234,14 @@ class TestModelOptModelConfigFromArgs:
         assert config.transformer.original_num_layers == 2
         assert config.transformations.original_num_layers == 2
 
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_rejects_inference_optimized_impl(self, hybrid):
+        args = make_modelopt_test_args(hybrid_layer_pattern="M*" if hybrid else None)
+        config = mc.modelopt_model_config_from_args(args)
+        config.transformer.transformer_impl = "inference_optimized"
+        with pytest.raises(ValueError, match="inference_optimized"):
+            config.validate()
+
     def test_offline_layer_count_survives_serialization(self):
         args = make_modelopt_test_args(export_offline_model=True)
         restored = ModelConfig.from_dict(mc.modelopt_model_config_from_args(args).as_dict())
@@ -250,7 +258,16 @@ class TestModelOptModelConfigFromArgs:
 
     def test_architecture_options_come_from_core_arguments(self):
         # The --export- spellings are deprecated aliases of the core flags.
-        args = make_modelopt_test_args(["--export-qk-l2-norm", "--enable-gpt-oss"])
+        args = make_modelopt_test_args(
+            [
+                "--export-qk-l2-norm",
+                "--position-embedding-type",
+                "yarn",
+                "--rotary-scaling-factor",
+                "32.0",
+                "--no-yarn-correction-range-round-to-int",
+            ]
+        )
 
         config = mc.modelopt_model_config_from_args(args)
 
@@ -413,6 +430,56 @@ class TestModelType:
         )
         config.get_builder_cls()(config).pre_wrap_hook()([Mock()])
         assert te_hook.called is not default_te_spec
+
+
+class TestTELayernormCheckpointKeys:
+    FUSED = "decoder.layers.self_attention.linear_qkv.layer_norm_weight"
+    LEGACY = "decoder.layers.input_layernorm.weight"
+
+    def _check(self, model_keys, checkpoint_keys, ckpt_format="torch_dist"):
+        from megatron.post_training import checkpointing
+
+        model = Mock()
+        model.sharded_state_dict.return_value = {k: Mock(key=k) for k in model_keys}
+        with (
+            patch.object(checkpointing, "get_sharded_load_dir", return_value="/ckpt/iter_1"),
+            patch.object(
+                checkpointing.dist_checkpointing,
+                "load_tensors_metadata",
+                return_value=dict.fromkeys(checkpoint_keys),
+            ),
+        ):
+            checkpointing.check_te_layernorm_checkpoint_keys(model, "/ckpt", ckpt_format)
+
+    def test_rejects_module_name_layernorm_keys(self):
+        with pytest.raises(RuntimeError, match="input_layernorm.weight"):
+            self._check([self.FUSED], [self.LEGACY])
+
+    def test_accepts_fused_keys(self):
+        self._check([self.FUSED], [self.FUSED, self.LEGACY])
+
+    def test_ignores_unmapped_layernorms(self):
+        # MoE layers keep pre_mlp_layernorm under its module name in every spec.
+        key = "decoder.layers.pre_mlp_layernorm.weight"
+        self._check([key], [key])
+
+    def test_skips_non_distributed_formats(self):
+        self._check([self.FUSED], [self.LEGACY], ckpt_format="torch")
+
+    @pytest.mark.parametrize("default_te_spec", [False, True])
+    def test_student_hook_registered_unless_default_te_spec(self, monkeypatch, default_te_spec):
+        from megatron.training.config.training_config import CheckpointConfig
+
+        check = Mock(return_value=lambda models: models)
+        monkeypatch.setattr(model_hooks, "te_layernorm_keys_check_hook", check)
+        monkeypatch.setattr(model_hooks, "restore_modelopt_state_hook", lambda *_: lambda m: m)
+        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
+        config = mc.modelopt_model_config_from_args(
+            make_modelopt_test_args(export_default_te_spec=default_te_spec)
+        )
+        checkpoint = CheckpointConfig(load="/ckpt", ckpt_format="torch_dist")
+        config.get_builder_cls()(config).pre_wrap_hook(checkpoint)([Mock()])
+        assert check.called is not default_te_spec
 
 
 class TestLoadTeacherModelConfig:

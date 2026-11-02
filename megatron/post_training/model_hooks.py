@@ -28,12 +28,16 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.checkpointing import (
+    check_te_layernorm_checkpoint_keys,
+    load_modelopt_state,
+)
 from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
 from megatron.training.models.base import compose_hooks
 
 PreWrapHook = Callable[[list[MegatronModule]], list[MegatronModule]]
+
 
 def on_model_init_device(hook: PreWrapHook, init_model_with_meta_device: bool) -> PreWrapHook:
     """Run ``hook`` under the device context the model stages were built in.
@@ -185,6 +189,20 @@ def lsq_hook(scale_lr: float | None) -> PreWrapHook:
     return hook
 
 
+def te_layernorm_keys_check_hook(load_dir: str, ckpt_format: str) -> PreWrapHook:
+    """Fail early if ``load_dir`` stores layernorms under keys the ModelOpt-local spec won't load.
+
+    See ``megatron.post_training.checkpointing.check_te_layernorm_checkpoint_keys``.
+    """
+
+    def hook(models: list[MegatronModule]) -> list[MegatronModule]:
+        for model in models:
+            check_te_layernorm_checkpoint_keys(model, load_dir, ckpt_format)
+        return models
+
+    return hook
+
+
 def te_load_state_dict_hook() -> PreWrapHook:
     """Register a ``load_state_dict`` pre-hook that handles known TE/local state_dict key mismatches."""
 
@@ -239,6 +257,7 @@ def kd_convert_hook(student_model_config, distillation, remap_te_layernorm: bool
         remap_te_layernorm: Whether to register the TE layernorm key-remapping load hook on
             the teacher.
     """
+
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         print_rank_0("Distillation: Enabled.")
         if len(models) != 1:
@@ -293,6 +312,8 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))
         if not options.default_te_spec:
+            if checkpoint is not None and checkpoint.load is not None:
+                register(te_layernorm_keys_check_hook(checkpoint.load, checkpoint.ckpt_format))
             register(te_load_state_dict_hook())
 
     hooks.extend(model_config.pre_wrap_hooks)
