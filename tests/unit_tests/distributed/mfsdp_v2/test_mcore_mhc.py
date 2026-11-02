@@ -28,9 +28,9 @@ def process_group_collection(distributed_setup):
 
 
 @pytest.mark.parametrize("recompute_mhc", [False, True], ids=["no-recompute", "recompute"])
-@pytest.mark.parametrize("pattern", ["**", "*E"], ids=["attention", "moe"])
+@pytest.mark.parametrize("pattern", ["**", "E*"], ids=["attention", "moe"])
 def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc, pattern):
-    """FSDP preserves the reference loss with mHC recompute on or off."""
+    """Compare losses; an early MoE layer exercises replay before its owner's backward hook."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
