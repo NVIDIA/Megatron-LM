@@ -48,6 +48,7 @@ def static_inference_engine(gpt2_tiktoken_tokenizer):
 
     controller.inference_wrapped_model.model.forward = mock_forward
     yield engine_wrapper.static_engine
+    Utils.destroy_model_parallel()
 
 
 @pytest.fixture(scope="module")

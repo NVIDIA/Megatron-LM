@@ -409,7 +409,7 @@ def _make_dsv4_cp_config(
         ),
         max_seqlen_per_dp_cp_rank=(
             sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS) // context_parallel_size
-            if cuda_graph_impl != "none" and context_parallel_size > 1
+            if context_parallel_size > 1
             else None
         ),
         pad_packed_seq_alignment=(
@@ -740,6 +740,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             cp_partition_mode="contiguous",
             sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=local_rows,
         )
         config_ref = _make_config(
             **common_config,
@@ -1136,6 +1137,41 @@ class TestDSv4HybridAttentionTHDCP:
             torch.testing.assert_close(param.grad, torch.zeros_like(param.grad), rtol=0, atol=0)
 
         del attn, full_hidden, full_grad, hidden, grad
+        _clear_cuda_test_state()
+
+    def test_dynamic_cp_singleton_matches_static_cp1(self):
+        """A CP-off microbatch uses its singleton, not the model's static CP group."""
+        packed, padded_tokens, _ = _make_ragged_cp_case(1, 0)
+        runtime_packed, _, _ = _make_ragged_cp_case(1, 0)
+        runtime_packed.local_cp_size = 1
+        runtime_packed.cp_group = None
+        runtime_packed.cp_singleton_group = self.ref_pg.cp
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=0.0,
+            use_fused_kernels=False,
+            apply_rope_fusion=False,
+        )
+        reference = _build_attention(config, layer_number=2, pg_collection=self.ref_pg).cuda()
+        runtime = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        reference.train()
+        runtime.train()
+        _copy_module_parameters(reference, runtime)
+        hidden, grad = _make_hidden_and_grad(padded_tokens, config.hidden_size)
+        expected = _run_dsv4_attention_forward_backward(
+            reference, hidden.detach().clone().requires_grad_(True), grad, packed
+        )
+        actual = _run_dsv4_attention_forward_backward(
+            runtime, hidden.detach().clone().requires_grad_(True), grad, runtime_packed
+        )
+        _assert_cp_tensor_match(actual[0], expected[0], "singleton:output")
+        _assert_cp_tensor_match(actual[1], expected[1], "singleton:hidden_grad")
+        assert actual[2].keys() == expected[2].keys()
+        for name in expected[2]:
+            _assert_cp_tensor_match(actual[2][name], expected[2][name], f"singleton:param:{name}")
+        assert runtime.pg_collection.cp is self.pg.cp
+        assert runtime.core_attention.pg_collection.cp is self.pg.cp
+        del reference, runtime, hidden, grad
         _clear_cuda_test_state()
 
     @pytest.mark.parametrize(

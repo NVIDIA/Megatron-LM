@@ -8,10 +8,14 @@ The golden-value JSON files produced by `download_golden_values.py` look like:
     {
         "lm loss": {
             "start_step": 1, "end_step": 50, "step_interval": 1,
+            "value_precision": "full",
             "values": {"1": 10.93, "2": 10.92, ...}
         },
         "num-zeros": { ... }
     }
+
+Legacy files may omit `value_precision`. This analysis reads the numeric `values`
+from either schema and does not apply functional-test comparison rounding.
 
 For each (file, metric) we compute a single number:
 

@@ -24,6 +24,7 @@ class TestSerializationWithMultiStorageClient:
         MultiStorageClientFeature.enable()
 
     def teardown_method(self, method):
+        MultiStorageClientFeature.disable()
         Utils.destroy_model_parallel()
 
     def test_process_save_load(self, tmp_path_dist_ckpt):

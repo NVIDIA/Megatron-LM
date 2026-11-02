@@ -14,6 +14,9 @@ NUM_WARMUP_ITERS: 2
 # 5 timed iters produced ~10–15% run-to-run swing on GB200 (batch 1 worst).
 # 10 iters stabilizes throughput/latency means used in CI comparison.
 NUM_TIMED_ITERS: 10
+# The H100 reference was recorded with five timed iterations.
+NUM_TIMED_ITERS_BY_PLATFORM:
+  h100: 5
 BATCH_SIZES:
   - 1
   - 8

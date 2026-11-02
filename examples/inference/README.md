@@ -91,6 +91,12 @@ Send requests with any OpenAI-compatible client. The dynamic server
 currently returns `"model": "EMPTY"` and does not validate the request
 `model` field — pass anything you like.
 
+For evaluation or other pure-serving workloads, pass `--eval-mode` to
+avoid returning prompt token IDs unless a request explicitly asks for them.
+Use `--default-temperature`, `--default-top-p`, and `--default-top-k` to change
+sampling defaults for requests that omit those fields; request-level values
+always take precedence.
+
 ### Advanced examples
 
 `advanced/` contains scripts that drive the lower-level
@@ -134,10 +140,14 @@ Forward hooks do not fire during CUDA graph replay. MoE cudagraphs must be disab
 
 **Inference — sink** (routing indices only, graphs on):
 
+The routing replay sink supports both legacy and async dynamic-batching schedules.
+The example below explicitly selects async scheduling.
+
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
 --moe-routing-trace-max-inference-steps 200
 --moe-enable-routing-replay
+--inference-dynamic-batching-async-sched-mode async
 ```
 
 **Inference — hook** (adds hidden states + weights for predictability):

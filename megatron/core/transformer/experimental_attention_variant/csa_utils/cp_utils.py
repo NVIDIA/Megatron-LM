@@ -541,3 +541,67 @@ def compute_cp_indexer_topk(
     else:
         topk, _ = topk_result
     return topk, logical_indexer_layout, compact_predict
+
+
+def validate_packed_inputs(packed_seq_params, config, cp_group):
+    """Validate the static packed contract without modifying any process group.
+
+    CP1 metadata may use None or the explicit singleton group required by the
+    main runtime-CP contract. Dynamic CP transitions remain unsupported; reject them
+    instead of accidentally
+    using a stale build-time group during forward or recompute.
+    """
+    if config.dsa_kernel_backend != "cudnn":
+        raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
+    if config.deterministic_mode:
+        raise NotImplementedError(
+            "Packed DSv4 attention does not yet support deterministic_mode; "
+            "deterministic THD/CP backward is tracked in #7921."
+        )
+    if packed_seq_params.qkv_format != "thd":
+        raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
+    if cp_group is None:
+        raise ValueError("DSv4 requires an explicit build-time CP process group, including CP1.")
+    runtime_size = packed_seq_params.local_cp_size
+    runtime_group = packed_seq_params.cp_group
+    if runtime_size is not None:
+        if runtime_size == 1 and runtime_group is not None and runtime_group.size() != 1:
+            raise ValueError("Runtime CP1 metadata requires None or a singleton cp_group.")
+        if runtime_size > 1 and (runtime_group is None or runtime_group.size() != runtime_size):
+            raise ValueError("Runtime CP metadata must provide the matching process group.")
+        if runtime_size != cp_group.size() or (runtime_size > 1 and runtime_group is not cp_group):
+            raise ValueError(
+                "DSv4 currently supports static CP; runtime group transitions are unsupported."
+            )
+    if cp_group.size() > 1 and config.attention_cp_layout != "contiguous":
+        raise ValueError("DSv4 packed CP requires attention_cp_layout='contiguous'.")
+    if packed_seq_params.max_seqlen_q is None or packed_seq_params.max_seqlen_kv is None:
+        raise ValueError("Packed DSv4 requires host-known maximum query and KV sequence lengths.")
+    q = packed_seq_params.cu_seqlens_q
+    kv = packed_seq_params.cu_seqlens_kv
+    if q is None or kv is None or q.ndim != 1 or q.shape != kv.shape or q.numel() < 2:
+        raise ValueError("Packed DSv4 requires query and KV cumulative lengths for self attention.")
+    for cu in (
+        q,
+        kv,
+        packed_seq_params.cu_seqlens_q_padded,
+        packed_seq_params.cu_seqlens_kv_padded,
+    ):
+        if cu is not None and (
+            cu.shape != q.shape or cu.dtype != torch.int32 or cu.device != q.device
+        ):
+            raise ValueError(
+                "Packed DSv4 cumulative lengths must be matching int32 tensors on one device."
+            )
+
+    if q.data_ptr() != kv.data_ptr():
+        torch._assert_async((q == kv).all(), "DSv4 packed CSA supports self attention only.")
+    padded_q = packed_seq_params.cu_seqlens_q_padded
+    padded_kv = packed_seq_params.cu_seqlens_kv_padded
+    physical_q = q if padded_q is None else padded_q
+    physical_kv = kv if padded_kv is None else padded_kv
+    if physical_q.data_ptr() != physical_kv.data_ptr():
+        torch._assert_async(
+            (physical_q == physical_kv).all(),
+            "Packed CSA requires matching physical Q/KV document boundaries.",
+        )

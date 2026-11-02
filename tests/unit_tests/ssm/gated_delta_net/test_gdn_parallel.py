@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._inductor import config as inductor_config
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -32,6 +33,15 @@ except ImportError:
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
+
+
+@pytest.fixture(scope="module", autouse=True)
+def synchronous_inductor_compilation():
+    """Keep this distributed shape matrix's compilation in-process."""
+    # A rank waiting on a compiler-worker future can leave peers in collectives.
+    # Keep torch.compile and all numerical checks enabled, and restore the setting.
+    with inductor_config.patch(compile_threads=1):
+        yield
 
 
 def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
@@ -62,7 +72,7 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, run_config
 ):
     transformer_config = TransformerConfig(
         hidden_size=128,
@@ -124,7 +134,9 @@ def test_parallel_gated_delta_net_correctness(
     [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
 )
 @pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
-def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+def test_parallel_gated_delta_net2_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, run_config
+):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,

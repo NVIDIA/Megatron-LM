@@ -26,7 +26,6 @@ if [ "${TP}" != "1" ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} is forced to be 1 during export!!\n"
 fi
 
-
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/export.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \

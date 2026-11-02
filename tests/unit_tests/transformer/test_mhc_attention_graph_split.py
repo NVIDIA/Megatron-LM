@@ -3,7 +3,6 @@
 import sys
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,10 +24,9 @@ from megatron.core.transformer.transformer_layer import (
 )
 
 
-@pytest.fixture
-def hybrid_split_wrapper():
-    """A CPU wrapper with only the inner compute and graph transport replaced."""
-    config = TransformerConfig(
+def _hybrid_split_config(**overrides):
+    """Build each variant from raw inputs, without reinitializing normalized CP defaults."""
+    kwargs = dict(
         num_layers=2,
         hidden_size=4,
         num_attention_heads=1,
@@ -42,6 +40,14 @@ def hybrid_split_wrapper():
         mhc_recompute_attn_cuda_graph_split=True,
         hidden_dropout=0.0,
     )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.fixture
+def hybrid_split_wrapper():
+    """A CPU wrapper with only the inner compute and graph transport replaced."""
+    config = _hybrid_split_config()
     inner = TransformerLayer.__new__(TransformerLayer)
     torch.nn.Module.__init__(inner)
     inner.config = config
@@ -91,8 +97,7 @@ class TestHybridMHCAttentionGraphSplit:
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
         helper = object.__new__(TECudaGraphHelper)
-        helper.config = replace(
-            hybrid_split_wrapper.config,
+        helper.config = _hybrid_split_config(
             multi_latent_attention=True,
             recompute_modules=["mhc", "mla_up_proj"] if mla_recompute else ["mhc"],
         )
@@ -154,7 +159,8 @@ class TestHybridMHCAttentionGraphSplit:
         slots = [torch.empty(3, 1, 4) for _ in range(2)]
         graph_reads = []
 
-        def producer(hidden, *, mhc_recompute_manager, output_slot):
+        def producer(hidden, *, mhc_recompute_manager, output_slot, return_residual):
+            assert return_residual is True
             aggregate = hidden[..., :4].clone()
             if with_manager:
                 assert mhc_recompute_manager is wrapper._mhc_recompute_manager
@@ -233,6 +239,7 @@ def test_mhc_aggregate_slot_dtype_preserves_recompute_and_gradients(
 ):
     """Cast after aggregation and restore the graph's fixed input before backward."""
     import megatron.core.tensor_parallel.random as random_module
+    import megatron.core.transformer.hyper_connection as hyper_connection_module
 
     # The computation is deterministic; CUDA RNG bookkeeping is unnecessary on CPU.
     monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
@@ -243,6 +250,11 @@ def test_mhc_aggregate_slot_dtype_preserves_recompute_and_gradients(
     # Exercise the native math without compiling CPU kernels in this transport test.
     module._h_aggregate_op = module._h_aggregate_op.__wrapped__
     module._fused_add_3_op = module._fused_add_3_op.__wrapped__
+    monkeypatch.setattr(
+        hyper_connection_module,
+        "_native_h_aggregate_into_forward",
+        hyper_connection_module._native_h_aggregate_into_forward.__wrapped__,
+    )
     generator = torch.Generator().manual_seed(123)
     hidden = torch.randn(3, 1, 8, generator=generator, dtype=torch.float32, requires_grad=True)
     h_pre = torch.randn(3, 1, 2, generator=generator, dtype=torch.float32, requires_grad=True)
@@ -268,7 +280,9 @@ def test_mhc_aggregate_slot_dtype_preserves_recompute_and_gradients(
     expected = (ref_hidden.view(3, 1, 2, 4) * ref_h_pre.unsqueeze(-1)).sum(dim=2).to(slot_dtype)
     expected.float().square().sum().backward()
 
-    aggregate, _, _, residual = module(hidden, mhc_recompute_manager=manager, output_slot=slot)
+    aggregate, _, _, residual = module(
+        hidden, mhc_recompute_manager=manager, output_slot=slot, return_residual=True
+    )
     assert residual.dtype == torch.float32
     assert aggregate.dtype == slot_dtype
     assert aggregate.data_ptr() == static_input.data_ptr()
@@ -291,8 +305,7 @@ def packed_split_layer(hybrid_split_wrapper, request, monkeypatch):
     import megatron.core.transformer.transformer_config as config_module
 
     monkeypatch.setattr(config_module, "is_te_min_version", lambda _version: True)
-    config = replace(
-        hybrid_split_wrapper.config,
+    config = _hybrid_split_config(
         is_hybrid_model=request.param == "hybrid",
         sequence_packing_scheduler="dp_balanced",
         max_seqlen_per_dp_cp_rank=8,
@@ -474,7 +487,8 @@ class TestMHCAttentionGraphSplitTHD:
             kwargs.update(route_kwargs)
             layer._te_cuda_graph_route_replay_state = (0, 0)
 
-        def produce(hidden, *, mhc_recompute_manager, output_slot):
+        def produce(hidden, *, mhc_recompute_manager, output_slot, return_residual):
+            assert return_residual is True
             assert output_slot is arena_slot
             assert layer._te_cuda_graph_route_replay_state == (0, 0)
             return output_slot.writer.copy_(hidden[..., :4]), "h_res", "h_post", hidden
@@ -528,6 +542,17 @@ class TestMHCAttentionGraphSplitTHD:
         layer.off_interface.exit_replay.assert_called_once_with()
 
 
+@pytest.fixture
+def isolated_mhc_compiler_cache():
+    """Keep graph/eager comparisons from inheriting another case's specialization budget."""
+    torch.compiler.reset()
+    try:
+        yield
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.mark.usefixtures("isolated_mhc_compiler_cache")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph regression requires a GPU")
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("mla_recompute", [False, True])
@@ -554,7 +579,7 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
     Utils.initialize_model_parallel()
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     model_parallel_cuda_manual_seed(123)
-    config = MLATransformerConfig(
+    config_kwargs = dict(
         num_layers=4 if hybrid else 2,
         hidden_size=64,
         num_attention_heads=4,
@@ -587,6 +612,7 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
         thd_max_packed_sequences=2 if packed else None,
         pad_packed_seq_alignment="max" if packed else None,
     )
+    config = MLATransformerConfig(**config_kwargs)
 
     def build_layers(layer_config):
         submodules = get_gpt_layer_with_transformer_engine_submodules(
@@ -616,11 +642,13 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
 
     try:
         reference = build_layers(
-            replace(
-                config,
-                cuda_graph_impl="none",
-                cuda_graph_modules=[],
-                mhc_recompute_attn_cuda_graph_split=False,
+            MLATransformerConfig(
+                **dict(
+                    config_kwargs,
+                    cuda_graph_impl="none",
+                    cuda_graph_modules=[],
+                    mhc_recompute_attn_cuda_graph_split=False,
+                )
             )
         )
         graphed = build_layers(config)
@@ -705,6 +733,13 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
             ):
                 assert (got.grad is None) == (want.grad is None), name
                 if want.grad is not None:
-                    torch.testing.assert_close(got.grad, want.grad, msg=name, **tolerance)
+                    torch.testing.assert_close(
+                        got.grad,
+                        want.grad,
+                        msg=lambda message, name=name, replay_index=replay_index: (
+                            f"replay {replay_index}, {name}: {message}"
+                        ),
+                        **tolerance,
+                    )
     finally:
         Utils.destroy_model_parallel()

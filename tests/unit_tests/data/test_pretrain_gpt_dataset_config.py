@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from megatron.training.arguments import parse_args
 
 
-def test_core_gpt_dataset_config_forwards_sft_mock_dataset_config(monkeypatch):
+def test_core_gpt_dataset_config_forwards_sft_mock_dataset_config(monkeypatch, run_config):
     import pretrain_gpt
 
     config_json = (

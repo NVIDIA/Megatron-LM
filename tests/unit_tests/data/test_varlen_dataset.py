@@ -9,6 +9,7 @@ varlen-specific contracts (auto-detect schema, normalize to messages,
 ValueError on unsupported shapes).
 """
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -587,7 +588,6 @@ def _write_jsonl(tmp_path: Path, rows):
 
 def test_low_level_loads_jsonl_alpaca(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -606,7 +606,6 @@ def test_low_level_loads_jsonl_alpaca(tmp_path):
 
 def test_low_level_loads_jsonl_sharegpt(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -625,7 +624,6 @@ def test_low_level_loads_jsonl_sharegpt(tmp_path):
 
 def test_low_level_loads_jsonl_messages(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -646,9 +644,8 @@ def test_low_level_loads_jsonl_messages(tmp_path):
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
     """Real datasets often mix rows that have / lack an optional field. Our
-    pandas-based loader must accept the union schema without ``CastError``."""
+    loader must accept the union schema without ``CastError``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     rows = [{"instruction": "a", "output": "x"}] * 100 + [
         {"instruction": "b", "output": "y", "file": "extra"}
     ] * 100
@@ -662,7 +659,6 @@ def test_low_level_jsonl_heterogeneous_columns(tmp_path):
 
 def test_low_level_rejects_unknown_schema(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(tmp_path, [{"foo": "bar"}])
     with pytest.raises(ValueError, match="cannot infer schema"):
         VarlenLowLevelDataset(path)
@@ -672,7 +668,6 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
     ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -1275,7 +1270,8 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     tokens = torch.arange(16, dtype=torch.int64).view(1, 16)
     padding_mask = tokens >= 10
     batch = {"tokens": tokens.clone(), "padding_mask": padding_mask.clone()}
-    result = get_batch_on_this_cp_rank(batch, cp_group=object())
+    # Main's DCP V2 API (ea99fdfce) makes dynamic_cp a required argument.
+    result = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=object())
 
     expected_indices = torch.tensor([2, 3, 12, 13])
     assert torch.equal(result["tokens"], tokens.index_select(1, expected_indices))
@@ -1288,7 +1284,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
     padding_mask = torch.tensor([[False, False, True, True]], dtype=torch.bool)
+    # NOTE(nightly-sync 26_10_2026): main's DCP V2 rewrite (ea99fdfce) made get_batch return a
+    # list in BATCH_KEYS order instead of dev's 7-tuple, so a TP receiver's batch must carry
+    # every key. Dev's assertion is unchanged in intent -- the dataset padding mask must still
+    # survive the handoff -- it is just addressed by name now that it is no longer last.
     source_batch = {
+        **dict.fromkeys(pretrain_gpt.BATCH_KEYS),
         "tokens": torch.tensor([[1, 2, 0, 0]], dtype=torch.int64),
         "labels": torch.tensor([[2, 0, 0, 0]], dtype=torch.int64),
         "loss_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
@@ -1302,27 +1303,48 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
         use_varlen_dataset=True,
         varlen_sbhd_validation=True,
         dynamic_context_parallel=False,
+        # Fields main's rewritten get_batch reads that dev's did not.
+        context_parallel_size=1,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        micro_batch_size=1,
+        seq_length=4,
+        pipeline_model_parallel_size=2,
     )
     config = SimpleNamespace(
-        virtual_pipeline_model_parallel_size=None, pad_packed_seq_alignment=None
+        virtual_pipeline_model_parallel_size=None,
+        pad_packed_seq_alignment=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=0,
     )
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
-    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+    # Merged pretrain_gpt carries main's aliased import, so patch the alias.
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
+    # Main's rewrite reads the process groups in get_batch itself rather than leaving them to
+    # the callee; stub them so this stays a single-process unit test. A non-zero TP rank keeps
+    # the batch on the broadcast-receive path, which is what exercises needs_padding_mask.
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_first_stage", lambda: False)
+    monkeypatch.setattr(pretrain_gpt.mpu, "is_pipeline_last_stage", lambda: False)
+    monkeypatch.setattr(pretrain_gpt, "get_context_parallel_group", lambda: None)
 
     def get_batch_on_this_tp_rank(*args, **kwargs):
         assert kwargs["needs_padding_mask"] is True
         return source_batch.copy()
 
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
-    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch, **_kwargs: batch)
     prebuild = MagicMock()
     monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
-    *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
+    returned = pretrain_gpt.get_batch(iter(()))
+    returned_padding_mask = returned[pretrain_gpt.BATCH_KEYS.index("padding_mask")]
     assert torch.equal(returned_padding_mask, padding_mask)
     prebuild.assert_not_called()
 
@@ -1331,14 +1353,21 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     """Every PP stage needs SBHD padding metadata for its local MoE layers."""
     import pretrain_gpt
 
-    args = SimpleNamespace(use_varlen_dataset=True, varlen_sbhd_validation=True)
+    # NOTE(nightly-sync 26_10_2026): sequence_packing_scheduler is explicit now because the
+    # merged is_dataset_built_on_rank keeps main's direct `args.sequence_packing_scheduler`
+    # read rather than dev's getattr, matching pretrain_hybrid's resolution.
+    args = SimpleNamespace(
+        use_varlen_dataset=True, varlen_sbhd_validation=True, sequence_packing_scheduler=None
+    )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(
         pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
     )
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
-    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+    # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
+    # varlen-SBHD disjunct should short-circuit before this is consulted at all.
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
 
@@ -1476,7 +1505,7 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate():
+def test_sbhd_validation_dataloader_uses_default_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1486,6 +1515,8 @@ def test_sbhd_validation_dataloader_uses_default_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         seq_len, mbs = 16, 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         # One global batch needs micro_batch_size * data_parallel_size samples;
         # size the dataset off the runtime DP world size so this passes under
         # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
@@ -1508,7 +1539,7 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate():
+def test_thd_dataloader_uses_identity_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1518,6 +1549,8 @@ def test_thd_dataloader_uses_identity_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=64, sbhd=False)
@@ -1537,7 +1570,7 @@ def test_thd_dataloader_uses_identity_collate():
         Utils.destroy_model_parallel()
 
 
-def test_dcp_dataloader_yields_microbatches_for_scheduler():
+def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1550,6 +1583,8 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         num_microbatches = 3
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
         n = gbs * 2
         cfg = _make_config(tok, seq_length=64, dp=dp, cp=1, dynamic_cp=True)
         variable = ["a", "abcdef", "xy", "qwerty"]
@@ -1578,12 +1613,48 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         Utils.destroy_model_parallel()
 
 
+def test_packing_scheduler_dataloader_yields_microbatches(run_config):
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The packing scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize(
     ("scheduler", "expected_prefetch_factor"),
     [("dp_balanced", 5), ("default_dynamic_cp", 5), (None, 2)],
 )
 def test_packing_scheduler_dataloader_prefetches_next_global_batch(
-    scheduler, expected_prefetch_factor
+    scheduler, expected_prefetch_factor, run_config
 ):
     from megatron.core import parallel_state
     from megatron.core.datasets.utils import Split
@@ -1597,6 +1668,9 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
         mbs, num_microbatches, num_workers = 2, 9, 2
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        run_config.validation.eval_micro_batch_size = mbs
         dynamic_cp = scheduler == "default_dynamic_cp"
         cfg = _make_config(tok, seq_length=64, dp=dp, dynamic_cp=dynamic_cp)
         ds = _build_varlen_for_loader(["abc"] * gbs * 2, cfg, num_samples=gbs * 2)
@@ -1622,3 +1696,46 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("entrypoint", ["pretrain_gpt", "pretrain_hybrid"])
+@pytest.mark.parametrize(
+    "sft, use_varlen_dataset, mock_data, expected_type, expected_packed",
+    [
+        (True, False, True, "MockSFTDataset", True),
+        (True, False, False, "SFTDataset", True),
+        (False, True, True, "MockVarlenDataset", True),
+        (False, True, False, "VarlenDataset", True),
+        (False, False, True, "MockGPTDataset", False),
+        (False, False, False, "GPTDataset", False),
+    ],
+)
+def test_datasets_provider_selects_dataset_type(
+    monkeypatch, entrypoint, sft, use_varlen_dataset, mock_data, expected_type, expected_packed
+):
+    """GPT and Hybrid pretraining select the same dataset type for each data mode."""
+    module = importlib.import_module(entrypoint)
+    args = SimpleNamespace(
+        sft=sft,
+        use_varlen_dataset=use_varlen_dataset,
+        mock_data=mock_data,
+        varlen_sbhd_validation=False,
+        fim_data=False,
+    )
+    built = {}
+
+    class _RecordingBuilder:
+        def __init__(self, dataset_type, num_samples, is_built_on_rank, config):
+            built.update(dataset_type=dataset_type, is_built_on_rank=is_built_on_rank)
+
+        def build(self):
+            return "train", "valid", "test"
+
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda _: None)
+    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+    monkeypatch.setattr(module, "print_rank_0", lambda *_args, **_kwargs: None)
+
+    assert module.train_valid_test_datasets_provider([1, 1, 1]) == ("train", "valid", "test")
+    assert built["dataset_type"] is getattr(module, expected_type)
+    assert built["is_built_on_rank"].keywords["is_packed_sequence"] is expected_packed

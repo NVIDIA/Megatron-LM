@@ -5,6 +5,7 @@
 set -euo pipefail
 
 TRAIN_ITERS=${TRAIN_ITERS:-20}
+PRETRAIN_MODULE=${MIMO_PRETRAIN_MODULE:-examples.mimo.pretrain_mimo}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EVAL_ITERS=${EVAL_ITERS:-0}
@@ -24,7 +25,7 @@ TORCHRUN_ARGS=(
 
 uv run --extra ssm python -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
-  -m examples.mimo.pretrain_mimo \
+  -m "${PRETRAIN_MODULE}" \
   --model-provider nemotron-moe-vlm \
   --dataset-provider mock \
   --image-token-id 511 \
@@ -71,15 +72,15 @@ uv run --extra ssm python -m torch.distributed.run \
   --seq-length 8192 \
   --max-position-embeddings 8192 \
   --bf16 \
-  --encoder-tp 2 \
-  --encoder-dp 2 \
-  --llm-offset 4 \
-  --llm-tp 2 \
-  --llm-cp 1 \
-  --llm-pp 1 \
-  --llm-dp "${LLM_DP}" \
-  --llm-ep 2 \
-  --llm-expt-tp 1 \
+  --mimo-encoder-tp 2 \
+  --mimo-encoder-dp 2 \
+  --mimo-llm-offset 4 \
+  --mimo-llm-tp 2 \
+  --mimo-llm-cp 1 \
+  --mimo-llm-pp 1 \
+  --mimo-llm-dp "${LLM_DP}" \
+  --mimo-llm-ep 2 \
+  --mimo-llm-expt-tp 1 \
   --tensor-parallel-num-weight-shards 4 \
   --expert-tensor-parallel-num-weight-shards 2 \
   --vocab-size 131072 \
@@ -98,7 +99,7 @@ uv run --extra ssm python -m torch.distributed.run \
   --use-distributed-optimizer \
   --overlap-grad-reduce \
   --overlap-param-gather \
-  --encoder-ddp-overlap \
+  --mimo-encoder-ddp-overlap \
   --train-iters "${TRAIN_ITERS}" \
   --eval-interval "${EVAL_INTERVAL}" \
   --eval-iters "${EVAL_ITERS}" \

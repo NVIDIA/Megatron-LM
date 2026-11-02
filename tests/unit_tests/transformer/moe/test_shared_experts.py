@@ -166,6 +166,7 @@ def _fake_shared_expert(**config_kwargs):
     shared_expert._fused_grouped_swiglu_recipe = None
     shared_expert._fused_grouped_swiglu_unit_scale = None
     shared_expert._fused_grouped_swiglu_tokens_per_expert = {}
+    shared_expert._grouped_linear_kwargs = {}
     return shared_expert
 
 
@@ -346,7 +347,7 @@ def test_fused_grouped_swiglu_ops_reject_input_modifying_hooks(monkeypatch):
 def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch):
     _patch_fake_shared_expert_te(monkeypatch)
     shared_expert = _fake_shared_expert()
-    hidden_states = torch.randn(2, 3, 4)
+    hidden_states = torch.randn(128, 2, 4)
 
     output = shared_expert._fused_grouped_swiglu_no_comm(hidden_states)
 
@@ -356,12 +357,21 @@ def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch)
     _, cached_tokens_per_expert, cached_scales, _ = ops.args
     assert output.shape == hidden_states.shape
     assert shared_expert._fused_grouped_swiglu_recipe.__class__ is _FakeMXFP8Recipe
-    assert hidden_states_2d.shape == (6, 4)
-    assert tokens_per_expert.tolist() == [6]
+    assert hidden_states_2d.shape == (256, 4)
+    assert tokens_per_expert.tolist() == [256]
     assert tokens_per_expert_again is tokens_per_expert
     torch.testing.assert_close(scales, torch.ones(1))
     assert cached_tokens_per_expert is tokens_per_expert
     assert cached_scales is scales
+
+
+def test_fused_grouped_swiglu_rejects_unaligned_input():
+    shared_expert = _fake_shared_expert()
+
+    with pytest.raises(ValueError, match="divisible by 256, but got 128"):
+        shared_expert._fused_grouped_swiglu_no_comm(torch.randn(64, 2, 4))
+
+    assert shared_expert._fused_grouped_swiglu_ops is None
 
 
 def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeypatch):
@@ -416,6 +426,89 @@ class TestSharedExperts:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch, overlap):
+        """The shared expert selects fused forward/backward ops using explicit alignment."""
+        import inspect
+
+        import transformer_engine.pytorch as te
+
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.transformer.mlp import MLPSubmodules
+
+        grouped_linear = getattr(getattr(te, "ops", None), "GroupedLinear", None)
+        if (
+            grouped_linear is None
+            or "split_alignment" not in inspect.signature(grouped_linear).parameters
+        ):
+            pytest.skip("Installed TE op fuser GroupedLinear lacks split_alignment")
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+        mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
+        if not mxfp8_available:
+            pytest.skip(reason)
+        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = dataclasses.replace(
+            self.config,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            moe_shared_expert_intermediate_size=256,
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=32,
+            moe_shared_expert_overlap=overlap,
+            use_cpu_initialization=False,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+        )
+        with get_fp8_context(config, is_init=True):
+            shared_expert = FusedSharedExpertMLP(
+                config,
+                MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+                gate=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            ).cuda()
+        hidden = torch.randn(
+            (128, 2, config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        if overlap:
+            shared_expert.pre_forward_comm(hidden)
+            shared_expert.linear_fc1_forward_and_act()
+            shared_expert.linear_fc2_forward()
+            shared_expert.post_forward_comm()
+            output = shared_expert.get_output()
+        else:
+            output = shared_expert(hidden)
+        output.backward(torch.randn_like(output))
+
+        (sequential,) = shared_expert._fused_grouped_swiglu_ops
+        assert sequential[0].split_alignment == 256
+        assert sequential[2].split_alignment == 256
+        (fuser,) = sequential._module_groups
+        assert len(fuser._forward_ops) == 1
+        assert len(fuser._backward_ops) == 1
+        assert isinstance(fuser._forward_ops[0][0], fused_cls)
+        assert fuser._backward_ops[0][0] is fuser._forward_ops[0][0]
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+        for tensor in (hidden, *shared_expert.parameters()):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad).all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -544,17 +637,11 @@ class TestSharedExperts:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("bias_activation_fusion", [True, False])
     def test_shared_expert_clamped_swiglu(self, bias_activation_fusion):
-        """
-        Verifies that ``activation_func_clamp_value`` is honored for SwiGLU shared
-        experts in both the overlapped and non-overlapped paths, and in both the
-        ``bias_activation_fusion`` and manual-glu code paths.
-        """
+        """Verify clamped SwiGLU parity for overlapped and synchronous shared experts."""
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
-
         clamp_value = 1.0
 
-        # Create MoE layer with shared expert overlap enabled.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=True,
             moe_token_dispatcher_type="alltoall",
@@ -562,8 +649,7 @@ class TestSharedExperts:
             bias_activation_fusion=bias_activation_fusion,
         ).to(dtype=torch.bfloat16)
 
-        # Create MoE layer with shared expert overlap disabled, sharing weights.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_no_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=False,
             moe_token_dispatcher_type="alltoall",
@@ -572,17 +658,15 @@ class TestSharedExperts:
         ).to(dtype=torch.bfloat16)
         moe_layer_no_overlap.load_state_dict(moe_layer_overlap.state_dict())
 
-        # Use a large input range to ensure the clamp actually triggers.
         hidden_states = (
             torch.randn((32, 2, self.config.hidden_size), device="cuda", dtype=torch.bfloat16) * 5.0
-        )
-        hidden_states = hidden_states.detach().requires_grad_(True)
+        ).requires_grad_(True)
         hidden_states_no_overlap = hidden_states.detach().clone().requires_grad_(True)
 
         output_overlap, _ = moe_layer_overlap(hidden_states)
         output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
 
-        cos_out = torch.nn.functional.cosine_similarity(
+        cos_out = F.cosine_similarity(
             output_overlap.flatten().unsqueeze(0).float(),
             output_no_overlap.flatten().unsqueeze(0).float(),
         ).item()
@@ -602,19 +686,16 @@ class TestSharedExperts:
                 f"max diff: {torch.max(torch.abs(p_overlap.grad - p_no_overlap.grad))}"
             )
 
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_unclamped = self.get_moe_layer(
             moe_shared_expert_overlap=False,
             moe_token_dispatcher_type="alltoall",
             activation_func_clamp_value=None,
-            situ_glu_beta1=4.0,
-            situ_glu_beta2=25.0,
-            use_fused_weighted_squared_relu=False,
             bias_activation_fusion=bias_activation_fusion,
         ).to(dtype=torch.bfloat16)
         moe_layer_unclamped.load_state_dict(moe_layer_overlap.state_dict())
 
-        hidden_states_unclamped = hidden_states.clone().detach().requires_grad_(True)
+        hidden_states_unclamped = hidden_states.detach().clone().requires_grad_(True)
         output_unclamped, _ = moe_layer_unclamped(hidden_states_unclamped)
         assert not torch.allclose(output_no_overlap, output_unclamped), (
             "Clamping had no observable effect on shared-expert output; "

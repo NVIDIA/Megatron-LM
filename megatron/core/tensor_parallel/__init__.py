@@ -12,6 +12,7 @@ from .layers import (
     VocabParallelEmbedding,
     copy_gtp_attributes,
     copy_tensor_model_parallel_attributes,
+    gtp_local_pad_zero_count,
     linear_with_grad_accumulation_and_async_allreduce,
     param_is_not_gtp_duplicate,
     param_is_not_tensor_parallel_duplicate,
@@ -63,6 +64,7 @@ __all__ = [
     "copy_gtp_attributes",
     "param_is_not_tensor_parallel_duplicate",
     "param_is_not_gtp_duplicate",
+    "gtp_local_pad_zero_count",
     "linear_with_grad_accumulation_and_async_allreduce",
     # mappings.py
     "copy_to_tensor_model_parallel_region",

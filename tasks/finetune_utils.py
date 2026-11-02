@@ -9,9 +9,10 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.training import get_args, get_timers, print_rank_0
+from megatron.core.num_microbatches_calculator import get_num_microbatches, update_num_microbatches
+from megatron.training import get_args, get_timers, get_train_state, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import get_run_config
 from megatron.training.training import (
     evaluate_and_print_results,
     setup_model_and_optimizer,
@@ -161,7 +162,9 @@ def _train(
     end_of_epoch_callback,
 ):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     assert (
@@ -176,9 +179,8 @@ def _train(
     losses_dict_sum = {}
 
     # Starting epoch and iteration
-    start_epoch = args.iteration // args.train_iters_per_epoch
-    start_iteration = args.iteration % args.train_iters_per_epoch
-    iteration = args.iteration
+    start_epoch = train_state.iteration // args.train_iters_per_epoch
+    start_iteration = train_state.iteration % args.train_iters_per_epoch
 
     # Memory reporting flag.
     report_memory_flag = True
@@ -189,7 +191,7 @@ def _train(
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(args.seed + epoch)
+        train_dataloader.sampler.set_epoch(cfg.rng.seed + epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
@@ -204,17 +206,17 @@ def _train(
             out = train_step(forward_step, batch, model, optimizer, opt_param_scheduler)
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
-            iteration += 1
+            train_state.iteration += 1
 
             # Logging.
             params_norm = None
-            if args.log_params_norm:
+            if cfg.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(
                 losses_dict,
                 losses_dict_sum,
                 optimizer.param_groups[0]['lr'],
-                iteration,
+                train_state.iteration,
                 optimizer.get_loss_scale().item(),
                 report_memory_flag,
                 skipped_iter,
@@ -224,37 +226,44 @@ def _train(
             )
 
             # Autoresume
-            if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
-                check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
+            if args.adlr_autoresume and (
+                train_state.iteration % args.adlr_autoresume_interval == 0
+            ):
+                check_adlr_autoresume_termination(
+                    train_state.iteration, model, optimizer, opt_param_scheduler
+                )
 
             # Checkpointing
             saved_checkpoint = False
-            if args.save and args.save_interval and iteration % args.save_interval == 0:
-                save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            if args.save and args.save_interval and train_state.iteration % args.save_interval == 0:
+                save_checkpoint(train_state.iteration, model, optimizer, opt_param_scheduler)
                 saved_checkpoint = True
 
             # Evaluation
             if (
                 args.eval_interval
-                and iteration % args.eval_interval == 0
-                and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter)
+                and train_state.iteration % args.eval_interval == 0
+                and (
+                    args.start_eval_at_iter is None
+                    or train_state.iteration >= args.start_eval_at_iter
+                )
             ):
-                prefix = 'iteration {}'.format(iteration)
+                prefix = 'iteration {}'.format(train_state.iteration)
                 evaluate_and_print_results(
-                    prefix, forward_step, valid_dataloader, model, iteration, None, False
+                    prefix, forward_step, valid_dataloader, model, train_state.iteration, None, False
                 )
 
             # Exiting based on iterations
-            if args.exit_interval and iteration % args.exit_interval == 0:
+            if args.exit_interval and train_state.iteration % args.exit_interval == 0:
                 if not saved_checkpoint:
-                    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+                    save_checkpoint(train_state.iteration, model, optimizer, opt_param_scheduler)
                 torch.distributed.barrier()
-                print_rank_0('exiting program at iteration {}'.format(iteration))
+                print_rank_0('exiting program at iteration {}'.format(train_state.iteration))
                 sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            save_checkpoint(train_state.iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
@@ -271,6 +280,7 @@ def finetune(
 ):
     """Main finetune function used across all tasks."""
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
     # Train and validation data loaders.
@@ -300,12 +310,13 @@ def finetune(
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
     timers('pretrained checkpoint', log_level=0).start(barrier=True)
-    if args.iteration == 0 and args.pretrained_checkpoint is not None:
+    if train_state.iteration == 0 and args.pretrained_checkpoint is not None:
         original_load = args.load
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
         args.no_load_rng = True
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, restore_training_state=True)
+        update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
         args.load = original_load
         args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure

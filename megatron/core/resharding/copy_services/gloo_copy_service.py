@@ -18,6 +18,8 @@ class GlooCopyService(CopyService):
     process group instead of NCCL.
     """
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self, group=None):
         super().__init__(group=group)
         if group is not None:
@@ -70,6 +72,7 @@ class GlooCopyService(CopyService):
             pairs = match_local_ops_by_task_id(
                 local_sends, local_recv_objs, "GlooCopyService", self.rank
             )
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad(), torch.cuda.stream(self._copy_stream):
                 for send_op, recv_op in pairs:
                     src_tensor = send_op.tensor

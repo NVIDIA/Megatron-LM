@@ -1008,10 +1008,21 @@ def test_mtp_block_and_layer_publish_one_repeat(shared_components):
             observed_repeats.append(
                 is_mtp_repeated_sharing_source(forward_state, config.num_layers + 1)
             )
-            return hidden_states + 1, input_ids, position_ids, padding_mask
+            return (
+                hidden_states + 1,
+                input_ids,
+                position_ids,
+                padding_mask,
+                kwargs.get("mtp_input_mask"),
+            )
 
     block = SimpleNamespace(
-        config=config, vp_stage=None, mtp_use_repeated_layer=True, layers=[FakeRepeatedLayer()]
+        config=config,
+        vp_stage=None,
+        pp_rank=None,
+        cp_group=None,
+        mtp_use_repeated_layer=True,
+        layers=[FakeRepeatedLayer()],
     )
     hidden_states = torch.randn(4, 1, 3)
 
@@ -1058,11 +1069,13 @@ def test_mtp_block_cleans_dsa_payload_when_a_later_depth_fails(monkeypatch, nest
             _, shared_payload = attention._prepare_mtp_sharing_payload(None, None)
             shared_payload.latent_kv_by_layer[attention.layer_number] = source_input.square()
             shared_payload.topk_by_layer[attention.layer_number] = ordinary_source_topk
-            return hidden_states + 1, input_ids, position_ids, padding_mask
+            return hidden_states + 1, input_ids, position_ids, padding_mask, None
 
     block = SimpleNamespace(
         config=attention.config,
         vp_stage=None,
+        pp_rank=None,
+        cp_group=None,
         mtp_use_repeated_layer=True,
         layers=[FailingRepeatedLayer()],
     )
@@ -1121,13 +1134,13 @@ def test_mtp_layer_preserves_inner_signature_without_prediction_depth():
             padding_mask=None,
             input_ids=None,
             *,
-            inference_params=None,
+            inference_context=None,
         ):
             calls.append(True)
             return hidden_states, None
 
     layer = SimpleNamespace(
-        config=SimpleNamespace(fp8=None, sequence_parallel=False),
+        config=SimpleNamespace(fp8=None, fp4=None, sequence_parallel=False),
         sequence_parallel=False,
         mtp_layer_pattern=None,
         mtp_model_layer=StrictLegacyTransformerLayer(),
@@ -1166,20 +1179,27 @@ def test_mtp_block_preserves_legacy_layer_signature_when_sharing_is_disabled(sha
             packed_seq_params,
             sequence_roll_context,
             roll_depth,
+            packed_seq_params_by_layout,
+            cp_layout_plan,
             sequence_len_offset,
             embedding,
+            decoder_input,
+            mtp_input_mask,
         ):
             observed_depths.append(roll_depth)
-            return hidden_states + 1, input_ids, position_ids, padding_mask
+            return hidden_states + 1, input_ids, position_ids, padding_mask, mtp_input_mask
 
     block = SimpleNamespace(
         config=SimpleNamespace(
             pipeline_model_parallel_size=1,
             mtp_num_layers=2,
             mtp_detach_heads=False,
+            mtp_hsm=False,
             mtp_repeated_layer_shared_components=shared_components,
         ),
         vp_stage=None,
+        pp_rank=None,
+        cp_group=None,
         mtp_use_repeated_layer=True,
         layers=[LegacyRepeatedLayer()],
     )
@@ -1203,7 +1223,7 @@ def test_cross_depth_sharing_rejects_hybrid_mtp_pattern():
         MultiTokenPredictionLayer(
             config=config,
             submodules=SimpleNamespace(mtp_model_layer=None),
-            pg_collection=SimpleNamespace(cp=None, tp=None),
+            pg_collection=SimpleNamespace(cp=None, tp=None, pp=SimpleNamespace(rank=lambda: 0)),
             mtp_layer_pattern="M",
         )
 

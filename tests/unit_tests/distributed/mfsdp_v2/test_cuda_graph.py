@@ -9,9 +9,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -40,8 +40,8 @@ class NestedModel(nn.Module):
         return x
 
 
-def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+def _default_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 # CUDA graph capture without symmetric memory is supported and runs by default. The symmetric
@@ -82,7 +82,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     static_input = torch.eye(dim, device=device)
     static_target = torch.zeros_like(static_input)
 
-    placements = _flat_placements()
+    placements = _default_placements()
     with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements)

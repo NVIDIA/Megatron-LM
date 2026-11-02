@@ -40,6 +40,7 @@ spec:
   script: |-
     rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
+    set -euo pipefail
     ls
     cd /opt/megatron-lm
 

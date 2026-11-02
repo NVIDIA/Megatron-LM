@@ -20,9 +20,13 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear, TENor
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
+    DSAttention,
     fused_qk_topk_naive,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -120,6 +124,53 @@ def test_fp32_weights_projection_ensures_weight_ready_before_direct_gemm(monkeyp
 
     assert output is expected
     assert events == ["ready", "gemm"]
+
+
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order(with_gate):
+    events = []
+
+    def deferred_linear(name):
+        return SimpleNamespace(backward_dw=lambda: events.append(name))
+
+    indexer = SimpleNamespace(
+        linear_wq_b=deferred_linear("indexer_wq_b"),
+        linear_wk=deferred_linear("indexer_wk"),
+        linear_weights_proj=deferred_linear("indexer_weights_proj"),
+    )
+    indexer.backward_dw = lambda: DSAIndexer.backward_dw(indexer)
+    core_attention = SimpleNamespace(indexer=indexer)
+    core_attention.backward_dw = lambda: DSAttention.backward_dw(core_attention)
+    owner = SimpleNamespace(
+        core_attention=core_attention,
+        linear_gate=deferred_linear("gate") if with_gate else None,
+        _backward_kv_proj=lambda: events.append("kv"),
+        _backward_q_proj=lambda: events.append("q"),
+        _backward_output_proj=lambda: events.append("output"),
+    )
+
+    AbsorbedMLASelfAttention.backward_dw(owner)
+
+    expected = ["kv", "q"] + (["gate"] if with_gate else [])
+    assert events == expected + ["indexer_wq_b", "indexer_wk", "indexer_weights_proj", "output"]
+
+
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_absorbed_mla_backward_dw_allows_core_without_deferred_wgrad(with_gate):
+    events = []
+    owner = SimpleNamespace(
+        core_attention=object(),
+        linear_gate=(
+            SimpleNamespace(backward_dw=lambda: events.append("gate")) if with_gate else None
+        ),
+        _backward_kv_proj=lambda: events.append("kv"),
+        _backward_q_proj=lambda: events.append("q"),
+        _backward_output_proj=lambda: events.append("output"),
+    )
+
+    AbsorbedMLASelfAttention.backward_dw(owner)
+
+    assert events == ["kv", "q"] + (["gate"] if with_gate else []) + ["output"]
 
 
 @pytest.fixture(autouse=True)
@@ -262,23 +313,6 @@ def test_precision_config_contract_is_validated_when_dsa_indexer_is_unused():
             ),
             experimental_attention_variant=None,
             dsa_indexer_weights_proj_output_dtype="fp8",
-        )
-
-
-@pytest.mark.internal
-def test_dsv4_config_validates_dsa_indexer_precision_contract():
-    """DSA indexer precision fields remain self-consistent when DSv4 is selected."""
-    with pytest.raises(ValueError, match="requires.*use_quantization=False"):
-        dataclasses.replace(
-            _make_config(
-                use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend="none"
-            ),
-            experimental_attention_variant="dsv4_hybrid",
-            csa_compress_ratios=[4],
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
-            dsa_indexer_weights_proj_use_quantization=True,
-            dsa_indexer_weights_proj_output_dtype="fp32",
         )
 
 
@@ -720,6 +754,10 @@ def test_unquantized_fp32_tilelang_dsa_matches_native():
 
 
 @pytest.mark.internal
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10,
+    reason="cuDNN DSA parity requires the SM100 FlashMLA kernels included in the CI image",
+)
 def test_unquantized_bf16_cudnn_dsa_matches_native():
     """cuDNN must retain its BF16 weights-tensor contract when quantization is bypassed."""
     run_absorbed_mla_dsa_parity(
@@ -732,3 +770,20 @@ def test_unquantized_bf16_cudnn_dsa_matches_native():
         dsa_indexer_weights_proj_use_quantization=False,
         dsa_indexer_weights_proj_output_dtype="bf16",
     )
+
+
+@pytest.mark.internal
+def test_dsv4_config_validates_dsa_indexer_precision_contract():
+    """DSA indexer precision fields remain self-consistent when DSv4 is selected."""
+    with pytest.raises(ValueError, match="requires.*use_quantization=False"):
+        dataclasses.replace(
+            _make_config(
+                use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend="none"
+            ),
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=[4],
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            dsa_indexer_weights_proj_use_quantization=True,
+            dsa_indexer_weights_proj_output_dtype="fp32",
+        )
