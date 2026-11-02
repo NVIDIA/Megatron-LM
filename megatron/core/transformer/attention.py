@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import copy
 import functools
+import importlib.metadata
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -111,10 +112,11 @@ except ImportError:
     HAVE_FMLA = False
 
 try:
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.mla import get_trtllm_gen_fmha_module, trtllm_batch_decode_with_kv_cache_mla
 
     HAVE_FLASHINFER_MLA = True
 except ImportError:
+    get_trtllm_gen_fmha_module = None
     trtllm_batch_decode_with_kv_cache_mla = None
     HAVE_FLASHINFER_MLA = False
 
@@ -294,32 +296,82 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
+@functools.lru_cache(maxsize=None)
+def _missing_flashinfer_prebuilt_kernels() -> Optional[str]:
+    """The FlashInfer kernel wheels missing for TRTLLM-GEN MLA decode, or None if none are.
+
+    That decode runs prebuilt cubins (``flashinfer-cubin``) through a compiled launcher
+    (``flashinfer-jit-cache``). Both wheels ship at flashinfer-python's own version, from
+    FlashInfer's index. Without a matching copy of either, FlashInfer downloads the cubins and
+    compiles the launcher with nvcc at its first call, which fails without network access and
+    otherwise stalls the first decode step, inside CUDA-graph warmup, for minutes.
+    """
+    try:
+        flashinfer_version = importlib.metadata.version("flashinfer-python")
+    except importlib.metadata.PackageNotFoundError:
+        return "flashinfer-python"
+    missing = []
+    for package in ("flashinfer-cubin", "flashinfer-jit-cache"):
+        try:
+            # flashinfer-jit-cache carries its CUDA version as a local label (e.g. +cu130).
+            installed = importlib.metadata.version(package).split("+")[0]
+        except importlib.metadata.PackageNotFoundError:
+            installed = None
+        if installed != flashinfer_version:
+            missing.append(f"{package}=={flashinfer_version}")
+    return ", ".join(missing) if missing else None
+
+
+def resolve_absorbed_mla_decode_kernel(
+    config: MLATransformerConfig, num_attention_heads: int
+) -> Tuple[Optional[str], str]:
+    """The kernel get_absorbed_mla_decode_kernel returns, and why none covers the layer when it
+    returns None."""
+    if (config.kv_lora_rank, config.qk_pos_emb_head_dim) != (512, 64):
+        return None, (
+            "the MLA decode kernels take kv_lora_rank 512 with a 64-dim RoPE part, not "
+            f"{config.kv_lora_rank} with {config.qk_pos_emb_head_dim}"
+        )
+    if not torch.cuda.is_available():
+        return None, "CUDA is not available"
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) == (9, 0):
+        return ("flash_mla", "") if HAVE_FMLA else (None, "flash_mla is not installed")
+    if major != 10:
+        return None, f"no MLA decode kernel runs on compute capability {major}.{minor}"
+    if not HAVE_FLASHINFER_MLA:
+        return None, "FlashInfer is not installed"
+    if config.params_dtype != torch.bfloat16:
+        return None, f"FlashInfer's MLA decode is bf16-only, not {config.params_dtype}"
+    if not (num_attention_heads <= 64 or num_attention_heads % 64 == 0):
+        return None, (
+            f"FlashInfer's TRTLLM-GEN MLA decode has no kernel for {num_attention_heads} heads "
+            "per rank, only for up to 64 and for multiples of 64"
+        )
+    missing = _missing_flashinfer_prebuilt_kernels()
+    if missing is not None:
+        return None, (
+            f"FlashInfer's prebuilt kernels are not installed ({missing}; "
+            "`flashinfer download-kernels` installs them)"
+        )
+    return "flashinfer", ""
+
+
 def get_absorbed_mla_decode_kernel(
     config: MLATransformerConfig, num_attention_heads: int
 ) -> Optional[str]:
     """Return the kernel that runs absorbed MLA decode over the cached latents on this device.
 
     ``"flash_mla"`` is FlashMLA's dense decode, which exists only for SM90. ``"flashinfer"`` is
-    FlashInfer's TRTLLM-GEN MLA decode for SM100 and SM103, which takes the same 64-token latent
-    pages, but only in bf16 and not with 64 < heads < 128. Both need DeepSeek's latent shape
-    (``kv_lora_rank`` 512 plus a 64-dim RoPE part). Returns None when no kernel covers the layer
-    on this device: its decode steps then up-project the cached latents like every other step.
+    FlashInfer's TRTLLM-GEN MLA decode for SM100 and SM103. It takes the same 64-token latent
+    pages, in bf16 only, and tiles heads by up to 64: it has kernels for up to 64 heads per rank
+    and for multiples of 64. It is picked only when FlashInfer's prebuilt kernel wheels are
+    installed, so a decode step never downloads cubins or compiles. Both need DeepSeek's latent
+    shape (``kv_lora_rank`` 512 plus a 64-dim RoPE part). Returns None when no kernel covers the
+    layer on this device: its decode steps then up-project the cached latents like every other
+    step.
     """
-    if (config.kv_lora_rank, config.qk_pos_emb_head_dim) != (512, 64):
-        return None
-    if not torch.cuda.is_available():
-        return None
-    major, minor = torch.cuda.get_device_capability()
-    if (major, minor) == (9, 0):
-        return "flash_mla" if HAVE_FMLA else None
-    if (
-        major == 10
-        and HAVE_FLASHINFER_MLA
-        and config.params_dtype == torch.bfloat16
-        and not 64 < num_attention_heads < 128
-    ):
-        return "flashinfer"
-    return None
+    return resolve_absorbed_mla_decode_kernel(config, num_attention_heads)[0]
 
 
 @functools.lru_cache(maxsize=None)
@@ -327,6 +379,45 @@ def get_flashinfer_mla_workspace(device: int) -> Tensor:
     """FlashInfer's MLA decode workspace for ``device``, which holds the partial results of its
     split-KV launches. Layers run one at a time, so all of them share it."""
     return torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+
+def prepare_flashinfer_mla_decode(device: int) -> None:
+    """Allocate FlashInfer's MLA decode workspace on ``device`` and load its TRTLLM-GEN module.
+
+    get_absorbed_mla_decode_kernel picks FlashInfer only when its prebuilt kernels are installed,
+    so loading the module reads them from disk and neither downloads nor compiles anything.
+    """
+    get_flashinfer_mla_workspace(device)
+    get_trtllm_gen_fmha_module()
+
+
+# Per device, the semaphore buffers handed to FlashInfer's MLA decode, the largest last. Smaller,
+# earlier ones stay referenced, since CUDA graphs captured with them keep their addresses.
+_flashinfer_mla_counter_buffers: Dict[int, List[Tensor]] = {}
+
+
+def get_flashinfer_mla_counter_buffer(
+    device: torch.device, num_requests: int, num_heads: int
+) -> Optional[Tensor]:
+    """Zeroed semaphores for the split-KV reduction of FlashInfer's TRTLLM-GEN MLA decode: one
+    int32 per request and head, at least one per SM, rounded up to 8.
+
+    The kernel resets the semaphores after each launch, so a buffer zeroed once serves every
+    later call on the device, where FlashInfer would allocate and zero one per call. A larger
+    buffer is allocated only outside CUDA-graph capture, so its zeroing has run before any
+    kernel reads it; a call captured before one exists gets None, and FlashInfer then zeroes
+    its own inside the graph.
+    """
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    num_bytes = 4 * (-(-max(num_requests * num_heads, sm_count) // 8) * 8)
+    buffers = _flashinfer_mla_counter_buffers.setdefault(device.index, [])
+    if buffers and buffers[-1].numel() >= num_bytes:
+        return buffers[-1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    # Round up so that slowly growing batches allocate rarely.
+    buffers.append(torch.zeros(1 << (num_bytes - 1).bit_length(), dtype=torch.uint8, device=device))
+    return buffers[-1]
 
 
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
@@ -1315,6 +1406,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         # The kernel adds exp(sink) to each head's softmax denominator.
                         sinks=None if softmax_offset is None else softmax_offset.float(),
                         backend="trtllm-gen",
+                        multi_ctas_kv_counter_buffer=get_flashinfer_mla_counter_buffer(
+                            q.device, q.shape[0], q.shape[2]
+                        ),
                     )
                 else:
                     num_heads_k = 1  # Only a single head for MLA Flash

@@ -449,26 +449,31 @@ def test_mla_flash_prefill_dispatch_sink_offset_replays(softmax_type):
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and FlashInfer")
-def test_mla_flashinfer_decode_dispatch_sink_offset_replays():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# FlashInfer picks the kernel family, and how split-KV partials are reduced, by head count.
+@pytest.mark.parametrize("heads", [16, 64, 128])
+def test_mla_flashinfer_decode_dispatch_sink_offset_replays(heads):
     """The FlashInfer MLA decode that dynamic-inference MLA runs on SM100/SM103 replays
     bit-exactly, with the sink offset applied by the kernel."""
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
+    from megatron.core.transformer.attention import resolve_absorbed_mla_decode_kernel
     from megatron.core.transformer.enums import AttnMaskType
     from megatron.core.transformer.multi_latent_attention import MLASelfAttention
     from megatron.core.transformer.transformer_config import MLATransformerConfig
     from megatron.core.utils import is_te_min_version
     from tests.unit_tests.test_utilities import Utils
 
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("FlashInfer's MLA decode runs on SM100 and SM103")
     if not is_te_min_version("2.8.0"):
         pytest.skip("softmax_type requires Transformer Engine >= 2.8.0")
 
     Utils.initialize_model_parallel()
     try:
         seeded()
-        heads, latent_dim = 16, 512 + 64
+        latent_dim = 512 + 64
         config = MLATransformerConfig(
             num_layers=1,
             hidden_size=512,
@@ -494,8 +499,9 @@ def test_mla_flashinfer_decode_dispatch_sink_offset_replays():
             config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
         ).cuda()
         module.eval()
-        if module.absorbed_decode_kernel != "flashinfer":
-            pytest.skip("requires FlashInfer's MLA decode (SM100 or SM103)")
+        assert module.absorbed_decode_kernel == "flashinfer", resolve_absorbed_mla_decode_kernel(
+            config, heads
+        )[1]
         with torch.no_grad():
             module.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
 

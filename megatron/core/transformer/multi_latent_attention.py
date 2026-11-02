@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import functools
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -39,8 +41,8 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import (
     Attention,
     LinearProjBuilder,
-    get_absorbed_mla_decode_kernel,
-    get_flashinfer_mla_workspace,
+    prepare_flashinfer_mla_decode,
+    resolve_absorbed_mla_decode_kernel,
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
@@ -52,6 +54,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
     is_te_min_version,
+    log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
 )
 
@@ -128,6 +131,20 @@ else:
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_unabsorbed_decode(reason: str) -> None:
+    """Warn, once per reason, that MLA layers decode without an absorbed kernel."""
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Dynamic MLA decode steps run unabsorbed: {reason}. Each decode step up-projects "
+        "the layer's whole latent cache to keys and values and runs FlashAttention over them, "
+        "as a mixed step does, which makes decoding much slower.",
+    )
 
 
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
@@ -347,14 +364,17 @@ class MultiLatentAttention(Attention):
         self.cache_mla_latents = self.config.cache_mla_latents
         # The kernel for absorbed decode over the cached latents on this device, or None if
         # none covers this layer (see _absorbs_cached_latents).
-        self.absorbed_decode_kernel = (
-            get_absorbed_mla_decode_kernel(self.config, self.num_attention_heads_per_partition)
-            if self.cache_mla_latents
-            else None
-        )
+        self.absorbed_decode_kernel = None
+        if self.cache_mla_latents:
+            self.absorbed_decode_kernel, reason = resolve_absorbed_mla_decode_kernel(
+                self.config, self.num_attention_heads_per_partition
+            )
+            if self.absorbed_decode_kernel is None and not self.batch_invariant_mode:
+                _warn_unabsorbed_decode(reason)
         if self.absorbed_decode_kernel == "flashinfer":
-            # Allocate the shared workspace now, before the KV cache and any CUDA-graph capture.
-            get_flashinfer_mla_workspace(torch.cuda.current_device())
+            # Before the KV cache and any CUDA-graph capture, so a failure shows here and not
+            # at the first decode step.
+            prepare_flashinfer_mla_decode(torch.cuda.current_device())
 
         if self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(

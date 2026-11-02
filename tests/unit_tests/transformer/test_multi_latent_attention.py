@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+import importlib.metadata
 import math
 import os
 import subprocess
@@ -2764,30 +2765,76 @@ class TestMLALatentCacheDecode:
         "capability",
         "have_flash_mla",
         "have_flashinfer",
+        "missing_prebuilt",
         "latent_shape",
         "num_heads",
         "params_dtype",
         "expected",
     ),
     [
-        pytest.param((9, 0), True, True, (512, 64), 16, torch.bfloat16, "flash_mla", id="sm90"),
-        pytest.param((9, 0), False, True, (512, 64), 16, torch.bfloat16, None, id="sm90-no-fmla"),
-        pytest.param((9, 0), True, True, (256, 64), 16, torch.bfloat16, None, id="sm90-rank256"),
-        pytest.param((10, 0), True, True, (512, 64), 16, torch.bfloat16, "flashinfer", id="sm100"),
         pytest.param(
-            (10, 3), True, True, (512, 64), 128, torch.bfloat16, "flashinfer", id="sm103-128h"
+            (9, 0), True, True, None, (512, 64), 16, torch.bfloat16, "flash_mla", id="sm90"
         ),
-        pytest.param((10, 0), True, True, (512, 64), 96, torch.bfloat16, None, id="sm100-96h"),
-        pytest.param((10, 0), True, True, (512, 64), 16, torch.float16, None, id="sm100-fp16"),
-        pytest.param((10, 0), True, False, (512, 64), 16, torch.bfloat16, None, id="sm100-no-fi"),
-        pytest.param((12, 0), True, True, (512, 64), 16, torch.bfloat16, None, id="sm120"),
+        pytest.param(
+            (9, 0), False, True, None, (512, 64), 16, torch.bfloat16, None, id="sm90-no-fmla"
+        ),
+        pytest.param(
+            (9, 0), True, True, None, (256, 64), 16, torch.bfloat16, None, id="sm90-rank256"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 16, torch.bfloat16, "flashinfer", id="sm100"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 24, torch.bfloat16, "flashinfer", id="sm100-24h"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 64, torch.bfloat16, "flashinfer", id="sm100-64h"
+        ),
+        pytest.param(
+            (10, 3), True, True, None, (512, 64), 128, torch.bfloat16, "flashinfer", id="sm103-128h"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 192, torch.bfloat16, "flashinfer", id="sm100-192h"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 96, torch.bfloat16, None, id="sm100-96h"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 160, torch.bfloat16, None, id="sm100-160h"
+        ),
+        pytest.param(
+            (10, 0), True, True, None, (512, 64), 16, torch.float16, None, id="sm100-fp16"
+        ),
+        pytest.param(
+            (10, 0), True, False, None, (512, 64), 16, torch.bfloat16, None, id="sm100-no-fi"
+        ),
+        pytest.param(
+            (10, 0),
+            True,
+            True,
+            "flashinfer-cubin==0.7.2.post1",
+            (512, 64),
+            16,
+            torch.bfloat16,
+            None,
+            id="sm100-no-prebuilt-kernels",
+        ),
+        pytest.param((12, 0), True, True, None, (512, 64), 16, torch.bfloat16, None, id="sm120"),
     ],
 )
 def test_absorbed_mla_decode_kernel_follows_device(
-    capability, have_flash_mla, have_flashinfer, latent_shape, num_heads, params_dtype, expected
+    capability,
+    have_flash_mla,
+    have_flashinfer,
+    missing_prebuilt,
+    latent_shape,
+    num_heads,
+    params_dtype,
+    expected,
 ):
-    """FlashMLA runs absorbed MLA decode on SM90 and FlashInfer on SM100 and SM103; a layer that
-    neither covers gets no absorbed decode kernel."""
+    """FlashMLA runs absorbed MLA decode on SM90 and FlashInfer on SM100 and SM103, for the head
+    counts its kernels tile and only from its prebuilt kernels; a layer that neither covers gets
+    no absorbed decode kernel, and a reason."""
     config = SimpleNamespace(
         kv_lora_rank=latent_shape[0], qk_pos_emb_head_dim=latent_shape[1], params_dtype=params_dtype
     )
@@ -2796,9 +2843,59 @@ def test_absorbed_mla_decode_kernel_follows_device(
         mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
         mock.patch.object(attention_module, "HAVE_FMLA", have_flash_mla),
         mock.patch.object(attention_module, "HAVE_FLASHINFER_MLA", have_flashinfer),
+        mock.patch.object(
+            attention_module, "_missing_flashinfer_prebuilt_kernels", return_value=missing_prebuilt
+        ),
     ):
-        kernel = attention_module.get_absorbed_mla_decode_kernel(config, num_heads)
+        kernel, reason = attention_module.resolve_absorbed_mla_decode_kernel(config, num_heads)
+        assert attention_module.get_absorbed_mla_decode_kernel(config, num_heads) == kernel
     assert kernel == expected
+    assert bool(reason) is (expected is None)
+    if missing_prebuilt is not None:
+        assert missing_prebuilt in reason
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [
+        pytest.param(
+            {
+                "flashinfer-python": "0.7.2.post1",
+                "flashinfer-cubin": "0.7.2.post1",
+                "flashinfer-jit-cache": "0.7.2.post1+cu130",
+            },
+            None,
+            id="matching",
+        ),
+        pytest.param(
+            {"flashinfer-python": "0.7.2.post1", "flashinfer-jit-cache": "0.7.2.post1+cu130"},
+            "flashinfer-cubin==0.7.2.post1",
+            id="no-cubin",
+        ),
+        pytest.param(
+            {
+                "flashinfer-python": "0.7.2.post1",
+                "flashinfer-cubin": "0.7.0",
+                "flashinfer-jit-cache": "0.7.2+cu130",
+            },
+            "flashinfer-cubin==0.7.2.post1, flashinfer-jit-cache==0.7.2.post1",
+            id="other-version",
+        ),
+    ],
+)
+def test_flashinfer_prebuilt_kernels_match_flashinfer_version(installed, expected):
+    """FlashInfer's MLA decode counts as prebuilt only with flashinfer-cubin and
+    flashinfer-jit-cache at flashinfer-python's version: FlashInfer ignores a mismatched copy and
+    downloads and compiles instead."""
+
+    def version(package):
+        if package not in installed:
+            raise importlib.metadata.PackageNotFoundError(package)
+        return installed[package]
+
+    with mock.patch.object(importlib.metadata, "version", side_effect=version):
+        missing = attention_module._missing_flashinfer_prebuilt_kernels.__wrapped__()
+    assert missing == expected
 
 
 def _absorbed_decode_reference(q, latents, block_table, seqlens_k, scale, softmax_offset=None):
@@ -2871,12 +2968,20 @@ def _latent_decode_inputs(lengths, tokens_per_request, num_heads, unwritten=None
     )
 
 
+# FlashInfer's TRTLLM-GEN MLA decode picks its kernel family by head count: up to 32 heads per
+# rank a SwapsMmaAb kernel that reduces split-KV partials in-kernel, at 64 SwapsMmaAb or KeepsMmaAb
+# depending on the load, at 128 a 2-CTA KeepsMmaAb kernel with a separate reduction kernel.
+_ABSORBED_DECODE_HEADS = [16, 64, 128]
+
+
 @pytest.mark.launch_on_gb200
 class TestMLAAbsorbedDecode:
     """Absorbed MLA decode with the kernel chosen for this device (FlashMLA on SM90, FlashInfer on
     SM100 and SM103) against a plain PyTorch reference."""
 
-    # Prompts across one to five pages, a page-aligned one, and a padding slot (length 0).
+    # Prompts across one to five pages, a page-aligned one, and a padding slot (length 0), as
+    # CUDA-graph-padded steps have. Most have an odd page count, so FlashInfer's last 128-token KV
+    # tile of the request also spans the block-table entry past its last page.
     lengths = [70, 300, 129, 64, 3, 0]
 
     @pytest.fixture(autouse=True)
@@ -2887,47 +2992,68 @@ class TestMLAAbsorbedDecode:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _attention(**overrides):
-        """TestMLALatentCacheDecode's layer (16 heads), skipping devices without a decode kernel."""
-        attention = TestMLALatentCacheDecode._attention(flash_attention_version=None, **overrides)
-        kernel = attention.absorbed_decode_kernel
-        if kernel is None or (kernel == "flash_mla" and not _flash_mla_decode_runs()):
-            pytest.skip(
-                "requires an MLA decode kernel for this device: FlashMLA built for SM90, or "
-                "FlashInfer on SM100 or SM103"
-            )
+    def _attention(num_heads, **overrides):
+        """TestMLALatentCacheDecode's layer with ``num_heads`` heads (MLA's head dimensions do not
+        depend on hidden_size). It must pick this device's decode kernel: FlashMLA on SM90 and
+        FlashInfer on SM100 and SM103. Only other devices, which have none, skip."""
+        major, minor = torch.cuda.get_device_capability()
+        if major == 10:
+            expected = "flashinfer"
+        elif (major, minor) == (9, 0):
+            expected = "flash_mla"
+        else:
+            pytest.skip("no absorbed MLA decode kernel exists for this device")
+        attention = TestMLALatentCacheDecode._attention(
+            flash_attention_version=None, num_attention_heads=num_heads, **overrides
+        )
+        _, reason = attention_module.resolve_absorbed_mla_decode_kernel(
+            attention.config, attention.num_attention_heads_per_partition
+        )
+        assert attention.absorbed_decode_kernel == expected, reason
+        if expected == "flash_mla":
+            assert _flash_mla_decode_runs(), "flash_mla was built without its SM90 decode kernels"
         return attention
 
     @staticmethod
     def _assert_matches(out, reference, lengths):
-        """Each non-padding request's output is within 2% (relative L2) of the reference."""
+        """Each request's output is within 2% (relative L2) of the reference, and a padding slot's
+        (length 0) output is finite: its rows flow on through the layer."""
         out = out.view(reference.shape)
         for request, length in enumerate(lengths):
             if length == 0:
+                assert torch.isfinite(out[request]).all(), f"padding slot {request} is not finite"
                 continue
             expected = reference[request]
             error = ((out[request].float() - expected).norm() / expected.norm()).item()
             assert error < 0.02, f"request {request} (length {length}): relative error {error:.3g}"
 
+    @pytest.mark.parametrize(
+        "lengths",
+        [
+            pytest.param(lengths, id="batch"),
+            # FlashInfer runs DeepSeek's min-latency kernels for a single request.
+            pytest.param([300], id="single"),
+        ],
+    )
     @pytest.mark.parametrize("tokens_per_request", [1, 2])
     @pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
-    def test_decode_matches_reference(self, softmax_type, tokens_per_request):
+    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
+    def test_decode_matches_reference(self, num_heads, softmax_type, tokens_per_request, lengths):
         """Every request's output matches the reference, with one or two (MTP) query tokens per
         request and with a learnable sink."""
         if softmax_type != "vanilla" and not is_te_min_version("2.8.0"):
             pytest.skip("softmax_type requires TE >= 2.8.0")
-        attention = self._attention(softmax_type=softmax_type)
-        heads = attention.num_attention_heads_per_partition
+        attention = self._attention(num_heads, softmax_type=softmax_type)
         if softmax_type == "learnable":
             with torch.no_grad():
-                attention.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
+                attention.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, num_heads))
         softmax_offset = attention._get_inference_softmax_offset()
-        inputs = _latent_decode_inputs(self.lengths, tokens_per_request, heads)
+        inputs = _latent_decode_inputs(lengths, tokens_per_request, num_heads)
 
         with torch.no_grad():
             out = attention.flash_decode_and_prefill(**inputs, softmax_offset=softmax_offset)
 
-        q = inputs["q"].view(len(self.lengths), tokens_per_request, heads, -1)
+        q = inputs["q"].view(len(lengths), tokens_per_request, num_heads, -1)
         reference = _absorbed_decode_reference(
             q,
             inputs["k"],
@@ -2936,31 +3062,33 @@ class TestMLAAbsorbedDecode:
             attention.softmax_scale,
             softmax_offset,
         )
-        self._assert_matches(out, reference, self.lengths)
+        self._assert_matches(out, reference, lengths)
 
-    def test_decode_ignores_unwritten_latent_rows(self):
-        """NaN in the rows past each request's length, and in the page that unused block-table
-        entries point at, does not reach any request's output."""
-        attention = self._attention()
-        heads = attention.num_attention_heads_per_partition
-        inputs = _latent_decode_inputs(self.lengths, 1, heads, unwritten=float("nan"))
+    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
+    def test_decode_masks_rows_past_each_request(self, num_heads):
+        """Large values in the rows past each request's length, and in the page that unused
+        block-table entries point at, which the 128-token tile past an odd page count spans, do
+        not reach any request's output. In the dynamic context those rows are finite: acquired
+        pages are zeroed (the KV page initialization PR) and the dummy page stays zero."""
+        attention = self._attention(num_heads)
+        inputs = _latent_decode_inputs(self.lengths, 1, num_heads, unwritten=1e4)
 
         with torch.no_grad():
             out = attention.flash_decode_and_prefill(**inputs)
 
-        q = inputs["q"].view(len(self.lengths), 1, heads, -1)
+        q = inputs["q"].view(len(self.lengths), 1, num_heads, -1)
         reference = _absorbed_decode_reference(
             q, inputs["k"], inputs["block_table"], inputs["seqlens_k"], attention.softmax_scale
         )
         self._assert_matches(out, reference, self.lengths)
 
-    def test_decode_replays_in_cuda_graph(self):
+    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
+    def test_decode_replays_in_cuda_graph(self, num_heads):
         """A decode call captured in a CUDA graph serves the next step: each request's next latent
         is written in place, the request at a page boundary gets a new page, and the replayed
         output matches the reference."""
-        attention = self._attention()
-        heads = attention.num_attention_heads_per_partition
-        inputs = _latent_decode_inputs(self.lengths, 1, heads, spare_pages=1)
+        attention = self._attention(num_heads)
+        inputs = _latent_decode_inputs(self.lengths, 1, num_heads, spare_pages=1)
 
         with torch.no_grad():
             stream = torch.cuda.Stream()
@@ -2987,16 +3115,17 @@ class TestMLAAbsorbedDecode:
         inputs["q"].copy_(torch.randn(inputs["q"].shape, generator=generator, device="cuda"))
         graph.replay()
 
-        q = inputs["q"].view(len(self.lengths), 1, heads, -1)
+        q = inputs["q"].view(len(self.lengths), 1, num_heads, -1)
         reference = _absorbed_decode_reference(
             q, latents, block_table, inputs["seqlens_k"], attention.softmax_scale
         )
         self._assert_matches(out, reference, next_lengths)
 
-    def test_layer_decode_step_matches_reference(self):
+    @pytest.mark.parametrize("num_heads", _ABSORBED_DECODE_HEADS)
+    def test_layer_decode_step_matches_reference(self, num_heads):
         """A decode-only step of the layer under a real dynamic context runs the device's decode
         kernel and matches the same step with the reference in place of the kernel."""
-        attention = self._attention()
+        attention = self._attention(num_heads)
         context = TestMLALatentCacheDecode._context(attention.config)
         context.memory_buffer.zero_()
         TestMLALatentCacheDecode._add_request(context, 0, 70)
@@ -3049,6 +3178,46 @@ class TestMLAAbsorbedDecode:
 
         error = ((decoded.float() - reference.float()).norm() / reference.float().norm()).item()
         assert error < 0.02, f"relative error {error:.3g}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_latent_cache_dummy_block_stays_zero():
+    """Padding tokens append their latents to the dummy block, which block tables use for unused
+    entries and which a decode kernel's 128-token KV tile reads past a request's last page.
+    However non-finite the padding latents, the dummy block is zero after the append, and the
+    request's latents are in place."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=16,
+            q_lora_rank=128,
+            kv_lora_rank=512,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            cache_mla_latents=True,
+        )
+        context = TestMLALatentCacheDecode._context(config)
+        TestMLALatentCacheDecode._add_request(context, 0, 70)
+        context.initialize_attention_state()
+        real, padded = context.active_token_count, context.padded_active_token_count
+        assert padded > real, "the step must have padding tokens"
+        latents = torch.randn(padded, 1, 576, device="cuda").to(torch.bfloat16)
+        latents[real:] = float("nan")
+
+        context.append_key_value_cache(1, latents, None)
+
+        pool = context.memory_buffer[0]
+        dummy = pool[context.kv_block_allocator.dummy_block_idx]
+        assert torch.equal(dummy, torch.zeros_like(dummy))
+        pages = context.request_to_kv_block_ids[0, : math.ceil(real / 64)].long()
+        assert torch.equal(pool[pages].reshape(-1, 576)[:real], latents[:real, 0])
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _fused_kv_rope_quant_config(**overrides):

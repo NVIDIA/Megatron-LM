@@ -220,6 +220,20 @@ RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-whee
     fi
 EOF
 
+# FlashInfer's prebuilt kernels at the locked flashinfer-python's version: the TRTLLM-GEN cubins
+# (flashinfer-cubin) and the compiled launchers of the CI GPUs (flashinfer-jit-cache). They ship
+# from FlashInfer's index, not PyPI, and must match flashinfer-python exactly, which FlashInfer's
+# installer resolves. Without them FlashInfer downloads cubins and compiles at first use, so
+# Blackwell MLA decode does not pick its kernel (megatron/core/transformer/attention.py).
+RUN bash -ex <<"EOF"
+    if [ "$IMAGE_TYPE" = "lts" ]; then
+        echo "[FlashInfer kernels] skipping install for IMAGE_TYPE=lts"
+        exit 0
+    fi
+    UV_NO_CACHE=1 "${UV_PROJECT_ENVIRONMENT}/bin/python" -m flashinfer download-kernels \
+        --sm sm90a --sm sm100a --sm sm103a
+EOF
+
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
 # nccl_m2n compiles all of its sources in one nvcc call, and nvcc --threads parallelizes across
 # those files as well as their GPU targets. Unset keeps nvcc's default; CI passes

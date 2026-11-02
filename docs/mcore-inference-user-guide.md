@@ -1058,11 +1058,15 @@ is the opposite of the `MegatronLLM` constructor default.
 - **MLA requires a specific configuration.** `cache_mla_latents=True` and a KV block
   size of exactly 64. Decode-only steps run absorbed attention over the latent
   cache: FlashMLA (the `flash_mla` package) on Hopper, FlashInfer's TRTLLM-GEN
-  MLA decode on Blackwell (SM100 and SM103, bf16, not 65 to 127 heads per
-  tensor-parallel rank), both for a latent rank of 512 plus a 64-dim RoPE part.
-  Batch-invariant mode, and layers neither kernel covers, skip absorption: each layer
-  up-projects the latent cache and runs FlashAttention 3 or 4, as in mixed steps,
-  which makes decoding slower. RoPE fusion, sliding-window
+  MLA decode on Blackwell (SM100 and SM103, bf16, up to 64 or a multiple of 64
+  heads per tensor-parallel rank), both for a latent rank of 512 plus a 64-dim
+  RoPE part. On Blackwell, FlashInfer's prebuilt kernels must also be installed
+  at FlashInfer's version (`flashinfer-cubin` and `flashinfer-jit-cache`, which
+  `flashinfer download-kernels` installs), so that no decode step downloads
+  cubins or compiles. Batch-invariant mode skips absorption, and so do layers
+  neither kernel covers, with a warning when the model is built: each decode step
+  up-projects the layer's whole latent cache and runs FlashAttention 3 or 4, as in
+  mixed steps, which makes decoding much slower. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all
   incompatible with the latent cache.
 - **GDN2 is not supported.** `experimental_attention_variant='gdn2'` raises
