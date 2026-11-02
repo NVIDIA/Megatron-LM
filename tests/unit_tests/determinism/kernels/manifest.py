@@ -409,6 +409,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
+        "allgather inference replay with unequal per-rank token counts (EP=2); "
         "virtual-expert routing metadata and probability gradients replay under stream contention.",
     ),
     KernelEntry(
