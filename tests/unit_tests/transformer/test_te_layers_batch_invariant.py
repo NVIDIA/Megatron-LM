@@ -207,7 +207,6 @@ def test_te_linear_fused_wgrad_accumulates_over_microbatches(backend, layer_type
             layer.weight.main_grad = torch.zeros(
                 layer.weight.shape, device="cuda", dtype=torch.float32
             )
-            layer.is_first_microbatch = True
             mode = (
                 set_batch_invariant_mode(True, backend=backend)
                 if batch_invariant
@@ -226,39 +225,76 @@ def test_te_linear_fused_wgrad_accumulates_over_microbatches(backend, layer_type
         Utils.destroy_model_parallel()
 
 
+_GEMM_CASES = {
+    # Weight gradient (NT) of x [64, 128] and dy [64, 96] added into fp32 main_grad, as TE's
+    # Linear passes it, and as the op fuser's BasicLinear passes it (alpha=None, beta=None).
+    "accumulate-fp32": [dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True)],
+    "accumulate-fp32-alpha-none": [
+        dict(
+            out_dtype=torch.float32, accumulate=True, layout="NT", grad=True, alpha=None, beta=None
+        )
+    ],
+    # A tracked first microbatch overwrites main_grad, the next one adds into it.
+    "overwrite-then-accumulate": [
+        dict(out_dtype=torch.float32, accumulate=False, layout="NT", grad=True),
+        dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True),
+    ],
+    # Scaled linear plus bias, added into a scaled bf16 residual.
+    "alpha-beta-bias": [dict(out_dtype=torch.bfloat16, accumulate=True, alpha=0.5, beta=2.0)],
+    "alpha": [dict(out_dtype=torch.bfloat16, alpha=0.25)],
+    "alpha-none": [dict(out_dtype=torch.bfloat16, alpha=None)],
+}
+
+
 @pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
-@pytest.mark.parametrize("case", ["accumulate-fp32", "alpha-beta-bias", "alpha"])
+@pytest.mark.parametrize("case", list(_GEMM_CASES))
 def test_bik_te_general_gemm_honors_accumulate_alpha_beta(backend, case):
     """The batch-invariant general_gemm computes what TE's computes with accumulate, alpha
-    and beta: it adds into out (a weight gradient into fp32 main_grad, a scaled linear
-    into a residual) instead of overwriting it."""
+    and beta, None included: it adds into out (a weight gradient into fp32 main_grad, a
+    scaled linear into a residual) instead of overwriting it."""
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
     assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
     torch.manual_seed(5)
     bf16 = _device(torch.bfloat16)
-    if case == "accumulate-fp32":
-        # Weight gradient (NT) of x [64, 128] and dy [64, 96], added into fp32 main_grad.
-        A, B = torch.randn(64, 128, **bf16), torch.randn(64, 96, **bf16)
+    calls = _GEMM_CASES[case]
+    if calls[0].get("layout") == "NT":
+        operands = [(torch.randn(64, 128, **bf16), torch.randn(64, 96, **bf16)) for _ in calls]
         out0 = torch.randn(96, 128, device="cuda", dtype=torch.float32)
-        kwargs = dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True)
-    elif case == "alpha-beta-bias":
-        # Scaled linear plus bias, added into a scaled bf16 residual.
-        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
-        out0 = torch.randn(64, 96, **bf16)
-        bias = torch.randn(96, **bf16)
-        kwargs = dict(out_dtype=torch.bfloat16, accumulate=True, alpha=0.5, beta=2.0, bias=bias)
     else:
-        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
+        operands = [(torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)) for _ in calls]
         out0 = torch.randn(64, 96, **bf16)
-        kwargs = dict(out_dtype=torch.bfloat16, alpha=0.25)
-    reference = out0.clone()
-    te_cpp.general_gemm(A, B, out=reference, **kwargs)
-    actual = out0.clone()
+    bias = torch.randn(96, **bf16) if case == "alpha-beta-bias" else None
+    reference, actual = out0.clone(), out0.clone()
+    for (A, B), kwargs in zip(operands, calls):
+        te_cpp.general_gemm(A, B, out=reference, bias=bias, **kwargs)
     with set_batch_invariant_mode(True, backend=backend):
-        result = te_cpp.general_gemm(A, B, out=actual, **kwargs)[0]
-    assert result is actual
+        for (A, B), kwargs in zip(operands, calls):
+            assert te_cpp.general_gemm(A, B, out=actual, bias=bias, **kwargs)[0] is actual
     torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+@pytest.mark.parametrize(
+    "option", [dict(fp8="hybrid", fp8_recipe="mxfp8"), dict(tp_comm_overlap=True)]
+)
+def test_batch_invariant_gemm_backends_reject_fp8_and_userbuffers(backend, option):
+    """The deepgemm/triton GEMMs take no quantized operands and no Userbuffers overlap, so
+    such configurations are rejected at construction rather than at the first GEMM."""
+    with pytest.raises(AssertionError, match="batch_invariant_backend"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=_BIK_FA_VERSION,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            **option,
+        )
 
 
 # ============================================================================

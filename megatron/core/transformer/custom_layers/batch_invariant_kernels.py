@@ -1308,10 +1308,13 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     Computes ``alpha * op(A) @ op(B) + beta * out + bias`` like TE, with the product from
     the batch-invariant GEMM. ``accumulate`` adds into ``out``, for example a weight
     gradient into an fp32 ``main_grad`` (``beta`` defaults to 1, as in TE), and
-    ``alpha``/``beta`` scale the product and ``out``; calls without them run the plain
-    GEMM as before. Calls it cannot serve (GELU fusion, output quantization, quantized
-    operands, Userbuffers overlap) fail rather than run TE's cuBLASLt GEMM. Returns
-    (gemm_out, bias_grad, gelu_input, extra_output) like TE.
+    ``alpha``/``beta`` scale the product and ``out``; None means TE's default for both.
+    A weight gradient into fp32 keeps the kernel's fp32 accumulator whether or not it
+    accumulates; other calls without alpha or accumulate run the plain GEMM as before.
+    Calls it cannot serve (GELU fusion, output quantization, quantized operands,
+    Userbuffers overlap) fail rather than run TE's cuBLASLt GEMM; TransformerConfig
+    rejects the configurations that lead to them where it can. Returns (gemm_out,
+    bias_grad, gelu_input, extra_output) like TE.
     """
     if _TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
@@ -1355,7 +1358,8 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
             "Batch-invariant GEMM does not support Userbuffers/overlap "
             "(extra_output/ub/ub_type/bulk_overlap)."
         )
-    alpha = float(p.get("alpha", 1.0))
+    # TE treats a None alpha as 1 and a None beta as 1 when accumulating, else 0.
+    alpha = 1.0 if p.get("alpha") is None else float(p["alpha"])
     beta = p.get("beta")
     if accumulate:
         beta = 1.0 if beta is None else float(beta)
@@ -1365,19 +1369,25 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise ValueError("Accumulating GEMM requires an out tensor.")
 
     epilogue_bias = bias if not grad else None
-    if alpha == 1.0 and not accumulate:
+    result_dtype = out.dtype if out is not None else (out_dtype or A.dtype)
+    if result_dtype == torch.float32 and (grad or accumulate):
+        # A weight gradient into fp32 (main_grad), accumulated or not: the product is kept in
+        # fp32 and combined into out in place, as TE does, with no main_grad-sized temporaries.
+        result = _te_gemm_product_fp32(A, B, layout)
+        if alpha != 1.0:
+            result.mul_(alpha)
+        if epilogue_bias is not None:
+            result.add_(epilogue_bias)
+        if accumulate:
+            if beta != 1.0:
+                out.mul_(beta)
+            result = out.add_(result)
+    elif alpha == 1.0 and not accumulate:
         # Compute via autograd-aware function matching TE's layout semantics
         result = BatchInvariantTEGemmFn.apply(A, B, epilogue_bias, out_dtype, layout)
     else:
-        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once. For an
-        # fp32 result (a weight gradient accumulated into main_grad) the product is taken
-        # from fp32 operands, exact for bf16/fp16 inputs, so it is not rounded to bf16 first.
-        result_dtype = out.dtype if out is not None else (out_dtype or A.dtype)
-        if result_dtype == torch.float32:
-            product = BatchInvariantTEGemmFn.apply(A.float(), B.float(), None, None, layout)
-        else:
-            product = BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
-        result = alpha * product
+        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once.
+        result = alpha * BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
         if epilogue_bias is not None:
             result = result + epilogue_bias.float()
         if accumulate:
@@ -1391,10 +1401,25 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         bias_grad = B_flat.sum(dim=0)  # Sum over batch/sequence, keeping output dim
 
     if out is not None:
-        out.copy_(result)
+        if result is not out:
+            out.copy_(result)
         # TE expects (gemm_out, bias_grad, gelu_input, extra_output)
         return (out, bias_grad, None, extra_output)
     return (result, bias_grad, None, extra_output)
+
+
+def _te_gemm_product_fp32(A: torch.Tensor, B: torch.Tensor, layout: str) -> torch.Tensor:
+    """``op(B) @ op(A)`` with TE's layout semantics, computed and returned in fp32.
+
+    Runs the batch-invariant persistent kernel on fp32 copies of the operands, in their
+    given (strided) layout. bf16 and fp16 values are exact in fp32 (and TF32), so the
+    products are exact and accumulate in fp32: the result is not rounded to bf16 before it
+    is added into an fp32 weight gradient.
+    """
+    opA = A.transpose(0, 1) if layout[0].upper() == "T" else A
+    opB = B.transpose(0, 1) if layout[1].upper() == "T" else B
+    product = matmul_persistent(opB.reshape(-1, opB.shape[-1]).float(), opA.float())
+    return product.reshape(*opB.shape[:-1], opA.shape[-1])
 
 
 class BatchInvariantRMSNormFn(torch.autograd.Function):
