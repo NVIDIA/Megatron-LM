@@ -964,7 +964,7 @@ class TestFlashDecodeAndPrefillSoftcap:
         # (num_requests * tokens_per_request, 1, heads, head_dim), which both branches accept:
         # prefill squeezes dim 1, decode reshapes on seqlens_k.shape[0] requests.
         q = torch.zeros(2, 1, 4, 8)
-        kv = torch.zeros(2, 4, 8)
+        kv = torch.zeros(1, 256, 4, 8)  # One 256-token page, which FA2 can read.
         out = torch.zeros(2, 4, 8) if not is_decode_only else torch.zeros(2, 1, 4, 8)
         if is_decode_only and returns_tuple:
             out = torch.zeros(2, 4, 8)  # FA4 decode reshapes the varlen output itself
@@ -1079,12 +1079,12 @@ class TestFlashAttentionDeviceSelection:
         return stack
 
     @staticmethod
-    def _run(attn, is_decode_only, v_head_dim=8, qk_head_dim=8):
+    def _run(attn, is_decode_only, v_head_dim=8, qk_head_dim=8, block_size=256):
         """Run flash_decode_and_prefill on two one-token requests; FA kernels must be faked."""
         attn.flash_decode_and_prefill(
             q=torch.zeros(2, 1, 4, qk_head_dim),
-            k=torch.zeros(2, 4, qk_head_dim),
-            v=torch.zeros(2, 4, v_head_dim),
+            k=torch.zeros(2, block_size, 4, qk_head_dim),
+            v=torch.zeros(2, block_size, 4, v_head_dim),
             max_seqlen_q=1 if is_decode_only else 2,
             max_seqlen_k=1024,
             cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -1171,3 +1171,85 @@ class TestFlashAttentionDeviceSelection:
         fa2.assert_not_called()
         fa4.assert_called_once()
         assert fa4.call_args.kwargs["num_splits"] == 1
+
+    @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
+    @pytest.mark.parametrize(
+        "capability, block_size, qk_head_dim, v_head_dim, remedy",
+        [
+            # Hopper or Blackwell without FA3/FA4 installed, with 64-token blocks.
+            pytest.param(
+                (9, 0),
+                64,
+                8,
+                8,
+                "Use FlashAttention-3 or FlashAttention-4 or a block size that is a multiple of 256",
+                id="sm90-block64",
+            ),
+            pytest.param(
+                (10, 0),
+                64,
+                8,
+                8,
+                "Use FlashAttention-4 or a block size that is a multiple of 256",
+                id="sm100-block64",
+            ),
+            # FA4 has no paged KV on SM80/SM120, so auto selection is FA2 there even if installed.
+            pytest.param(
+                (8, 0), 64, 8, 8, "Use a block size that is a multiple of 256", id="sm80-block64"
+            ),
+            # MLA's unabsorbed prefill head dims: no block size lets FA2 read them.
+            pytest.param(
+                (12, 0),
+                256,
+                192,
+                128,
+                "No FlashAttention kernel reads it on this GPU",
+                id="sm120-mla-head-dims",
+            ),
+        ],
+    )
+    def test_auto_fa2_rejects_paged_kv_it_cannot_read(
+        self, capability, block_size, qk_head_dim, v_head_dim, remedy, is_decode_only
+    ):
+        """Automatic selection falls back to FA2 when no FA3/FA4 runs paged KV on the device.
+
+        FA2 reads paged KV only in blocks of a multiple of 256 tokens, with value heads as wide as
+        query/key heads, so such a cache fails with a ValueError before FA2 is called, rather than
+        inside flash-attn.
+        """
+        attn = self._attention()
+        fa2_prefill, fa2_decode = mock.Mock(), mock.Mock()
+        with (
+            self._on_device(capability),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA3", False),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", capability[0] in (8, 12)),
+            mock.patch("megatron.core.transformer.attention.flash_attn_varlen_func", fa2_prefill),
+            mock.patch("megatron.core.transformer.attention.flash_attn_with_kvcache", fa2_decode),
+        ):
+            assert attn._resolve_flash_version(torch.device("cpu")) == (False, False)
+            with pytest.raises(ValueError, match=f"blocks hold {block_size} tokens.*{remedy}"):
+                self._run(
+                    attn,
+                    is_decode_only,
+                    qk_head_dim=qk_head_dim,
+                    v_head_dim=v_head_dim,
+                    block_size=block_size,
+                )
+        fa2_prefill.assert_not_called()
+        fa2_decode.assert_not_called()
+
+    @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
+    def test_auto_fa2_runs_paged_kv_it_can_read(self, is_decode_only):
+        """FA2 still runs 256-token blocks with equal head dims when it is all that is installed."""
+        attn = self._attention()
+        out = torch.zeros(2, 4, 8) if not is_decode_only else torch.zeros(2, 1, 4, 8)
+        fa2 = mock.Mock(return_value=out)
+        kernel = "flash_attn_with_kvcache" if is_decode_only else "flash_attn_varlen_func"
+        with (
+            self._on_device((9, 0)),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA3", False),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", False),
+            mock.patch(f"megatron.core.transformer.attention.{kernel}", fa2),
+        ):
+            self._run(attn, is_decode_only)
+        fa2.assert_called_once()

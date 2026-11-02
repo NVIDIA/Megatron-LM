@@ -356,7 +356,9 @@ class TestDynamicContext:
         assert max_seqlen_q >= 2
 
     @staticmethod
-    def _flash_attention_context(mla, flash_attention_version, block_size_tokens):
+    def _flash_attention_context(
+        mla, flash_attention_version, block_size_tokens, hybrid_layer_types=None
+    ):
         common = dict(
             num_layers=2,
             hidden_size=256,
@@ -378,6 +380,11 @@ class TestDynamicContext:
             )
         else:
             model_config = TransformerConfig(**common)
+        mamba_inference_state_config = None
+        if hybrid_layer_types is not None:
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                hybrid_layer_types, (544, 4), (8, 64, 16), torch.bfloat16, torch.bfloat16
+            )
         return DynamicInferenceContext(
             model_config=model_config,
             inference_config=InferenceConfig(
@@ -387,6 +394,7 @@ class TestDynamicContext:
                 block_size_tokens=block_size_tokens,
                 max_tokens=256,
                 max_requests=8,
+                mamba_inference_state_config=mamba_inference_state_config,
                 use_flashinfer_fused_rope=False,
                 unified_memory_level=0,
             ),
@@ -401,9 +409,28 @@ class TestDynamicContext:
         heads as wide as query/key heads. A pinned FA2 that cannot read the cache is rejected when
         the context is built, rather than failing inside flash-attn at the first prefill."""
         with pytest.raises(
-            ValueError, match="flash_attention_version=2 cannot run this dynamic-batching KV cache"
+            ValueError, match="FlashAttention-2 cannot read this dynamic-batching KV cache"
         ):
             self._flash_attention_context(mla, 2, block_size_tokens)
+
+    @pytest.mark.parametrize(
+        "hybrid_layer_types, runs_flash_attention",
+        [
+            pytest.param([Symbols.MAMBA, Symbols.ATTENTION], True, id="attention"),
+            pytest.param([Symbols.MAMBA, Symbols.DS_ATTENTION], False, id="dsa-only"),
+        ],
+    )
+    def test_pinned_flash_attention_2_checks_only_layers_that_run_it(
+        self, hybrid_layer_types, runs_flash_attention
+    ):
+        """A hybrid's DSA layers read the paged KV cache with their own kernels, so a pinned FA2
+        limits the cache only when the hybrid has attention layers that run FlashAttention."""
+        if runs_flash_attention:
+            with pytest.raises(ValueError, match="blocks hold 64 tokens"):
+                self._flash_attention_context(False, 2, 64, hybrid_layer_types)
+        else:
+            context = self._flash_attention_context(False, 2, 64, hybrid_layer_types)
+            assert context.block_size_tokens == 64
 
     @pytest.mark.parametrize(
         "mla, flash_attention_version, block_size_tokens",

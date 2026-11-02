@@ -164,6 +164,46 @@ def _flash_attn_majors(device_index: Optional[int]) -> Tuple[int, int]:
     return major, fa4_major
 
 
+def check_flash_attn_2_paged_kv(
+    block_size: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    mla_latent_cache: bool,
+    device_index: Optional[int],
+) -> None:
+    """Raise ValueError if FlashAttention-2 cannot read a paged KV cache of this shape.
+
+    FA2 reads paged KV only in blocks of a multiple of 256 tokens, and only with value heads as
+    wide as query/key heads (flash-attn 2.8.3, csrc/flash_attn/flash_api.cpp); FA3 and FA4 have
+    neither limit. MLA's latent cache fixes its blocks at 64 tokens. The message names what runs
+    the cache on the device instead.
+    """
+    if block_size % 256 == 0 and qk_head_dim == v_head_dim:
+        return
+    major, fa4_major = _flash_attn_majors(device_index)
+    remedies = [
+        kernel
+        for kernel, runs in (
+            ("FlashAttention-3", major == 9),
+            ("FlashAttention-4", fa4_major in _FA4_PAGED_KV_MAJORS),
+        )
+        if runs or major == 0  # Without CUDA the device is unknown.
+    ]
+    if not mla_latent_cache and qk_head_dim == v_head_dim:
+        remedies.append("a block size that is a multiple of 256")
+    raise ValueError(
+        "FlashAttention-2 cannot read this dynamic-batching KV cache: it reads paged KV only in "
+        "blocks of a multiple of 256 tokens, with value heads as wide as query/key heads, but the "
+        f"blocks hold {block_size} tokens and the query/key and value heads are {qk_head_dim} and "
+        f"{v_head_dim} wide. "
+        + (
+            f"Use {' or '.join(remedies)}."
+            if remedies
+            else "No FlashAttention kernel reads it on this GPU."
+        )
+    )
+
+
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
 
@@ -1223,6 +1263,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                # Pinned or automatically selected, FA2 must be able to read the cache.
+                check_flash_attn_2_paged_kv(
+                    k.shape[1],
+                    q.shape[-1],
+                    v.shape[-1],
+                    isinstance(self.config, MLATransformerConfig),
+                    q.device.index,
+                )
                 # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
                 # accordingly under GQA, which requires total_q == num_seqs.
                 assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
@@ -1379,6 +1427,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         assert (
                             not self.batch_invariant_mode
                         ), "Batch invariant mode is not supported for flash attention 2"
+                        check_flash_attn_2_paged_kv(
+                            k.shape[1],
+                            q.shape[-1],
+                            v.shape[-1],
+                            isinstance(self.config, MLATransformerConfig),
+                            q.device.index,
+                        )
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
                         # FA3 may append kernel metadata after (out, softmax_lse),

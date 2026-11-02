@@ -446,29 +446,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 inference_config.block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
-        # FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens, and only with
-        # value heads as wide as query/key heads (flash-attn 2.8.3, csrc/flash_attn/flash_api.cpp).
-        # FlashAttention-3 and -4 have neither limit.
-        if model_config.flash_attention_version == 2:
+        # A pinned FlashAttention-2 must be able to read the paged KV cache of the layers that run
+        # it: a plain transformer's, or a hybrid's attention and MLA layers (DSA layers and other
+        # attention variants use their own kernels). Attention checks again where FA2 runs, which
+        # also covers automatic selection.
+        hybrid_layer_types = (
+            inference_config.mamba_inference_state_config.layer_type_list
+            if inference_config.mamba_inference_state_config is not None
+            else None
+        )
+        if hybrid_layer_types is not None:
+            runs_flash_attention = bool(
+                {Symbols.ATTENTION, Symbols.MLA}.intersection(hybrid_layer_types)
+            )
+        else:
+            runs_flash_attention = model_config.experimental_attention_variant is None
+        if model_config.flash_attention_version == 2 and runs_flash_attention:
+            from megatron.core.transformer.attention import check_flash_attn_2_paged_kv
+
             if self.cache_mla_latent:
                 # Prefill attends over the up-projected latents.
                 qk_head_dim = model_config.qk_head_dim + model_config.qk_pos_emb_head_dim
                 v_head_dim = model_config.v_head_dim
             else:
                 qk_head_dim = v_head_dim = model_config.kv_channels
-            if inference_config.block_size_tokens % 256 != 0 or v_head_dim != qk_head_dim:
-                # MLA's latent cache needs 64-token blocks, so only another kernel can run it.
-                hint = (
-                    "" if self.cache_mla_latent else ", or a block size that is a multiple of 256"
-                )
-                raise ValueError(
-                    "flash_attention_version=2 cannot run this dynamic-batching KV cache: "
-                    "FlashAttention-2 reads paged KV only in blocks of a multiple of 256 tokens, "
-                    "with value heads as wide as query/key heads, but the blocks hold "
-                    f"{inference_config.block_size_tokens} tokens and the query/key and value "
-                    f"heads are {qk_head_dim} and {v_head_dim} wide. Use FlashAttention-3 or "
-                    f"-4{hint}."
-                )
+            check_flash_attn_2_paged_kv(
+                inference_config.block_size_tokens,
+                qk_head_dim,
+                v_head_dim,
+                self.cache_mla_latent,
+                torch.cuda.current_device() if torch.cuda.is_available() else None,
+            )
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
