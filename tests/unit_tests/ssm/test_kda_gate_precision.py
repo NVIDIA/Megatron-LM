@@ -164,9 +164,17 @@ def _build_kda_layer(config: KDALayerConfig):
 
 def test_two_stage_gates_require_rmsnorm():
     """The two-stage output norm and gate run as one fused gated RMSNorm, so a LayerNorm
-    out_norm is rejected when the config is built and when a copied config reaches the layer."""
-    with pytest.raises(ValueError, match="kda_two_stage_gates requires normalization='RMSNorm'"):
+    out_norm is rejected when the config is built and when a copied config reaches the layer.
+    normalization applies to the whole model, so the error offers RMSNorm throughout or
+    single-stage gates, and says a LayerNorm two-stage checkpoint has no equivalent config."""
+    with pytest.raises(
+        ValueError, match="kda_two_stage_gates requires normalization='RMSNorm'"
+    ) as error:
         _two_stage_kda_config(normalization="LayerNorm")
+    message = str(error.value)
+    assert "applies to the whole model" in message
+    assert "kda_two_stage_gates=False" in message
+    assert "no configuration reproduces" in message
 
     config = _two_stage_kda_config(normalization="LayerNorm", kda_two_stage_gates=False)
     config.kda_two_stage_gates = True

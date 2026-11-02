@@ -46,8 +46,14 @@ class KDALayerConfig(TransformerConfig):
             )
         if self.kda_two_stage_gates and self.normalization != "RMSNorm":
             raise ValueError(
-                "kda_two_stage_gates requires normalization='RMSNorm': its output norm and gate "
-                f"run as one fused gated RMSNorm, got normalization={self.normalization!r}."
+                "kda_two_stage_gates requires normalization='RMSNorm', got "
+                f"{self.normalization!r}: its output norm and gate run as one fused gated "
+                "RMSNorm, without a bias. normalization applies to the whole model, not only to "
+                f"KDA, so use RMSNorm throughout, or keep {self.normalization!r} with "
+                "kda_two_stage_gates=False, whose output norm follows it. A checkpoint trained "
+                f"with two-stage gates and {self.normalization!r} ran this output norm as "
+                "RMSNorm without its bias and the norms that follow normalization elsewhere as "
+                f"{self.normalization!r}; no configuration reproduces that mix."
             )
         required_positive = (
             "linear_conv_kernel_dim",
