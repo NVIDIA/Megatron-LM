@@ -752,9 +752,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
         "softmax_scale MultiLatentAttention hands to its core attention. The sink offset it hands "
         "to the dynamic-inference flash_decode_and_prefill is replayed on the FA2 prefill path in "
-        "test_runtime_cp_attention.py; the FlashMLA decode branch (SM90 only) is not. In "
-        "batch-invariant mode decode-only steps skip FlashMLA for the unabsorbed varlen kernel "
-        "with one KV split; TestMLALatentCacheDecode in "
+        "test_runtime_cp_attention.py, as is the FlashInfer decode kernel the layer picks on "
+        "SM100/SM103 (get_absorbed_mla_decode_kernel); the FlashMLA decode branch (SM90 only) is "
+        "not. In batch-invariant mode decode-only steps skip the absorbed decode kernel for the "
+        "unabsorbed varlen kernel with one KV split; TestMLALatentCacheDecode in "
         "tests/unit_tests/transformer/test_multi_latent_attention.py checks that path bitwise "
         "across co-batches and against a prefill. The TE FusedMLAQUpProj GEMM path and "
         "mxfp8_quantize_only are not replayed.",

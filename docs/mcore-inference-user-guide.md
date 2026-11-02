@@ -95,7 +95,7 @@ the configurations they have been exercised in.
 | Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature; primary optimization target to date |
 | GPT-style dense | TP, PP; chunked prefill, prefix caching, CUDA graphs, speculative decoding | Mature |
 | MoE | TP with EP; expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
-| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
+| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` (Hopper) or FlashInfer (Blackwell) | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
 | Gated Delta Net and Gated Delta Product | Dynamic batching only | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 | Vision-language | Image inputs only, `PP=1` | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 
@@ -167,7 +167,8 @@ workload rather than generalizing from any single comparison.
 >
 > MLA models with `cache_mla_latents` (required for dynamic batching) are
 > supported, with `flash_attention_version` 3 or 4 as above. Their decode-only
-> steps then skip FlashMLA, whose split-KV schedule depends on the whole batch.
+> steps then skip the absorbed decode kernel (FlashMLA or FlashInfer), whose
+> split-KV schedule depends on the whole batch.
 > Like mixed steps and training, they run unabsorbed attention: each layer
 > up-projects the latent cache to keys and values and runs FlashAttention with
 > one KV split. A decode step therefore costs about as much as a mixed step.
@@ -1054,9 +1055,12 @@ is the opposite of the `MegatronLLM` constructor default.
   inference also requires `PP=1` (pipeline and virtual pipeline parallelism both
   raise), and in-core static-tiling preprocessing was removed — clients needing
   static tiling must submit a preprocessed tensor payload.
-- **MLA requires a specific configuration.** `cache_mla_latents=True`, a KV block
-  size of exactly 64, and the `flash_mla` package. Batch-invariant mode works with
-  the latent cache, but its decode-only steps skip FlashMLA: each layer
+- **MLA requires a specific configuration.** `cache_mla_latents=True` and a KV block
+  size of exactly 64. Decode-only steps run absorbed attention over the latent
+  cache: FlashMLA (the `flash_mla` package) on Hopper, FlashInfer's TRTLLM-GEN
+  MLA decode on Blackwell (SM100 and SM103, bf16, not 65 to 127 heads per
+  tensor-parallel rank), both for a latent rank of 512 plus a 64-dim RoPE part.
+  Batch-invariant mode, and layers neither kernel covers, skip absorption: each layer
   up-projects the latent cache and runs FlashAttention 3 or 4, as in mixed steps,
   which makes decoding slower. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all

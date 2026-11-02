@@ -1,11 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+import math
 import os
 import subprocess
 import sys
 from dataclasses import replace
 from inspect import signature
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -141,12 +143,13 @@ backend = TESpecProvider()
 linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear()]
 
 
-def _dynamic_flash_attention_call(attention, is_decode_only):
+def _dynamic_flash_attention_call(attention, is_decode_only, absorbed_decode_kernel="flash_mla"):
     """Run a dynamic-batching MLA forward up to the attention kernel and return the kernel's
     bound arguments."""
     attention.eval()
     attention.config.cache_mla_latents = True
     attention.cache_mla_latents = True
+    attention.absorbed_decode_kernel = absorbed_decode_kernel
 
     hidden_states = torch.empty((1, 1, attention.config.hidden_size))
     query = torch.empty((1, 1, 1, 1))
@@ -232,23 +235,30 @@ class TestParallelMLAAttention:
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
+    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", "flashinfer", None])
     @pytest.mark.parametrize("batch_invariant_mode", [False, True])
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_forwards_decode_only_to_flash_attention(
-        self, is_decode_only, batch_invariant_mode
+        self, is_decode_only, batch_invariant_mode, absorbed_decode_kernel
     ):
         """Test that MLA runs the absorbed decode kernel for decode-only steps, except in
-        batch-invariant mode, where every step runs the varlen kernel."""
+        batch-invariant mode and on devices without one, where every step runs the varlen
+        kernel."""
         attention = self.parallel_attention
         attention.batch_invariant_mode = batch_invariant_mode
-        flash_call = _dynamic_flash_attention_call(attention, is_decode_only)
-        absorbed = is_decode_only and not batch_invariant_mode
+        flash_call = _dynamic_flash_attention_call(
+            attention, is_decode_only, absorbed_decode_kernel
+        )
+        absorbed = (
+            is_decode_only and not batch_invariant_mode and absorbed_decode_kernel is not None
+        )
         assert flash_call.arguments["is_decode_only"] is absorbed
 
+    @pytest.mark.parametrize("absorbed_decode_kernel", ["flash_mla", "flashinfer", None])
     @pytest.mark.parametrize("batch_invariant_mode", [False, True])
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_up_projects_cached_latents_unless_absorbed(
-        self, is_decode_only, batch_invariant_mode
+        self, is_decode_only, batch_invariant_mode, absorbed_decode_kernel
     ):
         """Test that the cached latents are up-projected to keys and values for every step that
         does not run absorbed attention."""
@@ -256,6 +266,7 @@ class TestParallelMLAAttention:
         attention.eval()
         attention.config.cache_mla_latents = True
         attention.cache_mla_latents = True
+        attention.absorbed_decode_kernel = absorbed_decode_kernel
         attention.batch_invariant_mode = batch_invariant_mode
 
         latents = torch.empty((1, 1, 1))
@@ -272,7 +283,9 @@ class TestParallelMLAAttention:
             attention._adjust_key_value_for_inference(
                 inference_context, latents, latents, None, rotary_pos_emb=None
             )
-        absorbed = is_decode_only and not batch_invariant_mode
+        absorbed = (
+            is_decode_only and not batch_invariant_mode and absorbed_decode_kernel is not None
+        )
         assert uncompress_kv_from_cache.called is not absorbed
 
     @pytest.mark.skipif(not is_te_min_version("2.8.0"), reason="softmax_type requires TE >= 2.8.0")
@@ -2744,6 +2757,298 @@ class TestMLALatentCacheDecode:
 
         assert relative_error(absorbed) < 0.05
         assert relative_error(absorbed_without_sink) > 0.2
+
+
+@pytest.mark.parametrize(
+    (
+        "capability",
+        "have_flash_mla",
+        "have_flashinfer",
+        "latent_shape",
+        "num_heads",
+        "params_dtype",
+        "expected",
+    ),
+    [
+        pytest.param((9, 0), True, True, (512, 64), 16, torch.bfloat16, "flash_mla", id="sm90"),
+        pytest.param((9, 0), False, True, (512, 64), 16, torch.bfloat16, None, id="sm90-no-fmla"),
+        pytest.param((9, 0), True, True, (256, 64), 16, torch.bfloat16, None, id="sm90-rank256"),
+        pytest.param((10, 0), True, True, (512, 64), 16, torch.bfloat16, "flashinfer", id="sm100"),
+        pytest.param(
+            (10, 3), True, True, (512, 64), 128, torch.bfloat16, "flashinfer", id="sm103-128h"
+        ),
+        pytest.param((10, 0), True, True, (512, 64), 96, torch.bfloat16, None, id="sm100-96h"),
+        pytest.param((10, 0), True, True, (512, 64), 16, torch.float16, None, id="sm100-fp16"),
+        pytest.param((10, 0), True, False, (512, 64), 16, torch.bfloat16, None, id="sm100-no-fi"),
+        pytest.param((12, 0), True, True, (512, 64), 16, torch.bfloat16, None, id="sm120"),
+    ],
+)
+def test_absorbed_mla_decode_kernel_follows_device(
+    capability, have_flash_mla, have_flashinfer, latent_shape, num_heads, params_dtype, expected
+):
+    """FlashMLA runs absorbed MLA decode on SM90 and FlashInfer on SM100 and SM103; a layer that
+    neither covers gets no absorbed decode kernel."""
+    config = SimpleNamespace(
+        kv_lora_rank=latent_shape[0], qk_pos_emb_head_dim=latent_shape[1], params_dtype=params_dtype
+    )
+    with (
+        mock.patch.object(torch.cuda, "is_available", return_value=True),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
+        mock.patch.object(attention_module, "HAVE_FMLA", have_flash_mla),
+        mock.patch.object(attention_module, "HAVE_FLASHINFER_MLA", have_flashinfer),
+    ):
+        kernel = attention_module.get_absorbed_mla_decode_kernel(config, num_heads)
+    assert kernel == expected
+
+
+def _absorbed_decode_reference(q, latents, block_table, seqlens_k, scale, softmax_offset=None):
+    """Absorbed MLA decode in fp32. q is [B, S, H, 576] and latents [pages, 64, 576]. Query s of a
+    request with L cached latents attends latents j <= L - S + s, whose first 512 channels are the
+    values; a sink adds exp(softmax_offset[h]) to head h's softmax denominator. Returns
+    [B, S, H, 512], with zeros for zero-length (padding) requests."""
+    batch, tokens, heads, _ = q.shape
+    out = torch.zeros(batch, tokens, heads, 512, device=q.device)
+    for request, length in enumerate(seqlens_k.tolist()):
+        if length == 0:
+            continue
+        pages = block_table[request, : math.ceil(length / latents.shape[1])].long()
+        cached = latents[pages].reshape(-1, latents.shape[-1])[:length].float()
+        scores = torch.einsum("shd,kd->shk", q[request].float(), cached) * scale
+        query_pos = torch.arange(tokens, device=q.device)[:, None, None]
+        key_pos = torch.arange(length, device=q.device)[None, None, :]
+        scores = scores.masked_fill(key_pos > length - tokens + query_pos, float("-inf"))
+        if softmax_offset is not None:
+            sink = softmax_offset.float().view(1, heads, 1).expand(tokens, heads, 1)
+            scores = torch.cat([scores, sink], dim=-1)
+        probs = torch.softmax(scores, dim=-1)[..., :length]
+        out[request] = torch.einsum("shk,kc->shc", probs, cached[:, :512])
+    return out
+
+
+def _latent_decode_inputs(lengths, tokens_per_request, num_heads, unwritten=None, spare_pages=0):
+    """Decode-only flash_decode_and_prefill arguments over a bf16 latent pool. Each request owns
+    consecutive pages; the block-table entries past them, and all entries of a zero-length
+    (padding) request, point at a last, dummy page, as in the dynamic context. The table is two
+    entries wider than the longest request needs, which makes it odd here. ``spare_pages`` free
+    pages sit before the dummy one. With ``unwritten``, the rows past each request's length and
+    the dummy page hold that value."""
+    block, dim = 64, 576
+    request_pages = [math.ceil(length / block) for length in lengths]
+    num_pages = sum(request_pages) + spare_pages + 1
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    latents = torch.randn(num_pages, block, dim, generator=generator, device="cuda")
+    latents = latents.to(torch.bfloat16)
+    dummy = num_pages - 1
+    block_table = torch.full(
+        (len(lengths), max(request_pages) + 2), dummy, dtype=torch.int32, device="cuda"
+    )
+    first = 0
+    for request, (length, pages) in enumerate(zip(lengths, request_pages)):
+        block_table[request, :pages] = torch.arange(first, first + pages, dtype=torch.int32)
+        if unwritten is not None and pages:
+            latents[first + pages - 1, length - (pages - 1) * block :] = unwritten
+        first += pages
+    if unwritten is not None:
+        latents[dummy] = unwritten
+    batch = len(lengths)
+    q = torch.randn(
+        batch * tokens_per_request, 1, num_heads, dim, generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    seqlens_k = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k[1:] = torch.cumsum(seqlens_k, 0)
+    return dict(
+        q=q,
+        k=latents,
+        v=None,
+        max_seqlen_q=tokens_per_request,
+        max_seqlen_k=max(lengths),
+        cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32, device="cuda") * tokens_per_request,
+        cu_seqlens_k=cu_seqlens_k,
+        seqlens_k=seqlens_k,
+        block_table=block_table,
+        is_decode_only=True,
+    )
+
+
+@pytest.mark.launch_on_gb200
+class TestMLAAbsorbedDecode:
+    """Absorbed MLA decode with the kernel chosen for this device (FlashMLA on SM90, FlashInfer on
+    SM100 and SM103) against a plain PyTorch reference."""
+
+    # Prompts across one to five pages, a page-aligned one, and a padding slot (length 0).
+    lengths = [70, 300, 129, 64, 3, 0]
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _attention(**overrides):
+        """TestMLALatentCacheDecode's layer (16 heads), skipping devices without a decode kernel."""
+        attention = TestMLALatentCacheDecode._attention(flash_attention_version=None, **overrides)
+        kernel = attention.absorbed_decode_kernel
+        if kernel is None or (kernel == "flash_mla" and not _flash_mla_decode_runs()):
+            pytest.skip(
+                "requires an MLA decode kernel for this device: FlashMLA built for SM90, or "
+                "FlashInfer on SM100 or SM103"
+            )
+        return attention
+
+    @staticmethod
+    def _assert_matches(out, reference, lengths):
+        """Each non-padding request's output is within 2% (relative L2) of the reference."""
+        out = out.view(reference.shape)
+        for request, length in enumerate(lengths):
+            if length == 0:
+                continue
+            expected = reference[request]
+            error = ((out[request].float() - expected).norm() / expected.norm()).item()
+            assert error < 0.02, f"request {request} (length {length}): relative error {error:.3g}"
+
+    @pytest.mark.parametrize("tokens_per_request", [1, 2])
+    @pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
+    def test_decode_matches_reference(self, softmax_type, tokens_per_request):
+        """Every request's output matches the reference, with one or two (MTP) query tokens per
+        request and with a learnable sink."""
+        if softmax_type != "vanilla" and not is_te_min_version("2.8.0"):
+            pytest.skip("softmax_type requires TE >= 2.8.0")
+        attention = self._attention(softmax_type=softmax_type)
+        heads = attention.num_attention_heads_per_partition
+        if softmax_type == "learnable":
+            with torch.no_grad():
+                attention.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
+        softmax_offset = attention._get_inference_softmax_offset()
+        inputs = _latent_decode_inputs(self.lengths, tokens_per_request, heads)
+
+        with torch.no_grad():
+            out = attention.flash_decode_and_prefill(**inputs, softmax_offset=softmax_offset)
+
+        q = inputs["q"].view(len(self.lengths), tokens_per_request, heads, -1)
+        reference = _absorbed_decode_reference(
+            q,
+            inputs["k"],
+            inputs["block_table"],
+            inputs["seqlens_k"],
+            attention.softmax_scale,
+            softmax_offset,
+        )
+        self._assert_matches(out, reference, self.lengths)
+
+    def test_decode_ignores_unwritten_latent_rows(self):
+        """NaN in the rows past each request's length, and in the page that unused block-table
+        entries point at, does not reach any request's output."""
+        attention = self._attention()
+        heads = attention.num_attention_heads_per_partition
+        inputs = _latent_decode_inputs(self.lengths, 1, heads, unwritten=float("nan"))
+
+        with torch.no_grad():
+            out = attention.flash_decode_and_prefill(**inputs)
+
+        q = inputs["q"].view(len(self.lengths), 1, heads, -1)
+        reference = _absorbed_decode_reference(
+            q, inputs["k"], inputs["block_table"], inputs["seqlens_k"], attention.softmax_scale
+        )
+        self._assert_matches(out, reference, self.lengths)
+
+    def test_decode_replays_in_cuda_graph(self):
+        """A decode call captured in a CUDA graph serves the next step: each request's next latent
+        is written in place, the request at a page boundary gets a new page, and the replayed
+        output matches the reference."""
+        attention = self._attention()
+        heads = attention.num_attention_heads_per_partition
+        inputs = _latent_decode_inputs(self.lengths, 1, heads, spare_pages=1)
+
+        with torch.no_grad():
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                attention.flash_decode_and_prefill(**inputs)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = attention.flash_decode_and_prefill(**inputs)
+
+        latents, block_table = inputs["k"], inputs["block_table"]
+        spare_page = latents.shape[0] - 2
+        generator = torch.Generator(device="cuda").manual_seed(11)
+        next_lengths = [length + 1 if length else 0 for length in self.lengths]
+        for request, length in enumerate(self.lengths):
+            if length == 0:
+                continue
+            if length % 64 == 0:
+                block_table[request, length // 64] = spare_page
+            page = int(block_table[request, length // 64])
+            latents[page, length % 64] = torch.randn(576, generator=generator, device="cuda")
+        inputs["seqlens_k"].copy_(torch.tensor(next_lengths, dtype=torch.int32))
+        inputs["q"].copy_(torch.randn(inputs["q"].shape, generator=generator, device="cuda"))
+        graph.replay()
+
+        q = inputs["q"].view(len(self.lengths), 1, heads, -1)
+        reference = _absorbed_decode_reference(
+            q, latents, block_table, inputs["seqlens_k"], attention.softmax_scale
+        )
+        self._assert_matches(out, reference, next_lengths)
+
+    def test_layer_decode_step_matches_reference(self):
+        """A decode-only step of the layer under a real dynamic context runs the device's decode
+        kernel and matches the same step with the reference in place of the kernel."""
+        attention = self._attention()
+        context = TestMLALatentCacheDecode._context(attention.config)
+        context.memory_buffer.zero_()
+        TestMLALatentCacheDecode._add_request(context, 0, 70)
+
+        def prefill_kernel(q, k, v, *args, **kwargs):
+            # The prefill only has to write the prompt's latents into the cache.
+            return torch.zeros(*q.shape[:-1], v.shape[-1], dtype=q.dtype, device=q.device)
+
+        def reference_kernel(q, k, v, *args, softmax_offset=None):
+            seqlens_k, block_table, is_decode_only = args[-3:]
+            assert is_decode_only and v is None
+            batch = seqlens_k.shape[0]
+            out = _absorbed_decode_reference(
+                q.view(batch, q.shape[0] // batch, *q.shape[2:]),
+                k,
+                block_table,
+                seqlens_k,
+                attention.softmax_scale,
+                softmax_offset,
+            )
+            return out.view(q.shape[0], 1, *out.shape[2:]).to(q.dtype)
+
+        def step(kernel):
+            generator = torch.Generator(device="cuda").manual_seed(2)
+            hidden_states = torch.randn(
+                context.padded_active_token_count,
+                1,
+                attention.config.hidden_size,
+                generator=generator,
+                device="cuda",
+            ).to(torch.bfloat16)
+            with (
+                mock.patch.object(attention, "flash_decode_and_prefill", side_effect=kernel),
+                torch.no_grad(),
+                InferenceMode.active(),
+            ):
+                output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
+            return output[:1]
+
+        context.initialize_attention_state()
+        step(prefill_kernel)
+        context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32),
+            new_tokens=torch.zeros(1, dtype=torch.int64),
+        )
+        context.initialize_attention_state()
+        assert context.is_decode_only()
+        reference = step(reference_kernel)
+        decoded = step(attention.flash_decode_and_prefill)
+
+        error = ((decoded.float() - reference.float()).norm() / reference.float().norm()).item()
+        assert error < 0.02, f"relative error {error:.3g}"
 
 
 def _fused_kv_rope_quant_config(**overrides):

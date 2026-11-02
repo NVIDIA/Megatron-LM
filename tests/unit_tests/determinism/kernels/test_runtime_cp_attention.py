@@ -446,3 +446,96 @@ def test_mla_flash_prefill_dispatch_sink_offset_replays(softmax_type):
         assert not bytes_equal(sink[0]["out"], vanilla)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and FlashInfer")
+def test_mla_flashinfer_decode_dispatch_sink_offset_replays():
+    """The FlashInfer MLA decode that dynamic-inference MLA runs on SM100/SM103 replays
+    bit-exactly, with the sink offset applied by the kernel."""
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+    from megatron.core.utils import is_te_min_version
+    from tests.unit_tests.test_utilities import Utils
+
+    if not is_te_min_version("2.8.0"):
+        pytest.skip("softmax_type requires Transformer Engine >= 2.8.0")
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        heads, latent_dim = 16, 512 + 64
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=heads,
+            q_lora_rank=128,
+            kv_lora_rank=512,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,  # FlashInfer's DeepSeek latent shape: 512 + 64.
+            v_head_dim=128,
+            rope_type="rope",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            softmax_type="learnable",
+            cache_mla_latents=True,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        module = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        module.eval()
+        if module.absorbed_decode_kernel != "flashinfer":
+            pytest.skip("requires FlashInfer's MLA decode (SM100 or SM103)")
+        with torch.no_grad():
+            module.core_attention.softmax_offset.copy_(torch.linspace(0.0, 8.0, heads))
+
+        # Absorbed decode of 64 requests, one token each, over 1 to 32 pages of 64 latents, long
+        # enough for the kernel to split a request's KV across CTAs and reduce the partials.
+        page_size, max_pages = 64, 32
+        lengths_k = [(37 * request) % (max_pages * page_size) + 1 for request in range(64)]
+        seqlens_k = torch.tensor(lengths_k, device="cuda", dtype=torch.int32)
+        num_pages = len(lengths_k) * max_pages
+        inputs = dict(
+            q=torch.randn(len(lengths_k), 1, heads, latent_dim, device="cuda").bfloat16(),
+            k=torch.randn(num_pages, page_size, latent_dim, device="cuda").bfloat16(),
+            v=None,
+            max_seqlen_q=1,
+            max_seqlen_k=max(lengths_k),
+            cu_seqlens_q=torch.arange(len(lengths_k) + 1, device="cuda", dtype=torch.int32),
+            cu_seqlens_k=torch.nn.functional.pad(seqlens_k.cumsum(0, dtype=torch.int32), (1, 0)),
+            seqlens_k=seqlens_k,
+            block_table=torch.arange(num_pages, device="cuda", dtype=torch.int32).view(
+                len(lengths_k), max_pages
+            ),
+        )
+
+        def fn(**call):
+            return module.flash_decode_and_prefill(
+                **call, is_decode_only=True, softmax_offset=module._get_inference_softmax_offset()
+            )
+
+        sink = assert_replays_bit_exact(
+            fn,
+            inputs,
+            replays=3,
+            backward=False,
+            contention=True,
+            what="MLA flash_decode_and_prefill[FlashInfer decode, learnable sink]",
+        )
+        assert torch.isfinite(sink[0]["out"]).all()
+
+        # Without the offset the output must change, proving the kernel applied the sink.
+        vanilla = module.flash_decode_and_prefill(**inputs, is_decode_only=True)
+        assert not bytes_equal(sink[0]["out"], vanilla)
+    finally:
+        Utils.destroy_model_parallel()
