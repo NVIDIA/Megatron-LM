@@ -37,7 +37,7 @@ def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc, pat
         num_attention_heads=4,
         ffn_hidden_size=128,
         num_moe_experts=2 if "E" in pattern else None,
-        moe_ffn_hidden_size=128,
+        moe_ffn_hidden_size=128 if "E" in pattern else None,
         moe_grouped_gemm=True,
         moe_token_dispatcher_type="alltoall",
         add_bias_linear=False,
