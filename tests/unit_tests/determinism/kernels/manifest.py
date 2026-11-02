@@ -537,13 +537,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/wy_fast.py",
             "megatron/core/ssm/context_parallel/gdp.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_gdp_cp_kernels.py"),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
         "replayed both for one token per request and for a speculative step of several draft "
         "tokens, where the recurrence also writes per-draft-token state snapshots for rollback; "
-        "prefill-prepare is replayed for a single token and for a full 4096-token step.",
+        "prefill-prepare is replayed for a single token and for a full 4096-token step. "
+        "context_parallel/gdp.py launches FLA's CP summary and merge kernels directly; "
+        "test_gdp_cp_kernels.py replays them for BLH and varlen fragments.",
     ),
     KernelEntry(
         name="gated_delta_net",

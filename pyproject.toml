@@ -143,7 +143,7 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
-    "flash-linear-attention==0.5.1",
+    "flash-linear-attention==0.6.0",
 ]
 
 [dependency-groups]
