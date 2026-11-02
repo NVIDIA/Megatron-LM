@@ -560,6 +560,35 @@ def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision
     ]
 
 
+def test_precision_aware_checkpoint_uses_te_checkpoint_under_chunk_wise_cuda_graphs(monkeypatch):
+    """BF16 inside a chunk-wise graph capture still needs TE's checkpoint: mcore's would skip the
+    checkpoint node while the graph is captured and keep the activations resident."""
+    calls = []
+
+    def fake_te_checkpoint(
+        function, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    ):
+        calls.append((distribute_saved_activations, tp_group, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
+    )
+    monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", _unexpected_checkpoint)
+    config = SimpleNamespace(fp8=None, fp4=None, cuda_graph_impl="chunk_wise")
+    tp_group = object()
+
+    output = transformer_utils.precision_aware_checkpoint(_scale, config, tp_group, 3, factor=2)
+
+    assert output == 6
+    assert calls == [(False, tp_group, (3,), {"factor": 2})]
+    # No graphs, per-layer TE graphs and local graphs keep mcore's checkpoint for BF16.
+    for impl in ("none", "transformer_engine", "local"):
+        assert not transformer_utils.use_te_checkpoint(
+            SimpleNamespace(fp8=None, fp4=None, cuda_graph_impl=impl)
+        )
+
+
 def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(monkeypatch):
     calls = []
 

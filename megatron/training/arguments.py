@@ -2251,6 +2251,15 @@ def validate_args(args, defaults={}):
         exit_interval=args.exit_interval,
     )
 
+    # The optimizer step graph replays fixed device addresses; offloaded optimizer state moves
+    # between host and device between steps and cannot be captured.
+    if args.optimizer_cuda_graph:
+        assert not (
+            args.optimizer_cpu_offload
+            or args.chunked_optimizer_state_offload
+            or args.offload_optimizer_states
+        ), "--optimizer-cuda-graph requires the optimizer state to stay resident on the GPU."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2376,12 +2385,12 @@ def validate_args(args, defaults={}):
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if (
-            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
-            and not args.te_rng_tracker
-        ):
+            args.transformer_impl == "transformer_engine"
+            or args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        ) and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        if args.cuda_graph_impl == "transformer_engine":
+        if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
                 or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"

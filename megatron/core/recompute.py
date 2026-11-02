@@ -6,13 +6,13 @@ from torch import Tensor
 
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_layer_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import precision_aware_checkpoint, use_te_checkpoint
 
 
 def checkpointed_forward(
@@ -97,8 +97,10 @@ def checkpointed_forward(
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
                     if self.config.fp8:
-                        inner_quantization_context = get_fp8_context(
-                            self.config, layer.layer_number - 1
+                        inner_quantization_context = get_layer_fp8_context(
+                            self.config,
+                            layer.layer_number - 1,
+                            is_mtp_layer=getattr(self, "is_mtp_layer", False),
                         )
                     # TODO: check if fp4 is supported in this case
                     elif self.config.fp4:
@@ -226,13 +228,13 @@ def checkpointed_forward(
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
-        # layers and skip the rest. Need at least one input tensor with
-        # gradient computation for the re-entrant autograd engine, so under
-        # FP8/FP4 we skip checkpointing while hidden_states.requires_grad
-        # is False (these slots get pushed past the recompute window).
+        # layers and skip the rest. TE's re-entrant checkpoint needs at least one
+        # input tensor with gradient computation, so wherever it is the backend we
+        # skip checkpointing while hidden_states.requires_grad is False (these
+        # slots get pushed past the recompute window).
         recompute_skip_num_layers = 0
         for layer_idx in range(self.num_layers_per_pipeline_rank):
-            if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+            if use_te_checkpoint(self.config) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
             use_checkpoint = (
                 layer_idx >= recompute_skip_num_layers

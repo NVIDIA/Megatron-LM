@@ -20,7 +20,11 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    packed_seq_idx_on_device,
+    resolve_cp_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
@@ -28,6 +32,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     a2a_hp_to_cp,
     build_cp_context,
     causal_conv1d,
+    causal_conv1d_packed_masked,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
     l2norm,
@@ -42,6 +47,8 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.transformer.cuda_graph_config import packed_gated_delta_net_chunk_graph_blockers
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
@@ -305,12 +312,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
+            validated = self._packed_boundaries_validated(packed_seq_params)
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
                 cp_size=self.cp_size,
+                validated=validated,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -318,8 +327,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_len,
                 "cu_seqlens_kv",
                 cp_size=self.cp_size,
+                validated=validated,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert validated or torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -638,12 +648,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
+            validated = self._packed_boundaries_validated(packed_seq_params)
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                validated=validated,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -651,8 +663,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                validated=validated,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert validated or torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -714,21 +727,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     chunkwise_cp_context,
                 )
 
-            if self.config.fp8 or self.config.fp4:
-                # Import here to avoid a circular dependency.
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                out, out_bias = te_checkpoint(
-                    _checkpointed_compute,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                )
-            else:
-                out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, False, hidden_states
-                )
+            out, out_bias = precision_aware_checkpoint(
+                _checkpointed_compute, self.config, self.pg_collection.tp, hidden_states
+            )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -916,6 +917,28 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
         )
 
+    def packed_chunk_graph_blockers(self) -> list[str]:
+        """Settings that keep this layer's packed forward out of a chunk-wise CUDA graph.
+
+        Gated DeltaNet replays on the Transformer Engine (cuDNN) kernel backend, which reads the
+        boundaries on the device and plans by shape; see
+        ``packed_gated_delta_net_chunk_graph_blockers`` for the complete matrix.
+        """
+        return packed_gated_delta_net_chunk_graph_blockers(self.config, variant="gdn")
+
+    def _uses_graph_safe_packed_conv(self, packed_seq_params, chunkwise_cp_context) -> bool:
+        """Whether the packed causal convolution must avoid host-sized kernel launches.
+
+        True for packed (THD) inputs under chunk-wise CUDA graphs without chunkwise CP: the
+        captured block is replayed with other pack layouts in the same static buffers, which
+        the FLA varlen convolution (grid sized on the host from the capture sample's chunk
+        count) cannot follow. Chunkwise CP and the fused pre-GDR path (which bypasses this
+        convolution) are rejected with packed chunk-wise graphs before this point.
+        """
+        if self.config.cuda_graph_impl != "chunk_wise" or chunkwise_cp_context is not None:
+            return False
+        return packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+
     def pre_gated_delta_rule(
         self,
         qkvzba,
@@ -971,6 +994,19 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
             qkv = self.act_fn(conv_out[..., :kernel_seq_len])
             qkv = qkv.transpose(1, 2)
+        elif self._uses_graph_safe_packed_conv(packed_seq_params, chunkwise_cp_context):
+            # The FLA varlen convolution sizes its kernel grid on the host from the chunk count
+            # of the pack it sees; a chunk-wise CUDA graph replays the captured block with other
+            # pack layouts in the same static buffers, so the packed convolution runs on
+            # fixed-shape tensor ops masked by the per-token sequence index instead.
+            seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None or seq_idx.shape[-1] != qkv.shape[1]:
+                # Metadata built without total_tokens (or for another token frame): derive the
+                # index from the resolved boundaries with fixed-shape device ops.
+                seq_idx = packed_seq_idx_on_device(cu_seqlens_q, qkv.shape[1])
+            qkv = causal_conv1d_packed_masked(
+                qkv.contiguous(), conv1d_weight.squeeze(1), conv1d_bias, self.activation, seq_idx
+            )
         else:
             assert self.activation in ["silu", "swish"]
             orig_seq = qkv.shape[1]

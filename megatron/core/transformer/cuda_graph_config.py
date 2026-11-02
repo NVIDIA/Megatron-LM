@@ -19,6 +19,7 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
     "local": {InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block},
     "transformer_engine": {InferenceCudaGraphScope.none},
     "full_iteration": {InferenceCudaGraphScope.none},
+    "chunk_wise": {InferenceCudaGraphScope.none},
 }
 
 
@@ -44,6 +45,20 @@ def validate_moe_cuda_graph_support(config) -> None:
             and config.moe_pad_expert_input_to_capacity
         )
     ):
+        return
+
+    if getattr(config, "cuda_graph_impl", "none") == "chunk_wise":
+        # The whole decoder block is captured, so the MoE only needs static shapes: a rank
+        # capacity with the sync-free HybridEP dispatcher, or a megakernel backend.
+        assert config.moe_megakernel_backend is not None or (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "hybridep"
+            and config.moe_expert_rank_capacity_factor is not None
+        ), (
+            "chunk-wise CUDA graphs with MoE need static token shapes: use drop-padding MoE "
+            "(moe_expert_capacity_factor + moe_pad_expert_input_to_capacity), the HybridEP "
+            "flex dispatcher with moe_expert_rank_capacity_factor, or a MoE megakernel backend."
+        )
         return
 
     assert (
@@ -91,11 +106,76 @@ def is_packed_dsa_cp_cuda_graph_experimental(
     )
 
 
+def packed_gated_delta_net_chunk_graph_blockers(config, variant: Optional[str] = None) -> List[str]:
+    """Settings that keep packed-sequence GDN-family layers out of a chunk-wise CUDA graph.
+
+    The FLA kernels behind GDN / GDN2 / KDA derive their chunk index tensors (and the chunkwise
+    CP context) on the host from the *values* of ``cu_seqlens`` and cache them by tensor
+    identity, so a captured block graph, whose static boundary buffers are refreshed in place,
+    would replay the pack layout of the capture sample. Gated DeltaNet on the Transformer
+    Engine backend (the cuDNN kernel reads the boundaries on the device and plans by shape) and
+    KDA on a flash-linear-attention with the fixed-shape ``use_graph`` mode can be captured, with
+    context parallelism limited to static headwise CP, whose exchange is performed by Megatron
+    with fixed-shape device ops.
+
+    Args:
+        config: the stack-level or layer-level transformer config.
+        variant: the GDN-family kind to judge (``'gdn'``, ``'gdn2'`` or ``'kda'``); defaults to
+            ``config.experimental_attention_variant``. Layers built from a hybrid layer pattern
+            carry no variant in their config and pass their own kind.
+
+    Returns:
+        Human-readable reasons; empty when the configuration is supported. KDA is admitted when
+    the installed flash-linear-attention provides ``chunk_kda(use_graph=True)`` (>= 0.6.0),
+    whose kernels build a fixed-shape chunk list on the device and skip the sentinel rows.
+    """
+    blockers = []
+    if variant is None:
+        variant = config.experimental_attention_variant
+    if variant in ("gdn", "gated_delta_net"):
+        if config.gdn_kernel_backend != "transformer_engine":
+            blockers.append(
+                f"gdn_kernel_backend={config.gdn_kernel_backend!r} (the FLA and torch GDN "
+                "kernels derive their chunk indices on the host; set "
+                "gdn_kernel_backend='transformer_engine' for the cuDNN kernel)"
+            )
+        if config.gdn_pre_gated_delta_rule_fusion:
+            blockers.append(
+                "gdn_pre_gated_delta_rule_fusion=True (the fused pre-GDR path bypasses the "
+                "fixed-shape packed convolution and is not validated under chunk graphs; "
+                "disable the fusion)"
+            )
+    elif variant == "kda":
+        from megatron.core.ssm.gated_delta_net.kda import fla_kda_supports_graph_capture
+
+        if not fla_kda_supports_graph_capture():
+            blockers.append(
+                "the installed flash-linear-attention has no fixed-shape varlen mode for KDA "
+                "(chunk_kda use_graph, flash-linear-attention >= 0.6.0)"
+            )
+    else:
+        blockers.append(
+            f"experimental_attention_variant={variant!r} (only 'gdn' on the Transformer Engine "
+            "backend and 'kda' on flash-linear-attention >= 0.6.0 have device-side chunk indices)"
+        )
+    if config.dynamic_context_parallel:
+        blockers.append(
+            "dynamic_context_parallel=True (the captured layer is built for a static CP size)"
+        )
+    if config.context_parallel_size > 1 and config.linear_cp_mode != "headwise":
+        blockers.append(
+            f"linear_cp_mode={config.linear_cp_mode!r} with context parallelism (chunkwise CP "
+            "converts the THD layout with data-dependent splits and needs an FLA CP context; "
+            "set linear_cp_mode='headwise')"
+        )
+    return blockers
+
+
 def cuda_graph_captures_attention(config) -> bool:
     """Return whether the normalized training graph scope includes attention."""
     impl = getattr(config, "cuda_graph_impl", "none")
     modules = getattr(config, "cuda_graph_modules", None)
-    return impl == "full_iteration" or (
+    return impl in ("full_iteration", "chunk_wise") or (
         impl in ("local", "transformer_engine") and (not modules or CudaGraphModule.attn in modules)
     )
 

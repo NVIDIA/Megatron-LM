@@ -5,6 +5,7 @@ import inspect
 import logging
 import os
 import sys
+import warnings
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -2759,6 +2760,207 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
+
+
+class TestChunkWiseCudaGraphs:
+    """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation and callable
+    selection."""
+
+    def test_chunk_config_accepts_full_recompute(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=1,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        assert cfg.cuda_graph_impl == 'chunk_wise'
+
+    def test_chunk_config_accepts_fine_grained_activation_offloading(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            fine_grained_activation_offloading=True,
+            offload_modules=['core_attn', 'attn_proj'],
+        )
+        assert cfg.cuda_graph_impl == 'chunk_wise'
+        assert cfg.fine_grained_activation_offloading
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({'cuda_graph_modules': [CudaGraphModule.attn]}, "cuda_graph_modules must be empty"),
+            (
+                {
+                    'cuda_graph_modules': [],
+                    'recompute_granularity': 'full',
+                    'recompute_method': 'uniform',
+                    'recompute_num_layers': 1,
+                    'hidden_dropout': 0.1,
+                    'attention_dropout': 0.0,
+                },
+                "hidden_dropout=0",
+            ),
+        ],
+    )
+    def test_chunk_config_rejections(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', **overrides)
+
+    def test_chunk_config_packed_gated_delta_net_support_matrix(self, monkeypatch):
+        """Packed GDN-family layers are captured only for Gated DeltaNet on the Transformer
+        Engine (cuDNN) kernel backend and for KDA on a flash-linear-attention with the
+        fixed-shape ``use_graph`` mode, without CP or with static headwise CP. The other FLA
+        kernels build their chunk indices on the host from the cu_seqlens values and cache them
+        per tensor, so a captured block graph would replay the capture sample's pack layout.
+        Fixed-length chunk graphs and the per-layer TE graphs of the same packed configuration
+        are unaffected."""
+        from megatron.core.ssm.gated_delta_net import kda as kda_module
+
+        def gated_delta_net(variant):
+            return dict(
+                experimental_attention_variant=variant,
+                linear_attention_freq=1,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_num_key_heads=4,
+                linear_num_value_heads=4,
+            )
+
+        packed = dict(
+            sequence_packing_scheduler="dp_balanced",
+            cuda_graph_dynamic_microbatches=True,
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
+        )
+        chunk = dict(cuda_graph_impl='chunk_wise', cuda_graph_modules=[])
+        match = "supports packed-sequence .* only for Gated DeltaNet"
+        # The FLA backend (the default) is rejected, and so are KDA and GDN2 on an FLA without
+        # the fixed-shape varlen mode.
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(**chunk, **gated_delta_net("gdn"), **packed)
+        monkeypatch.setattr(kda_module, "fla_kda_supports_graph_capture", lambda: False)
+        with pytest.raises(ValueError, match="flash-linear-attention >= 0.6.0") as rejected_kda:
+            _base_cuda_graph_config(**chunk, **gated_delta_net("kda"), **packed)
+        # KDA never consults gdn_kernel_backend: the blocking settings do not mention it.
+        assert "gdn_kernel_backend='fla'" not in str(rejected_kda.value)
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(**chunk, **gated_delta_net("gdn2"), **packed)
+        with pytest.raises(ValueError, match="experimental_attention_variant='gdn2'"):
+            _base_cuda_graph_config(
+                **chunk,
+                **gated_delta_net("gdn2"),
+                gdn_kernel_backend="transformer_engine",
+                **packed,
+            )
+        # KDA is admitted once the installed FLA has chunk_kda(use_graph=True).
+        monkeypatch.setattr(kda_module, "fla_kda_supports_graph_capture", lambda: True)
+        kda_admitted = _base_cuda_graph_config(**chunk, **gated_delta_net("kda"), **packed)
+        assert kda_admitted.cuda_graph_impl == 'chunk_wise'
+        with pytest.raises(ValueError, match="linear_cp_mode='chunkwise' with context"):
+            _base_cuda_graph_config(
+                **chunk, **gated_delta_net("kda"), context_parallel_size=2, **packed
+            )
+        # Also with context parallelism, where the message has to win over the generic
+        # THD CP layout-conversion rejection of attention-capturing graphs.
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(
+                **chunk,
+                **gated_delta_net("gdn"),
+                context_parallel_size=2,
+                cp_partition_mode="contiguous",
+                **packed,
+            )
+        te_gdn = dict(gated_delta_net("gdn"), gdn_kernel_backend="transformer_engine")
+        # Gated DeltaNet on the cuDNN kernel is admitted without CP ...
+        admitted = _base_cuda_graph_config(**chunk, **te_gdn, **packed)
+        assert admitted.cuda_graph_impl == 'chunk_wise'
+        # ... and with static headwise CP, whose exchange is Megatron's fixed-shape all-to-all.
+        headwise = _base_cuda_graph_config(
+            **chunk, **te_gdn, context_parallel_size=2, linear_cp_mode="headwise", **packed
+        )
+        assert headwise.context_parallel_size == 2
+        # Chunkwise CP (the GDN default) converts the THD layout with data-dependent splits.
+        with pytest.raises(ValueError, match="linear_cp_mode='chunkwise' with context"):
+            _base_cuda_graph_config(**chunk, **te_gdn, context_parallel_size=2, **packed)
+        # The fused pre-GDR path bypasses the fixed-shape packed convolution: not admitted.
+        with pytest.raises(ValueError, match="gdn_pre_gated_delta_rule_fusion=True"):
+            _base_cuda_graph_config(
+                **chunk, **te_gdn, gdn_pre_gated_delta_rule_fusion=True, **packed
+            )
+        # GDN layers built from a hybrid layer pattern carry no variant, so this gate cannot see
+        # them: the chunk-graph block asks every captured layer for its blockers instead
+        # (TestPackedGatedDeltaNetChunkGraph.test_hybrid_pattern_layers_are_checked_at_capture).
+        hybrid = _base_cuda_graph_config(
+            **chunk,
+            **dict(gated_delta_net(None), is_hybrid_model=True, linear_attention_freq=None),
+            **packed,
+        )
+        assert hybrid.experimental_attention_variant is None
+        fixed_length = _base_cuda_graph_config(**chunk, **gated_delta_net("gdn"))
+        assert fixed_length.cuda_graph_impl == 'chunk_wise'
+        per_layer = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[],
+            **gated_delta_net("gdn"),
+            **packed,
+        )
+        assert per_layer.cuda_graph_impl == 'transformer_engine'
+
+    def test_chunk_uses_outer_block_callable(self):
+        config = SimpleNamespace(cuda_graph_impl='chunk_wise')
+        for block_type in (TransformerBlock, HybridStack):
+            block = object.__new__(block_type)
+            object.__setattr__(block, 'config', config)
+            assert isinstance(block, GraphableMegatronModule)
+            assert _layer_is_graphable(block, config)
+            assert not block._should_call_local_cudagraph()
+        layer = object.__new__(TransformerLayer)
+        object.__setattr__(layer, 'config', config)
+        assert not _layer_is_graphable(layer, config)
+
+    def test_chunk_config_warns_when_packed_pp_keeps_the_p2p_shape_exchange(self):
+        """Packing pads every microbatch to max_seqlen_per_dp_cp_rank, so the pipeline P2P shape
+        is static; without pipeline_p2p_fixed_shape every P2P still exchanges shapes (a host
+        synchronization)."""
+        packed_pp = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            cuda_graph_dynamic_microbatches=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+        )
+        with pytest.warns(UserWarning, match="pipeline_p2p_fixed_shape=True"):
+            _base_cuda_graph_config(**packed_pp)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            _base_cuda_graph_config(**packed_pp, pipeline_p2p_fixed_shape=True)
+            _base_cuda_graph_config(**{**packed_pp, "pipeline_model_parallel_size": 1})
+
+    def test_te_capture_runs_on_the_shared_capture_stream_for_pool_sharing(self, monkeypatch):
+        """The chunk graphs and the optimizer-step graph share one memory pool, whose free blocks
+        are keyed by the allocating stream: TE's capture (torch.cuda.graph without a stream) must
+        therefore run on get_shared_capture_stream(). The helper only redirects torch's default
+        capture stream; the full-iteration path keeps passing the stream explicitly."""
+        from megatron.core import full_cuda_graph
+
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+        monkeypatch.setattr(torch.cuda.graphs.graph, "default_capture_stream", None)
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        full_cuda_graph.capture_te_graphs_on_shared_stream()
+        assert (
+            torch.cuda.graphs.graph.default_capture_stream
+            is full_cuda_graph.get_shared_capture_stream()
+        )
 
 
 class TestPartialCudaGraph:

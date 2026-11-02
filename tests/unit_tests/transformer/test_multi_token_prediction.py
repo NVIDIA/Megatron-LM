@@ -6035,6 +6035,129 @@ class TestMHCMTPIntegration:
                 assert not torch.all(param.main_grad == 0), f"Zero gradient for {name}"
 
 
+class TestZigzagPackedRoll:
+    """The zigzag-CP packed roll against a roll of the full packed sequence."""
+
+    @staticmethod
+    def _zigzag_shard(full, cu, cp, rank):
+        """Rows CP rank ``rank`` owns in zigzag layout: per packed sequence, global chunk ``rank``
+        followed by global chunk ``2 * cp - 1 - rank``; empty slots contribute nothing."""
+        parts = []
+        for start, end in zip(cu[:-1], cu[1:]):
+            if end == start:
+                continue
+            chunks = full[..., start:end].chunk(2 * cp, dim=-1)
+            parts += [chunks[rank], chunks[2 * cp - 1 - rank]]
+        return torch.cat(parts, dim=-1)
+
+    @pytest.mark.parametrize("cp", [2, 4])
+    def test_matches_the_roll_of_the_full_packed_sequence(self, cp):
+        if Utils.world_size % cp != 0:
+            pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
+        from megatron.core.transformer.multi_token_prediction import (
+            _roll_tensor_packed_seq_zigzag_cp,
+        )
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        try:
+            cp_group = get_context_parallel_group()
+            rank = torch.distributed.get_rank(group=cp_group)
+            # Global packed lengths (multiples of 2 * cp); the empty slot mimics static packed
+            # metadata that repeats a boundary.
+            lengths = [8 * cp, 2 * cp, 0, 6 * cp]
+            cu = [0]
+            for length in lengths:
+                cu.append(cu[-1] + length)
+            total = cu[-1]
+            full = torch.arange(1, 2 * total + 1, device="cuda", dtype=torch.int64).view(2, total)
+            fill = -7
+            expected_full = full.clone()
+            for start, end in zip(cu[:-1], cu[1:]):
+                if end > start:
+                    expected_full[..., start : end - 1] = full[..., start + 1 : end]
+                    expected_full[..., end - 1] = fill
+            local = self._zigzag_shard(full, cu, cp, rank)
+            expected = self._zigzag_shard(expected_full, cu, cp, rank)
+            # Rows beyond the packed data roll as a trailing segment whose last slot takes the
+            # fill value, like the CP1 path.
+            pad = torch.full((2, 3), 99, device="cuda", dtype=torch.int64)
+            local = torch.cat([local, pad], dim=-1)
+            expected_pad = pad.clone()
+            expected_pad[..., -1] = fill
+            expected = torch.cat([expected, expected_pad], dim=-1)
+            cu_seqlens = torch.tensor(cu, device="cuda", dtype=torch.int32)
+
+            rolled = _roll_tensor_packed_seq_zigzag_cp(
+                local, -1, -1, cu_seqlens, cp_group, fill_value=fill
+            )
+
+            assert torch.equal(rolled, expected)
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("cp", [2])
+    def test_replays_in_a_cuda_graph_across_packings(self, cp):
+        """Chunk CUDA graphs capture the roll with static ``cu_seqlens`` buffers whose values
+        change per replay (repeated final boundaries pad the slot count). The boundary exchange
+        and the scatter must therefore have data-independent shapes, and the captured graph must
+        reproduce the eager roll of every packing that fits the static slots."""
+        if Utils.world_size % cp != 0:
+            pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
+        from megatron.core.transformer.multi_token_prediction import (
+            _roll_tensor_packed_seq_zigzag_cp,
+        )
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        try:
+            cp_group = get_context_parallel_group()
+            rank = torch.distributed.get_rank(group=cp_group)
+            capacity, slots = 16 * cp, 4  # global tokens / sequence slots of the static layout
+            rows = capacity // cp
+
+            def cu_seqlens(lengths):
+                boundaries = [0]
+                for length in lengths:
+                    boundaries.append(boundaries[-1] + length)
+                # Static THD metadata always has ``slots + 1`` entries; unused slots repeat the
+                # final boundary.
+                boundaries += [boundaries[-1]] * (slots + 1 - len(boundaries))
+                return torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+
+            # The last packing leaves trailing rows beyond the packed data.
+            packings = (
+                [8 * cp, 8 * cp],
+                [16 * cp],
+                [2 * cp, 6 * cp, 4 * cp, 4 * cp],
+                [6 * cp, 4 * cp],
+            )
+            local = torch.arange(rows, device="cuda", dtype=torch.float32) + 100.0 * rank
+            local = local.view(1, rows).repeat(2, 1).contiguous()
+
+            def roll(x, cu):
+                return _roll_tensor_packed_seq_zigzag_cp(x, -1, -1, cu, cp_group)
+
+            references = [roll(local, cu_seqlens(packing)) for packing in packings]
+
+            static_x = local.clone()
+            static_cu = cu_seqlens(packings[0]).clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    roll(static_x, static_cu)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = roll(static_x, static_cu)
+            for packing, reference in zip(packings, references):
+                static_cu.copy_(cu_seqlens(packing))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(static_out, reference), packing
+        finally:
+            Utils.destroy_model_parallel()
+
+
 class TestRollTensorWithCPSubgroup:
     """Roll-tensor CP paths on a CP group that is a strict subgroup of WORLD.
 
