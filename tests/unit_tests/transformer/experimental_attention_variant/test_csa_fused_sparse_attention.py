@@ -227,6 +227,35 @@ def test_csa_sparse_attn_flattens_and_restores_sbhd_layout():
     assert torch.equal(actual, flat_output.reshape(sq, batch, heads * value_dim))
 
 
+@pytest.mark.parametrize("compact", [False, True], ids=["no-topk-length", "topk-length"])
+def test_sparse_attention_backward_clamps_sentinels_only_with_topk_length(monkeypatch, compact):
+    """Without ``topk_length`` the ``-1`` slots are the only invalid marker."""
+    rows, heads, dim = 4, 2, 8
+    query = torch.randn(rows, heads, dim, requires_grad=True)
+    kv = torch.randn(5, dim, requires_grad=True)
+    sink = torch.zeros(heads, requires_grad=True)
+    indices = torch.tensor([[0, 1, -1], [1, -1, -1], [2, 3, 4], [0, -1, -1]], dtype=torch.int32)
+    length = (indices >= 0).sum(dim=-1).int() if compact else None
+    out, lse = torch.randn(rows, heads, dim), torch.randn(rows, heads)
+    monkeypatch.setattr(
+        fused_csa, "_csa_fwd_flash_mla", lambda *args, **kwargs: (out.clone(), lse.clone(), None)
+    )
+    seen = {}
+
+    def fake_backward(q, kv, out, d_out, lse, sink, topk_idxs, softmax_scale, topk_length):
+        seen["indices"] = topk_idxs.clone()
+        return torch.zeros_like(q), torch.zeros_like(kv), torch.zeros_like(sink)
+
+    monkeypatch.setattr(fused_csa, "_csa_sparse_attention_backward", fake_backward)
+    saved = indices.clone()
+    output, _, _ = fused_csa.CSASparseAttnFunc.apply(query, kv, sink, saved, length, 0.125, 0)
+    output.sum().backward()
+
+    expected = indices.clamp_min(0) if compact else indices
+    assert torch.equal(seen["indices"], expected)
+    assert torch.equal(saved, indices), "the saved indices must not be modified"
+
+
 @pytest.mark.parametrize("actual_heads", [2, 64])
 def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch, actual_heads):
     seen = {}
