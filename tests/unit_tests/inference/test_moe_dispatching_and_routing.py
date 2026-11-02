@@ -303,23 +303,23 @@ class TestInferenceTopKRouter:
         assert torch.equal(inference_map, training_map)
         torch.testing.assert_close(probs, training_probs.gather(1, top_indices))
 
-    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["compiled", "eager"])
     @pytest.mark.parametrize(
         "topk,score_function,pre_softmax",
-        [(1, "softmax", False), (2, "softmax", False), (2, "sigmoid", False), (2, "softmax", True)],
-        ids=["top1", "top2-softmax", "top2-sigmoid", "top2-pre-softmax"],
+        [
+            (1, "softmax", False),
+            (2, "softmax", False),
+            (2, "sigmoid", False),
+            (2, "softmax", True),
+            (2, "sqrtsoftplus", False),
+        ],
+        ids=["top1", "top2-softmax", "top2-sigmoid", "top2-pre-softmax", "top2-sqrtsoftplus"],
     )
-    def test_sinkhorn_routing_matches_eval_routing(
-        self, monkeypatch, topk, score_function, pre_softmax, batch_invariant
-    ):
+    def test_sinkhorn_routing_matches_eval_routing(self, topk, score_function, pre_softmax):
         """Sinkhorn routing weights the selected experts by sigmoid (top-1) or the full softmax
-        (top-k > 1), whatever the score function, without renormalization or scaling: the
-        routing of TopKRouter in eval mode."""
-        import megatron.core.transformer.moe.router as router_module
-
-        monkeypatch.setattr(
-            router_module, "is_batch_invariant_mode_enabled", lambda: batch_invariant
-        )
+        (top-k > 1), whatever the score function (sqrtsoftplus included, without hash layers),
+        without renormalization or scaling: the routing of TopKRouter in eval mode. It returns
+        before the choice between the compiled and the batch-invariant routing, so one path
+        covers both modes."""
         router = self._make_router(
             moe_router_load_balancing_type="sinkhorn",
             moe_aux_loss_coeff=0.0,

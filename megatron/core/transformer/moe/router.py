@@ -1397,8 +1397,14 @@ class InferenceTopKRouter(TopKRouter):
             f"got {config.moe_router_num_groups}"
         )
         supported_compiled_scores = ["sigmoid", "softmax"]
-        assert config.moe_router_score_function in supported_compiled_scores or (
-            config.moe_num_hash_layers > 0 and config.moe_router_score_function == "sqrtsoftplus"
+        # Sinkhorn routing does not use the score function (see _sinkhorn_activation).
+        assert (
+            config.moe_router_load_balancing_type == "sinkhorn"
+            or config.moe_router_score_function in supported_compiled_scores
+            or (
+                config.moe_num_hash_layers > 0
+                and config.moe_router_score_function == "sqrtsoftplus"
+            )
         ), (
             "InferenceTopKRouter requires moe_router_score_function to be sigmoid/softmax, "
             "or sqrtsoftplus for hash routing; got "
