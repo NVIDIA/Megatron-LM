@@ -131,6 +131,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -6537,7 +6538,10 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=config.cuda_graph_use_single_mempool,
+            # Chunk-wise CUDA graphs capture into the shared pool; the optimizer step joins it.
+            use_single_mempool=(
+                config.cuda_graph_use_single_mempool or config.cuda_graph_impl == "chunk_wise"
+            ),
         )
 
     def get_e2e_base_metrics():
@@ -6621,7 +6625,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if args.cuda_graph_impl == "transformer_engine":
+    if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -6763,7 +6767,7 @@ def train(
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
         # own span, distinct from the megatron.train.iteration spans around it.
         if (
-            args.cuda_graph_impl == "transformer_engine"
+            args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
@@ -6776,6 +6780,12 @@ def train(
                 if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(model, param_sync=False)
                 cuda_graph_helper.create_cudagraphs()
+                # TE's warm-up passes ran the training forward on the static inputs and
+                # accumulated into the per-step loss trackers; drop that so this step logs only
+                # its real forward.
+                clear_aux_losses_tracker()
+                DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+                MTPLossLoggingHelper.clean_loss_in_tracker()
                 if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(model)
                     cuda_graph_helper.cuda_graph_set_manual_hooks()
@@ -6965,7 +6975,7 @@ def train(
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
-                        args.cuda_graph_impl == "transformer_engine"
+                        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
                         and args.cuda_graph_warmup_steps == 0
                     ):
                         assert (
@@ -7247,7 +7257,10 @@ def train(
         )
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if (
+        args.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        and cuda_graph_helper.graphs_created()
+    ):
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph

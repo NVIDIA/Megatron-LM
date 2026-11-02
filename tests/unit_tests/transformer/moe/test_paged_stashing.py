@@ -495,6 +495,41 @@ class TestPagedTensorRoundTrip:
         assert overflow.item() == 0
         assert torch.equal(paged._tensor[:num_tokens], src[:num_tokens])
 
+    @pytest.mark.parametrize("hidden_size", [64, 1000])
+    def test_reload_zero_fills_padded_rows_for_static_shape_consumers(self, hidden_size):
+        """``zero_padded_tokens`` zero-fills the rows in ``[num_tokens, max_num_tokens)`` of the
+        reloaded buffer (a chunk CUDA graph consumer reads all ``max_num_tokens`` static rows,
+        which are otherwise uninitialised memory) and keeps the valid rows bit-exact; without
+        the flag the pop kernel leaves those rows untouched."""
+        device = torch.device("cuda")
+        page_size, num_tokens, max_num_tokens = 64, 300, 600
+        src = torch.randn(max_num_tokens, hidden_size, device=device).to(torch.bfloat16)
+        garbage = torch.full_like(src, 7.0)
+
+        def round_trip(**reload_kwargs):
+            overflow = torch.zeros(1, dtype=torch.int64, device=device)
+            host_spill = torch.zeros(1, dtype=torch.int64, device=device)
+            stash = PagedStashBuffer(
+                max_num_tokens, hidden_size, page_size, device, overflow, host_spill, src.dtype
+            )
+            paged = PagedTensor(
+                src.clone(),
+                num_tokens_tensor=torch.tensor([num_tokens], dtype=torch.int64, device=device),
+                max_num_tokens=max_num_tokens,
+                hidden_size=hidden_size,
+                page_size=page_size,
+            )
+            paged.offload_to_stash(stash)
+            paged._tensor = garbage.clone()
+            paged.reload_from_stash(stash, **reload_kwargs)
+            torch.cuda.synchronize()
+            assert overflow.item() == 0
+            assert torch.equal(paged._tensor[:num_tokens], src[:num_tokens])
+            return paged._tensor[num_tokens:]
+
+        assert torch.count_nonzero(round_trip(zero_padded_tokens=True)) == 0
+        assert torch.equal(round_trip(), garbage[num_tokens:])
+
 
 class MoEModelTestContainer:
     def __init__(

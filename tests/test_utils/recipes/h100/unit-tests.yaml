@@ -450,6 +450,20 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_recompute_multi_microbatch.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_same_model_steady_state.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
     products:
       - environment: [lts, dev]

@@ -390,13 +390,12 @@ def _build_contiguous_packed_seq_roll_plan(
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
-    if cu.numel() > 1:
-        # Static packed metadata can repeat its final boundary to pad the number
-        # of cu_seqlens entries. Remove duplicates before assigning positions to
-        # packed intervals so every retained interval has a nonzero length.
-        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
-        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
-        cu = cu[nonduplicate_boundaries]
+    # Static packed metadata can repeat its final boundary to pad the number of cu_seqlens
+    # entries (zero-length intervals). They are harmless below: ``bucketize(right=True)``
+    # returns the first boundary strictly greater than a position, so a repeated boundary never
+    # becomes the end of a live position, and ``cu[-1]`` is unchanged. They are deliberately not
+    # compacted with a boolean mask: that indexing is data-dependent (host synchronization) and
+    # cannot be captured when the post-process runs inside a CUDA graph.
 
     has_sequences = cu.numel() > 1
     if local_seq_len == 0 or not has_sequences:
@@ -1013,38 +1012,56 @@ def _roll_tensor_packed_seq_cp1(tensor, shifts, dims, sequence_end_indices, fill
 
 
 def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
-    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries.
+    """Roll a zigzag-CP THD shard by one token without crossing packed sequence boundaries.
 
-    Each physical document length must be divisible by ``2 * cp_size`` so every rank owns
-    two equal chunks. All documents share one batched boundary exchange. Slots after the
-    final physical boundary roll as a separate segment whose last slot takes fill_value.
+    Zigzag layout: for packed sequence ``i`` with physical length ``L_i`` (divisible by
+    ``2 * cp``), CP rank ``r`` owns two chunks of ``h_i = L_i / (2 cp)`` rows -- global chunk ``r``
+    (front) and global chunk ``2cp-1-r`` (tail) -- stored contiguously at local rows
+    ``[cu_i / cp, cu_i / cp + 2 h_i)``. A left roll by one inside the global sequence means every
+    local row takes its right neighbour except (a) the last row of the front chunk, whose
+    successor is the first row of rank ``r+1``'s front chunk (rank ``cp-1``: its own tail chunk),
+    and (b) the last row of the tail chunk, whose successor is the first row of rank ``r-1``'s
+    tail chunk (rank 0: the sequence end -> ``fill_value``).
+
+    All documents share one batched boundary exchange whose shape, one row per sequence slot
+    and direction, does not depend on the data: the slot indices are computed on the device and
+    empty slots (repeated boundaries in static packed metadata) exchange junk rows that land in
+    discarded columns, so the roll can be captured in a CUDA graph and replayed with other
+    ``cu_seqlens`` values. Slots after the final physical boundary roll as a separate trailing
+    segment whose last slot takes ``fill_value``, like the CP1 path. The alignment requirement
+    is validated on the host outside graph capture.
     """
+    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cp_size = cp_group.size()
     sequence_dim = dims if dims >= 0 else tensor.dim() + dims
-    physical_cu_seqlens = cu_seqlens.to(device=tensor.device)
-    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=sequence_dim)
-    rolled_tensor.select(sequence_dim, shifts).fill_(fill_value)
-
-    # CP attention requires two equal chunks per rank for every physical document.
-    aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
-    local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
-    local_lengths = torch.diff(local_boundaries)
-    # Exchange one boundary vector per neighbour for all nonempty documents.
-    # RL packing may repeat the final boundary in fixed-size metadata.
-    nonempty = torch.nonzero(local_lengths > 0).flatten()
-    # nonzero already waits for CUDA, so validate on the host before indexing or communication.
-    if not bool(aligned):
+    t_local = tensor.size(sequence_dim)
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    lengths = cu[1:] - cu[:-1]
+    # CP attention requires two equal chunks per rank for every physical document. The check
+    # is one host sync, as in the CP1 path; a capture replays statically padded layouts that
+    # already satisfy it.
+    if not torch.cuda.is_current_stream_capturing() and not bool(
+        (lengths % (2 * cp_size) == 0).all()
+    ):
         raise ValueError("Packed document lengths must be divisible by twice the CP size")
-    if nonempty.numel() == 0:
-        return rolled_tensor
-    local_starts = local_boundaries[:-1].index_select(0, nonempty)
-    local_ends = local_boundaries[1:].index_select(0, nonempty)
-    chunk_lengths = local_lengths.index_select(0, nonempty) // 2
-    second_starts = local_starts + chunk_lengths
-    first_ends = second_starts - 1
-    second_ends = local_ends - 1
-    first_boundary = tensor.index_select(sequence_dim, local_starts)
-    second_boundary = tensor.index_select(sequence_dim, second_starts)
+
+    rolled = torch.roll(tensor, shifts=-1, dims=sequence_dim)
+    # The last local slot is the implicit end of the trailing segment.
+    rolled.select(sequence_dim, -1).fill_(fill_value)
+    num_slots = lengths.numel()
+    if num_slots == 0:
+        return rolled
+
+    local_start = cu[:-1] // cp_size
+    half = lengths // (2 * cp_size)
+    valid = half > 0
+    tail_first = local_start + half
+    front_last = tail_first - 1
+    tail_last = local_start + 2 * half - 1
+    # Boundary payloads, one row per slot. Clamping only affects empty slots, whose rows are
+    # never scattered back.
+    first_boundary = tensor.index_select(sequence_dim, local_start.clamp(0, t_local - 1))
+    second_boundary = tensor.index_select(sequence_dim, tail_first.clamp(0, t_local - 1))
     first_received, second_received = _exchange_cp_roll_boundaries(
         first_boundary, second_boundary, cp_group
     )
@@ -1052,9 +1069,15 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
         # Rank 0 holds every document's global end; the shared exchange zero-fills it.
         second_received.fill_(fill_value)
 
-    rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
-    rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
-    return rolled_tensor
+    # Scatter the received rows into the chunk ends. Every empty slot targets its own junk
+    # row, so the index tensors have a fixed shape and no duplicates.
+    junk = t_local + torch.arange(num_slots, device=tensor.device)
+    junk_shape = list(rolled.shape)
+    junk_shape[sequence_dim] = num_slots
+    extended = torch.cat([rolled, rolled.new_zeros(junk_shape)], dim=sequence_dim)
+    extended.index_copy_(sequence_dim, torch.where(valid, front_last, junk), first_received)
+    extended.index_copy_(sequence_dim, torch.where(valid, tail_last, junk), second_received)
+    return extended.narrow(sequence_dim, 0, t_local).contiguous()
 
 
 def _prefetch_contiguous_packed_cp_roll_halos(
@@ -1633,7 +1656,13 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def clean_loss_in_tracker():
-        """Clear per-step MTP loss and acceptance counters."""
+        """Clear per-step MTP loss and acceptance counters while retaining replay metadata.
+
+        The reduce groups are kept: when the post-process runs inside a CUDA graph, the captured
+        accumulation into ``loss_sums`` / ``num_tokens`` replays every step but
+        ``save_loss_to_tracker`` itself does not, so resetting the groups here would leave the
+        replayed losses unreduced (rank-local) in the logs.
+        """
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
@@ -2085,7 +2114,20 @@ class MTPLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MTPLossAutoScaler.main_loss_backward_scale = scale
+        # Keep one persistent device tensor and update it in place (same contract as
+        # MoEAuxLossAutoScaler): a CUDA graph that captured the MTP loss backward holds this
+        # tensor's address, so rebinding a new tensor every step would make the replayed
+        # backward read freed memory.
+        current = MTPLossAutoScaler.main_loss_backward_scale
+        if (
+            not torch.is_tensor(current)
+            or current.device != scale.device
+            or current.shape != scale.shape
+            or current.dtype != scale.dtype
+        ):
+            MTPLossAutoScaler.main_loss_backward_scale = scale.detach().clone()
+        else:
+            current.copy_(scale)
 
 
 def _process_mtp_e2e_tv_loss(
@@ -3194,10 +3236,19 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
-        * Non-tensor objects are captured by the ``custom_forward`` closure; only tensor / ``None``
-          arguments flow positionally through the underlying checkpoint primitive.
-        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
-          everything else uses ``tensor_parallel.checkpoint``.
+        * Non-tensor objects (``attention_bias``, ``inference_params``,
+          ``packed_seq_params``) are captured by the ``custom_forward``
+          closure; only tensor / ``None`` arguments flow positionally
+          through the underlying checkpoint primitive. This is required
+          by both backends: ``tensor_parallel.checkpoint`` because its
+          ``save_for_backward`` only accepts tensors and ``None``, and
+          ``te_checkpoint`` because its reentrant implementation only
+          tracks positional tensor inputs as checkpoint inputs (kwarg
+          tensors are not represented in the recompute backward path).
+        * Quantized recipes (fp8, fp4) and chunk CUDA graph captures route
+          through ``te_checkpoint`` (``precision_aware_checkpoint`` /
+          ``transformer.utils.use_te_checkpoint``); everything else uses
+          ``tensor_parallel.checkpoint``.
         * Only ``fp8 + delayed scaling`` needs an outer quantization
           context entered before ``te_checkpoint``; see the
           ``outer_quantization_context`` block below.
@@ -3281,10 +3332,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
 
         if self.config.recompute_method == 'uniform':
-            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # The MTP layer is a single recompute unit regardless of the decoder's
+            # recompute_num_layers, which only groups decoder layers.
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
