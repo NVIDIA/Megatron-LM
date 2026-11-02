@@ -49,6 +49,11 @@ class _FakeOptimizer:
             return
         self._log.append(('stage', self._name))
 
+    def _sync_unbuffered_model_params(self):
+        if self.is_stub_optimizer:
+            return
+        self._log.append(('own_gather', self._name))
+
 
 def _build(reuse_grad_buf, share_chunk=True, with_stub=False):
     log = []
@@ -86,6 +91,11 @@ def test_every_optimizer_stages_before_the_gather():
 
     order = [entry[0] for entry in log]
     assert max(i for i, k in enumerate(order) if k == 'stage') < order.index('sync'), log
+    # Optimizer-owned gathers (compact LayerWise) also run after every member has staged,
+    # and before DDP's gather of the remaining bucket groups.
+    first_own_gather = order.index('own_gather')
+    assert max(i for i, k in enumerate(order) if k == 'stage') < first_own_gather, log
+    assert max(i for i, k in enumerate(order) if k == 'own_gather') < order.index('sync'), log
 
 
 def test_distinct_model_chunks_are_each_gathered():
@@ -145,6 +155,9 @@ def test_gather_uses_the_chain_s_own_model_chunks():
 
         def _stage_model_params_from_main_params(self):
             log.append(('stage', self._name))
+
+        def _sync_unbuffered_model_params(self):
+            log.append(('own_gather', self._name))
 
     chained = ChainedOptimizer([_MemberWithoutChunks('a'), _MemberWithoutChunks('b')])
     assert chained.model_chunks == [], "members expose no chunks, so __init__ finds none"

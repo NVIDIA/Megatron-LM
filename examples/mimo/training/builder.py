@@ -137,7 +137,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if use_megatron_fsdp or use_torch_fsdp2:

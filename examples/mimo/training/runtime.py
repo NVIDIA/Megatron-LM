@@ -98,7 +98,7 @@ def wrap_active_modules_with_ddp(
     ddp_config: DistributedDataParallelConfig,
     data_parallel_random_init: bool = False,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool = True,
+    use_layer_wise_param_layout: bool | None = None,
 ) -> None:
     """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     if mimo_model.language_model is not None:

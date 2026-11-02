@@ -318,9 +318,10 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
+            requested_layout = gpt_model[0].ddp_config.layer_wise_param_layout
+            assert has_param_layout == (requested_layout != "legacy"), (
                 "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
+                f"requested={requested_layout}, actual={has_param_layout}"
             )
         self._on_model_built(gpt_model, optimizer, args)
 

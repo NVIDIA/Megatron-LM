@@ -235,7 +235,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -251,8 +251,10 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+            use_layer_wise_param_layout: Legacy boolean spelling of
+                ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
+                layout and ``False`` the legacy layout. ``None`` (default) defers to
+                ``ddp_config``.
 
         Returns:
             List of model stages.

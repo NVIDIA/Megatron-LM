@@ -327,6 +327,8 @@ def setup_model_and_optimizer(
         mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        # use_param_layout='compact' selects the compact LayerWise layout; True the padded one.
+        mock_args.layer_wise_param_layout = 'compact' if use_param_layout == 'compact' else None
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         # get_model reads the layer-wise flag from the run config to tag params for DDP
@@ -469,6 +471,8 @@ def setup_moe_model_and_optimizer(
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        # use_param_layout='compact' selects the compact LayerWise layout; True the padded one.
+        mock_args.layer_wise_param_layout = 'compact' if use_param_layout == 'compact' else None
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         # get_model reads the layer-wise flag from the run config to tag params for DDP
@@ -510,11 +514,17 @@ def setup_moe_model_and_optimizer(
     model_parallel_cuda_manual_seed(seed + 1)
 
     if optimizer_type in ('muon', 'dist_muon'):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+
+        def _init_states(opt):
+            # The padded and compact layouts nest LayerWise next to a DistOpt sibling, which
+            # seeds its state elsewhere.
+            if isinstance(opt, ChainedOptimizer):
+                for child_optimizer in opt.chained_optimizers:
+                    _init_states(child_optimizer)
+            elif hasattr(opt, 'init_state_fn'):
+                opt.init_state_fn(opt.optimizer if hasattr(opt, 'optimizer') else opt)
+
+        _init_states(optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:

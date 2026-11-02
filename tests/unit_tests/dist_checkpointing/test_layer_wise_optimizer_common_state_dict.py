@@ -133,7 +133,8 @@ class TestLayerWiseOptimizerCommonStateDict:
 
     @pytest.mark.parametrize('tp', [1, 2])
     @pytest.mark.parametrize('pp', [1, 2])
-    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp):
+    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
+    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp, use_param_layout):
         """End-to-end ``save_checkpoint``/``load_checkpoint`` roundtrip on the
         hybrid LayerWise + DistributedOptimizer path.
 
@@ -145,7 +146,8 @@ class TestLayerWiseOptimizerCommonStateDict:
         ``use_distributed_optimizer`` off in Muon mode -- the DistOpt
         sub-optimizer then defaulted to the deprecated
         ``fully_sharded_model_space`` save path which is incompatible with
-        the post-5ab481cb45 ShardedTensor validation.
+        the post-5ab481cb45 ShardedTensor validation. Runs with the padded and the compact
+        LayerWise layout.
         """
         if tp * pp > 8:
             pytest.skip("TP*PP > 8 is larger than world size")
@@ -170,7 +172,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=True,
+                    use_param_layout=use_param_layout,
                 )
 
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
@@ -194,7 +196,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=True,
+                    use_param_layout=use_param_layout,
                 )
 
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)

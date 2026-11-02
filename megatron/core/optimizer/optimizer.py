@@ -396,6 +396,15 @@ class MegatronOptimizer(ABC):
         """
         self._stage_model_params_from_main_params()
 
+    def _sync_unbuffered_model_params(self) -> None:
+        """Gather the model params that this optimizer publishes without DDP bucket groups.
+
+        Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
+        after every member has staged its params. DDP skips the bucket groups of such params
+        (see ``DistributedDataParallelConfig.param_sync_via_bucket_group``).
+        """
+        return
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -1943,12 +1952,22 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
+        # Optimizer-owned gathers (e.g. compact LayerWise without overlap) run after every
+        # member has staged its params; DDP below skips their bucket groups.
+        self._sync_unbuffered_model_params()
         # self.model_chunks, not a walk over the members: __init__ collects chunks only from
         # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
         # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
         # super().__init__(), and recomputing here would discard that and gather nothing.
         for model_chunk in self.model_chunks:
             model_chunk.start_param_sync(force_sync=True)
+
+    @override
+    def _sync_unbuffered_model_params(self) -> None:
+        if self.is_stub_optimizer:
+            return
+        for optimizer in self.chained_optimizers:
+            optimizer._sync_unbuffered_model_params()
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:

@@ -716,7 +716,9 @@ class TestDdpWrapFullParamLayout:
         # Single optimizer instance, so the intra-instance groups match the full groups.
         self.pg.intra_dp_cp.size.return_value = 4
         self.pg.intra_expt_dp.size.return_value = 2
-        self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
+        # _ddp_wrap() selects the layout through configure_ddp_for_layer_wise_optimizer(),
+        # which looks the class up in its defining module at call time.
+        self._opt_patcher = patch("megatron.core.optimizer.distrib_optimizer.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
 
