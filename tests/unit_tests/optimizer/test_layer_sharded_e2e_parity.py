@@ -9,6 +9,9 @@ genuine GTP_remat x TP domain) is bitwise identical to ``duplicated`` mode.
 Skips at module level when GTP is unavailable (TransformerEngine < 2.19.0.dev0), like
 ``test_gtp_fp8_param_gather.py``.
 
+The hybrid test runs ``--muon-expert-tp-mode`` on the MoE grid: each weight family gets the
+base optimizer its mode selects, with losses bitwise those of all-duplicated.
+
 Launch with 4 ranks:
   torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py
 """
@@ -23,6 +26,7 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
+from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 from tests.unit_tests.test_fp8_param import TestFP8Param as _Harness
 from tests.unit_tests.test_utilities import Utils
@@ -110,6 +114,36 @@ class _LayerShardedHarness(_Harness):
         )
 
 
+class _HybridHarness(_LayerShardedHarness):
+    """Also records, for every Muon base optimizer, its class and which weight family
+    (``expert_tp``, copied onto the main params) its params belong to."""
+
+    def _on_model_built(self, model_chunks, optimizer, args):
+        super()._on_model_built(model_chunks, optimizer, args)
+        families = []
+
+        def visit(opt):
+            if isinstance(opt, TensorParallelMuon):
+                flags = frozenset(
+                    bool(getattr(p, 'expert_tp', False))
+                    for group in opt.param_groups
+                    for p in group['params']
+                )
+                families.append((type(opt), flags))
+                return
+            children = getattr(opt, 'chained_optimizers', None)
+            if children:
+                for child in children:
+                    visit(child)
+                return
+            inner = vars(opt).get('optimizer')
+            if inner is not None and inner is not opt:
+                visit(inner)
+
+        visit(optimizer)
+        self.muon_families = families
+
+
 def _assert_bitwise_across_ranks(loss_ref, loss_test, label):
     local = torch.stack((loss_ref, loss_test)).cuda()
     gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
@@ -175,3 +209,56 @@ def test_dense_layer_sharded_matches_duplicated_end_to_end():
 def test_moe_layer_sharded_matches_duplicated_end_to_end():
     """GPT-MoE (EP1, ETP2 x EGTP2): layer_sharded (two-stage) == duplicated, bitwise."""
     _run_pair(_MOE, "moe")
+
+
+def _muon_class(mode):
+    return LayerShardedMuon if mode == "layer_sharded" else TensorParallelMuon
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    "dense_mode, expert_mode", [("duplicated", "layer_sharded"), ("layer_sharded", "duplicated")]
+)
+def test_moe_hybrid_modes_match_duplicated_end_to_end(dense_mode, expert_mode):
+    """GPT-MoE (EP1, ETP2 x EGTP2) with --muon-expert-tp-mode through the training loop.
+
+    Covers the seam the unit tests do not: config -> param grouping -> buckets -> one base
+    Muon optimizer per weight family -> step. EP=1 with matching dense/expert TP and GTP sizes
+    gives the routed experts ``allreduce=True``, so the split must follow the semantic expert
+    marker, not the communication flag. layer_sharded is bitwise duplicated, so every loss
+    must equal the all-duplicated run's."""
+    if Utils.world_size != 4:
+        pytest.skip("Requires exactly 4 torchrun ranks for TP2 x GTP2")
+    label = f"moe hybrid dense={dense_mode} expert={expert_mode}"
+    harness = _HybridHarness()
+    harness.setup_method(None)
+    harness.seq_length = 64
+    harness.micro_batch_size = 1
+    try:
+        common = {**_COMMON, **_MOE}
+        loss_dup = harness._run_test_helper(
+            tp_size=2, recipe=_RECIPE, fp8_param_gather=False, muon_tp_mode="duplicated", **common
+        )
+        loss_hybrid = harness._run_test_helper(
+            tp_size=2,
+            recipe=_RECIPE,
+            fp8_param_gather=False,
+            muon_tp_mode=dense_mode,
+            muon_expert_tp_mode=expert_mode,
+            **common,
+        )
+        expected = {
+            (_muon_class(dense_mode), frozenset({False})),
+            (_muon_class(expert_mode), frozenset({True})),
+        }
+        got = set(harness.muon_families)
+        assert got == expected, (
+            f"{label}: each weight family must get its own base optimizer of the class its "
+            f"mode selects; got {got}, expected {expected}"
+        )
+        _assert_bitwise_across_ranks(loss_dup, loss_hybrid, label)
+    finally:
+        harness.teardown_method(None)
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
+
+        update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
