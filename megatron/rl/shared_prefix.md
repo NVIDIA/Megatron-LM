@@ -81,14 +81,15 @@ adding backend support and generalized source-row/loss mappings.
 
 `MAX_SHARED_PREFIX_BRANCHES` (16) is the default number of completions stored
 behind one prompt copy. It is a planning policy, not a kernel limit, and planners
-that take a branch limit default to it. Planners split a larger exact-prompt
-group evenly: 17 rows become stars of 9 and 8, not a 16-completion star and an
-unshared singleton.
+that take a branch limit default to it. A larger exact-prompt group is split
+into the fewest stars the limit allows, with sizes that differ by at most one:
+17 rows become 9 and 8, and 241 rows become one star of 16 and fifteen of 15. A
+binding token budget can split a group further.
 
-The layout, execution, metadata, alignment and cost modules require only the
+Every module listed above except `shared_prefix_tensors` requires only the
 Python standard library. Tensor materialization additionally requires Torch.
-Importing them does not initialize a model or load the optional Pydantic
-generation request API.
+Importing these modules does not initialize a model or load the optional
+Pydantic generation request API.
 
 ## Minimal packing example
 
@@ -130,6 +131,14 @@ collectives over different tokens. `pack_dense_rows` calls the packer twice and
 rejects differing bins, which catches a non-repeatable packer but not one that
 differs between ranks.
 
+Determinism is not batch invariance. The planners are deterministic functions
+of the local batch, so peers with identical inputs build identical plans. A
+row's layout still depends on the other rows in its batch: which rows share its
+star, which stars share its forest, and how alignment splits its unit. Different
+layouts change logprobs and gradients at BF16 level. The `megatron.core`
+shared-prefix execution in #8156, #8157 and #7914 also rejects
+`batch_invariant_mode`.
+
 ## Integration responsibilities
 
 The caller validates its configuration and model capabilities, supplies the
@@ -137,6 +146,24 @@ TP/CP topology and padding multiple, transports metadata with source rows,
 and agrees on a forward count across all participating model ranks. It then
 calls the alignment helpers with that count. No helper launches collectives
 or fabricates dummy training examples.
+
+Each data-parallel replica plans only its own rows. Invalid flag combinations
+are rejected before any row is read, so they fail on every rank alike. A check
+on the rows can fail on one replica while its peers succeed: for example, a row
+longer than the token budget after padding makes
+`plan_shared_prefix_execution_units` raise only on the replica that holds it.
+The caller must carry any local planning error in the same collective that
+agrees on the forward count. Every rank then raises together instead of waiting
+in a model collective. The alignment helpers run after that agreement and have
+their own preconditions:
+
+- Pass them only units that the planners produced under the same token budget
+  and padding multiple.
+- The agreed count must not exceed any rank's number of real rows, because
+  alignment never fabricates rows. Carry the minimum local row count in the same
+  collective, and fail on every rank if it is too small.
+- `align_training_units` cannot split a forest with explicit MTP loss groups,
+  such as one built by `merge_dense_fallbacks`.
 
 TP greater than one requires sequence parallelism. The padding multiple must be
 a multiple of the topology quantum from `get_shared_prefix_physical_alignment`:
@@ -160,15 +187,16 @@ optional Megatron backend.
 
 ## Validation scope
 
-The portable packing tests live in `tests/unit_tests/rl/shared_prefix/`. They
-cover exact prompt identity, source-row coverage, causal isolation, physical
-padding, CP shard reconstruction, fallback behavior, execution-count alignment,
-MTP normalization, seeded planning and tensor properties, and the signatures
-NeMo RL calls. Their pure CPU contracts can run without the repository's
-distributed CUDA fixtures:
+The packing tests live in `tests/unit_tests/rl/shared_prefix/` and run in the
+unit-test CI buckets. They need neither a GPU nor torch.distributed. They cover
+exact prompt identity, source-row coverage, causal isolation, physical padding,
+CP shard reconstruction, fallback behavior, execution-count alignment, MTP
+normalization, seeded planning and tensor properties, the signatures NeMo RL
+calls, and the examples in this file. Where `megatron.core` cannot be imported,
+run them without the repository conftest:
 
 ```bash
-uv run python -m pytest --noconftest tests/unit_tests/rl/shared_prefix
+python -m pytest --noconftest tests/unit_tests/rl/shared_prefix
 ```
 
 These tests cover planning only. Model numerics, and the agreement between this
