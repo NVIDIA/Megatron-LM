@@ -78,13 +78,11 @@ def test_gather_then_local_slice_does_not_double_reduce(cp):
 
 
 class _CrossRankRegion(nn.Module):
-    def __init__(self, group):
+    def __init__(self, group, layout):
         super().__init__()
         self.group = group
         self.weight = nn.Parameter(torch.tensor(0.25, device="cuda"))
-        self.schema = TensorSchema(
-            (TensorField("shared", (8, 2), torch.float32, "contiguous", True),)
-        )
+        self.schema = TensorSchema((TensorField("shared", (8, 2), torch.float32, layout, True),))
 
     def forward(self, hidden, state):
         gathered, _ = gather_state(state, self.schema, self.group)
@@ -93,11 +91,13 @@ class _CrossRankRegion(nn.Module):
 
 @pytest.mark.usefixtures("te_rng_tracker")
 @pytest.mark.parametrize("mode", ["recompute", "torch", "transformer_engine"])
-def test_cp_collective_region_matches_eager_in_recompute_and_graphs(cp, mode):
-    module = _CrossRankRegion(cp)
+@pytest.mark.parametrize("layout", ["contiguous", "zigzag"])
+def test_cp_collective_region_matches_eager_in_recompute_and_graphs(cp, mode, layout):
+    """Zigzag reordering inside capture requires a gather without host synchronization."""
+    module = _CrossRankRegion(cp, layout)
     actual = StatefulModule(module, module.schema.fields)
     # Copy the parameters, retaining the same explicit process group.
-    expected = StatefulModule(_CrossRankRegion(cp), actual.inputs.fields)
+    expected = StatefulModule(_CrossRankRegion(cp, layout), actual.inputs.fields)
     expected.load_state_dict(actual.state_dict())
     state, _ = _state(cp)
     x = torch.randn(8, 2, device="cuda", requires_grad=True)
@@ -147,10 +147,13 @@ def test_tp_sp_cp_gather_orders_tokens_and_sums_owner_gradients(layout):
             restored, _ = redistribute_state(state, schema, "contiguous", groups.cp, **options)
             torch.testing.assert_close(restored["value"], value)
         gathered, _ = gather_state(state, schema, groups.cp, **options)
+        replicated, _ = gather_state(state, schema, groups.cp, tp_replicated=True, **options)
         torch.testing.assert_close(gathered["value"], whole)
         torch.testing.assert_close(gathered["ids"], torch.arange(32, device="cuda"))
-        (gathered["value"].square().sum() * (logical_rank + 1)).backward()
-        torch.testing.assert_close(value.grad, 20 * value)
+        # Distinct consumers sum (1+2+3+4) * 2v; TP-replicated duplicates are averaged.
+        loss = gathered["value"].square().sum() + replicated["value"].square().sum()
+        (loss * (logical_rank + 1)).backward()
+        torch.testing.assert_close(value.grad, 30 * value)
         for function, args in (
             (gather_state, (state, schema, groups.cp)),
             (redistribute_state, (state, schema, layout, groups.cp)),
