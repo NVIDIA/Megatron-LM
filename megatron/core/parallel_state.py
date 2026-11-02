@@ -6,7 +6,6 @@ import enum
 import logging
 import os
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -174,7 +173,7 @@ class TeardownStage(enum.IntEnum):
     """Stages of destroy_model_parallel(), in execution order."""
 
     VALIDATE = 0
-    """Raise if teardown must not start. Runs before anything is aborted or released."""
+    """Raise if teardown must not start. Runs before anything is released."""
 
     RELEASE_COMMUNICATION = 1
     """Release contexts and buffers that use model-parallel communicators."""
@@ -188,15 +187,9 @@ class TeardownStage(enum.IntEnum):
 
 # Teardown callbacks by stage. See register_model_parallel_teardown().
 _MODEL_PARALLEL_TEARDOWN_CALLBACKS = {stage: [] for stage in TeardownStage}
-_MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS = {}
 
 
-def register_model_parallel_teardown(
-    stage: TeardownStage,
-    callback: Callable[[], None],
-    *,
-    on_abort: Optional[Callable[[Sequence[torch.distributed.ProcessGroup]], None]] = None,
-) -> None:
+def register_model_parallel_teardown(stage: TeardownStage, callback: Callable[[], None]) -> None:
     """Run ``callback`` at ``stage`` of every destroy_model_parallel() call.
 
     Modules that cache resources bound to model-parallel process groups register a
@@ -205,17 +198,10 @@ def register_model_parallel_teardown(
     Within a stage, callbacks run in reverse registration order: a module registers
     after the modules it imports, so it releases its resources before theirs.
     Registering the same callback again has no effect.
-
-    If supplied, ``on_abort`` replaces ``callback`` during abort teardown and receives
-    the groups whose NCCL backends were aborted. This lets owners discard registrations
-    already released by NCCL abort without deregistering them a second time. Resources
-    associated with other groups still require normal cleanup.
     """
     callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS[stage]
     if callback not in callbacks:
         callbacks.append(callback)
-    if on_abort is not None:
-        _MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS[callback] = on_abort
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -2777,39 +2763,6 @@ def _destroy_created_process_groups():
         raise first_error
 
 
-def _abort_created_process_groups():
-    """Abort owned NCCL backends before cleanup that may synchronize CUDA work."""
-    groups = [
-        group
-        for group in reversed(_global_process_group_list or [])
-        if group is not None
-        and group in torch.distributed.distributed_c10d._world.pg_map
-        and torch.distributed.get_backend(group) == "nccl"
-    ]
-    if not groups:
-        return []
-
-    def abort_group(group):
-        group._get_backend(torch.device("cuda")).abort()
-
-    # Start all aborts together: outstanding work on different communicators can
-    # depend on one another, so aborting them one at a time can block.
-    first_error = None
-    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-        futures = [executor.submit(abort_group, group) for group in groups]
-        for future in futures:
-            try:
-                future.result()
-            except Exception as error:
-                logger.warning("Failed to abort a model-parallel NCCL backend.", exc_info=True)
-                if first_error is None:
-                    first_error = error
-    # Do not enter graceful finalization if an abort failed: it may wait forever.
-    if first_error is not None:
-        raise first_error
-    return groups
-
-
 def _clear_dtensor_sharding_cache():
     """Invalidate this thread's sharding specs, which can name a previous lifetime's groups."""
     from torch.distributed.tensor import DTensor
@@ -2825,7 +2778,7 @@ def _clear_dtensor_sharding_cache():
         cache.cache.cache_clear()
 
 
-def destroy_model_parallel(*, abort: bool = False) -> None:
+def destroy_model_parallel() -> None:
     """Destroy model-parallel process groups and clear their global state.
 
     Call on every member of each group after communications and Transformer Engine
@@ -2833,16 +2786,9 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     (including TE graphed callables) before invoking this function. The default
     process group is preserved.
 
-    Teardown runs the registered TeardownStage.VALIDATE callbacks, aborts the owned
-    NCCL backends if requested, runs the remaining stages' callbacks in stage order
-    while the groups still exist, clears this module's state, and destroys the created
-    groups last. See register_model_parallel_teardown().
-
-    Args:
-        abort: Abort the owned NCCL backends before releasing cached resources. Failure
-            handlers with outstanding collectives must use this mode, or abort their
-            backends before calling. This does not abort WORLD or communication owned
-            by external libraries such as DeepEP; those require caller-managed recovery.
+    Teardown runs the registered TeardownStage.VALIDATE callbacks, runs the remaining
+    stages' callbacks in stage order while the groups still exist, clears this module's
+    state, and destroys the created groups last. See register_model_parallel_teardown().
 
     Raises:
         RuntimeError: A validation callback refused teardown, for example because a TE
@@ -2856,8 +2802,6 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     for validate in reversed(callbacks[TeardownStage.VALIDATE]):
         validate()
 
-    aborted_groups = _abort_created_process_groups() if abort else []
-
     # Release cached resources while their process groups still exist. Run every
     # callback even if one fails: some releases rendezvous with peer ranks, which run
     # all of them.
@@ -2869,11 +2813,7 @@ def destroy_model_parallel(*, abort: bool = False) -> None:
     ):
         for release in reversed(callbacks[stage]):
             try:
-                on_abort = _MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS.get(release)
-                if abort and on_abort is not None:
-                    on_abort(aborted_groups)
-                else:
-                    release()
+                release()
             except Exception as error:
                 logger.warning("Failed to release a model-parallel resource.", exc_info=True)
                 if first_error is None:

@@ -263,12 +263,11 @@ class RegisteredLIFOPool:
 symmetric_wgrad_pool = RegisteredLIFOPool()
 
 
-def deregister_and_clear_gtp_symm_pools(aborted_groups=()) -> None:
+def deregister_and_clear_gtp_symm_pools() -> None:
     """Tear down what this module owns: deregister the pools' windows, then drop the
     recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
     are not freed here. Model-parallel teardown calls this before destroying groups.
-    ``aborted_groups`` have already released their windows and allocator hooks through
-    NCCL abort; only deregister pools belonging to other, still-live groups.
+    Pools whose group no longer exists are dropped without deregistration.
     """
     if not _pools and not _registered and not symmetric_wgrad_pool._free:
         return
@@ -280,7 +279,11 @@ def deregister_and_clear_gtp_symm_pools(aborted_groups=()) -> None:
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
         group = _registered[name]
-        if group not in aborted_groups:
+        # In-process restart (nvrx AbortTorchDistributed) aborts and destroys the
+        # process groups before Megatron's finalize calls destroy_model_parallel, so a
+        # pool can belong to a group that no longer exists. Its windows went with the
+        # communicator; only drop the bookkeeping.
+        if group in dist.distributed_c10d._world.pg_map:
             vmm_symm_allocator.deregister_mem_pool(_pools[name], group)
         del _registered[name]
     # Only now drop the buffers and the pools; the windows are gone, so the memory
@@ -291,7 +294,5 @@ def deregister_and_clear_gtp_symm_pools(aborted_groups=()) -> None:
 
 
 register_model_parallel_teardown(
-    TeardownStage.RELEASE_COMMUNICATION,
-    deregister_and_clear_gtp_symm_pools,
-    on_abort=deregister_and_clear_gtp_symm_pools,
+    TeardownStage.RELEASE_COMMUNICATION, deregister_and_clear_gtp_symm_pools
 )

@@ -282,30 +282,3 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
         assert OptimizerCudaGraphWrapper.cuda_graph is None
         assert OptimizerCudaGraphWrapper.curr_iteration == 0
     _assert_world_usable()
-
-
-@pytest.mark.skipif(Utils.world_size < 2, reason="Requires an unmatched collective")
-def test_abort_teardown_with_unmatched_collective(distributed_without_model_parallel, monkeypatch):
-    # Isolate the injected failure to the new subgroup. Its watchdog must leave
-    # recovery to the explicit abort rather than terminating the pytest worker.
-    monkeypatch.setenv("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
-    baseline = set(torch.distributed.distributed_c10d._world.pg_map)
-    group = ps.create_group(ranks=list(range(Utils.world_size)), backend="nccl")
-    value = torch.ones(2, device="cuda")
-    torch.distributed.all_reduce(value, group=group)
-    torch.cuda.synchronize()
-    store = torch.distributed.PrefixStore(
-        "test_abort_teardown_with_unmatched_collective",
-        torch.distributed.distributed_c10d._get_default_store(),
-    )
-    work = None
-    if torch.distributed.get_rank() == 0:
-        work = torch.distributed.all_reduce(value, group=group, async_op=True)
-        store.set("enqueued", "1")
-    else:
-        store.wait(["enqueued"], timedelta(seconds=30))
-    ps.destroy_model_parallel(abort=True)
-    del work
-    torch.cuda.synchronize()
-    assert set(torch.distributed.distributed_c10d._world.pg_map) == baseline
-    _assert_world_usable()

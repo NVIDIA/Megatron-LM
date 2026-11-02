@@ -52,13 +52,10 @@ def test_destroy_attempts_remaining_groups_after_failure(monkeypatch):
 def recorded_teardown(monkeypatch):
     """Replace the groups, callbacks and caches of teardown with recorders."""
     events = []
-    backend = SimpleNamespace(abort=lambda: events.append("abort"))
-    group = Mock()
-    group._get_backend.return_value = backend
+    group = object()
     monkeypatch.setattr(
         torch.distributed.distributed_c10d, "_world", SimpleNamespace(pg_map={group: None})
     )
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
     monkeypatch.setattr(
         torch.distributed, "destroy_process_group", lambda group: events.append("destroy")
     )
@@ -68,7 +65,6 @@ def recorded_teardown(monkeypatch):
     monkeypatch.setattr(
         ps, "_MODEL_PARALLEL_TEARDOWN_CALLBACKS", {stage: [] for stage in ps.TeardownStage}
     )
-    monkeypatch.setattr(ps, "_MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS", {})
     return events
 
 
@@ -76,8 +72,7 @@ def _recorder(events, name):
     return lambda: events.append(name)
 
 
-@pytest.mark.parametrize("abort", [False, True])
-def test_teardown_runs_callbacks_in_stage_order(recorded_teardown, abort):
+def test_teardown_runs_callbacks_in_stage_order(recorded_teardown):
     events = recorded_teardown
     stage = ps.TeardownStage
     # Register out of stage order. Within a stage the later registration runs first.
@@ -91,10 +86,9 @@ def test_teardown_runs_callbacks_in_stage_order(recorded_teardown, abort):
         ps.register_model_parallel_teardown(stage.RELEASE_COMMUNICATION, release_symm_buffers)
     ps.register_model_parallel_teardown(stage.VALIDATE, _recorder(events, "validate"))
 
-    ps.destroy_model_parallel(abort=abort)
+    ps.destroy_model_parallel()
     assert events == [
         "validate",
-        *(["abort"] if abort else []),
         "symm_buffers",
         "a2a_buffers",
         "graphs",
@@ -123,7 +117,6 @@ def test_resource_owners_register_teardown():
     assert OptimizerCudaGraphWrapper.reset_cuda_graph in graphs
     release_pools = gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools
     assert release_pools in communication
-    assert ps._MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS[release_pools] is release_pools
     assert gtp._destroy_gtp_state in callbacks[ps.TeardownStage.RESET_STATE]
 
 
@@ -155,13 +148,13 @@ def test_full_cuda_graph_teardown_without_graph_skips_rerun_state_machine(monkey
     assert FullCudaGraphWrapper.result == {"training": None, "validation": None}
 
 
-@pytest.mark.parametrize("abort", [False, True])
-def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch, abort):
+def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch):
     events = recorded_teardown
     group = ps._global_process_group_list[1]
-    # A caller-owned group is not aborted by model-parallel teardown. Its pool must
-    # still be deregistered normally, even when the owned group was aborted.
+    # A live caller-owned group is not destroyed by model-parallel teardown, but its
+    # pool must still be deregistered.
     external_group = object()
+    torch.distributed.distributed_c10d._world.pg_map[external_group] = None
     pools = {"owned": object(), "external": object()}
     monkeypatch.setattr(gtp_symmetric_memory, "_pools", pools.copy())
     monkeypatch.setattr(
@@ -183,19 +176,9 @@ def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch, abort):
 
     monkeypatch.setattr(gtp_symmetric_memory.vmm_symm_allocator, "deregister_mem_pool", deregister)
     release = gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools
-    ps.register_model_parallel_teardown(
-        ps.TeardownStage.RELEASE_COMMUNICATION, release, on_abort=release
-    )
-    ps.destroy_model_parallel(abort=abort)
-    assert events == [
-        *(["abort"] if abort else []),
-        "synchronize",
-        "external",
-        *([] if abort else ["owned"]),
-        "dtensor",
-        "memory",
-        "destroy",
-    ]
+    ps.register_model_parallel_teardown(ps.TeardownStage.RELEASE_COMMUNICATION, release)
+    ps.destroy_model_parallel()
+    assert events == ["synchronize", "external", "owned", "dtensor", "memory", "destroy"]
     assert not gtp_symmetric_memory._registered
     assert not gtp_symmetric_memory._pools
     assert not pool_cache._free
@@ -203,8 +186,35 @@ def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch, abort):
     assert events.count("synchronize") == 1
 
 
-@pytest.mark.parametrize("abort", [False, True])
-def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, monkeypatch, abort):
+def test_gtp_pool_teardown_skips_destroyed_groups(monkeypatch):
+    # In-process restart aborts and destroys the process groups before finalize calls
+    # destroy_model_parallel. A pool on a destroyed group must not be deregistered, but
+    # its bookkeeping must still be dropped.
+    live_group, dead_group = object(), object()
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d, "_world", SimpleNamespace(pg_map={live_group: None})
+    )
+    pools = {"live": object(), "dead": object()}
+    monkeypatch.setattr(gtp_symmetric_memory, "_pools", pools.copy())
+    monkeypatch.setattr(
+        gtp_symmetric_memory, "_registered", {"live": live_group, "dead": dead_group}
+    )
+    pool_cache = gtp_symmetric_memory.RegisteredLIFOPool()
+    pool_cache._free["buffer"] = [object()]
+    monkeypatch.setattr(gtp_symmetric_memory, "symmetric_wgrad_pool", pool_cache)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    deregister = Mock()
+    monkeypatch.setattr(gtp_symmetric_memory.vmm_symm_allocator, "deregister_mem_pool", deregister)
+
+    gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools()
+
+    deregister.assert_called_once_with(pools["live"], live_group)
+    assert not gtp_symmetric_memory._registered
+    assert not gtp_symmetric_memory._pools
+    assert not pool_cache._free
+
+
+def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, monkeypatch):
     param = Mock()
     param._get_cache_key.return_value = ("old_group",)
     param.flush_accumulated_wgrad.side_effect = AssertionError("used the destroyed group")
@@ -223,7 +233,7 @@ def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, mo
     monkeypatch.setattr(gtp_cuda_graphs, "_CG_MEMPOOL", object())
     ps.register_model_parallel_teardown(ps.TeardownStage.RESET_STATE, gtp._destroy_gtp_state)
 
-    ps.destroy_model_parallel(abort=abort)
+    ps.destroy_model_parallel()
 
     # A later non-GTP model can reach this fence without constructing a GTP model
     # (which would reset the cursors). It must not flush the previous model's gradient.
@@ -243,8 +253,7 @@ def test_gtp_teardown_discards_pending_gradients_and_cache(recorded_teardown, mo
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="Requires a multi-rank registered pool")
-@pytest.mark.parametrize("abort", [False, True])
-def test_gtp_registered_pool_and_pending_gradient_across_lifetimes(abort):
+def test_gtp_registered_pool_and_pending_gradient_across_lifetimes():
     Utils.initialize_distributed()
     ps.destroy_model_parallel()
     baseline = set(torch.distributed.distributed_c10d._world.pg_map)
@@ -263,7 +272,7 @@ def test_gtp_registered_pool_and_pending_gradient_across_lifetimes(abort):
             pending.flush_accumulated_wgrad.side_effect = AssertionError("used the old group")
             gtp._GTP_PENDING_WGRAD_ACCUM.add(pending)
             gtp._GTP_PARAMS.append(pending)
-            ps.destroy_model_parallel(abort=abort)
+            ps.destroy_model_parallel()
             gtp.wait_for_gtp_grad_reduction_on_current_stream()
             pending.flush_accumulated_wgrad.assert_not_called()
 
@@ -278,7 +287,7 @@ def test_gtp_registered_pool_and_pending_gradient_across_lifetimes(abort):
             assert world_value.item() == Utils.world_size
             del value, group
     finally:
-        ps.destroy_model_parallel(abort=abort)
+        ps.destroy_model_parallel()
 
 
 def test_release_failure_keeps_groups(recorded_teardown, monkeypatch):
@@ -351,20 +360,6 @@ def test_inprocess_restart_raises_teardown_failure(monkeypatch):
     monkeypatch.setattr(inprocess_restart, "destroy_state", destroy_state)
     with pytest.raises(RuntimeError, match="injected teardown failure"):
         finalize(state)
-
-
-def test_abort_failure_does_not_enter_graceful_destroy(monkeypatch):
-    groups = [Mock(), Mock()]
-    groups[1]._get_backend.return_value.abort.side_effect = RuntimeError("injected abort failure")
-    monkeypatch.setattr(
-        torch.distributed.distributed_c10d, "_world", SimpleNamespace(pg_map=dict.fromkeys(groups))
-    )
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(ps, "_global_process_group_list", [None, *groups])
-    with pytest.raises(RuntimeError, match="injected abort failure"):
-        ps._abort_created_process_groups()
-    for group in groups:
-        group._get_backend.return_value.abort.assert_called_once()
 
 
 def test_hybridep_rebuilds_buffer_for_new_group(monkeypatch):
