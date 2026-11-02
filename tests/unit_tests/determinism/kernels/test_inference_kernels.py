@@ -356,6 +356,53 @@ def test_batch_invariant_clamped_swiglu_matches_training():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("weighted", [True, False], ids=["weighted", "unweighted"])
+@pytest.mark.parametrize("options", [False, True], ids=["plain", "glu_options"])
+def test_batch_invariant_gated_squared_relu_matches_training(options, weighted):
+    """Both batch-invariant GLU kernels gate with relu(gate)^2 bit-identically to training's
+    only path for it, the unfused GLU of TEGroupedMLP: BF16 torch ops on the de-interleaved
+    FC1 output, then the FP32 probability (1 with moe_apply_probs_on_input)."""
+    from megatron.core.activations import squared_relu
+    from megatron.core.inference.moe.activations import GLUOptions
+    from megatron.core.inference.moe.batch_invariant import (
+        swiglu_with_probs,
+        weighted_silu_mul_bounded,
+    )
+
+    seeded()
+    rows, ffn = 512, 768
+    x = torch.randn(rows, 2 * ffn, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, device="cuda") if weighted else torch.ones(rows, device="cuda")
+    perm = torch.arange(rows, device="cuda", dtype=torch.int32)
+    # Neither is a BF16 number, so the clamp bound and linear + offset round.
+    glu = GLUOptions(clamp_value=0.3, linear_offset=0.7, interleave_size=64)
+    glu = glu if options else GLUOptions()
+
+    # The GLU of TEGroupedMLP._unfused_forward, on BF16 tensors.
+    fc1 = x
+    if glu.interleave_size is not None:
+        fc1 = fc1.reshape(rows, -1, 2, glu.interleave_size).transpose(1, 2).reshape(x.shape)
+    gate, linear = torch.chunk(fc1, 2, dim=-1)
+    if glu.clamp_value is not None:
+        gate = gate.clamp(min=None, max=glu.clamp_value)
+        linear = linear.clamp(min=-glu.clamp_value, max=glu.clamp_value)
+    expected = squared_relu(gate) * (linear + glu.linear_offset)
+    expected = (expected * probs[:, None]).to(torch.bfloat16)
+
+    actual = swiglu_with_probs(
+        x, perm, _dev_scalar(rows), probs, glu_options=glu, squared_relu_gate=True
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual = weighted_silu_mul_bounded(
+        x,
+        probs if weighted else None,
+        _dev_scalar(rows * ffn),
+        glu_options=glu,
+        squared_relu_gate=True,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("clamp_scale", [None, 8.0], ids=["unclamped", "clamped"])
 def test_batch_invariant_squared_relu_matches_training(clamp_scale):
     """Exercise the FP32 intermediates the training squared-ReLU fusion rounds only once."""

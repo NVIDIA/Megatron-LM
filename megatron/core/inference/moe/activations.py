@@ -102,15 +102,26 @@ def glu_inputs(gate, linear, clamp_value, linear_offset, CLAMP: tl.constexpr, OF
 
 
 @triton.jit
-def glu_gate(gate, SQUARED_RELU_GATE: tl.constexpr):
-    """Gate activation of the GLU on FP32 ``gate``: SiLU or, with SQUARED_RELU_GATE
-    (activation_func=squared_relu), relu(gate)^2."""
-    if SQUARED_RELU_GATE:
-        act = tl.maximum(gate, 0.0)
-        act = act * act
-    else:
-        act = gate * tl.sigmoid(gate)
-    return act
+def squared_relu_glu(
+    gate, linear, clamp_value, linear_offset, CLAMP: tl.constexpr, OFFSET: tl.constexpr
+):
+    """Gated squared ReLU, relu(gate)^2 * (linear + offset), on FP32 values of BF16 inputs.
+
+    Training has one path for this activation, the unfused GLU of TEGroupedMLP, which
+    runs each step as a BF16 torch op. This reproduces its roundings: the clamp (whose
+    bound torch rounds to BF16; rounding after the FP32 clamp gives the same value),
+    relu(gate)^2, linear + offset and their product are each rounded to BF16. Like
+    torch.clamp and F.relu, it keeps NaN inputs NaN. Returns the BF16 product as FP32.
+    """
+    if CLAMP:
+        gate, linear = glu_inputs(gate, linear, clamp_value, linear_offset, True, False)
+        gate = gate.to(tl.bfloat16).to(tl.float32)
+        linear = linear.to(tl.bfloat16).to(tl.float32)
+    if OFFSET:
+        linear = (linear + linear_offset).to(tl.bfloat16).to(tl.float32)
+    act = tl.maximum(gate, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    act = (act * act).to(tl.bfloat16).to(tl.float32)
+    return (act * linear).to(tl.bfloat16).to(tl.float32)
 
 
 @triton.jit
@@ -229,11 +240,11 @@ def _swiglu_kernel(
     NUM_BLOCKS: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
 ):
-    """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
+    """GLU: SiLU(gate) * up (SwiGLU) or, with SQUARED_RELU_GATE, relu(gate)^2 * up (see
+    squared_relu_glu), skipping rows beyond n_used and padding rows (perm_map == -1).
 
     Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention),
-    or interleaved blocks (see glu_columns). CLAMP / OFFSET apply training's GLU options;
-    SQUARED_RELU_GATE replaces SiLU with squared ReLU (see glu_gate).
+    or interleaved blocks (see glu_columns). CLAMP / OFFSET apply training's GLU options.
     Output row width is N. Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph compatible.
     MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
     therefore materializes neutral values for dummy rows inside each expert segment.
@@ -253,11 +264,14 @@ def _swiglu_kernel(
                     row_ptr = input_ptr + row.to(tl.int64) * two_N
                     gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
                     up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
-                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
-                    act = glu_gate(gate, SQUARED_RELU_GATE)
-                    tl.store(
-                        output_ptr + row.to(tl.int64) * N + o, (act * up).to(tl.bfloat16), mask=m
-                    )
+                    if SQUARED_RELU_GATE:
+                        value = squared_relu_glu(
+                            gate, up, clamp_value, linear_offset, CLAMP, OFFSET
+                        )
+                    else:
+                        gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                        value = gate * tl.sigmoid(gate) * up
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, value.to(tl.bfloat16), mask=m)
             elif ZERO_PADDING:
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
@@ -272,7 +286,8 @@ def padded_swiglu(
     glu_options: GLUOptions = GLUOptions(),
     squared_relu_gate: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
+    """GLU activation, SiLU(gate) * up or relu(gate)^2 * up (``squared_relu_gate``); skips
+    rows beyond n_used and alignment-padding rows.
 
     Gated counterpart of padded_squared_relu: FC1 output is 2x wide, so the output width
     is half the input.
@@ -330,7 +345,8 @@ def _silu_mul_bounded_kernel(
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
-    """SiLU(gate) * up on the first n_rows rows; rows beyond are left untouched.
+    """SiLU(gate) * up, or relu(gate)^2 * up with SQUARED_RELU_GATE, on the first n_rows
+    rows; rows beyond are left untouched.
 
     For the flat token-major FC1 layout (no permutation map): rows [0, n_rows) are
     live. n_rows is a device scalar, so the fixed grid stays CUDA-graph compatible.
@@ -351,9 +367,12 @@ def _silu_mul_bounded_kernel(
                 row_ptr = input_ptr + row.to(tl.int64) * two_N
                 gate = tl.load(row_ptr + gate_cols, mask=m).to(tl.float32)
                 up = tl.load(row_ptr + up_cols, mask=m).to(tl.float32)
-                gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
-                act = glu_gate(gate, SQUARED_RELU_GATE)
-                tl.store(output_ptr + row.to(tl.int64) * N + o, (act * up).to(tl.bfloat16), mask=m)
+                if SQUARED_RELU_GATE:
+                    value = squared_relu_glu(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                else:
+                    gate, up = glu_inputs(gate, up, clamp_value, linear_offset, CLAMP, OFFSET)
+                    value = gate * tl.sigmoid(gate) * up
+                tl.store(output_ptr + row.to(tl.int64) * N + o, value.to(tl.bfloat16), mask=m)
 
 
 def bounded_silu_mul(
@@ -362,7 +381,8 @@ def bounded_silu_mul(
     glu_options: GLUOptions = GLUOptions(),
     squared_relu_gate: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU (SiLU(gate) * up) over the first n_rows rows of a flat [M, 2N] tensor.
+    """GLU, SiLU(gate) * up or relu(gate)^2 * up (``squared_relu_gate``), over the first
+    n_rows rows of a flat [M, 2N] tensor.
 
     Args:
         x: [M, 2 * ffn_hidden] BF16 FC1 output, laid out as (gate | up) or, with

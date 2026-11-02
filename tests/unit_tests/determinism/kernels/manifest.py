@@ -677,8 +677,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
         "SwiGLU options (clamp, linear offset, interleave), the squared-ReLU gate of the GLU kernels and "
-        "input-side routing probabilities replay too, and the batch-invariant clamped SwiGLU matches "
-        "training's fused kernel bit for bit. "
+        "input-side routing probabilities replay too. The batch-invariant clamped SwiGLU matches "
+        "training's fused kernel, and the batch-invariant gated squared ReLU training's unfused GLU, "
+        "bit for bit. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(
