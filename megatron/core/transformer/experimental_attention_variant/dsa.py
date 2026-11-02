@@ -970,6 +970,13 @@ def fused_qk_topk_kpool(
     Set return_index_scores=False to select in query chunks without retaining scores.
     """
     sk = k.size(0)
+    if q.size(0) == 0:
+        # Empty packed-CP ranks still need a fixed-width index tensor; reshape
+        # with an inferred dimension is ambiguous when there are no query rows.
+        width = index_topk + (pool_size - 1 if always_select_tail else 0)
+        scores = q.new_empty((q.size(1), 0, sk // pool_size), dtype=torch.float32)
+        indices = torch.empty((q.size(1), 0, width), dtype=torch.int32, device=q.device)
+        return scores if return_index_scores else None, indices
 
     # Packed pools restart at each document boundary.
     use_per_seg = cu_seqlens_kv is not None and cu_seqlens_kv.numel() >= 2
@@ -3584,8 +3591,11 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        # KPool selection without its tail leaves the rows before a query's first complete
+        # pool without a key, which the layout checks cannot see, so it certifies nothing.
+        kpool_may_leave_rows_empty = _is_kpool and not self.indexer.index_kpool_always_select_tail
         all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
-            computes_topk=computes_topk,
+            computes_topk=computes_topk and not kpool_may_leave_rows_empty,
             indexer_topk=self.index_topk,
             kv_sequence_length=skv,
             attention_mask=float_mask,
