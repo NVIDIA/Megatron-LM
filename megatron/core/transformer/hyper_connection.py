@@ -615,7 +615,13 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+            # Recompute the fp32 projection in backward instead of retaining its
+            # token-sized intermediates for every layer.
+            from megatron.core import tensor_parallel
+
+            h_pre, h_post, h_res = tensor_parallel.checkpoint(
+                self.compute_mappings, False, hidden_states
+            )
             if mhc_recompute_manager is None:
                 aggregated = self._single_pass_aggregate(hidden_states, mhc_state.pre_mix)
             else:

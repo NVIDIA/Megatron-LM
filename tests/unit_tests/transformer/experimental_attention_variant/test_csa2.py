@@ -6,6 +6,7 @@ published inference implementation and does not call the CSA2 attention operator
 """
 
 import math
+from copy import copy
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_impl
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -35,7 +38,14 @@ from megatron.core.transformer.experimental_attention_variant.csa2_module_spec i
     get_csa2_module_spec_for_backend,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    CSA2CandidateBlocks,
     candidate_blocks_from_scores,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_context_parallel import (
+    build_csa2_cp_compression_layout,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    build_csa2_thd_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -209,6 +219,218 @@ def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
             else:
                 param.normal_(std=0.2)
     return layer
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+def test_thd_core_matches_independent_sequences_with_padding(pg_collection, ratio):
+    """Packed CSA2 must restart windows and compression at each logical segment."""
+    layer = _layer(pg_collection, ratio)
+    core = layer.core_attention
+    config = layer.config
+    lengths = (3, 4)
+    logical = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    physical = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    shape = (12, 1)
+    q = torch.randn(*shape, config.num_attention_heads, config.v_head_dim, device="cuda")
+    k = torch.randn(*shape, 1, config.v_head_dim, device="cuda")
+    x = torch.randn(*shape, config.hidden_size, device="cuda")
+    qr = torch.randn(*shape, config.q_lora_rank, device="cuda")
+    valid = torch.tensor([0, 1, 2, 5, 6, 7, 8], device="cuda")
+    padding = torch.tensor([3, 4, 9, 10, 11], device="cuda")
+    for tensor in (q, k, x, qr):
+        tensor[padding] = float("nan")
+    inputs = [tensor.requires_grad_() for tensor in (q, k, x, qr)]
+    output = core(
+        inputs[0], inputs[1], inputs[1], None, packed_seq_params=packed, x=inputs[2], qr=inputs[3]
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output[padding], torch.zeros_like(output[padding]))
+    gradient = torch.randn_like(output)
+    gradient[padding] = 0
+    (output * gradient).sum().backward()
+    packed_grads = [
+        tensor.grad[valid].clone() if tensor.grad is not None else None for tensor in inputs
+    ]
+    weight_grad = core.compressor.linear_wkv.weight.grad.clone() if ratio else None
+    core.zero_grad(set_to_none=True)
+
+    references = [tensor.detach().clone().requires_grad_() for tensor in (q, k, x, qr)]
+    expected = []
+    for start, length in zip((0, 5), lengths):
+        result = core(
+            references[0][start : start + length],
+            references[1][start : start + length],
+            references[1][start : start + length],
+            None,
+            x=references[2][start : start + length],
+            qr=references[3][start : start + length],
+        )
+        expected.append(result)
+        (result * gradient[start : start + length]).sum().backward()
+    torch.testing.assert_close(output[valid], torch.cat(expected, dim=0), atol=2e-5, rtol=2e-4)
+    for actual, reference in zip(packed_grads, references):
+        if actual is None:
+            assert reference.grad is None
+        else:
+            torch.testing.assert_close(actual, reference.grad[valid], atol=2e-5, rtol=2e-4)
+    if ratio:
+        torch.testing.assert_close(
+            weight_grad, core.compressor.linear_wkv.weight.grad, atol=2e-5, rtol=2e-4
+        )
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+def test_thd_attention_wrapper_matches_independent_sequences(pg_collection, ratio):
+    """QKV and output RoPE must restart at every packed sequence boundary."""
+    layer = _layer(pg_collection, ratio)
+    logical = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    physical = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    x = torch.randn(12, 1, layer.config.hidden_size, device="cuda")
+    valid = torch.tensor([0, 1, 2, 5, 6, 7, 8], device="cuda")
+    x[[3, 4, 9, 10, 11]] = float("nan")
+    x.requires_grad_()
+    actual, _ = layer(x, None, packed_seq_params=packed)
+    assert torch.isfinite(actual).all()
+    actual[valid].square().sum().backward()
+    packed_grad = x.grad[valid].clone()
+    layer.zero_grad(set_to_none=True)
+    reference_x = x.detach().clone().requires_grad_()
+    expected = []
+    for start, length in ((0, 3), (5, 4)):
+        output, _ = layer(reference_x[start : start + length], None)
+        expected.append(output)
+        output.square().sum().backward()
+    torch.testing.assert_close(actual[valid], torch.cat(expected), atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(packed_grad, reference_x.grad[valid], atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+@pytest.mark.parametrize("backend", ["none", "cudnn"])
+def test_thd_cp_matches_unsplit_forward_and_gradients(ratio, backend):
+    """A group crossing the CP cut has one owner and receives both ranks' gradients."""
+    if Utils.world_size not in (2, 4):
+        pytest.skip("run with torchrun --nproc-per-node=2 or 4")
+    if backend == "cudnn":
+        pytest.importorskip("flash_mla")
+        cudnn = pytest.importorskip("cudnn")
+        if not hasattr(cudnn, "DSA") or torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("requires cuDNN DSA on SM90 or newer")
+    world = Utils.world_size
+    Utils.initialize_model_parallel(context_parallel_size=world)
+    model_parallel_cuda_manual_seed(1234)
+    groups = ProcessGroupCollection.use_mpu_process_groups()
+    singleton_groups = [torch.distributed.new_group([rank]) for rank in range(world)]
+    reference_groups = copy(groups)
+    reference_groups.cp = singleton_groups[torch.distributed.get_rank()]
+    try:
+        torch.manual_seed(1234)
+        overrides = {"context_parallel_size": world}
+        dtype = torch.float32
+        if backend == "cudnn":
+            dtype = torch.bfloat16
+            overrides.update(
+                dsa_kernel_backend="cudnn",
+                v_head_dim=512,
+                qk_pos_emb_head_dim=64,
+                num_attention_heads=8,
+                dsa_indexer_head_dim=128,
+                dsa_indexer_n_heads=4,
+            )
+        distributed_layer = _layer(groups, ratio, dtype, **overrides)
+        overrides["context_parallel_size"] = 1
+        reference_layer = _layer(reference_groups, ratio, dtype, **overrides)
+        reference_layer.load_state_dict(distributed_layer.state_dict())
+        total_rows = 4 * world
+        global_x = torch.randn(
+            total_rows, 1, distributed_layer.config.hidden_size, device="cuda", dtype=dtype
+        )
+        rank = torch.distributed.get_rank()
+        local_x = global_x[rank * 4 : (rank + 1) * 4].detach().clone().requires_grad_()
+        reference_x = global_x.detach().clone().requires_grad_()
+        logical = torch.tensor([0, 3, total_rows], device="cuda", dtype=torch.int32)
+        packed_cp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            max_seqlen_q=total_rows - 3,
+            max_seqlen_kv=total_rows - 3,
+            cp_partition_mode="contiguous",
+        )
+        packed_ref = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            max_seqlen_q=total_rows - 3,
+            max_seqlen_kv=total_rows - 3,
+        )
+        actual, _ = distributed_layer(local_x, None, packed_seq_params=packed_cp)
+        expected, _ = reference_layer(reference_x, None, packed_seq_params=packed_ref)
+        expected_local = expected[rank * 4 : (rank + 1) * 4]
+        error = (actual - expected_local).abs().amax()
+        torch.distributed.all_reduce(error, op=torch.distributed.ReduceOp.MAX, group=groups.cp)
+        tolerance = 3e-2 if backend == "cudnn" else 1e-4
+        if error > tolerance:
+            pytest.fail(f"CP forward maximum error {error.item():.6g}")
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        grad_error = (local_x.grad - reference_x.grad[rank * 4 : (rank + 1) * 4]).abs().amax()
+        grad_scale = reference_x.grad[rank * 4 : (rank + 1) * 4].abs().amax()
+        torch.distributed.all_reduce(grad_error, op=torch.distributed.ReduceOp.MAX, group=groups.cp)
+        torch.distributed.all_reduce(grad_scale, op=torch.distributed.ReduceOp.MAX, group=groups.cp)
+        grad_tolerance = 8e-2 if backend == "cudnn" else 1e-4
+        if grad_error > grad_tolerance + (2e-2 if backend == "cudnn" else 0) * grad_scale:
+            pytest.fail(
+                f"CP input gradient maximum error {grad_error.item():.6g}, "
+                f"reference maximum {grad_scale.item():.6g}"
+            )
+        if ratio:
+            distributed_grad = distributed_layer.core_attention.compressor.linear_wkv.weight.grad
+            torch.distributed.all_reduce(distributed_grad, group=groups.cp)
+            weight_error = (
+                (
+                    distributed_grad
+                    - reference_layer.core_attention.compressor.linear_wkv.weight.grad
+                )
+                .abs()
+                .amax()
+            )
+            weight_scale = (
+                reference_layer.core_attention.compressor.linear_wkv.weight.grad.abs().amax()
+            )
+            torch.distributed.all_reduce(
+                weight_error, op=torch.distributed.ReduceOp.MAX, group=groups.cp
+            )
+            torch.distributed.all_reduce(
+                weight_scale, op=torch.distributed.ReduceOp.MAX, group=groups.cp
+            )
+            if weight_error > grad_tolerance + (2e-2 if backend == "cudnn" else 0) * weight_scale:
+                pytest.fail(
+                    f"CP compressor gradient maximum error {weight_error.item():.6g}, "
+                    f"reference maximum {weight_scale.item():.6g}"
+                )
+    finally:
+        from megatron.core import parallel_state
+
+        parallel_state.destroy_model_parallel()
+        Utils.inited = False
 
 
 def _reference_rope(x, config, ratio, position_stride=1, inverse=False):
@@ -458,6 +680,67 @@ def test_candidate_source_can_run_standalone(pg_collection):
     assert torch.isfinite(output).all() and torch.isfinite(x.grad).all()
 
 
+def test_thd_candidate_chunking_matches_dense_gather(pg_collection, monkeypatch):
+    """Streaming THD candidate selection preserves dense indices and candidates."""
+    layer = build_module(
+        csa2_attention_spec, config=_make_config(), layer_number=4, pg_collection=pg_collection
+    ).cuda()
+    core = layer.core_attention
+    x = torch.randn(12, 1, layer.config.hidden_size, device="cuda")
+    qr = torch.randn(12, 1, layer.config.q_lora_rank, device="cuda")
+    logical = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    physical = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    dense_state = CSA2State()
+    dense_state.thd_layout = build_csa2_thd_layout(packed, x.shape[0], cp_group=core.cp_group)
+    with torch.enable_grad():
+        core._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+    dense_indices = dense_state.candidates.indices.clone()
+    dense_global_indices = dense_state.global_indices.clone()
+
+    monkeypatch.setattr(csa2_impl, "_SELECT_ROW_CHUNK_ELEMENTS", 2)
+    chunked_state = CSA2State()
+    chunked_state.thd_layout = build_csa2_thd_layout(packed, x.shape[0], cp_group=core.cp_group)
+    with torch.no_grad():
+        core._shared_global_attention(x, qr, chunked_state, use_indexer_loss=False)
+    torch.testing.assert_close(chunked_state.candidates.indices, dense_indices)
+    torch.testing.assert_close(chunked_state.global_indices, dense_global_indices)
+
+
+def test_reindex_streaming_matches_dense_candidate_mask(pg_collection, monkeypatch):
+    """Streaming Reindex selection applies the same candidate mask as dense scoring."""
+    layers = _layers(pg_collection, candidates=True)
+    x = torch.randn(9, 2, layers[0].config.hidden_size, device="cuda")
+    qr = torch.randn(9, 2, layers[0].config.q_lora_rank, device="cuda")
+
+    dense_state = CSA2State()
+    with torch.enable_grad():
+        layers[3].core_attention._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+        layers[4].core_attention._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+    dense_candidates = dense_state.candidates.indices.clone()
+    dense_indices = dense_state.global_indices.clone()
+
+    monkeypatch.setattr(csa2_impl, "_SELECT_ROW_CHUNK_ELEMENTS", 2)
+    streamed_state = CSA2State()
+    with torch.no_grad():
+        layers[3].core_attention._shared_global_attention(
+            x, qr, streamed_state, use_indexer_loss=False
+        )
+        layers[4].core_attention._shared_global_attention(
+            x, qr, streamed_state, use_indexer_loss=False
+        )
+    torch.testing.assert_close(streamed_state.candidates.indices, dense_candidates)
+    torch.testing.assert_close(streamed_state.global_indices, dense_indices)
+
+
 def test_causal_mask_and_unsupported_packing(pg_collection):
     layer = _layer(pg_collection, 2)
     x = torch.randn(5, 2, layer.config.hidden_size, device="cuda")
@@ -466,8 +749,8 @@ def test_causal_mask_and_unsupported_packing(pg_collection):
     mask[..., 3, 0] = True
     with pytest.raises(NotImplementedError, match="ordinary causal"):
         layer(x, mask)
-    with pytest.raises(NotImplementedError, match="unpacked"):
-        layer(x, None, packed_seq_params=object())
+    with pytest.raises(NotImplementedError, match="requires V4.1 THD"):
+        layer(x, None, packed_seq_params=SimpleNamespace(qkv_format="bshd"))
 
 
 def _layers(pg_collection, dtype=torch.float32, candidates=True):
@@ -819,6 +1102,21 @@ def test_reindex_scores_preserve_owner_key_graph_and_candidate_mask(pg_collectio
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Candidate tensors use CUDA")
+def test_thd_candidate_mask_matches_sequence_local_block_lookup():
+    blocks = CSA2CandidateBlocks(
+        torch.tensor([[[0, 1, -1], [0, -1, -1], [1, 9, -1], [1, -1, -1]]]), block_size=2
+    )
+    query_sequences = torch.tensor([0, 1, 1, 0])
+    key_sequences = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+    key_positions = torch.tensor([0, 1, 2, 0, 1, 2, 3])
+    expected = (blocks.indices[..., None] == (key_positions // 2)[None, None, None, :]).any(-2) & (
+        query_sequences[None, :, None] == key_sequences[None, None, :]
+    )
+    torch.testing.assert_close(
+        blocks.to_mask_thd(query_sequences, key_sequences, key_positions), expected
+    )
+
+
 def test_candidate_blocks_exclude_old_blocks_and_force_newest():
     # Latest position has the lowest score; pinning must displace the second-best old block.
     scores = torch.tensor([[[9.0, 7.0, 8.0, 6.0, 5.0, 4.0, -100.0]]], device="cuda")
@@ -866,6 +1164,23 @@ def test_tied_selection_is_independent_of_masked_future_capacity():
         # Repeated invalid slots must not overwrite the valid first block in other rows.
         assert not compact.to_mask(width)[0].any()
         assert compact.to_mask(width)[1, :3].all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CSA2 selection uses CUDA")
+def test_chunked_selection_handles_row_chunk_boundary():
+    """Stable selection remains correct when the score rows span two sort chunks."""
+    rows, width = 1025, 16384
+    scores = torch.full((1, rows, width), -torch.inf, device="cuda")
+    scores[..., 0] = 3
+    scores[..., 1] = 2
+    scores[..., 2:6] = 1
+
+    selected = CSA2Indexer.select_indices(SimpleNamespace(topk=4), scores)
+    expected = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32).expand(1, rows, -1)
+    torch.testing.assert_close(selected, expected)
+
+    compact = candidate_blocks_from_scores(scores, 1, 4, 1)
+    torch.testing.assert_close(compact.indices, expected)
 
 
 def test_tied_shared_indexers_preserve_prefix_when_sequence_grows(pg_collection):
@@ -1251,3 +1566,51 @@ def test_evaluation_and_no_grad_do_not_attach_auxiliary_loss(monkeypatch, evalua
             outputs = _forward_cores(cores, inputs)
         assert all(not output.requires_grad for output in outputs)
     assert not records
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_thd_cp_compression_keeps_global_groups_and_gradients(ratio):
+    """A group straddling the CP cut has one owner and the right source gradient."""
+
+    class CPGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return 2
+
+    logical = torch.tensor([0, 4, 13], dtype=torch.int32)
+    physical = torch.tensor([0, 4, 14], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=10,
+        max_seqlen_kv=10,
+        cp_partition_mode="contiguous",
+    )
+    x = torch.arange(14, dtype=torch.float32, requires_grad=True)
+    local_values = []
+    layouts = []
+    for rank in range(2):
+        tokens = build_csa2_thd_layout(params, 7, cp_group=CPGroup(rank))
+        cp_layout = build_csa2_cp_compression_layout(tokens, ratio, halo_rows=2)
+        start = rank * 7
+        halo = x.new_zeros(2) if rank == 0 else x[start - 2 : start]
+        source = torch.cat((halo, x[start : start + 7]))
+        local_values.append(source[cp_layout.local.source_indices].mean(-1))
+        layouts.append(cp_layout)
+    global_layout = layouts[0].global_layout
+    actual = layouts[0].to_sequence_major(torch.cat(local_values))
+    expected = x[global_layout.source_indices].mean(-1).masked_fill(~global_layout.valid_groups, 0)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual.sum().backward(retain_graph=True)
+    actual_grad = x.grad.clone()
+    x.grad = None
+    expected.sum().backward()
+    torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)

@@ -2406,8 +2406,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_single_pass:
             if self.moe_shortcut_connection:
                 raise NotImplementedError("Single-pass mHC does not yet support shortcut MoE")
-            if self.tensor_model_parallel_size != 1 or self.context_parallel_size != 1:
-                raise NotImplementedError("Single-pass mHC currently requires TP=CP=1")
+            if self.tensor_model_parallel_size != 1 or (
+                self.context_parallel_size != 1
+                and not (
+                    self.experimental_attention_variant == "dsv4_hybrid"
+                    and getattr(self, "dsv4_version", None) == "v4.1"
+                )
+            ):
+                raise NotImplementedError("Single-pass mHC requires TP=1 and V4.1 for CP")
             if not self.enable_mhc_connections:
                 raise ValueError("mhc_single_pass requires enable_mhc_connections=True")
             if type(self.mhc_num_residual_streams) is not int or self.mhc_num_residual_streams < 1:
@@ -2433,7 +2439,16 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
+        stateful_csa2_recompute = (
+            self.experimental_attention_variant == "dsv4_hybrid"
+            and self.dsv4_version == "v4.1"
+            and self.mhc_single_pass
+        )
+        if (
+            self.enable_mhc_connections
+            and self.recompute_granularity == "full"
+            and not stateful_csa2_recompute
+        ):
             raise NotImplementedError(
                 "enable_mhc_connections is not yet compatible with full activation recompute. "
                 "Use selective recompute with 'mhc' in recompute_modules, or disable "

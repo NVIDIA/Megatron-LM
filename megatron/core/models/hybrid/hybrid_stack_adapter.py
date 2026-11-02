@@ -11,6 +11,7 @@ from torch.nn import Module
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.hyper_connection import SinglePassMHCState
+from megatron.core.transformer.stateful_module import detach_state
 from megatron.core.transformer.transformer_layer import CrossLayerState
 
 
@@ -20,6 +21,11 @@ class HybridStackForwardContext:
 
     cross_layer_state: CrossLayerState | None = None
     mhc_state: SinglePassMHCState | None = None
+
+    def detach_for_backward(self) -> None:
+        """Detach cross-layer state at an inferred frozen-prefix boundary."""
+        self.cross_layer_state = detach_state(self.cross_layer_state)
+        self.mhc_state = detach_state(self.mhc_state)
 
 
 class HybridStackForwardAdapter(Protocol):
