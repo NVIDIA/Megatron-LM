@@ -270,8 +270,9 @@ def test_moe_routing_receives_the_batch_first_padding_mask():
         received["packed_seq_params"] = packed_seq_params
         return hidden_states, None
 
-    def preprocess(hidden_states, probs, routing_map, padding_mask):
+    def preprocess(hidden_states, probs, routing_map, padding_mask, packed_seq_params=None):
         received["preprocess"] = padding_mask
+        received["preprocess_packed_seq_params"] = packed_seq_params
         return hidden_states, probs
 
     layer.mlp.route = route
@@ -292,6 +293,7 @@ def test_moe_routing_receives_the_batch_first_padding_mask():
     assert received["route"] is padding_mask
     assert received["packed_seq_params"] is node.chunk_state.packed_seq_params
     assert received["preprocess"] is padding_mask
+    assert received["preprocess_packed_seq_params"] is node.chunk_state.packed_seq_params
 
 
 def test_moe_slots_unflatten_packed_microbatches_like_the_eager_path(cpu_streams):
@@ -314,7 +316,7 @@ def test_moe_slots_unflatten_packed_microbatches_like_the_eager_path(cpu_streams
         received["route"] = (hidden_states, padding_mask)
         return hidden_states, None
 
-    def preprocess(hidden_states, probs, routing_map, padding_mask):
+    def preprocess(hidden_states, probs, routing_map, padding_mask, packed_seq_params=None):
         received["preprocess"] = (hidden_states, padding_mask)
         return hidden_states, probs
 
@@ -371,7 +373,10 @@ def test_norm_offload_uses_its_microbatch_manager_after_bda(cpu_streams, recompu
     layer.mlp_bda = lambda *args: lambda output, residual, dropout: output[0] + residual
     layer.mlp.shared_experts_compute = lambda hidden: None
     layer.mlp.route = lambda hidden, mask, packed_seq_params=None: (hidden, None)
-    layer.mlp.preprocess = lambda hidden, probs, routing, mask: (hidden, probs)
+    layer.mlp.preprocess = lambda hidden, probs, routing, mask, packed_seq_params=None: (
+        hidden,
+        probs,
+    )
     layer.mlp.routed_experts_compute = lambda hidden, probs: (hidden * 3, None)
     layer.mlp.combine = lambda output: output
     layer.mlp.postprocess = lambda output, shared: output
