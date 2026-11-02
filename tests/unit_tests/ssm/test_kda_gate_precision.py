@@ -162,24 +162,101 @@ def _build_kda_layer(config: KDALayerConfig):
     )
 
 
-def test_two_stage_gates_require_rmsnorm():
-    """The two-stage output norm and gate run as one fused gated RMSNorm, so a LayerNorm
-    out_norm is rejected when the config is built and when a copied config reaches the layer.
-    normalization applies to the whole model, so the error offers RMSNorm throughout or
-    single-stage gates, and says a LayerNorm two-stage checkpoint has no equivalent config."""
-    with pytest.raises(
-        ValueError, match="kda_two_stage_gates requires normalization='RMSNorm'"
-    ) as error:
-        _two_stage_kda_config(normalization="LayerNorm")
-    message = str(error.value)
-    assert "applies to the whole model" in message
-    assert "kda_two_stage_gates=False" in message
-    assert "no configuration reproduces" in message
+def test_two_stage_gates_accept_any_normalization():
+    """Two-stage gates fix their output norm to a gated RMSNorm, so `normalization` (which sets
+    every other norm) is not restricted, in the config or when the layer re-validates it."""
+    config = _two_stage_kda_config(normalization="LayerNorm")
+    config.validate_kda()
 
-    config = _two_stage_kda_config(normalization="LayerNorm", kda_two_stage_gates=False)
-    config.kda_two_stage_gates = True
-    with pytest.raises(ValueError, match="kda_two_stage_gates requires normalization='RMSNorm'"):
-        config.validate_kda()
+
+def test_out_norm_bias_pre_hook_drops_only_that_key():
+    """The two-stage load hook drops the LayerNorm bias that checkpoints saved before out_norm
+    became weight-only carry, and nothing else, at the module's own prefix."""
+    from megatron.core.ssm.gated_delta_net.kda import _drop_unused_out_norm_bias
+
+    prefix = "decoder.layers.0.self_attention."
+    state_dict = {
+        f"{prefix}out_norm.weight": torch.ones(4),
+        f"{prefix}out_norm.bias": torch.full((4,), 0.5),
+        "decoder.layers.1.self_attention.out_norm.bias": torch.zeros(4),
+    }
+    _drop_unused_out_norm_bias(None, state_dict, prefix, {}, True, [], [], [])
+    assert set(state_dict) == {
+        f"{prefix}out_norm.weight",
+        "decoder.layers.1.self_attention.out_norm.bias",
+    }
+    _drop_unused_out_norm_bias(None, state_dict, prefix, {}, True, [], [], [])
+
+
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_two_stage_out_norm_is_a_weight_only_rmsnorm(normalization):
+    """Two-stage gates build out_norm as a weight-only RMSNorm whatever `normalization` says, and
+    the output is bit-identical to the math they always ran: FLA's gated RMSNorm with
+    out_norm's weight and no bias."""
+    from fla.modules.fused_norm_gate import rms_norm_gated
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _two_stage_kda_config(normalization=normalization)
+        layer = _build_kda_layer(config)
+        assert [name for name, _ in layer.out_norm.named_parameters()] == ["weight"]
+        assert layer.out_norm.weight.is_rmsnorm_weight
+        with torch.no_grad():
+            layer.out_norm.weight.add_(torch.randn_like(layer.out_norm.weight) * 0.1)
+            torch.manual_seed(42)
+            x = torch.randn(4096, 128, device="cuda", dtype=torch.bfloat16)
+            gate = torch.randn_like(x)
+            actual = layer._apply_gated_norm(x, gate)
+            expected = rms_norm_gated(
+                x,
+                gate,
+                layer.out_norm.weight,
+                None,
+                activation="sigmoid",
+                eps=config.layernorm_epsilon,
+            )
+        assert torch.equal(actual, expected)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["layer", "in_parent"])
+def test_two_stage_loads_a_state_dict_with_the_old_out_norm_bias(nested):
+    """A two-stage LayerNorm state dict saved before out_norm became weight-only carries an
+    out_norm.bias the forward never read. It loads strictly, whatever the bias value, and the
+    layer computes exactly what the saved one does."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        config = _two_stage_kda_config(normalization="LayerNorm")
+        model_parallel_cuda_manual_seed(123)
+        saved = _build_kda_layer(config)
+        with torch.no_grad():
+            saved.out_norm.weight.add_(torch.randn_like(saved.out_norm.weight) * 0.1)
+        state_dict = saved.state_dict()
+        old_layout = dict(state_dict)
+        old_layout["out_norm.bias"] = torch.randn_like(saved.out_norm.weight)
+
+        model_parallel_cuda_manual_seed(456)
+        loaded = _build_kda_layer(config)
+        if nested:
+            parent = torch.nn.Module()
+            parent.self_attention = loaded
+            parent.load_state_dict(
+                {f"self_attention.{key}": value for key, value in old_layout.items()}, strict=True
+            )
+        else:
+            loaded.load_state_dict(old_layout, strict=True)
+
+        for key, value in loaded.state_dict().items():
+            if isinstance(value, torch.Tensor) and not key.endswith("_extra_state"):
+                assert torch.equal(value, state_dict[key]), key
+        torch.manual_seed(42)
+        hidden = torch.randn(256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            assert torch.equal(loaded(hidden, None)[0], saved(hidden, None)[0])
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA KDA is not installed.")
@@ -225,6 +302,7 @@ def test_single_stage_honors_layernorm_out_norm():
         model_parallel_cuda_manual_seed(123)
         config = _two_stage_kda_config(normalization="LayerNorm", kda_two_stage_gates=False)
         layer = _build_kda_layer(config)
+        assert [name for name, _ in layer.out_norm.named_parameters()] == ["weight", "bias"]
         with torch.no_grad():
             layer.out_norm.weight.fill_(1.0)
             layer.out_norm.bias.fill_(0.5)

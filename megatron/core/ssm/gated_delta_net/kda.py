@@ -2,6 +2,7 @@
 
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
+import copy
 import math
 from dataclasses import dataclass
 from functools import partial
@@ -57,11 +58,26 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     g_b_proj: ModuleSpec | type = IdentityOp
 
 
+def _drop_unused_out_norm_bias(module, state_dict, prefix, *args) -> None:
+    """Load-state-dict pre-hook for two-stage KDA: drop a saved ``out_norm.bias``.
+
+    Two-stage ``out_norm`` used to be built from ``normalization``, so under ``LayerNorm`` its
+    checkpoints carry a LayerNorm bias. The two-stage forward never read it (the gated RMSNorm
+    takes no bias), so whatever its value, dropping it loads exactly the math they trained and
+    served with. Distributed checkpoints need no hook: they load only the keys the model asks for.
+    """
+    state_dict.pop(f"{prefix}out_norm.bias", None)
+
+
 class KimiDeltaAttention(_GDNBase):
     """Channel-wise Gated DeltaNet variant with direct Q/K/V/F/G projections.
 
     Supports direct or two-stage gates with equal query/key and value heads.
     Recurrent inference is not implemented.
+
+    With direct gates the output norm follows ``normalization``. With two-stage gates it is
+    Kimi Linear's gated RMSNorm, ``RMSNorm(x) * weight * sigmoid(gate)`` with no bias, whatever
+    ``normalization`` says, and ``out_norm`` is built as that weight-only RMSNorm.
     """
 
     def __init__(
@@ -127,6 +143,10 @@ class KimiDeltaAttention(_GDNBase):
         # FP32 through model casting, optimizer construction, and checkpointing.
         mark_keep_in_fp32(self.dt_bias)
         mark_keep_in_fp32(self.A_log)
+
+        if self.two_stage_gates:
+            # Checkpoints from when out_norm followed `normalization` carry a bias it never used.
+            self.register_load_state_dict_pre_hook(_drop_unused_out_norm_bias)
 
         # Low-rank gates are precomputed in FP32.
         if self.two_stage_gates:
@@ -199,6 +219,15 @@ class KimiDeltaAttention(_GDNBase):
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
 
+    def _out_norm_config(self) -> KDALayerConfig:
+        """Two-stage gates build ``out_norm`` as a weight-only RMSNorm, the gated RMSNorm they
+        run, whatever ``normalization`` says; direct gates follow ``normalization``."""
+        if not self.two_stage_gates:
+            return self.config
+        config = copy.copy(self.config)
+        config.normalization = "RMSNorm"
+        return config
+
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
         """Return KDA qkv/raw-g/output-gate split sizes for runtime headwise CP."""
 
@@ -237,16 +266,15 @@ class KimiDeltaAttention(_GDNBase):
         beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
         return raw_g, {"beta": beta.contiguous()}
 
-    @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
 
-        x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
         gate = gate.reshape(-1, self.value_head_dim)
         if self.two_stage_gates:
-            # The output is rounded once, after normalization and gating. validate_kda requires
-            # an RMSNorm out_norm, which has no bias.
+            # Kimi Linear's gated RMSNorm, with out_norm's weight and no bias; the output is
+            # rounded once, after normalization and gating. FLA's kernel runs eagerly, outside
+            # torch.compile, which would otherwise trace it and let Inductor time its configs.
             weight = self.out_norm.weight
             if self.config.layernorm_zero_centered_gamma:
                 # Add the 1 in FP32, as TE's norms do: in BF16, w + 1 keeps 7 fraction bits.
@@ -254,6 +282,12 @@ class KimiDeltaAttention(_GDNBase):
             return rms_norm_gated(
                 x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
             )
+        return self._apply_gated_norm_unfused(x, gate)
+
+    @jit_fuser
+    def _apply_gated_norm_unfused(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply ``out_norm`` and the sigmoid gate, rounding once at the end."""
+        x_dtype = x.dtype
         x = self.out_norm(x)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 

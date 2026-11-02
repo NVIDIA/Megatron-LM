@@ -24,7 +24,12 @@ class KDALayerConfig(TransformerConfig):
     """Optional lower bound for KDA's bounded gate values."""
 
     kda_two_stage_gates: bool = False
-    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection.
+
+    The output norm is then Kimi Linear's gated RMSNorm, RMSNorm(x) * weight * sigmoid(gate)
+    with no bias, whatever ``normalization`` says, and is built as a weight-only RMSNorm;
+    ``normalization`` still sets every other norm. With direct gates the output norm follows
+    ``normalization``."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -43,17 +48,6 @@ class KDALayerConfig(TransformerConfig):
             raise ValueError(
                 "kda_lower_bound must be in the safe range [-5, 0) when kda_safe_gate=True, "
                 f"got {self.kda_lower_bound}."
-            )
-        if self.kda_two_stage_gates and self.normalization != "RMSNorm":
-            raise ValueError(
-                "kda_two_stage_gates requires normalization='RMSNorm', got "
-                f"{self.normalization!r}: its output norm and gate run as one fused gated "
-                "RMSNorm, without a bias. normalization applies to the whole model, not only to "
-                f"KDA, so use RMSNorm throughout, or keep {self.normalization!r} with "
-                "kda_two_stage_gates=False, whose output norm follows it. A checkpoint trained "
-                f"with two-stage gates and {self.normalization!r} ran this output norm as "
-                "RMSNorm without its bias and the norms that follow normalization elsewhere as "
-                f"{self.normalization!r}; no configuration reproduces that mix."
             )
         required_positive = (
             "linear_conv_kernel_dim",
