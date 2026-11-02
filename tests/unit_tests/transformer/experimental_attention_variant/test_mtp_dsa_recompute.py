@@ -123,6 +123,7 @@ def test_full_checkpoint_preserves_sharing_gradients_and_per_depth_snapshots(
 
     layer = SimpleNamespace(
         config=config,
+        tp_group=None,  # read by precision_aware_checkpoint (#7709)
         mtp_layer_pattern=None,
         mtp_model_layer=SimpleNamespace(self_attention=SimpleNamespace(core_attention=core)),
         _proj_and_transformer_layer=projected_forward,

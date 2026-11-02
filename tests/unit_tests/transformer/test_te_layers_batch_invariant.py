@@ -19,6 +19,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    mean_batch_invariant,
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
@@ -63,6 +64,29 @@ def test_batch_invariant_rejects_incompatible_te(monkeypatch):
     monkeypatch.setattr(transformer_engine, "__version__", "2.17.0+deadbeef")
     with pytest.raises(AssertionError, match="TransformerEngine PR #3204"):
         assert_te_supports_batch_invariant_attention()
+
+
+@pytest.mark.parametrize("dim", ([], (), None))
+@pytest.mark.parametrize("keepdim", (False, True))
+def test_mean_batch_invariant_full_reduction(dim, keepdim):
+    """An empty (or None) dim list reduces over every dimension, as aten::mean does."""
+    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    out = mean_batch_invariant(x, dim, keepdim=keepdim)
+    torch.testing.assert_close(out, x.mean(dim=(0, 1, 2), keepdim=keepdim))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_full_mean_under_batch_invariant_mode():
+    """`x.mean()` / `torch.mean(x)` dispatch to aten::mean.dim with dim=[]."""
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    ref = x.detach().sum() / x.numel()
+    with set_batch_invariant_mode(True):
+        out = x.mean()
+        out_fn = torch.mean(x)
+        out.backward()
+    torch.testing.assert_close(out.detach(), ref)
+    torch.testing.assert_close(out_fn.detach(), ref)
+    torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
 
 
 # ============================================================================
@@ -732,6 +756,50 @@ def _te_general_gemm(*args, **kwargs):
     if te_general_gemm is None:
         pytest.skip("TransformerEngine general_gemm is not available in this environment.")
     return te_general_gemm(*args, **kwargs)
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_te_native_device_metadata_workspace(monkeypatch, supported):
+    """Restrict the full-workspace exception and keep graph layouts isolated."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    if not hasattr(te_gemm, "_get_grouped_cublas_workspace"):
+        # Exercise the compatibility hook even with TE releases predating the
+        # device-metadata API used in production.
+        def _mock_grouped_workspace(device, layout):
+            del layout
+            return torch.empty(
+                te_gemm.get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device
+            )
+
+        monkeypatch.setattr(
+            te_gemm, "_get_grouped_cublas_workspace", _mock_grouped_workspace, raising=False
+        )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+        "te_supports_batch_invariant_grouped_gemm",
+        lambda device: supported,
+    )
+    unrestricted_bytes = te_gemm.get_cublas_workspace_size_bytes()
+    original_grouped_workspace = te_gemm._get_grouped_cublas_workspace
+    with set_batch_invariant_mode(True, backend="te_native"):
+        assert te_gemm.get_cublas_workspace_size_bytes() == 1024
+        device = torch.cuda.current_device()
+        if supported:
+            workspaces = [
+                te_gemm._get_grouped_cublas_workspace(device, layout)
+                for layout in ("TN", "NN", "NT")
+            ]
+            assert all(ws.numel() == unrestricted_bytes for ws in workspaces)
+            assert len({ws.data_ptr() for ws in workspaces}) == 3
+            assert te_gemm._get_grouped_cublas_workspace(device, "TN") is workspaces[0]
+        else:
+            with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+                te_gemm._get_grouped_cublas_workspace(device, "TN")
+
+    assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
+    assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
 
 
 # ============================================================================

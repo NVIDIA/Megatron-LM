@@ -1,5 +1,7 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import replace
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +12,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
+    CSA_OPERATION_DETERMINISM,
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
     Compressor,
@@ -18,6 +21,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexerSubmodules,
     _apply_rope,
     _compute_unfused_csa_non_compressed_lse,
+    _get_compress_causal_mask_cached,
+    _get_compress_valid_counts_cached,
+    _pool_compressor_values,
     build_cu_seqlens_kv_full,
     cat_per_segment,
     get_compress_topk_idxs,
@@ -46,6 +52,27 @@ except ImportError:
 def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Mock implementation of hadamard_transform for testing without the library installed."""
     return x * scale
+
+
+class _DisabledContextTracker:
+    """Track whether a projection runs inside the FP8-disabled context."""
+
+    def __init__(self):
+        self.depth = 0
+        self.entries = 0
+
+    def __call__(self, _config, is_init=False):
+        assert not is_init
+        return self
+
+    def __enter__(self):
+        self.depth += 1
+        self.entries += 1
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.depth -= 1
+        return False
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +107,55 @@ class _SingleRankTP:
 
 class _SingleRankPG:
     tp = _SingleRankTP()
+
+
+class _TwoRankTP:
+    @staticmethod
+    def size():
+        return 2
+
+
+class _TwoRankPG:
+    tp = _TwoRankTP()
+
+
+def test_csa_rejects_explicit_attention_mask():
+    """The native SBHD slice must not silently ignore padding or document boundaries."""
+    with pytest.raises(ValueError, match="implicit causal mask"):
+        CompressedSparseAttention.forward(
+            None, query=None, key=None, value=None, attention_mask=torch.zeros(1, 1, 1, 1)
+        )
+
+
+def test_all_csa_operations_declare_determinism():
+    """Every eager CSA operation declares a valid bit-exact determinism status."""
+    valid_statuses = {"deterministic", "nondeterministic", "unknown"}
+    assert set(CSA_OPERATION_DETERMINISM) == {
+        "unfused_sparse_attention",
+        "non_compressed_lse",
+        "compressor_pooling",
+    }
+    assert set(CSA_OPERATION_DETERMINISM.values()) <= valid_statuses
+
+
+def test_compressed_causal_metadata_is_cached_and_correct():
+    ratio, seqlen, n_compressed = 4, 12, 3
+    device_str = "cpu"
+    _get_compress_causal_mask_cached.cache_clear()
+    _get_compress_valid_counts_cached.cache_clear()
+
+    mask = _get_compress_causal_mask_cached(ratio, seqlen, n_compressed, device_str)
+    valid_counts = _get_compress_valid_counts_cached(ratio, seqlen, device_str)
+
+    assert mask is _get_compress_causal_mask_cached(ratio, seqlen, n_compressed, device_str)
+    assert valid_counts is _get_compress_valid_counts_cached(ratio, seqlen, device_str)
+    expected_counts = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+    expected_mask = torch.where(
+        torch.arange(n_compressed).unsqueeze(0) >= expected_counts, float("-inf"), 0.0
+    )
+    torch.testing.assert_close(valid_counts, expected_counts)
+    torch.testing.assert_close(mask, expected_mask)
+    assert mask.unsqueeze(0).expand(2, -1, -1).stride(0) == 0
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
@@ -145,6 +221,7 @@ def _independent_csa_indexer_loss(
     sparse_loss,
     loss_coeff,
 ):
+    """Compute a small-loop CSA teacher oracle with the complete denominator."""
     batch_size, seqlen_q, n_compressed = index_scores.shape
     num_heads = query.shape[2]
     losses = []
@@ -170,8 +247,9 @@ def _independent_csa_indexer_loss(
                     denominator = torch.logsumexp(
                         torch.stack(non_compressed_logits + compressed_logits), dim=0
                     )
+                    selected_position = selected.index(compressed_index)
                     head_mass = head_mass + torch.exp(
-                        compressed_logits[selected.index(compressed_index)] - denominator
+                        compressed_logits[selected_position] - denominator
                     )
                 target.append(head_mass)
             target = torch.stack(target)
@@ -182,7 +260,7 @@ def _independent_csa_indexer_loss(
 
 
 @pytest.mark.parametrize("sparse_loss", [False, True], ids=["dense", "sparse"])
-def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss):
+def test_csa_indexer_loss_uses_full_attention_denominator(sparse_loss):
     torch.manual_seed(29)
     seqlen_q, batch_size, num_heads, head_dim = 4, 1, 2, 3
     n_compressed, index_heads, index_dim = 3, 2, 2
@@ -196,21 +274,21 @@ def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss)
     compressed_kv = torch.randn(n_compressed, batch_size, head_dim, requires_grad=True)
     sink = torch.randn(num_heads, requires_grad=True)
     window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2], [2, 3]]])
-    kv_full = torch.cat([window_kv, compressed_kv], dim=0)
     non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
-        query, kv_full, sink, window_indices, softmax_scale=1.0
+        query, window_kv, sink, window_indices, softmax_scale=1.0
     )
     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, num_heads, -1)
     compressed_mask = torch.zeros(seqlen_q, n_compressed)
 
-    q_ref = q.detach().clone().requires_grad_(True)
-    weights_ref = weights.detach().clone().requires_grad_(True)
-    k_ref = k.detach().clone().requires_grad_(True)
-    index_scores_ref, topk_ref = fused_qk_topk_naive(q_ref, k_ref, weights_ref, index_topk)
-    index_scores_oracle = index_scores_ref.detach().clone()
-    loss_ref = compute_dsa_indexer_loss(
-        index_scores_ref,
-        topk_ref,
+    q_reference = q.detach().clone().requires_grad_(True)
+    weights_reference = weights.detach().clone().requires_grad_(True)
+    k_reference = k.detach().clone().requires_grad_(True)
+    index_scores_reference, topk_reference = fused_qk_topk_naive(
+        q_reference, k_reference, weights_reference, index_topk
+    )
+    loss_reference = compute_dsa_indexer_loss(
+        index_scores_reference,
+        topk_reference,
         query.detach(),
         key_for_loss.detach(),
         1.0,
@@ -220,40 +298,33 @@ def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss)
         mask=compressed_mask,
         non_compressed_lse=non_compressed_lse,
     )
-    loss_ref.backward()
+    loss_reference.backward()
 
-    saved_shapes = []
-
-    def pack_hook(tensor):
-        saved_shapes.append(tuple(tensor.shape))
-        return tensor
-
-    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
-        topk_actual, loss_actual = FusedDSAIndexerLoss.apply(
-            q,
-            weights,
-            k,
-            query,
-            key_for_loss,
-            1.0,
-            index_topk,
-            loss_coeff,
-            compressed_mask,
-            sparse_loss,
-            _SingleRankPG(),
-            None,
-            None,
-            None,
-            None,
-            False,
-            True,
-            non_compressed_lse,
-        )
-        loss_actual.backward()
+    topk_actual, loss_actual = FusedDSAIndexerLoss.apply(
+        q,
+        weights,
+        k,
+        query,
+        key_for_loss,
+        1.0,
+        index_topk,
+        loss_coeff,
+        compressed_mask,
+        sparse_loss,
+        _SingleRankPG(),
+        None,
+        None,
+        None,
+        None,
+        False,
+        True,
+        non_compressed_lse,
+    )
+    loss_actual.backward()
 
     independent_loss = _independent_csa_indexer_loss(
-        index_scores_oracle,
-        topk_ref,
+        index_scores_reference.detach(),
+        topk_reference,
         query.detach(),
         compressed_kv.detach(),
         window_kv.detach(),
@@ -264,14 +335,11 @@ def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss)
     )
 
     torch.testing.assert_close(loss_actual, independent_loss)
-    torch.testing.assert_close(loss_actual, loss_ref)
-    torch.testing.assert_close(topk_actual, topk_ref)
-    torch.testing.assert_close(q.grad, q_ref.grad)
-    torch.testing.assert_close(weights.grad, weights_ref.grad)
-    torch.testing.assert_close(k.grad, k_ref.grad)
-    assert (batch_size, seqlen_q, n_compressed) not in saved_shapes
-    assert tuple(non_compressed_lse.shape) in saved_shapes
-
+    torch.testing.assert_close(loss_actual, loss_reference)
+    torch.testing.assert_close(topk_actual, topk_reference)
+    torch.testing.assert_close(q.grad, q_reference.grad)
+    torch.testing.assert_close(weights.grad, weights_reference.grad)
+    torch.testing.assert_close(k.grad, k_reference.grad)
     for teacher_tensor in (query, window_kv, compressed_kv, sink):
         assert teacher_tensor.grad is None
 
@@ -343,6 +411,17 @@ class TestGetCompressTopkIdxs:
 # ===========================================================================
 # unfused_compressed_sparse_attn tests
 # ===========================================================================
+
+
+def test_unfused_sparse_attention_rejects_sink_head_mismatch():
+    with pytest.raises(ValueError, match="one value per query head"):
+        unfused_compressed_sparse_attn(
+            query=torch.zeros(2, 1, 2, 4),
+            kv_full=torch.zeros(2, 1, 4),
+            attn_sink=torch.zeros(1),
+            topk_indices=torch.zeros(1, 2, 1, dtype=torch.int32),
+            softmax_scale=1.0,
+        )
 
 
 class TestUnfusedCompressedSparseAttn:
@@ -420,10 +499,90 @@ class TestUnfusedCompressedSparseAttn:
         assert kv_full.grad is not None
         assert attn_sink.grad is not None
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_batched_repeated_and_invalid_indices_match_loop_oracle(self):
+        """Batch-flattened gather preserves forward and backward sparse-attention semantics."""
+        torch.manual_seed(41)
+        sq, b, np_, hn, n_kv = 3, 2, 2, 4, 5
+        topk_indices = torch.tensor(
+            [[[0, 0, -1], [1, 3, 1], [4, -1, 2]], [[2, -1, 2], [4, 0, -1], [1, 1, 3]]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        query = torch.randn(sq, b, np_, hn, device="cuda", requires_grad=True)
+        kv_full = torch.randn(n_kv, b, hn, device="cuda", requires_grad=True)
+        attn_sink = torch.randn(np_, device="cuda", requires_grad=True)
+        grad_output = torch.randn(sq, b, np_ * hn, device="cuda")
+
+        with patch("torch.gather", side_effect=AssertionError("expanded gather must not be used")):
+            actual = unfused_compressed_sparse_attn(
+                query, kv_full, attn_sink, topk_indices, softmax_scale=0.5
+            )
+        (actual * grad_output).sum().backward()
+        actual_grads = (query.grad.clone(), kv_full.grad.clone(), attn_sink.grad.clone())
+
+        query_ref = query.detach().clone().requires_grad_(True)
+        kv_ref = kv_full.detach().clone().requires_grad_(True)
+        sink_ref = attn_sink.detach().clone().requires_grad_(True)
+        rows = []
+        for row in range(sq):
+            batches = []
+            for batch in range(b):
+                heads = []
+                for head in range(np_):
+                    valid_indices = topk_indices[batch, row]
+                    valid_indices = valid_indices[valid_indices >= 0].long()
+                    logits = (
+                        torch.einsum(
+                            "h,kh->k", query_ref[row, batch, head], kv_ref[valid_indices, batch]
+                        )
+                        * 0.5
+                    )
+                    probabilities = torch.softmax(
+                        torch.cat([logits, sink_ref[head : head + 1]]), dim=0
+                    )
+                    heads.append(
+                        torch.einsum("k,kh->h", probabilities[:-1], kv_ref[valid_indices, batch])
+                    )
+                batches.append(torch.cat(heads))
+            rows.append(torch.stack(batches))
+        expected = torch.stack(rows)
+        (expected * grad_output).sum().backward()
+
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(
+            actual_grads, (query_ref.grad, kv_ref.grad, sink_ref.grad)
+        ):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
 
 # ===========================================================================
 # Compressor tests
 # ===========================================================================
+
+
+def test_compressor_pooling_matches_fp32_forward_and_backward_oracle():
+    torch.manual_seed(43)
+    kv = torch.randn(2, 4, 2, 6, dtype=torch.bfloat16, requires_grad=True)
+    score = torch.randn(2, 4, 2, 6, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(2, 2, 6, dtype=torch.bfloat16)
+
+    actual = _pool_compressor_values(kv, score, torch.bfloat16)
+    (actual * grad_output).sum().backward()
+    actual_grads = (kv.grad.clone(), score.grad.clone())
+
+    kv_ref = kv.detach().clone().requires_grad_(True)
+    score_ref = score.detach().clone().requires_grad_(True)
+    expected = (
+        (kv_ref.float() * torch.softmax(score_ref, dim=1, dtype=torch.float32))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+    (expected * grad_output).sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grads[0], kv_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grads[1], score_ref.grad, rtol=0, atol=0)
 
 
 def _make_mla_config(
@@ -442,6 +601,7 @@ def _make_mla_config(
     dsa_indexer_topk=8,
     dsa_indexer_loss_coeff=0.0,
     dsa_indexer_use_sparse_loss=False,
+    dsa_kernel_backend='none',
     rope_type='rope',
 ):
     """Helper to create MLATransformerConfig for CSA tests."""
@@ -474,6 +634,7 @@ def _make_mla_config(
         dsa_indexer_topk=dsa_indexer_topk,
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        dsa_kernel_backend=dsa_kernel_backend,
     )
 
 
@@ -491,24 +652,54 @@ def _make_compressor_submodules():
 
 def _make_csa_indexer_submodules():
     """Create CSAIndexer submodules spec."""
-    from megatron.core.extensions.transformer_engine import TELinear, TENorm
+    from megatron.core.extensions.transformer_engine import TELinear
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     return CSAIndexerSubmodules(
         linear_wq_b=ModuleSpec(module=TELinear),
         linear_weights_proj=ModuleSpec(module=TELinear),
-        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
+        compressor=partial(Compressor, submodules=_make_compressor_submodules()),
     )
 
 
 def _make_csa_submodules():
     """Create CompressedSparseAttention submodules spec."""
-    from megatron.core.transformer.spec_utils import ModuleSpec
-
     return CompressedSparseAttentionSubmodules(
-        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
-        indexer=ModuleSpec(module=CSAIndexer, submodules=_make_csa_indexer_submodules()),
+        compressor=partial(Compressor, submodules=_make_compressor_submodules()),
+        indexer=partial(CSAIndexer, submodules=_make_csa_indexer_submodules()),
     )
+
+
+def test_compressed_sparse_attention_rejects_tensor_parallelism():
+    config = _make_mla_config(num_attention_heads=2, csa_compress_ratios=[0] * 4)
+    with pytest.raises(ValueError, match="tensor-parallel size 1"):
+        CompressedSparseAttention(
+            config=config,
+            submodules=CompressedSparseAttentionSubmodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=_TwoRankPG(),
+            compress_ratio=0,
+        )
+
+
+def test_compressed_sparse_attention_rejects_query_head_mismatch():
+    config = _make_mla_config(num_attention_heads=2, csa_compress_ratios=[0] * 4)
+    attention = CompressedSparseAttention(
+        config=config,
+        submodules=CompressedSparseAttentionSubmodules(),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        pg_collection=_SingleRankPG(),
+        compress_ratio=0,
+    )
+
+    with pytest.raises(ValueError, match="query head count"):
+        attention(
+            query=torch.zeros(2, 1, 1, config.v_head_dim), key=None, value=None, attention_mask=None
+        )
 
 
 # ===========================================================================
@@ -570,6 +761,41 @@ class TestCompressor:
         assert output.dtype == torch.bfloat16
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_packed_unfused_rope_uses_explicit_row_positions(self, compress_ratio):
+        from dataclasses import replace
+
+        config = replace(self.config, apply_rope_fusion=False)
+        compressor = Compressor(
+            config=config,
+            submodules=_make_compressor_submodules(),
+            compress_ratio=compress_ratio,
+            head_dim=config.v_head_dim,
+            rotate=False,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+        hidden = torch.randn(
+            3 * compress_ratio,
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+        output = compressor.forward_packed(
+            hidden,
+            torch.tensor([0, 2, 3], dtype=torch.int32, device='cuda'),
+            max_seqlen_q=2 * compress_ratio,
+            compressed_group_ids=torch.tensor([0, 1, 0], device='cuda'),
+            compressed_position_ids=torch.tensor([0, compress_ratio, 0], device='cuda'),
+        )
+        assert output.shape == (3, 1, config.v_head_dim)
+        assert torch.isfinite(output).all()
+        output.float().sum().backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert torch.count_nonzero(hidden.grad) > 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_compressor_too_short_input(self, compress_ratio):
         """Test that compressor returns None when input is shorter than compress_ratio."""
         short_len = compress_ratio - 1
@@ -620,6 +846,45 @@ class TestCompressor:
         for name, param in compressor.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"Parameter {name} has no gradient"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_projection_disables_fp8(self, compress_ratio, monkeypatch):
+        compressor = Compressor(
+            config=self.config,
+            submodules=_make_compressor_submodules(),
+            compress_ratio=compress_ratio,
+            head_dim=self.config.v_head_dim,
+            rotate=False,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+        tracker = _DisabledContextTracker()
+        calls = []
+
+        for name, projection in (
+            ('linear_wkv', compressor.linear_wkv),
+            ('linear_wgate', compressor.linear_wgate),
+        ):
+            original_forward = projection.forward
+
+            def checked_forward(*args, _name=name, _forward=original_forward, **kwargs):
+                assert tracker.depth > 0, f"{_name} ran outside the FP8-disabled context"
+                calls.append(_name)
+                return _forward(*args, **kwargs)
+
+            monkeypatch.setattr(projection, 'forward', checked_forward)
+
+        monkeypatch.setattr(
+            'megatron.core.transformer.experimental_attention_variant.csa.get_fp8_disabled_context',
+            tracker,
+        )
+        x = torch.randn(
+            compress_ratio * 2, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        compressor(x)
+
+        assert calls == ['linear_wkv', 'linear_wgate']
+        assert tracker.entries == 1
 
 
 # ===========================================================================
@@ -712,6 +977,27 @@ class TestCSAIndexer:
         assert weights.shape == (seqlen, batch_size, self.config.dsa_indexer_n_heads)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_weights_projection_disables_fp8(self, seqlen, monkeypatch):
+        tracker = _DisabledContextTracker()
+        self.indexer.cuda()
+        original_forward = self.indexer.linear_weights_proj.forward
+
+        def checked_forward(*args, **kwargs):
+            assert tracker.depth > 0, "indexer weights projection ran under FP8"
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(self.indexer.linear_weights_proj, 'forward', checked_forward)
+        monkeypatch.setattr(
+            'megatron.core.transformer.experimental_attention_variant.csa.get_fp8_disabled_context',
+            tracker,
+        )
+        x = torch.randn(seqlen, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda')
+        weights = self.indexer._project_weights(x)
+
+        assert weights.shape == (seqlen, 1, self.config.dsa_indexer_n_heads)
+        assert tracker.entries == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_csa_indexer_with_mask(self, seqlen):
         """Test CSAIndexer with causal mask."""
         batch_size = 2
@@ -783,6 +1069,21 @@ class TestCompressedSparseAttentionRatio1:
         """With ratio=1, compressor and indexer should not be built."""
         assert self.csa.compressor is None
         assert self.csa.indexer is None
+
+    def test_mtp_layer_number_is_offset(self):
+        """MTP attention layers are numbered after all decoder layers."""
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            compress_ratio=0,
+            is_mtp_layer=True,
+        )
+
+        assert csa.layer_number == self.config.num_layers + 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_ratio1_forward(self):
@@ -898,61 +1199,6 @@ class TestCompressedSparseAttentionCompressed:
             assert csa.indexer is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_bshd_compact_workspace_prepared_in_warmup_and_reused_in_capture(self, compress_ratio):
-        """CUDA capture reuses the BSHD workspace created during eager warmup."""
-        if compress_ratio != 4:
-            pytest.skip("compact indexer workspace applies only to ratio-4 layers")
-
-        csa = CompressedSparseAttention(
-            config=self.config,
-            submodules=_make_csa_submodules(),
-            layer_number=self._get_layer_number(compress_ratio),
-            attn_mask_type=AttnMaskType.causal,
-            attention_type='self',
-            pg_collection=self.pg_collection,
-            rotary_pos_emb=self.rotary_pos_emb,
-            compress_ratio=compress_ratio,
-        ).cuda()
-        previous_cuda_graph_impl = csa.config.cuda_graph_impl
-        csa.config.cuda_graph_impl = "local"
-        # per-layer workspace ownership is what this test checks: opt out of cross-layer sharing
-        previous_sharing = csa.config.dsa_compact_indexer_workspace_sharing
-        csa.config.dsa_compact_indexer_workspace_sharing = False
-        q = torch.empty(8, 1, 64, 128, dtype=torch.bfloat16, device="cuda")
-        k = torch.empty(2, 1, 128, dtype=torch.bfloat16, device="cuda")
-        workspace = MagicMock()
-        workspace.matches_shape.return_value = True
-
-        try:
-            with (
-                patch(
-                    "megatron.core.transformer.experimental_attention_variant.csa."
-                    "bshd_compact_indexer_available",
-                    return_value=True,
-                ),
-                patch(
-                    "megatron.core.transformer.experimental_attention_variant.csa."
-                    "prepare_bshd_compact_indexer_workspace",
-                    return_value=workspace,
-                ) as prepare_workspace,
-                patch.object(torch.cuda, "is_current_stream_capturing", side_effect=[False, True]),
-            ):
-                warmup_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
-                capture_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
-
-            assert warmup_workspace is workspace
-            assert capture_workspace is workspace
-            assert csa._bshd_compact_indexer_workspaces == [workspace]
-            prepare_workspace.assert_called_once()
-            prepared_q, prepared_k = prepare_workspace.call_args.args
-            assert prepared_q.shape == (1, 8, 64, 128)
-            assert prepared_k.shape == (1, 2, 128)
-            workspace.matches_shape.assert_called_once()
-        finally:
-            csa.config.cuda_graph_impl = previous_cuda_graph_impl
-            csa.config.dsa_compact_indexer_workspace_sharing = previous_sharing
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward(self, compress_ratio):
         """Test forward pass with compressed attention."""
         seq_len = 256
@@ -1060,88 +1306,60 @@ class TestCompressedSparseAttentionCompressed:
         assert output.shape == (seq_len, batch_size, np_ * hn)
         assert not torch.isnan(output).any()
 
-
-# ===========================================================================
-# csa_dense_mode tests
-# ===========================================================================
-
-
-class TestCompressedSparseAttentionDenseMode:
-    """Test that csa_dense_mode=True disables the indexer for ratio=4 layers."""
-
-    @pytest.fixture(scope='class', autouse=True)
-    def setup_method(self, request):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
-
-        cls = request.cls
-        cls.config = _make_mla_config(
-            csa_compress_ratios=[4, 128, 4, 128], csa_window_size=8, csa_dense_mode=True
-        )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-
-        from megatron.core.models.common.embeddings import RotaryEmbedding
-
-        cls.rotary_pos_emb = RotaryEmbedding(
-            cls.config.qk_pos_emb_head_dim,
-            rotary_percent=cls.config.rotary_percent,
-            rotary_base=cls.config.rotary_base,
-            cp_group=cls.pg_collection.cp,
-        )
-
-        yield
-        Utils.destroy_model_parallel()
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dense_mode_disables_indexer_for_ratio4(self):
-        """With csa_dense_mode=True, ratio=4 layers should NOT build an indexer."""
-        csa = CompressedSparseAttention(
-            config=self.config,
-            submodules=_make_csa_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type='self',
-            pg_collection=self.pg_collection,
-            rotary_pos_emb=self.rotary_pos_emb,
-            compress_ratio=4,
-        ).cuda()
-
-        assert csa.compress_ratio == 4
-        assert csa.compressor is not None, "Compressor should still be built"
-        assert csa.indexer is None, "Indexer should be disabled in dense mode"
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dense_mode_forward_ratio4(self):
-        """Forward pass should work for ratio=4 in dense mode (uses all compressed positions)."""
-        seq_len = 256
-        batch_size = 2
-        np_ = self.config.num_attention_heads
-        hn = self.config.v_head_dim
+    def test_bshd_compact_workspace_prepared_in_warmup_and_reused_in_capture(self, compress_ratio):
+        """CUDA capture reuses the BSHD workspace created during eager warmup."""
+        if compress_ratio != 4:
+            pytest.skip("compact indexer workspace applies only to ratio-4 layers")
 
         csa = CompressedSparseAttention(
             config=self.config,
             submodules=_make_csa_submodules(),
-            layer_number=1,
+            layer_number=self._get_layer_number(compress_ratio),
             attn_mask_type=AttnMaskType.causal,
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
-            compress_ratio=4,
+            compress_ratio=compress_ratio,
         ).cuda()
+        previous_cuda_graph_impl = csa.config.cuda_graph_impl
+        csa.config.cuda_graph_impl = "local"
+        # per-layer workspace ownership is what this test checks: opt out of cross-layer sharing
+        previous_sharing = csa.config.dsa_compact_indexer_workspace_sharing
+        csa.config.dsa_compact_indexer_workspace_sharing = False
+        q = torch.empty(8, 1, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 1, 128, dtype=torch.bfloat16, device="cuda")
+        workspace = MagicMock()
+        workspace.matches_shape.return_value = True
 
-        query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.bfloat16).cuda()
-        key = torch.randn(seq_len, batch_size, 1, hn, dtype=torch.bfloat16).cuda()
-        value = key.clone()
-        x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        try:
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "bshd_compact_indexer_available",
+                    return_value=True,
+                ),
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "prepare_bshd_compact_indexer_workspace",
+                    return_value=workspace,
+                ) as prepare_workspace,
+                patch.object(torch.cuda, "is_current_stream_capturing", side_effect=[False, True]),
+            ):
+                warmup_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
+                capture_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
 
-        output = csa(query=query, key=key, value=value, attention_mask=None, x=x, qr=qr)
-
-        assert output.shape == (seq_len, batch_size, np_ * hn)
-        assert not torch.isnan(output).any()
+            assert warmup_workspace is workspace
+            assert capture_workspace is workspace
+            assert csa._bshd_compact_indexer_workspaces == [workspace]
+            prepare_workspace.assert_called_once()
+            prepared_q, prepared_k = prepare_workspace.call_args.args
+            assert prepared_q.shape == (1, 8, 64, 128)
+            assert prepared_k.shape == (1, 2, 128)
+            workspace.matches_shape.assert_called_once()
+        finally:
+            csa.config.cuda_graph_impl = previous_cuda_graph_impl
+            csa.config.dsa_compact_indexer_workspace_sharing = previous_sharing
 
 
 # ===========================================================================
@@ -1151,7 +1369,7 @@ class TestCompressedSparseAttentionDenseMode:
 
 class TestApplyRope:
     """Test ``_apply_rope`` — the layout-aware RoPE wrapper used by
-    Compressor / CSAIndexer / DSv4HybridAttention.
+    Compressor / CSAIndexer / hybrid-attention callers.
 
     Behaviours covered:
 
@@ -1354,8 +1572,237 @@ class TestApplyRope:
 
 
 # ===========================================================================
-# THD packed-sequence helpers
+# csa_dense_mode tests
 # ===========================================================================
+
+
+class TestCompressedSparseAttentionDenseMode:
+    """Test that csa_dense_mode=True disables the indexer for ratio=4 layers."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        cls = request.cls
+        cls.config = _make_mla_config(
+            csa_compress_ratios=[4, 128, 4, 128], csa_window_size=8, csa_dense_mode=True
+        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+
+        from megatron.core.models.common.embeddings import RotaryEmbedding
+
+        cls.rotary_pos_emb = RotaryEmbedding(
+            cls.config.qk_pos_emb_head_dim,
+            rotary_percent=cls.config.rotary_percent,
+            rotary_base=cls.config.rotary_base,
+            cp_group=cls.pg_collection.cp,
+        )
+
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dense_mode_disables_indexer_for_ratio4(self):
+        """With csa_dense_mode=True, ratio=4 layers should NOT build an indexer."""
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+        ).cuda()
+
+        assert csa.compress_ratio == 4
+        assert csa.compressor is not None, "Compressor should still be built"
+        assert csa.indexer is None, "Indexer should be disabled in dense mode"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dense_mode_forward_ratio4(self):
+        """Forward pass should work for ratio=4 in dense mode (uses all compressed positions)."""
+        seq_len = 256
+        batch_size = 2
+        np_ = self.config.num_attention_heads
+        hn = self.config.v_head_dim
+
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+        ).cuda()
+
+        query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.bfloat16).cuda()
+        key = torch.randn(seq_len, batch_size, 1, hn, dtype=torch.bfloat16).cuda()
+        value = key.clone()
+        x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+
+        output = csa(query=query, key=key, value=value, attention_mask=None, x=x, qr=qr)
+
+        assert output.shape == (seq_len, batch_size, np_ * hn)
+        assert not torch.isnan(output).any()
+
+
+class TestCSAHighPrecisionParams:
+    """Reference-checkpoint FP32 parameters survive BF16 model conversion."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        cls = request.cls
+        cls.config = _make_mla_config(csa_compress_ratios=[4, 4, 4, 4])
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+
+        from megatron.core.models.common.embeddings import RotaryEmbedding
+
+        cls.rotary_pos_emb = RotaryEmbedding(
+            cls.config.qk_pos_emb_head_dim,
+            rotary_percent=cls.config.rotary_percent,
+            rotary_base=cls.config.rotary_base,
+            cp_group=cls.pg_collection.cp,
+        )
+
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_ape_and_attn_sink_stay_fp32_after_bf16_conversion(self):
+        from megatron.core.transformer.module import Float16Module
+
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+            name="decoder.layers.0.self_attention.core_attention",
+        )
+
+        assert csa.attn_sink.dtype == torch.float32
+        assert csa.compressor.ape.dtype == torch.float32
+        assert csa.indexer.compressor.ape.dtype == torch.float32
+
+        bf16_module = Float16Module(config=self.config, module=csa)
+
+        assert bf16_module.module.attn_sink.dtype == torch.float32
+        assert bf16_module.module.compressor.ape.dtype == torch.float32
+        assert bf16_module.module.indexer.compressor.ape.dtype == torch.float32
+        assert bf16_module.module.compressor.linear_wkv.weight.dtype == torch.bfloat16
+        assert bf16_module.module.compressor.linear_wgate.weight.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("sparse_loss", [False, True], ids=["dense", "sparse"])
+def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss):
+    torch.manual_seed(29)
+    seqlen_q, batch_size, num_heads, head_dim = 4, 1, 2, 3
+    n_compressed, index_heads, index_dim = 3, 2, 2
+    index_topk, loss_coeff = 2, 0.7
+
+    q = torch.randn(seqlen_q, batch_size, index_heads, index_dim, requires_grad=True)
+    weights = torch.randn(seqlen_q, batch_size, index_heads, requires_grad=True)
+    k = torch.randn(n_compressed, batch_size, index_dim, requires_grad=True)
+    query = torch.randn(seqlen_q, batch_size, num_heads, head_dim, requires_grad=True)
+    window_kv = torch.randn(seqlen_q, batch_size, head_dim, requires_grad=True)
+    compressed_kv = torch.randn(n_compressed, batch_size, head_dim, requires_grad=True)
+    sink = torch.randn(num_heads, requires_grad=True)
+    window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2], [2, 3]]])
+    kv_full = torch.cat([window_kv, compressed_kv], dim=0)
+    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, sink, window_indices, softmax_scale=1.0
+    )
+    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, num_heads, -1)
+    compressed_mask = torch.zeros(seqlen_q, n_compressed)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    weights_ref = weights.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    index_scores_ref, topk_ref = fused_qk_topk_naive(q_ref, k_ref, weights_ref, index_topk)
+    index_scores_oracle = index_scores_ref.detach().clone()
+    loss_ref = compute_dsa_indexer_loss(
+        index_scores_ref,
+        topk_ref,
+        query.detach(),
+        key_for_loss.detach(),
+        1.0,
+        loss_coeff,
+        sparse_loss,
+        _SingleRankPG(),
+        mask=compressed_mask,
+        non_compressed_lse=non_compressed_lse,
+    )
+    loss_ref.backward()
+
+    saved_shapes = []
+
+    def pack_hook(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+        topk_actual, loss_actual = FusedDSAIndexerLoss.apply(
+            q,
+            weights,
+            k,
+            query,
+            key_for_loss,
+            1.0,
+            index_topk,
+            loss_coeff,
+            compressed_mask,
+            sparse_loss,
+            _SingleRankPG(),
+            None,
+            None,
+            None,
+            None,
+            False,
+            True,
+            non_compressed_lse,
+        )
+        loss_actual.backward()
+
+    independent_loss = _independent_csa_indexer_loss(
+        index_scores_oracle,
+        topk_ref,
+        query.detach(),
+        compressed_kv.detach(),
+        window_kv.detach(),
+        window_indices,
+        sink.detach(),
+        sparse_loss=sparse_loss,
+        loss_coeff=loss_coeff,
+    )
+
+    torch.testing.assert_close(loss_actual, independent_loss)
+    torch.testing.assert_close(loss_actual, loss_ref)
+    torch.testing.assert_close(topk_actual, topk_ref)
+    torch.testing.assert_close(q.grad, q_ref.grad)
+    torch.testing.assert_close(weights.grad, weights_ref.grad)
+    torch.testing.assert_close(k.grad, k_ref.grad)
+    assert (batch_size, seqlen_q, n_compressed) not in saved_shapes
+    assert tuple(non_compressed_lse.shape) in saved_shapes
+
+    for teacher_tensor in (query, window_kv, compressed_kv, sink):
+        assert teacher_tensor.grad is None
 
 
 def _cu_seqlens(seg_lens, device='cpu'):
@@ -1498,11 +1945,6 @@ class TestCsaThdIndexHelpers:
         assert out is kv
 
 
-# ===========================================================================
-# unfused_compressed_sparse_attn THD branch
-# ===========================================================================
-
-
 class TestUnfusedCompressedSparseAttnThd:
     """``unfused_compressed_sparse_attn`` dispatches on ``query.ndim``:
     3-D selects the THD branch (flat layout, global topk ids).
@@ -1581,22 +2023,6 @@ class TestUnfusedCompressedSparseAttnThd:
 
         # Same math, just different output layout.
         assert torch.allclose(out_sbhd.squeeze(1), out_thd, atol=1e-3, rtol=1e-3)
-
-
-# ===========================================================================
-# THD: Compressor / CSAIndexer / CompressedSparseAttention integration
-# ===========================================================================
-#
-# These integration tests exercise the THD branches of the full
-# Compressor / CSAIndexer / CompressedSparseAttention modules — the
-# layer above the kernel-level THD tests in test_csa_kernels.py and the
-# autograd-Function tests in test_attention_variant_dsa.py.
-#
-# Strategy: most tests use a B=1 single-segment THD input and compare
-# against the same data run through the SBHD path with b=1. For B=1
-# the two layouts go through equivalent math (sparse-attention kernels
-# are layout-agnostic; THD just adds slicing/concat glue), so any
-# divergence beyond float-precision tolerance signals a plumbing bug.
 
 
 def _make_packed_seq_params_thd(seg_lens, device='cuda'):
@@ -1935,10 +2361,15 @@ class TestCompressedSparseAttentionThd:
 
         cls = request.cls
         cls.config = _make_mla_config(
+            v_head_dim=512,
             csa_compress_ratios=[4, 128, 4, 128],
             csa_window_size=8,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
             dsa_indexer_topk=8,
             dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_kernel_backend='cudnn',
         )
         cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
@@ -1963,13 +2394,11 @@ class TestCompressedSparseAttentionThd:
         raise ValueError(f"No layer with compress_ratio={compress_ratio}")
 
     def _build_csa(self, compress_ratio, *, force_unfused_dsa=False):
-        # ``force_unfused_dsa`` is a config-level attribute consumed by
-        # ``CompressedSparseAttention.__init__`` via ``getattr(config,
-        # 'force_unfused_dsa', False)``; set it on the config object
-        # before constructing the module.
-        self.config.force_unfused_dsa = force_unfused_dsa
-        return CompressedSparseAttention(
-            config=self.config,
+        # The canonical backend selector replaced the old force_unfused attribute.
+        # Exercise both implementations rather than merely changing an unused flag.
+        config = replace(self.config, dsa_kernel_backend='none' if force_unfused_dsa else 'cudnn')
+        csa = CompressedSparseAttention(
+            config=config,
             submodules=_make_csa_submodules(),
             layer_number=self._get_layer_number(compress_ratio),
             attn_mask_type=AttnMaskType.causal,
@@ -1978,6 +2407,8 @@ class TestCompressedSparseAttentionThd:
             rotary_pos_emb=self.rotary_pos_emb,
             compress_ratio=compress_ratio,
         ).cuda()
+        assert csa.use_fused_kernels is (not force_unfused_dsa)
+        return csa
 
     def test_shared_compact_workspace_serves_capture_of_another_layer(self):
         """With sharing (default) a layer's capture reuses the compact-indexer workspace that
@@ -2270,6 +2701,12 @@ class TestCompressedSparseAttentionThd:
         self.config.dsa_indexer_use_sparse_loss = sparse_loss
 
         compress_ratio = 4
+        if not sparse_loss and not force_unfused_dsa and torch.cuda.get_device_capability()[0] == 9:
+            # Keep the production SM90 reliability restriction, rather than bypassing
+            # config validation when switching this fixture from sparse to dense loss.
+            with pytest.raises(ValueError, match="dense indexer loss is not supported on SM90"):
+                self._build_csa(compress_ratio)
+            return
         csa = self._build_csa(compress_ratio, force_unfused_dsa=force_unfused_dsa)
         # Multi-segment with enough length for indexer top-K to be exercised.
         seg_lens = [compress_ratio * 16, compress_ratio * 8]
@@ -2530,17 +2967,6 @@ class TestCompressedSparseAttentionThd:
         torch.testing.assert_close(no_grad_1, grad_1, rtol=0, atol=0)
 
 
-# ===========================================================================
-# _apply_rope direct THD tests (4 corners: ratio={1, >1} × fused={False, True})
-# ===========================================================================
-#
-# Direct tests of ``_apply_rope`` THD branches. Previously these were
-# only exercised indirectly via ``Compressor._forward_thd`` (ratio>1)
-# and ``CSAIndexer.forward_before_topk`` (ratio=1). Direct tests give
-# clearer failure attribution and pin down the contract for each of the
-# 4 supported (ratio, apply_rope_fusion) combinations.
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestApplyRopeThd:
     """Direct tests of :func:`_apply_rope` THD branches.
@@ -2712,61 +3138,3 @@ class TestApplyRopeThd:
             )
         finally:
             self.config.apply_rope_fusion = prev_fusion
-
-
-class TestCSAHighPrecisionParams:
-    """The compressor ``ape`` and attention ``attn_sink`` parameters must stay in FP32
-    (the reference DeepSeek V4 checkpoint stores them in FP32), even after the model is
-    converted to BF16/FP16 by ``Float16Module``."""
-
-    @pytest.fixture(scope='class', autouse=True)
-    def setup_method(self, request):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
-
-        cls = request.cls
-        cls.config = _make_mla_config(csa_compress_ratios=[4, 4, 4, 4])
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-
-        from megatron.core.models.common.embeddings import RotaryEmbedding
-
-        cls.rotary_pos_emb = RotaryEmbedding(
-            cls.config.qk_pos_emb_head_dim,
-            rotary_percent=cls.config.rotary_percent,
-            rotary_base=cls.config.rotary_base,
-            cp_group=cls.pg_collection.cp,
-        )
-
-        yield
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_ape_and_attn_sink_stay_fp32_after_bf16_conversion(self):
-        from megatron.core.transformer.module import Float16Module
-
-        csa = CompressedSparseAttention(
-            config=self.config,
-            submodules=_make_csa_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type='self',
-            pg_collection=self.pg_collection,
-            rotary_pos_emb=self.rotary_pos_emb,
-            compress_ratio=4,
-            name="decoder.layers.0.self_attention.core_attention",
-        )
-
-        assert csa.attn_sink.dtype == torch.float32
-        assert csa.compressor.ape.dtype == torch.float32
-        assert csa.indexer.compressor.ape.dtype == torch.float32
-
-        bf16_module = Float16Module(config=self.config, module=csa)
-
-        assert bf16_module.module.attn_sink.dtype == torch.float32
-        assert bf16_module.module.compressor.ape.dtype == torch.float32
-        assert bf16_module.module.indexer.compressor.ape.dtype == torch.float32
-        assert bf16_module.module.compressor.linear_wkv.weight.dtype == torch.bfloat16
-        assert bf16_module.module.compressor.linear_wgate.weight.dtype == torch.bfloat16

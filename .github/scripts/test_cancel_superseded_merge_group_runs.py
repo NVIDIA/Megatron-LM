@@ -7,7 +7,9 @@ from pathlib import Path
 from cancel_superseded_merge_group_runs import _pr_number, _select_superseded_runs
 
 
-def _run(run_id: int, head_branch: str, created_at: str, name: str = "CICD Megatron-LM") -> dict[str, object]:
+def _run(
+    run_id: int, head_branch: str, created_at: str, name: str = "CICD Megatron-LM"
+) -> dict[str, object]:
     return {
         "id": run_id,
         "event": "merge_group",
@@ -22,10 +24,7 @@ class TestCancelSupersededMergeGroupRuns(unittest.TestCase):
         self.old_head = "gh-readonly-queue/main/pr-123-a1d1234"
         self.current_head = "gh-readonly-queue/main/pr-123-b2e5678"
         self.current_run = _run(200, self.current_head, "2026-08-13T22:00:00Z")
-        self.trigger_runs = [
-            self.current_run,
-            _run(100, self.old_head, "2026-08-13T21:00:00Z"),
-        ]
+        self.trigger_runs = [self.current_run, _run(100, self.old_head, "2026-08-13T21:00:00Z")]
 
     def test_extracts_pr_number_only_from_merge_group_refs(self) -> None:
         self.assertEqual(_pr_number(self.current_head), 123)
@@ -51,9 +50,7 @@ class TestCancelSupersededMergeGroupRuns(unittest.TestCase):
         newer_run = _run(300, newer_head, "2026-08-13T23:00:00Z")
 
         selected = _select_superseded_runs(
-            [self.current_run, newer_run],
-            [newer_run, *self.trigger_runs],
-            self.current_run,
+            [self.current_run, newer_run], [newer_run, *self.trigger_runs], self.current_run
         )
 
         self.assertEqual(selected, [])
@@ -62,9 +59,7 @@ class TestCancelSupersededMergeGroupRuns(unittest.TestCase):
         old_rerun = _run(400, self.old_head, "2026-08-13T23:00:00Z")
 
         selected = _select_superseded_runs(
-            [old_rerun],
-            [old_rerun, *self.trigger_runs],
-            self.current_run,
+            [old_rerun], [old_rerun, *self.trigger_runs], self.current_run
         )
 
         self.assertEqual([run["id"] for run in selected], [400])

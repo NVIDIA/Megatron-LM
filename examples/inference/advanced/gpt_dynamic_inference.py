@@ -51,6 +51,8 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -143,9 +145,9 @@ def run_inference(
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
-        finished_request_records = result["finished_request_records"]
+        finished_requests = result["finished_requests"]
         step_time = result["step_time"]
-        if len(active_request_ids) > 0 or len(finished_request_records) > 0:
+        if len(active_request_ids) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -153,9 +155,8 @@ def run_inference(
 
             # Append output tokens.
             output_start = get_curr_time(do_broadcast=False)
-            for finished_request_record in finished_request_records:
-
-                finished_request = finished_request_record.merge()
+            for finished_request in finished_requests:
+                finished_request.finalize_text(engine.controller.tokenizer)
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -294,6 +295,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
     # Start Nsight profiler.
@@ -507,7 +509,7 @@ def main():
         p_count = len(p_times)
         d_count = len(d_times)
 
-        p_mean = p_total / p_count
+        p_mean = p_total / p_count if p_count != 0 else 0.0
         d_mean = d_total / d_count if d_count != 0 else 0.0
 
         # Commented out for now as the step/add/output times are not calculated correctly.

@@ -352,21 +352,24 @@ def test_block_checkpoint_preserves_cross_chunk_indices(
     mask = torch.zeros(1) if carrier_kind == "mask" else None
     state = get_forward_sharing_state(packed, mask, config)
 
-    def producer(hidden_states, attention_mask, context, **kwargs):
+    # Plain callables take dev's common recompute path for layers with a narrower interface
+    # (megatron.core.recompute.checkpointed_forward): keyword inputs only, no context.
+    def producer(hidden_states, attention_mask, **kwargs):
         current = get_forward_sharing_state(kwargs["packed_seq_params"], attention_mask, config)
         payload = current.get_or_create(_DSAIndexSharingPayload)
         payload.topk_by_layer[1] = torch.tensor([int(hidden_states[0].item()) % 2])
-        return hidden_states * 2, context
+        return hidden_states * 2
 
-    def consumer(hidden_states, attention_mask, context, **kwargs):
+    def consumer(hidden_states, attention_mask, **kwargs):
         current = get_forward_sharing_state(kwargs["packed_seq_params"], attention_mask, config)
         indices = current.get(_DSAIndexSharingPayload).topk_by_layer[1]
-        return hidden_states.index_select(0, indices).square(), context
+        return hidden_states.index_select(0, indices).square()
 
     block = SimpleNamespace(
         config=config,
         num_layers_per_pipeline_rank=2,
-        _get_layer=lambda index: [producer, consumer][index],
+        layers=[producer, consumer],
+        pg_collection=SimpleNamespace(tp=None),  # read by precision_aware_checkpoint (#7709)
     )
     inputs, outputs = [], []
     for values in ([2.0, 3.0], [3.0, 4.0]):

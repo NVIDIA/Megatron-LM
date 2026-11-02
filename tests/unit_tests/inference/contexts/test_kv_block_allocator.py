@@ -98,6 +98,33 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     assert a.block_routing == {}
 
 
+@pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
+def test_reset_clears_mtp_successors_before_block_reuse(policy):
+    allocator = KVBlockAllocator(
+        _make_context(),
+        pool_size=POOL_SIZE,
+        paused_limit=PAUSED_LIMIT,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=policy,
+    )
+    blocks = allocator.allocate_memory_blocks(2).clone()
+    allocator.register_kv_block_hashes(blocks.tolist(), [101, 102], [0, 101])
+    allocator.block_mtp_next_token[blocks] = torch.tensor([42, 43])
+
+    allocator.reset()
+    reused = allocator.allocate_memory_blocks(2)
+    torch.testing.assert_close(reused, blocks)
+    # Handoff registration has no MTP successor information. Reusing these IDs
+    # must not advertise the previous owner's draft KV as inheritable.
+    allocator.register_kv_block_hashes(reused.tolist(), [201, 202], [0, 201])
+    assert (allocator.block_mtp_next_token == -1).all()
+    assert (allocator.block_ref_counts[reused] == 1).all()
+    assert set(allocator.kv_hash_to_block_id) == {201, 202}
+    if policy == PrefixCachingEvictionPolicy.LRU:
+        assert allocator.block_parent_id[reused[1]].item() == reused[0].item()
+        assert allocator.block_child_count[reused[0]].item() == 1
+
+
 def test_reset_under_inference_mode_preserves_mutable_block_bag():
     allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
     original_block_bag = allocator.block_bag
@@ -182,7 +209,7 @@ def test_prefix_caching_allocate_and_hash_registration():
     # Hash registration populates both the tensor and the dict. Parent hashes are
     # ignored under REF_ZERO (they only drive LRU eviction ordering), so this mode
     # keeps no per-block parent bookkeeping.
-    a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333])
+    assert a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333]) == [1, 3]
     assert a.block_hashes[1].item() == 111
     assert a.block_hashes[3].item() == 333
     assert not hasattr(a, "block_parent_id")
@@ -196,7 +223,7 @@ def test_prefix_caching_allocate_and_hash_registration():
         a.register_kv_block_hashes(block_ids=[5], block_hashes=[555], parent_hashes=[1, 2])
 
     # Empty inputs are a no-op (avoids zero-element tensor construction).
-    a.register_kv_block_hashes(block_ids=[], block_hashes=[])
+    assert a.register_kv_block_hashes(block_ids=[], block_hashes=[]) == []
     assert a.kv_hash_to_block_id == {111: 1, 333: 3, 222: 2, 444: 4}
 
     # REF_ZERO has no eviction path when the free pool is short.
@@ -590,7 +617,7 @@ def test_register_existing_block_is_idempotent_and_keeps_parent_evictable():
     assert a.block_child_count[0].item() == 1
 
     # Re-register the child exactly as it stands: same block, hash and parent.
-    a.register_kv_block_hashes(block_ids=[1], block_hashes=[20], parent_hashes=[10])
+    assert a.register_kv_block_hashes(block_ids=[1], block_hashes=[20], parent_hashes=[10]) == []
 
     # The chain is unchanged -- one child on the parent, not two.
     assert a.block_child_count[0].item() == 1
@@ -614,9 +641,10 @@ def test_register_mixed_batch_skips_only_the_already_registered_blocks():
     _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
 
     # Block 1 is already registered; blocks 2 and 3 extend the chain past it.
-    a.register_kv_block_hashes(
+    registered = a.register_kv_block_hashes(
         block_ids=[1, 2, 3], block_hashes=[20, 30, 40], parent_hashes=[10, 20, 30]
     )
+    assert registered == [2, 3]
     a.block_ref_counts[torch.tensor([2, 3])] = 0
     a.pool_avail -= 2
 

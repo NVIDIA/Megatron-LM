@@ -27,6 +27,9 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
     if [ -z ${HF_MODEL_CKPT} ]; then
         HF_MODEL_CKPT=${1}
     fi
+    printf "${MLM_WARNING} Importing a Hugging Face checkpoint from convert.sh is deprecated.\n"
+    printf "Use Megatron-Bridge to create a Megatron-Core checkpoint, then set ${PURPLE}MLM_MODEL_CKPT${WHITE}.\n"
+    printf "For Hugging Face quantization workflows, see https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization\n"
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_model.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \

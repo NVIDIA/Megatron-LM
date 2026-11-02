@@ -64,3 +64,47 @@ def test_prepare_attention_routes_uses_physical_capacity(
 def test_unpacked_batch_needs_no_attention_config(monkeypatch):
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
     assert packed_seq_utils.prepare_packed_seq_params(None, SimpleNamespace()) is None
+
+
+class _SizedGroup:
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return 0
+
+
+@pytest.mark.parametrize("runtime_metadata", [True, False], ids=["runtime_group", "static"])
+def test_prepare_keeps_caller_owned_cp_group(monkeypatch, runtime_metadata):
+    """Packed metadata must resolve to the caller's CP group, never MPU's global one.
+
+    Runtime metadata already carries its group, so finalization must not query MPU (which a
+    caller owning its process groups may leave uninitialized). Static metadata carries no
+    group, so the caller's ``pg_collection.cp`` must win over an unrelated global group.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.context_parallel_layout import routes
+
+    caller_group, global_group = _SizedGroup(2), _SizedGroup(2)
+    global_reads = []
+
+    def get_global_cp_group(*args, **kwargs):
+        global_reads.append(True)
+        return global_group
+
+    monkeypatch.setattr(parallel_state, "get_context_parallel_group", get_global_cp_group)
+    monkeypatch.setattr(routes, "prebuild_thd_cp_partition_routes", lambda params, group: None)
+    cu = torch.tensor([0, 8, 16], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    if runtime_metadata:
+        packed.local_cp_size, packed.cp_group = 2, caller_group
+
+    result = packed_seq_utils.prepare_packed_seq_params(
+        packed, SimpleNamespace(), cp_group=None if runtime_metadata else caller_group
+    )
+
+    assert result is packed and packed.cp_group is caller_group
+    assert not global_reads

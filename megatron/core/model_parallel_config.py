@@ -6,6 +6,9 @@ from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
 
+from megatron.core.tensor_parallel.gtp_parallel_layout import (
+    resolve_tensor_parallel_sequence_shards,
+)
 from megatron.core.utils import experimental_api
 
 
@@ -93,6 +96,31 @@ class ModelParallelConfig:
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
+    tensor_parallel_num_sequence_shards: Optional[int] = None
+    """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
+
+    Defaults to TP when sequence parallelism (SP) is enabled, otherwise 1.
+    By default, GTP_remat ranks process independent microbatches; no sequence
+    partitioning occurs along the GTP_remat axis.
+
+    Increasing this value partitions sequences across GTP_remat ranks, reducing
+    the number of independent batch partitions within each weight-sharding group:
+
+        sp_size = tensor_model_parallel_size if sequence_parallel else 1
+        gtp_remat_num_sequence_shards = tensor_parallel_num_sequence_shards // sp_size
+        gtp_remat_num_batch_shards = gtp_weight_remat_size // gtp_remat_num_sequence_shards
+
+    Both divisions must be exact. Sequence partitioning within GTP_remat requires SP when TP > 1.
+
+    Configured CP adds further sequence partitions across weight replicas.
+    In this config, context_parallel_size must already contain the resolved
+    runtime CP size, excluding TP/SP:
+
+        context_parallel_size = configured_cp_size * gtp_remat_num_sequence_shards
+
+    TP must be the innermost axis and PP the outermost axis in the global rank ordering.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
@@ -119,7 +147,7 @@ class ModelParallelConfig:
     """Splits network input along sequence dimension across GPU ranks."""
 
     hierarchical_context_parallel_sizes: Optional[list[int]] = None
-    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify
        the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
        groups of two levels, so the first value of the list indicates the group size of the a2a
        communication type, and the second value indicates the group size of the p2p communication
@@ -131,13 +159,13 @@ class ModelParallelConfig:
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to 
+    This is used to calculate the number and length of sub-samples assigned to
     each rank when sequence_packing_scheduler is not None.
     """
 
     dynamic_context_parallel: bool = False
     """
-    If true, enables dynamic context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of
     each CP rank when we use packed samples with variable sequence lengths.
     Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
     Please set max_seqlen_per_dp_cp_rank.
@@ -318,7 +346,8 @@ class ModelParallelConfig:
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
-       must turn off gradient accumulation fusion.
+       must turn off gradient accumulation fusion. VocabParallelEmbedding then also adds its weight
+       gradient into main_grad in its backward.
     """
 
     use_te_rng_tracker: bool = field(
@@ -442,14 +471,14 @@ class ModelParallelConfig:
 
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
-    EP overlap can increase peak memory usage when the overlapped forward module allocates 
-    more memory than what is freed by the backward module. This flag addresses this by 
+    EP overlap can increase peak memory usage when the overlapped forward module allocates
+    more memory than what is freed by the backward module. This flag addresses this by
     reordering the attention backward pass to occur earlier in the schedule.
     Specifically:
     - Without this flag: attn_bwd executes after moe_combine_fwd
     - With this flag: attn_bwd executes before mlp_fwd
     The earlier execution releases attention activations sooner, reducing peak memory.
-    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become
     exposed (not overlapped with other computation).
     """
 
@@ -527,7 +556,7 @@ class ModelParallelConfig:
         metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
     )
     """If true, overlap communication and computation in warm up and flush phase.
-       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False.
        Defaults to False.
     """
 
@@ -537,22 +566,22 @@ class ModelParallelConfig:
             "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
         },
     )
-    """This value specifies the number of micro-batches that are executed 
+    """This value specifies the number of micro-batches that are executed
        at a time for a given virtual stage (both forward and backward).
-       Default (in __post_init__() method below) to pipeline_parallel_size 
+       Default (in __post_init__() method below) to pipeline_parallel_size
        which specifies a depth-first schedule.
-       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
-       num_microbatches = 4, we have 
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2,
+       num_microbatches = 4, we have
        rank 0 | 0 1 0 1 2 3 2 3
        rank 1 |   0 1 0 1 2 3 2 3
-       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5,
        we have
-       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 0 | 0 1 2 0 1 2 3 4 3 4
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
     mtp_standalone: bool = False
-    """This will be set automatically according to the pipeline layout, 
+    """This will be set automatically according to the pipeline layout,
     and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
@@ -607,6 +636,16 @@ class ModelParallelConfig:
                 stacklevel=2,
             )
 
+    @property
+    def gtp_remat_num_sequence_shards(self) -> int:
+        """Sequence-shard count within GTP_remat, excluding sequence parallelism across TP."""
+        return resolve_tensor_parallel_sequence_shards(
+            self.tensor_model_parallel_size,
+            self.tensor_parallel_num_sequence_shards,
+            self.gtp_weight_remat_size,
+            self.sequence_parallel,
+        )[1]
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -617,6 +656,7 @@ class ModelParallelConfig:
                 "hybrid_context_parallel is deprecated and will be removed in a future release. "
                 "Use dynamic_context_parallel instead.",
                 DeprecationWarning,
+                stacklevel=2,
             )
             if self.dynamic_context_parallel:
                 raise ValueError(
@@ -624,6 +664,7 @@ class ModelParallelConfig:
                     "Please use dynamic_context_parallel only."
                 )
             self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
 
         if self.dynamic_context_parallel:
             if self.sequence_packing_scheduler is None:
@@ -639,6 +680,17 @@ class ModelParallelConfig:
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
                 )
+
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
+        # NOTE(nightly-sync 26_10_2026): main's ea99fdfce additionally rejects
+        # sequence_packing_scheduler='default_dynamic_cp' when dynamic_context_parallel is
+        # False. That restriction is not adopted here because dev treats the packing-aware
+        # scheduler as usable under static CP and has test coverage asserting that
+        # configuration constructs successfully (e.g.
+        # tests/unit_tests/transformer/test_balanced_dynamic_pack_config.py and
+        # tests/unit_tests/transformer/experimental_attention_variant/
+        # test_attention_variant_dsa.py).
 
         if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
             raise ValueError(
@@ -744,15 +796,6 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
-            warnings.warn(
-                "Transformer Engine cross entropy loss fusion has known stability issues. "
-                "Megatron-LM training args validation rejects this combination by default. "
-                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
-                UserWarning,
-                stacklevel=2,
-            )
-
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(
                 "Cannot defer embedding wgrad compute when pipeline model parallel is not used"
@@ -784,3 +827,21 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
+            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+
+        if self.sequence_packing_scheduler is not None:
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when sequence_packing_scheduler "
+                    "is not None."
+                )
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True

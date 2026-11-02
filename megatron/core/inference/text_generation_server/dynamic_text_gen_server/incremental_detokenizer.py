@@ -6,6 +6,8 @@
 import logging
 from typing import Any
 
+from megatron.core.inference.utils import model_eos_token_ids
+
 logger = logging.getLogger(__name__)
 
 _INVALID_PREFIX_ERROR = "Invalid prefix encountered"
@@ -41,24 +43,33 @@ class HuggingFaceFastIncrementalDetokenizer:
             )
 
         self._native_tokenizer = huggingface_tokenizer._tokenizer
-        # Final inference decoding always strips special tokens. Streaming must
-        # make the same choice or its concatenated deltas can differ from
-        # ``generated_text`` in the non-streaming response.
-        self._skip_special_tokens = True
+        # Streaming must drop exactly what the non-streaming response drops, or its
+        # concatenated deltas differ from `generated_text`. That is the tokens in the
+        # tokenizer's special-tokens map (`all_special_ids`) and the trailing EOS ids
+        # (`remove_EOD`), not every added token flagged `special`: chat models flag
+        # their reasoning and tool-call markers (`<think>`, `</think>`,
+        # `<tool_call>`) as special, and the reasoning and tool parsers need them.
+        # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
+        self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids) | (
+            model_eos_token_ids(tokenizer)
+        )
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0
 
     def _new_decode_stream(self, prompt_token_ids: list[int] | None = None):
-        kwargs = {"skip_special_tokens": self._skip_special_tokens}
+        kwargs = {"skip_special_tokens": False}
         if prompt_token_ids is not None:
-            kwargs["ids"] = list(prompt_token_ids)
+            kwargs["ids"] = self._kept(prompt_token_ids)
         return self._tokenizers.decoders.DecodeStream(**kwargs)
+
+    def _kept(self, token_ids: list[int]) -> list[int]:
+        return [token_id for token_id in token_ids if token_id not in self._skipped_token_ids]
 
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
         fragments = []
-        for token_id in token_ids:
+        for token_id in self._kept(token_ids):
             fragment = self._decode_next(token_id)
             if fragment:
                 fragments.append(fragment)

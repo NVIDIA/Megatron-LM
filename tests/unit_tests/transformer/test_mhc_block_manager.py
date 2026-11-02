@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
     MHCCheckpointManager,
     initialize_rng_tracker,
 )
@@ -22,9 +23,12 @@ class TestCheckpointWithoutOutputManagerAPI:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_auto_register(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_auto_register(self, manager_class):
         """CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided."""
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         def func(x):
             return x * 2 + 1
@@ -49,9 +53,12 @@ class TestCheckpointWithoutOutputManagerAPI:
 
         assert input_t.grad is not None
 
-    def test_discard_is_noop_with_manager(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_discard_is_noop_with_manager(self, manager_class):
         """discard_output_and_register_recompute is a NO-OP when ckpt_manager is set."""
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         def func1(x):
             return x * 2
@@ -118,9 +125,12 @@ class TestCheckpointWithoutOutputManagerAPI:
 
         assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6)
 
-    def test_error_handling(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_error_handling(self, manager_class):
         """MHCCheckpointManager rejects invalid add_checkpoint calls."""
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         with pytest.raises(TypeError):
             manager.add_checkpoint("not a checkpoint")
@@ -140,7 +150,10 @@ class TestCheckpointManagerSequentialChain:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_basic_sequential_chain(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_basic_sequential_chain(self, manager_class):
         """Three sequential checkpoints: gradients match non-checkpointed version."""
 
         def func1(x):
@@ -162,7 +175,7 @@ class TestCheckpointManagerSequentialChain:
         loss_ref.backward()
         grad_ref = input_ref.grad.clone()
 
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func1, input_ckpt)
         y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func2, y1)
@@ -182,7 +195,10 @@ class TestCheckpointManagerSequentialChain:
             grad_ckpt, grad_ref, atol=1e-6
         ), f"Gradients mismatch!\nWith manager: {grad_ckpt}\nReference: {grad_ref}"
 
-    def test_sequential_chain_with_dropout(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_sequential_chain_with_dropout(self, manager_class):
         """RNG state is restored during recompute so dropout gradients match."""
 
         def func_with_dropout(x):
@@ -206,7 +222,7 @@ class TestCheckpointManagerSequentialChain:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_with_dropout, input_ckpt)
         y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func2, y1)
@@ -221,7 +237,10 @@ class TestCheckpointManagerSequentialChain:
             grad_ckpt, grad_ref, atol=1e-6
         ), f"Gradients with dropout mismatch!\nWith manager: {grad_ckpt}\nReference: {grad_ref}"
 
-    def test_multiple_outputs(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_multiple_outputs(self, manager_class):
         """MHCCheckpointManager handles functions that return multiple outputs."""
 
         def func_multi_output(x):
@@ -239,7 +258,7 @@ class TestCheckpointManagerSequentialChain:
         loss_ref.backward()
         grad_ref = input_ref.grad.clone()
 
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             func_multi_output, input_ckpt
@@ -268,7 +287,10 @@ class TestCheckpointManagerPartialCheckpoint:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_partial_checkpoint(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_partial_checkpoint(self, manager_class):
         """
         Only f and h are checkpointed; g is a regular operation.
 
@@ -296,7 +318,7 @@ class TestCheckpointManagerPartialCheckpoint:
 
         input_ckpt = input_ref.detach().clone().requires_grad_(True)
 
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_f, input_ckpt)
         c = func_g(b)
@@ -317,7 +339,10 @@ class TestCheckpointManagerPartialCheckpoint:
             f"With manager: {grad_ckpt}\nReference: {grad_ref}"
         )
 
-    def test_partial_checkpoint_with_tuple_output(self):
+    @pytest.mark.parametrize(
+        "manager_class", [MHCCheckpointManager, CheckpointWithoutOutputManager]
+    )
+    def test_partial_checkpoint_with_tuple_output(self, manager_class):
         """
         Mimics HyperConnection's computation pattern with tuple outputs.
 
@@ -359,7 +384,7 @@ class TestCheckpointManagerPartialCheckpoint:
         x_ckpt = x_ref.detach().clone().requires_grad_(True)
         residual_ckpt = residual_ref.detach().clone().requires_grad_(True)
 
-        manager = MHCCheckpointManager()
+        manager = manager_class()
 
         h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             compute_mappings, x_ckpt
@@ -398,22 +423,6 @@ class TestCheckpointManagerPartialCheckpoint:
         )
 
 
-# ============================================================================
-# Block-level mHC recompute coverage
-# ============================================================================
-#
-# These tests instantiate a full ``TransformerBlock`` with mHC enabled to
-# exercise:
-#   * ``build_mhc_recompute_layer_plan`` (per-layer ``MHCCheckpointManager``
-#     allocation, including the ``mhc_recompute_layer_num`` boundary case),
-#   * ``finalize_mhc_recompute_layer`` (manager finalization at block end),
-#   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
-#     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
-#     stages.
-#
-# Single-process (no PP) so they can run on a single-GPU CI lane.
-
-
 class TestTransformerBlockMHCRecompute:
     """End-to-end ``TransformerBlock`` forward with mHC selective recompute."""
 
@@ -441,8 +450,8 @@ class TestTransformerBlockMHCRecompute:
             hidden_size=64,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
             mhc_recompute_layer_num=mhc_recompute_layer_num,
@@ -504,6 +513,25 @@ class TestTransformerBlockMHCRecompute:
         """TransformerBlock records static mHC recompute enablement during initialization."""
         block, _ = self._make_mhc_block(num_layers=2)
         assert block.mhc_recompute_enabled
+
+    def test_plain_transformer_layer_still_fails_fast_in_transformer_block(self):
+        """The Hybrid ownership exception must not weaken ordinary TransformerBlock wiring."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+        )
+
+        with pytest.raises(ValueError, match="HyperConnectionTransformerLayer"):
+            TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
 
     def test_block_forward_input_expand_output_contract(self):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""

@@ -24,7 +24,6 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
                 library (str): tokenizer library.
                 class_name (str): name of tokenizer class.
                 class_path (str): path to tokenizer class.
-                model_type (str): type of the model to be used with tokenizer.
         """
 
         super().__init__(path, config, **kwargs)
@@ -43,7 +42,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         else:
             return library_class(self.path, **kwargs)
 
-    def tokenize(self, text: Union[str, List[Dict]]) -> List[int]:
+    def tokenize(self, text: Union[str, List[Dict]], **kwargs) -> List[int]:
         """
         Text tokenization.
 
@@ -54,7 +53,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
             list: list of ids.
         """
 
-        return self._tokenizer.tokenize(text)
+        return self._tokenizer.tokenize(text, **kwargs)
 
     def detokenize(self, ids: List[int]) -> str:
         """
@@ -70,7 +69,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         return self._tokenizer.detokenize(ids)
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool, **kwargs
     ):
         """Convert a conversation to tokens.
 
@@ -89,6 +88,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
             conversation=conversation,
             return_target=return_target,
             add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
 
     def add_special_tokens(self, special_tokens: Union[list, dict]) -> None:
@@ -137,6 +137,19 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         return self._tokenizer.pad
 
     @property
+    def bos(self):
+        """Beginning of sentence token ID."""
+        return self._tokenizer.bos
+
+    @property
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eod
+
+    @property
+    def image_token_index(self):
+        """Image sentinel token ID used by multimodal models."""
+        image_token_index = getattr(self._tokenizer, "image_token_index", None)
+        if image_token_index is not None:
+            return image_token_index
+        return self._tokenizer._image_token_id

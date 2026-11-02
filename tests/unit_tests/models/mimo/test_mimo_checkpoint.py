@@ -16,8 +16,10 @@ import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core.dist_checkpointing import load, save
+from examples.mimo.training.topology import ModuleGridSpec, create_topology
+from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
@@ -56,7 +58,51 @@ def _randomize_params(model, seed):
             p.random_()
 
 
-def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed):
+def _sync_tied_pair(model, first_rank, last_rank):
+    """Copy the first-stage word embedding onto the last-stage tied output layer.
+
+    Checkpointing tied embeddings assumes both copies hold identical values, as training
+    keeps them via the embedding-group grad all-reduce. _randomize_params breaks that
+    invariant, so the tied test restores it before the fp32 main params are cloned at
+    optimizer construction. All ranks must call this (collective broadcast). The fake
+    per-param grads do not need syncing: the optimizer reads the zero-initialized
+    DDP main_grad buffers, not param.grad, so the step is grad-free either way.
+    """
+    rank = dist.get_rank()
+    meta = [None]
+    src = None
+    if rank == first_rank:
+        emb = next(
+            p
+            for name, p in model.named_parameters()
+            if name.endswith('embedding.word_embeddings.weight')
+        )
+        src = emb.data
+        meta = [(tuple(src.shape), src.dtype)]
+    dist.broadcast_object_list(meta, src=first_rank)
+    shape, dtype = meta[0]
+    buf = src.contiguous() if rank == first_rank else torch.empty(shape, dtype=dtype, device='cuda')
+    dist.broadcast(buf, src=first_rank)
+    if rank == last_rank:
+        out = next(
+            p for name, p in model.named_parameters() if name.endswith('output_layer.weight')
+        )
+        with torch.no_grad():
+            out.data.copy_(buf)
+
+
+def _create_model_and_optimizer(
+    encoder_grid,
+    llm_grid,
+    hidden_size,
+    num_layers,
+    vocab_size,
+    seed,
+    tie_embeddings=False,
+    tied_sync_ranks=None,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+):
     """Create MIMO model with DDP + optimizer, do a fake step to populate optimizer state.
 
     Caller must call create_all_embedding_groups() before this function.
@@ -71,8 +117,13 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=64,
+        share_embeddings_and_output_weights=tie_embeddings,
+        encoder_hidden_size=encoder_hidden_size,
+        language_rank_input_projection=language_rank_input_projection,
     )
     _randomize_params(mimo_model, seed)
+    if tied_sync_ranks is not None:
+        _sync_tied_pair(mimo_model, *tied_sync_ranks)
 
     # Use Float16Optimizer (not DistributedOptimizer) to exercise the MIMO-specific
     # param_groups/grad_scaler extraction in sharded_state_dict. DistributedOptimizer
@@ -95,6 +146,77 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
     return mimo_model, optimizer
 
 
+def run_projection_cross_placement_checkpoint_test(source_on_language_ranks):
+    """Save with one projector placement and load model weights with the other."""
+    for name in ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN'):
+        os.environ.pop(name, None)
+
+    topology = create_topology(
+        [
+            ModuleGridSpec(name=ENCODER_NAME, num_ranks=4, tp=2, rank_offset=0, expt_tp=2),
+            ModuleGridSpec(
+                name=MIMO_LANGUAGE_MODULE_KEY,
+                num_ranks=4,
+                tp=2,
+                gtp_remat=2,
+                rank_offset=4,
+                expt_tp=2,
+                expt_gtp_remat=2,
+            ),
+        ]
+    )
+    encoder_grid = topology.grids[ENCODER_NAME]
+    llm_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+
+    common = {
+        "encoder_name": ENCODER_NAME,
+        "encoder_grid": encoder_grid,
+        "llm_grid": llm_grid,
+        "hidden_size": 256,
+        "encoder_hidden_size": 128,
+        "num_layers": 2,
+        "vocab_size": 1000,
+        "seq_len": 64,
+        "projection_type": "affine",
+        "language_pg_collection": topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
+        "vision_pg_collection": topology.module_pgs[ENCODER_NAME],
+    }
+    model_a, *_ = get_mimo_model(
+        **common, language_rank_input_projection=source_on_language_ranks, freeze_encoder=True
+    )
+    _randomize_params(model_a, seed=1)
+
+    source_ckpt = _get_shared_tmpdir()
+    destination_ckpt = _get_shared_tmpdir()
+    try:
+        save(model_a.sharded_state_dict(), source_ckpt)
+        dist.barrier()
+
+        model_b, *_ = get_mimo_model(
+            **common,
+            language_rank_input_projection=not source_on_language_ranks,
+            freeze_encoder=True,
+        )
+        _randomize_params(model_b, seed=2)
+        model_sd, missing, unexpected = load(
+            model_b.sharded_state_dict(), source_ckpt, strict=StrictHandling.RETURN_ALL
+        )
+        assert not [key for key in missing if '_extra_state' not in key], missing
+        assert not [key for key in unexpected if '_extra_state' not in key], unexpected
+        model_b.load_state_dict(model_sd)
+
+        save(model_b.sharded_state_dict(), destination_ckpt)
+        source_tensors = load_plain_tensors(source_ckpt)
+        destination_tensors = load_plain_tensors(destination_ckpt)
+        assert source_tensors.keys() == destination_tensors.keys()
+        for name, tensor in source_tensors.items():
+            assert torch.equal(tensor, destination_tensors[name]), name
+    finally:
+        _cleanup_tmpdir(source_ckpt)
+        _cleanup_tmpdir(destination_ckpt)
+        topology.destroy()
+
+
 def run_checkpoint_test(
     encoder_tp,
     encoder_pp,
@@ -107,6 +229,7 @@ def run_checkpoint_test(
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
+    tie_embeddings=False,
 ):
     """Save model + optimizer checkpoint, load into fresh instances, verify match."""
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
@@ -121,9 +244,23 @@ def run_checkpoint_test(
     llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
     create_all_embedding_groups([encoder_grid, llm_grid])
 
+    tied_sync_ranks = None
+    if tie_embeddings:
+        # The tied pair lives on the first and last LLM PP stage; the sync helper
+        # assumes each stage is a single rank.
+        assert llm_tp == 1 and llm_dp == 1, "tie_embeddings test path assumes llm tp=1, dp=1"
+        tied_sync_ranks = (llm_offset, llm_offset + llm_pp - 1)
+
     # --- Create model A + optimizer, snapshot state ---
     model_a, optimizer_a = _create_model_and_optimizer(
-        encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed=1
+        encoder_grid,
+        llm_grid,
+        hidden_size,
+        num_layers,
+        vocab_size,
+        seed=1,
+        tie_embeddings=tie_embeddings,
+        tied_sync_ranks=tied_sync_ranks,
     )
     params_a = {name: p.clone() for name, p in model_a.named_parameters()}
 
@@ -150,7 +287,14 @@ def run_checkpoint_test(
 
         # --- Create model B + optimizer with different weights (reuse same grids) ---
         model_b, optimizer_b = _create_model_and_optimizer(
-            encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed=2
+            encoder_grid,
+            llm_grid,
+            hidden_size,
+            num_layers,
+            vocab_size,
+            seed=2,
+            tie_embeddings=tie_embeddings,
+            tied_sync_ranks=tied_sync_ranks,
         )
 
         # Load model
@@ -259,6 +403,26 @@ class TestMimoCheckpoint:
             num_layers=7,
         )
 
+    def test_encoder_tp1_llm_pp7_tied_embeddings(self):
+        """Tied word embeddings with PP >= 2: saving reaches the tied output-layer
+        replica_id in tie_embeddings_and_output_weights_state_dict, which must come
+        from metadata['dp_cp_group'] — the global MPU is not initialized here."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_checkpoint_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=7,
+            llm_dp=1,
+            llm_offset=1,
+            hidden_size=256,
+            num_layers=7,
+            tie_embeddings=True,
+        )
+
     def test_encoder_tp2_pp2_llm_tp2_pp2(self):
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -274,6 +438,16 @@ class TestMimoCheckpoint:
             hidden_size=256,
             num_layers=2,
         )
+
+    @pytest.mark.parametrize("source_on_language_ranks", [False, True])
+    def test_input_projection_checkpoint_loads_across_placements(self, source_on_language_ranks):
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        if not HAVE_GTP:
+            pytest.skip("GTP requires a supported Transformer Engine version")
+        run_projection_cross_placement_checkpoint_test(source_on_language_ranks)
 
 
 class TestOptimizerCheckpointHelpers:

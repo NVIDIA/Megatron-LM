@@ -41,7 +41,7 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
-COPY README.md pyproject.toml uv.lock /workspace/
+COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
     uv sync --extra mlm --extra ssm --link-mode copy --locked \
+        --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -95,12 +96,17 @@ RUN bash -ex <<"EOF"
 
     git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git checkout 34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72
+        git checkout 10d4dd7377d5bce900fbb4b80cce863764892b95
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
     rm -rf DeepEP
 EOF
+
+# Install the local project after expensive dependency builds so README-only
+# changes do not invalidate those layers.
+COPY README.md /workspace/
+RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python

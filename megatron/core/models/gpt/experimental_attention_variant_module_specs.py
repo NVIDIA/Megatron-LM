@@ -4,7 +4,7 @@ import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     GatedDeltaNet2,
@@ -13,21 +13,12 @@ from megatron.core.ssm.gated_delta_net import (
     KimiDeltaAttentionSubmodules,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.csa import (
-    CompressedSparseAttention,
-    CompressedSparseAttentionSubmodules,
-    Compressor,
-    CompressorSubmodules,
-    CSAIndexer,
-    CSAIndexerSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-    DSv4HybridSelfAttention,
-    DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -54,33 +45,8 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.typed_torch import not_none
 
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-
-try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
-except ImportError:
-    HAVE_KITCHEN = False
-
-
-##########
-# Experimental Attention Variant Names
-##########
-
-# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+# All canonical GDN-family variants, including dev KDA and incoming GDN2.
 GDN_ATTENTION_VARIANTS = ("gdn", "gdn2", "kda")
-
-# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
 _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
 
@@ -182,58 +148,10 @@ def get_dsa_module_spec_for_backend(
 def get_dsv4_hybrid_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Helper function to get module spec for DSv4 Hybrid Sparse Attention."""
-    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
-    assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
-
-    # Adjust for RMS norm.
-    rms_norm = config.normalization == "RMSNorm"
-    # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
-    # with linear projection and have to use unfused qk layernorm.
-    qk_norm = (
-        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
-    )
-
-    compressor_spec = ModuleSpec(
-        module=Compressor,
-        submodules=CompressorSubmodules(
-            linear_wkv=backend.linear(),
-            linear_wgate=backend.linear(),
-            norm=backend.layer_norm(rms_norm=True, for_qk=False),
-        ),
-    )
-
-    indexer_spec = ModuleSpec(
-        module=CSAIndexer,
-        submodules=CSAIndexerSubmodules(
-            linear_wq_b=backend.linear(),
-            linear_weights_proj=backend.linear(),
-            compressor=compressor_spec,
-        ),
-    )
-
-    core_attention = ModuleSpec(
-        module=CompressedSparseAttention,
-        submodules=CompressedSparseAttentionSubmodules(
-            compressor=compressor_spec, indexer=indexer_spec
-        ),
-    )
-
-    attention = ModuleSpec(
-        module=DSv4HybridSelfAttention,
-        params={"attn_mask_type": AttnMaskType.causal},
-        submodules=DSv4HybridSelfAttentionSubmodules(
-            linear_q_down_proj=backend.linear(),
-            linear_q_up_proj=backend.column_parallel_linear(),
-            linear_kv_proj=backend.column_parallel_linear(),
-            core_attention=core_attention,
-            linear_proj=backend.row_parallel_linear(),
-            q_layernorm=qk_norm,
-            kv_layernorm=qk_norm,
-        ),
-        metainfo={"fuse_input_layernorm": False},
-    )
-    return attention
+    """Compatibility entry point for the shared DSv4 component-spec factory."""
+    if backend is None:
+        backend = _get_backend_spec_provider(config)
+    return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(config, backend)
 
 
 def get_experimental_attention_variant_module_spec(
@@ -337,10 +255,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
-    enable_hc = config.enable_hyper_connections
-    hc_module = HyperConnectionModule if enable_hc else IdentityOp
-    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
-
+    enable_mhc = config.enable_mhc_connections
+    hyper_connection = HyperConnectionModule if enable_mhc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -372,11 +289,11 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
-                    self_attention_hyper_connection=hc_module,
+                    self_attention_hyper_connection=hyper_connection,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
-                    mlp_hyper_connection=hc_module,
+                    mlp_hyper_connection=hyper_connection,
                 ),
             )
         )
@@ -597,16 +514,8 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
         "Experimental GPT decoder block spec only supports "
         "transformer engine implementation for now."
     )
-    backend: BackendSpecProvider = (
-        KitchenSpecProvider(
-            fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn),
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        if config.use_kitchen
-        else TESpecProvider()
-    )
-    return backend
+    # The factory also applies config.use_kitchen with TE as its fallback provider.
+    return get_backend_from_config(config)
 
 
 ##########

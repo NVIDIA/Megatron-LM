@@ -8,8 +8,9 @@ subgraph from the same saved input. So enabling it must not move the numerics at
 Any drift would mean the replay observed a different weight, a different RNG state, or
 a stale storage after the output-discarding checkpoint shared the recomputed one back.
 
-The one exception is `conv1d.weight`, see NONDETERMINISTIC_PARAMS below: its gradient is
-not reproducible run to run, for reasons that have nothing to do with recompute.
+`conv1d.weight` used to be exempt, because the conv backward reduced it with atomicAdd. The
+fixture below turns on the kernel's deterministic reduction instead, so it is held to the same
+bitwise bar as everything else.
 """
 
 import pytest
@@ -20,14 +21,17 @@ from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import (
     HAVE_CUTEDSL_GDP,
+    HAVE_CUTEDSL_GDP_CP,
     HAVE_EINOPS,
     HAVE_FLA,
+    HAVE_FLA_GDP_CP,
     HAVE_MAMBA_SSM,
     GatedDeltaProductMixer,
     causal_conv1d_fn,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -99,35 +103,20 @@ def _run(mixer, hidden_states, grads):
     return out.detach().clone(), x.grad.clone(), param_grads
 
 
-# `causal_conv1d_fn` accumulates its weight gradient across blocks with atomicAdd on the
-# channels-last layout the mixer feeds it, so the reduction order -- and with it the
-# last-place rounding -- varies from launch to launch. Two runs of the *same* mixer can
-# therefore disagree on this tensor. It is unrelated to recompute and to FP8: it
-# reproduces with recompute disabled, in plain BF16, and the conv sees the identical
-# layout and dtypes either way. Everything else here must still match bitwise, so scope
-# the tolerance to this one tensor rather than loosening the whole comparison.
-NONDETERMINISTIC_PARAMS = ("conv1d.weight",)
+@pytest.fixture(autouse=True)
+def deterministic_conv1d(monkeypatch):
+    """Hold the conv backward to its deterministic reduction for every test in this module.
 
-
-def _assert_grad_matches(name, recomputed_grad, base_grad):
-    """Compare one gradient: bitwise, unless the kernel that produced it is unstable."""
-    if name in NONDETERMINISTIC_PARAMS:
-        # Reordering shifts an element by a few ulps of its own value, so the budget is
-        # relative: BF16 carries 8 mantissa bits, so 2**-6 is four ulps. atol only has to
-        # cover elements too close to zero for rtol to mean anything, and is derived from
-        # the tensor's magnitude so it cannot go stale if these tests change shape.
-        atol = float(base_grad.abs().max()) * 2**-11
-        torch.testing.assert_close(
-            recomputed_grad, base_grad, rtol=2**-6, atol=atol, msg=f"{name} gradient drifted"
-        )
-    else:
-        torch.testing.assert_close(
-            recomputed_grad, base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
-        )
+    Without it, `causal_conv1d_fn` accumulates its weight gradient across blocks with atomicAdd
+    on the channel-last layout the mixer feeds it, so two runs of the *same* mixer disagree on
+    `conv1d.weight` and a parity test has to tolerate a drifting gradient. Set per-test rather
+    than process-wide because the env var is read on each backward call.
+    """
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
 
 
 def _assert_replay_matches(baseline, recomputed):
-    """Compare a (output, input grad, param grads) triple; exact but for the conv weight."""
+    """Compare a (output, input grad, param grads) triple; every tensor bitwise."""
     base_out, base_input_grad, base_param_grads = baseline
     recomp_out, recomp_input_grad, recomp_param_grads = recomputed
 
@@ -137,7 +126,9 @@ def _assert_replay_matches(baseline, recomputed):
     )
     assert set(recomp_param_grads) == set(base_param_grads)
     for name, base_grad in base_param_grads.items():
-        _assert_grad_matches(name, recomp_param_grads[name], base_grad)
+        torch.testing.assert_close(
+            recomp_param_grads[name], base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
+        )
 
 
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
@@ -202,6 +193,110 @@ def test_fp8_in_proj_recompute_parity(fp8_recipe):
         _assert_replay_matches(
             _run(baseline, hidden_states, grads), _run(recomputed, hidden_states, grads)
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
+@pytest.mark.parametrize("recompute_qkv", [False, True])
+@pytest.mark.parametrize("fp8_recipe", [None, "mxfp8"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_in_proj_recompute_preserves_norm_gate_view(
+    monkeypatch, recompute_qkv, fp8_recipe, cp_size
+):
+    """At MB=1, CP1 and chunkwise CP must discard and restore the norm's saved gate."""
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires at least {cp_size} distributed ranks")
+    if cp_size > 1:
+        if not is_causal_conv1d_min_version("1.7.0"):
+            pytest.skip("chunkwise CP requires causal-conv1d >= 1.7.0")
+        if not (HAVE_FLA_GDP_CP if HAVE_FLA else HAVE_CUTEDSL_GDP_CP):
+            pytest.skip("the selected GDP backend does not support chunkwise CP")
+    if fp8_recipe == "mxfp8":
+        te = pytest.importorskip("transformer_engine.pytorch")
+        available, reason = te.is_mxfp8_available(return_reason=True)
+        if not available:
+            pytest.skip(reason)
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        modules = ["gdp_in_proj"] + (["gdp_qkv"] if recompute_qkv else [])
+        config = _make_config(modules, fp8_recipe=fp8_recipe)
+        config.context_parallel_size = cp_size
+        config.linear_cp_mode = "chunkwise"
+        config.linear_cp_layout = "contiguous"
+        if fp8_recipe:
+            config.fp8 = "e4m3"
+        config.gdp_cutedsl_kernel = not HAVE_FLA
+        # Eight heads align the projection's ba width to MXFP8's 32-element blocks.
+        config.mamba_num_heads = 8
+        baseline = _build_mixer(config)
+        recomputed = _build_mixer(config, state_dict=baseline.state_dict())
+
+        baseline_norm_forward = baseline.norm.forward
+
+        def contiguous_norm_forward(x, z):
+            return baseline_norm_forward(x, z.contiguous())
+
+        monkeypatch.setattr(baseline.norm, "forward", contiguous_norm_forward)
+
+        projection_gate_storages = []
+        in_proj_preprocess = recomputed._in_proj_preprocess
+
+        def tracked_in_proj_preprocess(*args, **kwargs):
+            outputs = in_proj_preprocess(*args, **kwargs)
+            projection_gate_storages.append(outputs[0].untyped_storage())
+            return outputs
+
+        monkeypatch.setattr(recomputed, "_in_proj_preprocess", tracked_in_proj_preprocess)
+        saved_gates = []
+        expected_gates = []
+
+        def capture_saved_gate(module, inputs, output):
+            z = inputs[1]
+            assert not z.is_contiguous()
+            assert z.stride(-1) == 1
+            assert z.untyped_storage().data_ptr() == projection_gate_storages[0].data_ptr()
+            # Inspect the actual Mamba autograd save, including its internal 2D reshape.
+            saved_gate = output.grad_fn.saved_tensors[-1]
+            assert saved_gate.untyped_storage().data_ptr() == z.untyped_storage().data_ptr()
+            saved_gates.append(saved_gate)
+            expected_gates.append(saved_gate.detach().clone())
+
+            def check_restored_gate(grad_outputs):
+                assert len(projection_gate_storages) == 2
+                assert (
+                    saved_gate.untyped_storage().data_ptr()
+                    == projection_gate_storages[1].data_ptr()
+                )
+                torch.testing.assert_close(saved_gate, expected_gates[0], rtol=0, atol=0)
+
+            output.grad_fn.register_prehook(check_restored_gate)
+
+        norm_hook = recomputed.norm.register_forward_hook(capture_saved_gate)
+        hidden_states = torch.randn((256, 1, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
+        grads = torch.randn_like(hidden_states)
+        baseline_result = _run(baseline, hidden_states, grads)
+
+        x = hidden_states.clone().requires_grad_(True)
+        with get_fp8_context(recomputed.config):
+            output, _ = recomputed(x)
+        assert len(saved_gates) == len(projection_gate_storages) == 1
+        assert saved_gates[0].untyped_storage().nbytes() == 0
+        assert projection_gate_storages[0].nbytes() == 0
+
+        output.backward(grads)
+        assert len(projection_gate_storages) == 2
+        assert saved_gates[0].untyped_storage().data_ptr() == projection_gate_storages[1].data_ptr()
+        torch.testing.assert_close(saved_gates[0], expected_gates[0], rtol=0, atol=0)
+        recomputed_result = (
+            output.detach().clone(),
+            x.grad.clone(),
+            {name: param.grad.clone() for name, param in recomputed.named_parameters()},
+        )
+        _assert_replay_matches(baseline_result, recomputed_result)
+        norm_hook.remove()
     finally:
         Utils.destroy_model_parallel()
 

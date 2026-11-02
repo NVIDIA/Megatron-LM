@@ -13,8 +13,9 @@ Compared to :class:`SFTDataset`, this dataset adds:
 
   * **Multi-source loading** — accepts HuggingFace Hub repo ids
     (``owner/repo``), local ``.parquet`` files, and local ``.jsonl/.json``
-    files. Hub repos may expose multiple configs and splits; these are joined
-    logically without requiring their Arrow schemas to be identical.
+    files; the latter use stdlib JSON and Dataset.from_list to avoid per-chunk
+    schema inference failures when fields vary across rows.
+    Hub configs and splits are joined logically without requiring identical Arrow schemas.
 
   * **Auto schema detection** — four input layouts are auto-detected by column
     name. The three instruction-tuning layouts are normalized to the messages
@@ -482,12 +483,8 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
-      * Otherwise local jsonl/json — loaded via pandas
-        ``read_json(lines=True)`` and wrapped in ``Dataset.from_pandas``.
-        We avoid ``datasets.load_dataset("json", ...)`` for local files
-        because its pyarrow-based JSON reader infers schema per parallel
-        chunk and fails with ``CastError`` when the union of fields varies
-        between rows (e.g. LongAlpaca-12k).
+      * Otherwise local jsonl/json — parsed with stdlib JSON and built by
+        Dataset.from_list in one pass without a pandas dependency.
 
     Each config/split remains a separate map-style component and is joined by
     index arithmetic. This avoids requiring Arrow feature compatibility across
@@ -606,15 +603,14 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         elif dataset_path.endswith(".parquet"):
             add_component(load_dataset("parquet", data_files=dataset_path, split="all"))
         else:
-            try:
-                import pandas as pd
-            except ImportError as exc:
-                raise ImportError(
-                    "VarlenDataset requires `pandas` to load local jsonl "
-                    "files (pip install pandas)."
-                ) from exc
-            df = pd.read_json(dataset_path, lines=True)
-            add_component(Dataset.from_pandas(df, preserve_index=False))
+            # Parse the jsonl with the stdlib and build the table in one
+            # pyarrow pass: datasets.load_dataset("json", ...) infers schema
+            # per parallel chunk and fails with CastError when the union of
+            # fields varies between rows (e.g. LongAlpaca-12k); building from
+            # the full record list sidesteps that without a pandas dependency.
+            with open(dataset_path) as f:
+                records = [json.loads(line) for line in f if line.strip()]
+            add_component(Dataset.from_list(records))
 
         if not self._datasets:
             raise ValueError(f"VarlenDataset: no data was loaded from {dataset_path!r}.")

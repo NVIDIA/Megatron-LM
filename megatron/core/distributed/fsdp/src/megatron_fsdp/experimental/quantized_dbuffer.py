@@ -1,0 +1,400 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Transformer Engine MXFP8 distributed buffers composed from physical planes."""
+
+import functools
+from collections.abc import Iterable
+
+import torch
+import torch.nn.functional as F
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
+
+try:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+except ImportError as exc:
+    # Keep "UnavailableError": .gitlab/scripts/check_imports.py imports this module
+    # directly and uses that string to classify missing optional dependencies as graceful.
+    raise ImportError(
+        "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
+    ) from exc
+
+from . import layout_builder
+from .dbuffer import DBuffer
+from .layout import GlobalLayout, Shape
+from .placement import BlockAtomic, RowAtomic
+
+_MXFP8_DTYPE = tex.DType.kFloat8E4M3
+_MXFP8_BLOCK_SIZE = 32
+
+
+@functools.cache
+def _get_quantizer(*, rowwise: bool, columnwise: bool) -> MXFP8Quantizer:
+    """Return a shared MXFP8 quantizer with the given usages."""
+    return MXFP8Quantizer(_MXFP8_DTYPE, rowwise=rowwise, columnwise=columnwise)
+
+
+def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Return MFSDP's storage dtype for a parameter."""
+    return torch.uint8 if isinstance(tensor, MXFP8Tensor) else tensor.dtype
+
+
+def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
+    """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
+    return GlobalLayout(
+        tensor_shapes=(
+            (shape[0], shape[1] // _MXFP8_BLOCK_SIZE) for shape in data_layout.tensor_shapes
+        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
+        size=data_layout.size // _MXFP8_BLOCK_SIZE,
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+    )
+
+
+def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
+    """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
+    return GlobalLayout(
+        tensor_shapes=(
+            (shape[0] // _MXFP8_BLOCK_SIZE, shape[1]) for shape in data_layout.tensor_shapes
+        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
+        size=data_layout.size // _MXFP8_BLOCK_SIZE,
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+    )
+
+
+def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, ...]:
+    """Replace BlockAtomic placements with RowAtomic for coordinates measured in blocks.
+
+    For example, one MXFP8 columnwise scale row represents a 32-row weight
+    block, so RowAtomic preserves the shard boundaries of BlockAtomic(32).
+    """
+    placements = tuple(placements)
+    return tuple(
+        RowAtomic() if isinstance(placement, BlockAtomic) else placement for placement in placements
+    )
+
+
+def _pad_rowwise_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Pad rowwise scales to TE's physical allocation shape."""
+    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
+        (scale.shape[0], scale.shape[1] * _MXFP8_BLOCK_SIZE), columnwise=False
+    )
+    if scale.shape == shape:
+        return scale
+    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
+
+
+def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Pad columnwise scales to TE's physical allocation shape."""
+    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
+        (scale.shape[0] * _MXFP8_BLOCK_SIZE, scale.shape[1]), columnwise=True
+    )
+    if scale.shape == shape:
+        return scale
+    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
+
+
+def update_mxfp8_tensor(
+    src: MXFP8Tensor, dst: MXFP8Tensor, *, rowwise: bool = True, columnwise: bool = True
+) -> None:
+    """Update ``dst`` in place from ``src``, a compact view of the allocated planes.
+
+    ``rowwise`` and ``columnwise`` select the newly gathered planes, which are taken
+    from ``src`` with padded scales. Planes gathered earlier for the other phase stay
+    as installed on ``dst``, and planes absent from ``src`` are cleared. ``src`` is
+    not modified.
+    """
+    # Work around TE rejecting compact MXFP8 scales in GEMM:
+    # https://github.com/NVIDIA/TransformerEngine/issues/3518
+    # Pad only newly installed planes. Repadding the other phase's scales
+    # would replace them with a new copy not covered by its readiness event.
+    # TODO: Remove update_mxfp8_tensor once TE accepts compact scales.
+    # Callers can assign dst.data = src directly; there will be
+    # no padded copies to preserve across phases.
+    # Planes installed earlier for the other phase; dst.data = src replaces them.
+    rowwise_planes = (dst._rowwise_data, dst._rowwise_scale_inv)
+    columnwise_planes = (dst._columnwise_data, dst._columnwise_scale_inv)
+    # MXFP8Tensor's data setter shares src's plane tensors with dst without copying.
+    # It also takes src's quantizer, whose usage matches the allocated planes as TE
+    # checks, and src's unswizzled-scales flag. Planes absent from src are cleared.
+    # dst stays the same object, which TE may have saved for backward. The fixes
+    # below only rebind dst's attributes, so src is left untouched.
+    dst.data = src
+    if src._rowwise_data is not None:
+        if rowwise:
+            dst._rowwise_scale_inv = _pad_rowwise_scale(src._rowwise_scale_inv)
+        else:
+            # Allocated but not newly gathered: the other phase installed these planes.
+            assert rowwise_planes[0] is not None, "Expected previously installed rowwise planes."
+            dst._rowwise_data, dst._rowwise_scale_inv = rowwise_planes
+    if src._columnwise_data is not None:
+        if columnwise:
+            dst._columnwise_scale_inv = _pad_columnwise_scale(src._columnwise_scale_inv)
+        else:
+            # Allocated but not newly gathered: the other phase installed these planes.
+            assert (
+                columnwise_planes[0] is not None
+            ), "Expected previously installed columnwise planes."
+            dst._columnwise_data, dst._columnwise_scale_inv = columnwise_planes
+
+
+class QuantizedDBuffer:
+    """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
+
+    The data layout owns the parameter-to-rank partition. Scale planes use its
+    compact MXFP8 coordinates, so every plane on a rank describes the same
+    local data rows. TE-only padding is added when materializing a wrapper for
+    compute, not to distributed storage.
+    """
+
+    rowwise_data: DBuffer
+    columnwise_data: DBuffer
+    rowwise_scale: DBuffer
+    columnwise_scale: DBuffer
+
+    def __init__(
+        self,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        layout: GlobalLayout,
+        device: torch.device | str,
+    ) -> None:
+        """Allocate MXFP8 data and scale planes from a shared weight layout."""
+        tensor_shapes = layout.tensor_shapes
+        if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
+            raise ValueError("QuantizedDBuffer requires one or more 2D MXFP8 tensor shapes.")
+        if any(
+            shape[0] % _MXFP8_BLOCK_SIZE or shape[1] % _MXFP8_BLOCK_SIZE for shape in tensor_shapes
+        ):
+            raise ValueError(
+                f"QuantizedDBuffer requires dimensions divisible by {_MXFP8_BLOCK_SIZE}."
+            )
+        layout.validate_for_row_atomic(block_size=_MXFP8_BLOCK_SIZE)
+        placements = tuple(placements)
+        self.rowwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
+        self.columnwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
+        self.rowwise_scale = DBuffer(
+            mesh, placements, _rowwise_scale_layout(layout), torch.uint8, device
+        )
+        self.columnwise_scale = DBuffer(
+            mesh,
+            _block_atomic_to_flat(placements),
+            _columnwise_scale_layout(layout),
+            torch.uint8,
+            device,
+        )
+
+    @classmethod
+    def empty(
+        cls,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[Shape],
+        device: torch.device | str,
+    ) -> "QuantizedDBuffer":
+        """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
+        layout = layout_builder.build_for_row_atomic(
+            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+        )
+        return cls(mesh, placements, layout, device)
+
+    @property
+    def mesh(self) -> DeviceMesh:
+        """Device mesh shared by all physical planes."""
+        return self.rowwise_data.mesh
+
+    @property
+    def placements(self) -> tuple[Placement, ...]:
+        """Logical weight placements; scale planes map these to scale coordinates."""
+        return self.rowwise_data.placements
+
+    @classmethod
+    def _from_planes(
+        cls,
+        rowwise_data: DBuffer,
+        columnwise_data: DBuffer,
+        rowwise_scale: DBuffer,
+        columnwise_scale: DBuffer,
+    ) -> "QuantizedDBuffer":
+        """Create a composed view from already-allocated physical planes."""
+        result = cls.__new__(cls)
+        result.rowwise_data = rowwise_data
+        result.columnwise_data = columnwise_data
+        result.rowwise_scale = rowwise_scale
+        result.columnwise_scale = columnwise_scale
+        return result
+
+    @property
+    def is_rowwise_allocated(self) -> bool:
+        """Whether rowwise data and scales are allocated."""
+        return self.rowwise_data.is_allocated and self.rowwise_scale.is_allocated
+
+    @property
+    def is_columnwise_allocated(self) -> bool:
+        """Whether columnwise data and scales are allocated."""
+        return self.columnwise_data.is_allocated and self.columnwise_scale.is_allocated
+
+    def get_tensor_view(self, index: int) -> MXFP8Tensor:
+        """Return a compact, unswizzled MXFP8 view that aliases every allocated plane pair.
+
+        Released planes are omitted, so the view never reads storage that
+        ``release_storage()`` freed.
+        """
+        rowwise, columnwise = self.is_rowwise_allocated, self.is_columnwise_allocated
+        if not (rowwise or columnwise):
+            raise RuntimeError("QuantizedDBuffer has no allocated rowwise or columnwise planes.")
+        rowwise_data = self.rowwise_data.get_tensor_view(index) if rowwise else None
+        columnwise_data = self.columnwise_data.get_tensor_view(index) if columnwise else None
+        data = rowwise_data if rowwise_data is not None else columnwise_data
+        return MXFP8Tensor(
+            shape=data.shape,
+            dtype=torch.bfloat16,
+            rowwise_data=rowwise_data,
+            rowwise_scale_inv=(self.rowwise_scale.get_tensor_view(index) if rowwise else None),
+            columnwise_data=columnwise_data,
+            columnwise_scale_inv=(
+                self.columnwise_scale.get_tensor_view(index) if columnwise else None
+            ),
+            fp8_dtype=_MXFP8_DTYPE,
+            quantizer=_get_quantizer(rowwise=rowwise, columnwise=columnwise),
+            with_gemm_swizzled_scales=False,
+            device=data.device,
+        )
+
+    def quantize_(self, main_weight: DBuffer) -> None:
+        """Quantize a local master shard with matching mesh, placements, layout, and device."""
+        for attribute in ("mesh", "placements", "layout", "device"):
+            expected = getattr(self.rowwise_data, attribute)
+            actual = getattr(main_weight, attribute)
+            if actual != expected:
+                raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
+        assert (
+            self.is_rowwise_allocated and self.is_columnwise_allocated
+        ), "quantize_() requires both rowwise and columnwise planes to be allocated."
+
+        for index in range(len(self.rowwise_data.layout.tensor_shapes)):
+            # TE's MXFP8 quantize kernel writes scale_inv in its padded physical
+            # layout (see _pad_rowwise_scale and _pad_columnwise_scale) and stores
+            # scales for every row of its 64-row chunk, including rows beyond the
+            # tensor (https://github.com/NVIDIA/TransformerEngine/issues/3689). The
+            # compact plane views are smaller than that whenever this rank's shard
+            # is not a multiple of 64 rows, so quantizing into them is an
+            # out-of-bounds write: into the next rank's chunk of a replicated plane,
+            # or beyond the end of the local buffer. This is the producer-side
+            # counterpart of the GEMM padding in update_mxfp8_tensor() (TE issue 3518):
+            # quantize into padded scales and copy the compact region back. Once TE
+            # quantizes into compact scales in bounds, this loop body reduces to:
+            #   self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
+            tensor = self.get_tensor_view(index)
+            tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
+            tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
+            tensor.quantize_(main_weight.get_tensor_view(index))
+            for plane, padded in (
+                (self.rowwise_scale, tensor._rowwise_scale_inv),
+                (self.columnwise_scale, tensor._columnwise_scale_inv),
+            ):
+                compact = plane.get_tensor_view(index)
+                if padded.shape != compact.shape:
+                    compact.copy_(padded[: compact.shape[0], : compact.shape[1]])
+
+    @property
+    def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
+        """Physical planes in TE's rowwise-data-first order."""
+        return self.rowwise_data, self.columnwise_data, self.rowwise_scale, self.columnwise_scale
+
+    def planes_for(self, *, rowwise: bool, columnwise: bool) -> tuple[DBuffer, ...]:
+        """Physical data and scale planes of the selected representations."""
+        planes: tuple[DBuffer, ...] = ()
+        if rowwise:
+            planes += (self.rowwise_data, self.rowwise_scale)
+        if columnwise:
+            planes += (self.columnwise_data, self.columnwise_scale)
+        return planes
+
+    @property
+    def is_symmetric_memory(self) -> bool:
+        """Whether every plane is backed by symmetric memory."""
+        return all(plane.is_symmetric_memory for plane in self.planes)
+
+    def reallocate_storage(self) -> None:
+        """Restore every plane's backing storage."""
+        for plane in self.planes:
+            plane.reallocate_storage()
+
+    def release_storage(self, *, rowwise_only: bool = False) -> None:
+        """Release all plane storage, or only rowwise storage, while retaining aliases."""
+        # Preserve Storage aliases that autograd may have saved for backward.
+        for plane in self.planes_for(rowwise=True, columnwise=not rowwise_only):
+            plane.release_storage()
+
+    def view(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
+        """Return a storage-sharing view of every physical plane."""
+        placements = tuple(placements)
+        if self.rowwise_data.placements == placements:
+            return self
+        return QuantizedDBuffer._from_planes(
+            self.rowwise_data.view(placements),
+            self.columnwise_data.view(placements),
+            self.rowwise_scale.view(placements),
+            self.columnwise_scale.view(_block_atomic_to_flat(placements)),
+        )
+
+    def redistribute(
+        self,
+        new_placements: Iterable[Placement],
+        *,
+        out: "QuantizedDBuffer | None" = None,
+        rowwise: bool = True,
+        columnwise: bool = True,
+    ) -> "QuantizedDBuffer":
+        """Redistribute the selected planes, returning ``out`` or a new wrapper."""
+        new_placements = tuple(new_placements)
+        if out is None:
+            if not (rowwise and columnwise):
+                raise NotImplementedError("redistribute() without `out` requires every plane.")
+            return self._from_planes(
+                self.rowwise_data.redistribute(new_placements),
+                self.columnwise_data.redistribute(new_placements),
+                self.rowwise_scale.redistribute(new_placements),
+                self.columnwise_scale.redistribute(_block_atomic_to_flat(new_placements)),
+            )
+        if out.mesh != self.mesh:
+            raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
+        if out.rowwise_data.placements != new_placements:
+            raise ValueError(
+                "Expected out rowwise-data placements "
+                f"{new_placements!r}, got {out.rowwise_data.placements!r}."
+            )
+        for plane, out_plane in zip(
+            self.planes_for(rowwise=rowwise, columnwise=columnwise),
+            out.planes_for(rowwise=rowwise, columnwise=columnwise),
+        ):
+            plane.redistribute(out_plane.placements, out=out_plane)
+        return out
+
+    def allgather(
+        self, mesh_axis: int | Iterable[int], *, out: "QuantizedDBuffer | None" = None
+    ) -> "QuantizedDBuffer":
+        """Gather one or more axes in every plane, reusing ``out`` when supplied."""
+        # Materialize generators once so every plane gathers the same axes.
+        if not isinstance(mesh_axis, int):
+            mesh_axis = tuple(mesh_axis)
+        if out is None:
+            return self._from_planes(*(plane.allgather(mesh_axis) for plane in self.planes))
+        for plane, out_plane in zip(self.planes, out.planes):
+            plane.allgather(mesh_axis, out=out_plane)
+        return out

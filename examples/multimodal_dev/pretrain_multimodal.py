@@ -27,10 +27,7 @@ import importlib
 import os
 import sys
 
-sys.path.insert(
-    0,
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
-)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step, seqlen_alignment_factor
@@ -38,15 +35,12 @@ from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.training import validate_vision_flops_metadata
 from megatron.training.utils import start_memory_history_recording
 
 
-def model_provider(
-    pre_process: bool = True,
-    post_process: bool = True,
-    **kwargs,
-):
+def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
     """Build a multimodal model from ``--model-arch``.
 
     The language ``TransformerConfig`` is built from CLI args so that
@@ -61,8 +55,7 @@ def model_provider(
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -132,9 +125,7 @@ def _resolve_provider_fn(provider_fn):
     """Resolve a provider that may be a dotted import path string."""
     if isinstance(provider_fn, str):
         module_path, func_name = provider_fn.rsplit(".", 1)
-        provider_fn = getattr(
-            importlib.import_module(module_path), func_name,
-        )
+        provider_fn = getattr(importlib.import_module(module_path), func_name)
     return provider_fn
 
 
@@ -155,8 +146,7 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -175,10 +165,7 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+    args = parse_and_validate_args(extra_args_provider=add_multimodal_args, args_defaults={})
     if args.pipeline_model_parallel_size > 1 and not args.use_packed_sequence:
         # The BSHD collate pads to --seq-length and rounds *up* to the CP/SP
         # alignment factor, while the pipeline scheduler sizes its static P2P
@@ -187,9 +174,7 @@ if __name__ == "__main__":
         # cross-stage send.  The packed/THD path is exempt: it sets
         # ``variable_seq_lengths`` and negotiates shapes instead.
         alignment = seqlen_alignment_factor(
-            args.tensor_model_parallel_size,
-            args.context_parallel_size,
-            args.sequence_parallel,
+            args.tensor_model_parallel_size, args.context_parallel_size, args.sequence_parallel
         )
         if args.seq_length % alignment != 0:
             raise ValueError(
@@ -199,6 +184,7 @@ if __name__ == "__main__":
                 f"activation length would not match them."
             )
     full_config = pretrain_cfg_container_from_args(args)
+    set_run_config(full_config)
     # training.py enables allocator history only on the config-container MODEL
     # flow; this entry uses model_provider, so it enables recording itself, and
     # must stay ahead of pretrain(), which constructs the model.

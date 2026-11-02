@@ -7,6 +7,37 @@ import pytest
 import torch
 
 
+def test_per_layer_config_copies_share_a_registry_before_first_warmup():
+    from copy import deepcopy
+    from dataclasses import asdict
+
+    from megatron.core.models.hybrid.layers.utils import create_layer_config
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        _shared_compact_indexer_workspace_store,
+    )
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=4,
+        dsa_compact_indexer_workspace_sharing=True,
+    )
+    layers = [create_layer_config(config, symbol) for symbol in "DCHW"]
+    assert len({id(layer) for layer in layers}) == 4
+    layers[1].hidden_size = 256
+    assert config.hidden_size == layers[0].hidden_size == layers[2].hidden_size == 128
+    device = torch.device("cuda", 0)
+    first = _shared_compact_indexer_workspace_store(layers[0], device)
+    assert all(_shared_compact_indexer_workspace_store(layer, device) is first for layer in layers)
+    assert _shared_compact_indexer_workspace_store(deepcopy(layers[0]), device) is first
+    assert _shared_compact_indexer_workspace_store(config, torch.device("cuda", 1)) is not first
+    assert "_compact_indexer_workspace_stores" not in asdict(config)
+    other = MLATransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert _shared_compact_indexer_workspace_store(other, device) is not first
+
+
+@pytest.mark.launch_on_gb200
 class TestCompactIndexerWorkspaceSharingKernels:
     """Real compact-indexer kernels: two layers dispatched through one shared workspace must produce
     exactly what each produces through its own workspace (stale content from the other layer must
@@ -20,7 +51,7 @@ class TestCompactIndexerWorkspaceSharingKernels:
             fused_sparse_attention as dk,
         )
         from tests.unit_tests.transformer.experimental_attention_variant import (
-            test_csa_fused_sparse_attention as fsa_tests,
+            test_csa_fused_sparse_attention_dev as fsa_tests,
         )
 
         fsa_tests._skip_if_real_kernels_unavailable()

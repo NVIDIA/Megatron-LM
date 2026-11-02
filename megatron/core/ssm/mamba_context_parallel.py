@@ -59,6 +59,7 @@ class MambaContextParallel:
             The A_log parameter which would be used on this tp rank if cp_size was 1
         D_cp1 (torch.Tensor): The D parameter which would be used on this tp rank if cp_size was 1
         D_has_hdim (bool): D parameter is sized to hidden dimension, rather than being per-head
+        sequence_is_contiguous (bool): Whether CP ranks already hold contiguous causal intervals.
     """
 
     def __init__(
@@ -75,6 +76,7 @@ class MambaContextParallel:
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        sequence_is_contiguous: bool = False,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required by the Mamba model but cannot be imported")
@@ -91,6 +93,7 @@ class MambaContextParallel:
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self.sequence_is_contiguous = sequence_is_contiguous
 
         self._set_cp_params()
 
@@ -201,8 +204,8 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
         output = torch.cat([z, x, B, C, dt], dim=-1)
-        # TODO(duncan): for hybrid models, consider isolating load-balancing to attention layers
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
+        if not self.sequence_is_contiguous:
+            output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
@@ -212,11 +215,9 @@ class MambaContextParallel:
         """Method to be applied after the convolution and SSM"""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-                self.cp_group,
-            )
+        if not self.sequence_is_contiguous:
+            input_ = _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params)
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """

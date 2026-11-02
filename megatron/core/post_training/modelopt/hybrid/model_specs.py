@@ -247,6 +247,8 @@ def _get_hybrid_stack_local_spec(
                         enorm=Norm,
                         hnorm=Norm,
                         eh_proj=ColumnParallelLinear,
+                        e_proj=ColumnParallelLinear,
+                        h_proj=ColumnParallelLinear,
                         mtp_model_layer=None,
                         layer_norm=Norm,
                     ),

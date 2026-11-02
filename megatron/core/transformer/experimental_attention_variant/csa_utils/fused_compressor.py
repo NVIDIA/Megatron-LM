@@ -25,9 +25,9 @@ zero-init) instead of ~40 forward / ~50 backward eager launches. CP pre-grouped 
 reuse the same API with local token/group prefixes emitted by their compaction kernel;
 static-capacity halo and padding rows remain noncanonical and their output gradients are
 ignored by the frontend contract.
-Numerics are fp32 with a single final bf16 rounding: not
-bit-identical to the eager region (which rounds the softmax weights to bf16 and
-multiplies in bf16) but at least as accurate against an fp64 oracle; forward, ``dKV``
+Numerics use fp32 intermediates with a single final bf16 rounding, matching the
+common eager pooling contract. The historical eager region rounded softmax weights
+and products to bf16 before accumulation. Forward, ``dKV``
 and ``dScore`` are bitwise run-to-run deterministic, ``dAPE`` is accumulated with fp32
 atomics and is not — the dispatch therefore keeps the eager path under
 ``torch.use_deterministic_algorithms(True)``. The two ratio families carry different
@@ -35,9 +35,9 @@ contracts against that fp32-intermediate eager reference: at ``compress_ratio ==
 ``dKV``/``dScore`` are bit-identical to it, while at ``compress_ratio == 128`` they are
 faithful within the r128 gate tolerances (differing elements <= max(1, 0.1%), max_abs
 <= 1.6e-2 on the frontend gate's documented input distribution). Keeping the softmax
-weights in fp32 also makes the fused output measurably closer to an fp64 oracle than the
-region it replaces: on a 4096-token pack the fused forward's max absolute error against
-that oracle is 1.4-2.6x smaller than the eager region's across ``compress_ratio in
+weights in fp32 made the fused output measurably closer to an fp64 oracle than the
+historical eager region: on a 4096-token pack the fused forward's max absolute error against
+that oracle was 1.4-2.6x smaller than the historical region's across ``compress_ratio in
 {4, 128}`` x ``coff in {1, 2}`` x ``head_dim in {128, 512}``, and matches an
 fp32-intermediate eager reference (what remains is the single final bf16 rounding).
 Measurements and numerics analysis: cudnn-frontend PR #427 and

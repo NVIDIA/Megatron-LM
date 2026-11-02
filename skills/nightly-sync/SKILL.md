@@ -1,7 +1,6 @@
 ---
 name: nightly-sync
-description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues.
-when_to_use: Working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
+description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues. Use when working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
 ---
 
 # Nightly Sync: Main to Dev
