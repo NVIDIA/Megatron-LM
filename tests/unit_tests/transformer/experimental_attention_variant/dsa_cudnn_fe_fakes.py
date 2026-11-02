@@ -12,6 +12,10 @@ the kernels' arithmetic order:
 * ``Fe131DSA`` mirrors cuDNN frontend 1.31.0: no ``q_causal_offsets`` means a zero
   (top-left) offset, the wrapper accepts ``precision='mxfp8'`` with packed E8M0 scales,
   and the buffer is prefilled with ``-inf``.
+* ``Fe131DSA.sparse_indexer_score_recompute_wrapper`` is a torch reference of the FE
+  sparse indexer score recompute: FP32 ``softmax`` over the selected keys of
+  ``sum_h relu(q_h . k) * w_h`` from BF16 inputs, slots with a negative index masked (or
+  past ``topk_length`` when given), top-k a multiple of 128; calls are recorded.
 * ``Fe131CleanLogitsDSA`` adds the proposed ``clean_logits`` switch. With
   ``clean_logits=False`` the buffer starts as ``poison`` (NaN by default) and only the
   causal prefix ``[0, causal_len)`` of every covered row is written, as the FE 1.31
@@ -22,6 +26,8 @@ out-of-bounds-lane guard that cuDNN frontend 1.29 added to the varlen radix top-
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 
@@ -162,15 +168,84 @@ class BottomRightDefaultDSA:
     indexer_top_k_wrapper = staticmethod(indexer_top_k_wrapper)
 
 
+def sparse_indexer_score_recompute(
+    q_indexer,
+    k_indexer,
+    weights,
+    topk_indices,
+    *,
+    qhead_per_kv_head=None,
+    topk_length=None,
+    topk_indices_global=False,
+):
+    """Torch reference of ``sparse_indexer_score_recompute_wrapper`` (``"predict"``)."""
+    assert q_indexer.dtype == torch.bfloat16 and k_indexer.dtype == torch.bfloat16
+    assert weights.dtype == torch.bfloat16 and topk_indices.dtype == torch.int32
+    assert q_indexer.ndim == 4 and k_indexer.ndim == 3 and topk_indices.ndim == 3
+    batch, rows, heads, _dim = q_indexer.shape
+    keys = k_indexer.size(1)
+    assert qhead_per_kv_head in (None, heads)
+    assert topk_indices.size(-1) % 128 == 0, "topk must be a multiple of n_block_size (128)"
+    indices = topk_indices.long()
+    if topk_indices_global:
+        indices = indices - torch.arange(batch).view(batch, 1, 1) * keys
+    valid = indices >= 0
+    if topk_length is not None:
+        valid = torch.arange(indices.size(-1)).view(1, 1, -1) < topk_length.view(batch, rows, 1)
+    safe = indices.clamp(min=0, max=keys - 1)
+    selected_k = torch.stack([k_indexer[b].float()[safe[b]] for b in range(batch)])
+    logits = torch.einsum("bqhd,bqkd->bqhk", q_indexer.float(), selected_k).relu()
+    logits = (logits * weights.float().unsqueeze(-1)).sum(dim=2)
+    masked = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+    predict = torch.softmax(masked, dim=-1)
+    return {"predict": torch.where(valid, predict, torch.zeros_like(predict))}
+
+
 class Fe131DSA:
     """cuDNN frontend 1.31.0: top-left default offset, MXFP8 dense scorer, prefilled."""
 
     calls: list = []
+    recompute_calls: list = []
     poison: float = float("nan")
 
     @classmethod
     def reset(cls):
         cls.calls = []
+        cls.recompute_calls = []
+
+    @classmethod
+    def sparse_indexer_score_recompute_wrapper(
+        cls,
+        q_indexer,
+        k_indexer,
+        weights,
+        topk_indices,
+        qhead_per_kv_head=None,
+        topk_length=None,
+        topk_indices_global=False,
+        out=None,
+        stream=None,
+    ):
+        cls.recompute_calls.append(
+            dict(
+                q=q_indexer,
+                k=k_indexer,
+                w=weights,
+                topk_indices=topk_indices,
+                qhead_per_kv_head=qhead_per_kv_head,
+                topk_length=topk_length,
+                topk_indices_global=topk_indices_global,
+            )
+        )
+        return sparse_indexer_score_recompute(
+            q_indexer,
+            k_indexer,
+            weights,
+            topk_indices,
+            qhead_per_kv_head=qhead_per_kv_head,
+            topk_length=topk_length,
+            topk_indices_global=topk_indices_global,
+        )
 
     @classmethod
     def _run(cls, q, k, w, *, fill_value, kwargs):
@@ -308,3 +383,65 @@ class Fe131CleanLogitsDSA(Fe131DSA):
         )
         fill_value = float("-inf") if clean_logits else cls.poison
         return {"scores": cls._run(q, k, w, fill_value=fill_value, kwargs=kwargs)}
+
+
+def fake_quantize_indexer_mxfp8(
+    x: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_scale_padded: Optional[torch.Tensor] = None,
+    buffers=None,
+    out_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    calls: Optional[list] = None,
+):
+    """Stand-in for ``quantize_indexer_mxfp8``: E4M3 data, caller-owned scale storage."""
+    del buffers
+    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    assert sf_vec_size == 32
+    assert out_scale is not None, "the DSA scorer must pass static scale storage"
+    if calls is not None:
+        calls.append(
+            dict(
+                shape=tuple(x.shape),
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_scale_padded=cu_seqlens_scale_padded,
+                out_scale_shape=tuple(out_scale.shape),
+            )
+        )
+    return x.to(torch.float8_e4m3fn), out_scale
+
+
+def packed_zigzag_layout(seq_lens, cp_size, cp_rank, max_num_seqs=None, device="cpu"):
+    """Local rows, key bounds and padded cu_seqlens of a zigzag-CP packed THD batch.
+
+    Returns ``(starts, ends, cu_seqlens, max_seqlen)``: ``starts``/``ends`` are global
+    packed key bounds of this CP rank's local query rows (front then back chunk of each
+    sequence), and ``cu_seqlens`` is the global packed boundary table, padded to
+    ``max_num_seqs + 1`` entries when given, as static CUDA-graph inputs are.
+    """
+    divisor = 2 * cp_size if cp_size > 1 else 1
+    assert all(length % divisor == 0 for length in seq_lens)
+    cu = [0]
+    for length in seq_lens:
+        cu.append(cu[-1] + length)
+    if max_num_seqs is not None:
+        cu += [cu[-1]] * (max_num_seqs + 1 - len(cu))
+    starts, ends = [], []
+    for seq, length in enumerate(seq_lens):
+        if cp_size == 1:
+            positions = list(range(length))
+        else:
+            half = length // divisor
+            positions = list(range(cp_rank * half, (cp_rank + 1) * half)) + list(
+                range((divisor - 1 - cp_rank) * half, (divisor - cp_rank) * half)
+            )
+        for position in positions:
+            starts.append(cu[seq])
+            ends.append(cu[seq] + position + 1)
+    return (
+        torch.tensor(starts, dtype=torch.int64, device=device),
+        torch.tensor(ends, dtype=torch.int64, device=device),
+        torch.tensor(cu, dtype=torch.int32, device=device),
+        max(seq_lens),
+    )
