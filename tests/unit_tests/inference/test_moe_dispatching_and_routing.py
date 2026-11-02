@@ -303,6 +303,49 @@ class TestInferenceTopKRouter:
         assert torch.equal(inference_map, training_map)
         torch.testing.assert_close(probs, training_probs.gather(1, top_indices))
 
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["compiled", "eager"])
+    @pytest.mark.parametrize(
+        "topk,score_function,pre_softmax",
+        [(1, "softmax", False), (2, "softmax", False), (2, "sigmoid", False), (2, "softmax", True)],
+        ids=["top1", "top2-softmax", "top2-sigmoid", "top2-pre-softmax"],
+    )
+    def test_sinkhorn_routing_matches_eval_routing(
+        self, monkeypatch, topk, score_function, pre_softmax, batch_invariant
+    ):
+        """Sinkhorn routing weights the selected experts by sigmoid (top-1) or the full softmax
+        (top-k > 1), whatever the score function, without renormalization or scaling: the
+        routing of TopKRouter in eval mode."""
+        import megatron.core.transformer.moe.router as router_module
+
+        monkeypatch.setattr(
+            router_module, "is_batch_invariant_mode_enabled", lambda: batch_invariant
+        )
+        router = self._make_router(
+            moe_router_load_balancing_type="sinkhorn",
+            moe_aux_loss_coeff=0.0,
+            moe_router_topk=topk,
+            moe_router_score_function=score_function,
+            moe_router_pre_softmax=pre_softmax,
+            moe_router_enable_expert_bias=False,
+        ).eval()
+        num_tokens = 16
+        hidden = torch.randn(
+            num_tokens, 1, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            eval_probs, eval_map = router(hidden)
+            logits = router.gating(hidden).view(num_tokens, -1)
+        with torch.inference_mode(), InferenceMode.active():
+            probs, top_indices = router(hidden)
+
+        assert probs.shape == top_indices.shape == (num_tokens, topk)
+        assert probs.dtype == torch.float32 and top_indices.dtype == torch.int64
+        inference_map = torch.zeros_like(eval_map).scatter(1, top_indices, True)
+        assert torch.equal(inference_map, eval_map)
+        activation = torch.sigmoid(logits) if topk == 1 else torch.softmax(logits, dim=-1)
+        torch.testing.assert_close(probs, activation.gather(1, top_indices))
+        torch.testing.assert_close(probs, eval_probs.gather(1, top_indices), rtol=0, atol=0)
+
     @requires_te_fused_router
     def test_fusion_without_dense_te_indices_warns_and_routes_unfused(self, monkeypatch):
         """A TE fused router that cannot write dense indices cannot serve inference routing:

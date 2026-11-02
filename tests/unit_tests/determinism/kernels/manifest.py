@@ -367,7 +367,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing; "
+        "InferenceTopKRouter's sinkhorn routing replays under InferenceMode.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",

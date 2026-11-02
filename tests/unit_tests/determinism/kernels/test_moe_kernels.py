@@ -1075,6 +1075,50 @@ class TestMoEModules:
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
 
+    @pytest.mark.parametrize("topk", [1, 4])
+    def test_inference_topk_router_sinkhorn_replays(self, topk):
+        """InferenceTopKRouter's sinkhorn routing (eval semantics: sigmoid for top-1, the full
+        softmax otherwise) under InferenceMode."""
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.transformer.moe.router import InferenceTopKRouter
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=topk,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_aux_loss_coeff=0.0,
+        )
+        router = (
+            InferenceTopKRouter(
+                config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
+            .cuda()
+            .eval()
+        )
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            probs, top_indices = _InInferenceMode(router)(hidden)
+            assert probs.shape == top_indices.shape == (8192, topk)
+            assert_module_replays_bit_exact(
+                _InInferenceMode(router),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"InferenceTopKRouter[sinkhorn, topk={topk}]",
+            )
+
     @pytest.mark.parametrize("accumulate", [True, False])
     def test_global_batch_quantile_router_replays(self, accumulate):
         """Include the router's nonpersistent histogram in the replay comparison."""

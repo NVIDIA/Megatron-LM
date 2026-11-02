@@ -401,6 +401,16 @@ class TopKRouter(Router):
             if self.qb_bin_bounds.dtype != torch.float32:
                 self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
+    def _sinkhorn_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        """Expert weights of sinkhorn routing: sigmoid for top-1, else softmax over experts.
+
+        Sinkhorn routing uses these whatever the score function, without renormalizing the
+        selected experts' weights.
+        """
+        if self.topk == 1:
+            return torch.sigmoid(logits)
+        return torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
 
@@ -411,14 +421,6 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
             probabilities and mask.
         """
-
-        def _sinkhorn_activation(logits):
-            if self.topk == 1:
-                logits = torch.sigmoid(logits)
-            else:  # k > 1
-                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            return logits
-
         assert self.config.moe_aux_loss_coeff == 0, "Sinkhorn routing does not support aux loss."
         if self.training:
             with torch.no_grad():
@@ -426,9 +428,9 @@ class TopKRouter(Router):
                     logits.to(dtype=torch.float32)
                 )  # explicit fp32 conversion for stability
                 _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
-            logits = _sinkhorn_activation(logits)
+            logits = self._sinkhorn_activation(logits)
         else:
-            logits = _sinkhorn_activation(logits)
+            logits = self._sinkhorn_activation(logits)
             _, indices = torch.topk(logits, k=self.topk, dim=1)
         map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
         scores = logits * map
@@ -1462,6 +1464,13 @@ class InferenceTopKRouter(TopKRouter):
                 "the model, transformer block, and transformer layer."
             )
             return self._hash_routing(logits, input_ids, dense_output=True)
+
+        if self.routing_type == "sinkhorn":
+            # Sinkhorn balances the expert selection only in training. As in eval-mode
+            # sinkhorn_load_balancing, route to the top-k experts of the sinkhorn activation,
+            # weighted by it.
+            probs, top_indices = torch.topk(self._sinkhorn_activation(logits), k=self.topk, dim=1)
+            return probs, top_indices
 
         # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
         # fixed additive bias through the normal score-function route.
