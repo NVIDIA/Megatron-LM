@@ -15,7 +15,6 @@
 """Planning examples, invalid inputs, branch-limit splits and seeded planning properties."""
 
 import itertools
-import math
 import pickle
 import random
 from collections import defaultdict
@@ -42,11 +41,7 @@ from megatron.rl.shared_prefix_execution import (
     plan_shared_prefix_execution_units,
     validate_shared_prefix_execution_units,
 )
-from megatron.rl.shared_prefix_metadata import (
-    get_prescribed_shared_prefix_slots,
-    plan_fixed_execution_slots,
-    plan_group_coherent_shards,
-)
+from megatron.rl.shared_prefix_metadata import plan_group_coherent_shards
 from megatron.rl.shared_prefix_packing import (
     MAX_SHARED_PREFIX_BRANCHES,
     SharedPrefixForestLayout,
@@ -78,8 +73,8 @@ from tests.unit_tests.rl.shared_prefix.shared_prefix_oracles import (
 _INTERLEAVED_STARS = ((0, 2, 4, 5), (2, 2, 1, 1), (-1, -1, 0, 1))
 WORKER_MODES = {
     "slots": dict(),
-    "forest": dict(pack_groups=True, repack_groups=True),
-    "forest_dense": dict(pack_groups=True, repack_groups=True, pack_dense_fallbacks=True),
+    "forest": dict(pack_groups=True),
+    "forest_dense": dict(pack_groups=True, pack_dense_fallbacks=True),
 }
 
 
@@ -96,23 +91,14 @@ def two_stars():
 
 def planned_star_unit() -> SharedPrefixExecutionUnit:
     """A three-row star planned through the public execution planner."""
-    kwargs = dict(row_slots=((0, 1, 2),), bin_capacity=16, padding_multiple=1)
+    kwargs = dict(bin_capacity=16, padding_multiple=1)
     (unit,) = plan_shared_prefix_execution_units(rows(3, group="a", completion=2), **kwargs)
     return unit
-
-
-def fixed_slots(group_ids, lengths, capacity, multiple=1, **kwargs):
-    kwargs |= dict(bin_capacity=capacity, sequence_length_pad_multiple=multiple)
-    return plan_fixed_execution_slots(group_ids=list(group_ids), sequence_lengths=lengths, **kwargs)
 
 
 def shards(group_ids, lengths, num_shards, **kwargs):
     kwargs |= dict(sequence_lengths=lengths, num_shards=num_shards)
     return plan_group_coherent_shards(group_ids=list(group_ids), **kwargs)
-
-
-def prescribed_slots(group_ids, slot_ids):
-    return get_prescribed_shared_prefix_slots(group_ids=tuple(group_ids), slot_ids=slot_ids)
 
 
 def estimate(group_ids, lengths, prompts, **kwargs):
@@ -158,21 +144,8 @@ def check_units(units, costs, *, capacity, multiple, expanded_budget=True):
     validate_shared_prefix_execution_units(tuple(units), batch_size=len(costs))
 
 
-def check_slot_plan(slot_plan, group_ids, lengths, *, capacity, multiple, chunk_size):
-    """Every group has K nonempty, in-budget slots of at most the branch limit."""
-    for chunk, slots_per_group in enumerate(slot_plan.units_per_group_by_chunk):
-        members = defaultdict(lambda: defaultdict(list))
-        for row in range(chunk * chunk_size, (chunk + 1) * chunk_size):
-            members[group_ids[row]][slot_plan.row_slot_ids[row]].append(row)
-        for slots in members.values():
-            assert sorted(slots) == list(range(slots_per_group))
-            for slot_rows in slots.values():
-                assert len(slot_rows) <= MAX_SHARED_PREFIX_BRANCHES
-                assert sum(_round_up(lengths[row], multiple) for row in slot_rows) <= capacity
-
-
-def slot_work(lengths, prefixes, *, physical_weight=4, expanded_weight=1):
-    """Executed work of one slot: one prompt copy when its rows can share."""
+def group_work(lengths, prefixes, *, physical_weight=4, expanded_weight=1):
+    """Estimated work of one group: one prompt copy when its rows can share."""
     expanded = sum(lengths)
     shares = len(lengths) > 1 and len(set(prefixes)) == 1
     backbone = expanded - (len(lengths) - 1) * prefixes[0] if shares else expanded
@@ -219,8 +192,7 @@ def _forest(order, *args):
 
 def _evaluation_vs_training_budget():
     plan_rows = rows(4, group="group", prompt=tuple(range(8)), completion=2)
-    kwargs = dict(row_slots=((0, 1), (2, 3)), bin_capacity=20, padding_multiple=1)
-    kwargs |= dict(pack_groups=True, repack_groups=True, evaluation_packing=True)
+    kwargs = dict(bin_capacity=20, padding_multiple=1, pack_groups=True, evaluation_packing=True)
     train = plan_shared_prefix_execution_units(plan_rows, **kwargs)
     evaluation = plan_shared_prefix_execution_units(plan_rows, forward_only=True, **kwargs)
     return {"train": _summary(train), "evaluation": _summary(evaluation)}
@@ -229,7 +201,7 @@ def _evaluation_vs_training_budget():
 def _mismatch_and_singleton_units():
     plan_rows = [row(0, group="a", prompt=(1, 2)), row(1, group="a", prompt=(1, 3))]
     plan_rows.append(row(2, group="b", prompt=(5, 6)))
-    kwargs = dict(row_slots=((0, 1), (2,)), bin_capacity=8, padding_multiple=4)
+    kwargs = dict(bin_capacity=8, padding_multiple=4)
     plan = SharedPrefixExecutionPlan(plan_shared_prefix_execution_units(plan_rows, **kwargs))
     pickled = pickle.loads(pickle.dumps(plan))
     return {"units": _summary(plan.units), "pickled": pickled, "round_trip": pickled == plan}
@@ -240,12 +212,52 @@ def _merged_dense_fallbacks(capacity):
     specs = [(0, "a", (1, 2), 2), (1, "a", (1, 2), 2), (2, None, (5, 6), 2)]
     specs += [(3, "b", (7, 8), 1), (4, "b", (7, 9), 1)]
     merge_rows = [SharedPrefixRow(*spec) for spec in specs]
-    kwargs = dict(row_slots=((0, 1), (2,), (3, 4)), bin_capacity=capacity, padding_multiple=1)
+    kwargs = dict(bin_capacity=capacity, padding_multiple=1)
     kwargs |= dict(pack_groups=True, pack_dense_fallbacks=True, merge_dense_fallbacks=True)
     kwargs["dense_packer"] = lambda costs: [[0], [1, 2]]
     units = plan_shared_prefix_execution_units(merge_rows, **kwargs)
     costs = [merge_row.total_length for merge_row in merge_rows]
     return {"units": _summary(units), "expanded": [expanded_length(u, costs) for u in units]}
+
+
+def _worker_modes(plan_rows, capacity, **kwargs):
+    """Plan ``plan_rows`` in every worker mode, with a first-fit-decreasing dense packer."""
+    kwargs |= dict(bin_capacity=capacity, dense_packer=first_fit_decreasing(capacity))
+    return {
+        mode: _summary(plan_shared_prefix_execution_units(plan_rows, **kwargs, **options))
+        for mode, options in WORKER_MODES.items()
+    }
+
+
+def _ungrouped_rows():
+    """Rows 0-1 share group ``a``'s prompt; rows 2 and 3 have no group ID."""
+    plan_rows = [row(0, group="a"), row(1, group="a"), row(2, group=None), row(3, group=None)]
+    return _worker_modes(plan_rows, 16, padding_multiple=1)
+
+
+def _largest_first():
+    """Stars ``a`` (4 tokens) and ``b`` (14) plus an ungrouped 8-token row."""
+    plan_rows = [SharedPrefixRow(i, "a", (1, 2), 1) for i in (0, 1)]
+    plan_rows += [SharedPrefixRow(i, "b", tuple(range(6)), 4) for i in (2, 3)]
+    plan_rows.append(SharedPrefixRow(4, None, (9,), 7))
+    return _worker_modes(plan_rows, 20, padding_multiple=1, largest_first=True)
+
+
+def _odd_row(siblings, odd, *, prompt, completion, multiple, capacity):
+    """``siblings`` rows of group ``g`` share ``prompt``; the next row of ``g`` is ``odd``."""
+    plan_rows = rows(siblings, group="g", prompt=prompt, completion=completion)
+    plan_rows.append(SharedPrefixRow(siblings, "g", *odd))
+    return _worker_modes(plan_rows, capacity, padding_multiple=multiple)
+
+
+def _placeholder_dense_bin(placeholder):
+    """One aligned dense bin: 15 siblings with 100-token prompts, optionally a placeholder."""
+    plan_rows = rows(15, group="g", prompt=tuple(range(1, 101)), completion=20)
+    plan_rows += [SharedPrefixRow(15, "g", (), 1)] if placeholder else []
+    costs = [_round_up(plan_row.total_length, 16) for plan_row in plan_rows]
+    dense = (SharedPrefixExecutionUnit(tuple(range(len(plan_rows))), None, sum(costs)),)
+    kwargs = dict(costs=costs, padding_multiple=16, bin_capacity=4096)
+    return _summary(share_prefixes_in_dense_training_bins(plan_rows, dense, **kwargs))
 
 
 def _packer_called_twice():
@@ -281,14 +293,9 @@ def _physical_alignment():
 def _ppo_singleton_groups():
     """PPO may sample one answer per prompt; no row may disappear."""
     group_ids, lengths = [f"ppo:{index}" for index in range(4)], [9, 8, 2, 1]
-    return [fixed_slots(group_ids, lengths, 12, 4), shards(group_ids, lengths, 2)]
-
-
-def _equalized_slots():
-    group_ids, lengths = ["large"] * 4 + ["small"] * 4, [6] * 4 + [4] * 4
-    plan = fixed_slots(group_ids, lengths, 10)
-    check_slot_plan(plan, group_ids, lengths, capacity=10, multiple=1, chunk_size=8)
-    return plan
+    ppo_rows = [SharedPrefixRow(i, group_ids[i], (1,), n - 1) for i, n in enumerate(lengths)]
+    units = plan_shared_prefix_execution_units(ppo_rows, bin_capacity=12, padding_multiple=4)
+    return [_summary(units), shards(group_ids, lengths, 2)]
 
 
 def _clean_group_work():
@@ -325,7 +332,7 @@ def _concatenated_trees():
 
 def _root_only_star_roots():
     trees = (PackedTreeLayout.from_shared_prefix(2, (1, 2)), PackedTreeLayout((0,), (3,), (-1,)))
-    return tuple(PackedTreeLayout.concat(trees).iter_star_roots())
+    return PackedTreeLayout.concat(trees).iter_star_roots()
 
 
 PLANNING_EXAMPLES = {
@@ -438,6 +445,60 @@ PLANNING_EXAMPLES = {
         lambda: _merged_dense_fallbacks(12),
         {"units": [((2,), "dense", 4), ((3, 4), "dense", 6), ((0, 1), "star", 6)]},
     ),
+    # Rows without a group ID are independent dense rows, however many there are.
+    "execution-ungrouped-rows": (
+        _ungrouped_rows,
+        {
+            "slots": [((0, 1), "star", 7), ((2,), "dense", 5), ((3,), "dense", 5)],
+            "forest": [((2,), "dense", 5), ((3,), "dense", 5), ((0, 1), "star", 7)],
+            "forest_dense": [((2, 3), "dense", 10), ((0, 1), "star", 7)],
+        },
+    ),
+    # Every mode returns stars, forests and dense units by nonincreasing physical length.
+    "execution-largest-first": (
+        _largest_first,
+        {
+            mode: [((2, 3), "star", 14), ((4,), "dense", 8), ((0, 1), "star", 4)]
+            for mode in WORKER_MODES
+        },
+    ),
+    # One odd row in a slot: with group packing the other rows still share and only the odd
+    # row runs dense; without it the slot stays one forward and runs dense.
+    "execution-partial-star-prompt-mismatch": (
+        lambda: _odd_row(
+            7, ((1, 2, 4), 2), prompt=(1, 2, 3), completion=2, multiple=1, capacity=40
+        ),
+        {
+            "slots": [(tuple(range(8)), "dense", 40)],
+            "forest, forest_dense": ([((7,), "dense", 5), (tuple(range(7)), "star", 17)],) * 2,
+        },
+    ),
+    "execution-partial-star-empty-placeholder": (
+        lambda: _odd_row(7, ((), 1), prompt=(1, 2, 3), completion=2, multiple=1, capacity=40),
+        {
+            "slots": [(tuple(range(8)), "dense", 36)],
+            "forest, forest_dense": ([((7,), "dense", 1), (tuple(range(7)), "star", 17)],) * 2,
+        },
+    ),
+    # A NeMo-RL reassembler placeholder (prompt length 0, one pad token) next to 15 siblings
+    # with 100-token prompts at padding multiple 16: a 520-token star plus a 16-token
+    # placeholder instead of 1936 dense tokens.
+    "execution-partial-star-nemo-rl-placeholder": (
+        lambda: _odd_row(
+            15, ((), 1), prompt=tuple(range(1, 101)), completion=20, multiple=16, capacity=4096
+        ),
+        {
+            "slots": [(tuple(range(16)), "dense", 1936)],
+            "forest, forest_dense": ([((15,), "dense", 16), (tuple(range(15)), "star", 520)],) * 2,
+        },
+    ),
+    # An aligned dense bin is one forward, and a reassembler placeholder (prompt length 0, one
+    # pad token) cannot be a forest root, so the bin that holds it stays dense: 1936 tokens
+    # instead of the 520-token root its 15 siblings form alone.
+    "dense-bins-placeholder-keeps-bin-dense": (
+        lambda: [_placeholder_dense_bin(placeholder) for placeholder in (True, False)],
+        {"0": [(tuple(range(16)), "dense", 1936)], "1": [(tuple(range(15)), (1,), 520)]},
+    ),
     # Called twice to enforce determinism.
     "dense-bins-packer-called-twice": (
         _packer_called_twice,
@@ -475,14 +536,10 @@ PLANNING_EXAMPLES = {
         _physical_alignment,
         {"units": [((0, 1), "star", 12), ((2, 3), "star", 12)], "rebuilt_units": 2},
     ),
-    "metadata-prescribed-slots-order": (
-        lambda: prescribed_slots("abab", (0, 0, 1, 1)),
-        ((0,), (1,), (2,), (3,)),
-    ),
     "metadata-ppo-singleton-groups": (
         _ppo_singleton_groups,
         {
-            "0.row_slot_ids, 0.units_per_group_by_chunk": ((0, 0, 0, 0), (1,)),
+            "0": [((0,), "dense", 12), ((1,), "dense", 8), ((2,), "dense", 4), ((3,), "dense", 4)],
             "1.shard_indices, 1.rank_order_permutation": (((0, 3), (1, 2)), (0, 3, 1, 2)),
         },
     ),
@@ -492,11 +549,6 @@ PLANNING_EXAMPLES = {
             "shard_indices": ((0, 1, 6, 7), (2, 3, 4, 5)),
             "rank_order_permutation": (0, 1, 6, 7, 2, 3, 4, 5),
         },
-    ),
-    "metadata-slots-equalize-real-units": (_equalized_slots, {"units_per_group_by_chunk": (4,)}),
-    "metadata-slots-per-global-batch": (
-        lambda: fixed_slots("aabbccdd", [6, 6, 6, 6, 4, 4, 4, 4], 10, batch_size=4),
-        {"units_per_group_by_chunk, row_slot_ids": ((2, 1), (0, 1, 0, 1, 0, 0, 0, 0))},
     ),
     "metadata-shards-keep-batch-boundaries": (
         lambda: shards("aabbccdd", [9, 9, 8, 8, 2, 2, 1, 1], 2, batch_size=4),
@@ -510,7 +562,7 @@ PLANNING_EXAMPLES = {
         _clean_group_work,
         {
             "work": [42, 62, 28, 78],
-            "group_sums": [2 * slot_work([5, 7], [2, 2]), 2 * slot_work([4, 9], [3, 3])],
+            "group_sums": [2 * group_work([5, 7], [2, 2]), 2 * group_work([4, 9], [3, 3])],
         },
     ),
     "cost-prompt-mismatch-is-dense": (
@@ -566,7 +618,6 @@ def test_planning_examples(build, expected):
 # so ``-k tree-`` selects one area. Calls are lambdas or partials: nothing runs at collection.
 
 _BATCH = dict(input_ids=[[2, 3, 4, 5], [2, 3, 6, 7]], lengths=[4, 4], prompts=[2, 2])
-_pad_slots = partial(fixed_slots, "aa", (3, 4), 16)
 
 
 def _pair(**second):
@@ -598,10 +649,10 @@ def _validate_star(**changes):
     validate_shared_prefix_execution_units((replace(unit, **changes),), batch_size=3)
 
 
-def _slots(row_slots, plan_rows=None, **kwargs):
-    """Plan ``plan_rows`` (default: one two-row group) into prescribed slots of 8 tokens."""
+def _execution(plan_rows=None, **kwargs):
+    """Plan ``plan_rows`` (default: one two-row group) into forwards of 8 tokens."""
     plan_rows = plan_rows or rows(2, group="a", prompt=(1, 2), completion=2)
-    kwargs |= dict(row_slots=row_slots, bin_capacity=8, padding_multiple=1)
+    kwargs = dict(bin_capacity=8, padding_multiple=1) | kwargs
     return plan_shared_prefix_execution_units(plan_rows, **kwargs)
 
 
@@ -609,7 +660,7 @@ def _dense_singletons(count, completion, bins):
     """``count`` single-row groups through group packing and a dense packer returning ``bins``."""
     singletons = [row(i, group=str(i), prompt=(1, 2), completion=completion) for i in range(count)]
     options = dict(pack_groups=True, pack_dense_fallbacks=True, dense_packer=lambda costs: bins)
-    return _slots(tuple((i,) for i in range(count)), singletons, **options)
+    return _execution(singletons, **options)
 
 
 def _unstable_dense_bins():
@@ -706,18 +757,43 @@ ALIGNMENT = [
 
 COST = [
     ("unequal-groups", lambda: _estimate(group_ids="aab"), "equal-size"),
-    ("slot-count", lambda: _estimate(row_slot_ids=[0]), "one entry per row"),
-    ("slot-negative", lambda: _estimate(row_slot_ids=[0, -1, 0]), "nonnegative integers"),
     ("empty-group-id", lambda: _estimate(group_ids=["a", "", "a"]), "prompt-group identity"),
 ]
 
 EXECUTION = [
     ("validate-reordered-rows", lambda: _validate_star(row_indices=(2, 0, 1)), "in layout order"),
     ("validate-padded-length", lambda: _validate_star(physical_length=13), "length must equal"),
-    ("slots-lost", lambda: _slots(((0,),)), "every source row exactly once"),
-    ("slots-duplicated", lambda: _slots(((0, 0),)), "every source row exactly once"),
-    ("slots-empty", lambda: _slots(((0, 1), ())), "every source row exactly once"),
-    ("slots-unknown", lambda: _slots(((0, 2),)), "every source row exactly once"),
+    ("duplicate-row", lambda: _execution([row(0), row(0)]), "unique source row indices"),
+    ("branch-limit-one", lambda: _execution(max_completions_per_bin=1), "at least 2"),
+    # Flags are checked before any row, so these raise even for a batch that plans as one star.
+    (
+        "evaluation-without-group-packing",
+        lambda: _execution(evaluation_packing=True),
+        "pack_groups",
+    ),
+    (
+        "dense-repacking-without-groups",
+        lambda: _execution(pack_dense_fallbacks=True),
+        "pack_groups",
+    ),
+    (
+        "dense-repacking-without-packer",
+        lambda: _execution(pack_groups=True, pack_dense_fallbacks=True),
+        "length-only packer",
+    ),
+    (
+        "merge-without-dense-repacking",
+        lambda: _execution(pack_groups=True, merge_dense_fallbacks=True),
+        "pack_dense_fallbacks",
+    ),
+    # A 3-token prompt plus 7 completion tokens exceeds the 8-token budget, in a group or alone.
+    ("row-over-capacity", lambda: _execution([row(0, completion=7)]), "execution bin"),
+    (
+        "group-row-over-capacity",
+        lambda: _execution([row(0), row(1, completion=7)]),
+        "execution bin",
+    ),
+    ("row-empty", lambda: _execution([row(0), row(1, prompt=(), completion=0)]), "positive"),
     ("dense-packer-drops-row", lambda: _dense_singletons(2, 2, [[0]]), "every source row exactly"),
     ("dense-packer-over-budget", lambda: _dense_singletons(4, 6, [[0, 1, 2, 3]]), "token budget"),
 ]
@@ -725,13 +801,6 @@ EXECUTION = [
 DENSE_BINS = [("unstable-packer", _unstable_dense_bins, "deterministic")]
 
 METADATA = [
-    ("prescribed-slots-uneven", lambda: prescribed_slots("aab", (0, 1, 0)), "same number"),
-    ("slots-singleton-over-capacity", lambda: fixed_slots(["ppo:0"], [9], 10, 4), "execution bin"),
-    ("slots-pad-none", lambda: _pad_slots(None), "pad_multiple must be a positive integer"),
-    ("slots-pad-zero", lambda: _pad_slots(0), "pad_multiple must be a positive integer"),
-    ("slots-pad-float", lambda: _pad_slots(2.0), "pad_multiple must be a positive integer"),
-    ("slots-pad-bool", lambda: _pad_slots(True), "pad_multiple must be a positive integer"),
-    ("slots-padded-rows-over-capacity", lambda: fixed_slots("aa", (9, 8), 10, 4), "execution bin"),
     ("shards-group-crosses-batch", lambda: shards("abab", [1] * 4, 1, batch_size=2), "not cross"),
     ("shards-unequal-groups", lambda: shards("aab", [1] * 3, 1), "equal-size"),
     ("shards-non-integral", lambda: shards("aabbcc", [1] * 6, 2), "integral number"),
@@ -807,19 +876,19 @@ TREE = [
     ("node-query-float", lambda: nested_tree().path_token_indices(1.0), "node index"),
     (
         "star-lowering-nested",
-        lambda: tuple(nested_tree().iter_star_roots()),
+        lambda: nested_tree().iter_star_roots(),
         "forest of stars",
         NotImplementedError,
     ),
     (
         "star-lowering-interleaved",
-        lambda: tuple(PackedTreeLayout(*_INTERLEAVED_STARS).iter_star_roots()),
+        lambda: PackedTreeLayout(*_INTERLEAVED_STARS).iter_star_roots(),
         "contiguous star storage",
         NotImplementedError,
     ),
     (
         "star-lowering-padded-root",
-        lambda: tuple(PackedTreeLayout((0, 4), (4, 1), (-1, 0), (2, 1)).iter_star_roots()),
+        lambda: PackedTreeLayout((0, 4), (4, 1), (-1, 0), (2, 1)).iter_star_roots(),
         "unpadded prompt roots",
         NotImplementedError,
     ),
@@ -865,19 +934,11 @@ def _plan_shared_prefix_bins(count):
 
 
 def _execution_units(count, **kwargs):
-    kwargs |= dict(row_slots=(tuple(range(count)),), bin_capacity=4 * count, padding_multiple=1)
+    kwargs |= dict(bin_capacity=4 * count, padding_multiple=1)
     units = plan_shared_prefix_execution_units(rows(count), **kwargs)
     layouts = [unit.shared_layout for unit in units if unit.shared_layout is not None]
     sizes = tuple(len(root.row_indices) for layout in layouts for _, root in layout.iter_roots())
     return {"sizes": sizes, "rows": [i for unit in units for i in unit.row_indices], "units": units}
-
-
-def _fixed_execution_slots(count):
-    plan = fixed_slots("g" * count, [4] * count, 4 * count)
-    (slots,) = plan.units_per_group_by_chunk
-    sizes = tuple(plan.row_slot_ids.count(slot) for slot in range(slots))
-    rows_in_slots = [index for index, slot in enumerate(plan.row_slot_ids) if slot < slots]
-    return {"sizes": sizes, "rows": rows_in_slots, "groups": plan.units_per_group_by_chunk}
 
 
 def _dense_training_bins(count):
@@ -890,28 +951,32 @@ def _dense_training_bins(count):
     return {"sizes": sizes, "rows": list(unit.row_indices), "units": units, **observed}
 
 
-BRANCH_LIMIT_SIZES = {0: (), 3: (3,), 16: (16,), 17: (9, 8), 32: (16, 16), 33: (11, 11, 11)}
-_COUNTS = (3, 16, 17, 32, 33)
+BRANCH_LIMIT_SIZES = {
+    0: (),
+    3: (3,),
+    16: (16,),
+    17: (9, 8),
+    32: (16, 16),
+    33: (11, 11, 11),
+    # Sizes differ by at most one: not 13+13+13+10, and not fifteen 16-row stars plus one row.
+    49: (13, 12, 12, 12),
+    241: (16,) + (15,) * 15,
+}
+_COUNTS = (3, 16, 17, 32, 33, 49, 241)
 BRANCH_LIMIT_PLANNERS = {
     "split_rows_evenly": (_split_rows_evenly, (0, *_COUNTS)),
     "plan_shared_prefix_bins": (_plan_shared_prefix_bins, (0, *_COUNTS)),
-    "execution-slots": (partial(_execution_units, pack_groups=True), _COUNTS),
-    "execution-repack": (partial(_execution_units, pack_groups=True, repack_groups=True), _COUNTS),
-    "fixed-slots": (_fixed_execution_slots, _COUNTS),
+    # Without group packing, every local slot is one star forward.
+    "execution": (_execution_units, _COUNTS),
+    "execution-forest": (partial(_execution_units, pack_groups=True), _COUNTS),
     "dense-bins": (_dense_training_bins, _COUNTS),
-    # Without group packing, a slot past the branch limit warns and stays one dense forward.
-    "execution-unpacked": (_execution_units, _COUNTS),
-    # Raising the limit keeps the slot as one shared star.
-    "execution-unpacked-limit17": (partial(_execution_units, max_completions_per_bin=17), (17,)),
+    # Raising the limit keeps the group as one shared star.
+    "execution-limit17": (partial(_execution_units, max_completions_per_bin=17), (17,)),
 }
 
 
 def _branch_limit_case(planner, count):
-    sizes = BRANCH_LIMIT_SIZES[count]
-    if planner == "execution-unpacked-limit17":
-        sizes = (count,)
-    elif planner == "execution-unpacked" and count > MAX_SHARED_PREFIX_BRANCHES:
-        sizes = ()
+    sizes = (count,) if planner == "execution-limit17" else BRANCH_LIMIT_SIZES[count]
     return pytest.param(planner, count, sizes, id=f"{planner}-{count}")
 
 
@@ -923,23 +988,18 @@ def _branch_limit_case(planner, count):
         for count in counts
     ],
 )
-def test_branch_limit_splits_evenly(planner, count, sizes, recwarn):
+def test_branch_limit_splits_evenly(planner, count, sizes):
     """Every planner splits a group past the branch limit into near-equal shared chunks.
 
     Each planner reports what it can observe; every report is checked against the same
     expectation. A dense bin stores one 3-token prompt per root plus one token per completion.
     """
     result = BRANCH_LIMIT_PLANNERS[planner][0](count)
-    dense = planner == "execution-unpacked" and count > MAX_SHARED_PREFIX_BRANCHES
-    warned = [w.category for w in recwarn if "exceeds max_completions_per_bin=16" in str(w.message)]
-    assert warned == [UserWarning] * dense
     expected = dict(sizes=sizes, rows=list(range(count)), same=True, fallback=())
     expected |= dict(groups=(len(sizes),), length=3 * len(sizes) + count)
     assert_observed(result, {key: value for key, value in expected.items() if key in result})
     if "units" in result:
         check_units(result["units"], [4] * count, capacity=4 * count, multiple=1)
-        if not sizes:
-            assert _summary(result["units"]) == [(tuple(range(count)), "dense", 4 * count)]
 
 
 def _random_batch(rng):
@@ -970,20 +1030,18 @@ def _reorder_data(values, permutation):
 
 
 def _pipeline(rng):
-    """Shard, slot, plan and align random multi-chunk batches like the NeMo-RL driver."""
+    """Shard random multi-chunk batches, then plan and align each rank like NeMo-RL."""
     for iteration in range(25):
         batch, multiple, dp, chunk_size, capacity = _random_batch(rng)
         limits = dict(capacity=capacity, multiple=multiple)
         group_ids = [group for group, _, _ in batch]
         lengths = [len(prompt) + completion for _, prompt, completion in batch]
-        with note(iteration=iteration, stage="shard-and-slot"):
-            slot_plan = fixed_slots(group_ids, lengths, capacity, multiple, batch_size=chunk_size)
+        with note(iteration=iteration, stage="shard"):
             shard_plan = shards(group_ids, lengths, dp, batch_size=chunk_size)
             flat = [row for shard in shard_plan.shard_indices for row in shard]
             if shard_plan.rank_order_permutation is not None:
                 flat = _reorder_data(flat, shard_plan.rank_order_permutation)
             assert flat == list(range(len(batch)))
-            check_slot_plan(slot_plan, group_ids, lengths, chunk_size=chunk_size, **limits)
 
         size = chunk_size // dp
         for chunk in range(len(batch) // chunk_size):
@@ -996,37 +1054,44 @@ def _pipeline(rng):
             ranks = []
             for local in locals_:
                 local_rows = [SharedPrefixRow(i, *batch[row]) for i, row in enumerate(local)]
-                slot_ids = [slot_plan.row_slot_ids[row] for row in local]
-                row_slots = prescribed_slots([r.group_id for r in local_rows], slot_ids)
                 costs = [_round_up(local_row.total_length, multiple) for local_row in local_rows]
-                ranks.append((local_rows, row_slots, costs))
+                ranks.append((local_rows, costs))
+            largest_first = iteration % 2 == 1
             for mode, options in WORKER_MODES.items():
                 for forward_only, evaluation in ((False, False), (True, False), (True, True)):
                     if evaluation and not options:
                         continue
                     context = dict(mode=mode, forward_only=forward_only, evaluation=evaluation)
                     with note(iteration=iteration, chunk=chunk, **context):
-                        _check_rank_plans(ranks, options, forward_only, evaluation, **limits)
+                        _check_rank_plans(
+                            ranks, options, forward_only, evaluation, largest_first, **limits
+                        )
             with note(iteration=iteration, chunk=chunk, mode="dense-bins"):
                 _check_dense_bins(ranks, **limits)
 
 
-def _check_rank_plans(ranks, options, forward_only, evaluation, *, capacity, multiple):
+def _check_rank_plans(
+    ranks, options, forward_only, evaluation, largest_first, *, capacity, multiple
+):
     physical_only = forward_only and evaluation
     limits = dict(capacity=capacity, multiple=multiple, expanded_budget=not physical_only)
     kwargs = dict(bin_capacity=capacity, padding_multiple=multiple, forward_only=forward_only)
     kwargs |= dict(evaluation_packing=evaluation, dense_packer=first_fit_decreasing(capacity))
+    kwargs |= dict(largest_first=largest_first)
     plans = []
-    for local_rows, slots, costs in ranks:
-        units = plan_shared_prefix_execution_units(local_rows, row_slots=slots, **kwargs, **options)
+    for local_rows, costs in ranks:
+        units = plan_shared_prefix_execution_units(local_rows, **kwargs, **options)
         check_units(units, costs, **limits)
+        lengths = [unit.physical_length for unit in units]
+        assert not largest_first or lengths == sorted(lengths, reverse=True)
+        if not options:
+            # Without group packing, every forward is one local slot of one group.
+            for unit in units:
+                assert len({local_rows[r].group_id for r in unit.row_indices}) == 1
+                assert len(unit.row_indices) <= MAX_SHARED_PREFIX_BRANCHES
         plans.append((units, costs))
-    counts = [len(units) for units, _ in plans]
-    if not options:
-        # Driver slots alone give every DP rank the same forward count.
-        assert len(set(counts)) == 1
-        return
-    target = max(counts)
+    # Each rank splits its own groups, so forward counts can differ between ranks.
+    target = max(len(units) for units, _ in plans)
     if target > min(len(costs) for _, costs in plans):
         return
     for units, costs in plans:
@@ -1043,7 +1108,7 @@ def _check_rank_plans(ranks, options, forward_only, evaluation, *, capacity, mul
 
 def _check_dense_bins(ranks, *, capacity, multiple):
     packer = dict(bin_capacity=capacity, dense_packer=first_fit_decreasing(capacity))
-    plans = [(rs, costs, plan_dense_training_bins(costs=costs, **packer)) for rs, _, costs in ranks]
+    plans = [(rs, costs, plan_dense_training_bins(costs=costs, **packer)) for rs, costs in ranks]
     target = max(len(units) for _, _, units in plans)
     if target > min(len(costs) for _, costs, _ in plans):
         return
@@ -1057,6 +1122,10 @@ def _check_dense_bins(ranks, *, capacity, multiple):
         for dense, unit in zip(aligned, shared):
             assert set(dense.row_indices) == set(unit.row_indices)
             assert expanded_length(unit, costs) == dense.physical_length
+            assert (
+                unit.shared_layout is None
+                or unit.shared_layout.dense_length == dense.physical_length
+            )
             if isinstance(unit.shared_layout, SharedPrefixForestLayout):
                 roots = unit.shared_layout.roots
                 assert unit.shared_layout.mtp_loss_group_root_counts == (len(roots),)
@@ -1095,28 +1164,25 @@ def _align_rows(rng):
 
 
 def _row_work(rng):
-    """Row weights sum, per (group, slot), to that slot's executed work times a common scale."""
+    """Row weights sum, per group, to that group's estimated work times the group size."""
     for iteration in range(200):
         group_size = rng.randint(1, 6)
         groups = [f"g{index}" for index in range(rng.randint(1, 4)) for _ in range(group_size)]
-        prompts, lengths, slots = [], [], []
+        prompts, lengths = [], []
         for group in dict.fromkeys(groups):
             prompt = rng.randint(0, 5)
-            num_slots = rng.randint(1, group_size)
-            for index in range(group_size):
+            for _ in range(group_size):
                 prompts.append(prompt if rng.random() > 0.1 else rng.randint(0, 5))
                 lengths.append(prompts[-1] + rng.randint(0, 9))
-                slots.append(index % num_slots)
-        with note(iteration=iteration, groups=groups, slots=slots):
-            work = estimate(groups, lengths, prompts, row_slot_ids=slots)
+        with note(iteration=iteration, groups=groups):
+            work = estimate(groups, lengths, prompts)
             assert all(value >= 0 for value in work)
             members = defaultdict(list)
-            for index, key in enumerate(zip(groups, slots)):
-                members[key].append(index)
-            scale = math.lcm(*(len(indices) for indices in members.values()))
+            for index, group in enumerate(groups):
+                members[group].append(index)
             for indices in members.values():
-                expected = slot_work([lengths[i] for i in indices], [prompts[i] for i in indices])
-                assert sum(work[i] for i in indices) == scale * expected
+                expected = group_work([lengths[i] for i in indices], [prompts[i] for i in indices])
+                assert sum(work[i] for i in indices) == group_size * expected
 
 
 PLANNING_PROPERTIES = {f"pipeline-seed{seed}": (_pipeline, seed) for seed in range(4)}

@@ -22,6 +22,7 @@ Update this contract together with the NeMo-RL adapter.
 import importlib
 import importlib.util
 import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -41,7 +42,7 @@ NEMO_RL_CONTRACT = {
     },
     "shared_prefix_cost": {
         "estimate_shared_prefix_row_work": "group_ids sequence_lengths prompt_lengths"
-        " physical_weight expanded_weight row_slot_ids"
+        " physical_weight expanded_weight"
     },
     "shared_prefix_dense_bins": {
         "plan_dense_training_bins": "costs bin_capacity dense_packer",
@@ -50,17 +51,13 @@ NEMO_RL_CONTRACT = {
     "shared_prefix_execution": {
         "SharedPrefixExecutionPlan": "units .units .num_units .max_physical_length",
         "SharedPrefixExecutionUnit": "row_indices shared_layout physical_length",
-        "plan_shared_prefix_execution_units": "rows row_slots bin_capacity padding_multiple"
-        " pack_groups repack_groups pack_dense_fallbacks merge_dense_fallbacks forward_only"
-        " evaluation_packing dense_packer largest_first",
+        "plan_shared_prefix_execution_units": "rows bin_capacity padding_multiple pack_groups"
+        " pack_dense_fallbacks merge_dense_fallbacks forward_only evaluation_packing"
+        " dense_packer largest_first",
         "validate_shared_prefix_execution_units": "units batch_size",
     },
     "shared_prefix_metadata": {
-        "FixedExecutionSlotPlan": ".row_slot_ids",
         "GroupCoherentShardPlan": ".shard_indices .rank_order_permutation",
-        "get_prescribed_shared_prefix_slots": "group_ids slot_ids",
-        "plan_fixed_execution_slots": "group_ids sequence_lengths bin_capacity batch_size"
-        " sequence_length_pad_multiple",
         "plan_group_coherent_shards": "group_ids sequence_lengths num_shards batch_size",
     },
     "shared_prefix_packing": {
@@ -139,15 +136,30 @@ def _undeclared_dependency_probe():
 
 
 _PURE_PACKING_PROBE = """
+import importlib
+for name in MODULES:
+    importlib.import_module(name)
 from megatron.rl.shared_prefix_packing import SharedPrefixRow, plan_shared_prefix_bins
-from megatron.rl.shared_prefix_execution import plan_shared_prefix_execution_units
-from megatron.rl.shared_prefix_alignment import align_rows_to_count
-from megatron.rl.shared_prefix_cost import estimate_shared_prefix_row_work
 rows = [SharedPrefixRow(i, "a", (1, 2), 1) for i in range(2)]
 assert len(plan_shared_prefix_bins(rows, bin_capacity=4).shared_bins) == 1
 assert not any(k == "torch" or k == "pydantic" or k.startswith("nemo_rl")
                or k.startswith("megatron.core") for k in sys.modules)
 """
+
+
+def _pure_packing_probe():
+    """Every packing module except ``shared_prefix_tensors`` needs only the standard library."""
+    modules = [name for name in _packing_modules() if name != "megatron.rl.shared_prefix_tensors"]
+    return _PURE_PACKING_PROBE.replace("MODULES", repr(modules))
+
+
+def _readme_examples_probe():
+    """Run every Python example in ``shared_prefix.md`` as written, each in its own namespace."""
+    readme = (REPO / "megatron" / "rl" / "shared_prefix.md").read_text()
+    examples = re.findall(r"```python\n(.*?)```", readme, flags=re.DOTALL)
+    assert examples, "shared_prefix.md has no Python examples"
+    return "".join(f"exec({example!r}, {{}})\n" for example in examples)
+
 
 _GENERATION_API_PROBE = r"""
 import inspect, pickle
@@ -180,7 +192,8 @@ _LOG_ENV = {"LANGRL_LOG_DIR": "{tmp}", "PATH": ""}
 # Id -> (probe, interpreter flags, environment, marks).
 IMPORT_PROBES = {
     "packing-modules-without-undeclared-deps": (_undeclared_dependency_probe, (), None, ()),
-    "packing-imports-without-torch-or-core": (_PURE_PACKING_PROBE, ("-I", "-S"), None, ()),
+    "packing-imports-without-torch-or-core": (_pure_packing_probe, ("-I", "-S"), None, ()),
+    "readme-examples-run-without-torch": (_readme_examples_probe, ("-I", "-S"), None, ()),
     # Importing the RL log module must not print or truncate a shared log file.
     "rl-logging-no-import-side-effects": ("import megatron.rl.logging", (), _LOG_ENV, ()),
     "generation-api-pickle-compat": (_GENERATION_API_PROBE, (), None, _PYDANTIC),

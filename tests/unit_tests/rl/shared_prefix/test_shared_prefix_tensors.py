@@ -53,9 +53,13 @@ from tests.unit_tests.rl.shared_prefix.shared_prefix_oracles import (
 VOCAB, WIDTH, MAX_POSITION = 50, 8, 128
 
 
-def _cp_shards(tensor_bin, cp_size, **kwargs):
-    shard = shard_shared_prefix_tensor_bin_for_context_parallel
-    return [shard(tensor_bin, cp_rank=rank, cp_size=cp_size, **kwargs) for rank in range(cp_size)]
+def _cp_shards(tensor_bin, cp_size, *, tp_size=1, padding_multiple=None):
+    shard = partial(
+        shard_shared_prefix_tensor_bin_for_context_parallel,
+        tp_size=tp_size,
+        padding_multiple=padding_multiple,
+    )
+    return [shard(tensor_bin, cp_rank=rank, cp_size=cp_size) for rank in range(cp_size)]
 
 
 def _unshard(shards):
@@ -99,6 +103,26 @@ def _padded_branch_tails():
     source = tensor([[0, 0, 0, 1, 1, 7, 7], [0, 0, 0, 1, 1, 1, 1]])
     mtp_mask = materialize_shared_prefix_token_aligned_tensor(source, tensor_bin=tensor_bin)
     return result | dict(routes=(star_counts, dense_counts), mtp_mask=mtp_mask)
+
+
+def test_token_aligned_source_must_cover_every_real_token():
+    """A source narrower than the longest real row raises instead of overwriting real tokens."""
+    input_ids = tensor([[10, 11, 12, 20, 21, 22, 0], [10, 11, 12, 30, 31, 32, 33]])
+    star_rows = [
+        row(0, prompt=(10, 11, 12), completion=3),
+        row(1, prompt=(10, 11, 12), completion=4),
+    ]
+    layout = build_shared_prefix_layout(star_rows, sequence_length_pad_multiple=4)
+    lengths = tensor([6, 7])
+    tensor_bin = materialize_shared_prefix_layout(input_ids, input_lengths=lengths, layout=layout)
+    full = torch.ones_like(input_ids)
+    gathered = materialize_shared_prefix_token_aligned_tensor(full, tensor_bin=tensor_bin)
+    padding = tensor_bin.indices.physical_padding_positions
+    assert torch.equal(gathered, torch.ones_like(gathered).index_fill_(0, padding, 0))
+    # Width 6 cuts row 1's last completion token, as a [:, :-1] slice does; width 2 a prompt token.
+    for width in (6, 2):
+        with pytest.raises(ValueError, match="width"):
+            materialize_shared_prefix_token_aligned_tensor(full[:, :width], tensor_bin=tensor_bin)
 
 
 def _tp_sp_cp_padding():

@@ -25,6 +25,7 @@ from megatron.rl.shared_prefix_packing import (
     MAX_SHARED_PREFIX_BRANCHES,
     SharedPrefixForestLayout,
     SharedPrefixRow,
+    _round_up,
     build_shared_prefix_layout,
     split_rows_evenly,
 )
@@ -81,9 +82,12 @@ def share_prefixes_in_dense_training_bins(
     """Share exact prompts in aligned dense bins without changing MTP groups.
 
     Each output bin retains one auxiliary-loss normalization group, source-row
-    coverage, and independent causal boundaries. Ineligible bins stay dense.
-    An exact-prompt group with more than ``max_completions_per_bin`` rows is
-    split evenly into several roots.
+    coverage, and independent causal boundaries. Rows that do not share a
+    prompt run as single-row causal roots next to the stars. A bin that holds a
+    row without a group ID, prompt or completion stays dense: the aligned bin
+    is one forward, and a forest root needs a group ID, a nonempty prompt and a
+    nonempty completion. An exact-prompt group with more than
+    ``max_completions_per_bin`` rows is split evenly into several roots.
     """
     multiple = padding_multiple
     _validate_dense_partition(units, costs, bin_capacity)
@@ -110,14 +114,9 @@ def share_prefixes_in_dense_training_bins(
             for chunk in split_rows_evenly(group, max_completions_per_bin=max_completions_per_bin)
         )
         forest = SharedPrefixForestLayout(roots, mtp_loss_group_root_counts=(len(roots),))
-        expanded = sum(
-            len(root.row_indices) * root.prompt_length + sum(root.physical_completion_lengths)
-            for root in roots
-        )
-        padded_physical = (forest.physical_total_length + multiple - 1) // multiple * multiple
         if (
-            expanded != unit.physical_length
-            or padded_physical > expanded
+            forest.dense_length != unit.physical_length
+            or _round_up(forest.physical_total_length, multiple) > forest.dense_length
             or sorted(forest.row_indices) != sorted(unit.row_indices)
         ):
             raise ValueError("Shared reconstruction changed the dense training bin")

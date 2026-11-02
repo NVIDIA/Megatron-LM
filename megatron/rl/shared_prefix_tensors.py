@@ -204,16 +204,18 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     *,
     cp_rank: int,
     cp_size: int,
-    tp_size: int = 1,
+    tp_size: int,
+    padding_multiple: int | None,
     padding_token_id: int = 0,
-    padding_multiple: int | None = None,
 ) -> SharedPrefixContextParallelShard:
     """Pad and shard a materialized star for MCore context parallelism.
 
     The logical layout remains unpadded.  Padding is appended after all real
     branches, so causality guarantees that it cannot influence a real token;
     a model backend must mask padded queries/keys, and the caller never selects
-    their logits for the loss.
+    their logits for the loss. ``tp_size`` and ``padding_multiple`` have no
+    defaults because the padded length depends on both; ``padding_multiple=None``
+    selects the topology quantum of ``tp_size`` and ``cp_size``.
     """
     total_length = tensor_bin.layout.physical_total_length
     resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
@@ -423,12 +425,24 @@ def materialize_shared_prefix_token_aligned_tensor(
     This is used for metadata such as MTP loss masks that must follow exactly
     the same prompt deduplication, branch padding, and row permutation as token
     IDs.  The returned tensor is global and unsharded; topology-only padding is
-    applied by the caller together with the model input.
+    applied by the caller together with the model input. ``source`` must be at
+    least as wide as the longest real row (prompt plus completion) in the
+    layout; branch padding tails past its width are filled with
+    ``padding_value``.
     """
     if source.ndim != 2:
         raise ValueError("shared-prefix token-aligned source must have shape [batch, sequence]")
     if source.shape[0] <= max(tensor_bin.layout.row_indices):
         raise ValueError("shared-prefix token-aligned source is missing a referenced row")
+    required_width = max(
+        root.prompt_length + max(root.completion_lengths)
+        for _, root in tensor_bin.layout.iter_roots()
+    )
+    if source.shape[1] < required_width:
+        raise ValueError(
+            f"shared-prefix token-aligned source has width {source.shape[1]}, but the layout "
+            f"reads real tokens up to column {required_width - 1}"
+        )
     return _gather_token_aligned_tensor(
         source, indices=tensor_bin.indices, padding_value=padding_value
     )
@@ -439,14 +453,12 @@ def _gather_token_aligned_tensor(
 ) -> torch.Tensor:
     """Apply the same physical gather and tail-padding rule to tokens and metadata.
 
-    Columns past the source width (only branch padding tails reach them) are
-    clamped for the gather and then overwritten, so no padded copy of the
-    source is made.
+    Callers have checked that every real token lies inside ``source``, so only
+    branch padding tails can reach past its width. Those columns are clamped for
+    the gather and then overwritten, so no padded copy of the source is made.
     """
-    columns = indices.token_gather_columns
-    width = source.shape[1]
-    packed = source[indices.token_gather_rows, columns.clamp_max(width - 1)]
-    packed.masked_fill_(columns >= width, padding_value)
+    columns = indices.token_gather_columns.clamp_max(source.shape[1] - 1)
+    packed = source[indices.token_gather_rows, columns]
     return packed.index_fill_(0, indices.physical_padding_positions, padding_value)
 
 

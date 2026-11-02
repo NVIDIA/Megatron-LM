@@ -31,9 +31,7 @@ MAX_SHARED_PREFIX_BRANCHES = 16
 """Default number of completion branches stored behind one prompt copy.
 
 This is a planning policy, not a kernel limit. Planners that accept a branch
-limit default to this value; larger exact-prompt groups are split evenly, except
-by ``plan_shared_prefix_execution_units`` without ``pack_groups``, which keeps an
-oversized prescribed slot as one dense forward.
+limit default to this value and split larger exact-prompt groups evenly.
 """
 
 
@@ -183,6 +181,11 @@ class SharedPrefixLayout:
         return self.tree_layout.total_len
 
     @property
+    def dense_length(self) -> int:
+        """Conventional packed length: every row with its own prompt copy and packing tail."""
+        return len(self.row_indices) * self.prompt_length + sum(self.physical_completion_lengths)
+
+    @property
     def branch_starts(self) -> tuple[int, ...]:
         """Packed start of each completion branch."""
         return self.tree_layout.node_start[1:]
@@ -308,6 +311,11 @@ class SharedPrefixForestLayout:
         return sum(root.total_length for root in self.roots)
 
     @cached_property
+    def dense_length(self) -> int:
+        """Conventional packed length of every root's rows."""
+        return sum(root.dense_length for root in self.roots)
+
+    @cached_property
     def row_indices(self) -> tuple[int, ...]:
         """Source rows of every root, in forest order."""
         return tuple(value for root in self.roots for value in root.row_indices)
@@ -407,19 +415,12 @@ def pack_shared_prefix_groups(
     ):
         raise ValueError("group packing capacities must be aligned to the padding multiple")
 
-    def dense_length(layout: SharedPrefixLayout) -> int:
-        return len(layout.row_indices) * layout.prompt_length + sum(
-            layout.physical_completion_lengths
-        )
-
     bins: list[list[SharedPrefixLayout]] = []
     trunk_lengths: list[int] = []
     dense_lengths: list[int] = []
-    for root in sorted(
-        layouts, key=lambda item: (-dense_length(item), -item.physical_total_length)
-    ):
+    for root in sorted(layouts, key=lambda item: (-item.dense_length, -item.physical_total_length)):
         trunk = root.physical_total_length
-        dense = dense_length(root)
+        dense = root.dense_length
         if _round_up(trunk, padding_multiple) > bin_capacity:
             raise ValueError("shared-prefix root exceeds the aligned backbone budget")
         for index in range(len(bins)):
@@ -589,9 +590,12 @@ def plan_shared_prefix_bins(
             continue
 
         prompt_length = exact_rows[0].prompt_length
-        # Spread a group past the branch limit evenly (17 -> 9+8, not a
-        # 16-star plus an unshared singleton), as split_rows_evenly does.
-        branch_limit = -(-len(exact_rows) // -(-len(exact_rows) // max_completions_per_bin))
+        # Spread a group past the branch limit over the fewest stars with sizes
+        # that differ by at most one, as split_rows_evenly does: ``extra`` stars
+        # of ``base + 1`` rows and the rest of ``base`` (17 -> 9+8 and
+        # 49 -> 13+12+12+12, not a full star plus a short or unshared remainder).
+        base, extra = divmod(len(exact_rows), -(-len(exact_rows) // max_completions_per_bin))
+        large_bins = 0
         physical_bins: list[list[SharedPrefixRow]] = []
         bin_completion_tokens: list[int] = []
         rows_by_size = sorted(
@@ -605,7 +609,9 @@ def plan_shared_prefix_bins(
         for row in rows_by_size:
             destination: int | None = None
             for bin_index, bin_rows in enumerate(physical_bins):
-                has_branch_slot = len(bin_rows) < branch_limit
+                has_branch_slot = len(bin_rows) < base or (
+                    len(bin_rows) == base and large_bins < extra
+                )
                 has_token_space = (
                     prompt_length
                     + bin_completion_tokens[bin_index]
@@ -619,6 +625,7 @@ def plan_shared_prefix_bins(
                 physical_bins.append([row])
                 bin_completion_tokens.append(physical_completion_length(row))
             else:
+                large_bins += len(physical_bins[destination]) == base
                 physical_bins[destination].append(row)
                 bin_completion_tokens[destination] += physical_completion_length(row)
 

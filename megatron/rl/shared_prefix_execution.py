@@ -14,22 +14,19 @@
 
 """Backend-neutral execution plans with physical and expanded token budgets."""
 
-import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Optional
 
-from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
 from megatron.rl.shared_prefix_packing import (
     MAX_SHARED_PREFIX_BRANCHES,
     SharedPrefixForestLayout,
     SharedPrefixLayout,
     SharedPrefixRow,
+    _is_int,
     _round_up,
     build_shared_prefix_layout,
     pack_shared_prefix_groups,
     plan_shared_prefix_bins,
-    split_rows_evenly,
 )
 
 DensePacker = Callable[[Sequence[int]], Sequence[Sequence[int]]]
@@ -40,7 +37,7 @@ class SharedPrefixExecutionUnit:
     """One forward for an exact-prompt star, a forest, or a dense fallback."""
 
     row_indices: tuple[int, ...]
-    shared_layout: Optional[SharedPrefixLayout | SharedPrefixForestLayout]
+    shared_layout: SharedPrefixLayout | SharedPrefixForestLayout | None
     physical_length: int
 
 
@@ -48,10 +45,9 @@ class SharedPrefixExecutionUnit:
 class SharedPrefixExecutionPlan:
     """Planned physical forwards for one local shared-prefix batch.
 
-    ``units`` is the driver-prescribed execution order consumed by
-    the caller's microbatch consumer. ``num_units`` is the rank-local
-    forward count the worker barrier compares across the model world, and
-    ``max_physical_length`` bounds the padded microbatch width.
+    ``units`` lists the forwards in execution order. ``num_units`` is this
+    rank's forward count; distributed callers must make it equal on every rank
+    that shares a collective before the first forward.
     """
 
     units: tuple[SharedPrefixExecutionUnit, ...]
@@ -67,7 +63,11 @@ class SharedPrefixExecutionPlan:
 
     @property
     def max_physical_length(self) -> int:
-        """Longest physical forward, which bounds the padded microbatch width."""
+        """Longest physical forward, before the caller's TP/CP padding.
+
+        The padded microbatch width is this value rounded up to the caller's
+        TP/CP padding multiple.
+        """
         return max(unit.physical_length for unit in self.units)
 
 
@@ -132,14 +132,58 @@ def pack_dense_rows(
     return bins
 
 
+def _pack_full_length_group(
+    rows: Sequence[SharedPrefixRow],
+    *,
+    bin_capacity: int,
+    padding_multiple: int,
+    max_rows_per_slot: int,
+) -> list[tuple[int, ...]]:
+    """FFD-pack one prompt group's conventional full lengths into execution slots.
+
+    Full duplicated lengths are deliberately conservative. Any resulting slot
+    also fits as one deduplicated star because removing repeated prompts can
+    only shorten it; if exact-prompt validation later fails, the same slot
+    still fits as one ordinary block-diagonal packed microbatch.
+
+    A group larger than ``max_rows_per_slot`` is spread over the fewest slots
+    that respect it, with sizes that differ by at most one (17 -> 9+8 with the
+    default 16, not a 16-row slot plus an unshared singleton), as
+    ``plan_shared_prefix_bins`` does. Each slot lists its source row indices in
+    input order. Every row must fit ``bin_capacity`` on its own.
+    """
+    padded_lengths = [_round_up(row.total_length, padding_multiple) for row in rows]
+    num_bins = -(-len(rows) // max_rows_per_slot)
+    # ``extra`` slots of ``base + 1`` rows and the rest of ``base``.
+    base, extra = divmod(len(rows), num_bins) if num_bins else (max_rows_per_slot, 0)
+    large_bins = 0
+    bins: list[list[int]] = []
+    bin_work: list[int] = []
+    for position in sorted(range(len(rows)), key=lambda index: (-padded_lengths[index], index)):
+        destination: int | None = None
+        for bin_index, bin_positions in enumerate(bins):
+            has_row_slot = len(bin_positions) < base or (
+                len(bin_positions) == base and large_bins < extra
+            )
+            if has_row_slot and bin_work[bin_index] + padded_lengths[position] <= bin_capacity:
+                destination = bin_index
+                break
+        if destination is None:
+            bins.append([position])
+            bin_work.append(padded_lengths[position])
+        else:
+            large_bins += len(bins[destination]) == base
+            bins[destination].append(position)
+            bin_work[destination] += padded_lengths[position]
+    return [tuple(rows[position].row_index for position in sorted(positions)) for positions in bins]
+
+
 def plan_shared_prefix_execution_units(
     rows: Sequence[SharedPrefixRow],
     *,
-    row_slots: Sequence[Sequence[int]],
     bin_capacity: int,
     padding_multiple: int,
     pack_groups: bool = False,
-    repack_groups: bool = False,
     pack_dense_fallbacks: bool = False,
     merge_dense_fallbacks: bool = False,
     forward_only: bool = False,
@@ -148,87 +192,124 @@ def plan_shared_prefix_execution_units(
     largest_first: bool = False,
     max_completions_per_bin: int = MAX_SHARED_PREFIX_BRANCHES,
 ) -> tuple[SharedPrefixExecutionUnit, ...]:
-    """Resolve prescribed real-row slots into shared forests or dense units.
+    """Plan one rank's local batch as exact-prompt stars, forests and dense fallbacks.
 
-    ``dense_packer`` is a length-only callback chosen by the caller; see
-    :func:`pack_dense_rows` for its determinism contract. Training retains
-    both physical and expanded MTP budgets; evaluation may use only the
-    physical budget when the caller disables MTP uniformly. The caller must
-    align unit counts across its distributed model world afterward.
+    Each prompt group is split locally into execution slots: conventional
+    full-length first-fit decreasing under ``bin_capacity``, with at most
+    ``max_completions_per_bin`` rows per slot. Rows without a group ID and
+    single-row groups get a slot each. A slot whose rows all share one exact
+    prompt runs as one star. Every rank plans only its own rows, so forward
+    counts can differ between ranks; a distributed caller must agree on one
+    count and align to it before the first forward. Flags are validated
+    before any row is read, so an invalid combination raises on every rank.
 
-    A slot of more than ``max_completions_per_bin`` exact-prompt rows is split
-    evenly into several stars when ``pack_groups`` allows multiple units per
-    slot. Otherwise the slot must remain one forward and runs dense.
+    Args:
+        rows: Planner rows of this rank's local batch. ``row_index`` addresses
+            the caller's batch and must be unique.
+        bin_capacity: Token budget of one forward. It bounds every unit's
+            physical length after padding, and in training also its expanded
+            length (one prompt copy per row), which MTP processes.
+        padding_multiple: Per-row TP/CP padding quantum.
+        pack_groups: Allow several forwards per slot and coalesce stars into
+            forests. A slot whose rows do not all share then keeps its stars
+            and runs only the other rows dense. Without it, every slot is
+            exactly one forward: a star, or a dense unit when any of its rows
+            cannot share.
+        pack_dense_fallbacks: Repack all dense rows across groups with
+            ``dense_packer``. Requires ``pack_groups`` and ``dense_packer``.
+        merge_dense_fallbacks: Training only: fold whole dense bins into
+            forests as independent causal roots with their own MTP loss group.
+            Requires ``pack_dense_fallbacks``; ignored with ``forward_only``.
+        forward_only: Plan for a no-grad forward.
+        evaluation_packing: With ``forward_only``, apply only the physical
+            budget; the caller must disable MTP uniformly. Requires
+            ``pack_groups``.
+        dense_packer: Deterministic length-only packer for dense rows; see
+            :func:`pack_dense_rows` for its contract.
+        largest_first: Return the units in nonincreasing ``physical_length``
+            order. Ties keep the planning order.
+        max_completions_per_bin: Branch limit of one star.
+
+    Returns:
+        Execution units in execution order, covering every row exactly once.
+
+    Raises:
+        ValueError: If a limit or flag combination is invalid, a row index
+            repeats, a row is empty or longer than ``bin_capacity`` after
+            padding, the batch is empty, or ``dense_packer`` returns invalid
+            bins.
+        RuntimeError: If a planned dense fallback exceeds ``bin_capacity``,
+            which valid rows cannot cause.
     """
     if bin_capacity < 1 or padding_multiple < 1:
         raise ValueError("Positive capacity and padding multiple required")
-    rows_by_index = {row.row_index: row for row in rows}
-    covered = [index for slot in row_slots for index in slot]
-    if (
-        len(rows_by_index) != len(rows)
-        or any(not slot for slot in row_slots)
-        or sorted(covered) != sorted(rows_by_index)
-    ):
-        raise ValueError("Execution slots must cover every source row exactly once")
+    if not _is_int(max_completions_per_bin) or max_completions_per_bin < 2:
+        raise ValueError("max_completions_per_bin must be an integer of at least 2")
     if pack_dense_fallbacks and not pack_groups:
         raise ValueError("dense fallback repacking requires pack_groups")
+    if pack_dense_fallbacks and dense_packer is None:
+        raise ValueError("Dense fallback repacking requires a length-only packer")
     if merge_dense_fallbacks and not (pack_groups and pack_dense_fallbacks):
         raise ValueError("dense fallback merging requires pack_groups and pack_dense_fallbacks")
-    if pack_groups and repack_groups:
-        # Repacking ignores the driver's equal-slot schedule, so the caller
-        # must keep forward counts matched across data-parallel ranks (NeMo-RL
-        # aligns them at DP>1). One long group must not force unrelated groups
-        # into singleton fallbacks: repack each complete group with the same
-        # conventional token bound; both expanded MTP work and prompt-mismatch
-        # fallbacks still fit.
-        grouped_indices: dict[str | None, list[int]] = {}
-        for row in rows:
-            grouped_indices.setdefault(row.group_id, []).append(row.row_index)
-        independent_slots: list[tuple[int, ...]] = []
-        for group_id, indices in grouped_indices.items():
-            if len(indices) == 1:
-                independent_slots.append(tuple(indices))
-                continue
-            assert group_id is not None  # Validated by the prescribed-slot reader.
-            if forward_only and evaluation_packing:
-                # Evaluation never expands these stars for MTP. Apply the
-                # physical budget before splitting a group, as well as when
-                # packing stars together below. Retaining the training slot
-                # cuts here would still duplicate a large prefix unnecessarily.
-                evaluation_plan = plan_shared_prefix_bins(
-                    [rows_by_index[index] for index in indices],
-                    bin_capacity=bin_capacity,
-                    max_completions_per_bin=max_completions_per_bin,
-                    sequence_length_pad_multiple=padding_multiple,
-                )
-                independent_slots.extend(
-                    layout.row_indices for layout in evaluation_plan.shared_bins
-                )
-                independent_slots.extend(
-                    (row_index,) for row_index in evaluation_plan.fallback_row_indices
-                )
-                continue
-            plan = plan_fixed_execution_slots(
-                group_ids=[group_id] * len(indices),
-                sequence_lengths=[rows_by_index[index].total_length for index in indices],
+    if evaluation_packing and not pack_groups:
+        raise ValueError("evaluation packing requires pack_groups")
+    rows_by_index = {row.row_index: row for row in rows}
+    if len(rows_by_index) != len(rows):
+        raise ValueError("Execution planning requires unique source row indices")
+    for row in rows:
+        if row.total_length < 1:
+            raise ValueError(
+                f"shared-prefix row {row.row_index} must have a positive length, "
+                f"got {row.total_length}"
+            )
+        padded_length = _round_up(row.total_length, padding_multiple)
+        if padded_length > bin_capacity:
+            raise ValueError(
+                "shared-prefix row exceeds the execution bin capacity after "
+                f"padding: row={row.row_index}, padded_length={padded_length}, "
+                f"capacity={bin_capacity}"
+            )
+    # Split each complete group locally with the same conventional token
+    # bound, so one long group cannot force unrelated groups into singleton
+    # fallbacks; both expanded MTP work and prompt-mismatch fallbacks still
+    # fit. Forward counts can then differ between data-parallel ranks, so a
+    # distributed caller must align them.
+    grouped_indices: dict[str | None, list[int]] = {}
+    for row in rows:
+        grouped_indices.setdefault(row.group_id, []).append(row.row_index)
+    row_slots: list[tuple[int, ...]] = []
+    for group_id, indices in grouped_indices.items():
+        if group_id is None or len(indices) == 1:
+            # Rows without a group ID never share a prompt, however many there
+            # are: each one is its own dense slot.
+            row_slots.extend((index,) for index in indices)
+            continue
+        if forward_only and evaluation_packing:
+            # Evaluation never expands these stars for MTP. Apply the
+            # physical budget before splitting a group, as well as when
+            # packing stars together below. Retaining the training slot
+            # cuts here would still duplicate a large prefix unnecessarily.
+            evaluation_plan = plan_shared_prefix_bins(
+                [rows_by_index[index] for index in indices],
                 bin_capacity=bin_capacity,
+                max_completions_per_bin=max_completions_per_bin,
                 sequence_length_pad_multiple=padding_multiple,
+            )
+            row_slots.extend(layout.row_indices for layout in evaluation_plan.shared_bins)
+            row_slots.extend((row_index,) for row_index in evaluation_plan.fallback_row_indices)
+            continue
+        row_slots.extend(
+            _pack_full_length_group(
+                [rows_by_index[index] for index in indices],
+                bin_capacity=bin_capacity,
+                padding_multiple=padding_multiple,
                 max_rows_per_slot=max_completions_per_bin,
             )
-            for slot_id in range(plan.units_per_group_by_chunk[0]):
-                independent_slots.append(
-                    tuple(
-                        index
-                        for index, assigned_slot in zip(indices, plan.row_slot_ids, strict=True)
-                        if assigned_slot == slot_id
-                    )
-                )
-        row_slots = tuple(independent_slots)
+        )
     units: list[SharedPrefixExecutionUnit] = []
     for row_indices in row_slots:
-        slot_rows = [rows_by_index[index] for index in row_indices]
         candidate = plan_shared_prefix_bins(
-            slot_rows,
+            [rows_by_index[index] for index in row_indices],
             bin_capacity=bin_capacity,
             max_completions_per_bin=max_completions_per_bin,
             sequence_length_pad_multiple=padding_multiple,
@@ -248,55 +329,35 @@ def plan_shared_prefix_execution_units(
             )
             continue
 
-        # ``SharedPrefixRow.total_length`` is exactly the validated input
-        # length of that row, so no second host copy of ``input_lengths`` and
-        # no per-row ``.item()`` are needed here.
+        dense_rows = row_indices
+        if pack_groups and candidate.shared_bins:
+            # Group packing already allows several forwards per slot, so rows
+            # that cannot share (a prompt mismatch, an empty placeholder) run
+            # dense without taking the slot's stars with them. Each star is a
+            # subset of a slot that fits as dense rows, so it fits both budgets.
+            units.extend(
+                SharedPrefixExecutionUnit(
+                    row_indices=layout.row_indices,
+                    shared_layout=layout,
+                    physical_length=layout.physical_total_length,
+                )
+                for layout in candidate.shared_bins
+            )
+            fallback = set(candidate.fallback_row_indices)
+            dense_rows = tuple(index for index in row_indices if index in fallback)
+            if not dense_rows:
+                continue
         fallback_length = sum(
-            _round_up(rows_by_index[index].total_length, padding_multiple) for index in row_indices
+            _round_up(rows_by_index[index].total_length, padding_multiple) for index in dense_rows
         )
         if fallback_length > bin_capacity:
             raise RuntimeError(
-                "driver-prescribed shared-prefix fallback exceeds its bin "
-                f"capacity: rows={row_indices}, padded_length={fallback_length}, "
-                f"capacity={bin_capacity}"
-            )
-        if len(slot_rows) > max_completions_per_bin and _is_exact_prompt_group(slot_rows):
-            if pack_groups:
-                # Each even chunk is a star no longer than the dense slot, so it
-                # fits both budgets; group packing below may coalesce them.
-                for chunk in split_rows_evenly(
-                    sorted(slot_rows, key=lambda row: row.row_index),
-                    max_completions_per_bin=max_completions_per_bin,
-                ):
-                    if len(chunk) == 1:
-                        units.append(
-                            SharedPrefixExecutionUnit(
-                                row_indices=(chunk[0].row_index,),
-                                shared_layout=None,
-                                physical_length=_round_up(chunk[0].total_length, padding_multiple),
-                            )
-                        )
-                        continue
-                    layout = build_shared_prefix_layout(
-                        chunk, sequence_length_pad_multiple=padding_multiple
-                    )
-                    units.append(
-                        SharedPrefixExecutionUnit(
-                            row_indices=layout.row_indices,
-                            shared_layout=layout,
-                            physical_length=layout.physical_total_length,
-                        )
-                    )
-                continue
-            warnings.warn(
-                f"a shared-prefix slot of {len(slot_rows)} exact-prompt rows exceeds "
-                f"max_completions_per_bin={max_completions_per_bin} and runs dense; "
-                "enable group packing or raise the branch limit to keep sharing",
-                stacklevel=2,
+                "shared-prefix dense fallback exceeds its bin capacity: "
+                f"rows={dense_rows}, padded_length={fallback_length}, capacity={bin_capacity}"
             )
         units.append(
             SharedPrefixExecutionUnit(
-                row_indices=row_indices, shared_layout=None, physical_length=fallback_length
+                row_indices=dense_rows, shared_layout=None, physical_length=fallback_length
             )
         )
     if not units:
@@ -317,9 +378,9 @@ def plan_shared_prefix_execution_units(
         ]
         if pack_dense_fallbacks:
             # Fallback rows have ordinary causal semantics. Pack them across
-            # prompt groups instead of retaining the driver's equal-slot cuts.
-            # This also recovers conventional batching when every slot falls
-            # back, while leaving the shared attention layout unchanged.
+            # prompt groups instead of keeping each group's slot cuts. This
+            # also recovers conventional batching when every slot falls back,
+            # while leaving the shared attention layout unchanged.
             fallback_rows = sorted(
                 index for unit in units if unit.shared_layout is None for index in unit.row_indices
             )
@@ -328,25 +389,16 @@ def plan_shared_prefix_execution_units(
                     _round_up(rows_by_index[index].total_length, padding_multiple)
                     for index in fallback_rows
                 ]
-                if dense_packer is None:
-                    raise ValueError("Dense fallback repacking requires a length-only packer")
-                bins = [
-                    list(indices)
-                    for indices in pack_dense_rows(
-                        lengths, bin_capacity=bin_capacity, dense_packer=dense_packer
-                    )
-                ]
-                if largest_first:
-                    bins.sort(
-                        key=lambda indices: sum(lengths[index] for index in indices), reverse=True
-                    )
+                assert dense_packer is not None  # Checked on entry.
                 dense_units = [
                     SharedPrefixExecutionUnit(
                         row_indices=tuple(fallback_rows[index] for index in indices),
                         shared_layout=None,
                         physical_length=sum(lengths[index] for index in indices),
                     )
-                    for indices in bins
+                    for indices in pack_dense_rows(
+                        lengths, bin_capacity=bin_capacity, dense_packer=dense_packer
+                    )
                 ]
                 units = dense_units + [unit for unit in units if unit.shared_layout is not None]
         if merge_dense_fallbacks and not forward_only:
@@ -358,20 +410,10 @@ def plan_shared_prefix_execution_units(
             )
     if sorted(index for unit in units for index in unit.row_indices) != sorted(rows_by_index):
         raise ValueError("Execution packing must cover every source row exactly once")
+    if largest_first:
+        # Stable, so equal lengths keep their deterministic planning order.
+        units = sorted(units, key=lambda unit: -unit.physical_length)
     return tuple(units)
-
-
-def _is_exact_prompt_group(rows: Sequence[SharedPrefixRow]) -> bool:
-    """Whether every row can share one stored copy of the first row's prompt."""
-    first = rows[0]
-    return all(
-        row.group_id is not None
-        and row.group_id == first.group_id
-        and row.prompt_length > 0
-        and row.prompt_token_ids == first.prompt_token_ids
-        and row.completion_length > 0
-        for row in rows
-    )
 
 
 def _merge_dense_fallback_execution_units(
@@ -395,10 +437,7 @@ def _merge_dense_fallback_execution_units(
     for index in shared_indices:
         layout = units[index].shared_layout
         assert layout is not None
-        expanded_lengths[index] = sum(
-            len(root.row_indices) * root.prompt_length + sum(root.physical_completion_lengths)
-            for _, root in layout.iter_roots()
-        )
+        expanded_lengths[index] = layout.dense_length
     absorbed: set[int] = set()
     fallback_indices = sorted(
         (index for index, unit in enumerate(units) if unit.shared_layout is None),

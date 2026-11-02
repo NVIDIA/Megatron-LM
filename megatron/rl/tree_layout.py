@@ -23,7 +23,7 @@ does not imply that a particular fused execution backend supports deeper trees.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -154,8 +154,11 @@ class PackedTreeLayout:
         parents = set(self.node_parent)
         return tuple(node for node in range(self.num_nodes) if node not in parents)
 
-    def iter_star_roots(self) -> Iterator[tuple[int, tuple[int, ...]]]:
+    def iter_star_roots(self) -> tuple[tuple[int, tuple[int, ...]], ...]:
         """Lower only a forest of stars; reject deeper trees before execution.
+
+        Returns every root with its child nodes, in storage order. All checks
+        run when this is called, not when the result is iterated.
 
         A backend that implements only prompt-to-completion forks must use this
         guard rather than silently treating all descendants as sibling branches.
@@ -175,7 +178,7 @@ class PackedTreeLayout:
             raise NotImplementedError("this execution backend requires contiguous star storage")
         if any(self.node_len[root] != self.logical_node_len[root] for root, _ in stars):
             raise NotImplementedError("this execution backend requires unpadded prompt roots")
-        yield from stars
+        return stars
 
     def segment_ids(self) -> tuple[int, ...]:
         """Physical token-to-node map."""
