@@ -2643,13 +2643,14 @@ def test_generate_mixed_batch_waits_only_for_its_pending_future():
 @pytest.mark.parametrize("replay", [True, False], ids=["routing-replayed", "routing-off"])
 def test_snapshot_live_requests(replay):
     """Every entry but a failed one is copied, with the finish reason the engine records when it
-    detects a stop, one pass before completion, and, under routing replay, the routing its blocks
-    still hold. Any loop may run the snapshot while none runs the engine, as between a suspend and
-    a resume driven inline; a live engine loop refuses the others."""
+    detects a stop, one pass before completion, kept across the segment an eviction opens, and,
+    under routing replay, the routing its blocks still hold. Any loop may run the snapshot while
+    none runs the engine, as between a suspend and a resume driven inline; a live engine loop
+    refuses the others."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._loop, other_loop = asyncio.new_event_loop(), asyncio.new_event_loop()
     active = Status.ACTIVE_AND_GENERATING_TOKENS
-    live, stop_hit, stop_masked, failed, waiting, requeued = (
+    live, stop_hit, stop_masked, failed, waiting, requeued, stop_evicted = (
         _make_request_entry(engine._loop, request_id, status, resolve=False)
         for request_id, status in (
             (1, active),
@@ -2658,11 +2659,21 @@ def test_snapshot_live_requests(replay):
             (4, Status.FAILED),
             (5, active),
             (6, active),
+            (7, active),
         )
     )
-    engine.requests = {1: live, 2: stop_hit, 3: stop_masked, 4: failed, 5: waiting, 6: requeued}
+    engine.requests = {
+        1: live,
+        2: stop_hit,
+        3: stop_masked,
+        4: failed,
+        5: waiting,
+        6: requeued,
+        7: stop_evicted,
+    }
     # The engine records a stop's reason when it detects it, a step before completion.
     stop_hit.record[-1].finish_reason = stop_masked.record[-1].finish_reason = "stop"
+    stop_evicted.record[-1].finish_reason = "stop"
     # Routing replay keeps each token's expert choices in the blocks a request owns and reads them
     # back at completion; a snapshot reads every generating request's the same way, its last
     # token's apart.
@@ -2670,6 +2681,9 @@ def test_snapshot_live_requests(replay):
     stop_masked.record[-1].generated_tokens = [8]  # the waiting entry has generated nothing yet
     # Evicted and re-queued: tokens banked, but no context row — its routing is recomputed.
     requeued.record[-1].generated_tokens = [7]
+    # Stop detected, then evicted: the segment the eviction opens keeps the reason.
+    stop_evicted.record[-1].generated_tokens = [5]
+    stop_evicted.record.checkpoint()
     live.record[-1].sampling_params.num_tokens_to_generate = 4
     stop_hit.record[-1].sampling_params.num_tokens_to_generate = 2
     requeued.record[-1].sampling_params.num_tokens_to_generate = 3
@@ -2695,10 +2709,10 @@ def test_snapshot_live_requests(replay):
     )
     expected = [
         LiveRequestSnapshot.from_record(entry.record)
-        for entry in (live, stop_hit, stop_masked, waiting, requeued)
+        for entry in (live, stop_hit, stop_masked, waiting, requeued, stop_evicted)
     ]
-    assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None, None]
-    routed = [routing[40], routing[20], routing[30], None, None] if replay else [None] * 5
+    assert [s.record.finish_reason for s in expected] == [None, "stop", "stop", None, None, "stop"]
+    routed = [routing[40], routing[20], routing[30], None, None, None] if replay else [None] * 6
 
     def listed(arrays):
         return [None if array is None else array.tolist() for array in arrays]

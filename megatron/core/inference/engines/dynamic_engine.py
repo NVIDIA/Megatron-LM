@@ -2099,7 +2099,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request_entry: Engine-owned record and completion future.
             finished_request: Result finalized before context cleanup, when available.
-            reply_now: Send the result to the coordinator now instead of with the step.
+            reply_now: Send the result to the coordinator now. Used for a request that ends outside
+                a step: one that failed before it ran a step, a resumed generation that arrived
+                finished, or a KV import already satisfied by its transferred token.
         """
         assert not request_entry.future.done(), "Request future was already resolved."
         if finished_request is None:
@@ -2440,21 +2442,35 @@ class DynamicInferenceEngine(AbstractEngine):
         return True
 
     def _add_request(
-        self, request: DynamicInferenceRequest, *, is_resume: bool = False
+        self,
+        request: DynamicInferenceRequest,
+        *,
+        is_resume: bool = False,
+        record: Optional[DynamicInferenceRequestRecord] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
         Args:
             request (DynamicInferenceRequest): Request to add.
-            is_resume (bool): Whether an existing record is being explicitly
-                re-admitted after suspend/resume.
+            is_resume (bool): Whether the newest segment of a record is being re-admitted,
+                as after suspend/resume, rather than a new record opened.
+            record (Optional[DynamicInferenceRequestRecord]): With `is_resume`, the record of
+                a generation resumed from another engine.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
         """
 
+        assert record is None or is_resume, "A record is registered only on resume."
         request_id = request.request_id
         if is_resume:
+            if record is not None:
+                assert (
+                    request_id not in self.requests
+                ), f"Request ID {request_id} is already active."
+                self.requests[request_id] = RequestEntry(
+                    record=record, future=self._loop.create_future()
+                )
             if request_id not in self.requests or self.get_request(request_id) is not request:
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
         elif request_id in self.requests:
@@ -2755,13 +2771,11 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_total = None
             return self._add_request(request)
 
-        entry = RequestEntry(record=record, future=self._loop.create_future())
         if resumed.finish_reason is not None:  # ended on its first engine: nothing to schedule
+            entry = RequestEntry(record=record, future=self._loop.create_future())
             self._complete_request(entry, reply_now=True)
-        else:
-            self.requests[request.request_id] = entry
-            self._add_request(record[-1], is_resume=True)
-        return entry.future
+            return entry.future
+        return self._add_request(record[-1], is_resume=True, record=record)
 
     def _build_vlm_request(
         self,

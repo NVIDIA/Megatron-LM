@@ -26,7 +26,7 @@ REQUEST_FIELD_POLICY = {
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
-    "finish_reason": "checkpoint:reset / merge:last-non-none",
+    "finish_reason": "checkpoint:preserve / merge:last",
     "encoder_prompt": "checkpoint:drop / merge:drop",
     "generated_text": "checkpoint:reset / merge:reset / finalize:decode-concatenated-tokens",
     "segments": "checkpoint:drop / merge:drop-unsupported",

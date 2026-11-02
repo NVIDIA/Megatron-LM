@@ -1176,7 +1176,24 @@ class DynamicInferenceRequestRecord:
         *,
         generation_epoch: Optional[int],
     ) -> "DynamicInferenceRequestRecord":
-        """Build the record the engine admits for a request that resumes a generation."""
+        """Build the record the engine admits for a request that resumes a generation.
+
+        Args:
+            first: The request built from the new submission, on the prompt as this engine
+                expanded it. It becomes the record's first segment and takes over the resumed
+                generation's tokens, scores, stamps, evictions and budget.
+            resumed: The generation the prompt preparer handed back, decoded from its wire form:
+                what an earlier engine generated for this request and whether it ended.
+            generation_epoch: This engine's current epoch, stamped on the continuation when it
+                differs from the resumed generation's last.
+
+        Returns:
+            A completed one-segment record when the generation already ended; otherwise two
+            segments, the resumed prefix evicted and the continuation the engine schedules.
+
+        Raises:
+            ValueError: When the resumed generation does not fit the request it resumes.
+        """
         if resumed.log_probs is None and first.sampling_params.return_log_probs:
             raise ValueError(
                 "resumed generation carries no log probs for a request that returns them"
@@ -1304,6 +1321,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=old_request.sampling_params,
             offload_params=old_request.offload_params,
             status=old_request.status,
+            finish_reason=old_request.finish_reason,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
             stop_word_ids=copy.deepcopy(old_request.stop_word_ids),
@@ -1403,13 +1421,6 @@ class DynamicInferenceRequestRecord:
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
-        # Need to account for the case where an earlier segment holds the stop but the
-        # final segment lost it: checkpoint() does not carry finish_reason, so an evict
-        # or suspend checkpoint buries a stop detected one step before completion.
-        finish_reason = next(
-            (r.finish_reason for r in reversed(self.requests) if r.finish_reason is not None), None
-        )
-
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
@@ -1432,7 +1443,7 @@ class DynamicInferenceRequestRecord:
             ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
-            finish_reason=finish_reason,
+            finish_reason=self.requests[-1].finish_reason,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
