@@ -550,6 +550,7 @@ class HybridStack(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -577,6 +578,8 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             rotary_pos_sin (Tensor, optional): RoPE sines, for static flash decoding.
                 Defaults to None.
+            rotary_pos_cos_sin (Tensor, optional): RoPE cosines and sines concatenated, for
+                FlashInfer's fused RoPE in dynamic inference. Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
         Returns:
@@ -746,6 +749,7 @@ class HybridStack(MegatronModule):
                             quant_context_factory=get_inner_quant_context,
                             rotary_pos_cos=rotary_pos_cos,
                             rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
                             cp_layout_state=cp_layout_state,
                             packed_sequence_cp_metadata=layer_cp_metadata,
                             attn_recompute_context=residual_stream_recompute_context,
@@ -778,6 +782,7 @@ class HybridStack(MegatronModule):
                                     rotary_pos_emb=rotary_pos_emb,
                                     rotary_pos_cos=rotary_pos_cos,
                                     rotary_pos_sin=rotary_pos_sin,
+                                    rotary_pos_cos_sin=rotary_pos_cos_sin,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,

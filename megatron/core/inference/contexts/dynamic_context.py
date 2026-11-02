@@ -401,6 +401,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        # Flash decoding keeps each layer's KV cache in a static per-layer buffer; attention
+        # runs it only under static batching.
+        if model_config.flash_decode:
+            raise ValueError(
+                "Flash decode is only applicable to static batching; set flash_decode=False "
+                "to use the dynamic inference context."
+            )
+
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy

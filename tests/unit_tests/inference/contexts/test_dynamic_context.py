@@ -229,6 +229,19 @@ def test_zero_padding_tokens_reads_real_token_count_at_cuda_graph_replay(
         assert torch.all(activations[real_token_count:] == 0)
 
 
+def test_flash_decode_is_rejected():
+    """Flash decoding runs only under static batching, for every model, so building the context
+    fails with a clear message instead of a bare assert inside the first attention layer."""
+    model_config = TransformerConfig(
+        num_layers=2, hidden_size=64, num_attention_heads=4, flash_decode=True
+    )
+    with pytest.raises(ValueError, match="Flash decode is only applicable to static batching"):
+        DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(max_sequence_length=64, buffer_size_gb=0.01),
+        )
+
+
 class TestDynamicContext:
 
     @classmethod
