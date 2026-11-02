@@ -1985,8 +1985,8 @@ def _add_inference_args(parser):
         action=argparse.BooleanOptionalAction,
         default=False,
         help='Overlap Shortcut MoE inference with its unsplit GDP or attention '
-        'predecessor. Requires dynamic BF16 inference_optimized language '
-        'layers, TP=CP=1, vLLM expert GEMMs, and NVLS.',
+        'predecessor. Requires dynamic inference_optimized language layers, '
+        'BF16 model parameters, TP=CP=1, and Triton NVLS.',
     )
 
     group.add_argument('--inference-batch-times-seqlen-threshold',

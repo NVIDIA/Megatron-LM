@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     ImageProcessingConfig,
@@ -600,11 +601,25 @@ def test_shortcut_overlap_model_validation():
         bf16=True,
         inference_grouped_gemm_backend="vllm",
         inference_moe_token_dispatcher_type="nvls",
+        activation_func=squared_relu,
     )
     config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
-    config.validate_shortcut_moe_model(model_config)
+    for backend in InferenceGroupedGemmBackend:
+        for mxfp8 in (False, True):
+            candidate = dataclasses.replace(
+                model_config,
+                inference_grouped_gemm_backend=backend,
+                fp8="hybrid" if mxfp8 else None,
+                fp8_recipe="mxfp8" if mxfp8 else "delayed",
+                fp8_param=mxfp8,
+            )
+            if mxfp8:
+                with pytest.raises(ValueError, match="requires further testing"):
+                    config.validate_shortcut_moe_model(candidate)
+            else:
+                config.validate_shortcut_moe_model(candidate)
     model_config.fp8 = "e4m3"
-    with pytest.raises(ValueError, match="BF16"):
+    with pytest.raises(ValueError, match="requires further testing"):
         config.validate_shortcut_moe_model(model_config)
 
 

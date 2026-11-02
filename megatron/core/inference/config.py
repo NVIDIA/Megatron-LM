@@ -857,8 +857,6 @@ class InferenceConfig:
         """Validate model compatibility before engine setup and CUDA graph capture."""
         if not self.inference_shortcut_moe_overlap:
             return
-        from megatron.core.inference.moe import InferenceGroupedGemmBackend
-
         if not model_config.moe_shortcut_connection:
             raise ValueError("inference_shortcut_moe_overlap requires Shortcut MoE")
 
@@ -867,12 +865,12 @@ class InferenceConfig:
                 "inference_shortcut_moe_overlap requires "
                 "transformer_impl='inference_optimized' for the language model"
             )
-        if model_config.params_dtype != torch.bfloat16 or model_config.fp8 or model_config.fp4:
-            raise ValueError("inference_shortcut_moe_overlap requires BF16 without FP8 or FP4")
+        if model_config.params_dtype != torch.bfloat16:
+            raise ValueError("inference_shortcut_moe_overlap requires BF16 model parameters")
+        if model_config.fp8 or model_config.fp4:
+            raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
         if model_config.tensor_model_parallel_size != 1 or model_config.context_parallel_size != 1:
             raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
-        if model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM:
-            raise ValueError("inference_shortcut_moe_overlap requires the vllm expert backend")
         if model_config.inference_moe_token_dispatcher_type != "nvls":
             raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
         if model_config.inference_disable_triton_nvls_kernels:
