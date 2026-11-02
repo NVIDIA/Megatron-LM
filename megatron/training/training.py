@@ -1805,28 +1805,27 @@ def pretrain(
 
     set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
-    # MIMO hands a per-module collection, which holds one ProcessGroupCollection
-    # per module and has no tp of its own. The cross-entropy warmup is vocab
-    # parallel, so it belongs to the language model's tensor-parallel group;
-    # a rank carrying only encoders warms its own module's shapes instead.
-    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        warmup_pg_collection = (
-            pg_collection.get_language_model_collection()
-            if pg_collection.has_language_model()
-            else next(iter(pg_collection))
-        )
-        warmup_tp_group = warmup_pg_collection.tp
-    elif pg_collection is not None:
-        warmup_tp_group = pg_collection.tp
+    # The GPT/Hybrid config describes language-model kernels, not encoder kernels.
+    # Only ranks carrying the language model should warm them, using its TP group.
+    if (
+        isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        and not pg_collection.has_language_model()
+    ):
+        print_rank_0("Skipping training-kernel warmup on encoder-only ranks.")
     else:
-        warmup_tp_group = mpu.get_tensor_model_parallel_group()
-    warmup_training_kernels(
-        cfg_container.model,
-        warmup_tp_group,
-        seq_length=args.seq_length,
-        micro_batch_size=cfg_container.train.micro_batch_size,
-    )
-    print_rank_0("Finished training-kernel warmup.")
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            warmup_tp_group = pg_collection.get_language_model_collection().tp
+        elif pg_collection is not None:
+            warmup_tp_group = pg_collection.tp
+        else:
+            warmup_tp_group = mpu.get_tensor_model_parallel_group()
+        warmup_training_kernels(
+            cfg_container.model,
+            warmup_tp_group,
+            seq_length=args.seq_length,
+            micro_batch_size=cfg_container.train.micro_batch_size,
+        )
+        print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
 
