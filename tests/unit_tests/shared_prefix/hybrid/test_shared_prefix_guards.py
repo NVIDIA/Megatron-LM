@@ -545,9 +545,16 @@ def test_hybrid_model_rejects_config_list_before_any_preprocessing():
     """Shared-prefix guards read the model-level config, not config-list per-layer configs."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
-    # The guard runs before the forward touches any module, so no allocation is needed.
+    # The guard runs before the forward touches any module, so no allocation is needed. The stub
+    # is a complete PP1 training model without MTP, so the other early guards pass wherever the
+    # config-list guard sits among them.
     model = HybridModel.__new__(HybridModel)
     torch.nn.Module.__init__(model)
+    model.pre_process = True
+    model.post_process = True
+    model.vp_stage = None
+    model.mtp_process = False
+    model.training = True
     model.hybrid_layer_config_list = (_config(),)
     with pytest.raises(NotImplementedError, match="hybrid_layer_config_list"):
         HybridModel.forward(
