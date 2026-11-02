@@ -970,10 +970,6 @@ jobs:
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -981,7 +977,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    name: "${{ matrix.bucket }} - latest"
+    name: Unit tests (H100)
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
@@ -998,8 +994,7 @@ jobs:
       && !cancelled()
     uses: ./.github/workflows/_unit-tests.yml
     with:
-      bucket: ${{ matrix.bucket }}
-      timeout: ${{ matrix.timeout || 30 }}
+      buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
@@ -1044,10 +1039,6 @@ jobs:
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest-gb200:
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200) }}
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -1055,7 +1046,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests-gb200
-    name: "${{ matrix.bucket }} - gb200 latest"
+    name: Unit tests (GB200)
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
@@ -1074,8 +1065,7 @@ jobs:
       && !cancelled()
     uses: ./.github/workflows/_unit-tests.yml
     with:
-      bucket: ${{ matrix.bucket }}
-      timeout: ${{ matrix.timeout || 30 }}
+      buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
       runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200

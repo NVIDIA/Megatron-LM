@@ -51,6 +51,9 @@ def _get_dsa_gqa_indexer_spec() -> ModuleSpec:
     )
 
 
+dsa_gqa_indexer_spec = _get_dsa_gqa_indexer_spec()
+
+
 def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
     """Return a copy of ``stack_spec`` whose attention layer uses DSA over GQA.
 
