@@ -523,6 +523,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+
+        # Cache for RoPE tensors which do not change between iterations.
+        self.rotary_pos_emb_cache = {}
+
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -805,15 +809,29 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         rotary_pos_emb = None
+        rotary_pos_cos = None
+        rotary_pos_sin = None
         if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
+            if in_inference_mode and inference_context is not None and self.config.flash_decode:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self._flash_decode_rotary_cos_sin(
+                    inference_context
+                )
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
         elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
+            if in_inference_mode and self.config.flash_decode:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "YarnRotaryEmbedding yet."
+                )
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -861,10 +879,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask_by_layout[layout] = layout_mask
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
-        decoder_rotary_pos_emb = (
-            None
+        # MLA layers apply their own decoupled RoPE.
+        decoder_rotary_pos_emb, decoder_rotary_pos_cos, decoder_rotary_pos_sin = (
+            (None, None, None)
             if self.hybrid_layer_config_list is not None and self._decoder_uses_mla
-            else rotary_pos_emb
+            else (rotary_pos_emb, rotary_pos_cos, rotary_pos_sin)
         )
 
         # Run decoder.
@@ -879,6 +898,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=decoder_rotary_pos_emb,
+                rotary_pos_cos=decoder_rotary_pos_cos,
+                rotary_pos_sin=decoder_rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 padding_mask_by_layout=padding_mask_by_layout,

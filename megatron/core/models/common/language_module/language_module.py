@@ -317,6 +317,23 @@ class LanguageModule(MegatronModule):
             return logits * self.config.mup_output_mult
         return logits
 
+    def _flash_decode_rotary_cos_sin(self, inference_context) -> Tuple[Tensor, Tensor]:
+        """RoPE cosines and sines for static flash decoding, which applies RoPE itself.
+
+        Attention under flash_decode ignores rotary_pos_emb and takes these instead. They cover
+        the context's maximum sequence length and are cached in `self.rotary_pos_emb_cache`.
+
+        Args:
+            inference_context (BaseInferenceContext): the inference context of this forward.
+        """
+        assert (
+            inference_context.is_static_batching()
+        ), "Flash decode is only applicable to static batching."
+        max_sequence_length = inference_context.max_sequence_length_for_model
+        return self.rotary_pos_emb_cache.setdefault(
+            max_sequence_length, self.rotary_pos_emb.get_cos_sin(max_sequence_length)
+        )
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).

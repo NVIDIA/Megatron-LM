@@ -425,18 +425,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 and inference_context is not None
                 and (self.config.flash_decode or use_flash_infer_fused_rope)
             ):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
-                    "Flash decode is only applicable to static batching."
-                )
                 # Flash decoding uses precomputed cos and sin for RoPE
                 if self.config.flash_decode:
-                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length_for_model,
-                        self.rotary_pos_emb.get_cos_sin(
-                            inference_context.max_sequence_length_for_model
-                        ),
+                    rotary_pos_cos, rotary_pos_sin = self._flash_decode_rotary_cos_sin(
+                        inference_context
                     )
                 elif use_flash_infer_fused_rope:
                     assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
