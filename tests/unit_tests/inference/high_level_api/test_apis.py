@@ -19,8 +19,6 @@ from megatron.core.inference.apis.serve_config import ServeConfig
 @pytest.fixture
 def mock_pipeline(monkeypatch):
     """Stub out the engine pipeline so the constructor runs without torch/megatron."""
-    from megatron.core import parallel_state
-
     engine = MagicMock()
     engine.context = MagicMock()
     engine.controller = MagicMock()
@@ -29,16 +27,14 @@ def mock_pipeline(monkeypatch):
     # None and resolve it in their public modules at call time.
     monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
-    # Bypass the EP-group initialization assert when no distributed setup
-    # is in scope. Individual tests can override (e.g.,
-    # ``test_ep_gt_1_requires_use_coordinator``).
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
 
 
 @pytest.fixture
 def fake_model_and_tokenizer():
     model = MagicMock()
-    model.config = MagicMock()
+    model.config = MagicMock(
+        tensor_model_parallel_size=1, expert_tensor_parallel_size=1, expert_model_parallel_size=1
+    )
     tokenizer = MagicMock()
     return model, tokenizer
 
@@ -92,17 +88,33 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="requires use_coordinator=True"):
             MegatronAsyncLLM(model=model, tokenizer=tok, use_coordinator=False)
 
-    def test_ep_gt_1_requires_use_coordinator(
-        self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
+    @pytest.mark.parametrize(
+        "tp, etp, ep", [(1, 1, 4), (1, 2, 1), (2, 2, 2)], ids=["ep", "etp-gt-tp", "tp-etp-ep"]
+    )
+    def test_moe_spanning_replicas_requires_use_coordinator(
+        self, mock_pipeline, fake_model_and_tokenizer, tp, etp, ep
     ):
-        """Direct mode with expert_model_parallel_size > 1 must raise --
-        EP routing requires the coordinator."""
-        from megatron.core import parallel_state
-
-        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
+        """Direct mode must raise when the MoE collectives span more than one data-parallel
+        replica (ETP * EP > TP) -- only the coordinator keeps the replicas in lockstep."""
         model, tok = fake_model_and_tokenizer
-        with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
+        model.config.tensor_model_parallel_size = tp
+        model.config.expert_tensor_parallel_size = etp
+        model.config.expert_model_parallel_size = ep
+        with pytest.raises(ValueError, match="span more than one data-parallel replica"):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+
+    @pytest.mark.parametrize("tp, etp, ep", [(2, 2, 1), (2, 1, 2)], ids=["etp-eq-tp", "ep-in-tp"])
+    def test_moe_within_one_replica_allows_direct_mode(
+        self, mock_pipeline, fake_model_and_tokenizer, tp, etp, ep
+    ):
+        """MoE collectives inside one attention TP group serve one replica's requests."""
+        model, tok = fake_model_and_tokenizer
+        model.config.tensor_model_parallel_size = tp
+        model.config.expert_tensor_parallel_size = etp
+        model.config.expert_model_parallel_size = ep
+        assert (
+            MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)._use_coordinator is False
+        )
 
 
 class TestLifecycleGuards:

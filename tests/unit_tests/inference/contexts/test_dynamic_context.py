@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import zero_padding_rows_kernel
@@ -49,6 +50,18 @@ def rounder_override(n):
     finally:
         DynamicInferenceContext.TOKEN_ROUNDER = original_token_rounder
         DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
+
+
+class _ScriptedCommunicator:
+    """Stands in for the engine's tp_ep ZMQ communicator, with the peers' votes scripted."""
+
+    def __init__(self, peers_not_decode_only: bool):
+        self.peers = int(peers_not_decode_only)
+        self.sent = []
+
+    def sync_all_reduce_max(self, value):
+        self.sent.append(value)
+        return max(value, self.peers)
 
 
 @pytest.mark.parametrize(
@@ -271,6 +284,7 @@ class TestDynamicContext:
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
         expert_model_parallel_size: int = 1,
+        expert_tensor_parallel_size: int = 1,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
     ):
@@ -296,7 +310,12 @@ class TestDynamicContext:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
                 expert_model_parallel_size=expert_model_parallel_size,
-                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
+                expert_tensor_parallel_size=expert_tensor_parallel_size,
+                num_moe_experts=(
+                    2 if expert_model_parallel_size * expert_tensor_parallel_size > 1 else None
+                ),
+                # MoE biases need ETP == 1.
+                add_bias_linear=expert_tensor_parallel_size == 1,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -2895,11 +2914,15 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
-        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
+    # ETP > TP with EP = 1 still makes the idle rank join tp_ep peers' collectives.
+    @pytest.mark.parametrize("etp, ep", [(1, 2), (2, 1)])
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self, etp, ep):
+        parallel = dict(expert_tensor_parallel_size=etp, expert_model_parallel_size=ep)
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16, **parallel)
         ctx = self._get_hybrid_ep_context(
-            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
+            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True, **parallel
         )
+        assert ctx.reserve_recurrent_state_dummy_slot
         assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
         assert ctx.max_requests == baseline.max_requests
         metadata = ctx.mamba_metadata
@@ -2936,6 +2959,128 @@ class TestDynamicContext:
 
         with pytest.raises(AssertionError, match="No free recurrent-state slots"):
             ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
+
+    def _get_bounded_moe_context(
+        self, *, etp, ep, max_requests, num_cuda_graphs=None, communicator=None
+    ):
+        """A context for an NVLS FlashInfer MoE model with a 128-row token capacity and TP = 1."""
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=128,
+            moe_grouped_gemm=True,
+            moe_router_dtype="fp32",
+            transformer_impl="inference_optimized",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            activation_func=squared_relu,
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_nvfp4_recipe="per_token",
+            inference_moe_token_dispatcher_type="nvls",
+            inference_flashinfer_mxfp8_token_capacity=128,
+            expert_tensor_parallel_size=etp,
+            expert_model_parallel_size=ep,
+        )
+        ctx = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                buffer_size_gb=0.05,
+                block_size_tokens=128,
+                max_tokens=256,
+                max_requests=max_requests,
+                num_cuda_graphs=num_cuda_graphs,
+                unified_memory_level=0,
+            ),
+        )
+        ctx.set_ep_zmq_communicator(communicator)
+        return ctx
+
+    @staticmethod
+    def _dummy_decode_step(ctx):
+        """An idle rank's dummy decode step: agree, then initialize the attention state."""
+        ctx.agree_on_moe_decode_only(True)
+        ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        result = (ctx.use_bounded_mxfp8_rows, ctx.using_cuda_graph_this_step())
+        ctx.reset()
+        return result
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize(
+        "etp, ep, max_requests, bounded",
+        [
+            # 2 replicas x 64 decode rows fit the 128-row capacity.
+            (1, 2, 64, True),
+            # ETP > TP: the NVLS all-gather holds 4 replicas x 64 decode rows.
+            (2, 2, 64, False),
+            (2, 2, 32, True),
+        ],
+    )
+    def test_bounded_moe_rows_hold_every_replicas_decode_tokens(
+        self, etp, ep, max_requests, bounded
+    ):
+        """Bounded MoE rows must hold the decode tokens of every replica in the tp_ep group."""
+        ctx = self._get_bounded_moe_context(
+            etp=etp,
+            ep=ep,
+            max_requests=max_requests,
+            communicator=_ScriptedCommunicator(peers_not_decode_only=False),
+        )
+        assert self._dummy_decode_step(ctx) == (bounded, False)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 8])
+    def test_bounded_moe_rows_need_every_replica_decode_only(self, num_cuda_graphs):
+        """A decode-only rank bounds its MoE rows only when every replica agrees that it is
+        decode-only too. Otherwise it runs eagerly: decode-only CUDA graphs are captured bounded,
+        and a peer's prefill tokens sit past the capacity in the gathered rows."""
+        graphed = num_cuda_graphs is not None
+        peers_decode = _ScriptedCommunicator(peers_not_decode_only=False)
+        ctx = self._get_bounded_moe_context(
+            etp=1, ep=2, max_requests=64, num_cuda_graphs=num_cuda_graphs, communicator=peers_decode
+        )
+        assert self._dummy_decode_step(ctx) == (True, graphed)
+        assert peers_decode.sent == [0]
+
+        ctx.set_ep_zmq_communicator(_ScriptedCommunicator(peers_not_decode_only=True))
+        assert self._dummy_decode_step(ctx) == (False, False)
+
+        # A prefilling rank tells its peers, and runs unbounded itself.
+        ctx.set_ep_zmq_communicator(peers_decode)
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 8, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            )
+        )
+        ctx.agree_on_moe_decode_only(ctx.num_prefill_requests == 0)
+        ctx.initialize_attention_state()
+        assert not ctx.use_bounded_mxfp8_rows
+        assert peers_decode.sent == [0, 1]
+        ctx.reset()
+
+        # Without the engine's tp_ep communicator the replicas cannot agree.
+        ctx.set_ep_zmq_communicator(None)
+        assert self._dummy_decode_step(ctx) == (False, False)
+
+        if graphed:
+            # Graph capture runs the same batch on every rank and consumes no agreement.
+            ctx.set_ep_zmq_communicator(peers_decode)
+            ctx.initialize_attention_state(
+                construct_graph_dimensions=min(
+                    dims
+                    for dims in ctx.cuda_graph_batch_dimensions_list
+                    if dims.prefill_req_count == 0
+                )
+            )
+            assert ctx.use_bounded_mxfp8_rows and ctx.using_cuda_graph_this_step()
+            assert peers_decode.sent == [0, 1]
+            ctx.reset()
 
     @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):

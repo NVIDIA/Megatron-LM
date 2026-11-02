@@ -308,6 +308,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
             return_value=(torch.empty(0, dtype=torch.int32), torch.arange(metadata_len))
         ),
         copy_async_sched_sample_to_forward=mock.Mock(),
+        agree_on_moe_decode_only=mock.Mock(),
         reset=mock.Mock(),
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
@@ -348,6 +349,8 @@ def _make_async_sched_controller(context=None, model_config=None):
     context = context or _make_async_sched_context()
     model_config = model_config or SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=None,
         moe_enable_routing_replay=False,
@@ -496,6 +499,8 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     context.request_metadata["top_n_logprobs"] = torch.tensor([1, 1])
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=2,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -692,6 +697,8 @@ def test_collect_router_recording_gathers_sequence_parallel_rows():
     )
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -835,6 +842,8 @@ def test_run_async_sched_forward_records_pending_routing():
     context = _make_async_sched_context()
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -882,6 +891,8 @@ def test_capture_async_sched_routing_alternates_banks_with_delayed_copy(discard)
     )
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         num_moe_experts=4,
         moe_enable_routing_replay=True,
@@ -1011,16 +1022,27 @@ def test_dummy_forward_matches_mode_forward_order(mode, expected_order):
 
 
 @pytest.mark.parametrize(
-    "num_speculative_tokens, ep_size, expected_order",
-    [(0, 2, ["base"]), (2, 1, ["base"]), (2, 2, ["mtp", "base"])],
+    "num_speculative_tokens, tp_size, etp_size, ep_size, expected_order",
+    [
+        (0, 1, 1, 2, ["base"]),
+        (2, 1, 1, 1, ["base"]),
+        (2, 1, 1, 2, ["mtp", "base"]),
+        # ETP > TP: the expert-TP peers are other data-parallel replicas.
+        (2, 1, 2, 1, ["mtp", "base"]),
+        # The MoE collectives stay inside one attention TP group: no other replica to match.
+        (2, 2, 2, 1, ["base"]),
+        (2, 2, 1, 2, ["base"]),
+    ],
 )
 def test_async_sched_primer_matches_dummy_mtp_order(
-    num_speculative_tokens, ep_size, expected_order
+    num_speculative_tokens, tp_size, etp_size, ep_size, expected_order
 ):
-    """An EP primer inserts dummy MTP collectives only when its peers do."""
+    """A primer inserts dummy MTP collectives only when replicas in its tp_ep group do."""
     context = _make_async_sched_context(total_request_count=1)
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=tp_size,
+        expert_tensor_parallel_size=etp_size,
         expert_model_parallel_size=ep_size,
         num_moe_experts=4 if ep_size > 1 else None,
         moe_enable_routing_replay=False,
@@ -1038,6 +1060,89 @@ def test_async_sched_primer_matches_dummy_mtp_order(
     controller._run_async_sched_forward_primer()
 
     assert order == expected_order
+
+
+@pytest.mark.parametrize(
+    "mode, run_async_overlap, has_pending_logits, num_prefill_requests, decode_only",
+    [
+        # The engine admits a legacy step's requests before the step starts.
+        (AsyncScheduleMode.LEGACY, True, False, 0, True),
+        (AsyncScheduleMode.LEGACY, True, False, 1, False),
+        # Overlap steps launch decode-only forwards; a no-overlap step admits requests later.
+        (AsyncScheduleMode.ASYNC, True, True, 0, True),
+        (AsyncScheduleMode.ASYNC, False, True, 0, False),
+        (AsyncScheduleMode.ASYNC, True, False, 0, False),
+    ],
+)
+def test_step_agrees_on_moe_decode_only_before_its_forwards(
+    mode, run_async_overlap, has_pending_logits, num_prefill_requests, decode_only
+):
+    """The replicas sharing the MoE collectives agree on the step's phase before any of them
+    issues a collective, so none bounds its MoE rows while another is not decode-only."""
+    context = _make_async_sched_context()
+    context.config.async_sched_mode = mode
+    context.num_prefill_requests = num_prefill_requests
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_forward.is_valid = has_pending_logits
+    controller._validate_async_sched_support_for_step = mock.Mock()
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append(("agree", value))
+    step = mock.AsyncMock(side_effect=lambda *args, **kwargs: order.append("step"))
+    controller._run_legacy_step = step
+    controller._run_async_sched_step_no_overlap = step
+    controller._run_async_sched_step_overlap = step
+    controller._run_async_sched_step_overlap_mtp = step
+
+    asyncio.run(
+        controller.async_generate_output_tokens_dynamic_batch(run_async_overlap=run_async_overlap)
+    )
+
+    assert order == [("agree", decode_only), "step"]
+
+
+def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
+    """An idle rank's dummy step counts as decode-only and agrees before its collectives."""
+    context = _make_async_sched_context()
+    controller = _make_async_sched_controller(context)
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append(("agree", value))
+
+    def context_init(**kwargs):
+        order.append("init")
+        return torch.tensor([[1]]), torch.tensor([[0]]), None
+
+    controller._dynamic_step_context_init = mock.Mock(side_effect=context_init)
+    controller._run_dummy_base_forward = mock.Mock(side_effect=lambda *_: order.append("base"))
+    controller._run_dummy_serial_mtp_forward = mock.Mock(side_effect=lambda: order.append("mtp"))
+
+    controller.dummy_forward()
+
+    assert order == [("agree", True), "init", "mtp", "base"]
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_dynamic_step_forward_takes_bounded_moe_rows_from_the_context(bounded):
+    """The forward uses the bounded MoE rows exactly when the context decided so this step."""
+    context = _make_async_sched_context()
+    context.use_bounded_mxfp8_rows = bounded
+    context.num_last_token_logits = 2
+    context.has_vlm_data = False
+    controller = _make_async_sched_controller(context)
+    controller.model_is_pipeline_parallel = False
+    controller._select_async_sched_routing_buffer = mock.Mock()
+    seen = []
+
+    def run_one_forward_step(inference_input):
+        seen.append(InferenceMode.use_bounded_mxfp8_rows())
+        return torch.zeros(1, 2, 4)
+
+    controller.inference_wrapped_model.run_one_forward_step = run_one_forward_step
+    tokens = torch.zeros(1, 2, dtype=torch.long)
+
+    with InferenceMode.active():
+        controller._dynamic_step_forward_logits(tokens, tokens)
+
+    assert seen == [bounded]
 
 
 def test_async_sched_router_returns_empty_result_without_active_requests():
@@ -1974,6 +2079,8 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
     context.num_prefill_requests = 1
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=2,
         num_moe_experts=4,
         moe_enable_routing_replay=False,

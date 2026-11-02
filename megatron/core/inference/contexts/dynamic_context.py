@@ -38,7 +38,11 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import device_memory_summary, tensor_swap
+from megatron.core.inference.utils import (
+    device_memory_summary,
+    get_moe_dp_replica_count,
+    tensor_swap,
+)
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
@@ -672,12 +676,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         mamba_max_requests = float('inf')
         # Handoff may retain every request-owned recurrent-state slot after the requests leave
-        # the batch. An idle EP rank must still run a dummy forward to join its peers' expert
-        # collectives, so disaggregated callers can reserve one slot outside request capacity.
+        # the batch. An idle rank must still run a dummy forward to join the expert collectives
+        # of its tp_ep peers (the engine's consensus spans tp_ep), so disaggregated callers can
+        # reserve one slot outside request capacity.
         self.reserve_recurrent_state_dummy_slot = bool(
             self.is_hybrid_model
             and inference_config.reserve_recurrent_state_dummy_slot
-            and model_config.expert_model_parallel_size > 1
+            and model_config.expert_tensor_parallel_size * model_config.expert_model_parallel_size
+            > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
         reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
@@ -946,6 +952,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
+
+        # Bounded FlashInfer MoE rows (inference_flashinfer_mxfp8_token_capacity): the experts of
+        # a decode-only step may process only the first `capacity` gathered rows, provided those
+        # rows hold every live token. A decode-only step gathers up to `decode_bound` tokens from
+        # each data-parallel replica in the MoE group. With more than one replica, each step the
+        # replicas must also agree that all of them are decode-only (agree_on_moe_decode_only).
+        token_capacity = model_config.inference_flashinfer_mxfp8_token_capacity
+        moe_dp_replicas = get_moe_dp_replica_count(model_config)
+        self._moe_decode_rows_fit_capacity = (
+            token_capacity is not None and moe_dp_replicas * decode_bound <= token_capacity
+        )
+        self._moe_decode_only_needs_agreement = (
+            self._moe_decode_rows_fit_capacity and moe_dp_replicas > 1
+        )
+        self._moe_replicas_agree_decode_only = False
+        self.use_bounded_mxfp8_rows = False
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -2330,13 +2352,34 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         When set, match_graph_config() uses this communicator's
         sync_all_reduce_max() to perform the EP batch-dimension MAX reduction on
         the CPU instead of launching a NCCL AllReduce kernel on the compute
-        stream. Expected to be called once by the inference engine after both
+        stream, and agree_on_moe_decode_only() uses it to agree on the step's
+        phase. Expected to be called once by the inference engine after both
         the context and the communicator have been created.
 
         Args:
-            communicator: AsyncZMQCommunicator over the EP process group.
+            communicator: AsyncZMQCommunicator over the tp_ep process group.
         """
         self._ep_zmq_communicator = communicator
+
+    def agree_on_moe_decode_only(self, decode_only: bool) -> None:
+        """Agree across the MoE group whether every replica runs a decode-only forward this step.
+
+        The bounded FlashInfer MoE rows hold every gathered token only if every data-parallel
+        replica in the tp_ep group runs a decode-only (or dummy) forward. Every tp_ep rank calls
+        this once per engine step, before the step's first MoE collective; the next
+        initialize_attention_state() consumes the result. Without the engine's tp_ep
+        communicator the replicas cannot agree, so their steps never use the bounded rows.
+
+        Args:
+            decode_only (bool): Whether this rank's forward this step is known to be
+                decode-only.
+        """
+        if not self._moe_decode_only_needs_agreement:
+            return
+        communicator = self._ep_zmq_communicator
+        self._moe_replicas_agree_decode_only = (
+            communicator is not None and communicator.sync_all_reduce_max(int(not decode_only)) == 0
+        )
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
@@ -2701,6 +2744,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
+
+        # Bounded MoE rows need every replica in the MoE group to be decode-only. Graph capture
+        # runs the same batch on every rank, so only regular steps consume the agreement.
+        decode_only = batch_dimensions.prefill_req_count == 0
+        if self._moe_decode_only_needs_agreement and not self.is_creating_cuda_graphs:
+            decode_only = decode_only and self._moe_replicas_agree_decode_only
+            self._moe_replicas_agree_decode_only = False
+        self.use_bounded_mxfp8_rows = self._moe_decode_rows_fit_capacity and decode_only
+        if (
+            self._moe_decode_rows_fit_capacity
+            and best_graph is not None
+            and best_graph.prefill_req_count == 0
+            and not self.use_bounded_mxfp8_rows
+        ):
+            # Decode-only graphs are captured with the bounded rows; run eagerly instead while
+            # another replica is not decode-only.
+            best_graph = None
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:

@@ -37,6 +37,7 @@ from megatron.core.inference.utils import (
     detokenize_tokens,
     get_attention_mask,
     get_language_model,
+    get_moe_dp_replica_count,
     model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -930,17 +931,7 @@ class TextGenerationController(MTPControllerMixin):
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
-        decode_token_upper_bound = (
-            context.max_requests
-            * (self.num_speculative_tokens + 1)
-            * self.model_config.expert_model_parallel_size
-        )
-        InferenceMode.set_bounded_mxfp8_rows(
-            context.is_decode_only()
-            and token_capacity is not None
-            and decode_token_upper_bound <= token_capacity
-        )
+        InferenceMode.set_bounded_mxfp8_rows(context.use_bounded_mxfp8_rows)
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
@@ -1768,6 +1759,7 @@ class TextGenerationController(MTPControllerMixin):
     def dummy_forward(self) -> None:
         """Run the mode-specific dummy step used by idle expert-parallel ranks."""
         context = self.inference_wrapped_model.inference_context
+        context.agree_on_moe_decode_only(True)
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
 
         if context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
@@ -2858,7 +2850,7 @@ class TextGenerationController(MTPControllerMixin):
             input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
                 self._dynamic_step_context_init(record_bookkeeping_done_event=True)
             )
-            if self.num_speculative_tokens > 0 and self.model_config.expert_model_parallel_size > 1:
+            if self.num_speculative_tokens > 0 and get_moe_dp_replica_count(self.model_config) > 1:
                 self._run_dummy_serial_mtp_forward()
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -3195,7 +3187,7 @@ class TextGenerationController(MTPControllerMixin):
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     launched_decode_only = context.is_decode_only()
                     self._synchronize_async_sched_event(bookkeeping_done_event)
-            elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
+            elif had_pending_forward and get_moe_dp_replica_count(self.model_config) > 1:
                 self._run_dummy_async_sched_base_step()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
@@ -3612,6 +3604,8 @@ class TextGenerationController(MTPControllerMixin):
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY:
+            # The engine admitted this step's requests before the call.
+            context.agree_on_moe_decode_only(context.num_prefill_requests == 0)
             return await self._run_legacy_step(
                 skip_bookkeeping, finalize_requests=finalize_requests
             )
@@ -3620,6 +3614,10 @@ class TextGenerationController(MTPControllerMixin):
 
         assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
         self._validate_async_sched_support_for_step(run_async_overlap)
+        # Agree before the step's MTP forwards, which an idle peer's dummy step joins only after
+        # its own agreement. Overlap steps launch decode-only forwards; a no-overlap step admits
+        # its requests later, so it does not count as decode-only.
+        context.agree_on_moe_decode_only(run_async_overlap and self._async_sched_forward.is_valid)
 
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0:

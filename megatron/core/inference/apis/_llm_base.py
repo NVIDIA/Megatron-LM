@@ -28,6 +28,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import get_moe_dp_replica_count
 
 
 class _EventLoopManager:
@@ -283,15 +284,16 @@ class _MegatronLLMBase:
         if disaggregated and not use_coordinator:
             raise ValueError("disaggregated inference requires use_coordinator=True")
 
-        if not use_coordinator:
-            from megatron.core import parallel_state
-
-            ep_size = parallel_state.get_expert_model_parallel_world_size()
-            if ep_size > 1:
-                raise ValueError(
-                    f"use_coordinator=True is required when expert_model_parallel_size > 1 "
-                    f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
-                )
+        if not use_coordinator and get_moe_dp_replica_count(model.config) > 1:
+            config = model.config
+            raise ValueError(
+                "use_coordinator=True is required when the MoE token collectives span more than "
+                "one data-parallel replica, i.e. expert_tensor_parallel_size * "
+                "expert_model_parallel_size > tensor_model_parallel_size (got ETP="
+                f"{config.expert_tensor_parallel_size}, EP={config.expert_model_parallel_size}, "
+                f"TP={config.tensor_model_parallel_size}). Use coordinator mode to keep the "
+                "replicas in lockstep."
+            )
 
         engine = build_dynamic_inference_engine(
             model=model,

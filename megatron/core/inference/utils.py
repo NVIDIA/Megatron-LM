@@ -130,6 +130,29 @@ class InferenceMode:
             cls.unset_active()
 
 
+def get_moe_dp_replica_count(config) -> int:
+    """Return how many data-parallel replicas share the inference MoE token collectives.
+
+    The inference MoE dispatchers gather and scatter tokens over the expert tensor-and-model
+    parallel (tp_ep) group of expert_tensor_parallel_size * expert_model_parallel_size ranks.
+    The ranks of one attention TP group serve the same requests, and TP is the innermost
+    dimension of both the attention and the expert rank layouts, so tp_ep either lies inside one
+    attention TP group or is made of whole ones.
+
+    With more than one replica the tp_ep ranks serve different requests: they must step in
+    lockstep (an idle rank runs dummy steps that issue every MoE collective its peers issue),
+    and a decode-only step gathers the decode tokens of every replica.
+
+    Args:
+        config: Model config holding the tensor, expert-tensor and expert parallel sizes.
+
+    Returns:
+        int: The number of replicas, at least 1.
+    """
+    tp_ep_size = config.expert_tensor_parallel_size * config.expert_model_parallel_size
+    return max(1, -(-tp_ep_size // config.tensor_model_parallel_size))
+
+
 def device_memory_summary() -> str:
     """One-line GPU memory summary for torch_memory_saver logging."""
     dev = torch.cuda.current_device()

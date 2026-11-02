@@ -207,6 +207,8 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
     controller.model_config = SimpleNamespace(
         params_dtype=torch.float32,
         hidden_size=HIDDEN_SIZE,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
         expert_model_parallel_size=1,
         moe_pad_experts_for_cuda_graph_inference=False,
     )

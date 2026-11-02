@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.utils import get_moe_dp_replica_count
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -676,8 +677,9 @@ class MTPControllerMixin:
 
         When speculative decoding is active and MTP layers contain MoE sublayers
         (inherited from the decoder layer spec), each serial MTP step triggers
-        EP all-to-all collectives. The dummy EP rank must issue matching
-        collective calls so the real ranks do not hang.
+        MoE collectives over the tp_ep group. When that group spans more than one
+        data-parallel replica, the dummy rank must issue matching collective calls
+        so the real ranks do not hang.
 
         This mirrors the structure of `_compute_serial_mtp_and_sample`:
         - On the last PP stage (where MTP resides): run `compute_mtp_single_step`
@@ -687,7 +689,7 @@ class MTPControllerMixin:
         """
         if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
-        if self.model_config.expert_model_parallel_size <= 1:
+        if get_moe_dp_replica_count(self.model_config) <= 1:
             return
 
         context = self.inference_wrapped_model.inference_context
