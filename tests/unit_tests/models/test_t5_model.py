@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import os
 from copy import deepcopy
 
@@ -174,7 +175,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
 @pytest.mark.parametrize(
     'pp_size, pre_process, post_process, tied, embedding_state, valid',
     [
-        (1, False, False, False, 'omitted', False),
+        (1, False, False, False, 'omitted', True),
         (2, False, True, True, 'omitted', False),
         (1, True, True, True, 'none', True),
         (2, False, False, True, 'none', True),
@@ -229,11 +230,18 @@ def test_constructor_embedding_group_contract(
         share_embeddings_and_output_weights=tied,
         pg_collection=pg_collection,
     )
+    # A collection without an embd field is treated as embd=None, with a deprecation warning.
+    missing_embd = (
+        pytest.warns(FutureWarning, match='without an embd field')
+        if embedding_state == 'omitted'
+        else contextlib.nullcontext()
+    )
     if valid:
-        model = T5Model(**kwargs)
+        with missing_embd:
+            model = T5Model(**kwargs)
         assert model.embd_group is pg_collection.embd
     else:
-        with pytest.raises(ValueError, match='embd'):
+        with pytest.raises(ValueError, match='embd'), missing_embd:
             T5Model(**kwargs)
     global_groups.assert_not_called()
 
