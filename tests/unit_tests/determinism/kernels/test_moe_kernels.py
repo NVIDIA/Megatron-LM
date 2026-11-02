@@ -710,6 +710,45 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("num_tokens", [64, 4096], ids=["decode", "prefill"])
+@pytest.mark.parametrize("topk,scaling_factor", [(4, None), (8, 2.5)])
+def test_batch_invariant_sigmoid_topk_routing_replays(num_tokens, topk, scaling_factor):
+    """Batch-invariant sigmoid routing runs the Triton top-k kernel (training and inference).
+
+    Forward is the kernel with a token-count-independent launch; backward differentiates the
+    reference formula at the kernel's indices. Both must replay bit-exactly.
+    """
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    seeded()
+    logits = torch.randn(num_tokens, 256, device="cuda", dtype=torch.float32, requires_grad=True)
+    expert_bias = torch.randn(256, device="cuda") * 0.01
+    with set_batch_invariant_mode(True):
+        assert moe_utils._use_batch_invariant_sigmoid_topk(
+            logits, topk, "sigmoid", expert_bias, False, None, None
+        ), "the batch-invariant kernel path must be selected"
+
+        def fn(logits):
+            return moe_utils.topk_routing_with_score_function(
+                logits,
+                topk=topk,
+                score_function="sigmoid",
+                expert_bias=expert_bias,
+                scaling_factor=scaling_factor,
+            )
+
+        assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn(num_tokens, 256, device="cuda")},
+            replays=3,
+            contention=True,
+            what=f"batch-invariant sigmoid routing[topk={topk}, tokens={num_tokens}]",
+        )
+
+
 @pytest.mark.parametrize("det_algos", [True, False])
 def test_quantile_balancing_histogram_and_bias_replay(det_algos):
     """Replay accumulated integer histograms, routing gradients, and the batch update."""
