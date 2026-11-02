@@ -227,7 +227,8 @@ def test_csa_sparse_attn_flattens_and_restores_sbhd_layout():
     assert torch.equal(actual, flat_output.reshape(sq, batch, heads * value_dim))
 
 
-def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
+@pytest.mark.parametrize("actual_heads", [2, 64])
+def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch, actual_heads):
     seen = {}
 
     def fake_flash(q, _kv, _indices, _scale, **kwargs):
@@ -236,6 +237,7 @@ def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
         rows, heads, _ = q.shape
         out = torch.arange(rows * heads * 3, dtype=q.dtype).reshape(rows, heads, 3)
         lse = torch.arange(rows * heads, dtype=torch.float32).reshape(rows, heads)
+        seen["out"] = out
         lse_indexer = lse + 1000
         return out, torch.empty(0), lse, lse_indexer
 
@@ -243,28 +245,32 @@ def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
     monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
     monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 1)
 
-    q = torch.randn(3, 2, 8)
+    q = torch.randn(3, actual_heads, 8)
     kv = torch.randn(5, 8)
     indices = torch.zeros(3, 4, dtype=torch.int32)
-    sink = torch.tensor([0.25, -0.5])
+    sink = torch.linspace(-0.5, 0.25, actual_heads)
 
     out, lse, lse_indexer = fused_csa._csa_fwd_flash_mla(
         q, kv, indices, 0.125, d_v=3, attn_sink=sink, indexer_topk=1
     )
 
     assert seen["q"].shape == (3, 64, 8)
-    assert torch.equal(seen["q"][:, :2], q)
-    assert torch.count_nonzero(seen["q"][:, 2:]) == 0
-    assert torch.equal(seen["sink"][:2], sink)
-    assert torch.all(seen["sink"][2:] == float("-inf"))
-    assert out.shape == (3, 2, 3)
-    assert lse.shape == (3, 2)
-    assert lse_indexer.shape == (3, 2)
-    expected_out = torch.arange(3 * 64 * 3, dtype=q.dtype).reshape(3, 64, 3)[:, :2]
-    expected_lse = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)[:, :2]
+    assert torch.equal(seen["q"][:, :actual_heads], q)
+    assert torch.count_nonzero(seen["q"][:, actual_heads:]) == 0
+    assert torch.equal(seen["sink"][:actual_heads], sink)
+    assert torch.all(seen["sink"][actual_heads:] == float("-inf"))
+    assert out.shape == (3, actual_heads, 3)
+    assert lse.shape == (3, actual_heads)
+    assert lse_indexer.shape == (3, actual_heads)
+    expected_out = torch.arange(3 * 64 * 3, dtype=q.dtype).reshape(3, 64, 3)[:, :actual_heads]
+    expected_lse = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)[:, :actual_heads]
     assert torch.equal(out, expected_out)
     assert torch.equal(lse, expected_lse)
     assert torch.equal(lse_indexer, expected_lse + 1000)
+
+    assert out.is_contiguous()
+    if actual_heads == 64:
+        assert out is seen["out"]
 
 
 def test_attn_target_pads_small_head_count(monkeypatch):
