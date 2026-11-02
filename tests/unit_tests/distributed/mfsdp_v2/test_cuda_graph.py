@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -60,7 +60,8 @@ def _default_placements() -> Placements:
         ),
     ],
 )
-def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
+@pytest.mark.parametrize("singleton_inner", [False, True], ids=["sharded", "local_inner"])
+def test_captures_full_iteration(distributed_setup, use_symmetric_memory, singleton_inner):
     """A full training iteration should be CUDA-graphable, with and without symmetric memory.
 
     With ``use_symmetric_memory=True`` the FSDP collective path changes: unshard allocates the
@@ -76,7 +77,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     if use_symmetric_memory and world_size < 2:
         pytest.skip("Symmetric memory requires at least 2 ranks.")
 
-    mesh = init_device_mesh(device.type, (world_size,))
+    mesh = init_device_mesh(device.type, (world_size, 1) if singleton_inner else (world_size,))
     torch.manual_seed(1234)
     dim = _HIDDEN
     model = NestedModel(dim=dim, num_children=2).to(device)
@@ -85,9 +86,17 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     static_target = torch.zeros_like(static_input)
 
     placements = _default_placements()
+    if singleton_inner:
+        placements = Placements(
+            [0, 1], [Replicate(), Shard(0)], [Partial("avg"), Shard(0)], [Replicate(), Shard(0)]
+        )
     with fully_shard_context(
         FsdpContext(
-            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+            device=device,
+            runtime_policy=RuntimePolicy(
+                use_symmetric_memory=use_symmetric_memory,
+                overlap_outer_communication=singleton_inner,
+            ),
         )
     ):
         for layer in model.layers:

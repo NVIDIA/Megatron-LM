@@ -51,6 +51,56 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
+@pytest.mark.parametrize("explicit_out", [False, True])
+@pytest.mark.parametrize(
+    "source_placement,target_placement,operation,args",
+    [
+        (RowAtomic(), Replicate(), "allgather", (0,)),
+        (Partial("avg"), Replicate(), "allreduce", (0,)),
+        (Partial("avg"), RowAtomic(), "reduce_scatter", (0, RowAtomic())),
+        (Partial("sum"), RowAtomic(), "reduce_scatter", (0, RowAtomic())),
+    ],
+)
+def test_singleton_collectives_reuse_storage(
+    distributed_setup,
+    monkeypatch,
+    explicit_out,
+    source_placement,
+    target_placement,
+    operation,
+    args,
+):
+    """Singleton collectives return views, or fill an explicit output without communication."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("outer", "singleton"),
+    )["singleton"]
+    tensor = torch.arange(32, device=distributed_setup.device, dtype=torch.float32).reshape(8, 4)
+    source = DBuffer.distribute_tensors([tensor], mesh, [source_placement])
+    out = None
+    if explicit_out:
+        out = DBuffer(mesh, [target_placement], source.layout, source.dtype, source.device)
+        out.local_buffer.fill_(-1)
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("A singleton redistribution must not launch a collective.")
+
+    for name in ("all_gather", "all_gather_into_tensor", "all_reduce", "reduce_scatter_tensor"):
+        monkeypatch.setattr(dist, name, unexpected_collective)
+
+    for result in (
+        source.redistribute([target_placement], out=out),
+        getattr(source, operation)(*args, out=out),
+    ):
+        assert result.placements == (target_placement,)
+        if out is None:
+            assert result.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+        else:
+            assert result is out
+        _assert_dbuffer_local_tensors_close(result, [tensor])
+
+
 @pytest.mark.parametrize(
     "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
 )

@@ -33,7 +33,7 @@ from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
+from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic, can_redistribute_locally
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
@@ -118,6 +118,7 @@ class FsdpParameterGroup:
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
     grad_comm_dtype: torch.dtype
+    requires_inner_reduction: bool
     # Full compute storage: persistent model_weight when replicated, otherwise a
     # temporary buffer populated by all-gather.
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
@@ -350,7 +351,7 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if self.model_weight.placements == unsharded_placements:
+        if can_redistribute_locally(self.mesh, self.model_weight.placements, unsharded_placements):
             self._unsharded_model_weight = self.model_weight
         else:
             with self._symmetric_memory_context():
@@ -372,6 +373,9 @@ class FsdpParameterGroup:
         self._main_grad_is_stale = False
         grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
+        self.requires_inner_reduction = not can_redistribute_locally(
+            self.mesh, (Partial("avg"),) * self.mesh.ndim, main_grad_placements
+        )
         if not self.requires_grad:
             return
 
@@ -636,12 +640,42 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
-    def _has_sharded_grads(self) -> bool:
+    def accumulate_local_gradients(self) -> None:
+        """Accumulate gradients requiring no inner reduction, without a packing buffer."""
+        assert self.main_grad is not None
+        assert not self.requires_inner_reduction
+        for fsdp_parameter in self.fsdp_parameters:
+            if fsdp_parameter.unsharded.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+
+        has_sharded_grads = self._prepare_main_grad()
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            grad = fsdp_parameter.unsharded.grad
+            destination = self.main_grad.get_tensor_view(index)
+            if not has_sharded_grads and self.grad_comm_dtype == self.main_grad.dtype:
+                # Convert before scaling: mul(bf16_grad, scale, out=fp32) rounds in bf16.
+                destination.copy_(grad)
+                if self.grad_scale != 1:
+                    destination.mul_(self.grad_scale)
+            else:
+                # Preserve the packed path's cast, scale, then accumulate ordering.
+                grad = grad.to(self.grad_comm_dtype)
+                if self.grad_scale != 1:
+                    grad = grad * self.grad_scale
+                if has_sharded_grads:
+                    destination.add_(grad)
+                else:
+                    destination.copy_(grad)
+            fsdp_parameter.unsharded.grad = None
+        self._install_sharded_grads(self.main_grad)
+
+    def _prepare_main_grad(self) -> bool:
+        """Clear stale storage and report whether this backward must accumulate."""
+        assert self.main_grad is not None
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
@@ -651,6 +685,12 @@ class FsdpParameterGroup:
                 has_any_grad = True
         if has_any_grad and has_any_missing_grad:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+        if self._main_grad_is_stale:
+            # zero_grad(False) only zeros the optimizer view, which can be smaller.
+            # With zero_grad(True), this backward overwrites every parameter instead.
+            if has_any_grad:
+                self.main_grad.local_buffer.zero_()
+            self._main_grad_is_stale = False
         return has_any_grad
 
     def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
@@ -665,18 +705,7 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
-        has_sharded_grads = self._has_sharded_grads()
-        if self._main_grad_is_stale:
-            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
-            # optimizer view. Clear the persistent full accumulation buffer before this
-            # new step; set_to_none=True needs no clear because out= below overwrites it.
-            if has_sharded_grads:
-                self.main_grad.local_buffer.zero_()
-            self._main_grad_is_stale = False
-
+        has_sharded_grads = self._prepare_main_grad()
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):

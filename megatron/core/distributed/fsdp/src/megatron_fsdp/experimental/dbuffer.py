@@ -26,7 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import BlockAtomic, ShardLayout, TensorAtomic
+from .placement import BlockAtomic, ShardLayout, TensorAtomic, can_redistribute_locally
 from .range import Range, intersect_ranges
 
 
@@ -426,8 +426,9 @@ class DBuffer:
 
         Only Shard-to-Replicate gathers and Replicate-to-Shard views may change
         multiple axes. Reductions and other transitions must change one axis.
-        Without ``out``, sharding returns a view and unchanged placements return
-        ``self``. Other transitions allocate the destination as needed.
+        Without ``out``, local transitions (including singleton-axis changes)
+        return a view and unchanged placements return ``self``. Other transitions
+        allocate the destination as needed. An explicit ``out`` receives a copy.
         """
         new_placements = tuple(new_placements)
         changed_axes = [
@@ -435,13 +436,7 @@ class DBuffer:
             for axis, (old, new) in enumerate(zip(self.placements, new_placements))
             if old != new
         ]
-        # all() is True for an empty changed_axes, so unchanged placements also
-        # use this path. view() then returns self, avoiding allocation/copying
-        # when out is omitted; an explicit out still receives a copy.
-        if all(
-            self.placements[axis].is_replicate() and new_placements[axis].is_shard()
-            for axis in changed_axes
-        ):
+        if can_redistribute_locally(self.mesh, self.placements, new_placements):
             view = self.view(new_placements)
             if out is None:
                 return view
@@ -495,6 +490,8 @@ class DBuffer:
             if not isinstance(placements[axis], Shard):
                 raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
             placements[axis] = Replicate()
+        if can_redistribute_locally(self.mesh, self.placements, placements):
+            return self.redistribute(placements, out=out)
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
         placements = list(self.placements)
@@ -518,14 +515,17 @@ class DBuffer:
             input_placements = tuple(placements)
             placements[axis] = Replicate()
             view = out.view(placements)
-            group = self.mesh.get_group(axis)
-            if self.layout.has_equal_shard_sizes:
+            if self.mesh.size(axis) == 1:
+                view.local_buffer.copy_(local_buffer)
+            elif self.layout.has_equal_shard_sizes:
                 # Symmetric-memory registration is scoped to the collective's process
                 # group, so rendezvous the output on the same mesh axis as the all-gather.
                 if out.is_symmetric_memory:
                     out.rendezvous(axis)
                 dist.all_gather_into_tensor(
-                    output_tensor=view.local_buffer, input_tensor=local_buffer, group=group
+                    output_tensor=view.local_buffer,
+                    input_tensor=local_buffer,
+                    group=self.mesh.get_group(axis),
                 )
             else:
                 # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
@@ -535,7 +535,7 @@ class DBuffer:
                         "Symmetric-memory allgather() requires equal shard sizes."
                     )
                 chunks = self._peer_chunks(view, input_placements, axis)
-                dist.all_gather(chunks, local_buffer, group=group)
+                dist.all_gather(chunks, local_buffer, group=self.mesh.get_group(axis))
             local_buffer = view.local_buffer
         return out
 
@@ -548,6 +548,8 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
+        if self.mesh.size(axis) == 1:
+            return self.redistribute(placements, out=out)
         out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
@@ -569,6 +571,8 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
+        if self.mesh.size(axis) == 1:
+            return self.redistribute(placements, out=out)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
         group = self.mesh.get_group(axis)

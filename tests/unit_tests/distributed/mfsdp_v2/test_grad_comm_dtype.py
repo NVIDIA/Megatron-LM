@@ -13,15 +13,17 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -47,6 +49,80 @@ class TinyModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_replicated_gradients_still_reduce(distributed_setup):
+    """Full local gradient storage does not imply that cross-rank reduction is unnecessary."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires distinct contributions from at least two ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(8, 8, bias=False, device=device)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(model, mesh, Placements([0], [Replicate()], [Replicate()], [Replicate()]))
+    inputs = torch.full((1, 8), float(distributed_setup.rank + 1), device=device)
+    for count in (1, 2):
+        model(inputs).sum().backward()
+        expected = torch.full_like(
+            inputs.expand(8, 8), count * (distributed_setup.world_size + 1) / 2
+        )
+        torch.testing.assert_close(model.weight.grad.to_local(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("outer_optimizer", [Replicate(), Shard(0)], ids=["hsdp", "hfsdp"])
+@pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("set_to_none", [False, True])
+def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
+    distributed_setup, outer_optimizer, grad_comm_dtype, set_to_none
+):
+    """Local accumulation preserves cast-before-scale precision and deferred outer reduction."""
+    setup = distributed_setup
+    if setup.world_size < 2:
+        pytest.skip("Requires a nontrivial outer data-parallel axis.")
+    mesh = init_device_mesh(setup.device.type, (setup.world_size, 1))
+    model = nn.Linear(8, 8, bias=False, device=setup.device, dtype=torch.bfloat16)
+    context = FsdpContext(
+        device=setup.device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
+    )
+    scale = 1 / 3
+    with fully_shard_context(context):
+        fully_shard(
+            model,
+            mesh,
+            Placements(
+                [0, 1],
+                [Replicate(), Shard(0)],
+                [Partial("avg"), Shard(0)],
+                [outer_optimizer, Shard(0)],
+            ),
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+            ),
+            grad_scale=scale,
+        )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=set_to_none)
+        expected_by_rank = torch.zeros(setup.world_size, device=setup.device)
+        for index in range(2):
+            with microbatch(context, is_last=index == 1):
+                inputs = torch.full(
+                    (1, 8), setup.rank + index + 1, device=setup.device, dtype=torch.bfloat16
+                )
+                model(inputs).float().sum().backward()
+            context.finish_grad_sync()
+            # Independently form each rank's contribution in the configured reduction dtype.
+            contributions = torch.arange(
+                index + 1, setup.world_size + index + 1, device=setup.device, dtype=torch.bfloat16
+            )
+            expected_by_rank.add_(
+                (contributions.to(grad_comm_dtype or torch.float32) * scale).float()
+            )
+            expected = expected_by_rank.mean() if index == 1 else expected_by_rank[setup.rank]
+            actual = model.weight.grad.to_local()
+            torch.testing.assert_close(actual, expected.expand_as(actual), rtol=1e-6, atol=0)
+        optimizer.step()
 
 
 @pytest.mark.parametrize(
