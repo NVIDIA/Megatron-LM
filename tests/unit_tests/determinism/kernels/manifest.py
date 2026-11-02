@@ -778,10 +778,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py. The shared-prefix branch (a "
-        "MambaSharedPrefixCall attached by forward_mamba_layer_shared_prefix) hands the mixer half "
-        "to mamba_shared_prefix; its ragged and packed scans are replayed through a real "
-        "MambaMixer in test_shared_prefix_mamba_kernels.py, and "
+        "kernels replayed piecewise in test_ssm_kernels.py. The shared-prefix branch (the "
+        "shared_prefix_call argument that forward_mamba_layer_shared_prefix passes through "
+        "MambaLayer.forward) hands the mixer half to mamba_shared_prefix; its ragged and packed "
+        "scans are replayed through a real MambaMixer in test_shared_prefix_mamba_kernels.py, and "
         "test_shared_prefix_mamba_module_call.py checks that the branch runs through the layer "
         "and mixer module calls.",
     ),
