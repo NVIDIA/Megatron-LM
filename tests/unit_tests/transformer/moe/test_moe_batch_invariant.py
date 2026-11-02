@@ -147,7 +147,7 @@ def _moe_env():
         Utils.destroy_model_parallel()
 
 
-def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
+def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1, **overrides):
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
@@ -175,6 +175,7 @@ def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
         flash_attention_version=4,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        **overrides,
     )
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
@@ -207,11 +208,13 @@ def test_tegroupedmlp_batch_invariant_split(_moe_env):
     )
 
 
-def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
+@pytest.mark.parametrize("grouped_tensor", [False, True])
+def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env, grouped_tensor):
     """The strongest batch-invariance check: a fixed set of "target" tokens must
     produce the *exact same output* regardless of what other tokens surround
-    them in the batch. This is what RL log-prob parity needs."""
-    layer, cfg = _build_moe_layer()
+    them in the batch. This is what RL log-prob parity needs. With grouped
+    tensors the experts take TE's GroupedTensor path."""
+    layer, cfg = _build_moe_layer(moe_use_grouped_tensor=grouped_tensor)
     torch.manual_seed(1)
 
     # 8 target tokens whose outputs we lock in by running them alone.
@@ -256,80 +259,194 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
     )
 
 
-@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
-def test_tegroupedlinear_runs_batch_invariant_grouped_gemm(_moe_env, monkeypatch, backend):
-    """A TE expert linear built from an accepted config runs DeepGEMM's grouped GEMM, never
-    TE's GroupedTensor grouped GEMM (config validation rejects that path for this backend)."""
-    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
+def _forbid_te_grouped_gemms(monkeypatch):
+    """Make every TE cuBLASLt grouped GEMM raise, so a bypass fails the test."""
+    import transformer_engine_torch as tex
 
-    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+    def forbidden(name):
+        def raise_(*args, **kwargs):
+            raise AssertionError(f"{name} ran TE's grouped GEMM under batch-invariant mode")
+
+        return raise_
+
+    for name in (
+        "te_general_grouped_gemm",
+        "te_general_grouped_gemm_for_grouped_tensor",
+        "te_general_grouped_gemm_for_discrete_in",
+        "te_general_grouped_gemm_for_discrete_out",
+    ):
+        if hasattr(tex, name):
+            monkeypatch.setattr(tex, name, forbidden(name))
+
+
+def _count_deepgemm_grouped_gemms(monkeypatch):
     from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    calls = {"m_grouped": 0, "k_grouped": 0}
+    for key, name in (
+        ("m_grouped", "m_grouped_bf16_gemm_nt_contiguous"),
+        ("k_grouped", "k_grouped_bf16_gemm_tn_contiguous"),
+    ):
+
+        def counted(*args, _key=key, _fn=getattr(bik.deep_gemm, name), **kwargs):
+            calls[_key] += 1
+            return _fn(*args, **kwargs)
+
+        monkeypatch.setattr(bik.deep_gemm, name, counted)
+    return calls
+
+
+@pytest.mark.parametrize("counts", [[37, 0, 300, 5, 128], [0, 0, 1, 0, 0], [256] * 5])
+def test_grouped_gemm_device_counts_matches_host_counts(counts):
+    """Reading the group sizes on the device gives the host-count kernel's bits."""
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        _bf16_grouped_gemm_device_counts,
+    )
+
+    torch.manual_seed(0)
+    E, K, N = len(counts), 256, 192
+    x = torch.randn(sum(counts), K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
+    m_indices = _m_splits_to_m_indices(counts, x.device, x.shape[0])
+    expected = _bf16_grouped_gemm_contiguous(x, w, m_indices, counts)
+    out = torch.full_like(expected, float("nan"))
+    device_counts = torch.tensor(counts, device="cuda", dtype=torch.int64)
+    groups = _bf16_grouped_gemm_device_counts(x, w, device_counts, out=out)
+    assert torch.equal(out, expected)
+    assert torch.equal(groups.to(torch.int32), m_indices)
+
+
+@pytest.mark.parametrize("splits", [[256, 512, 0, 256], [37, 0, 300, 5]])
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_te_grouped_linear_grouped_tensor_path_matches_legacy_path(
+    _moe_env, monkeypatch, backend, splits
+):
+    """TE GroupedLinear's GroupedTensor path (moe_use_grouped_tensor=True) runs DeepGEMM's
+    grouped GEMMs, never TE's, with the legacy path's bits in forward, dgrad and wgrad."""
+    from transformer_engine.pytorch.module.grouped_linear import (
+        is_module_grouped_tensor_path_supported,
+    )
+
+    from megatron.core.extensions.transformer_engine import (
+        _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+        TEGroupedLinear,
+    )
     from megatron.core.transformer.enums import AttnBackend
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import init_method_normal
 
-    num_experts, k, n = 4, 512, 256
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=k,
-        ffn_hidden_size=n,
-        moe_ffn_hidden_size=n,
-        num_attention_heads=4,
-        num_moe_experts=num_experts,
-        moe_router_topk=2,
-        moe_grouped_gemm=True,
-        moe_token_dispatcher_type="alltoall",
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        add_bias_linear=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=3,
-        batch_invariant_mode=True,
-        batch_invariant_backend=backend,
-    )
-    calls = {"deepgemm": 0, "grouped_tensor": 0}
+    # The CI image's TE and cuBLASLt take the GroupedTensor path on this GPU; without it
+    # this test would compare the legacy path with itself.
+    assert _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+    assert is_module_grouped_tensor_path_supported(None, torch.bfloat16)
 
-    def counted(name, fn):
-        def wrapper(*args, **kwargs):
-            calls[name] += 1
-            return fn(*args, **kwargs)
+    num_experts, k, n = len(splits), 512, 256
 
-        return wrapper
-
-    monkeypatch.setattr(
-        bik.deep_gemm,
-        "m_grouped_bf16_gemm_nt_contiguous",
-        counted("deepgemm", bik.deep_gemm.m_grouped_bf16_gemm_nt_contiguous),
-    )
-    if hasattr(te_grouped_linear, "general_grouped_gemm_for_grouped_tensor"):
-        monkeypatch.setattr(
-            te_grouped_linear,
-            "general_grouped_gemm_for_grouped_tensor",
-            counted("grouped_tensor", te_grouped_linear.general_grouped_gemm_for_grouped_tensor),
+    def build(grouped_tensor):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=k,
+            ffn_hidden_size=n,
+            moe_ffn_hidden_size=n,
+            num_attention_heads=4,
+            num_moe_experts=num_experts,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_use_grouped_tensor=grouped_tensor,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=3,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
         )
-    module = TEGroupedLinear(
-        num_experts,
-        k,
-        n,
-        parallel_mode=None,
-        config=config,
-        init_method=init_method_normal(0.02),
-        bias=False,
-        skip_bias_add=False,
-        is_expert=True,
-    ).cuda()
-    splits = [256, 512, 0, 256]
+        return TEGroupedLinear(
+            num_experts,
+            k,
+            n,
+            parallel_mode=None,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+        ).cuda()
+
+    legacy, grouped = build(False), build(True)
+    with torch.no_grad():
+        for i in range(num_experts):
+            getattr(grouped, f"weight{i}").copy_(getattr(legacy, f"weight{i}"))
     torch.manual_seed(3)
     x = torch.randn(sum(splits), k, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
-        out, _ = module(x, splits)
-    assert calls["deepgemm"] > 0 and calls["grouped_tensor"] == 0, calls
+    dy = torch.randn(sum(splits), n, device="cuda", dtype=torch.bfloat16)
+    _forbid_te_grouped_gemms(monkeypatch)
+    calls = _count_deepgemm_grouped_gemms(monkeypatch)
+    results = {}
+    with set_batch_invariant_mode(True, backend=backend):
+        for name, module, m_splits in (
+            ("legacy", legacy, splits),
+            ("grouped", grouped, torch.tensor(splits, device="cuda", dtype=torch.int64)),
+        ):
+            x_i = x.clone().requires_grad_(True)
+            out, _ = module(x_i, m_splits)
+            out.backward(dy)
+            weight_grads = [getattr(module, f"weight{i}").grad for i in range(num_experts)]
+            results[name] = (out, x_i.grad, weight_grads)
+    assert calls["m_grouped"] >= 4 and calls["k_grouped"] >= 2, calls
+    (out, dx, dw), (out_ref, dx_ref, dw_ref) = results["grouped"], results["legacy"]
+    assert torch.equal(out, out_ref)
+    assert torch.equal(dx, dx_ref)
+    for i in range(num_experts):
+        assert torch.equal(dw[i], dw_ref[i]), f"weight{i} gradient"
     reference = torch.cat(
         [
-            x_i.double() @ getattr(module, f"weight{i}").double().t()
+            x_i.double() @ getattr(legacy, f"weight{i}").double().t()
             for i, x_i in enumerate(torch.split(x, splits))
         ]
     )
     torch.testing.assert_close(out.double(), reference, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_te_op_fuser_grouped_linear_runs_batch_invariant_grouped_gemm(
+    _moe_env, monkeypatch, backend
+):
+    """The op fuser's GroupedLinear (use_transformer_engine_op_fuser experts) runs
+    DeepGEMM's grouped GEMMs, never TE's, in forward, dgrad and wgrad."""
+    import transformer_engine.pytorch.ops as te_ops
+    from transformer_engine.pytorch.ops.basic.grouped_linear import (
+        is_op_fuser_grouped_tensor_path_supported,
+    )
+
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        _bf16_grouped_gemm_wgrad_contiguous,
+    )
+
+    # BF16 takes the op fuser's GroupedTensor path on the CI image.
+    assert is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16)
+    splits = [256, 512, 0, 256]
+    num_experts, k, n = len(splits), 512, 256
+    op = te_ops.GroupedLinear(num_experts, k, n, bias=False, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(4)
+    x = torch.randn(sum(splits), k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dy = torch.randn(sum(splits), n, device="cuda", dtype=torch.bfloat16)
+    _forbid_te_grouped_gemms(monkeypatch)
+    calls = _count_deepgemm_grouped_gemms(monkeypatch)
+    with set_batch_invariant_mode(True, backend=backend):
+        out = op(x, torch.tensor(splits, device="cuda", dtype=torch.int64))
+        out.backward(dy)
+        assert calls["m_grouped"] >= 2 and calls["k_grouped"] >= 1, calls
+        w = torch.stack([getattr(op, f"weight{i}").detach() for i in range(num_experts)])
+        m_indices = _m_splits_to_m_indices(splits, x.device, x.shape[0])
+        expected_out = _bf16_grouped_gemm_contiguous(x.detach(), w, m_indices, splits)
+        w_kn = w.transpose(1, 2).contiguous()
+        expected_dx = _bf16_grouped_gemm_contiguous(dy, w_kn, m_indices, splits)
+        expected_dw = _bf16_grouped_gemm_wgrad_contiguous(dy, x.detach(), splits)
+    assert torch.equal(out, expected_out)
+    assert torch.equal(x.grad, expected_dx)
+    for i in range(num_experts):
+        assert torch.equal(getattr(op, f"weight{i}").grad, expected_dw[i]), f"weight{i} gradient"

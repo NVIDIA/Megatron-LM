@@ -628,7 +628,7 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
-_TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_GROUPED_GEMM_FUNC_ORIGS: Dict[tuple, Any] = {}
 _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
 
@@ -697,8 +697,9 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
             meg_te.general_gemm = _te_general_gemm_patched
 
-        # Patch TE.general_grouped_gemm at every known import site so that
-        # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
+        # Patch both TE grouped GEMMs at every known import site so that TE
+        # GroupedLinear experts (legacy and grouped-tensor paths, module and op
+        # fuser; forward + dgrad + wgrad) go through DeepGEMM in bf16.
         # Grouped GEMMs are a GEMM concern: under skip_gemm ("te_native") they
         # stay native, covered by the same cuBLASLt workspace starvation.
         _te_patch_general_grouped_gemm()
@@ -778,62 +779,48 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             mod.apply_normalization = _te_apply_normalization_patched
 
 
+# TE modules that bind its grouped GEMMs by name: the GroupedLinear module, the
+# cpp_extensions package and its gemm module, and the op fuser's GroupedLinear op.
+_TE_GROUPED_GEMM_SITES = (
+    "transformer_engine.pytorch.module.grouped_linear",
+    "transformer_engine.pytorch.cpp_extensions",
+    "transformer_engine.pytorch.cpp_extensions.gemm",
+    "transformer_engine.pytorch.ops.basic.grouped_linear",
+)
+
+
 def _te_patch_general_grouped_gemm() -> None:
-    """Replace TE.general_grouped_gemm with a batch-invariant dispatcher.
+    """Replace TE's grouped GEMMs with batch-invariant DeepGEMM dispatchers.
 
-    Patches the symbol at three import sites — the consumer module
-    (transformer_engine.pytorch.module.grouped_linear), the package-level
-    re-export (transformer_engine.pytorch.cpp_extensions), and the source
-    module (transformer_engine.pytorch.cpp_extensions.gemm). Stores originals
-    in _TE_GROUPED_GEMM_FUNC_ORIGS so the unpatch can restore them.
+    TE has two grouped GEMM entry points: general_grouped_gemm, which takes host
+    split sizes (GroupedLinear's legacy path), and
+    general_grouped_gemm_for_grouped_tensor, which takes GroupedTensors with
+    device split sizes (GroupedLinear's grouped-tensor path and the op fuser).
+    Both are rebound at every module in _TE_GROUPED_GEMM_SITES that imports them;
+    the originals are stored in _TE_GROUPED_GEMM_FUNC_ORIGS for the unpatch.
     """
-    te_grouped_linear_mod = _import_module_if_available(
-        "transformer_engine.pytorch.module.grouped_linear"
-    )
-    if te_grouped_linear_mod is not None and hasattr(te_grouped_linear_mod, "general_grouped_gemm"):
-        key = "module.grouped_linear.general_grouped_gemm"
-        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
-            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_grouped_linear_mod.general_grouped_gemm
-            te_grouped_linear_mod.general_grouped_gemm = _te_general_grouped_gemm_patched
-
-    te_cpp = _import_module_if_available("transformer_engine.pytorch.cpp_extensions")
-    if te_cpp is not None and hasattr(te_cpp, "general_grouped_gemm"):
-        key = "cpp_extensions.general_grouped_gemm"
-        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
-            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_cpp.general_grouped_gemm
-            te_cpp.general_grouped_gemm = _te_general_grouped_gemm_patched
-
-    te_cpp_gemm = _import_module_if_available("transformer_engine.pytorch.cpp_extensions.gemm")
-    if te_cpp_gemm is not None and hasattr(te_cpp_gemm, "general_grouped_gemm"):
-        key = "cpp_extensions.gemm.general_grouped_gemm"
-        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
-            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_cpp_gemm.general_grouped_gemm
-            te_cpp_gemm.general_grouped_gemm = _te_general_grouped_gemm_patched
+    patched = {
+        "general_grouped_gemm": _te_general_grouped_gemm_patched,
+        "general_grouped_gemm_for_grouped_tensor": _te_grouped_tensor_gemm_patched,
+    }
+    for module_name in _TE_GROUPED_GEMM_SITES:
+        mod = _import_module_if_available(module_name)
+        if mod is None:
+            continue
+        for name, fn in patched.items():
+            key = (module_name, name)
+            if hasattr(mod, name) and key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
+                _TE_GROUPED_GEMM_FUNC_ORIGS[key] = getattr(mod, name)
+                setattr(mod, name, fn)
 
 
 def _te_unpatch_general_grouped_gemm() -> None:
     """Restore the originals captured by _te_patch_general_grouped_gemm."""
-    module_paths = {
-        "module.grouped_linear.general_grouped_gemm": (
-            "transformer_engine.pytorch.module.grouped_linear",
-            "general_grouped_gemm",
-        ),
-        "cpp_extensions.general_grouped_gemm": (
-            "transformer_engine.pytorch.cpp_extensions",
-            "general_grouped_gemm",
-        ),
-        "cpp_extensions.gemm.general_grouped_gemm": (
-            "transformer_engine.pytorch.cpp_extensions.gemm",
-            "general_grouped_gemm",
-        ),
-    }
-    for key, (mod_name, attr) in module_paths.items():
-        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
-            continue
-        mod = _import_module_if_available(mod_name)
-        if mod is not None and hasattr(mod, attr):
-            setattr(mod, attr, _TE_GROUPED_GEMM_FUNC_ORIGS[key])
-        _TE_GROUPED_GEMM_FUNC_ORIGS.pop(key, None)
+    for (module_name, name), fn in list(_TE_GROUPED_GEMM_FUNC_ORIGS.items()):
+        mod = _import_module_if_available(module_name)
+        if mod is not None:
+            setattr(mod, name, fn)
+        del _TE_GROUPED_GEMM_FUNC_ORIGS[(module_name, name)]
 
 
 def _is_bf16_grouped_path(A, B, quantization_params, gelu: bool) -> bool:
@@ -892,16 +879,16 @@ def _te_general_grouped_gemm_patched(
             "with GELU fusion disabled."
         )
 
-    # Dispatch by TE's call convention.
-    # In TE _GroupedLinear:
+    # Dispatch by TE's call convention. TE's GroupedLinear module passes grad=True
+    # for dgrad and wgrad; the op fuser's GroupedLinear op does not.
     #   forward  -> layout="TN", single_output=True,  grad=False  (A=weights, B=inputmats)
-    #   dgrad    -> layout="NN", single_output=True,  grad=True   (A=weights, B=grad_y)
-    #   wgrad    -> layout="NT", single_output=False, grad=True   (A=inputmats, B=grad_y)
+    #   dgrad    -> layout="NN", single_output=True               (A=weights, B=grad_y)
+    #   wgrad    -> layout="NT", single_output=False              (A=inputmats, B=grad_y)
     if single_output and layout == "TN" and not grad:
         return _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate)
-    if single_output and layout == "NN" and grad:
+    if single_output and layout == "NN":
         return _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate)
-    if (not single_output) and layout == "NT" and grad:
+    if (not single_output) and layout == "NT":
         return _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
     raise RuntimeError(
         "Unsupported batch-invariant grouped GEMM call: "
@@ -1004,6 +991,120 @@ def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
         else:
             target.copy_(contrib)
     return out, grad_bias, None
+
+
+def _grouped_tensor_data(t, role: str, dtypes=(torch.bfloat16,)) -> torch.Tensor:
+    """Row-wise data of an unquantized TE GroupedTensor, in its 2D logical shape."""
+    from transformer_engine.pytorch.tensor import GroupedTensorStorage
+
+    if (
+        not isinstance(t, GroupedTensorStorage)
+        or t.quantizer is not None
+        or t.rowwise_data is None
+        or t.rowwise_data.dtype not in dtypes
+    ):
+        raise RuntimeError(
+            f"Batch-invariant grouped GEMM requires the {role} as an unquantized "
+            f"GroupedTensor of dtype {', '.join(str(d) for d in dtypes)}."
+        )
+    return t.rowwise_data.view(t.logical_shape)
+
+
+def _grouped_tensor_row_counts(t) -> torch.Tensor:
+    """Per-group row counts of a TE GroupedTensor, on its device."""
+    if t.first_dims is not None:
+        return t.first_dims
+    rows = t.logical_shape[0] // t.num_tensors
+    return torch.full((t.num_tensors,), rows, dtype=torch.int64, device=t.rowwise_data.device)
+
+
+def _grouped_tensor_weights(A) -> torch.Tensor:
+    """Expert weights as one [E, N, K] bf16 tensor, from a list or a single grouped weight."""
+    from transformer_engine.pytorch.tensor import GroupedTensorStorage, QuantizedTensorStorage
+
+    if isinstance(A, GroupedTensorStorage):
+        w = _grouped_tensor_data(A, "weight")
+        return w.view(A.num_tensors, -1, w.shape[-1])
+    if isinstance(A, (list, tuple)) and all(
+        isinstance(w, torch.Tensor)
+        and not isinstance(w, QuantizedTensorStorage)
+        and w.dtype == torch.bfloat16
+        for w in A
+    ):
+        return _stack_weights_for_deepgemm(list(A))
+    raise RuntimeError("Batch-invariant grouped GEMM requires unquantized BF16 weights.")
+
+
+def _te_grouped_tensor_gemm_patched(
+    A,
+    B,
+    out,
+    *,
+    layout: str = "TN",
+    accumulate: bool = False,
+    use_split_accumulator: bool = False,
+    bias=None,
+    bias_scale: Optional[torch.Tensor] = None,
+    grad: bool = False,
+    alpha: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+):
+    """Batch-invariant replacement for TE general_grouped_gemm_for_grouped_tensor.
+
+    Runs the DeepGEMM grouped GEMMs of the general_grouped_gemm patch, with each
+    group's row count read from the GroupedTensor's device metadata. Forward and
+    dgrad never read the counts on the host, so they stay CUDA-graph safe. Wgrad
+    copies them to the host, because DeepGEMM's K-grouped GEMM takes them there
+    on SM90 (as the legacy path does). Unsupported calls fail rather than run
+    TE's cuBLASLt grouped GEMM.
+    """
+    del use_split_accumulator  # BF16 GEMMs accumulate in fp32 throughout.
+    if grad or alpha is not None or beta is not None or (bias is not None and layout != "TN"):
+        raise RuntimeError(
+            "Batch-invariant grouped-tensor GEMM supports no grad, alpha or beta argument, and "
+            f"bias only in forward (layout={layout!r})."
+        )
+    if layout in ("TN", "NN"):
+        # forward: out = x @ W[e]^T;  dgrad: out = dy @ W[e].  A = weights, B = x or dy.
+        assert not accumulate, "Forward and dgrad never accumulate"
+        weights = _grouped_tensor_weights(A)
+        if layout == "NN":
+            weights = weights.transpose(1, 2).contiguous()
+        rows = _grouped_tensor_data(B, "input")
+        counts = _grouped_tensor_row_counts(B)
+        result = _grouped_tensor_data(out, "output")
+        groups = _bf16_grouped_gemm_device_counts(rows, weights, counts, out=result)
+        if bias is not None:
+            row_bias = _grouped_tensor_data(bias, "bias").view(weights.shape[0], -1)[groups]
+            if bias_scale is not None:
+                row_bias = row_bias * bias_scale.view(-1, 1)
+            result.add_(row_bias)
+        return out
+    if layout == "NT":
+        # wgrad: out[e] (+)= dy[e]^T @ x[e].  A = x, B = dy, out = list or grouped weights.
+        from transformer_engine.pytorch.tensor import GroupedTensorStorage
+
+        x = _grouped_tensor_data(A, "input")
+        dy = _grouped_tensor_data(B, "output gradient")
+        counts = _grouped_tensor_row_counts(B).tolist()
+        dw = _bf16_grouped_gemm_wgrad_contiguous(dy.contiguous(), x.contiguous(), counts)
+        if isinstance(out, GroupedTensorStorage):
+            targets = [
+                _grouped_tensor_data(out, "weight gradient", (torch.bfloat16, torch.float32)).view(
+                    dw.shape
+                )
+            ]
+            contribs = [dw]
+        else:
+            targets, contribs = list(out), list(dw)
+        for target, contrib in zip(targets, contribs):
+            contrib = contrib.to(target.dtype)
+            if accumulate:
+                target.add_(contrib)
+            else:
+                target.copy_(contrib)
+        return out
+    raise RuntimeError(f"Unsupported batch-invariant grouped-tensor GEMM layout {layout!r}.")
 
 
 def _te_unpatch_for_batch_invariant():
@@ -1574,6 +1675,46 @@ def _bf16_grouped_gemm_contiguous(
         src += count
         dst += padded_count
     return d
+
+
+def _bf16_grouped_gemm_device_counts(
+    a: torch.Tensor, b: torch.Tensor, counts: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    """bf16 M-grouped GEMM via DeepGEMM with each group's row count on the device.
+
+    a:      [M_total, K] bf16, rows of group i contiguous and in group order.
+    b:      [E, N, K]    bf16 per-group weights (NT layout).
+    counts: [E]          int, rows per group, on the device; sums to M_total.
+    out:    [M_total, N] bf16, written in place.
+    Returns the [M_total] group index of each row.
+
+    Same kernel and per-row results as _bf16_grouped_gemm_contiguous, without a
+    host read of the counts: each group's rows are scattered into its own block,
+    padded to DeepGEMM's alignment, of a buffer sized for any counts, and the
+    output rows are gathered back. CUDA-graph safe.
+    """
+    _require_deepgemm_bf16("m_grouped_bf16_gemm_nt_contiguous")
+    M_total, K = a.shape
+    E, N, _ = b.shape
+    rows = torch.arange(M_total, device=a.device)
+    counts = counts.to(device=a.device, dtype=torch.int64)
+    ends = torch.cumsum(counts, 0)
+    # Clamp keeps rows past sum(counts), which TE never passes, inside the buffer.
+    groups = torch.searchsorted(ends, rows, right=True).clamp_(max=E - 1)
+    if M_total == 0:
+        return groups
+    alignment = _deepgemm_m_alignment()
+    padded = (counts + alignment - 1) // alignment * alignment
+    padded_starts = torch.cumsum(padded, 0) - padded
+    dst = padded_starts[groups] + rows - (ends - counts)[groups]
+    capacity = (M_total + E * (alignment - 1) + alignment - 1) // alignment * alignment
+    a_padded = a.new_zeros(capacity, K).index_copy_(0, dst, a.contiguous())
+    m_indices = torch.full((capacity,), -1, device=a.device, dtype=torch.int32)
+    m_indices.index_copy_(0, dst, groups.to(torch.int32))
+    d_padded = a.new_empty(capacity, N)
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a_padded, b.contiguous(), d_padded, m_indices)
+    torch.index_select(d_padded, 0, dst, out=out)
+    return groups
 
 
 def _bf16_grouped_gemm_aligned_contiguous(

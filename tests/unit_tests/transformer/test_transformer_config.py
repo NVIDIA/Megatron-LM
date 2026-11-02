@@ -147,50 +147,6 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
-def _make_batch_invariant_moe_config(backend, **overrides):
-    from megatron.core.transformer.enums import AttnBackend
-
-    return TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        num_moe_experts=4,
-        moe_router_topk=2,
-        moe_grouped_gemm=True,
-        moe_token_dispatcher_type="alltoall",
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        add_bias_linear=False,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=3,
-        attention_dropout=0.0,
-        batch_invariant_mode=True,
-        batch_invariant_backend=backend,
-        **overrides,
-    )
-
-
-@pytest.mark.parametrize("backend", ["te_native", "deepgemm", "triton"])
-def test_batch_invariant_moe_rejects_te_op_fuser(backend):
-    # The op fuser's expert ops call TE's grouped GEMMs, which no backend replaces.
-    with pytest.raises(AssertionError, match="does not support TE op fuser"):
-        _make_batch_invariant_moe_config(backend, use_transformer_engine_op_fuser=True)
-
-
-@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
-def test_batch_invariant_moe_rejects_grouped_tensor_outside_te_native(monkeypatch, backend):
-    # TE's GroupedTensor path bypasses the DeepGEMM grouped GEMM these backends patch in.
-    monkeypatch.setattr(
-        "megatron.core.transformer.custom_layers.batch_invariant_kernels.HAVE_DEEPGEMM_BF16", True
-    )
-    with pytest.raises(AssertionError, match="moe_use_grouped_tensor=False"):
-        _make_batch_invariant_moe_config(backend, moe_use_grouped_tensor=True)
-    assert not _make_batch_invariant_moe_config(backend).moe_use_grouped_tensor
-    assert _make_batch_invariant_moe_config(
-        "te_native", moe_use_grouped_tensor=True
-    ).moe_use_grouped_tensor
-
-
 def test_mhc_fused_backend_defaults_to_auto():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
