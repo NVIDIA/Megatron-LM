@@ -592,6 +592,95 @@ class TestSequenceParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+class TestMLALatentPoolUpProjection:
+    """Prefill and mixed steps up-project the layer's whole latent pool, including unused, freed
+    and never-written blocks. A request's keys and values must not depend on those blocks; under
+    a per-tensor FP8 recipe they would if the pool were quantized with one scale."""
+
+    kv_lora_rank = 64
+    qk_pos_emb_head_dim = 32
+    block_size = 64
+    pool_blocks = 8
+    used_blocks = 3
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _attention(self, fp8_recipe):
+        quantization = dict(fp8="e4m3", fp8_recipe=fp8_recipe) if fp8_recipe else {}
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            q_lora_rank=64,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
+            v_head_dim=64,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            rope_type="rope",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            cache_mla_latents=True,
+            **quantization,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True, qk_layernorm=True
+        ).self_attention.submodules
+        attention = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        )
+        attention = attention.cuda().eval()
+        with torch.no_grad():
+            attention.prepare_for_absorption()
+        return attention
+
+    def _used_keys_and_values(self, attention, unused_fill):
+        generator = torch.Generator(device="cuda").manual_seed(11)
+        pool = torch.randn(
+            self.pool_blocks,
+            self.block_size,
+            self.kv_lora_rank + self.qk_pos_emb_head_dim,
+            generator=generator,
+            device="cuda",
+        ).bfloat16()
+        pool[self.used_blocks :] = unused_fill
+        # The context TransformerBlock runs each layer in.
+        with torch.no_grad(), get_fp8_context(attention.config):
+            key, value = attention.uncompress_kv_from_cache(pool)
+        return key[: self.used_blocks], value[: self.used_blocks]
+
+    @pytest.mark.parametrize("fp8_recipe", [None, "tensorwise"], ids=["bf16", "fp8-tensorwise"])
+    @pytest.mark.parametrize(
+        "unused_fill", [1e4, float("inf"), float("nan")], ids=["large", "inf", "nan"]
+    )
+    def test_used_blocks_ignore_unused_blocks(self, fp8_recipe, unused_fill):
+        if fp8_recipe:
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
+
+            fp8_available, reason = check_fp8_support()
+            if not fp8_available:
+                pytest.skip(reason)
+        attention = self._attention(fp8_recipe)
+        if fp8_recipe:
+            with get_fp8_context(attention.config):
+                assert FP8GlobalStateManager.is_fp8_enabled()
+
+        key, value = self._used_keys_and_values(attention, 0.0)
+        poisoned_key, poisoned_value = self._used_keys_and_values(attention, unused_fill)
+
+        assert torch.isfinite(key).all() and torch.isfinite(value).all()
+        assert torch.equal(poisoned_key, key) and torch.equal(poisoned_value, value)
+
+
 class _AttentionKernelReached(Exception):
     """Raised by a stubbed attention kernel to end the forward once its inputs are captured."""
 
