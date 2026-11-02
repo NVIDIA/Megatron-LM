@@ -1504,6 +1504,24 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn-4"
+version = "4.0.0b37"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "einops" },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "quack-kernels" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "torch-c-dlpack-ext" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/17/b09861c76473c01f926f607bd533f12a6cec1bc2f0e529beaf25542ce6ef/flash_attn_4-4.0.0b37.tar.gz", hash = "sha256:4cdc8aabd219d6ec96afebf07921e8f11d407af19a8aac662271960ade89eeab", size = 512818, upload-time = "2026-10-28T08:15:10.682Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/73/1dbd8f083c8f2c9849df6ebdd84ba88ec5f0a1c221d34454c5732f88258e/flash_attn_4-4.0.0b37-py3-none-any.whl", hash = "sha256:e6c5b99c8d001691a1e6e7b27d553a34cefdee01bcfded3fd945297b7c3e421c", size = 541273, upload-time = "2026-10-28T08:15:08.888Z" },
+]
+
+[[package]]
 name = "flash-linear-attention"
 version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2617,6 +2635,7 @@ dev = [
     { name = "emerging-optimizers" },
     { name = "fast-hadamard-transform" },
     { name = "fastapi" },
+    { name = "flash-attn-4" },
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "megatron-energon", extra = ["av-decode"] },
@@ -2742,6 +2761,7 @@ requires-dist = [
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
+    { name = "flash-attn-4", marker = "extra == 'dev'", specifier = ">=4.0.0b27" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
