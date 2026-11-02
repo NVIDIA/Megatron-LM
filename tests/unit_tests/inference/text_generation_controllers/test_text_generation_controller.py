@@ -2629,8 +2629,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context = self.text_generation_controller.inference_wrapped_model.inference_context
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
-        # The temperature=0 / top_k=1 bucket exercises the greedy path: torch short-circuits
-        # to argmax, flashinfer relies on its temperature clamp to avoid divide-by-zero.
+        # The temperature=0 / top_k=1 bucket exercises the greedy path: both backends take the
+        # lowest-index argmax.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
             (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
             (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),

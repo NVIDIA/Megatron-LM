@@ -4854,6 +4854,46 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("beyond", [0, 1000], ids=["vocab", "beyond-vocab"])
+    @torch.inference_mode()
+    def test_top_k_keeping_the_whole_vocabulary_is_served(self, sampling_backend, beyond):
+        """A top-k at or above the vocabulary is served as no top-k, next to a plain request.
+
+        The engine admits it as no top-k; the torch backend asserted on it inside the step.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=3,
+                max_prompt_length=3,
+                num_tokens_to_generate=8,
+                sampling_backend=sampling_backend,
+            )
+        )
+        _use_fixed_sampling_logits(env)
+        top_k = env.engine.controller.vocab_size + beyond
+        params = [
+            SamplingParams(num_tokens_to_generate=8, termination_id=-1),
+            SamplingParams(num_tokens_to_generate=8, termination_id=-1, top_k=top_k, top_p=0.7),
+        ]
+
+        finished = _serve_requests(env, [[1, 2, 3], [4, 5, 6]], params)
+
+        assert finished[1].sampling_params.top_k == 0
+        for request_id, request_params in enumerate(params):
+            request = finished[request_id]
+            assert request.status == Status.COMPLETED
+            assert len(request.generated_tokens) == 8
+            support = _sampling_support(1.0, 0, request_params.top_p)
+            assert set(request.generated_tokens) <= support
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize(
         "generation_config, filters",
         [

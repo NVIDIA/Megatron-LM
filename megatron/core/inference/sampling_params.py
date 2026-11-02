@@ -94,7 +94,16 @@ class SamplingParams:
             raise ValueError("seed must be a nonnegative int64 or null")
 
     def _normalize_filters(self):
-        """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0)."""
+        """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0), and a zero
+        temperature to greedy decoding (top_k=1, the lowest-index argmax).
+
+        A top_k at or above the vocabulary is a no-op too; the engine, which knows the
+        vocabulary, disables it when it admits the request.
+        """
+        if self.temperature == 0.0:
+            # The limit of temperature -> 0 is the argmax, whatever the filters.
+            self.top_k = 1
+            self.top_p = 0.0
         if is_no_op_top_p(self.top_p):
             self.top_p = 0.0
         if is_no_op_top_k(self.top_k):

@@ -120,10 +120,6 @@ try:
             )
             echo = bool(req.get("echo", False))
 
-            if temperature == 0.0:
-                top_k = 1
-                top_p = 0.0
-
             # Parse logprobs - can be an integer (number of top logprobs to return) or None
             logprobs_param = req.get("logprobs", None)
 

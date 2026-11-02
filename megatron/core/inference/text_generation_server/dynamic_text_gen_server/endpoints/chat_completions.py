@@ -1146,10 +1146,6 @@ try:
             )
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
-            if temperature == 0.0:
-                top_k = 1
-                top_p = 0.0
-
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(_get_non_none(req, "logprobs", False))
             top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0

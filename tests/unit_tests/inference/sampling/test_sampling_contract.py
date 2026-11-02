@@ -5,15 +5,20 @@
 * Top-k and top-p together: top-p applies to the renormalized top-k set (top-k first).
 * Greedy (`top_k == 1`, which temperature 0 maps to): the lowest-index argmax on every row, in
   all-greedy and mixed batches, with or without a top-p; its processed log-probs are one-hot.
+* A top-k at or above the vocabulary filters nothing: the engine admits it as no top-k.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
+from megatron.core.inference.sampling_params import SamplingParams
 
 try:
     import flashinfer  # noqa: F401
@@ -158,3 +163,48 @@ def test_greedy_rows_take_lowest_tied_index(backend, mixed, greedy_top_p, tie):
     one_hot = torch.full_like(log_probs[0], float("-inf"))
     one_hot[7] = 0.0
     assert torch.equal(log_probs, one_hot.expand_as(log_probs))
+
+
+@pytest.mark.parametrize(
+    "top_k, admitted_top_k",
+    [(VOCAB - 1, VOCAB - 1), (VOCAB, 0), (VOCAB + 1000, 0)],
+    ids=["below-vocab", "vocab", "beyond-vocab"],
+)
+def test_admission_disables_a_top_k_that_keeps_the_whole_vocabulary(top_k, admitted_top_k):
+    """The engine admits a top-k at or above the vocabulary as no top-k, next to its top-p.
+
+    Such a top-k filters nothing, as a top-p of 1.0 does, which SamplingParams already maps to
+    no top-p. The samplers only apply a top-k below the vocabulary; the torch backend asserted
+    on it inside the engine step, failing the whole batch.
+    """
+    engine = object.__new__(DynamicInferenceEngine)
+    engine.context = SimpleNamespace(
+        config=SimpleNamespace(sampling_backend="torch", num_speculative_tokens=0),
+        max_sequence_length=16,
+        max_tokens=16,
+        num_speculative_tokens=0,
+        block_size_tokens=8,
+        kv_block_allocator=SimpleNamespace(pool_size=32),
+    )
+    engine.controller = SimpleNamespace(vocab_size=VOCAB)
+    engine.requests = {}
+    engine._loop = asyncio.new_event_loop()
+    engine._generation_epoch = None
+    engine.rank = 0
+    engine.enable_chunked_prefill = False
+    engine.waiting_request_ids = []
+    request = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(
+            top_k=top_k, top_p=0.7, termination_id=0, num_tokens_to_generate=4
+        ),
+    )
+    try:
+        engine._add_request(request)
+    finally:
+        engine._loop.close()
+
+    assert engine.waiting_request_ids == [1]
+    assert request.sampling_params.top_k == admitted_top_k
+    assert request.sampling_params.top_p == 0.7
