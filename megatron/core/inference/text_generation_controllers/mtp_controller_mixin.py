@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.utils import InferenceMode, get_moe_dp_replica_count
+from megatron.core.inference.utils import get_moe_dp_replica_count, mtp_cuda_graph_key
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -32,21 +32,6 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push, round_up_to_nearest_multiple
-
-
-def mtp_cuda_graph_key(prefix: str, padded_count: int, depth: Optional[int]) -> tuple:
-    """Return the CUDA graph key of an MTP draft forward.
-
-    A captured graph fixes whether its FlashInfer MoE kernels process only the bounded rows.
-    An MTP forward runs with the setting of the base forward before it (InferenceMode), so the
-    key includes it; see DynamicInferenceContext.bounded_moe_row_mtp_graph_variants().
-
-    Args:
-        prefix (str): "mtp" for the cache-free graphs, "mtp_kv" for the KV-aware ones.
-        padded_count (int): Requests the forward is padded to.
-        depth (Optional[int]): MTP depth, or None for a repeated MTP layer.
-    """
-    return (prefix, padded_count, depth, InferenceMode.use_bounded_mxfp8_rows())
 
 
 @dataclass

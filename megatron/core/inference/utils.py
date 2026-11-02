@@ -6,7 +6,7 @@ import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -128,6 +128,21 @@ class InferenceMode:
             yield
         finally:
             cls.unset_active()
+
+
+def mtp_cuda_graph_key(prefix: str, padded_count: int, depth: Optional[int]) -> tuple:
+    """Return the CUDA graph key of an MTP draft forward.
+
+    A captured graph fixes whether its FlashInfer MoE kernels process only the bounded rows.
+    An MTP forward runs with the setting of the base forward before it (InferenceMode), so the
+    key includes it; see DynamicInferenceContext.bounded_moe_row_mtp_graph_variants().
+
+    Args:
+        prefix (str): "mtp" for the cache-free graphs, "mtp_kv" for the KV-aware ones.
+        padded_count (int): Requests the forward is padded to.
+        depth (Optional[int]): MTP depth, or None for a repeated MTP layer.
+    """
+    return (prefix, padded_count, depth, InferenceMode.use_bounded_mxfp8_rows())
 
 
 def get_moe_dp_replica_count(config) -> int:

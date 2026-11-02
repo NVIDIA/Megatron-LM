@@ -63,15 +63,17 @@ from megatron.core.inference.inference_request import (
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
-    mtp_cuda_graph_key,
-)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
+from megatron.core.inference.utils import (
+    Counter,
+    InferenceMode,
+    await_process_call,
+    mtp_cuda_graph_key,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
