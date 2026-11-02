@@ -14,8 +14,9 @@
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
   (causal and padding CUDA kernels).
 * The rank-order sum of batch-invariant mode's TP reduction, on the all-to-all output it
-  reduces when there is no symmetric memory (its multi-rank paths are checked bit for bit
-  against a reference in ``tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py``).
+  reduces when there is no symmetric memory and on peers' symmetric buffers (local buffers
+  stand in for the peers), at power-of-two and other TP sizes. Its multi-rank paths are checked
+  bit for bit in ``tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py``.
 """
 
 import importlib.util
@@ -44,6 +45,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
+    LocalSymmetricPeers,
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     deterministic_algorithms,
@@ -420,3 +422,32 @@ def test_batch_invariant_rank_ordered_sum_replays(dtype, world_size):
         what=f"_rank_ordered_sum[{dtype}, {world_size} ranks]",
     )
     assert torch.equal(out["out"], ref.to(dtype))
+
+
+@pytest.mark.parametrize("world_size", [3, 6, 8])
+def test_batch_invariant_rank_ordered_sum_from_peers_replays(world_size):
+    """The symmetric-memory reading: this rank's segment of every peer's buffer, summed in rank
+    order. TP sizes that are not powers of two pad and mask the barrier's arange."""
+    seeded()
+    numel, rank = 1 << 20, world_size - 1
+    peers = LocalSymmetricPeers(world_size, world_size * numel, torch.bfloat16, rank=rank)
+    for buf in peers.buffers:
+        buf.copy_(torch.randn(buf.numel(), device="cuda"))
+    ref = peers.buffers[0].view(world_size, numel)[rank].float()
+    for buf in peers.buffers[1:]:
+        ref = ref + buf.view(world_size, numel)[rank].float()
+
+    def reduce():
+        peers.prime()
+        out = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+        return _rank_ordered_sum(out, peers.buffers[rank], world_size, rank, peers)
+
+    out, _ = assert_replays_bit_exact(
+        reduce,
+        (),
+        replays=3,
+        backward=False,
+        contention=True,
+        what=f"_rank_ordered_sum[symmetric memory, {world_size} ranks]",
+    )
+    assert torch.equal(out["out"], ref.to(torch.bfloat16))

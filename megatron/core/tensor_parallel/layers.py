@@ -861,8 +861,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            # Asynchronous all-reduce; in batch-invariant mode the rank-ordered one, which is
-            # asynchronous only where NCCL reduces (it returns no handle otherwise).
+            # Asynchronous all-reduce; in batch-invariant mode the rank-ordered one.
             if is_batch_invariant_mode_enabled():
                 grad_input, handle = batch_invariant_all_reduce(grad_input, tp_group, async_op=True)
             else:

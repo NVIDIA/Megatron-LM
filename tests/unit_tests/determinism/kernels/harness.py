@@ -346,3 +346,41 @@ def assert_module_replays_bit_exact(
             out, grad = _module_fwd_bwd(module, inputs, grad_output, backward)
         _assert_replay_matches(i, ref_out, ref_grad, out, grad, what)
     return ref_out, ref_grad
+
+
+class LocalSymmetricPeers:
+    """A one-GPU stand-in for a torch symmetric-memory handle (``_SymmetricMemory``).
+
+    ``world_size`` local buffers play the peers' buffers, so a symmetric-memory kernel can be
+    replayed on one GPU with its multi-rank arithmetic intact. ``prime()`` sets the barrier
+    slots the absent peers would signal (see ``symm_mem_sync``) and clears the ones this rank
+    signals; call it before every launch.
+    """
+
+    def __init__(self, world_size: int, numel: int, dtype: torch.dtype, rank: int = 0):
+        from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+            SYMM_MEM_KERNEL_CONFIG,
+        )
+
+        self.rank = rank
+        self.world_size = world_size
+        self.buffers = [torch.zeros(numel, dtype=dtype, device="cuda") for _ in range(world_size)]
+        self.buffer_ptrs = [buf.data_ptr() for buf in self.buffers]
+        self._buffer_ptrs = torch.tensor(self.buffer_ptrs, dtype=torch.int64, device="cuda")
+        self.buffer_ptrs_dev = self._buffer_ptrs.data_ptr()
+        slots = SYMM_MEM_KERNEL_CONFIG.max_num_blocks * world_size
+        self._pads = [
+            torch.zeros(slots, dtype=torch.int32, device="cuda") for _ in range(world_size)
+        ]
+        self._pad_ptrs = torch.tensor(
+            [pad.data_ptr() for pad in self._pads], dtype=torch.int64, device="cuda"
+        )
+        self.signal_pad_ptrs_dev = self._pad_ptrs.data_ptr()
+
+    def prime(self) -> None:
+        """Arm this rank's barrier: every peer has signaled every block, this rank has not."""
+        for pad in self._pads:
+            pad.zero_()
+        own = self._pads[self.rank].view(-1, self.world_size)
+        own.fill_(1)
+        own[:, self.rank] = 0

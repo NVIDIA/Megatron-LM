@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from tests.unit_tests.determinism.kernels.harness import (
+    LocalSymmetricPeers,
     assert_replays_bit_exact,
     count_differing_replays,
     seeded,
@@ -717,6 +718,49 @@ def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
     expected = (gathered * (inverse_map >= 0)[..., None]).sum(dim=1).float()
     assert torch.equal(out[:valid_tokens], expected[:valid_tokens])
     assert torch.all(out[0] == 2.0**24 + 8)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_ordered_reduce_scatter_v_sums_in_rank_order_and_replays(world_size):
+    """The batch-invariant EP combine's cross-rank sum on one GPU, with local buffers standing
+    in for the peers' symmetric buffers. Each output row is the peers' rows added in rank order
+    in fp32 (add_rn_f32 keeps the compiler from reordering the adds) and replays bit-exactly."""
+    from megatron.core.inference.moe import batch_invariant
+
+    seeded()
+    hidden, tokens_per_rank = 1024, [96, 64, 128, 32][:world_size]
+    rank, total = world_size - 1, sum(tokens_per_rank)
+    offset, local = sum(tokens_per_rank[:rank]), tokens_per_rank[rank]
+    peers = LocalSymmetricPeers(world_size, total * hidden, torch.float32, rank=rank)
+    for buf in peers.buffers:
+        # A wide exponent range, so a different add order changes the bits.
+        scale = torch.exp2(torch.randint(-20, 20, (buf.numel(),), device="cuda").float())
+        buf.copy_(torch.randn(buf.numel(), device="cuda") * scale)
+    expected = torch.zeros(local, hidden, device="cuda")
+    for buf in peers.buffers:
+        expected = expected + buf.view(total, hidden)[offset : offset + local]
+    max_tokens = max(tokens_per_rank)
+
+    def reduce():
+        peers.prime()
+        return batch_invariant.ordered_reduce_scatter_v(
+            torch.empty(local, hidden, device="cuda"),
+            peers.buffers[rank].view(total, hidden),
+            peers,
+            _dev_scalar(offset),
+            _dev_scalar(max_tokens),
+            max_tokens,
+        )
+
+    out, _ = assert_replays_bit_exact(
+        reduce,
+        (),
+        replays=3,
+        backward=False,
+        contention=True,
+        what=f"ordered_reduce_scatter_v[{world_size} ranks]",
+    )
+    assert torch.equal(out["out"], expected)
 
 
 @pytest.mark.xfail(

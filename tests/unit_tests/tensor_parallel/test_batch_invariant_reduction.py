@@ -17,11 +17,16 @@ import torch.distributed as dist
 import transformer_engine.pytorch.module.linear as te_linear
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
-from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+)
+from megatron.core.inference.symmetric_memory import SymmetricMemoryBuffer, SymmetricMemoryManager
 from megatron.core.tensor_parallel import batch_invariant_reduction, inference_layers, mappings
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers import batch_invariant_kernels
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -66,7 +71,7 @@ def _identity_linear(cls, tp_group, sequence_parallel=True):
     rank contributes to the reduction is its input (row parallel) or its output gradient
     (column parallel)."""
     tp = tp_group.size()
-    if cls in (TEColumnParallelLinear, ColumnParallelLinear):
+    if cls in (TEColumnParallelLinear, TELayerNormColumnParallelLinear, ColumnParallelLinear):
         sizes = dict(input_size=H, output_size=H * tp, gather_output=False)
     else:
         sizes = dict(input_size=H * tp, output_size=H, input_is_parallel=True)
@@ -129,6 +134,10 @@ REDUCE_SCATTERS = {
     "te_column_parallel_dgrad": lambda g: _column_parallel_dgrad(
         _identity_linear(TEColumnParallelLinear, g), g
     ),
+    # QKV and FC1 in Megatron's TE spec, through module.layernorm_linear's binding.
+    "te_layernorm_column_parallel_dgrad": lambda g: _column_parallel_dgrad(
+        _identity_linear(TELayerNormColumnParallelLinear, g), g
+    ),
     # Megatron's mappings: local layers, embeddings, inference without symmetric memory, MoE.
     "local_row_parallel_linear": lambda g: _identity_linear(RowParallelLinear, g).train(),
     "local_column_parallel_dgrad": lambda g: _column_parallel_dgrad(
@@ -150,6 +159,11 @@ ALL_REDUCES = {
         lambda x: mappings.reduce_from_tensor_model_parallel_region(x, group=g)
     ),
 }
+
+
+# The input is zero, so the norm's backward scales the reduced gradient by the same factor in
+# every row: its rows must still all agree, but are not the plain rank-order sum.
+NORMED = {"te_layernorm_column_parallel_dgrad"}
 
 
 def _call(reduce, x):
@@ -193,13 +207,19 @@ def test_reduction_is_position_invariant(tp_group, entry):
     tp = tp_group.size()
     all_reduce = entry in ALL_REDUCES
     partial = _partial(tp_group)
-    expected = _bits(_rank_order_sum(partial, tp_group))
+    expected = None if entry in NORMED else _bits(_rank_order_sum(partial, tp_group))
     reduce = (ALL_REDUCES if all_reduce else REDUCE_SCATTERS)[entry](tp_group)
     differing_rows = {}
     with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
         for t in T_VALUES:
             out = _call(reduce, partial.expand(t, 1, H).contiguous())
             assert out.shape == (t if all_reduce else t // tp, 1, H), out.shape
+            if expected is None:
+                # Every rank's first row of the first step; all_ranks below compares ranks.
+                expected = _bits(out).view(-1, H)[0].clone()
+                gathered = torch.empty(tp, H, dtype=torch.int16, device="cuda")
+                dist.all_gather_into_tensor(gathered, expected, group=tp_group)
+                expected = gathered[0]
             bad = int((_bits(out).view(-1, H) != expected).any(dim=-1).sum())
             if bad:
                 differing_rows[t] = bad
@@ -243,31 +263,41 @@ def test_rollout_reproduces_training(tp_group):
     assert _all_ranks(torch.equal(trained, _bits(_rank_order_sum(tokens, tp_group))))
 
 
-def _wide_partials(numel, seed):
-    """Random bf16 partials over a wide exponent range, with zeros of both signs and
-    subnormals, so any rounding or sign difference between two adds shows up."""
+# Per dtype: the exponent range of the random partials, and the smallest subnormal.
+_WIDE_RANGE = {
+    torch.bfloat16: (-40, 40, 2.0**-133),
+    torch.float16: (-20, 10, 2.0**-24),
+    torch.float32: (-140, 100, 2.0**-149),
+}
+
+
+def _wide_partials(numel, seed, dtype):
+    """Random partials over a wide exponent range, with zeros of both signs and subnormals, so
+    any rounding, flushing or sign difference between two adds shows up."""
+    low, high, tiniest = _WIDE_RANGE[dtype]
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    scale = torch.exp2(torch.randint(-40, 40, (numel,), device="cuda", generator=gen).float())
-    x = (torch.randn(numel, device="cuda", generator=gen) * scale).to(torch.bfloat16)
+    scale = torch.exp2(torch.randint(low, high, (numel,), device="cuda", generator=gen).float())
+    x = (torch.randn(numel, device="cuda", generator=gen) * scale).to(dtype)
     x[0::97] = -0.0
     x[1::89] = 0.0
-    x[2::83] = -(2.0**-130)
-    x[3::79] = 2.0**-133
+    x[2::83] = -tiniest
+    x[3::79] = 4 * tiniest
     return x
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("numel", [8, 1 << 12, 1 << 20, 1 << 24])
-def test_two_rank_nccl_add_equals_rank_order_sum(numel):
+def test_two_rank_nccl_add_equals_rank_order_sum(dtype, numel):
     """With two ranks and no symmetric buffer the reduction keeps NCCL's reduce-scatter and
-    all-reduce, because their single add gives the bits of the rank-order fp32 sum. Checked
-    against the kernel on both of its inputs (the all-to-all output and the symmetric buffer),
-    at sizes across NCCL's algorithm and protocol choices."""
+    all-reduce, so their single add must give the bits of the rank-order fp32 sum for every
+    routed dtype. Checked against the kernel on both of its inputs (the all-to-all output and
+    the symmetric buffer), at sizes across NCCL's algorithm and protocol choices."""
     tp_group = _init_tp(2)
     try:
         rank = dist.get_rank(tp_group)
-        x = _wide_partials(2 * numel, seed=99 + dist.get_rank())
-        nccl_rs = torch.empty(numel, dtype=x.dtype, device="cuda")
+        x = _wide_partials(2 * numel, seed=99 + dist.get_rank(), dtype=dtype)
+        nccl_rs = torch.empty(numel, dtype=dtype, device="cuda")
         dist.reduce_scatter_tensor(nccl_rs, x, group=tp_group)
         nccl_ar = x.clone()
         dist.all_reduce(nccl_ar, group=tp_group)
@@ -277,20 +307,24 @@ def test_two_rank_nccl_add_equals_rank_order_sum(numel):
         ordered_rs = batch_invariant_reduction._rank_ordered_sum(
             torch.empty_like(nccl_rs), partials, 2, rank
         )
-        symm = _symmetric_buffer(tp_group).maybe_get_tensor([2 * numel], dtype=x.dtype)
+        symm = _symmetric_buffer(tp_group).maybe_get_tensor([2 * numel], dtype=dtype)
         symm["tensor"].copy_(x)
         symm_rs, _ = batch_invariant_reduction.batch_invariant_reduce_scatter(
             symm["tensor"], tp_group, symm_mem_hdl=symm["handle"]
         )
-        gathered = torch.empty(2, 2 * numel, dtype=x.dtype, device="cuda")
+        gathered = torch.empty(2, 2 * numel, dtype=dtype, device="cuda")
         dist.all_gather_into_tensor(gathered, x, group=tp_group)
         ordered_ar = batch_invariant_reduction._rank_ordered_sum(
             torch.empty_like(x), gathered.view(-1), 2, rank
         )
+
+        def same(a, b):
+            return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
         results = {
-            "reduce_scatter_vs_all_to_all_sum": torch.equal(_bits(nccl_rs), _bits(ordered_rs)),
-            "reduce_scatter_vs_symmetric_memory_sum": torch.equal(_bits(nccl_rs), _bits(symm_rs)),
-            "all_reduce_vs_rank_order_sum": torch.equal(_bits(nccl_ar), _bits(ordered_ar)),
+            "reduce_scatter_vs_all_to_all_sum": same(nccl_rs, ordered_rs),
+            "reduce_scatter_vs_symmetric_memory_sum": same(nccl_rs, symm_rs),
+            "all_reduce_vs_rank_order_sum": same(nccl_ar, ordered_ar),
         }
         assert _all_ranks(all(results.values())), results
     finally:
@@ -344,7 +378,9 @@ def test_uneven_reduce_scatter_sums_in_rank_order(tp_group):
 
 
 @pytest.mark.parametrize("tp_group", [4], indirect=True, ids=["tp4"])
-@pytest.mark.parametrize("path", ["symmetric_memory", "all_to_all", "all_reduce"])
+@pytest.mark.parametrize(
+    "path", ["symmetric_memory", "all_to_all", "async_all_to_all", "all_reduce"]
+)
 def test_reduction_replays_in_cuda_graph(tp_group, path):
     """The batch-invariant reduction captures in a CUDA graph and replays like eager."""
     if path == "symmetric_memory":
@@ -352,6 +388,15 @@ def test_reduction_replays_in_cuda_graph(tp_group, path):
         reduce = _identity_linear(inference_layers.InferenceRowParallelLinear, tp_group).eval()
     elif path == "all_to_all":
         reduce = lambda x: mappings.reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
+    elif path == "async_all_to_all":
+
+        def reduce(x):
+            out, handle = batch_invariant_reduction.batch_invariant_reduce_scatter(
+                x, tp_group, async_op=True
+            )
+            handle.wait()
+            return out
+
     else:
         reduce = lambda x: mappings.reduce_from_tensor_model_parallel_region(x, group=tp_group)
     x = torch.zeros(64, 1, H, dtype=torch.bfloat16, device="cuda")
@@ -375,9 +420,105 @@ def test_reduction_replays_in_cuda_graph(tp_group, path):
             assert _all_ranks(torch.equal(_bits(out), _bits(eager)))
 
 
+@pytest.mark.parametrize("tp_group", [4], indirect=True, ids=["tp4"])
+@pytest.mark.parametrize("op", ["reduce_scatter", "all_reduce"])
+def test_async_reduction_finishes_on_wait(tp_group, op):
+    """With async_op the all-to-all is still in flight on return, so the caller's work (the
+    weight-gradient GEMM in TE's and Megatron's backward) overlaps it; wait() finishes the
+    reduction with the bits of the synchronous one. A second reduction started before the
+    first is waited for must not share its scratch."""
+    reduce = getattr(batch_invariant_reduction, f"batch_invariant_{op}")
+    inputs = [_partial(tp_group, numel=256 * H, seed=seed).view(256, 1, H) for seed in (3, 4)]
+    synchronous = [reduce(x.clone(), tp_group)[0].clone() for x in inputs]
+    pending = [reduce(x.clone(), tp_group, async_op=True) for x in inputs]
+    assert all(handle is not None for _, handle in pending)
+    a = torch.randn(2048, 2048, device="cuda")
+    a @ a  # the work the caller overlaps
+    for out, handle in reversed(pending):
+        handle.wait()
+    ok = all(torch.equal(_bits(out), _bits(sync)) for (out, _), sync in zip(pending, synchronous))
+    assert _all_ranks(ok)
+
+
+def test_reduction_at_tp6():
+    """A TP size that is not a power of two: six ranks of the job, through symmetric memory
+    (the barrier pads and masks its arange), the all-to-all and the all-reduce."""
+    if Utils.world_size < 6:
+        pytest.skip(f"needs 6 ranks, got {Utils.world_size}")
+    Utils.initialize_model_parallel(1)
+    group = dist.new_group(list(range(6)))
+    ok = True
+    try:
+        if dist.get_rank() < 6:
+            buf = SymmetricMemoryBuffer(64, group)
+            assert buf.symm_mem_hdl is not None, buf.init_failure_reason
+            x = _partial(group, numel=96 * H, seed=21).view(96, 1, H)
+            expected = _bits(_rank_order_sum(x, group))
+            rank = dist.get_rank(group)
+            rows = slice(rank * 16, (rank + 1) * 16)
+            symm = buf.maybe_get_tensor(list(x.shape), dtype=x.dtype)
+            symm["tensor"].copy_(x)
+            reduce_scatter = batch_invariant_reduction.batch_invariant_reduce_scatter
+            results = {
+                "symmetric_memory": reduce_scatter(
+                    symm["tensor"], group, symm_mem_hdl=symm["handle"]
+                )[0],
+                "all_to_all": reduce_scatter(x, group)[0],
+            }
+            ok = all(torch.equal(_bits(out), expected[rows]) for out in results.values())
+            ok &= torch.equal(
+                _bits(batch_invariant_reduction.batch_invariant_all_reduce(x.clone(), group)[0]),
+                expected,
+            )
+        assert _all_ranks(ok)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_te_reductions_are_restored_outside_batch_invariant_mode():
-    names = ("reduce_scatter_along_first_dim", "allreduce", "symmetric_all_reduce")
-    originals = {name: getattr(te_linear, name) for name in names}
+    """Every TE module that binds a TP reduction by name is patched in the mode, restored out."""
+    import importlib
+
+    patched = {
+        (module_name, name)
+        for module_name in batch_invariant_kernels._TE_TP_COLLECTIVE_MODULES
+        for name in batch_invariant_kernels._TE_TP_COLLECTIVE_PATCHES
+        if hasattr(importlib.import_module(module_name), name)
+    }
+    # TE's Linear, LayerNormLinear (QKV, FC1) and LayerNormMLP bind the reduce-scatter.
+    for module_name in ("linear", "layernorm_linear", "layernorm_mlp"):
+        assert (
+            f"transformer_engine.pytorch.module.{module_name}",
+            "reduce_scatter_along_first_dim",
+        ) in patched
+    originals = {key: getattr(importlib.import_module(key[0]), key[1]) for key in patched}
     with set_batch_invariant_mode(True, backend="te_native"):
-        assert all(getattr(te_linear, name) is not originals[name] for name in names)
-    assert all(getattr(te_linear, name) is originals[name] for name in names)
+        still_native = [
+            k for k in patched if getattr(importlib.import_module(k[0]), k[1]) is originals[k]
+        ]
+    restored = [k for k in patched if getattr(importlib.import_module(k[0]), k[1]) is originals[k]]
+    assert not still_native, still_native
+    assert len(restored) == len(patched)
+
+
+def test_inference_gemm_into_symmetric_memory_runs_the_backend_kernel(monkeypatch):
+    """Under the triton backend the inference row-parallel GEMM, written into a given buffer as
+    it is into symmetric memory, runs the batch-invariant kernel into that buffer, no copy."""
+    calls = []
+    matmul_persistent = batch_invariant_kernels.matmul_persistent
+
+    def spy(a, b, bias=None, out=None):
+        calls.append(out is not None)
+        return matmul_persistent(a, b, bias=bias, out=out)
+
+    monkeypatch.setattr(batch_invariant_kernels, "matmul_persistent", spy)
+    x = torch.randn(64, 1, 512, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(768, 512, device="cuda", dtype=torch.bfloat16)
+    buf = torch.empty(64, 1, 768, device="cuda", dtype=torch.bfloat16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        expected = inference_layers._apply_linear(x, w, None)
+        calls.clear()
+        out = inference_layers._apply_linear(x, w, None, out=buf)
+    assert calls == [True]
+    assert out.data_ptr() == buf.data_ptr()
+    assert torch.equal(out, expected)

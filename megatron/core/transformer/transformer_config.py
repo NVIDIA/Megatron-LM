@@ -4778,15 +4778,25 @@ class TransformerConfig(ModelParallelConfig):
             ), "Batch invariant mode does not support attention dropout"
             # Every TP reduce-scatter and all-reduce must sum a token's partials in rank order
             # (megatron.core.tensor_parallel.batch_invariant_reduction), not in an order set
-            # by the token's position. Megatron routes TE's row-parallel reductions there, but
-            # Userbuffers reduce inside the GEMM and TE's operation fuser calls
-            # torch.distributed directly. With two ranks each element is one add, which has no
-            # order to get wrong.
+            # by the token's position. Megatron routes TE's TP reductions there, but the
+            # Userbuffers reduce-scatter overlaps reduce inside the GEMM and TE's operation
+            # fuser calls torch.distributed directly. With two ranks each element is one add,
+            # which has no order to get wrong. All-gather overlaps sum nothing.
             if self.tensor_model_parallel_size > 2:
-                assert not self.tp_comm_overlap, (
+                ub_reduce_scatters = [
+                    name
+                    for name in (
+                        "tp_comm_overlap_rs",
+                        "tp_comm_overlap_rs_dgrad",
+                        "tp_comm_bulk_wgrad",
+                    )
+                    if self.tp_comm_overlap and getattr(self, name)
+                ]
+                assert not ub_reduce_scatters, (
                     "Batch invariant mode with tensor_model_parallel_size > 2 does not support "
-                    "tp_comm_overlap: Userbuffers reduce-scatter inside the GEMM, in an order "
-                    "that depends on a token's position in the batch."
+                    f"the Userbuffers reduce-scatter overlaps {ub_reduce_scatters}: they reduce "
+                    "inside the GEMM, in an order that depends on a token's position in the "
+                    "batch. Set them to False; the all-gather overlaps remain available."
                 )
                 assert not self.use_transformer_engine_op_fuser, (
                     "Batch invariant mode with tensor_model_parallel_size > 2 does not support "
@@ -4794,6 +4804,14 @@ class TransformerConfig(ModelParallelConfig):
                     "tensor-parallel group with NCCL directly, in an order that depends on a "
                     "token's position in the batch."
                 )
+            # Only te_native leaves TE's GEMMs native; the GEMM the other backends put in their
+            # place cannot run Userbuffers' communication-overlapped GEMMs.
+            assert not self.tp_comm_overlap or self.batch_invariant_backend == "te_native", (
+                "Batch invariant mode supports tp_comm_overlap only with "
+                f"batch_invariant_backend='te_native' (got {self.batch_invariant_backend!r}): "
+                "the batch-invariant GEMM that replaces TE's cannot run Userbuffers' overlapped "
+                "GEMMs."
+            )
             if (self.num_moe_experts or 0) > 0:
                 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                     HAVE_DEEPGEMM_BF16,

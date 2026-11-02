@@ -222,8 +222,13 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM, into ``out`` if given."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -235,8 +240,11 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    if out is None:
+        c = torch.empty((M, N), device=a.device, dtype=dtype)
+    else:
+        assert out.shape == (M, N) and out.dtype == dtype, (out.shape, out.dtype)
+        c = out
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -574,6 +582,23 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
+def mm_out_batch_invariant(a, b, *, out):
+    """`a @ b` written into `out` by the triton / deepgemm backends' GEMM.
+
+    `torch.matmul(..., out=...)` lowers to aten::mm.out, which these backends do not replace,
+    so a caller that writes a GEMM into a given buffer (the inference row-parallel layers write
+    into symmetric memory) calls this instead.
+    """
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
+        # _mm_deepgemm lays out its own TMA-aligned output.
+        return out.copy_(_mm_deepgemm(a, b))
+    return matmul_persistent(a, b, out=out)
+
+
 def addmm_batch_invariant(bias, a, b):
     """Batch-invariant replacement for `aten::addmm`."""
     if (
@@ -691,9 +716,11 @@ def _te_patch_tp_collectives() -> None:
 
     NCCL's ring adds a token's partials in an order set by its position in the step, so with
     TP >= 3 TE's row-parallel layers were not batch invariant, in training or inference. The
-    reductions are patched at every module that imported them by name. TE's operation fuser
-    and Userbuffers overlap reduce inside TE itself; TransformerConfig rejects them in
-    batch-invariant mode at TP >= 3.
+    reductions are patched at every module that imported them by name; with async_op the
+    patched reduction returns a handle whose wait() finishes it, so TE's backward still
+    overlaps its input-gradient reduction with the weight-gradient GEMM. TE's operation fuser
+    and the Userbuffers reduce-scatter overlaps reduce inside TE itself; TransformerConfig
+    rejects them in batch-invariant mode at TP >= 3.
     """
     for mod_name in _TE_TP_COLLECTIVE_MODULES:
         mod = _import_module_if_available(mod_name)

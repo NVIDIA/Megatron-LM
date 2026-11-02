@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_backend,
     is_batch_invariant_mode_enabled,
+    mm_out_batch_invariant,
     rmsnorm_batch_invariant,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -75,6 +76,16 @@ def _apply_linear(
     kwargs = {"out": out} if out is not None else {}
     if isinstance(weight, MXFP8Tensor):
         return mm_mxfp8(x, weight, **kwargs)
+    if (
+        out is not None
+        and is_batch_invariant_mode_enabled()
+        and get_batch_invariant_backend() != "te_native"
+    ):
+        # The backend replaces aten::mm, not the out= overload torch.matmul would use here.
+        mm_out_batch_invariant(
+            x.reshape(-1, x.size(-1)), weight.t(), out=out.view(-1, out.size(-1))
+        )
+        return out
     return torch.matmul(x, weight.t(), **kwargs)
 
 
@@ -526,13 +537,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             and self.triton_nvls_kernels_allowed
             and symm_mem_buffer["handle"] is not None
         ):
-            # Put the matmul output in symmetric memory; one kernel then sums every rank's
-            # rows of this rank's chunk in rank order. The triton and deepgemm backends
-            # replace aten::mm but not its out= overload, so their output is copied in.
-            if use_mxfp8 or get_batch_invariant_backend() == "te_native":
-                x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
-            else:
-                x = symm_mem_buffer["tensor"].copy_(_apply_linear(x, self.weight, self.config))
+            # Write the matmul output to symmetric memory; one kernel then sums every
+            # rank's rows of this rank's chunk in rank order.
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
             x, _ = batch_invariant_reduce_scatter(
                 x, self.tp_group, symm_mem_hdl=symm_mem_buffer["handle"]
             )

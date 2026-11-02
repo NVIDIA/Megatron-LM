@@ -325,11 +325,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py",
         ),
         kind="triton",
-        notes="Batch-invariant TP reduce-scatter / all-reduce: each element is the rank-order fp32 sum "
-        "of its partials, rounded once (inline-PTX adds, so the compiler cannot reorder them). The "
-        "kernel on the all-to-all output replays bit-exactly in test_tensor_parallel_kernels.py; its "
-        "symmetric-memory reading, the NCCL fallback and NCCL's two-rank add are checked bitwise "
-        "against the rank-order reference on 4-8 GPUs in test_batch_invariant_reduction.py.",
+        notes="Batch-invariant TP reduce-scatter / all-reduce: each element is a chain of fp32 adds "
+        "in rank order (add_rn_f32, inline PTX, so the compiler cannot reorder them), rounded to the "
+        "input dtype. The kernel replays bit-exactly in test_tensor_parallel_kernels.py on the "
+        "all-to-all output and on stand-in peer buffers (TP 3, 6, 8); the multi-rank paths and "
+        "NCCL's two-rank add are checked bitwise in test_batch_invariant_reduction.py.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",

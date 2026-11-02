@@ -11,6 +11,7 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     SYMM_MEM_KERNEL_CONFIG,
 )
 from megatron.core.inference.communication.torch_symm_triton.utils import (
+    add_rn_f32,
     is_device_nvls_capable,
     sync_threads,
 )
@@ -319,7 +320,7 @@ def _ordered_reduce_scatter_v_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
-    """Reduce peer rows with an explicit rank-order FP32 sum."""
+    """Reduce peer rows with an explicit rank-order FP32 sum (add_rn_f32 fixes the order)."""
     pid = tl.program_id(axis=0)
 
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
@@ -354,7 +355,7 @@ def _ordered_reduce_scatter_v_kernel(
                 values = tl.load(
                     peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
                 )
-                acc += values
+                acc = add_rn_f32(acc, values)
 
             tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
 
