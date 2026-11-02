@@ -1447,6 +1447,8 @@ def _te_apply_normalization_patched(
 @lru_cache(maxsize=None)
 def _te_general_gemm_parameters(general_gemm) -> tuple:
     """Parameter names of TE's general_gemm, in order, and their defaults."""
+    import inspect
+
     params = inspect.signature(general_gemm).parameters
     defaults = {name: p.default for name, p in params.items() if p.default is not p.empty}
     return tuple(params), defaults
@@ -1464,11 +1466,12 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     """Batch-invariant replacement for TE general_gemm.
 
     Computes ``alpha * op(A) @ op(B) + beta * out + bias`` like TE, with the product from
-    the batch-invariant GEMM: ``accumulate`` adds into ``out`` (``beta`` defaults to 1, as
-    in TE), and ``alpha``/``beta`` scale the product and ``out``. Calls it cannot serve
-    (GELU fusion, output quantization, quantized operands, Userbuffers overlap) fail
-    rather than run TE's cuBLASLt GEMM. Returns (gemm_out, bias_grad, gelu_input,
-    extra_output) like TE.
+    the batch-invariant GEMM. ``accumulate`` adds into ``out``, for example a weight
+    gradient into an fp32 ``main_grad`` (``beta`` defaults to 1, as in TE), and
+    ``alpha``/``beta`` scale the product and ``out``; calls without them run the plain
+    GEMM as before. Calls it cannot serve (GELU fusion, output quantization, quantized
+    operands, Userbuffers overlap) fail rather than run TE's cuBLASLt GEMM. Returns
+    (gemm_out, bias_grad, gelu_input, extra_output) like TE.
     """
     if _TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
@@ -1526,13 +1529,20 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         # Compute via autograd-aware function matching TE's layout semantics
         result = BatchInvariantTEGemmFn.apply(A, B, epilogue_bias, out_dtype, layout)
     else:
-        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once.
-        result = alpha * BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
+        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once. For an
+        # fp32 result (a weight gradient accumulated into main_grad) the product is taken
+        # from fp32 operands, exact for bf16/fp16 inputs, so it is not rounded to bf16 first.
+        result_dtype = out.dtype if out is not None else (out_dtype or A.dtype)
+        if result_dtype == torch.float32:
+            product = BatchInvariantTEGemmFn.apply(A.float(), B.float(), None, None, layout)
+        else:
+            product = BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
+        result = alpha * product
         if epilogue_bias is not None:
             result = result + epilogue_bias.float()
         if accumulate:
             result = result + beta * out.float()
-        result = result.to(out.dtype if out is not None else (out_dtype or A.dtype))
+        result = result.to(result_dtype)
 
     bias_grad = None
     if grad and bias is not None:
