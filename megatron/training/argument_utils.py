@@ -795,6 +795,7 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
 # them. The fields the container writes (layout, validation flags) are listed separately.
 _DATASET_FIELD_SOURCES = {
     "random_seed": "seed",
+    "train_data_down_sampling_seed": "train_data_down_sampling_seed",
     "sequence_length": "seq_length",
     "split": "split",
     "num_dataset_builder_threads": "num_dataset_builder_threads",
@@ -835,7 +836,7 @@ def requested_dataset_family(args: Namespace) -> str:
     return selected[0] if selected else "gpt"
 
 
-def _resolve_data_sources(args: Namespace):
+def _resolve_data_sources(args: Namespace, *, allow_per_source_downsampling: bool = False):
     """``(blend, blend_per_split, sequences_per_dataset)`` from the legacy path arguments.
 
     ``--mock-data`` next to a file-backed source is rejected here: ``validate_args`` counts only the
@@ -849,7 +850,9 @@ def _resolve_data_sources(args: Namespace):
     )
     if getattr(args, "mock_data", False) and file_backed:
         raise ValueError("A single data source must be provided in training mode, else None")
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = get_blend_and_blend_per_split(
+        args, allow_per_source_downsampling=allow_per_source_downsampling
+    )
     sequences_per_dataset = None
     path = getattr(args, "per_dataset_sequences_path", None)
     if path is not None:
@@ -894,7 +897,17 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     Megatron Core's ``validate()``.
     """
     family = requested_dataset_family(args)
-    blend, blend_per_split, sequences_per_dataset = _resolve_data_sources(args)
+    blend, blend_per_split, sequences_per_dataset = _resolve_data_sources(
+        args, allow_per_source_downsampling=family in ("gpt", "fim")
+    )
+    train_blend = None if blend_per_split is None else blend_per_split[0]
+    if (
+        train_blend is not None
+        and len(train_blend) == 3
+        and any(probability < 1.0 for probability in train_blend[2])
+        and (getattr(args, "logits_save_dir", None) or getattr(args, "logits_load_dir", None))
+    ):
+        raise ValueError("Cached-logit distillation does not support training downsampling")
     has_source = blend is not None or (blend_per_split is not None and any(blend_per_split))
     mock_requested = bool(getattr(args, "mock_data", False))
     dataset_type = dataset_type_from_family(family, mock=False)
@@ -910,7 +923,11 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         # Otherwise (fim) the real class stays and DataConfig.validate() reports the missing source.
 
     kwargs: dict[str, Any] = {
-        field_name: deepcopy(getattr(args, source))
+        field_name: deepcopy(
+            getattr(args, source, 1234)
+            if source == "train_data_down_sampling_seed"
+            else getattr(args, source)
+        )
         for field_name, source in _DATASET_FIELD_SOURCES.items()
     }
     kwargs["blend"] = blend

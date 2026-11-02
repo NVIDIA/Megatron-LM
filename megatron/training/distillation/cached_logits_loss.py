@@ -113,6 +113,7 @@ from megatron.training.distillation.utils import (
     storage_glob_with_caching,
     v2_iter_logprobs_tar_entries,
     v2_sorted_batched_tars,
+    validate_cached_logits_dataset,
 )
 from megatron.training.utils import print_rank_last
 
@@ -238,6 +239,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         ignore_hash: bool = False,
         meta: Optional[Dict[str, Any]] = None,
     ):
+        validate_cached_logits_dataset()
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
         self.cp_size = cp_size
@@ -767,6 +769,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         # NOTE: intentionally bypass the v2 base ``__init__`` because it
         # demands v2 metadata fields and constructs a LogprobsReshardPlan
         # that the v1 path does not use.
+        validate_cached_logits_dataset()
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
         self.cp_size = cp_size

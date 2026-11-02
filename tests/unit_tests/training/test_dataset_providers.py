@@ -332,6 +332,10 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
     else:
         assert isinstance(actual, type(expected))
         names = [f.name for f in fields(expected)]
+    # The seed field was added after the frozen factory. Check its forwarding explicitly;
+    # compare all pre-existing fields against the unmodified historical oracle.
+    assert actual.train_data_down_sampling_seed == args.train_data_down_sampling_seed
+    names = [name for name in names if name != "train_data_down_sampling_seed"]
     compared = names
     if entry_point == "hybrid_flex":
         # No model config: the layout fields keep Megatron Core's defaults, as the legacy factory
@@ -386,7 +390,12 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).builder_inputs()
-    names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
+    assert actual.train_data_down_sampling_seed == args.train_data_down_sampling_seed
+    names = [
+        f.name
+        for f in fields(GPTDatasetConfig)
+        if f.name not in ("tokenizer", "train_data_down_sampling_seed")
+    ]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     assert changed == LEGACY_OMISSIONS[entry_point]
     expected = legacy.legacy_gpt_dataset_config(args)

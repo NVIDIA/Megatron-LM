@@ -109,6 +109,107 @@ The `BlendedDataset` class is a high-level data interface in Megatron Core. It i
 
 The `BlendedDataset` is only necessary when a blend multiple data distributions, i.e. multiple `MegatronDataset` instances, should contribute to a certain dataset split. The blend can be controlled via the `BlendedMegatronDatasetConfig`.
 
+## Deterministic training subsets
+
+GPT pretraining can select a fixed subset of each training source before building
+sample indexes. A per-split blend accepts flattened **weight, prefix, probability**
+triples for `train`; validation and test continue to use ordinary prefixes or
+weight/prefix pairs. For example:
+
+```json
+{
+  "train": ["0.7", "/data/source_a", "0.5", "0.3", "/data/source_b", "0.25"],
+  "valid": ["/data/validation"],
+  "test": null
+}
+```
+
+Add these options to a GPT or Hybrid pretraining command, along with its model,
+tokenizer, batch and training-duration settings:
+
+```bash
+--per-split-data-args-path /path/to/blend.json \
+--train-data-down-sampling-seed 1234 \
+--data-cache-path /path/to/cache
+```
+
+For each source containing `N` eligible indexed sequences, probability `p` retains
+`ceil(p * N)` entries from a NumPy `RandomState` permutation. Probabilities must be
+finite and in `(0, 1]`. The subset seed is independent of `--seed`, which controls
+sample shuffling and other training randomness. Use the same subset seed and
+unchanged source indexes to obtain nested subsets as probabilities increase.
+Probability `1` keeps the legacy order and cache identity. Unweighted blends and
+weight/prefix pairs keep their existing behavior.
+
+Selection operates on **indexed sequence IDs**. It selects whole documents only
+when preprocessing stored exactly one sequence per document; it does not remove
+duplicate text. Blend weights still determine sampling frequency, while
+probabilities determine which source records are eligible. The selected pool's
+token count is separate from the training horizon: a longer run can revisit
+selected records.
+
+Training subsets require a per-split training blend. They are not supported with
+`--data-path`, validation/test triples, SFT/variable-length datasets, or cached-logit
+distillation. An optional
+`--train-data-down-sampling-prob-override` applies one probability to every training
+source; using it replaces the per-source probabilities, including calibrated ones.
+
+### Cache preparation
+
+Use the same blend, subset seed, tokenizer, sequence length and requested sample
+counts for `tools/prepare_cache.py` and training. Probability and subset seed are
+part of the dataset cache identity whenever downsampling is active; changing them
+requires matching caches. `--dataloader-fast-cache-load` consumes prepared caches
+and does not construct a new subset from missing source-index arrays. Prepare
+caches before enabling it, and retain the corresponding per-source sequence counts
+and dtype settings used by the fast-cache workflow.
+`tools/build_sequences_per_dataset.py` accepts the training triples and records
+the full source sequence counts; subset probabilities are applied later by GPTDataset.
+
+The feature is wired through GPT, Hybrid and cache-preparation configuration.
+GPT fill-in-the-middle datasets also retain the selected source subset.
+
+### Prepare nested pools by token budget
+
+[`tools/prepare_data_subsets.py`](../../../tools/prepare_data_subsets.py) converts a
+training-only weighted blend into nested subsets using the token lengths recorded
+in native Megatron indexes. It preserves source weights and paths, supports native
+token storage dtypes, and does not copy token binaries. Start with a JSON such as:
+
+```json
+{
+  "train": ["0.7", "/data/source_a", "0.3", "/data/source_b"],
+  "valid": null,
+  "test": null
+}
+```
+
+Run from the repository root, using an output directory that does not exist:
+
+```bash
+python -m tools.prepare_data_subsets \
+  --input-blend /path/to/sources.json \
+  --output-dir /path/to/subsets \
+  --token-budgets 1000000000 500000000 250000000 \
+  --seed 1234
+```
+
+Each source receives a token quota proportional to its blend weight. The tool
+selects the shortest prefix of the same seeded sequence permutation that meets
+that quota. Whole-sequence selection can exceed the requested token budget; the
+outputs record both requested and actual counts. Source quotas above available
+capacity are rejected. The tool refuses to overwrite an existing output directory.
+
+The outputs are `subset_<token_budget>.json` and `summary.json`. The summary
+records source sizes, quotas, selected sequence/token counts and the NumPy version.
+Relative source prefixes are interpreted from the working directory and remain
+unchanged in the generated blends.
+
+Use a generated training blend, add your existing validation/test paths if needed,
+and pass the recorded subset seed to both cache preparation and training. Keep the
+original source indexes and a matching NumPy version for reproducible selection.
+The helper uses memory proportional to the largest source's sequence count.
+
 ## Data loading: implementation
 
 ### GPTDataset

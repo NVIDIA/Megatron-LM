@@ -10,43 +10,42 @@ python3 tools/build_sequences_per_dataset.py --per-split-data-args-path my-train
 
 import argparse
 import json
-from typing import Optional, Tuple, List
-
 
 from megatron.core.datasets.indexed_dataset import _IndexReader
 from megatron.training.utils import get_blend_and_blend_per_split
 
+
 def get_paths_from_blend(
-    blend: Optional[Tuple[List[str], Optional[List[float]]]],
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]],
-) -> List[str]:
+    blend: tuple[list[str], list[float] | None] | None, blend_per_split: list[tuple | None] | None
+) -> list[str]:
     """Extract all dataset paths from blend and blend_per_split.
 
     Args:
-        blend (Optional[Tuple[List[str], Optional[List[float]]]]): A blend tuple containing
+        blend: A blend tuple containing
             a list of dataset paths and optionally a list of weights, e.g.,
             (["path/to/dataset_1", "path/to/dataset_2"], [0.3, 0.7])
-        blend_per_split (Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]): 
-            A list of 3 blend tuples (for train, valid, test splits), where each element has 
-            the same structure as blend
+        blend_per_split:
+            A list of 3 blend tuples (for train, valid, test splits), where each element has
+            the same structure as blend. The train blend may include a third list of
+            downsampling probabilities; metadata still describes the complete source.
 
     Returns:
-        List[str]: A list of all unique dataset paths found in blend and blend_per_split
+        A list of all unique dataset paths found in blend and blend_per_split.
     """
     paths = []
-    
+
     # Extract paths from blend
     if blend is not None:
-        paths_list, _ = blend
+        paths_list = blend[0]
         paths.extend(paths_list)
-    
+
     # Extract paths from blend_per_split
     if blend_per_split is not None:
         for split_blend in blend_per_split:
             if split_blend is not None:
-                split_paths, _ = split_blend
+                split_paths = split_blend[0]
                 paths.extend(split_paths)
-    
+
     # Remove duplicates while preserving order
     seen = set()
     unique_paths = []
@@ -54,13 +53,14 @@ def get_paths_from_blend(
         if path not in seen:
             seen.add(path)
             unique_paths.append(path)
-    
+
     return unique_paths
+
 
 def build_sequences_per_dataset(args):
     print("Building sequences per dataset...")
 
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = get_blend_and_blend_per_split(args, allow_per_source_downsampling=True)
 
     file_prefixes = get_paths_from_blend(blend, blend_per_split)
 
@@ -75,6 +75,7 @@ def build_sequences_per_dataset(args):
 
     return sequence_count_dict
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-path', nargs='*', default=None,
@@ -86,8 +87,9 @@ if __name__ == "__main__":
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     parser.add_argument('--train-data-path', nargs='*', default=None,
-                       help='The weight and prefix list for an independent train dataset. '
-                       'Follows the same pattern rules as --data-path.')
+                       help="The weight and prefix list for an independent train dataset. "
+                       "Also accepts weight prefix downsampling-probability triples. "
+                       "Counts always describe the complete sources.")
     parser.add_argument('--valid-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent validation dataset. '
                        'Follows the same pattern rules as --data-path.')

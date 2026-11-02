@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Blend, Split, normalize
 from megatron.core.tokenizers import MegatronTokenizerBase
 
 
@@ -26,9 +26,10 @@ class BlendedMegatronDatasetConfig:
        'blend_per_split'. Defaults to None.
     """
 
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]] = None
-    """A set of blends, as defined above, one for each split distribution. Not to be used with
-       'blend'. Defaults to None.
+    blend_per_split: list[Blend | None] | None = None
+    """One blend per split. The train blend may also contain a third list of per-source
+       downsampling probabilities, parallel to the prefixes. Validation and test use pairs.
+       Not to be used with 'blend'. Defaults to None.
     """
 
     multiple_validation_sets: Optional[bool] = None
@@ -117,12 +118,30 @@ class BlendedMegatronDatasetConfig:
             assert len(self.blend_per_split) == len(
                 Split
             ), f"blend_per_split must contain {len(Split)} blends"
-            for blend in self.blend_per_split:
-                assert (
-                    blend is None or blend[1] is None or len(blend[0]) == len(blend[1])
+            for split_index, blend in enumerate(self.blend_per_split):
+                if blend is None:
+                    continue
+                if len(blend) not in (2, 3):
+                    raise ValueError(
+                        "A blend must contain prefixes, weights and optional probabilities"
+                    )
+                assert blend[1] is None or len(blend[0]) == len(
+                    blend[1]
                 ), "blend per split prefixes and weights must be equal in number"
+                if len(blend) == 3:
+                    if split_index != Split.train.value:
+                        raise ValueError("Per-source downsampling is only supported for train")
+                    probabilities = blend[2]
+                    if probabilities is None or len(probabilities) != len(blend[0]):
+                        raise ValueError(
+                            "Prefixes and downsampling probabilities must have equal lengths"
+                        )
+                    if not all(0.0 < probability <= 1.0 for probability in probabilities):
+                        raise ValueError("Downsampling probabilities must be finite and in (0, 1]")
         else:
             if self.blend is not None:
+                if len(self.blend) != 2:
+                    raise ValueError("Downsampling requires a per-split train blend")
                 assert self.blend[1] is None or len(self.blend[0]) == len(
                     self.blend[1]
                 ), "blend prefixes and weights must be equal in number"
