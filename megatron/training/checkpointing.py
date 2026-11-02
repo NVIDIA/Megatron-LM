@@ -627,7 +627,6 @@ class CheckpointType(Enum):
 
 
 def _build_sharded_state_dict_metadata(
-    args: Namespace,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     ckpt_format: Optional[str] = None,
@@ -643,15 +642,14 @@ def _build_sharded_state_dict_metadata(
     impossible to enforce a linearly increasing versioning for this whole space.
 
     Args:
-        args: Arguments namespace
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         ckpt_format: The format of the operation (default: the run's checkpoint section's)
     """
-    checkpoint = get_run_config().checkpoint
+    cfg = get_run_config()
+    checkpoint = cfg.checkpoint
     if ckpt_format is None:
         ckpt_format = checkpoint.ckpt_format
     metadata = {}
-    cfg = get_run_config()
 
     # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
     # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
@@ -944,7 +942,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, ckpt_format=save_format
+                dp_cp_group=dp_cp_group, ckpt_format=save_format
             )
             if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
@@ -1860,7 +1858,7 @@ def generate_state_dict(
                 if 'metadata' not in optim_sd_kwargs:
                     optim_sd_kwargs['metadata'] = {}
                 optim_sd_kwargs['metadata'].update(
-                    _build_sharded_state_dict_metadata(args, ckpt_format=ckpt_format)
+                    _build_sharded_state_dict_metadata(ckpt_format=ckpt_format)
                 )
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
             else:
@@ -3052,7 +3050,7 @@ def load_checkpoint(
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, ckpt_format=load_format
+                dp_cp_group=dp_cp_group, ckpt_format=load_format
             )
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(
@@ -3271,7 +3269,7 @@ def load_checkpoint(
 
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(
-                args, dp_cp_group=dp_cp_group, ckpt_format=load_format
+                dp_cp_group=dp_cp_group, ckpt_format=load_format
             ),
             is_loading=True,
         )

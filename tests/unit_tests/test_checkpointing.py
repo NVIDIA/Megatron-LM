@@ -1151,7 +1151,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_fp_ops = 456
 
-        base_metadata = _build_sharded_state_dict_metadata(args)
+        base_metadata = _build_sharded_state_dict_metadata()
         first_job_mock_metadata = {**base_metadata, 'metadata_A': 42, 'metadata_B_soon_removed': 43}
         with mock.patch(
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
@@ -1334,7 +1334,7 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
 
 
-def _make_metadata_args(
+def _describe_metadata_run(
     run_config,
     use_distributed_optimizer=False,
     use_layer_wise_distributed_optimizer=False,
@@ -1342,25 +1342,15 @@ def _make_metadata_args(
     dist_ckpt_optim_fully_reshardable=False,
     distrib_optim_fully_reshardable_mem_efficient=False,
 ):
-    # The metadata builder reads the optimizer flags from the run config, the rest from args.
+    """The metadata builder reads the optimizer flags from the optimizer section and the
+    checkpoint settings from the checkpoint section."""
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
-    args = SimpleNamespace()
-    args.ckpt_format = ckpt_format
-    args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
-    args.distrib_optim_fully_reshardable_mem_efficient = (
-        distrib_optim_fully_reshardable_mem_efficient
-    )
-    return args
-
-
-def _register_metadata_section(args):
-    """The checkpoint section the metadata builder reads; the namespace keeps the rest."""
-    get_run_config().checkpoint = CheckpointConfig(
-        ckpt_format=args.ckpt_format,
-        dist_ckpt_optim_fully_reshardable=args.dist_ckpt_optim_fully_reshardable,
+    run_config.checkpoint = CheckpointConfig(
+        ckpt_format=ckpt_format,
+        dist_ckpt_optim_fully_reshardable=dist_ckpt_optim_fully_reshardable,
         distrib_optim_fully_reshardable_mem_efficient=(
-            args.distrib_optim_fully_reshardable_mem_efficient
+            distrib_optim_fully_reshardable_mem_efficient
         ),
     )
 
@@ -1384,9 +1374,8 @@ class TestBuildShardedStateDictMetadata:
             model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
         )
         monkeypatch.setattr('megatron.training.checkpointing.get_run_config', lambda: cfg)
-        args = SimpleNamespace(ckpt_format=ckpt_format)
 
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
 
         assert metadata == {
             'singleton_local_shards': False,
@@ -1395,51 +1384,45 @@ class TestBuildShardedStateDictMetadata:
         }
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self, run_config):
-        args = _make_metadata_args(run_config, use_distributed_optimizer=True)
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config, use_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_distributed_optimizer_fully_reshardable_flag(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config, use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
     def test_distributed_optimizer_fsdp_dtensor(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config, use_distributed_optimizer=True, ckpt_format='fsdp_dtensor'
         )
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
     def test_layer_wise_only_still_sets_sharding_type(self, run_config):
         # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
-        args = _make_metadata_args(run_config, use_layer_wise_distributed_optimizer=True)
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config, use_layer_wise_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_layer_wise_with_fully_reshardable(self, run_config):
-        args = _make_metadata_args(
+        _describe_metadata_run(
             run_config,
             use_layer_wise_distributed_optimizer=True,
             dist_ckpt_optim_fully_reshardable=True,
         )
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
     def test_no_distributed_optimizer_no_sharding_type(self, run_config):
-        args = _make_metadata_args(run_config)
-        _register_metadata_section(args)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        _describe_metadata_run(run_config)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
 
 

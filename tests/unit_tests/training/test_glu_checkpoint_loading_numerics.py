@@ -611,7 +611,7 @@ def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
         args = get_args()
         assert args.no_save_optim is False and args.no_load_optim is False
         assert (
-            checkpointing._build_sharded_state_dict_metadata(args)["distrib_optim_sharding_type"]
+            checkpointing._build_sharded_state_dict_metadata()["distrib_optim_sharding_type"]
             == "dp_reshardable"
         )
         force_param_sync(model, optimizer=optimizer)
