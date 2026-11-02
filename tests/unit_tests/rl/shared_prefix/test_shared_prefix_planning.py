@@ -332,7 +332,7 @@ def _concatenated_trees():
 
 def _root_only_star_roots():
     trees = (PackedTreeLayout.from_shared_prefix(2, (1, 2)), PackedTreeLayout((0,), (3,), (-1,)))
-    return tuple(PackedTreeLayout.concat(trees).iter_star_roots())
+    return PackedTreeLayout.concat(trees).iter_star_roots()
 
 
 PLANNING_EXAMPLES = {
@@ -876,19 +876,19 @@ TREE = [
     ("node-query-float", lambda: nested_tree().path_token_indices(1.0), "node index"),
     (
         "star-lowering-nested",
-        lambda: tuple(nested_tree().iter_star_roots()),
+        lambda: nested_tree().iter_star_roots(),
         "forest of stars",
         NotImplementedError,
     ),
     (
         "star-lowering-interleaved",
-        lambda: tuple(PackedTreeLayout(*_INTERLEAVED_STARS).iter_star_roots()),
+        lambda: PackedTreeLayout(*_INTERLEAVED_STARS).iter_star_roots(),
         "contiguous star storage",
         NotImplementedError,
     ),
     (
         "star-lowering-padded-root",
-        lambda: tuple(PackedTreeLayout((0, 4), (4, 1), (-1, 0), (2, 1)).iter_star_roots()),
+        lambda: PackedTreeLayout((0, 4), (4, 1), (-1, 0), (2, 1)).iter_star_roots(),
         "unpadded prompt roots",
         NotImplementedError,
     ),
