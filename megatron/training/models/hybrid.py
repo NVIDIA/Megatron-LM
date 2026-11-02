@@ -151,7 +151,7 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
         )
     if model_config.restore_modelopt_state:
         _check_modelopt_spec_supported(use_wide_residual)
-        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=True)
     return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
 
 

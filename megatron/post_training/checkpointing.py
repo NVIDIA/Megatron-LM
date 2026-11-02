@@ -57,7 +57,7 @@ def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
     try:
         if ckpt_format == "torch":
             # Non-sharded
-            state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(checkpoint_path, get_args(), rank0=False)
             if state_dict is None:
                 return False
             modelopt_state = state_dict.get("modelopt_state")
@@ -118,7 +118,7 @@ def load_modelopt_state(
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _ = _load_base_checkpoint(load_dir, rank0=False)
+            state_dict, _, _, _ = _load_base_checkpoint(load_dir, args, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -140,16 +140,10 @@ def load_modelopt_state(
 def load_kd_teacher_checkpoint(
     model, distillation: DistillationConfig | None = None, *, student_checkpoint=None
 ) -> None:
-    """Load teacher weights after wrapping, using configuration or legacy CLI arguments."""
-    args = get_args()
+    """Load the teacher's weights after wrapping. No-op when the run has no distillation."""
     if distillation is None:
-        teacher_load = getattr(args, "export_kd_teacher_load", None)
-        if not teacher_load:
-            return
-        distillation = DistillationConfig(
-            teacher_load=teacher_load,
-            teacher_ckpt_format=getattr(args, "export_kd_teacher_ckpt_format", None),
-        )
+        return
+    args = get_args()
 
     teacher = unwrap_model(model[0]).teacher_model
     print_rank_0(
@@ -157,11 +151,16 @@ def load_kd_teacher_checkpoint(
     )
     # load_checkpoint still uses runtime args. Adapt only for the duration of this call,
     # restoring even absent fields and failed loads so the student's state is unchanged.
+    # Also clear the student's resume/finetune selectors, which would otherwise redirect the
+    # teacher load to another iteration or directory.
     overrides = {
         "finetune": True,
         "export_kd_teacher_load": distillation.teacher_load,
         "ckpt_format": distillation.teacher_ckpt_format
         or (student_checkpoint.ckpt_format if student_checkpoint is not None else args.ckpt_format),
+        "pretrained_checkpoint": None,
+        "ckpt_step": None,
+        "non_persistent_ckpt_type": None,
     }
     missing = object()
     original = {key: getattr(args, key, missing) for key in overrides}

@@ -33,7 +33,7 @@ def distillation_config_from_args(
     """Build the run's ``DistillationConfig`` from ``--export-kd-*``, or ``None`` without KD.
 
     The teacher architecture is resolved here from the student's model config and the teacher
-    YAML, and the ``--export-kd-cfg`` YAML is read into the loss fields, so the result is
+    YAML, and the ``--export-kd-cfg`` YAML is read into ``loss``, so the result is
     self-contained. Incompatible settings are rejected by the run container's validation.
 
     Args:
@@ -43,12 +43,11 @@ def distillation_config_from_args(
     if not getattr(args, "export_kd_teacher_load", None):
         return None
 
-    loss = load_distillation_loss_yaml(args.export_kd_cfg) if args.export_kd_cfg else {}
     distillation = DistillationConfig(
         teacher_load=args.export_kd_teacher_load,
         teacher_model_config=args.export_kd_teacher_model_config,
         teacher_ckpt_format=args.export_kd_teacher_ckpt_format,
-        **loss,
+        loss=load_distillation_loss_yaml(args.export_kd_cfg) if args.export_kd_cfg else {},
     )
     teacher_args = _load_teacher_model_config(distillation, args)
     teacher_transformations = student_model_config.transformations
@@ -210,12 +209,14 @@ def apply_modelopt_model_config(
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
     _check_model_type(model_config, args)
 
+    original_num_layers = None
     if not isinstance(model_config, HybridModelConfig) and getattr(
         args, "export_offline_model", False
     ):
         transformer_config = model_config.transformer
         # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
-        transformer_config.original_num_layers = transformer_config.num_layers
+        original_num_layers = transformer_config.num_layers
+        transformer_config.original_num_layers = original_num_layers
         # Set num_layers to 0 for base model in offline mode
         transformer_config.num_layers = 0
         # SP is not used for offline
@@ -236,6 +237,7 @@ def apply_modelopt_model_config(
         moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
+        original_num_layers=original_num_layers,
     )
     return model_config
 

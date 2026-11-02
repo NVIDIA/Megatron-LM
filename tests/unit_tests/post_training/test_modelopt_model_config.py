@@ -17,7 +17,7 @@ from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.models.base import ModelConfig
-from megatron.training.models.distillation import DistillationConfig
+from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
 from megatron.training.models.hybrid import (
     HybridModelBuilder,
@@ -64,9 +64,10 @@ class TestDistillationConfigFromArgs:
         assert distillation.teacher_load == str(tmp_path)
         assert distillation.teacher_model_config == str(teacher_yaml)
         assert distillation.teacher_ckpt_format == "torch_dist"
-        assert distillation.kd_cfg is None
-        assert distillation.logit_kl_temperature == 2.0
-        assert distillation.intermediate_layer_pairs == [("a", "b", "mse")]
+        assert distillation.loss == {
+            "logit_kl_temperature": 2.0,
+            "intermediate_layer_pairs": [["a", "b", "mse"]],
+        }
         assert distillation.teacher_model.transformer.num_layers == 4
         assert distillation.teacher_model.share_embeddings_and_output_weights is False
         assert distillation.teacher_model.rotary_base == 500000
@@ -80,65 +81,35 @@ class TestDistillationConfigFromArgs:
         )
         assert student.transformer.num_layers == 2  # the student config is untouched
 
-    def test_rejects_unknown_loss_yaml_keys(self, tmp_path):
+    def test_loss_yaml_is_passed_through_unchanged(self, tmp_path):
+        # Fields follow the installed ModelOpt version, so unknown keys are not rejected here.
         kd_yaml = tmp_path / "kd.yaml"
-        kd_yaml.write_text(yaml.safe_dump({"criterion": "x"}))
+        kd_yaml.write_text(yaml.safe_dump({"kd_loss_alpha": 0.5, "logit_kl_top_p": 0.9}))
         args = make_modelopt_test_args(
             export_kd_teacher_load=str(tmp_path), export_kd_cfg=str(kd_yaml)
         )
-        with pytest.raises(ValueError, match="Unknown distillation settings"):
-            mc.distillation_config_from_args(args, mc.modelopt_model_config_from_args(args))
+        distillation = mc.distillation_config_from_args(
+            args, mc.modelopt_model_config_from_args(args)
+        )
+        assert distillation.loss == {"kd_loss_alpha": 0.5, "logit_kl_top_p": 0.9}
 
 
 class TestDistillationConfig:
-    def test_deprecated_kd_cfg_is_read_into_loss_fields(self, tmp_path):
-        kd_yaml = tmp_path / "kd.yaml"
-        kd_yaml.write_text(yaml.safe_dump({"skip_lm_loss": False, "kd_loss_scale": 0.5}))
-        with pytest.warns(DeprecationWarning, match="kd_cfg is deprecated"):
-            config = DistillationConfig(teacher_load="/t", kd_cfg=str(kd_yaml))
-        assert config.kd_cfg is None
-        assert (config.skip_lm_loss, config.kd_loss_scale) == (False, 0.5)
+    def test_default_loss_is_empty(self):
+        assert DistillationConfig(teacher_load="/t").loss == {}
 
-    def test_deprecated_kd_cfg_conflicting_with_field_raises(self, tmp_path):
-        kd_yaml = tmp_path / "kd.yaml"
-        kd_yaml.write_text(yaml.safe_dump({"kd_loss_scale": 0.5}))
-        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="kd_loss_scale"):
-            DistillationConfig(teacher_load="/t", kd_cfg=str(kd_yaml), kd_loss_scale=2.0)
-
-    def test_loss_kwargs_only_contains_non_defaults(self):
-        assert DistillationConfig(teacher_load="/t").loss_kwargs() == {}
-        config = DistillationConfig(
-            teacher_load="/t", logit_kl_topk=64, logit_layers=["out", "out"]
-        )
-        assert config.logit_layers == ("out", "out")
-        assert config.loss_kwargs() == {"logit_kl_topk": 64, "logit_layers": ("out", "out")}
-
-    def test_loss_kwargs_are_accepted_by_modelopt(self):
+    def test_loss_is_accepted_by_modelopt(self):
         import modelopt.torch.distill.plugins.megatron as mtd_mcore
 
         config = DistillationConfig(
-            teacher_load="/t",
-            intermediate_layer_pairs=[("decoder.layers.0", "decoder.layers.0", "cosine")],
-            logit_kl_temperature=2.0,
-            logit_kl_topk=8,
-            skip_lm_loss=False,
-            kd_loss_scale=0.5,
+            teacher_load="/t", loss={"logit_kl_temperature": 2.0, "logit_kl_topk": 8}
         )
-        modelopt_config = mtd_mcore.DistillationConfig(**config.loss_kwargs())
+        modelopt_config = mtd_mcore.DistillationConfig(**config.loss)
         assert modelopt_config.logit_kl_topk == 8
-        assert modelopt_config.kd_loss_scale == 0.5
 
-    @pytest.mark.parametrize(
-        "overrides,match",
-        [
-            ({"logit_layers": ("a",)}, "logit_layers"),
-            ({"intermediate_layer_pairs": [("a",)]}, "intermediate_layer_pairs"),
-            ({"kd_loss_scale": 0.0}, "positive"),
-        ],
-    )
-    def test_validate_rejects_invalid_loss(self, overrides, match):
-        config = DistillationConfig(teacher_load="/t", teacher_model=Mock(), **overrides)
-        with pytest.raises(ValueError, match=match):
+    def test_validate_rejects_non_mapping_loss(self):
+        config = DistillationConfig(teacher_load="/t", teacher_model=Mock(), loss=["x"])
+        with pytest.raises(ValueError, match="mapping"):
             config.validate()
 
     def test_validate_requires_resolved_teacher(self):
@@ -186,7 +157,18 @@ class TestDistillationConfig:
     def test_validate_student_rejects_mismatched_parallelism_or_dtype(self, attr):
         distillation = self._distillation_with_teacher(**{attr: 2})
         with pytest.raises(ValueError, match=f"same {attr}"):
-            distillation.validate_student(self._student_config())
+            validate_distillation_student(distillation, self._student_config())
+
+    def test_dense_teacher_ignores_student_expert_parallelism(self):
+        distillation = self._distillation_with_teacher()
+        student = self._student_config(num_moe_experts=8, expert_model_parallel_size=2)
+        validate_distillation_student(distillation, student)
+
+    def test_moe_teacher_must_match_student_expert_parallelism(self):
+        distillation = self._distillation_with_teacher(num_moe_experts=8)
+        student = self._student_config(num_moe_experts=8, expert_model_parallel_size=2)
+        with pytest.raises(ValueError, match="same expert_model_parallel_size"):
+            validate_distillation_student(distillation, student)
 
 
 class TestModelOptModelConfigFromArgs:
@@ -250,6 +232,21 @@ class TestModelOptModelConfigFromArgs:
 
         assert config.transformer.num_layers == 0
         assert config.transformer.original_num_layers == 2
+        assert config.transformations.original_num_layers == 2
+
+    def test_offline_layer_count_survives_serialization(self):
+        args = make_modelopt_test_args(export_offline_model=True)
+        restored = ModelConfig.from_dict(mc.modelopt_model_config_from_args(args).as_dict())
+        assert restored.transformer.num_layers == 0
+        assert not hasattr(restored.transformer, "original_num_layers")
+
+        with (
+            patch("megatron.training.models.gpt.default_layer_spec"),
+            patch("megatron.training.models.gpt.mtp_block_spec", return_value=None),
+            patch("megatron.training.models.gpt.GPTModel") as gpt_model,
+        ):
+            GPTModelBuilder(restored).build_model(Mock(), pre_process=True, post_process=True)
+        assert gpt_model.call_args.kwargs["config"].original_num_layers == 2
 
     def test_architecture_options_come_from_core_arguments(self):
         # The --export- spellings are deprecated aliases of the core flags.
@@ -607,7 +604,9 @@ class TestTeacherCheckpointConfig:
     def test_uses_config_and_restores_runtime_args(self, fail):
         from megatron.post_training import checkpointing
 
-        args = Namespace(finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale")
+        args = Namespace(
+            finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale", ckpt_step=5
+        )
         teacher = Mock()
         student = Mock(teacher_model=teacher)
         config = DistillationConfig(teacher_load="/configured", teacher_ckpt_format="torch_dist")
@@ -617,6 +616,9 @@ class TestTeacherCheckpointConfig:
             assert args.export_kd_teacher_load == "/configured"
             assert args.ckpt_format == "torch_dist"
             assert args.finetune is True
+            assert args.ckpt_step is None
+            assert args.pretrained_checkpoint is None
+            assert args.non_persistent_ckpt_type is None
             if fail:
                 raise RuntimeError("load failed")
 
@@ -632,8 +634,19 @@ class TestTeacherCheckpointConfig:
                 checkpointing.load_kd_teacher_checkpoint([student], config)
         load_checkpoint.assert_called_once()
         assert vars(args) == dict(
-            finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale"
+            finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale", ckpt_step=5
         )
+
+    def test_no_distillation_ignores_legacy_teacher_flag(self):
+        from megatron.post_training import checkpointing
+
+        args = Namespace(export_kd_teacher_load="/teacher")
+        with (
+            patch.object(checkpointing, "get_args", return_value=args),
+            patch.object(checkpointing, "load_checkpoint") as load_checkpoint,
+        ):
+            checkpointing.load_kd_teacher_checkpoint([Mock()], None)
+        load_checkpoint.assert_not_called()
 
     def test_student_checkpoint_format_when_teacher_format_unset(self):
         from megatron.post_training import checkpointing
@@ -679,11 +692,11 @@ class TestTeacherCheckpointConfig:
         with (
             patch.object(checkpointing, "get_args", return_value=args),
             patch.object(
-                checkpointing, "_load_base_checkpoint", return_value=({}, None, None)
+                checkpointing, "_load_base_checkpoint", return_value=({}, None, None, None)
             ) as load,
         ):
             checkpointing.load_modelopt_state(Mock(), "/explicit", ckpt_format="torch")
-        load.assert_called_once_with("/explicit", rank0=False)
+        load.assert_called_once_with("/explicit", args, rank0=False)
 
 
 class TestConfigurationDrivenKDLoss:

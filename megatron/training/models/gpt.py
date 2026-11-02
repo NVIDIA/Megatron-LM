@@ -334,6 +334,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         Returns:
             The constructed model
         """
+        options = self._model_config.transformations
+        if options is not None and options.original_num_layers is not None:
+            self._model_config.transformer.original_num_layers = options.original_num_layers
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
             transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)

@@ -14,6 +14,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+from megatron.training.models.distillation import validate_distillation_student
 from megatron.training.models.transforms import ModelTransformConfig
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
@@ -269,7 +270,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             config.validate()
             if distillation is not None:
                 distillation.validate()
-                distillation.validate_student(config)
+                validate_distillation_student(distillation, config)
 
             return modelopt_pre_wrap_hook(config, checkpoint, distillation)
         return compose_hooks(config.pre_wrap_hooks)

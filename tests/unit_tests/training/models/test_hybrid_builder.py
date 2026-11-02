@@ -275,7 +275,7 @@ class TestHybridModelBuilderBuildModel:
             return_value=modelopt_spec,
         ) as mock_fn:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
-        mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=False)
+        mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is modelopt_spec
 

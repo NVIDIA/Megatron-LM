@@ -98,7 +98,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
             restored.distillation.teacher_model.get_builder_cls()
             is restored.model.get_builder_cls()
         )
-        assert restored.distillation.loss_kwargs() == cfg.distillation.loss_kwargs()
+        assert restored.distillation.loss == cfg.distillation.loss
     elif training:
         assert restored.distillation is None
     else:
@@ -138,6 +138,16 @@ def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
     cfg.distillation = mc.distillation_config_from_args(args, model)
     setattr(cfg.model.transformer, field, value)
     with pytest.raises(ValueError, match="incompatible"):
+        cfg.validate()
+
+
+def test_container_rejects_unresolved_teacher_before_checking_student(tmp_path):
+    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
+    model = mc.modelopt_model_config_from_args(args)
+    cfg = pretrain_cfg_container_from_args(args, model)
+    cfg.distillation = mc.distillation_config_from_args(args, model)
+    cfg.distillation.teacher_model = None
+    with pytest.raises(ValueError, match="resolved teacher_model"):
         cfg.validate()
 
 

@@ -30,6 +30,10 @@ class ModelTransformConfig:
     lsq_scale_lr: float | None = None
     """Enable optimizer overrides for learned quantization scales."""
 
+    original_num_layers: int | None = None
+    """Offline speculative decoding: the base model's layer count. The model is built with
+    ``num_layers=0``, and ModelOpt reads this from the built ``TransformerConfig``."""
+
     def validate(self) -> None:
         """Validate transformation settings before allocating models or loading checkpoints."""
         if self.qad_train_target not in (None, "mtp", "base", "both"):

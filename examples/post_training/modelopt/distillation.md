@@ -51,9 +51,9 @@ logit_kl_temperature: 1.0
 
 Without this configuration file, the default logits-only distillation with scale and temperatures of 1.0 will be performed.
 
-The YAML is read once, when the CLI is translated, into the fields of the same names on the run's
-`DistillationConfig` (`PretrainConfigContainer.distillation`). A run config built directly can set those
-fields itself; `DistillationConfig.kd_cfg` (a path to this YAML) is deprecated.
+The YAML is read once, when the CLI is translated, into `DistillationConfig.loss` on the run's
+`PretrainConfigContainer.distillation`. Its keys are passed through to ModelOpt's `DistillationConfig`
+unchanged, so they follow the installed ModelOpt version. A run config built directly sets `loss` itself.
 
 ### Training
 
