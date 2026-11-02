@@ -388,6 +388,47 @@ def test_release_shared_block_decrements_once_per_owner():
     assert lru.block_hashes[lshared].item() == 333  # kept cached, not pool-returned
 
 
+def test_block_generation_advances_when_a_block_returns_to_the_free_pool():
+    """Work deferred for a block's owner, such as the context's queued page zeroing, is keyed
+    by the block's generation, which every path back to the free pool advances, and only
+    those paths."""
+    # Without prefix caching, a release returns the blocks.
+    plain = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
+    blocks = plain.allocate_memory_blocks(2).clone()
+    assert plain.block_generation[blocks].tolist() == [0, 0]
+    plain.release_memory_blocks(blocks)
+    assert plain.block_generation[blocks].tolist() == [1, 1]
+
+    # REF_ZERO: a block returns when its last reference is released.
+    rz = KVBlockAllocator(
+        _make_context(),
+        pool_size=8,
+        paused_limit=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+    )
+    shared = rz.allocate_memory_blocks(1).clone()
+    rz.retain_memory_blocks(shared.tolist())
+    rz.release_memory_blocks(shared)
+    assert rz.block_generation[shared].item() == 0
+    rz.release_memory_blocks(shared)
+    assert rz.block_generation[shared].item() == 1
+
+    # LRU: an unregistered block returns on release; a registered one stays cached until it
+    # is evicted.
+    lru = _lru_allocator(pool_size=4, paused_limit=0)
+    private, cached = (int(block) for block in lru.allocate_memory_blocks(2))
+    lru.register_kv_block_hashes([cached], [111], [0])
+    lru.release_memory_blocks(torch.tensor([private, cached], dtype=torch.int32))
+    assert lru.block_generation[[private, cached]].tolist() == [1, 0]
+    assert lru.allocate_memory_blocks(3) is not None  # evicts the cached block
+    assert lru.block_generation[cached].item() == 1
+
+    # A reset returns every block.
+    lru.reset()
+    assert lru.block_generation[[private, cached]].tolist() == [2, 2]
+
+
 # ---------------------------------------------------------------------------
 # LRU eviction: parent-chain safety
 # ---------------------------------------------------------------------------

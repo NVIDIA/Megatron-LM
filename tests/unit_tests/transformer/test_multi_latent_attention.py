@@ -2667,28 +2667,38 @@ class TestFusedMLAKVRoPEQuant:
 
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
-    get_device_arch_version() < 10,
-    reason="FlashAttention-4 loads whole latent pages on the split-KV path only on Blackwell",
+    get_device_arch_version() not in (10, 11),
+    reason="FlashAttention-4 loads whole latent pages on the split-KV path only on SM100/SM110",
 )
 class TestDynamicMLAUnwrittenLatentRows:
     """Unwritten rows of a request's last latent page must not reach the attention output.
 
-    On Blackwell, FlashAttention-4 split-KV for (192, 128) head dims lowers its key tile to 64
-    tokens, the latent page size, which selects the paged TMA path: it loads whole pages and
-    multiplies the masked (zero) probabilities by the unwritten tail of a request's last page.
-    A NaN there would make the output NaN, so newly acquired latent pages are zeroed. The step
-    decodes one token of a long request A (so that FA4 splits) while request B prefills, on a
-    latent pool filled with NaN or zeros before any request arrives.
+    On SM100, FlashAttention-4 split-KV for (192, 128) head dims over at least 64 key tiles of
+    128 lowers its key tile to 64 tokens, the latent page size, which selects the paged TMA
+    path: it loads whole pages and multiplies the masked (zero) probabilities by the unwritten
+    tail of a request's last page. A NaN there would make the output NaN, so newly acquired
+    latent pages are zeroed. The step decodes one token of a long request A while request B
+    prefills, on a latent pool filled with NaN or zeros before any request arrives. FA4's
+    heuristic splits such a step with few query tiles; the test requests the split
+    explicitly, so it pins the whole-page load whatever the heuristic picks.
     """
 
     max_sequence_length = 8448
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self):
+    def setup_and_teardown(self, monkeypatch):
         import megatron.core.transformer.attention as attention_module
 
-        if not attention_module.HAVE_FA4:
-            pytest.skip("flash-attn-4 is not installed")
+        assert attention_module.HAVE_FA4, "flash-attn-4 is required on SM100"
+        flash_attn4_varlen_func = attention_module.flash_attn4_varlen_func
+        self.paged_fa4_calls = 0
+
+        def split_kv(*args, **kwargs):
+            if kwargs.get("page_table") is not None:
+                self.paged_fa4_calls += 1
+            return flash_attn4_varlen_func(*args, **{**kwargs, "num_splits": 2})
+
+        monkeypatch.setattr(attention_module, "flash_attn4_varlen_func", split_kv)
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         yield
@@ -2779,7 +2789,10 @@ class TestDynamicMLAUnwrittenLatentRows:
         add_request(1, len_b)
         assert not context.is_decode_only()
         assert int(context.cu_kv_lengths()[2]) == len_a + 1
-        return forward(seed=2)[: 1 + len_b].float()
+        paged_fa4_calls = self.paged_fa4_calls
+        output = forward(seed=2)[: 1 + len_b].float()
+        assert self.paged_fa4_calls > paged_fa4_calls, "the mixed step must run paged FA4"
+        return output
 
     def _assert_matches_zero_pool(self, len_a, len_b):
         attention = self._build_attention()

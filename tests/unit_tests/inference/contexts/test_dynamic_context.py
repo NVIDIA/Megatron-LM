@@ -1455,6 +1455,7 @@ class TestDynamicContext:
             last_block_offsets=last_offsets,
         )
         original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
+        ctx._zero_pending_kv_pages()  # the previous step's publish (the reset queued the dummy)
         ctx.memory_buffer[1].fill_(5)
 
         # Prepare overlaps the previous forward, so it must not wait on the GPU, even when a
@@ -1497,7 +1498,9 @@ class TestDynamicContext:
 
         Paged attention multiplies the masked (zero) probabilities of a request's last page
         by that page's unwritten rows, so a stale NaN there reaches the output. MLA latent
-        pages hold the values too and need the same initialization as MHA value pages.
+        pages hold the values too and need the same initialization as MHA value pages. The
+        dummy block, which padding rows point at, is never acquired and is zeroed after the
+        pool is reset.
         """
         model_config_kwargs = dict(params_dtype=torch.float32, num_layers=2)
         if cache_mla_latents:
@@ -1545,21 +1548,41 @@ class TestDynamicContext:
         assert block_ids.numel() == 2
         new_pages = pages[:, block_ids.to(pages.device)]
         assert torch.count_nonzero(new_pages) == 0
-        # Only the request's pages are initialized; the rest of the pool is untouched.
-        assert torch.count_nonzero(~torch.isnan(pages)) == new_pages.numel()
+        dummy_page = pages[:, ctx.kv_block_allocator.dummy_block_idx]
+        assert torch.count_nonzero(dummy_page) == 0
+        # Only these pages are initialized; the rest of the pool is untouched.
+        assert torch.count_nonzero(~torch.isnan(pages)) == new_pages.numel() + dummy_page.numel()
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_kv_pages_queued_twice_before_a_publish_are_zeroed(self):
-        """A block released and acquired again before the next publish is queued twice. More
-        queued ids than the pool holds still fit the pinned staging buffer."""
+    def test_kv_page_zeroing_is_dropped_when_its_block_is_released(self):
+        """Zeroing queued for a block is dropped if the block returns to the free pool first.
+
+        The block's next owner may write it outside a forward (a disaggregated KV import),
+        so the publish must not zero it on the previous owner's behalf. Releasing and
+        acquiring a block more times than the pool holds blocks still fits the staging
+        buffers.
+        """
         ctx = self._get_async_sched_context()
+        allocator = ctx.kv_block_allocator
+        ctx._zero_pending_kv_pages()  # the previous step's publish (the reset queued the dummy)
         ctx.memory_buffer[1].fill_(float("nan"))
-        block_id = 3
-        ctx._initialize_kv_pages([block_id] * (ctx.kv_block_allocator.pool_size + 1))
+        for _ in range(allocator.pool_size):
+            block_ids = allocator.allocate_memory_blocks(1)
+            ctx._queue_kv_page_zeroing(block_ids)
+            allocator.release_memory_blocks(block_ids)
+        # The block's last owner imports its KV; another request's new page is queued.
+        imported = allocator.allocate_memory_blocks(1).item()
+        ctx.memory_buffer[1, :, imported] = 3.0
+        written = allocator.allocate_memory_blocks(1).item()
+        ctx._queue_kv_page_zeroing([written])
+
         ctx.transfer_bookkeeping_to_gpu()
-        assert torch.count_nonzero(ctx.memory_buffer[1, :, block_id]) == 0
-        assert torch.isnan(ctx.memory_buffer[1, :, block_id + 1]).all()
+
+        assert torch.all(ctx.memory_buffer[1, :, imported] == 3.0)
+        assert torch.count_nonzero(ctx.memory_buffer[1, :, written]) == 0
+        page_numel = ctx.memory_buffer[1, :, written].numel()
+        assert torch.count_nonzero(~torch.isnan(ctx.memory_buffer[1])) == 2 * page_numel
 
     @pytest.mark.internal
     @rounder_override(8)
