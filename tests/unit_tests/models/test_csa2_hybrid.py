@@ -192,7 +192,9 @@ def test_automatic_frozen_prefix_boundary_matches_eager_and_is_cached(
         moe_router_enable_expert_bias=False,
         ffn_hidden_size=64,
     )
-    recompute = dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
+    recompute = dict(
+        recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+    )
     configs = [_make_config(**common), _make_config(**common), _make_config(**common, **recompute)]
     models = [
         HybridModel(
@@ -227,6 +229,68 @@ def test_automatic_frozen_prefix_boundary_matches_eager_and_is_cached(
     for model in (eager, recomputed):
         assert model.decoder._gradient_boundary_layer_cache[False] == first_trainable
     _assert_trainable_grads_match((eager, recomputed), reference, atol=2e-4, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "first_trainable", [0, 2], ids=["boundary-on-first-layer", "boundary-after-frozen-layers"]
+)
+def test_boundary_detaches_forward_context_only_after_frozen_layers(
+    groups, monkeypatch, first_trainable
+):
+    """The stack cuts its forward context only once a frozen layer has produced state.
+
+    A frozen embedding leaves the decoder input without grad, so the boundary lands on
+    the first layer even when every layer trains. The context there still holds only what
+    the caller passed in, which can be trainable, so it must keep its graph.
+    """
+    from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+
+    config = _make_config(
+        num_layers=6,
+        csa_compress_ratios=[2, 0, 2, 0, 2, 0],
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0, 4],
+        csa2_candidate_source_layer=0,
+        csa2_candidate_topk_blocks=2,
+        csa2_candidate_block_size=2,
+        dsa_indexer_loss_coeff=0,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        num_moe_experts=None,
+        moe_ffn_hidden_size=None,
+        activation_func_clamp_value=None,
+        moe_shared_expert_intermediate_size=None,
+        moe_router_enable_expert_bias=False,
+        ffn_hidden_size=64,
+    )
+    model = HybridModel(
+        config,
+        hybrid_csa2_stack_spec,
+        vocab_size=128,
+        max_sequence_length=64,
+        hybrid_layer_pattern="V-V-V-",
+        position_embedding_type="none",
+        pg_collection=groups,
+    ).cuda()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for layer in model.decoder.layers[first_trainable:]:
+        for parameter in layer.parameters():
+            parameter.requires_grad_(True)
+    detached = []
+    original = HybridStackForwardContext.detach_for_backward
+
+    def record_detach(context):
+        detached.append(context)
+        original(context)
+
+    monkeypatch.setattr(HybridStackForwardContext, "detach_for_backward", record_detach)
+    ids = torch.randint(0, 128, (2, 17), device="cuda")
+    positions = torch.arange(17, device="cuda").expand_as(ids)
+    model(ids, positions, None, labels=ids).mean().backward()
+
+    assert model.decoder._gradient_boundary_layer_cache[False] == first_trainable
+    assert len(detached) == (1 if first_trainable else 0)
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -319,10 +383,7 @@ def test_standard_transformer_block_state(groups, csa2):
         assert layer.mlp_hyper_connection.mapping_proj.weight.grad is not None
 
 
-@pytest.mark.parametrize(
-    "recompute_method,expected_checkpoints",
-    [("uniform", 2), ("block", 1)],
-)
+@pytest.mark.parametrize("recompute_method,expected_checkpoints", [("uniform", 2), ("block", 1)])
 def test_automatic_frozen_prefix_boundary_matches_eager_for_standard_transformer_block(
     groups, monkeypatch, recompute_method, expected_checkpoints
 ):

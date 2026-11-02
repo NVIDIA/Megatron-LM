@@ -685,7 +685,11 @@ class HybridStack(MegatronModule):
                     )
                     if layer_at_or_after_boundary and not gradient_boundary_applied:
                         hidden_states = hidden_states.detach()
-                        forward_context.detach_for_backward()
+                        if layer_idx > 0:
+                            # Cut only state that this stage's frozen layers produced. Before
+                            # the first layer the context holds the caller's inputs, which can
+                            # be trainable.
+                            forward_context.detach_for_backward()
                         gradient_boundary_applied = True
                     mhc_manager = (
                         mhc_layer_managers[layer_idx] if layer_at_or_after_boundary else None
