@@ -19,6 +19,8 @@ same reduction, so rollouts reproduce training at any TP size.
   sums them locally. With ``async_op`` the all-to-all runs on NCCL's stream and the returned
   handle's ``wait()`` launches the kernel, so the caller's work in between (TE's and Megatron's
   weight-gradient GEMM) overlaps the communication as it does with NCCL's reduce-scatter.
+  Its temporaries are caching-allocator tensors on the calling stream, so reductions issued
+  from different streams at once, and CUDA graphs that capture one, each own theirs.
 * With two ranks every element is a single add of two values. bf16 and fp16 partials are exact
   in fp32 and fp32 has at least 2p + 2 bits for their p-bit significands, so the fp32 add
   rounded to the input dtype equals one correctly rounded add; for fp32 it is one add.
@@ -38,7 +40,6 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     SYMM_MEM_KERNEL_CONFIG,
 )
 from megatron.core.inference.communication.torch_symm_triton.utils import add_rn_f32, sync_threads
-from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import null_decorator
 
 try:
@@ -214,39 +215,6 @@ def _rank_ordered_sum(
     return output
 
 
-class _Scratch:
-    """The temporaries of one reduction (received partials, padding, the all-reduce's chunk).
-
-    Synchronous reductions reuse one persistent set (Megatron's global memory buffer, the same
-    storage on every call and CUDA graph replay): stream order keeps the next reduction's
-    all-to-all from writing it before this one's kernel has read it. An asynchronous
-    reduction's all-to-all can still be writing when another reduction starts, so it takes a
-    second set, or fresh tensors while another asynchronous reduction holds that set (TE and
-    Megatron keep one in flight at a time).
-    """
-
-    async_set_in_use = False
-
-    def __init__(self, async_op: bool):
-        self.suffix = ""
-        if async_op:
-            self.suffix = None if _Scratch.async_set_in_use else "_async"
-            _Scratch.async_set_in_use = True
-
-    def tensor(self, shape, dtype: torch.dtype, name: str) -> torch.Tensor:
-        """A persistent (or, see above, fresh) scratch tensor."""
-        if self.suffix is None:
-            return torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
-        return get_global_memory_buffer().get_tensor(
-            list(shape), dtype, f"batch_invariant_tp_{name}{self.suffix}"
-        )
-
-    def release(self) -> None:
-        """Give the asynchronous set back once the reduction has read it."""
-        if self.suffix == "_async":
-            _Scratch.async_set_in_use = False
-
-
 class _PendingReduction:
     """Work-like handle of a rank-ordered reduction whose all-to-all is in flight.
 
@@ -269,12 +237,19 @@ class _PendingReduction:
         return True
 
 
-def _launch_all_to_all(input_, group, output, rows, input_split_sizes, scratch, async_op):
+def _launch_all_to_all(input_, group, output, rows, input_split_sizes, async_op):
     """Send each rank its rows of every partial; returns the all-to-all's work (None unless
-    async_op) and a function that sums the received partials into output."""
+    async_op) and a function that sums the received partials into output.
+
+    The received partials are a fresh caching-allocator tensor on the current stream: stream
+    ordered, private to this reduction even when another stream reduces at the same time, and
+    owned by a CUDA graph's private pool when captured.
+    """
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    partials = scratch.tensor((world_size * rows, *input_.shape[1:]), input_.dtype, "partials")
+    partials = torch.empty(
+        (world_size * rows, *input_.shape[1:]), dtype=input_.dtype, device=input_.device
+    )
     work = dist.all_to_all_single(
         partials,
         input_,
@@ -344,16 +319,10 @@ def batch_invariant_reduce_scatter(
                 output, list(torch.split(input_, input_split_sizes)), group=group, async_op=async_op
             )
         return output, work
-    scratch = _Scratch(async_op)
     work, sum_partials = _launch_all_to_all(
-        input_, group, output, rows, input_split_sizes, scratch, async_op
+        input_, group, output, rows, input_split_sizes, async_op
     )
-
-    def finish():
-        sum_partials()
-        scratch.release()
-
-    return output, _finish_or_defer(work, finish, async_op, input_)
+    return output, _finish_or_defer(work, sum_partials, async_op, input_)
 
 
 def batch_invariant_all_reduce(
@@ -377,23 +346,18 @@ def batch_invariant_all_reduce(
     flat = input_.view(-1)
     numel = flat.numel()
     padded_numel = -(-numel // world_size) * world_size
-    scratch = _Scratch(async_op)
     if padded_numel == numel:
         buffer = flat
     else:
-        buffer = scratch.tensor((padded_numel,), flat.dtype, "padded")
+        buffer = flat.new_zeros(padded_numel)
         buffer[:numel].copy_(flat)
-        buffer[numel:].zero_()
-    chunk = scratch.tensor((padded_numel // world_size,), flat.dtype, "chunk")
-    work, sum_partials = _launch_all_to_all(
-        buffer, group, chunk, chunk.numel(), None, scratch, async_op
-    )
+    chunk = flat.new_empty(padded_numel // world_size)
+    work, sum_partials = _launch_all_to_all(buffer, group, chunk, chunk.numel(), None, async_op)
 
     def finish():
         sum_partials()
         dist.all_gather_into_tensor(buffer, chunk, group=group)
         if buffer is not flat:
             flat.copy_(buffer[:numel])
-        scratch.release()
 
     return input_, _finish_or_defer(work, finish, async_op, buffer)

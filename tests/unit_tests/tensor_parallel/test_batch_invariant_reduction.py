@@ -422,11 +422,76 @@ def test_reduction_replays_in_cuda_graph(tp_group, path):
 
 @pytest.mark.parametrize("tp_group", [4], indirect=True, ids=["tp4"])
 @pytest.mark.parametrize("op", ["reduce_scatter", "all_reduce"])
+def test_graph_replay_after_a_larger_eager_reduction(tp_group, op):
+    """A reduction captured at a small size keeps its memory when a larger one then runs
+    eagerly, as an inference prefill after decode-graph capture does: the replay gives the
+    eager bits and writes nothing into tensors allocated since."""
+    reduce = getattr(batch_invariant_reduction, f"batch_invariant_{op}")
+    small = torch.zeros(64, 1, H, dtype=torch.bfloat16, device="cuda")
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        # Warm up (and create NCCL's communicator) on the stream the eager steps use.
+        for _ in range(2):
+            reduce(small.clone(), tp_group)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            # The all-reduce works in place, so the graph reduces a copy of its input.
+            out = reduce(small.clone(), tp_group)[0]
+        large = _partial(tp_group, numel=1024 * H, seed=5).view(1024, 1, H)
+        reduce(large.clone(), tp_group)
+        # Tensors the size of the small reduction's temporaries, allocated after the large
+        # step on the stream that ran it: a block the graph still wrote to would be reused here.
+        victims = [
+            torch.full((64 * H,), 7.0, dtype=torch.bfloat16, device="cuda") for _ in range(8)
+        ]
+        small.copy_(_partial(tp_group, numel=64 * H, seed=6).view(64, 1, H))
+        graph.replay()
+        eager = reduce(small.clone(), tp_group)[0]
+        torch.cuda.synchronize()
+    intact = all(bool((victim == 7.0).all()) for victim in victims)
+    assert _all_ranks(intact and torch.equal(_bits(out), _bits(eager))), intact
+
+
+@pytest.mark.parametrize("tp_group", [4], indirect=True, ids=["tp4"])
+def test_reductions_on_two_streams_do_not_share_temporaries(tp_group, monkeypatch):
+    """Reductions issued from two streams at once (the shared-expert overlap stream next to the
+    main stream) keep their own temporaries. The first stream's sum is delayed until the
+    second's all-to-all, which follows it on NCCL's stream, has run; with shared temporaries
+    the first would sum the second's partials."""
+    sum_kernel = batch_invariant_reduction._rank_ordered_sum
+    delayed_stream = torch.cuda.Stream()
+
+    def delayed_sum(*args, **kwargs):
+        if torch.cuda.current_stream() == delayed_stream:
+            torch.cuda._sleep(200_000_000)  # about 0.1 s
+        return sum_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(batch_invariant_reduction, "_rank_ordered_sum", delayed_sum)
+    inputs = [_partial(tp_group, numel=256 * H, seed=seed).view(256, 1, H) for seed in (8, 9)]
+    expected = [
+        _bits(_rank_order_sum(x, tp_group))[dist.get_rank(tp_group) * 64 :][:64] for x in inputs
+    ]
+    other_stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        with torch.cuda.stream(delayed_stream):
+            first = batch_invariant_reduction.batch_invariant_reduce_scatter(inputs[0], tp_group)[0]
+        with torch.cuda.stream(other_stream):
+            second = batch_invariant_reduction.batch_invariant_reduce_scatter(inputs[1], tp_group)[
+                0
+            ]
+    torch.cuda.synchronize()
+    ok = torch.equal(_bits(first), expected[0]) and torch.equal(_bits(second), expected[1])
+    assert _all_ranks(ok)
+
+
+@pytest.mark.parametrize("tp_group", [4], indirect=True, ids=["tp4"])
+@pytest.mark.parametrize("op", ["reduce_scatter", "all_reduce"])
 def test_async_reduction_finishes_on_wait(tp_group, op):
     """With async_op the all-to-all is still in flight on return, so the caller's work (the
     weight-gradient GEMM in TE's and Megatron's backward) overlaps it; wait() finishes the
-    reduction with the bits of the synchronous one. A second reduction started before the
-    first is waited for must not share its scratch."""
+    reduction with the bits of the synchronous one, also with a second reduction started
+    before the first is waited for."""
     reduce = getattr(batch_invariant_reduction, f"batch_invariant_{op}")
     inputs = [_partial(tp_group, numel=256 * H, seed=seed).view(256, 1, H) for seed in (3, 4)]
     synchronous = [reduce(x.clone(), tp_group)[0].clone() for x in inputs]
@@ -445,34 +510,32 @@ def test_reduction_at_tp6():
     (the barrier pads and masks its arange), the all-to-all and the all-reduce."""
     if Utils.world_size < 6:
         pytest.skip(f"needs 6 ranks, got {Utils.world_size}")
-    Utils.initialize_model_parallel(1)
+    # No model-parallel state: the reduction takes its group from the caller.
+    Utils.initialize_distributed()
     group = dist.new_group(list(range(6)))
     ok = True
-    try:
-        if dist.get_rank() < 6:
-            buf = SymmetricMemoryBuffer(64, group)
-            assert buf.symm_mem_hdl is not None, buf.init_failure_reason
-            x = _partial(group, numel=96 * H, seed=21).view(96, 1, H)
-            expected = _bits(_rank_order_sum(x, group))
-            rank = dist.get_rank(group)
-            rows = slice(rank * 16, (rank + 1) * 16)
-            symm = buf.maybe_get_tensor(list(x.shape), dtype=x.dtype)
-            symm["tensor"].copy_(x)
-            reduce_scatter = batch_invariant_reduction.batch_invariant_reduce_scatter
-            results = {
-                "symmetric_memory": reduce_scatter(
-                    symm["tensor"], group, symm_mem_hdl=symm["handle"]
-                )[0],
-                "all_to_all": reduce_scatter(x, group)[0],
-            }
-            ok = all(torch.equal(_bits(out), expected[rows]) for out in results.values())
-            ok &= torch.equal(
-                _bits(batch_invariant_reduction.batch_invariant_all_reduce(x.clone(), group)[0]),
-                expected,
-            )
-        assert _all_ranks(ok)
-    finally:
-        Utils.destroy_model_parallel()
+    if dist.get_rank() < 6:
+        buf = SymmetricMemoryBuffer(64, group)
+        assert buf.symm_mem_hdl is not None, buf.init_failure_reason
+        x = _partial(group, numel=96 * H, seed=21).view(96, 1, H)
+        expected = _bits(_rank_order_sum(x, group))
+        rank = dist.get_rank(group)
+        rows = slice(rank * 16, (rank + 1) * 16)
+        symm = buf.maybe_get_tensor(list(x.shape), dtype=x.dtype)
+        symm["tensor"].copy_(x)
+        reduce_scatter = batch_invariant_reduction.batch_invariant_reduce_scatter
+        results = {
+            "symmetric_memory": reduce_scatter(symm["tensor"], group, symm_mem_hdl=symm["handle"])[
+                0
+            ],
+            "all_to_all": reduce_scatter(x, group)[0],
+        }
+        ok = all(torch.equal(_bits(out), expected[rows]) for out in results.values())
+        ok &= torch.equal(
+            _bits(batch_invariant_reduction.batch_invariant_all_reduce(x.clone(), group)[0]),
+            expected,
+        )
+    assert _all_ranks(ok)
 
 
 def test_te_reductions_are_restored_outside_batch_invariant_mode():
