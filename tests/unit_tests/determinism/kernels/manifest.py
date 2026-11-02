@@ -545,7 +545,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tokens, where the recurrence also writes per-draft-token state snapshots for rollback; "
         "prefill-prepare is replayed for a single token and for a full 4096-token step. "
         "context_parallel/gdp.py launches FLA's CP summary and merge kernels directly; "
-        "test_gdp_cp_kernels.py replays them for BLH and varlen fragments.",
+        "test_gdp_cp_kernels.py replays them for BLH and varlen fragments and checks them against "
+        "FLA's chunk scans.",
     ),
     KernelEntry(
         name="gated_delta_net",
@@ -761,7 +762,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_gdp_cp_kernels.py"),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "

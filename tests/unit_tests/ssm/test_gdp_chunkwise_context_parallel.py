@@ -20,6 +20,7 @@ from megatron.core.ssm.context_parallel.chunkwise import (
 from megatron.core.ssm.context_parallel.gdp_common import GDPInputs
 from megatron.core.ssm.gated_delta_product import (
     HAVE_CUTEDSL_GDP_CP,
+    HAVE_FLA,
     HAVE_FLA_GDP_CP,
     GatedDeltaProductMixer,
 )
@@ -96,10 +97,13 @@ def test_shared_autograd_adapter(monkeypatch):
         torch.testing.assert_close(tensor.grad, torch.full_like(tensor, multiplier))
 
 
-@pytest.mark.skipif(not HAVE_FLA_GDP_CP, reason="FLA GDP CP kernels are not installed")
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed")
 def test_interleave_last_update():
     """Verify backward values align with each token's final Householder update."""
-    assert gdp_cp_module is not None
+    assert HAVE_FLA_GDP_CP, (
+        "FLA is installed, but its GDP chunkwise CP kernels did not import; "
+        "they need flash-linear-attention >= 0.6.0"
+    )
     tensor = torch.arange(12).reshape(1, 3, 2, 2)
 
     interleaved = gdp_cp_module._interleave_last_update(tensor, num_householder=3)

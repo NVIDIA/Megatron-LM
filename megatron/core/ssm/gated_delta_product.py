@@ -312,8 +312,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             else:
                 if not HAVE_FLA_GDP_CP:
                     raise ImportError(
-                        "GDP chunkwise CP requires Triton and an FLA build with "
-                        "fla.ops.cp.chunk_delta_h"
+                        "GDP chunkwise CP requires Triton and flash-linear-attention >= 0.6.0 "
+                        "(fla.ops.cp.chunk_fwd, chunk_bwd and chunk_merge)"
                     )
                 self.chunkwise_cp_backend = build_module(FLAGatedDeltaProductCPBackend)
 

@@ -14,6 +14,7 @@ contiguous view at the start of a NaN-filled buffer.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 try:
     from fla.ops.gdn2.fused_recurrent import fused_recurrent_gdn2
@@ -32,21 +33,24 @@ NUM_TOKENS, NUM_HEADS = 6, 4
 
 
 def _inputs(head_dim):
-    """BF16 [N, 1, H, K] q/k/v and a gate followed by NaN, as single-token sequences pass them."""
+    """BF16 [N, 1, H, K] q/k/v, as single-token sequences pass them, and their generator."""
     gen = torch.Generator(device="cuda").manual_seed(head_dim)
-    shape = (NUM_TOKENS, 1, NUM_HEADS, head_dim)
 
     def randn(*size):
         return torch.randn(*size, generator=gen, device="cuda")
 
+    shape = (NUM_TOKENS, 1, NUM_HEADS, head_dim)
     q, k, v = (randn(*shape).bfloat16() for _ in range(3))
-    numel = q.numel()
-    buffer = torch.full((numel + 1024,), float("nan"), dtype=torch.bfloat16, device="cuda")
-    buffer[:numel] = randn(numel)
-    g = buffer[:numel].view(shape)
-    a_log = randn(NUM_HEADS)
-    dt_bias = randn(NUM_HEADS * head_dim)
-    return q, k, v, g, a_log, dt_bias, randn
+    return q, k, v, randn
+
+
+def _followed_by_nan(values):
+    """``values`` as a contiguous view at the start of a NaN-filled buffer."""
+    buffer = torch.full(
+        (values.numel() + 1024,), float("nan"), dtype=values.dtype, device=values.device
+    )
+    buffer[: values.numel()] = values.flatten()
+    return buffer[: values.numel()].view(values.shape)
 
 
 def _one_step(q, k, value, l2norm):
@@ -62,16 +66,16 @@ def _one_step(q, k, value, l2norm):
 @pytest.mark.parametrize("l2norm", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 96, 192])
 def test_fused_recurrent_kda_reads_only_g(head_dim, l2norm, lower_bound):
-    q, k, v, g, a_log, dt_bias, randn = _inputs(head_dim)
+    q, k, v, randn = _inputs(head_dim)
     beta = torch.sigmoid(randn(NUM_TOKENS, 1, NUM_HEADS))
     out, _ = fused_recurrent_kda(
         q,
         k,
         v,
-        g,
+        _followed_by_nan(randn(*q.shape).bfloat16()),
         beta,
-        A_log=a_log,
-        dt_bias=dt_bias,
+        A_log=randn(NUM_HEADS),
+        dt_bias=randn(NUM_HEADS * head_dim),
         use_qk_l2norm_in_kernel=l2norm,
         use_gate_in_kernel=True,
         lower_bound=lower_bound,
@@ -80,23 +84,30 @@ def test_fused_recurrent_kda_reads_only_g(head_dim, l2norm, lower_bound):
     torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=2e-2)
 
 
+# Megatron's GDN2 hands the kernel an FP32 log decay (gate_in_kernel=False); FLA can also form it
+# from the raw gate features.
+@pytest.mark.parametrize("gate_in_kernel", [False, True])
 @pytest.mark.parametrize("l2norm", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 96, 192])
-def test_fused_recurrent_gdn2_reads_only_g(head_dim, l2norm):
-    q, k, v, g, a_log, dt_bias, randn = _inputs(head_dim)
+def test_fused_recurrent_gdn2_reads_only_g(head_dim, l2norm, gate_in_kernel):
+    q, k, v, randn = _inputs(head_dim)
     erase = torch.sigmoid(randn(*q.shape)).bfloat16()
     write = torch.sigmoid(randn(*v.shape)).bfloat16()
+    if gate_in_kernel:
+        g = randn(*q.shape).bfloat16()
+        gate = dict(A_log=randn(NUM_HEADS), dt_bias=randn(NUM_HEADS * head_dim))
+    else:
+        g, gate = -F.softplus(randn(*q.shape)), {}
     out, _ = fused_recurrent_gdn2(
         q,
         k,
         v,
-        g,
+        _followed_by_nan(g),
         erase,
         write,
-        A_log=a_log,
-        dt_bias=dt_bias,
         use_qk_l2norm_in_kernel=l2norm,
-        use_gate_in_kernel=True,
+        use_gate_in_kernel=gate_in_kernel,
+        **gate,
     )
     expected = _one_step(q, k, write.float() * v.float(), l2norm)
     torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=2e-2)
