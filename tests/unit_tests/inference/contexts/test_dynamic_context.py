@@ -3,7 +3,9 @@
 import contextlib
 import importlib.util
 import math
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -13,7 +15,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
-from megatron.core.inference.contexts import zero_padding_rows_kernel
+from megatron.core.inference.contexts import dynamic_context, zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -4860,3 +4862,132 @@ def test_flashinfer_sample_kernel_dispatch(
     }
     for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):
         assert torch.equal(safe_arg, expected)
+
+
+# FlashInfer fused RoPE shapes, as (head_dim, rotary_dim, interleaved).
+# Rotated exactly by FlashInfer 0.7: whole vectors in the NeoX half / interleaved span.
+_FUSED_ROPE_KERNEL_SHAPES = [
+    (32, 32, False),
+    (96, 96, False),
+    (64, 64, False),
+    (64, 16, False),
+    (128, 48, False),
+    (32, 16, True),
+]
+# Generic-kernel NeoX with rotary_dim % 32 == 16: FlashInfer silently mis-rotates lanes R/2..R/2+7.
+_FUSED_ROPE_SILENT_SHAPES = [
+    (32, 16, False),
+    (48, 48, False),
+    (80, 80, False),
+    (96, 48, False),
+    (112, 112, False),
+]
+# Generic-kernel interleaved with rotary_dim % 16 == 8: the last vector races with other stores.
+_FUSED_ROPE_RACY_SHAPES = [(16, 8, True), (96, 24, True)]
+# NeoX with rotary_dim % 16 != 0 (misaligned partner load), and interleaved with rotary_dim ==
+# head_dim == 8 (mod 16) (16-byte store past the output) can leave a sticky CUDA error.
+_FUSED_ROPE_FAULT_SHAPES = [(72, 72, False), (96, 24, False), (128, 40, False), (72, 72, True)]
+
+
+def _rope_id(shape):
+    head_dim, rotary_dim, interleaved = shape
+    return f"D{head_dim}-R{rotary_dim}-{'interleaved' if interleaved else 'neox'}"
+
+
+def _fused_rope_error(head_dim, rotary_dim, interleaved):
+    """Run `apply_fused_qk_rotary_emb` on one shape; None if it matches an fp64 rotation.
+
+    Three query and two key heads are views of one buffer, with 4 of 6 token rows active.
+    """
+    dtype = torch.bfloat16
+    positions = torch.tensor([3, 0, 3, 1], device="cuda")
+    angles = torch.arange(2 * rotary_dim, device="cuda", dtype=torch.float64).view(4, -1) / 7
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).float()
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    storage = torch.rand(6, 1, 5, head_dim, generator=generator, device="cuda") * 2 - 1
+    storage = storage.to(dtype)
+    query, key = storage[:, :, :3], storage[:, :, 3:]
+    context = SimpleNamespace(
+        use_flashinfer_fused_rope=True,
+        padded_active_token_count=4,
+        gpu_view=SimpleNamespace(token_to_pos_ids=positions),
+    )
+    config = SimpleNamespace(rotary_interleaved=interleaved)
+    outputs = DynamicInferenceContext.apply_fused_qk_rotary_emb(
+        context, query, key, cos_sin, config
+    )
+
+    phase = torch.polar(torch.ones_like(angles), angles)[positions, None, None]
+    lane_error = torch.zeros(head_dim, dtype=torch.float64, device="cuda")
+    for original, actual in zip((query, key), outputs):
+        rotary, tail = original[:4, ..., :rotary_dim].double(), original[:4, ..., rotary_dim:]
+        if interleaved:
+            pairs = rotary.unflatten(-1, (-1, 2))
+        else:
+            pairs = torch.stack(rotary.chunk(2, dim=-1), dim=-1)
+        expected = torch.view_as_real(torch.view_as_complex(pairs.contiguous()) * phase)
+        expected = expected.flatten(-2) if interleaved else expected.transpose(-1, -2).flatten(-2)
+        expected = torch.cat((expected, tail.double()), dim=-1)
+        lane_error = torch.maximum(lane_error, (actual.double() - expected).abs().amax((0, 1, 2)))
+    wrong = torch.nonzero(lane_error > 2 * torch.finfo(dtype).eps).flatten().tolist()
+    if not wrong:
+        return None
+    shape = _rope_id((head_dim, rotary_dim, interleaved))
+    return f"{shape}: lanes {wrong} off by up to {lane_error.max():.3f}"
+
+
+def test_flashinfer_fused_rope_supports():
+    """The shape predicate admits the shapes FlashInfer rotates exactly and nothing else."""
+    supported = _FUSED_ROPE_KERNEL_SHAPES + [(160, 160, False), (80, 32, False), (256, 64, False)]
+    unsupported = (
+        _FUSED_ROPE_SILENT_SHAPES
+        + _FUSED_ROPE_RACY_SHAPES
+        + _FUSED_ROPE_FAULT_SHAPES
+        + [(16, 16, False), (16, 8, False), (40, 40, False), (80, 40, True), (20, 20, False)]
+    )
+    for shape in supported:
+        assert dynamic_context.flashinfer_fused_rope_supports(*shape), _rope_id(shape)
+    for shape in unsupported:
+        assert not dynamic_context.flashinfer_fused_rope_supports(*shape), _rope_id(shape)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and dynamic_context.HAVE_FLASHINFER),
+    reason="FlashInfer fused RoPE needs CUDA and FlashInfer",
+)
+@pytest.mark.parametrize(
+    "shape",
+    _FUSED_ROPE_KERNEL_SHAPES + _FUSED_ROPE_SILENT_SHAPES + _FUSED_ROPE_RACY_SHAPES,
+    ids=_rope_id,
+)
+def test_flashinfer_fused_rope_matches_fp64_rotation(shape):
+    """Every head shape is rotated exactly: by FlashInfer where it can, in fp32 otherwise."""
+    kernel = dynamic_context.flashinfer.rope.apply_rope_with_cos_sin_cache
+    with mock.patch.object(
+        dynamic_context.flashinfer.rope, "apply_rope_with_cos_sin_cache", wraps=kernel
+    ) as spy:
+        error = _fused_rope_error(*shape)
+    assert error is None, error
+    assert spy.call_count == int(shape in _FUSED_ROPE_KERNEL_SHAPES)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and dynamic_context.HAVE_FLASHINFER),
+    reason="FlashInfer fused RoPE needs CUDA and FlashInfer",
+)
+@pytest.mark.parametrize("shape", _FUSED_ROPE_FAULT_SHAPES, ids=_rope_id)
+def test_flashinfer_fused_rope_fault_shapes_run(shape):
+    """Shapes FlashInfer would fault on run and rotate exactly (each in its own process)."""
+    script = (
+        "import sys\n"
+        "from tests.unit_tests.inference.contexts.test_dynamic_context import _fused_rope_error\n"
+        "sys.exit(_fused_rope_error(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == 'True'))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, *map(str, shape)],
+        cwd=Path(__file__).resolve().parents[4],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
