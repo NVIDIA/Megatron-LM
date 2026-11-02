@@ -33,10 +33,7 @@ from megatron.core.ssm.mamba_shared_prefix import (
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
-from megatron.core.transformer.shared_prefix_attention import (
-    require_shared_prefix_flash_attn,
-    validate_shared_prefix_attention,
-)
+from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
@@ -315,7 +312,6 @@ def _validate_hybrid_stack(
                 "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
             )
 
-    has_attention = False
     for layer in stack.layers:
         if isinstance(layer, MambaLayer):
             validate_mamba_layer_shared_prefix(layer, tp_size=tp_size, cp_size=cp_size)
@@ -326,9 +322,9 @@ def _validate_hybrid_stack(
                     'layers'
                 )
             if isinstance(layer.self_attention, SelfAttention):
-                has_attention = True
+                # Also binds flash-attn, so a missing or old install fails before any layer runs.
                 validate_shared_prefix_attention(
-                    layer.self_attention, stack.config, tp_size=tp_size, cp_size=cp_size
+                    layer.self_attention, tp_size=tp_size, cp_size=cp_size
                 )
             if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
                 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -345,9 +341,6 @@ def _validate_hybrid_stack(
             raise NotImplementedError(
                 f"shared-prefix state forking is not implemented for {type(layer).__name__}"
             )
-    if has_attention:
-        # The attention entry repeats this check; failing here precedes the first Mamba layer.
-        require_shared_prefix_flash_attn()
 
 
 def forward_hybrid_stack_shared_prefix(

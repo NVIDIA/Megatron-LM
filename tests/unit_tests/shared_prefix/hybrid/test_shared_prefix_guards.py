@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import shared_prefix
@@ -17,11 +18,12 @@ from megatron.core.models.hybrid.shared_prefix import (
     _validate_hybrid_stack,
     forward_hybrid_stack_shared_prefix,
 )
+from megatron.core.ops import _backends
+from megatron.core.ops.attention import shared_prefix as forest_attention
 from megatron.core.shared_prefix_layout import SharedPrefixLayout
 from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.transformer import shared_prefix_attention
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.identity_op import IdentityOp
@@ -184,9 +186,11 @@ def test_full_attention_window_accepted(window_size):
     _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
-def _attention_layer():
+def _attention_layer(config):
     layer = Mock(spec=TransformerLayer)
     layer.self_attention = Mock(spec=SelfAttention)
+    # The attention validation reads the module's own config, which SelfAttention stores.
+    layer.self_attention.config = config
     layer.self_attention.core_attention = Mock(spec=DotProductAttention)
     layer.self_attention.checkpoint_core_attention = False
     layer.self_attention.pg_collection = SimpleNamespace(tp=_group(1), cp=_group(1))
@@ -194,18 +198,33 @@ def _attention_layer():
     return layer
 
 
-@pytest.mark.parametrize("installed", [False, True])
-def test_old_or_missing_flash_attn_rejected_before_any_layer(monkeypatch, installed):
-    def is_fa_min_version(version):
-        if not installed:
-            raise ImportError("No module named 'flash_attn'")
-        return False
+@pytest.mark.parametrize(
+    "version, match",
+    [
+        (None, r"Shared-prefix forest attention requires flash_attn\.flash_attn_interface: No"),
+        ("2.6.3", r"requires flash_attn\.flash_attn_interface>=2\.7\.0; found 2\.6\.3"),
+    ],
+    ids=["missing", "old"],
+)
+def test_old_or_missing_flash_attn_rejected_before_any_layer(request, monkeypatch, version, match):
+    def import_module(name):
+        if version is None:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return SimpleNamespace(
+            flash_attn_varlen_func=object(), _flash_attn_varlen_backward=object()
+        )
 
-    monkeypatch.setattr(shared_prefix_attention, "is_fa_min_version", is_fa_min_version)
-    stack = _stack(_config(), [_attention_layer()])
-    with pytest.raises(RuntimeError, match="flash-attn >= 2.7.0"):
+    monkeypatch.setattr(_backends, "import_module", import_module)
+    monkeypatch.setattr(_backends, "installed_version", lambda *_args: Version(version))
+    # A successful check is cached. Clear it so this test imports the stand-in, and again
+    # afterwards so later tests bind the installed flash-attn.
+    forest_attention._flash_attn_interface.cache_clear()
+    request.addfinalizer(forest_attention._flash_attn_interface.cache_clear)
+    config = _config()
+    stack = _stack(config, [_attention_layer(config)])
+    with pytest.raises(ImportError, match=match):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
-    # Attention-free stacks never reach the fused attention kernel.
+    # Attention-free stacks never reach the forest attention kernel.
     _validate_hybrid_stack(_stack(_config()), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
@@ -268,7 +287,7 @@ def test_unsupported_stack_config_rejected(overrides, error, message):
 def test_batch_invariant_mode_rejected_before_layer_checks():
     """One stack-level message, before the attention and Mamba layers report their own causes."""
     config = _config(batch_invariant_mode=True, flash_attention_version=3)
-    stack = _stack(config, [_attention_layer(), _mamba_layer(1, contiguous=False)])
+    stack = _stack(config, [_attention_layer(config), _mamba_layer(1, contiguous=False)])
     with pytest.raises(NotImplementedError, match="Hybrid does not yet support batch-invariant"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
@@ -292,17 +311,18 @@ def test_unsupported_stack_topology_and_layers_rejected():
     stack = _stack(_config(), [Mock(spec=torch.nn.Linear)])
     with pytest.raises(NotImplementedError, match="not implemented for"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
-    checkpointed = _attention_layer()
+    config = _config()
+    checkpointed = _attention_layer(config)
     checkpointed.self_attention.checkpoint_core_attention = True
     with pytest.raises(NotImplementedError, match="selective core-attention recomputation"):
         _validate_hybrid_stack(
-            _stack(_config(), [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
+            _stack(config, [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
         )
+    # The attention validation reports QK clipping from the layer's own config.
+    config = _config(qk_clip=True)
     with pytest.raises(NotImplementedError, match="QK-clipping"):
         _validate_hybrid_stack(
-            _stack(_config(qk_clip=True), [_attention_layer()]),
-            _LAYOUT,
-            physical_len=_PHYSICAL_LEN[1],
+            _stack(config, [_attention_layer(config)]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
         )
 
 
