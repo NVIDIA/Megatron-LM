@@ -85,8 +85,10 @@ if not HAVE_FA3:
 # The FA4 version is tracked by the `flash-attn-4` distribution metadata,
 # not `flash_attn.__version__` (which reports the 2.x version) or
 # `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
-# `is_fa_min_version` here.
-_MIN_FA4_VERSION = "4.0.0b20"
+# `is_fa_min_version` here. The floor matches pyproject.toml, which locks FA4 with the
+# quack-kernels and CuTe DSL it calls (4.0.0b25 and earlier call a quack-kernels API
+# that the locked quack-kernels removed).
+_MIN_FA4_VERSION = "4.0.0b37"
 flash_attn4_varlen_func = None
 try:
     from importlib.metadata import PackageNotFoundError

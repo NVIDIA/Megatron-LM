@@ -107,6 +107,7 @@ dev = [
     "av",
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
+    "flash-attn-4>=4.0.0b37",                           # Lock FA4 with the quack-kernels and CuTe DSL it calls
     "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",
     "onnxscript",
