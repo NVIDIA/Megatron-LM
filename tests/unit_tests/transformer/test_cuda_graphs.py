@@ -2809,21 +2809,27 @@ class TestChunkWiseCudaGraphs:
         with pytest.raises(ValueError, match=match):
             _base_cuda_graph_config(cuda_graph_impl='chunk_wise', **overrides)
 
-    @pytest.mark.parametrize("variant", ["gdn", "kda"])
-    def test_chunk_config_rejects_gated_delta_net_with_packed_sequences(self, variant):
-        """FLA builds the GDN / KDA chunk indices on the host from the cu_seqlens values and
-        caches them per tensor, so a captured block graph would replay the capture sample's pack
-        layout for every microbatch. Fixed-length chunk graphs with the same layers, and the
-        per-layer TE graphs of the same packed configuration, are unaffected."""
-        gated_delta_net = dict(
-            experimental_attention_variant=variant,
-            linear_attention_freq=1,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=32,
-            linear_value_head_dim=32,
-            linear_num_key_heads=4,
-            linear_num_value_heads=4,
-        )
+    def test_chunk_config_packed_gated_delta_net_support_matrix(self, monkeypatch):
+        """Packed GDN-family layers are captured only for Gated DeltaNet on the Transformer
+        Engine (cuDNN) kernel backend and for KDA on a flash-linear-attention with the
+        fixed-shape ``use_graph`` mode, without CP or with static headwise CP. The other FLA
+        kernels build their chunk indices on the host from the cu_seqlens values and cache them
+        per tensor, so a captured block graph would replay the capture sample's pack layout.
+        Fixed-length chunk graphs and the per-layer TE graphs of the same packed configuration
+        are unaffected."""
+        from megatron.core.ssm.gated_delta_net import kda as kda_module
+
+        def gated_delta_net(variant):
+            return dict(
+                experimental_attention_variant=variant,
+                linear_attention_freq=1,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_num_key_heads=4,
+                linear_num_value_heads=4,
+            )
+
         packed = dict(
             sequence_packing_scheduler="dp_balanced",
             cuda_graph_dynamic_microbatches=True,
@@ -2831,28 +2837,77 @@ class TestChunkWiseCudaGraphs:
             max_seqlen_per_dp_cp_rank=128,
             thd_max_packed_sequences=8,
         )
-        match = "does not support packed-sequence .* GDN / KDA"
+        chunk = dict(cuda_graph_impl='chunk_wise', cuda_graph_modules=[])
+        match = "supports packed-sequence .* only for Gated DeltaNet"
+        # The FLA backend (the default) is rejected, and so are KDA and GDN2 on an FLA without
+        # the fixed-shape varlen mode.
         with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(**chunk, **gated_delta_net("gdn"), **packed)
+        monkeypatch.setattr(kda_module, "fla_kda_supports_graph_capture", lambda: False)
+        with pytest.raises(ValueError, match="flash-linear-attention >= 0.6.0") as rejected_kda:
+            _base_cuda_graph_config(**chunk, **gated_delta_net("kda"), **packed)
+        # KDA never consults gdn_kernel_backend: the blocking settings do not mention it.
+        assert "gdn_kernel_backend='fla'" not in str(rejected_kda.value)
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(**chunk, **gated_delta_net("gdn2"), **packed)
+        with pytest.raises(ValueError, match="experimental_attention_variant='gdn2'"):
             _base_cuda_graph_config(
-                cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **gated_delta_net, **packed
+                **chunk,
+                **gated_delta_net("gdn2"),
+                gdn_kernel_backend="transformer_engine",
+                **packed,
+            )
+        # KDA is admitted once the installed FLA has chunk_kda(use_graph=True).
+        monkeypatch.setattr(kda_module, "fla_kda_supports_graph_capture", lambda: True)
+        kda_admitted = _base_cuda_graph_config(**chunk, **gated_delta_net("kda"), **packed)
+        assert kda_admitted.cuda_graph_impl == 'chunk_wise'
+        with pytest.raises(ValueError, match="linear_cp_mode='chunkwise' with context"):
+            _base_cuda_graph_config(
+                **chunk, **gated_delta_net("kda"), context_parallel_size=2, **packed
             )
         # Also with context parallelism, where the message has to win over the generic
         # THD CP layout-conversion rejection of attention-capturing graphs.
         with pytest.raises(ValueError, match=match):
             _base_cuda_graph_config(
-                cuda_graph_impl='chunk_wise',
-                cuda_graph_modules=[],
+                **chunk,
+                **gated_delta_net("gdn"),
                 context_parallel_size=2,
                 cp_partition_mode="contiguous",
-                **gated_delta_net,
                 **packed,
             )
-        fixed_length = _base_cuda_graph_config(
-            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **gated_delta_net
+        te_gdn = dict(gated_delta_net("gdn"), gdn_kernel_backend="transformer_engine")
+        # Gated DeltaNet on the cuDNN kernel is admitted without CP ...
+        admitted = _base_cuda_graph_config(**chunk, **te_gdn, **packed)
+        assert admitted.cuda_graph_impl == 'chunk_wise'
+        # ... and with static headwise CP, whose exchange is Megatron's fixed-shape all-to-all.
+        headwise = _base_cuda_graph_config(
+            **chunk, **te_gdn, context_parallel_size=2, linear_cp_mode="headwise", **packed
         )
+        assert headwise.context_parallel_size == 2
+        # Chunkwise CP (the GDN default) converts the THD layout with data-dependent splits.
+        with pytest.raises(ValueError, match="linear_cp_mode='chunkwise' with context"):
+            _base_cuda_graph_config(**chunk, **te_gdn, context_parallel_size=2, **packed)
+        # The fused pre-GDR path bypasses the fixed-shape packed convolution: not admitted.
+        with pytest.raises(ValueError, match="gdn_pre_gated_delta_rule_fusion=True"):
+            _base_cuda_graph_config(
+                **chunk, **te_gdn, gdn_pre_gated_delta_rule_fusion=True, **packed
+            )
+        # GDN layers built from a hybrid layer pattern carry no variant, so this gate cannot see
+        # them: the chunk-graph block asks every captured layer for its blockers instead
+        # (TestPackedGatedDeltaNetChunkGraph.test_hybrid_pattern_layers_are_checked_at_capture).
+        hybrid = _base_cuda_graph_config(
+            **chunk,
+            **dict(gated_delta_net(None), is_hybrid_model=True, linear_attention_freq=None),
+            **packed,
+        )
+        assert hybrid.experimental_attention_variant is None
+        fixed_length = _base_cuda_graph_config(**chunk, **gated_delta_net("gdn"))
         assert fixed_length.cuda_graph_impl == 'chunk_wise'
         per_layer = _base_cuda_graph_config(
-            cuda_graph_impl='transformer_engine', cuda_graph_modules=[], **gated_delta_net, **packed
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[],
+            **gated_delta_net("gdn"),
+            **packed,
         )
         assert per_layer.cuda_graph_impl == 'transformer_engine'
 

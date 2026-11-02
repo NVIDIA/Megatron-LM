@@ -232,6 +232,53 @@ def test_selective_state_update_replays():
 # --- causal conv (Megatron Triton variants) ---------------------------------------------------
 
 
+def test_causal_conv1d_packed_masked_replays():
+    """The graph-safe packed causal convolution of the GDN layer (fixed-shape taps masked by the
+    per-token sequence index, used under chunk-wise CUDA graphs) is bit-exact across runs and
+    matches a per-sequence ``conv1d`` reference, including empty and trailing slots."""
+    from megatron.core.packed_seq_params import packed_seq_idx_on_device
+    from megatron.core.ssm.gated_delta_net.common import causal_conv1d_packed_masked
+
+    seeded()
+    tokens, channels, width = 256, 192, 4
+    cu_seqlens = torch.tensor([0, 37, 37, 150, 256, 256], dtype=torch.int32, device="cuda")
+    seq_idx = packed_seq_idx_on_device(cu_seqlens, tokens)
+    x = torch.randn(1, tokens, channels, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.randn(channels, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def fn(x, weight, bias, seq_idx):
+        return causal_conv1d_packed_masked(x, weight, bias, "silu", seq_idx)
+
+    ref_out, ref_grad = assert_replays_bit_exact(
+        fn, (x, weight, bias, seq_idx), replays=4, what="causal_conv1d_packed_masked"
+    )
+    out = ref_out["out"]
+    # fp32 per-sequence reference, forward and backward (the harness drives the backward with an
+    # all-ones upstream gradient): every result is accumulated in fp32 and cast once, so it has
+    # to track the reference to bf16 rounding, the input gradient included.
+    x32 = x.detach().float().requires_grad_(True)
+    weight32 = weight.detach().float().requires_grad_(True)
+    bias32 = bias.detach().float().requires_grad_(True)
+    reference = torch.zeros(1, tokens, channels, device="cuda", dtype=torch.float32)
+    boundaries = cu_seqlens.tolist()
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if end == start:
+            continue
+        segment = x32[:, start:end].transpose(1, 2)
+        conv = torch.nn.functional.conv1d(
+            torch.nn.functional.pad(segment, (width - 1, 0)),
+            weight32.unsqueeze(1),
+            bias32,
+            groups=channels,
+        )
+        reference[:, start:end] = torch.nn.functional.silu(conv).transpose(1, 2)
+    torch.testing.assert_close(out, reference.to(out.dtype), rtol=2e-2, atol=2e-2)
+    reference.backward(torch.ones_like(reference))
+    for name, expected in (("in[0]", x32.grad), ("in[1]", weight32.grad), ("in[2]", bias32.grad)):
+        torch.testing.assert_close(ref_grad[name].float(), expected, rtol=2e-2, atol=2e-2)
+
+
 def test_causal_conv1d_update_replays():
     from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, run_once, seeded
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -290,6 +290,66 @@ def test_kda_recurrence_replays():
     assert_replays_bit_exact(
         run, (q, k, v, raw_g, raw_beta, a_log, dt_bias), contention=True, what="KDA recurrence"
     )
+
+
+def test_kda_recurrence_packed_graph_mode_replays():
+    """Replay the packed KDA recurrence in the fixed-shape ``use_graph`` mode that chunk-wise
+    CUDA graphs select (flash-linear-attention >= 0.6.0): the chunk list is built on the device
+    for ``max_num_seqs`` slots, zero-length slots included, and the result matches the plain
+    varlen call on the same boundaries."""
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if not kda.fla_kda_supports_graph_capture():
+        pytest.skip("KDA graph mode needs flash-linear-attention >= 0.6.0")
+    seeded()
+    tokens, max_num_seqs = 256, 4
+    # max_num_seqs + 1 boundaries with an empty slot in the middle and an unused trailing slot.
+    cu_seqlens = torch.tensor([0, 70, 70, 256, 256], dtype=torch.int32, device="cuda")
+    shape = (1, tokens, 4, 64)
+    q, k, v = (
+        torch.randn(shape, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for _ in range(3)
+    )
+    raw_g = torch.randn(1, tokens, 256, device="cuda", requires_grad=True)
+    raw_beta = torch.randn(1, tokens, 4, device="cuda", requires_grad=True)
+    a_log = torch.zeros(4, device="cuda", requires_grad=True)
+    dt_bias = torch.zeros(256, device="cuda", requires_grad=True)
+    layer = SimpleNamespace(key_head_dim=64)
+
+    def run(q, k, v, g, beta, a_log, dt_bias, use_graph):
+        gate, extra = kda.KimiDeltaAttention._compute_gates(
+            layer, a_log, dt_bias, 1, tokens, g, beta
+        )
+        graph_kwargs = dict(use_graph=True, max_num_seqs=max_num_seqs) if use_graph else {}
+        output, _ = kda.chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=gate,
+            beta=extra["beta"],
+            A_log=a_log,
+            dt_bias=dt_bias,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            initial_state=None,
+            output_final_state=False,
+            safe_gate=False,
+            cu_seqlens=cu_seqlens,
+            **graph_kwargs,
+        )
+        return output
+
+    inputs = (q, k, v, raw_g, raw_beta, a_log, dt_bias)
+    graph_out, graph_grad = assert_replays_bit_exact(
+        lambda *args: run(*args, use_graph=True),
+        inputs,
+        contention=True,
+        what="KDA recurrence (use_graph)",
+    )
+    plain_out, plain_grad = run_once(lambda *args: run(*args, use_graph=False), inputs)
+    torch.testing.assert_close(graph_out["out"], plain_out["out"], rtol=2e-2, atol=2e-2)
+    for name, expected in plain_grad.items():
+        torch.testing.assert_close(graph_grad[name], expected, rtol=2e-2, atol=2e-2)
 
 
 def test_mok_route_adapter_replays():

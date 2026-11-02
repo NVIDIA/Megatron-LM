@@ -44,6 +44,11 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
+    # The host-side checks of the packed boundaries (monotonic, full coverage, CP alignment,
+    # q == kv) already ran for this microbatch, so modules that consume ``cu_seqlens`` may skip
+    # their own device-to-host validation. Set by the chunk-wise CUDA graph replay, which
+    # validates the pack before it refreshes the static boundary buffers of the captured graph.
+    cu_seqlens_validated: bool = False
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -61,7 +66,11 @@ class PackedSeqParams:
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
-        if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
+        if (
+            self.seq_idx is None
+            and isinstance(cu_seqlens, Tensor)
+            and self.total_tokens is not None
+        ):
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
@@ -84,6 +93,19 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def packed_seq_idx_on_device(cu_seqlens: Tensor, total_tokens: int) -> Tensor:
+    """Per-token sequence index of a packed buffer, built from fixed-shape device ops only.
+
+    Same layout as the ``seq_idx`` that ``PackedSeqParams.__post_init__`` precomputes
+    (``[1, total_tokens]`` int32, tokens past the last boundary get one extra index), but without
+    the host synchronization of ``repeat_interleave``, so it can be recorded in a CUDA graph and
+    replayed with other ``cu_seqlens`` values in the same static buffer.
+    """
+    positions = torch.arange(total_tokens, device=cu_seqlens.device)
+    boundaries = cu_seqlens[1:].to(torch.long).clamp_(min=0, max=total_tokens)
+    return torch.bucketize(positions, boundaries, right=True).to(torch.int32).unsqueeze(0)
 
 
 def resolve_cp_group(

@@ -28,6 +28,7 @@ from megatron.core.transformer.cuda_graph_config import (
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
+    packed_gated_delta_net_chunk_graph_blockers,
     validate_deprecated_cuda_graph_modules_migration_inputs,
     validate_moe_cuda_graph_support,
 )
@@ -5152,26 +5153,41 @@ class TransformerConfig(ModelParallelConfig):
             warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
         has_gated_delta_net_layers = is_gated_delta_net_variant(self.experimental_attention_variant)
-        if (
+        packed_gated_delta_net_chunk_graph = (
             is_te_chunk_graph
             and self.sequence_packing_scheduler is not None
             and has_gated_delta_net_layers
-        ):
-            # The FLA kernels behind GDN / KDA build their chunk index tensors (and the CP
-            # context) on the host from the *values* of cu_seqlens and cache them by tensor
+        )
+        if packed_gated_delta_net_chunk_graph:
+            # The FLA kernels behind GDN / GDN2 / KDA build their chunk index tensors (and the
+            # CP context) on the host from the *values* of cu_seqlens and cache them by tensor
             # identity. A captured block graph refreshes the static cu_seqlens buffer in place,
-            # so every replay keeps the chunk layout of the capture sample and silently computes
-            # wrong results as soon as the pack layout changes between microbatches.
-            raise ValueError(
-                "cuda_graph_impl='chunk_wise' does not support packed-sequence (THD) training "
-                "with GDN / KDA layers (experimental_attention_variant="
-                f"{self.experimental_attention_variant!r}): the FLA kernels derive their chunk "
-                "indices on the host from the cu_seqlens values and cache them per tensor, so a "
-                "captured graph replays the pack layout of the capture sample. Use fixed-length "
-                "sequences (no sequence_packing_scheduler) with chunk-wise graphs, or run the "
-                "model without CUDA graphs."
-            )
-        cp_layout_conversion_required = has_gated_delta_net_layers
+            # so every replay would keep the chunk layout of the capture sample and silently
+            # compute wrong results as soon as the pack layout changes between microbatches.
+            # Gated DeltaNet on the Transformer Engine (cuDNN) backend reads the boundaries on
+            # the device and is replayed with the pack validated on the host before each replay.
+            # Layers built from a hybrid layer pattern carry no variant: the chunk-graph block
+            # asks each captured layer for its blockers before the first capture
+            # (ChunkCudaGraphBlockMixin._check_packed_gated_delta_net_capture).
+            blockers = packed_gated_delta_net_chunk_graph_blockers(self)
+            if blockers:
+                raise ValueError(
+                    "cuda_graph_impl='chunk_wise' supports packed-sequence (THD) training with "
+                    "GDN-family layers only for Gated DeltaNet on "
+                    "gdn_kernel_backend='transformer_engine' or KDA on flash-linear-attention "
+                    ">= 0.6.0, without context parallelism or with static headwise CP: the "
+                    "other kernels derive their chunk indices on the host from the cu_seqlens "
+                    "values and cache them per tensor, so a captured graph would replay the pack "
+                    "layout of the capture sample. Blocking settings: "
+                    + "; ".join(blockers)
+                    + ". Otherwise use fixed-length sequences (no sequence_packing_scheduler) or "
+                    "run without CUDA graphs."
+                )
+        # Headwise CP redistributes heads with fixed-shape all-to-alls inside the GDN layer;
+        # only chunkwise CP converts the THD layout with data-dependent splits.
+        cp_layout_conversion_required = has_gated_delta_net_layers and not (
+            packed_gated_delta_net_chunk_graph and self.linear_cp_mode == "headwise"
+        )
         # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
         # indexer operates natively on the contiguous layout and performs no
         # module-local THD CP layout conversion.)

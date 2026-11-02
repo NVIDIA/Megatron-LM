@@ -166,10 +166,19 @@ step graph is captured into that same pool.
 Requirements: `--cuda-graph-modules` must be empty; MoE layers need static token shapes (drop-padding
 MoE, the HybridEP flex dispatcher with `--moe-expert-rank-capacity-factor`, or a MoE megakernel
 backend); `--overlap-moe-expert-parallel-comm` and `--delay-wgrad-compute` are not supported.
-GDN / KDA layers are rejected together with packed sequences: the FLA kernels derive their chunk
-indices on the host from the `cu_seqlens` values and cache them per tensor, so a captured block
-graph would replay the pack layout of the capture sample; fixed-length (non-packed) chunk graphs
-with those layers are fine. A graph replay runs under the block-wide FP8 autocast the eager block
+Packed sequences with GDN-family layers are supported for Gated DeltaNet on
+`--gdn-kernel-backend transformer_engine` (the cuDNN kernel reads the sequence boundaries on the
+device and plans by shape) and for KDA on flash-linear-attention >= 0.6.0 (`chunk_kda` in its
+fixed-shape `use_graph` mode), without context parallelism or with static headwise CP
+(`--linear-cp-mode headwise`); the packed causal convolution then runs on fixed-shape tensor ops
+masked by the per-token sequence index (so `--gdn-pre-gated-delta-rule-fusion`, which bypasses
+it, is not admitted), and every pack is validated on the host before its boundaries are written
+into the captured graph. The FLA GDN kernels (the default backend), GDN2 and older FLA releases
+derive their chunk indices on the host from the `cu_seqlens` values and cache them per tensor, so
+a captured block graph would replay the pack layout of the capture sample: those configurations
+are rejected with packed sequences, at configuration time for the experimental attention variants
+and before the first capture for GDN layers built from a hybrid layer pattern (`G`), while
+fixed-length (non-packed) chunk graphs with any GDN-family layer are fine. A graph replay runs under the block-wide FP8 autocast the eager block
 forward opens (the replay does not run the forward), so delayed scaling keeps reducing its amax
 and updating its scales, and the FP8 weight cache keeps following `is_first_microbatch`.
 `--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are captured into each

@@ -23,6 +23,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.transformer.cuda_graph_config import packed_gated_delta_net_chunk_graph_blockers
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -113,6 +114,11 @@ class GatedDeltaNet2(_GDNBase):
         ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
         self.gdn_backend = "fla"
         self.gated_delta_rule = chunk_gdn2
+
+    def packed_chunk_graph_blockers(self) -> list[str]:
+        """GDN2 has no kernel that reads the pack boundaries on the device (see
+        ``packed_gated_delta_net_chunk_graph_blockers``)."""
+        return packed_gated_delta_net_chunk_graph_blockers(self.config, variant="gdn2")
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.

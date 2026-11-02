@@ -11,6 +11,7 @@ from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -68,6 +69,7 @@ __all__ = [
     "a2a_hp_to_cp",
     "build_cp_context",
     "causal_conv1d",
+    "causal_conv1d_packed_masked",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",
     "l2norm",
@@ -95,6 +97,153 @@ class _TorchL2Norm(torch.autograd.Function):
         y_float, dy_float = y.float(), dy.float()
         dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
         return dx.to(y.dtype), None
+
+
+class _CausalConv1dPackedMasked(torch.autograd.Function):
+    """Depthwise causal convolution over a packed buffer whose taps never cross a boundary.
+
+    Both passes are fixed-shape elementwise and reduction ops, so a CUDA graph recorded with a
+    static ``seq_idx`` buffer replays correctly for any pack layout written into that buffer.
+    Every accumulation runs in fp32 with one cast per result (the precision class of the FLA
+    varlen kernel), and only the input, the filters and the sequence index are saved: the
+    masked taps are recomputed in the backward pass instead of being kept alive.
+    """
+
+    @staticmethod
+    def _masked_tap(padded_x, padded_idx, seq_idx, start, tokens):
+        """``x[t - shift]`` for ``start = kernel_size - 1 - shift``; zero across boundaries."""
+        same_sequence = (padded_idx[:, start : start + tokens] == seq_idx).unsqueeze(-1)
+        return torch.where(same_sequence, padded_x[:, start : start + tokens], 0.0)
+
+    @staticmethod
+    def _preactivation(padded_x, padded_idx, seq_idx, weight, bias, tokens):
+        kernel_size = weight.shape[-1]
+        pre = padded_x[:, kernel_size - 1 :] * weight[:, kernel_size - 1]
+        for shift in range(1, kernel_size):
+            start = kernel_size - 1 - shift
+            tap = _CausalConv1dPackedMasked._masked_tap(
+                padded_x, padded_idx, seq_idx, start, tokens
+            )
+            pre = pre + tap * weight[:, kernel_size - 1 - shift]
+        if bias is not None:
+            pre = pre + bias
+        return pre
+
+    @staticmethod
+    def _accumulation_dtype(x):
+        """fp32 for half-precision and fp32 inputs; fp64 inputs stay in fp64 (gradcheck)."""
+        return torch.float64 if x.dtype == torch.float64 else torch.float32
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, seq_idx, apply_silu):
+        tokens = x.shape[1]
+        kernel_size = weight.shape[-1]
+        acc = _CausalConv1dPackedMasked._accumulation_dtype(x)
+        padded_x = F.pad(x.to(acc), (0, 0, kernel_size - 1, 0))
+        # -1 never equals a sequence index: taps before the buffer start are masked.
+        padded_idx = F.pad(seq_idx, (kernel_size - 1, 0), value=-1)
+        pre = _CausalConv1dPackedMasked._preactivation(
+            padded_x,
+            padded_idx,
+            seq_idx,
+            weight.to(acc),
+            bias.to(acc) if bias is not None else None,
+            tokens,
+        )
+        out = F.silu(pre) if apply_silu else pre
+        ctx.save_for_backward(x, weight, bias, seq_idx)
+        ctx.apply_silu = apply_silu
+        return out.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, bias, seq_idx = ctx.saved_tensors
+        tokens = x.shape[1]
+        kernel_size = weight.shape[-1]
+        acc = _CausalConv1dPackedMasked._accumulation_dtype(x)
+        weight32 = weight.to(acc)
+        padded_x = F.pad(x.to(acc), (0, 0, kernel_size - 1, 0))
+        padded_idx = F.pad(seq_idx, (kernel_size - 1, 0), value=-1)
+        grad_pre = grad_out.to(acc)
+        if ctx.apply_silu:
+            pre = _CausalConv1dPackedMasked._preactivation(
+                padded_x,
+                padded_idx,
+                seq_idx,
+                weight32,
+                bias.to(acc) if bias is not None else None,
+                tokens,
+            )
+            sigmoid = torch.sigmoid(pre)
+            grad_pre = grad_pre * (sigmoid * (1 + pre * (1 - sigmoid)))
+            del pre, sigmoid
+        grad_x = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            # x[t] feeds out[t + shift] through weight[:, kernel_size - 1 - shift] whenever both
+            # tokens belong to the same sequence (positions past the buffer end are masked).
+            grad_x = grad_pre * weight32[:, kernel_size - 1]
+            padded_grad = F.pad(grad_pre, (0, 0, 0, kernel_size - 1))
+            padded_idx_ahead = F.pad(seq_idx, (0, kernel_size - 1), value=-1)
+            for shift in range(1, kernel_size):
+                ahead = slice(shift, shift + tokens)
+                same_sequence = (padded_idx_ahead[:, ahead] == seq_idx).unsqueeze(-1)
+                grad_ahead = torch.where(same_sequence, padded_grad[:, ahead], 0.0)
+                grad_x = grad_x + grad_ahead * weight32[:, kernel_size - 1 - shift]
+            grad_x = grad_x.to(x.dtype)
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.empty_like(weight32)
+            grad_weight[:, kernel_size - 1] = (grad_pre * padded_x[:, kernel_size - 1 :]).sum(
+                dim=(0, 1)
+            )
+            for shift in range(1, kernel_size):
+                start = kernel_size - 1 - shift
+                tap = _CausalConv1dPackedMasked._masked_tap(
+                    padded_x, padded_idx, seq_idx, start, tokens
+                )
+                grad_weight[:, kernel_size - 1 - shift] = (grad_pre * tap).sum(dim=(0, 1))
+            grad_weight = grad_weight.to(weight.dtype)
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = grad_pre.sum(dim=(0, 1)).to(bias.dtype)
+        return grad_x, grad_weight, grad_bias, None, None
+
+
+def causal_conv1d_packed_masked(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    seq_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Depthwise causal convolution over a packed buffer that never crosses sequence boundaries.
+
+    Built from fixed-shape tensor ops only: every tap ``x[t - j]`` is masked out when
+    ``seq_idx[t - j] != seq_idx[t]``, so a CUDA graph recorded with a static ``seq_idx`` buffer
+    replays correctly for any pack layout written into that buffer. The FLA varlen convolution
+    sizes its kernel grid from the number of chunks of the capture sample (a host-side read of
+    ``cu_seqlens``), which a replay cannot refresh. Forward and backward accumulate in fp32 and
+    cast once; the backward saves the input (not fp32 copies of the taps) and recomputes.
+
+    Args:
+        x: ``[batch, total_tokens, channels]`` packed input (``batch`` is 1 for THD).
+        weight: ``[channels, kernel_size]`` depthwise filters; ``weight[:, -1]`` multiplies the
+            current token (the layout of ``torch.nn.functional.conv1d`` with left padding).
+        bias: ``[channels]`` or ``None``.
+        activation: ``"silu"`` / ``"swish"``, or ``None`` for the raw convolution.
+        seq_idx: ``[1, total_tokens]`` per-token sequence index.
+
+    Returns:
+        ``[batch, total_tokens, channels]`` in the dtype of ``x``.
+    """
+    assert x.dim() == 3, f"expected [batch, tokens, channels], got {tuple(x.shape)}"
+    assert seq_idx is not None, "the graph-safe packed convolution needs a per-token seq_idx"
+    if activation in ("silu", "swish"):
+        apply_silu = True
+    elif activation is None:
+        apply_silu = False
+    else:
+        raise ValueError(f"Unsupported causal conv activation {activation!r}.")
+    seq_idx = seq_idx.reshape(1, x.shape[1])
+    return _CausalConv1dPackedMasked.apply(x, weight, bias, seq_idx, apply_silu)
 
 
 def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -587,18 +736,64 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         """
         raise NotImplementedError
 
+    def packed_chunk_graph_blockers(self) -> list[str]:
+        """Settings that keep this layer's packed (THD) forward out of a chunk-wise CUDA graph.
+
+        The chunk-graph block asks every GDN-family layer it captures (the stack-level
+        configuration gate judges ``experimental_attention_variant`` and cannot see layers
+        built from a hybrid layer pattern), and the layer refuses metadata marked as validated
+        for a graph replay when its own kernel path cannot be replayed. Subclasses report the
+        kernel path they bind; the default refuses the layer.
+        """
+        return [
+            f"{type(self).__name__} has no packed kernel path that a chunk-wise CUDA graph can "
+            "replay"
+        ]
+
+    def _packed_boundaries_validated(self, packed_seq_params) -> bool:
+        """Whether the pack's boundaries were already checked on the host for this microbatch.
+
+        The chunk-wise CUDA graph replay validates every pack before it refreshes the static
+        ``cu_seqlens`` buffers of the captured graph and marks the metadata it rebuilds inside
+        the graph; the module then skips its own device-to-host checks, which a capture forbids
+        and which would otherwise freeze the capture sample's values into the graph. A layer
+        whose kernels cannot follow the refreshed boundaries (see
+        ``packed_chunk_graph_blockers``) refuses such metadata instead of replaying silently
+        wrong results.
+        """
+        if not getattr(packed_seq_params, "cu_seqlens_validated", False):
+            return False
+        blockers = getattr(self, "_packed_chunk_graph_blockers_cache", None)
+        if blockers is None:
+            blockers = self.packed_chunk_graph_blockers()
+            self._packed_chunk_graph_blockers_cache = blockers
+        if blockers:
+            raise ValueError(
+                f"{type(self).__name__} received packed-sequence metadata validated for a "
+                "chunk-wise CUDA graph replay, but its kernel path cannot be replayed with the "
+                f"pack boundaries refreshed in place: {'; '.join(blockers)}."
+            )
+        return True
+
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        validated: bool = False,
     ) -> torch.Tensor:
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding.
+
+        ``validated`` skips the host-synchronizing geometry checks (see
+        ``_packed_boundaries_validated``).
+        """
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
-
-        if torch.cuda.is_current_stream_capturing():
-            # The checks below read device values on the host; the geometry was already validated
-            # by the eager warm-up steps that precede a CUDA graph capture.
+        if validated:
             return cu_seqlens
 
         total_cu = cu_seqlens[-1].cpu().item()

@@ -2,6 +2,7 @@
 
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
+import inspect
 import math
 from dataclasses import dataclass
 from functools import partial
@@ -14,7 +15,11 @@ from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    packed_seq_idx_on_device,
+    resolve_cp_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
@@ -24,9 +29,11 @@ from megatron.core.ssm.gated_delta_net.common import (
     a2a_hp_to_cp,
     build_cp_context,
     causal_conv1d,
+    causal_conv1d_packed_masked,
     get_parameter_local_cp,
 )
 from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
+from megatron.core.transformer.cuda_graph_config import packed_gated_delta_net_chunk_graph_blockers
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -42,6 +49,22 @@ try:
 except ImportError:  # pragma: no cover
     chunk_kda = None
     HAVE_FLA_KDA = False
+
+
+def fla_kda_supports_graph_capture() -> bool:
+    """Whether the installed FLA KDA kernel has the fixed-shape (``use_graph``) varlen mode.
+
+    flash-linear-attention >= 0.6.0 builds the packed chunk index list on the device with a
+    static shape and makes every kernel return on the sentinel rows, so a CUDA graph captured
+    with a static ``cu_seqlens`` buffer replays correctly after the boundaries change. Older
+    releases derive the chunk list on the host from the boundary values.
+    """
+    if chunk_kda is None:
+        return False
+    try:
+        return "use_graph" in inspect.signature(chunk_kda).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return False
 
 
 @dataclass
@@ -144,6 +167,33 @@ class KimiDeltaAttention(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
+
+    def packed_chunk_graph_blockers(self) -> list[str]:
+        """Settings that keep this layer's packed forward out of a chunk-wise CUDA graph.
+
+        KDA replays when the installed flash-linear-attention provides ``chunk_kda(use_graph=True)``
+        (>= 0.6.0); see ``packed_gated_delta_net_chunk_graph_blockers`` for the complete matrix.
+        """
+        return packed_gated_delta_net_chunk_graph_blockers(self.config, variant="kda")
+
+    def _uses_graph_safe_packed_path(self, packed_seq_params, chunkwise_cp_context) -> bool:
+        """Whether this packed forward must avoid host-sized kernel launches.
+
+        True for packed (THD) inputs under chunk-wise CUDA graphs without chunkwise CP: the
+        convolution runs on fixed-shape masked taps and ``chunk_kda`` in its ``use_graph`` mode.
+        Both are selected by the configuration check (``fla_kda_supports_graph_capture``), so
+        reaching this path with an older FLA is a configuration error.
+        """
+        if self.config.cuda_graph_impl != "chunk_wise" or chunkwise_cp_context is not None:
+            return False
+        if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
+            return False
+        if not fla_kda_supports_graph_capture():
+            raise ValueError(
+                "Packed KimiDeltaAttention under cuda_graph_impl='chunk_wise' needs "
+                "flash-linear-attention >= 0.6.0 (chunk_kda use_graph mode)."
+            )
+        return True
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
         """Return KDA qkv/raw-g/output-gate split sizes for runtime headwise CP."""
@@ -274,12 +324,14 @@ class KimiDeltaAttention(_GDNBase):
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             if batch != 1:
                 raise ValueError("Packed KDA expects batch dimension to be 1.")
+            validated = self._packed_boundaries_validated(packed_seq_params)
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                validated=validated,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -287,8 +339,10 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                validated=validated,
             )
-            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
+            if not validated:
+                self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
         else:
             cu_seqlens_q = None
 
@@ -445,6 +499,13 @@ class KimiDeltaAttention(_GDNBase):
         nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        graph_kwargs = {}
+        if self._uses_graph_safe_packed_path(packed_seq_params, chunkwise_cp_context):
+            # Fixed-shape varlen mode: the chunk list is built on the device for
+            # thd_max_packed_sequences slots, so the captured kernels replay for every pack
+            # written into the static cu_seqlens buffer (the static buffer always carries
+            # exactly thd_max_packed_sequences + 1 boundaries).
+            graph_kwargs = dict(use_graph=True, max_num_seqs=int(cu_seqlens_q.shape[0]) - 1)
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
             initial_state=None,
@@ -455,6 +516,7 @@ class KimiDeltaAttention(_GDNBase):
             lower_bound=self.config.kda_lower_bound,
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
+            **graph_kwargs,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -580,6 +642,17 @@ class KimiDeltaAttention(_GDNBase):
             )
             qkv = self.act_fn(conv_out[..., :kernel_seq_len])
             qkv = qkv.transpose(1, 2).contiguous()
+        elif self._uses_graph_safe_packed_path(packed_seq_params, chunkwise_cp_context):
+            # FLA's varlen convolution sizes its kernel grid on the host from the chunk count
+            # of the pack it sees; the captured block replays with other packs in the same
+            # static buffers, so the packed convolution runs on fixed-shape tensor ops masked
+            # by the per-token sequence index instead.
+            seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None or seq_idx.shape[-1] != qkv.shape[1]:
+                seq_idx = packed_seq_idx_on_device(cu_seqlens_q, qkv.shape[1])
+            qkv = causal_conv1d_packed_masked(
+                qkv.contiguous(), conv1d_weight.squeeze(1), conv1d_bias, self.activation, seq_idx
+            )
         else:
             if self.activation not in ("silu", "swish"):
                 raise ValueError(f"FLA causal convolution requires SiLU, got {self.activation}.")
@@ -660,7 +733,7 @@ class KimiDeltaAttention(_GDNBase):
             )
         # torch.equal synchronises with the device, which a CUDA graph capture forbids; the
         # boundaries were validated during the eager warm-up steps and the captured graph's static
-        # cu_seqlens are identical by construction (same guard as GatedDeltaNet).
+        # cu_seqlens are identical by construction.
         if cu_seqlens_q.shape != cu_seqlens_kv.shape or (
             not torch.cuda.is_current_stream_capturing()
             and not torch.equal(cu_seqlens_q, cu_seqlens_kv)

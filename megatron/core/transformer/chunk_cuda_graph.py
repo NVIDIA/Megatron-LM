@@ -15,8 +15,85 @@ from contextlib import nullcontext
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, packed_seq_idx_on_device
 from megatron.core.transformer.module import GraphableMegatronModule
+
+# Boundary tensors that passed validate_packed_boundaries_for_linear_attention, keyed by tensor
+# identity: (cu_q, cu_kv, (versions, capacity, max_num_seqs, cp_size)). Holding the (tiny)
+# tensors keeps their ids from being reused while they are cached; in-place refreshes of a
+# reused buffer bump the version and are validated again.
+_VALIDATED_PACKS_CAPACITY = 16
+_VALIDATED_PACKS: "OrderedDict[tuple[int, int], tuple]" = OrderedDict()
+
+
+def validate_packed_boundaries_for_linear_attention(
+    packed_seq_params, capacity, max_num_seqs, cp_size
+):
+    """Host-side check of one pack before its boundaries are written into a captured graph.
+
+    GDN-family layers consume ``cu_seqlens`` inside the captured block, where their own
+    device-to-host checks cannot run. The replay therefore validates the pack here, in eager
+    code, with a single device-to-host copy: ``max_num_seqs + 1`` boundaries, q == kv,
+    non-decreasing, starting at 0 and covering the static capacity exactly (the dummy tail
+    sequence of ``thd_tail_padding_policy='append_dummy_seq'``; a shorter pack would leave rows
+    the kernels never write), and every physical length a multiple of ``2 * cp_size`` (the
+    zigzag layout headwise CP redistributes, see ``_build_thd_cp_a2a_perm``).
+
+    Raises:
+        ValueError: with the offending boundaries, instead of a silently wrong replay.
+    """
+    cu_q = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    cu_kv = (
+        packed_seq_params.cu_seqlens_kv_padded
+        if packed_seq_params.cu_seqlens_kv_padded is not None
+        else packed_seq_params.cu_seqlens_kv
+    )
+    if cu_q is None or cu_kv is None:
+        raise ValueError("Packed GDN chunk graphs need cu_seqlens_q and cu_seqlens_kv.")
+    # Every captured block of a microbatch (decoder chunks, the post-process block) replays the
+    # same pack: only the first one pays the device-to-host copy, the others find the boundary
+    # tensors (by identity and in-place version) in the small cache of validated packs.
+    cache_key = (id(cu_q), id(cu_kv))
+    stamp = (cu_q._version, cu_kv._version, capacity, max_num_seqs, cp_size)
+    cached = _VALIDATED_PACKS.get(cache_key)
+    if cached is not None and cached[0] is cu_q and cached[1] is cu_kv and cached[2] == stamp:
+        return
+    host = torch.stack([cu_q, cu_kv]).detach().to(device="cpu", dtype=torch.long)
+    boundaries, boundaries_kv = host[0], host[1]
+    problems = []
+    if boundaries.numel() != max_num_seqs + 1:
+        problems.append(
+            f"{boundaries.numel()} boundaries, expected thd_max_packed_sequences + 1 = "
+            f"{max_num_seqs + 1}"
+        )
+    if not torch.equal(boundaries, boundaries_kv):
+        problems.append("cu_seqlens_q and cu_seqlens_kv differ")
+    lengths = boundaries[1:] - boundaries[:-1]
+    if boundaries.numel() and boundaries[0].item() != 0:
+        problems.append(f"first boundary is {boundaries[0].item()}, expected 0")
+    if (lengths < 0).any():
+        problems.append("boundaries are not non-decreasing")
+    if boundaries.numel() and boundaries[-1].item() != capacity:
+        problems.append(
+            f"last boundary is {boundaries[-1].item()}, expected the static capacity "
+            f"{capacity} (thd_tail_padding_policy='append_dummy_seq' covers the padding)"
+        )
+    if cp_size > 1 and (lengths % (2 * cp_size) != 0).any():
+        problems.append(
+            f"a physical sequence length is not a multiple of 2 * cp_size = {2 * cp_size}"
+        )
+    if problems:
+        raise ValueError(
+            "Packed sequence boundaries cannot be replayed through the GDN layers of a chunk "
+            f"CUDA graph: {'; '.join(problems)}. cu_seqlens={boundaries.tolist()}"
+        )
+    _VALIDATED_PACKS[cache_key] = (cu_q, cu_kv, stamp)
+    while len(_VALIDATED_PACKS) > _VALIDATED_PACKS_CAPACITY:
+        _VALIDATED_PACKS.popitem(last=False)
 
 
 class ChunkCudaGraphBlockMixin:
@@ -61,6 +138,51 @@ class ChunkCudaGraphBlockMixin:
             and module._uses_graph_dynamic_dsa_route()
             for module in self.modules()
         )
+
+    def _gated_delta_net_layers(self):
+        """The GDN-family layers (GDN / GDN2 / KDA) captured in this block, with their names."""
+        cached = getattr(self, '_chunk_graph_gated_delta_net_layers', None)
+        if cached is None:
+            from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+            cached = [
+                (name, module)
+                for name, module in self.named_modules()
+                if isinstance(module, _GDNBase)
+            ]
+            self._chunk_graph_gated_delta_net_layers = cached
+        return cached
+
+    def _block_has_gated_delta_net_layers(self):
+        """Whether a GDN-family layer (GDN / GDN2 / KDA) is captured in this block."""
+        return bool(self._gated_delta_net_layers())
+
+    def _check_packed_gated_delta_net_capture(self):
+        """Refuse to capture packed GDN-family layers whose kernels cannot replay other packs.
+
+        The stack-level configuration gate judges ``experimental_attention_variant``; layers
+        built from a hybrid layer pattern ('G' / 'K') carry no variant, so every captured layer
+        is asked for its own blockers here, before the first capture and the first replay.
+        """
+        if getattr(self, '_chunk_graph_gated_delta_net_checked', False):
+            return
+        problems = []
+        for name, module in self._gated_delta_net_layers():
+            blockers = module.packed_chunk_graph_blockers()
+            if blockers:
+                problems.append(f"{name or type(module).__name__}: {'; '.join(blockers)}")
+        if problems:
+            raise ValueError(
+                "cuda_graph_impl='chunk_wise' cannot capture packed-sequence (THD) training with "
+                "the GDN-family layers of this block, whose kernels derive their chunk indices on "
+                "the host from the capture sample's cu_seqlens values: "
+                + " | ".join(problems)
+                + ". Only Gated DeltaNet on gdn_kernel_backend='transformer_engine' and KDA on "
+                "flash-linear-attention >= 0.6.0 read the pack boundaries on the device. Use "
+                "fixed-length sequences (no sequence_packing_scheduler) or run without CUDA "
+                "graphs."
+            )
+        self._chunk_graph_gated_delta_net_checked = True
 
     def _chunk_graph_has_quantized_modules(self):
         """Whether the captured block holds modules the block-level FP8 autocast applies to.
@@ -117,6 +239,7 @@ class ChunkCudaGraphBlockMixin:
             )
 
         if self._is_thd_cuda_graph():
+            self._check_packed_gated_delta_net_capture()
             max_num_seqs = config.thd_max_packed_sequences
             assert (
                 max_num_seqs is not None
@@ -195,6 +318,15 @@ class ChunkCudaGraphBlockMixin:
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
+        if self._block_has_gated_delta_net_layers():
+            # The GDN layers skip their device-to-host boundary checks inside the graph.
+            self._check_packed_gated_delta_net_capture()
+            validate_packed_boundaries_for_linear_attention(
+                packed_seq_params,
+                self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size,
+                self.config.thd_max_packed_sequences,
+                self.config.context_parallel_size,
+            )
         kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
@@ -223,16 +355,28 @@ class ChunkCudaGraphBlockMixin:
             kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
         )
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        cu_seqlens_q_padded = kwargs.pop('cu_seqlens_q_padded')
+        # GDN-family layers consume the pack inside the graph: the per-token sequence index is
+        # built from the static boundary buffer with fixed-shape device ops (the eager data path
+        # uses a host-synchronizing repeat_interleave), and the pack was validated on the host by
+        # _decompose_packed_seq_params_to_kwargs before this replay.
+        linear_attention = self._block_has_gated_delta_net_layers()
+        seq_idx = (
+            packed_seq_idx_on_device(cu_seqlens_q_padded, max_seqlen) if linear_attention else None
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             pad_between_seqs=True,
+            total_tokens=max_seqlen if linear_attention else None,
+            seq_idx=seq_idx,
+            cu_seqlens_validated=linear_attention,
         )
         if graph_dynamic_plan is not None:
             cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)

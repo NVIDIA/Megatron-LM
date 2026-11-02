@@ -32,7 +32,7 @@ import pytest
 import torch
 
 from megatron.core.datasets.data_schedule import _build_thd_padding_mask
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, HAVE_TE_GDN
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     _resolve_thd_padding_lengths,
@@ -1502,6 +1502,56 @@ def _thd_batch(seqlens, vocab, seed, capacity, max_num_seqs):
     )
 
 
+def _thd_batch_cp(seqlens, vocab, seed, local_capacity, max_num_seqs, cp_size, cp_rank):
+    """``_thd_batch`` for a CP rank: the real sequences are built globally, this rank's zigzag
+    shard (chunks ``cp_rank`` and ``2 * cp_size - 1 - cp_rank`` of every sequence's ``2 * cp_size``
+    equal chunks, in sequence order) is cut out, and ``pad_sequence_for_thd`` pads the shard to the
+    per-rank capacity while extending the *global* boundaries with the dummy tail sequence."""
+    assert all(length % (2 * cp_size) == 0 for length in seqlens), seqlens
+    total = sum(seqlens)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    tokens = torch.randint(0, vocab, (1, total + 1), generator=generator).cuda()
+    position_ids = torch.cat([torch.arange(length) for length in seqlens]).unsqueeze(0).cuda()
+    pieces, start = [], 0
+    for length in seqlens:
+        chunk = length // (2 * cp_size)
+        for chunk_id in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            first = start + chunk_id * chunk
+            pieces.append(torch.arange(first, first + chunk, device="cuda"))
+        start += length
+    index = torch.cat(pieces)
+    alignment, target_len, padded_num_seqs = get_thd_padding_kwargs(
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=local_capacity,
+        thd_max_packed_sequences=max_num_seqs,
+        cuda_graph_static=True,
+    )
+    input_ids, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+        pad_sequence_for_thd(
+            tokens[:, :-1].index_select(1, index).contiguous(),
+            tokens[:, 1:].index_select(1, index).contiguous(),
+            torch.ones(1, index.numel(), dtype=torch.float32, device="cuda"),
+            position_ids.index_select(1, index).contiguous(),
+            _make_psp(seqlens),
+            alignment=alignment,
+            target_len=target_len,
+            max_num_seqs=padded_num_seqs,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+    )
+    assert input_ids.shape == (1, local_capacity)
+    assert packed_seq_params.cu_seqlens_q.numel() == max_num_seqs + 1
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        position_ids=position_ids,
+        loss_mask=loss_mask,
+        padding_mask=padding_mask,
+        packed_seq_params=packed_seq_params,
+    )
+
+
 def _train_step(model, batch):
     """Forward + backward without an optimizer step; returns (per-token loss, {name: grad})."""
     for param in model.parameters():
@@ -1755,6 +1805,284 @@ class TestChunkGraphRegression:
                 # into the history, and recomputed the scale from it.
                 assert torch.count_nonzero(history[1:]) > 0, history
                 assert not torch.equal(scale, initial_scale), (scale, initial_scale)
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None and helper.graphs_created():
+                helper.delete_cuda_graphs()
+            destroy_num_microbatches_calculator()
+            Utils.destroy_model_parallel()
+
+
+# The hybrid layer-pattern stack (``G*``) is only built, never run, in this class: with cuDNN
+# frontend 1.29.0 (nvidia-cudnn-frontend[cutedsl]) a cuDNN GDN model instance that runs after
+# another one in the same process can crash with an illegal memory access in the cuDNN GDN kernel
+# of its first forward (reliably when it repeats the shapes of an instance that was released, and
+# in most runs when it follows a hybrid stack that was captured, whichever shapes it has), while
+# the GPT instances below leave no such trace behind. Hybrid capture / replay parity against eager
+# was verified in standalone runs; see the PR description.
+@pytest.mark.internal
+class TestPackedGatedDeltaNetChunkGraph:
+    """Packed (THD) Gated DeltaNet layers captured in a chunk-wise CUDA graph.
+
+    Only the Transformer Engine (cuDNN) GDN kernel can be captured: it reads the sequence
+    boundaries on the device and plans by shape, so one captured block replays correctly for
+    every pack written into the static ``cu_seqlens`` buffer. The packed causal convolution runs
+    on fixed-shape tensor ops masked by the per-token sequence index (the FLA varlen convolution
+    sizes its grid on the host), and the replay validates each pack on the host before the
+    GDN layers skip their own device-to-host checks inside the graph.
+    """
+
+    @staticmethod
+    def _build_model(
+        tokens, max_num_seqs, vocab, variant="gdn", model_type="gpt", **config_overrides
+    ):
+        """Layer 1 is the linear-attention layer, layer 2 standard attention: through the GPT
+        experimental-attention route (``variant`` + ``linear_attention_freq``) or, for
+        ``model_type="hybrid"``, through the hybrid layer pattern ``G*``, whose GDN layer carries
+        no variant in its config."""
+        hybrid = model_type == "hybrid"
+        assert model_type in ("gpt", "hybrid") and (not hybrid or variant == "gdn")
+        config_kwargs = dict(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=4,
+            ffn_hidden_size=256,
+            # SiLU like the production GDN recipes (the causal conv's activation follows it).
+            activation_func=torch.nn.functional.silu,
+            experimental_attention_variant=None if hybrid else variant,
+            linear_attention_freq=None if hybrid else 2,
+            is_hybrid_model=hybrid,
+            gdn_kernel_backend="transformer_engine",
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            max_seqlen_per_dp_cp_rank=tokens,
+            thd_max_packed_sequences=max_num_seqs,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            cuda_graph_impl="chunk_wise",
+            cuda_graph_modules=[],
+            cuda_graph_dynamic_microbatches=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+            use_cpu_initialization=True,
+        )
+        config_kwargs.update(config_overrides)
+        config = TransformerConfig(**config_kwargs)
+        model_parallel_cuda_manual_seed(42)
+        model_kwargs = dict(
+            config=config,
+            vocab_size=vocab,
+            # Positions are global: the rotary table spans the whole pack across CP ranks.
+            max_sequence_length=tokens * config.context_parallel_size,
+            position_embedding_type="rope",
+        )
+        if hybrid:
+            from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+            from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+            return HybridModel(
+                hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern="G*", **model_kwargs
+            ).cuda()
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        block_spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+        return GPTModel(transformer_layer_spec=block_spec, **model_kwargs).cuda()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hybrid_pattern_layers_are_checked_at_capture(self):
+        """GDN layers built from a hybrid layer pattern ('G') carry no
+        experimental_attention_variant, so the configuration gate cannot judge them: the
+        chunk-graph block asks every captured GDN-family layer for its blockers before the
+        first capture and the first replay, and a layer whose kernel path cannot replay (here
+        the FLA kernel) refuses pack metadata marked as validated instead of running on the
+        capture sample's chunk layout."""
+        from megatron.core.ssm.gated_delta_net.common import HAVE_FLA
+
+        if not HAVE_FLA:
+            pytest.skip("the GDN-family layers need FLA")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        try:
+            tokens, max_num_seqs, vocab = 256, 4, 128
+            model = self._build_model(
+                tokens, max_num_seqs, vocab, model_type="hybrid", gdn_kernel_backend="fla"
+            )
+            assert model.config.experimental_attention_variant is None
+            gdn_layer = model.decoder.layers[0].self_attention
+            assert gdn_layer.gdn_backend == "fla"
+            assert model.decoder._block_has_gated_delta_net_layers()
+            with pytest.raises(ValueError, match="gdn_kernel_backend='fla'"):
+                model.decoder.get_layer_static_inputs(seq_length=tokens, micro_batch_size=1)
+            batch = _thd_batch([100, 156], vocab, 0, tokens, max_num_seqs)
+            with pytest.raises(ValueError, match="gdn_kernel_backend='fla'"):
+                model.decoder._decompose_packed_seq_params_to_kwargs(
+                    {"packed_seq_params": batch["packed_seq_params"]}
+                )
+            batch["packed_seq_params"].cu_seqlens_validated = True
+            with pytest.raises(ValueError, match="cannot be replayed with the pack boundaries"):
+                gdn_layer._packed_boundaries_validated(batch["packed_seq_params"])
+            if HAVE_TE and HAVE_TE_GDN:
+                # The same stack on the Transformer Engine kernel is admitted.
+                te_model = self._build_model(tokens, max_num_seqs, vocab, model_type="hybrid")
+                te_layer = te_model.decoder.layers[0].self_attention
+                assert te_layer.gdn_backend == "transformer_engine"
+                assert te_layer.packed_chunk_graph_blockers() == []
+                static_inputs = te_model.decoder.get_layer_static_inputs(
+                    seq_length=tokens, micro_batch_size=1
+                )
+                assert static_inputs["cu_seqlens_q"].numel() == max_num_seqs + 1
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_capture_replay_matches_eager_across_packings(self, monkeypatch):
+        self._run_capture_replay(monkeypatch, cp=1)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_kda_capture_replay_matches_eager_across_packings(self, monkeypatch):
+        """KDA on flash-linear-attention >= 0.6.0: ``chunk_kda(use_graph=True)`` builds its
+        chunk list on the device for ``thd_max_packed_sequences`` slots and its kernels return
+        on the sentinel rows, so the captured block replays for every pack."""
+        self._run_capture_replay(monkeypatch, cp=1, variant="kda")
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_kda_capture_replay_matches_eager_headwise_cp2(self, monkeypatch):
+        self._run_capture_replay(monkeypatch, cp=2, variant="kda")
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_capture_replay_matches_eager_headwise_cp2(self, monkeypatch):
+        """Static headwise CP: the GDN layer redistributes heads with Megatron's fixed-shape
+        all-to-all inside the captured block, every rank validates the global pack before the
+        replay and the graph rebuilds the global per-token sequence index for the exchanged
+        sequences. Every physical sequence length is a multiple of 2 * cp (zigzag layout)."""
+        self._run_capture_replay(monkeypatch, cp=2)
+
+    def _run_capture_replay(self, monkeypatch, cp, variant="gdn"):
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator,
+        )
+        from megatron.core.ssm.gated_delta_net import gdn as gdn_module
+        from megatron.core.ssm.gated_delta_net import kda as kda_module
+        from megatron.core.ssm.gated_delta_net.common import HAVE_FLA
+        from megatron.core.tensor_parallel.random import initialize_rng_tracker
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        if not HAVE_FLA:
+            pytest.skip("the GDN-family layers need FLA (L2 norm, KDA kernel)")
+        if variant == "gdn" and not (HAVE_TE and HAVE_TE_GDN):
+            pytest.skip("Transformer Engine GatedDeltaNetAttention (cuDNN GDN) not available")
+        if variant == "kda" and not kda_module.fla_kda_supports_graph_capture():
+            pytest.skip("KDA graph mode needs flash-linear-attention >= 0.6.0")
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("cuDNN GDN kernels are validated on Blackwell")
+        if cp > 1 and (Utils.world_size < cp or Utils.world_size % cp != 0):
+            pytest.skip(f"CP={cp} requires a world size that is a multiple of {cp}")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=2,
+            micro_batch_size=1,
+            data_parallel_size=1,
+        )
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        helper = None
+        try:
+            # Per-rank static capacity; the pack and its boundaries are global.
+            tokens, max_num_seqs, vocab = 256 // cp, 4, 128
+            overrides = dict(context_parallel_size=cp, linear_cp_mode="headwise") if cp > 1 else {}
+            model = self._build_model(tokens, max_num_seqs, vocab, variant=variant, **overrides)
+            model.train()
+            gdn_layer = model.decoder.layers[0].self_attention
+            if variant == "gdn":
+                assert gdn_layer.gdn_backend == "transformer_engine"
+            assert gdn_layer.cp_size == cp
+            assert model.decoder._block_has_gated_delta_net_layers()
+            model.zero_grad_buffer = lambda: None
+            # The FLA varlen convolution must stay out of the chunk-graph configuration, in
+            # eager warm-up as well as in the capture: its kernel grid is sized on the host.
+            for module in (gdn_module, kda_module):
+                monkeypatch.setattr(
+                    module,
+                    "causal_conv1d",
+                    lambda *args, **kwargs: pytest.fail("FLA varlen conv used under chunk graphs"),
+                )
+            # Packings with uneven lengths and unused slots; under CP every physical length
+            # (the dummy tail included) is a multiple of 2 * cp, as the data path guarantees.
+            packings = (
+                ([250], [100, 156], [37, 91, 128], [16, 40, 60])
+                if cp == 1
+                else ([248], [100, 148], [40, 92, 116], [16, 40, 60])
+            )
+            if cp == 1:
+                batches = [
+                    _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs)
+                    for seed, seqlens in enumerate(packings)
+                ]
+            else:
+                cp_rank = torch.distributed.get_rank(group=gdn_layer.pg_collection.cp)
+                batches = [
+                    _thd_batch_cp(seqlens, vocab, seed, tokens, max_num_seqs, cp, cp_rank)
+                    for seed, seqlens in enumerate(packings)
+                ]
+            for batch in batches:
+                assert batch["input_ids"].shape == (1, tokens)
+                assert int(batch["packed_seq_params"].cu_seqlens_q_padded[-1]) == tokens * cp
+            reference = [_train_step(model, batch) for batch in batches]
+            for first, second in zip(reference, reference[1:]):
+                assert not torch.allclose(first[0], second[0]), "batches must differ"
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=tokens, micro_batch_size=1
+            )
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(model.decoder.cuda_graphs) > 0
+            replays = []
+            original_replay = torch.cuda.CUDAGraph.replay
+
+            def counting_replay(graph, *args, **kwargs):
+                replays.append(graph)
+                return original_replay(graph, *args, **kwargs)
+
+            monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
+            for order in ((0, 1, 2, 3), (3, 1, 0, 2)):
+                for index in order:
+                    before = len(replays)
+                    per_token_loss, grads = _train_step(model, batches[index])
+                    assert len(replays) > before, index
+                    ref_loss, ref_grads = reference[index]
+                    torch.testing.assert_close(per_token_loss, ref_loss, rtol=1e-3, atol=1e-3)
+                    assert grads.keys() == ref_grads.keys()
+                    for name, ref_grad in ref_grads.items():
+                        error = (grads[name] - ref_grad).norm()
+                        assert error <= 2e-2 * ref_grad.norm() + 1e-6, (
+                            name,
+                            index,
+                            error.item(),
+                            ref_grad.norm().item(),
+                        )
+            # A pack that does not cover the static capacity would leave rows the GDN kernel
+            # never writes: the replay rejects it on the host instead of replaying it.
+            short = batches[1]["packed_seq_params"]
+            for boundaries in (short.cu_seqlens_q_padded, short.cu_seqlens_kv_padded):
+                boundaries[-1] -= 2 * cp * 4
+            with pytest.raises(ValueError, match="cannot be replayed through the GDN layers"):
+                _train_step(model, batches[1])
         finally:
             torch.cuda.synchronize()
             if helper is not None and helper.graphs_created():

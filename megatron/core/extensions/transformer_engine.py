@@ -2628,6 +2628,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("cp_partition_route")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
         self.kept_packed_seq_params.discard("cp_singleton_group")
+        # Host-validation marker consumed by the GDN-family layers under chunk-wise graphs.
+        self.kept_packed_seq_params.discard("cu_seqlens_validated")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
