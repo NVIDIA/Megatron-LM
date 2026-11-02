@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import router_gating_linear, router_gating_token_blocks
@@ -197,6 +198,7 @@ def test_topk_router_expert_bias_counts_logical_tokens(with_padding):
 def test_transformer_layer_routes_multiplicities_to_moe_layer(overrides):
     """TransformerLayer hands the multiplicities to MoELayer.forward, not to attention."""
     Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
     try:
         config = TransformerConfig(
             num_layers=1,
@@ -244,6 +246,7 @@ def test_transformer_layer_routes_multiplicities_to_moe_layer(overrides):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_transformer_layer_rejects_multiplicities_for_dense_mlp():
     Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
     try:
         config = TransformerConfig(
             num_layers=1,
