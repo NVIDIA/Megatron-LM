@@ -16,12 +16,18 @@ from megatron.core.distributed.distributed_data_parallel_config import (
 )
 from megatron.core.distributed.param_and_grad_buffer import (
     _compute_default_per_buffer_param_layout,
+    _param_uses_quantized_storage,
     group_params_for_buffers,
 )
 from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
+from ..fp8_utils import (
+    is_blockwise_float8tensor,
+    is_mxfp8tensor,
+    requantize_whole_params_from_high_precision,
+)
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
@@ -746,6 +752,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ),
             )
 
+        if self.param_layout != 'padded':
+            self._check_whole_param_gather_storage(optimizers, config)
+
         # With the padded layout, ddp_config.use_distributed_optimizer is True and model
         # params are views into the DDP param buffer. After the optimizer step copies updated
         # fp32 main params → bf16 model params, the buffer is already up-to-date in-place, so
@@ -988,6 +997,30 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "configure_ddp_for_layer_wise_optimizer() so both use the same layout."
             )
         return built
+
+    def _check_whole_param_gather_storage(self, optimizers, config) -> None:
+        """Reject quantized params that the whole-parameter gather cannot publish.
+
+        The compact and legacy layouts gather quantized params as BF16 staged from the owners'
+        FP32 masters and requantize them on every rank, which supports plain MXFP8 and
+        blockwise FP8 storage only.
+        """
+        for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+            for param in (p for owned in params_list or [] for p in owned):
+                if not _param_uses_quantized_storage(param):
+                    continue
+                if not (is_mxfp8tensor(param) or is_blockwise_float8tensor(param)):
+                    raise ValueError(
+                        f"The {self.param_layout} LayerWise layout gathers quantized params as "
+                        "BF16 and supports only plain MXFP8 and blockwise FP8 params; got "
+                        f"{type(param.data).__name__}. Use the padded layout or another "
+                        "recipe."
+                    )
+                if not config.bf16:
+                    raise ValueError(
+                        f"Quantized params on the {self.param_layout} LayerWise layout need the "
+                        "bf16 FP32 master copies (OptimizerConfig.bf16=True)."
+                    )
 
     def shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):
         """Shard params across ranks according to the computed param layout.
@@ -1237,23 +1270,35 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Used by the compact and legacy layouts when DDP bucket groups do not gather
         (``layerwise_param_sync_via_bucket_group=False``); the padded layout uses the
         standard distributed optimizer buffer all-gather (via ``start_param_sync``).
+
+        Owners flatten their updated params into one uneven all-gather per transport dtype.
+        Quantized params (plain MXFP8 / blockwise FP8) travel as BF16 staged from the owners'
+        FP32 masters and are requantized on every rank, owner included, so all replicas hold
+        identical quantized values.
         """
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
-        def _allgather_helper(params_list, group):
+        def _allgather_helper(params_list, group, quantized):
             # Any rank, including rank 0, may own no param of this domain.
             first_param = next((params[0] for params in params_list if params), None)
             if first_param is None:
                 return
             device = first_param.device
-            dtype = first_param.dtype
+            dtype = torch.bfloat16 if quantized else first_param.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
+            local_params = params_list[rank]
+            if quantized:
+                for param in local_params:
+                    assert (
+                        getattr(param, 'main_param', None) is not None
+                    ), "LayerWise quantized param gather needs the owner's FP32 main_param."
+                local_params = [param.main_param.to(dtype) for param in local_params]
             src = (
-                _flatten_dense_tensors(params_list[rank])
-                if len(params_list[rank]) > 0
+                _flatten_dense_tensors(local_params)
+                if len(local_params) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
             flat_sizes = [sum(p.numel() for p in params) for params in params_list]
@@ -1272,6 +1317,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             torch.distributed.all_gather(gather_list, src, group=group)
 
+            if quantized:
+                params, values = [], []
+                for idx, owned in enumerate(params_list):
+                    if not owned:
+                        continue
+                    templates = [torch.empty(p.shape, device="meta", dtype=dtype) for p in owned]
+                    params.extend(owned)
+                    values.extend(_unflatten_dense_tensors(gather_list[idx], templates))
+                requantize_whole_params_from_high_precision(params, values)
+                return
+
             # Unflatten and copy gathered params for each rank.
             for idx, params in enumerate(params_list):
                 if len(params) == 0 or idx == rank:
@@ -1280,12 +1336,36 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
+        def _allgather_by_transport(params_list, group):
+            # Flattening needs one dtype; keep e.g. FP32 params out of a BF16 transport, and
+            # quantized params apart from plain ones. The transport order follows the owner
+            # lists, which are identical on every rank.
+            transports = dict.fromkeys(
+                (_param_uses_quantized_storage(param), param.dtype)
+                for params in params_list
+                for param in params
+            )
+            for quantized, dtype in transports:
+                _allgather_helper(
+                    [
+                        [
+                            param
+                            for param in params
+                            if (_param_uses_quantized_storage(param), param.dtype)
+                            == (quantized, dtype)
+                        ]
+                        for params in params_list
+                    ],
+                    group,
+                    quantized,
+                )
+
         if self.pg_collection is None:
             return
         if self.dp_cp_params_list:
-            _allgather_helper(self.dp_cp_params_list, self.dp_cp)
+            _allgather_by_transport(self.dp_cp_params_list, self.dp_cp)
         if self.expt_dp_params_list:
-            _allgather_helper(self.expt_dp_params_list, self.expt_dp)
+            _allgather_by_transport(self.expt_dp_params_list, self.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):

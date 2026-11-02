@@ -858,7 +858,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). The whole-param BF16 -> MXFP8 / "
+        "blockwise requantization of LayerWise gathers is replayed in test_optimizer_kernels.py "
+        "(blockwise on Hopper, MXFP8 on Blackwell).",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",

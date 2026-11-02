@@ -385,3 +385,63 @@ class TestExpertReplay:
     @pytest.mark.parametrize("layout", ["padded", "compact"])
     def test_expert_training_replays_bit_exact(self, layout):
         _assert_training_replays_bit_exact(layout, with_experts=True)
+
+
+class TestPendingGatherPublication:
+    """Every path that completes an in-flight variable-size LayerWise gather publishes it.
+
+    The forward pre-hook normally completes the gather (``finish_param_sync``). A forced
+    synchronous sync and ``free_overlap_buffers`` (before async checkpoint saves) complete it
+    too, and must copy the gathered params out of ``grad_data`` and clear it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def model_parallel(self):
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("layout", ["compact", "legacy"])
+    @pytest.mark.parametrize("complete", ["force_sync", "free_overlap_buffers"])
+    def test_pending_gather_is_published(self, layout, complete):
+        model, optimizer = _build(layout, overlap=True, bucket_size=4096)
+        owned = [p for params in _layer_wise(optimizer).dp_cp_params_list for p in params]
+        before = [p.detach().clone() for p in owned]
+
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        generator = torch.Generator(device='cuda').manual_seed(dp_rank)
+        x = torch.randn(8, 32, generator=generator, device='cuda', dtype=torch.bfloat16)
+        model.zero_grad_buffer()
+        model(x).float().pow(2).mean().backward()
+        model.finish_grad_sync()
+        assert optimizer.step()[0]
+        # Dispatch the gathers that the next forward pre-hooks would start, then complete
+        # them without a forward pass.
+        model.start_param_sync()
+        bucket_groups = model.bucket_groups + model.expert_parallel_bucket_groups
+        pending = [
+            bucket_group
+            for bucket_group in bucket_groups
+            if bucket_group.param_gather_handle is not None
+            and any(bucket.layerwise_gather_list is not None for bucket in bucket_group.buckets)
+        ]
+        assert pending, "Expected an in-flight variable-size LayerWise gather"
+        if complete == "force_sync":
+            model.start_param_sync(force_sync=True)
+        else:
+            model.free_overlap_buffers()
+
+        for bucket_group in bucket_groups:
+            assert bucket_group.param_gather_handle is None
+            assert all(bucket.layerwise_gather_list is None for bucket in bucket_group.buckets)
+        for bucket_group in pending:
+            for bucket in bucket_group.buckets:
+                # grad_data was the receive buffer; the next backward accumulates from zero.
+                assert torch.count_nonzero(bucket.grad_data) == 0
+        _assert_replicas_equal(model)
+        for param, old in zip(owned, before):
+            assert not torch.equal(param, old), "An owner's update was not published"
+
+        # Training continues normally from the published state.
+        _train_step(model, optimizer, step=1)
+        _assert_replicas_equal(model)

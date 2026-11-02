@@ -64,6 +64,13 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE_MXFP8TENSOR = False
 
 try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
+
+try:
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
     HAVE_TE_GROUPED_TENSOR_CLASS = True
@@ -135,6 +142,43 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
+
+
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8BlockwiseQTensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and _is_instance_or_param_data(
+        tensor, Float8BlockwiseQTensor
+    )
+
+
+def requantize_whole_params_from_high_precision(
+    params: List[torch.Tensor], srcs: List[torch.Tensor]
+) -> None:
+    """Requantize whole high-precision values into plain MXFP8 or blockwise FP8 params.
+
+    Used by parameter gathers that move whole parameters as BF16 staged from FP32 masters
+    (the compact and legacy LayerWise layouts). Every rank, owner included, requantizes the
+    same values, so all replicas hold identical quantized data. Both rowwise and columnwise
+    data are rebuilt: MXFP8 columnwise data cannot be derived from rowwise data, so its
+    quantizer is set to produce both, and blockwise columnwise data is recreated afterwards.
+
+    Raises:
+        TypeError: For other quantized storage (per-tensor FP8, NVFP4, GroupedTensor), whose
+            quantization depends on state this path does not reproduce.
+    """
+    if len(params) != len(srcs):
+        raise ValueError(f"Got {len(params)} params and {len(srcs)} source values.")
+    for param in params:
+        if not (is_mxfp8tensor(param) or is_blockwise_float8tensor(param)):
+            raise TypeError(
+                "Whole-parameter requantization supports plain MXFP8 and blockwise FP8 "
+                f"parameters only, got {type(_unwrap_parameter_data(param)).__name__}."
+            )
+    for param in params:
+        if is_mxfp8tensor(param):
+            _unwrap_parameter_data(param)._get_quantizer().set_usage(rowwise=True, columnwise=True)
+    copy_tensors_to_quantized_params(params, srcs)
+    post_all_gather_processing(list(params))
 
 
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:

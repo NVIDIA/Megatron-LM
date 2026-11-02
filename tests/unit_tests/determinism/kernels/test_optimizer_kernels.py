@@ -282,3 +282,57 @@ def test_embedding_min_norm_projection_replays(monkeypatch, end_in_padding):
     unchanged[num_rows:] = True
     flat_unchanged = unchanged.repeat_interleave(row_width)[start:end]
     assert bytes_equal(projected[flat_unchanged], shard[flat_unchanged])
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+def test_whole_param_requantize_replays(recipe):
+    """LayerWise whole-param gathers requantize BF16 into FP8 params on every rank."""
+    from megatron.core.fp8_utils import requantize_whole_params_from_high_precision
+    from megatron.training.utils import get_device_arch_version
+
+    try:
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+    except ImportError:
+        pytest.skip("requires Transformer Engine quantized tensors")
+    arch = get_device_arch_version()
+    if recipe == "blockwise" and arch != 9:
+        pytest.skip("blockwise FP8 params are supported on Hopper")
+    if recipe == "mxfp8" and arch < 10:
+        pytest.skip("MXFP8 params need Blackwell")
+    seeded()
+    quantizer_cls = Float8BlockQuantizer if recipe == "blockwise" else MXFP8Quantizer
+    shapes = [(1024, 512), (2048, 256), (384, 1024)]
+    values = [torch.randn(*shape, device="cuda", dtype=torch.bfloat16) for shape in shapes]
+
+    def requantize(*srcs):
+        quantizer = quantizer_cls(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        params = [
+            torch.nn.Parameter(
+                quantizer.make_empty(src.shape, dtype=torch.bfloat16, device="cuda"),
+                requires_grad=False,
+            )
+            for src in srcs
+        ]
+        requantize_whole_params_from_high_precision(params, list(srcs))
+        return [
+            getattr(param.data, name)
+            for param in params
+            for name in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            )
+            if getattr(param.data, name, None) is not None
+        ]
+
+    assert_replays_bit_exact(
+        requantize,
+        tuple(values),
+        replays=4,
+        backward=False,
+        contention=True,
+        what=f"{recipe} whole-param requantize",
+    )
