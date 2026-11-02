@@ -7,12 +7,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, NoReturn
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.distributed as dist
 
-REPLICA_EXPERT_DISPATCHER_TYPES = ("replica_peer_tma", "replica_hybridep", "replica_nccl")
+REPLICA_EXPERT_DISPATCHER_TYPES = ("replica_peer_tma", "replica_nccl")
 
 
 class ReplicaWeightLayout(Enum):
@@ -313,52 +313,6 @@ class ReplicaWeightTransport(ABC):
         """Release layer-local transport resources."""
 
 
-class UnimplementedReplicaWeightTransport(ReplicaWeightTransport):
-    """Fail before allocation or collectives for reserved transport types."""
-
-    def __init__(self, config: ReplicaTransportConfig) -> None:
-        self.config = config
-        self._unavailable()
-
-    def _unavailable(self) -> NoReturn:
-        raise NotImplementedError(
-            f"{self.transport_name} weight transport is not implemented. "
-            "Use replica_peer_tma for the existing NVLink implementation. "
-            "The old replica_hybridep configuration was renamed to replica_peer_tma; "
-            "replica_hybridep now reserves the actual HybridEP weight backend."
-        )
-
-    @property
-    def grad_dtype(self) -> torch.dtype:
-        self._unavailable()
-
-    def projection_views(self, projection_index: int) -> tuple[tuple[Any, ...], torch.Tensor]:
-        self._unavailable()
-
-    def prepare_plan(self, placement: ReplicaPlacement) -> ReplicaPreparedPlan:
-        self._unavailable()
-
-    def start_weight_sync(
-        self, *, sources: tuple[ReplicaWeightSource, ...], plan: ReplicaPreparedPlan
-    ) -> ReplicaTransferHandle:
-        self._unavailable()
-
-    def wait_weight_sync(self, handle: ReplicaTransferHandle) -> None:
-        self._unavailable()
-
-    def start_grad_reduce(
-        self,
-        *,
-        native_grads: tuple[ReplicaGradDestination, ...],
-        plan: ReplicaPreparedPlan,
-        projections: tuple[int, ...],
-    ) -> ReplicaTransferHandle:
-        self._unavailable()
-
-    def wait_grad_reduce(self, handle: ReplicaTransferHandle) -> None:
-        self._unavailable()
-
-
 def create_replica_weight_transport(
     expert_dispatcher_type: str, config: ReplicaTransportConfig
 ) -> ReplicaWeightTransport:
@@ -368,9 +322,11 @@ def create_replica_weight_transport(
 
         return PeerTmaTransport(config)
     if expert_dispatcher_type == "replica_hybridep":
-        from megatron.core.transformer.moe.replica_hybridep_transport import HybridEPWeightTransport
-
-        return HybridEPWeightTransport(config)
+        raise NotImplementedError(
+            "replica_hybridep weight transport is not implemented. "
+            "Use replica_peer_tma or replica_nccl. "
+            "The old replica_hybridep configuration was renamed to replica_peer_tma."
+        )
     if expert_dispatcher_type == "replica_nccl":
         from megatron.core.transformer.moe.replica_nccl_transport import NcclP2PTransport
 
