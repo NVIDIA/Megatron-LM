@@ -82,7 +82,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -152,6 +152,8 @@ def _build_mock_vlm_engine(image_embeddings):
     engine._vision_embedding_cache = OrderedDict()
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
+    engine._has_deferred_image_encodes = False
+    engine.waiting_request_ids = deque()
     return engine, wrapper
 
 
@@ -255,16 +257,33 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
     wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
 
 
-def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
+def _run_deferred_encode(engine, request):
+    """Run the encode admission deferred, as schedule_waiting_requests does before prefill."""
+    engine.waiting_request_ids.append(request.request_id)
+    engine.get_request = lambda request_id: request
+    engine.context.max_tokens = 4096
+    engine._handle_failed_request = mock.Mock()
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        engine._encode_waiting_images()
+
+
+def test_build_vlm_request_fails_preexpanded_embedding_count_mismatch_at_encode():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(1, 4))
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
         [-1, 0, 1, -1], dtype=torch.int64
     )
 
-    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
-        _call_build_vlm_request(
-            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
-        )
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+    )
+    request.add_event_error_nontransient = mock.Mock()
+    _run_deferred_encode(engine, request)
+
+    (error,), _ = request.add_event_error_nontransient.call_args
+    assert "2 media-token position" in str(error) and "1 embedding" in str(error)
+    engine._handle_failed_request.assert_called_once_with(
+        request.request_id, stage="encode its images before prefill"
+    )
 
 
 def test_build_vlm_request_validates_cached_embedding_count_once():
@@ -290,12 +309,18 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     wrapper.expand_image_tokens.assert_called_once()
+    wrapper._forward_vision_encoder.assert_not_called()  # deferred to prefill scheduling
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+    _run_deferred_encode(engine, request)
+
     encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
     assert torch.equal(encoder_args[0], torch.ones(1, 2, 4))
     assert encoder_kwargs["num_image_tiles"] is None
     assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
-    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert request.image_embeddings is not None
+    engine._handle_failed_request.assert_not_called()
 
 
 def test_build_vlm_request_stitches_expanded_multimodal_prefix():
@@ -838,6 +863,434 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     }
 
 
+def _patch_count(imgs_sizes):
+    """Embeddings per image for the mock encoder below: a 2x2-pixel patch grid, no merging."""
+    return [(h // 2) * (w // 2) for h, w in imgs_sizes.tolist()]
+
+
+def _arange_encoder(imgs, num_image_tiles=None, imgs_sizes=None):
+    total = sum(_patch_count(imgs_sizes))
+    return torch.arange(total, dtype=torch.float32).view(total, 1, 1)
+
+
+def _waiting_image_request(request_id, imgs_sizes, *, media_cache_key=None):
+    sizes = torch.tensor(imgs_sizes)
+    count = sum(_patch_count(sizes))
+    request = mock.Mock(spec=DynamicVLMInferenceRequest)
+    request.request_id = request_id
+    request.image_embeddings = None
+    request.imgs = torch.full((1, count, 3), float(request_id))
+    request.imgs_sizes = sizes
+    request.image_token_mask = torch.tensor([-1] + list(range(count)) + [-1])
+    request.deferred_image_embedding_count = count
+    request.media_cache_key = media_cache_key
+    request.num_img_embeddings_per_tile = 0
+    request.video_frame_indices = None
+    request.video_fps = None
+    return request
+
+
+def _build_waiting_engine(requests, *, max_tokens=4096):
+    """An engine whose waiting queue holds ``requests`` and whose wrapper encodes arange()."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    wrapper = mock.Mock()
+    wrapper._forward_vision_encoder.side_effect = _arange_encoder
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+    engine.context = mock.Mock(max_tokens=max_tokens)
+    by_id = {request.request_id: request for request in requests}
+    engine.get_request = lambda request_id: by_id[request_id]
+    engine.waiting_request_ids = deque(by_id)
+    engine._has_deferred_image_encodes = True
+    engine.vision_embedding_cache_max_bytes = 0
+    engine._get_cached_vision_embedding = mock.Mock(return_value=None)
+    engine._cache_vision_embedding = mock.Mock()
+    engine._handle_failed_request = mock.Mock()
+    return engine, wrapper
+
+
+def _encode_waiting(engine):
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        engine._encode_waiting_images()
+
+
+def test_build_vlm_request_defers_encode_with_the_expected_embedding_count():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+    )
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    engine._cache_vision_embedding.assert_not_called()
+    assert request.image_embeddings is None
+    assert request.deferred_image_embedding_count == 2
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert torch.equal(request.imgs, torch.ones(1, 2, 4))
+    assert engine._has_deferred_image_encodes is True
+    _, kwargs = engine.context.add_vlm_request_data.call_args
+    assert kwargs["image_embeddings"] is None
+
+
+def test_encode_waiting_images_does_not_recache_a_cache_hit():
+    hit = _waiting_image_request(1, [[4, 4]], media_cache_key="hit")
+    fresh = _waiting_image_request(2, [[4, 4]])
+    other = _waiting_image_request(3, [[2, 4]])
+    engine, _ = _build_waiting_engine([hit, fresh, other])
+    engine._get_cached_vision_embedding.side_effect = lambda key: (
+        torch.full((4, 1, 1), 7.0) if key == "hit" else None
+    )
+
+    _encode_waiting(engine)
+
+    cached_ids = [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list]
+    assert cached_ids == [1, 2, 3]
+    assert engine._cache_vision_embedding.call_count == 2  # the two freshly encoded ones
+    assert hit.image_embeddings.flatten().tolist() == [7.0] * 4
+    assert hit.deferred_image_embedding_count is None
+
+
+def test_encode_waiting_images_handles_out_of_memory_per_request():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    wrapper._forward_vision_encoder.side_effect = torch.cuda.OutOfMemoryError("CUDA OOM")
+
+    _encode_waiting(engine)  # must not raise: the engine loop stays up
+
+    # One shared attempt, then one per-request attempt each; both requests fail on their own.
+    assert wrapper._forward_vision_encoder.call_count == 3
+    assert sorted(c.args[0] for c in engine._handle_failed_request.call_args_list) == [1, 2]
+    assert list(engine.waiting_request_ids) == []
+    assert engine._has_deferred_image_encodes is False
+
+
+def test_encode_waiting_images_keeps_the_flag_when_a_pass_is_interrupted():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    engine._get_cached_vision_embedding.side_effect = RuntimeError("cache lookup broke")
+
+    with pytest.raises(RuntimeError):
+        _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    assert engine._has_deferred_image_encodes is True  # the next pass retries them
+
+
+def test_encode_waiting_images_falls_back_per_request_after_a_count_mismatch(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+    wrapper._forward_vision_encoder.side_effect = (
+        lambda imgs, num_image_tiles=None, imgs_sizes=None: (
+            torch.zeros(1, 1, 1)
+            if len(imgs_sizes) > 1
+            else _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "shared vision encoding of 2 requests failed" in caplog.text
+    assert all(request.image_embeddings is not None for request in requests)
+    engine._handle_failed_request.assert_not_called()
+    # Only this group fell back: later image requests are still deferred and batched.
+    assert engine._can_defer_image_encode(
+        imgs=torch.ones(1, 4, 3), num_tiles=None, imgs_sizes=torch.tensor([[4, 4]]), num_frames=None
+    )
+
+
+def test_refresh_leaves_a_waiting_deferred_request_to_the_shared_encode():
+    request = _waiting_image_request(7, [[4, 4]])
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.waiting_request_ids = deque([7])
+    engine._has_deferred_image_encodes = False
+    wrapper = mock.Mock()
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+
+    engine._refresh_vlm_request_data(request)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    assert request.image_embeddings is None
+    assert engine._has_deferred_image_encodes is True
+
+
+def test_build_vlm_request_encodes_at_admission_for_non_concatenable_layout():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=0)
+
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        request = engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 42, 20], dtype=torch.int64),
+            sampling_params=params,
+            imgs=torch.ones(2, 3, 4, 4),  # [N, C, H, W]: not a patch layout the engine can concat
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2]]),
+            media_tokens_preexpanded=False,
+        )
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert request.deferred_image_embedding_count is None
+
+
+def test_schedule_waiting_requests_encodes_deferred_images_first():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    order = []
+    engine._encode_waiting_images = mock.Mock(side_effect=lambda: order.append("encode"))
+    engine.schedule_non_chunked_prefill = mock.Mock(side_effect=lambda: order.append("prefill"))
+    engine.enable_chunked_prefill = False
+    engine.waiting_request_ids = deque()
+    engine._generation_epoch = None
+
+    engine.schedule_waiting_requests()
+
+    assert order == ["encode", "prefill"]
+
+
+def test_encode_waiting_images_shares_one_encoder_call():
+    text_request = mock.Mock(spec=DynamicInferenceRequest)
+    text_request.request_id = 2
+    requests = [
+        _waiting_image_request(1, [[4, 4]]),  # 4 embeddings
+        text_request,
+        _waiting_image_request(3, [[2, 4], [4, 4]]),  # 2 + 4 embeddings
+    ]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0].shape == (1, 10, 3)
+    assert encoder_args[0][0, :4, 0].tolist() == [1.0] * 4
+    assert encoder_args[0][0, 4:, 0].tolist() == [3.0] * 6
+    assert encoder_kwargs["imgs_sizes"].tolist() == [[4, 4], [2, 4], [4, 4]]
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert requests[2].image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [1, 3]
+    assert engine._cache_vision_embedding.call_count == 2
+    assert list(engine.waiting_request_ids) == [1, 2, 3]
+    engine._handle_failed_request.assert_not_called()
+
+
+def test_encode_waiting_images_copies_shared_slices_that_go_into_the_cache():
+    keyed_request = _waiting_image_request(1, [[4, 4]], media_cache_key="a")
+    unkeyed_request = _waiting_image_request(2, [[4, 4]])
+    engine, wrapper = _build_waiting_engine([keyed_request, unkeyed_request])
+    engine.vision_embedding_cache_max_bytes = 1 << 20
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    # The cache sizes an entry by its storage, so a cached slice must own its memory.
+    (cached,) = [c.args[1] for c in engine._cache_vision_embedding.call_args_list if c.args[0]]
+    assert cached.untyped_storage().nbytes() == cached.numel() * cached.element_size()
+    assert keyed_request.image_embeddings is cached
+    shared = unkeyed_request.image_embeddings
+    assert shared.untyped_storage().nbytes() > shared.numel() * shared.element_size()
+    assert keyed_request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert unkeyed_request.image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0]
+
+
+def test_encode_waiting_images_skips_requests_already_encoded_or_cached():
+    encoded_request = _waiting_image_request(1, [[4, 4]])
+    encoded_request.image_embeddings = torch.zeros(4, 1, 1)
+    cached_request = _waiting_image_request(2, [[4, 4]], media_cache_key="hit")
+    fresh_request = _waiting_image_request(3, [[4, 4]])
+    engine, wrapper = _build_waiting_engine([encoded_request, cached_request, fresh_request])
+    engine._get_cached_vision_embedding.side_effect = lambda key: (
+        torch.full((4, 1, 1), 7.0) if key == "hit" else None
+    )
+
+    _encode_waiting(engine)
+
+    # Only the fresh request needs the encoder, and alone it takes the per-request path.
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.kwargs["imgs_sizes"].tolist() == [[4, 4]]
+    assert cached_request.image_embeddings.flatten().tolist() == [7.0] * 4
+    assert fresh_request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert encoded_request.image_embeddings.flatten().tolist() == [0.0] * 4
+
+
+def test_encode_waiting_images_encodes_shared_media_key_once():
+    requests = [
+        _waiting_image_request(1, [[4, 4]], media_cache_key="same"),
+        _waiting_image_request(2, [[4, 4]], media_cache_key="same"),
+        _waiting_image_request(3, [[2, 4]], media_cache_key="other"),
+    ]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.kwargs["imgs_sizes"].tolist() == [
+        [4, 4],
+        [2, 4],
+    ]
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert torch.equal(requests[1].image_embeddings, requests[0].image_embeddings)
+    assert requests[2].image_embeddings.flatten().tolist() == [4.0, 5.0]
+
+
+def test_encode_waiting_images_caps_each_shared_call_at_max_tokens():
+    requests = [_waiting_image_request(i, [[4, 4]]) for i in (1, 2, 3)]  # 4 embeddings each
+    engine, wrapper = _build_waiting_engine(requests, max_tokens=8)
+
+    _encode_waiting(engine)
+
+    # 4 + 4 fits the budget; the third request is alone and takes the per-request path.
+    sizes = [
+        c.kwargs["imgs_sizes"].tolist() for c in wrapper._forward_vision_encoder.call_args_list
+    ]
+    assert sizes == [[[4, 4], [4, 4]], [[4, 4]]]
+    for request in requests:
+        assert request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0] or (
+            request.image_embeddings.flatten().tolist() == [4.0, 5.0, 6.0, 7.0]
+        )
+    assert all(request.image_embeddings is not None for request in requests)
+
+
+def test_encode_waiting_images_falls_back_per_request_when_shared_call_fails(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[4, 4]])]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    def _encode(imgs, num_image_tiles=None, imgs_sizes=None):
+        if len(imgs_sizes) > 1:
+            raise RuntimeError("encoder exploded")
+        return _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+
+    wrapper._forward_vision_encoder.side_effect = _encode
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "shared vision encoding of 2 requests failed" in caplog.text
+    assert wrapper._forward_vision_encoder.call_count == 3
+    for request in requests:
+        assert request.image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    engine._handle_failed_request.assert_not_called()
+
+
+def test_encode_waiting_images_fails_only_the_request_whose_encode_is_wrong():
+    bad_request = _waiting_image_request(1, [[4, 4]])
+    good_request = _waiting_image_request(2, [[2, 4]])
+    engine, wrapper = _build_waiting_engine([bad_request, good_request])
+
+    def _encode(imgs, num_image_tiles=None, imgs_sizes=None):
+        total = sum(_patch_count(imgs_sizes))
+        if total == 6:  # the shared call: wrong total forces the per-request fallback
+            return torch.zeros(5, 1, 1)
+        if total == 4:  # bad_request alone: still one embedding short
+            return torch.zeros(3, 1, 1)
+        return _arange_encoder(imgs, imgs_sizes=imgs_sizes)
+
+    wrapper._forward_vision_encoder.side_effect = _encode
+
+    _encode_waiting(engine)
+
+    engine._handle_failed_request.assert_called_once_with(
+        1, stage="encode its images before prefill"
+    )
+    bad_request.add_event_error_nontransient.assert_called_once()
+    assert list(engine.waiting_request_ids) == [2]
+    assert bad_request.image_embeddings is None
+    assert good_request.image_embeddings.flatten().tolist() == [0.0, 1.0]
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [2]
+
+
+def test_encode_waiting_images_returns_at_once_without_deferred_admissions():
+    engine, wrapper = _build_waiting_engine([_waiting_image_request(1, [[4, 4]])])
+    engine._has_deferred_image_encodes = False
+    engine.get_request = mock.Mock(side_effect=AssertionError("queue must not be scanned"))
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_not_called()
+
+
+def test_encode_waiting_images_clears_the_flag_once_the_queue_is_encoded():
+    request = _waiting_image_request(1, [[4, 4]])
+    engine, _ = _build_waiting_engine([request, _waiting_image_request(2, [[4, 4]])])
+
+    _encode_waiting(engine)
+
+    assert engine._has_deferred_image_encodes is False
+    assert request.deferred_image_embedding_count is None
+
+
+def test_encode_waiting_images_concatenates_two_dimensional_patch_tensors():
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    for request in requests:
+        request.imgs = request.imgs[0]  # [P, F]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    _encode_waiting(engine)
+
+    wrapper._forward_vision_encoder.assert_called_once()
+    assert wrapper._forward_vision_encoder.call_args.args[0].shape == (6, 3)
+    assert requests[0].image_embeddings.flatten().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert requests[1].image_embeddings.flatten().tolist() == [4.0, 5.0]
+
+
+def test_encode_waiting_images_falls_back_per_request_on_mixed_layouts(caplog):
+    requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
+    requests[1].imgs = requests[1].imgs[0]  # one [P, F] among [1, P, F]
+    engine, wrapper = _build_waiting_engine(requests)
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        _encode_waiting(engine)
+
+    assert "cannot concatenate image tensors" in caplog.text
+    assert wrapper._forward_vision_encoder.call_count == 2
+    assert all(request.image_embeddings is not None for request in requests)
+
+
+def test_encode_waiting_images_fails_duplicates_of_a_failed_primary():
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    engine, wrapper = _build_waiting_engine([primary, duplicate])
+    wrapper._forward_vision_encoder.side_effect = RuntimeError("encoder exploded")
+
+    _encode_waiting(engine)
+
+    assert sorted(c.args[0] for c in engine._handle_failed_request.call_args_list) == [1, 2]
+    assert list(engine.waiting_request_ids) == []
+    engine._cache_vision_embedding.assert_not_called()
+
+
+def test_encode_waiting_images_duplicates_share_the_primary_without_recaching():
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    engine, _ = _build_waiting_engine([primary, duplicate])
+
+    _encode_waiting(engine)
+
+    assert engine._cache_vision_embedding.call_count == 1
+    assert torch.equal(duplicate.image_embeddings, primary.image_embeddings)
+    assert [c.args[0] for c in engine.context.add_vlm_request_data.call_args_list] == [1, 2]
+
+
+def test_encode_waiting_images_fails_only_the_member_whose_count_disagrees():
+    short_request = _waiting_image_request(1, [[4, 4]])
+    short_request.deferred_image_embedding_count = 3  # admission count disagrees with its mask
+    other_request = _waiting_image_request(2, [[2, 4]])
+    engine, wrapper = _build_waiting_engine([short_request, other_request])
+
+    _encode_waiting(engine)
+
+    # The shared call returns 4 + 2 = 6 rows against the 3 + 2 = 5 the counts expect, so the
+    # group is encoded per request: the first request's 4 rows disagree with its count of 3 and
+    # only it fails.
+    engine._handle_failed_request.assert_called_once_with(
+        1, stage="encode its images before prefill"
+    )
+    assert list(engine.waiting_request_ids) == [2]
+    assert other_request.image_embeddings is not None
+
+
 def teardown_module(module):
     # inference_optimized MoE parametrizations use the default 'vllm' grouped-GEMM
     # backend, which allocates class-level persistent intermediate buffers at
@@ -920,6 +1373,8 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    batch_invariant_mode: bool = False
+    batch_invariant_backend: str = "te_native"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -948,6 +1403,7 @@ class DynamicEngineTestConfig:
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    normalization: str = "LayerNorm"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
@@ -962,6 +1418,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
     # A repeated (rather than per-depth) MTP head is one of the gates on
     # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
     mtp_use_repeated_layer: bool = False
@@ -1001,6 +1458,11 @@ class DynamicEngineTestConfig:
             self.position_embedding_type = (
                 "none" if self.num_speculative_tokens else "learned_absolute"
             )
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -1197,7 +1659,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1239,6 +1701,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1261,7 +1729,7 @@ class DynamicInferenceEngineTestBase:
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
-                    else "LayerNorm"
+                    else test_config.normalization
                 ),
                 softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
@@ -1276,13 +1744,15 @@ class DynamicInferenceEngineTestBase:
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts, normalization=transformer_config.normalization
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -1310,7 +1780,7 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1341,6 +1811,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1365,9 +1841,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -2422,6 +2898,81 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
         image_embeddings=refreshed_embeddings,
         image_token_mask=checkpointed_request.image_token_mask,
     )
+
+
+@pytest.mark.parametrize("scored_before", [0, 2])
+def test_cached_prompt_log_probs_wait_for_preceding_scores(scored_before):
+    """Cached rows for a later chunk are placed only after the scores before them."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(detokenize=lambda token_ids: f"tok_{token_ids[0]}")
+    )
+    start = scored_before + 2
+    request = types.SimpleNamespace(
+        prompt_log_probs=[-float(i) for i in range(scored_before)] or None,
+        prompt_top_n_logprobs=[{f"tok_{i}": -float(i)} for i in range(scored_before)] or None,
+        sampling_params=types.SimpleNamespace(top_n_logprobs=1),
+        cached_prompt_log_probs=[
+            (
+                start,
+                torch.tensor([-start, -start - 1.0]).numpy(),
+                torch.tensor([[-start], [-start - 1.0]]).numpy(),
+                torch.tensor([[start], [start + 1]]).numpy(),
+            )
+        ],
+    )
+
+    # The two computed rows before the cached run have not arrived yet.
+    engine._place_cached_prompt_log_probs(request)
+    assert len(request.prompt_log_probs or []) == scored_before
+
+    request.prompt_log_probs = (request.prompt_log_probs or []) + [
+        -float(scored_before),
+        -float(scored_before + 1),
+    ]
+    request.prompt_top_n_logprobs = (request.prompt_top_n_logprobs or []) + [{}, {}]
+    engine._place_cached_prompt_log_probs(request)
+    assert request.prompt_log_probs == [-float(i) for i in range(start + 2)]
+    assert request.prompt_top_n_logprobs[start:] == [
+        {f"tok_{start}": -float(start)},
+        {f"tok_{start + 1}": -float(start + 1)},
+    ]
+    assert not request.cached_prompt_log_probs
+
+
+def test_recomputed_prompt_scores_repair_the_original_segment():
+    """Scores lost to a checkpoint are restored from the first complete recomputation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    original = DynamicInferenceRequest(
+        request_id=3,
+        prompt_tokens=torch.arange(9),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=4,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=3,
+        ),
+    )
+    # The request was checkpointed after one generated token, before its scores arrived.
+    original.generated_tokens = [9]
+    record = DynamicInferenceRequestRecord.from_request(original)
+    record.checkpoint()
+    recomputed = record[-1]
+    entry = RequestEntry(record=record, future=mock.Mock())
+
+    # A partial recomputation leaves the original segment untouched.
+    recomputed.prompt_log_probs = [-float(i) for i in range(4)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(4)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs is None
+
+    # The recomputed prompt includes the generated token, so it has one extra row.
+    recomputed.prompt_log_probs = [-float(i) for i in range(9)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(9)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs == recomputed.prompt_log_probs[:8]
+    assert original.prompt_top_n_logprobs == recomputed.prompt_top_n_logprobs[:8]
+    assert original.prompt_log_probs is not recomputed.prompt_log_probs
 
 
 def test_streaming_partials_are_sent():
@@ -5757,6 +6308,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
 
+        if kv_cache_management_mode == "recompute":
+            allocator = context.kv_block_allocator
+            next_block_id = allocator.block_bag[allocator.pool_avail - 1].item()
+            context.memory_buffer[1, :, next_block_id] = float("nan")
+            context.add_request(env.requests[0])
+            assert context.request_last_kv_block_id[0].item() == next_block_id
+            assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -6525,9 +7084,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
-            # Disable positional embeddings so speculative position IDs
-            # beyond max_sequence_length don't cause out-of-bounds lookups.
-            position_embedding_type="none",
+            position_embedding_type="rope",
+            use_flashinfer_fused_rope=False,
             sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
@@ -6539,8 +7097,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # then replace the output logits with deterministic values so all
         # speculative tokens are accepted and sampling is predictable.
         real_forward = unwrapped_model.forward
+        max_position_seen = -1
 
         def deterministic_forward(*args, **kwargs):
+            nonlocal max_position_seen
+            position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
+            assert position_ids is not None
+            max_position_seen = max(max_position_seen, int(position_ids.max().item()))
             logits = real_forward(*args, **kwargs)
             # Overwrite with deterministic logits: always predict token 0.
             logits.zero_()
@@ -6601,6 +7164,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), f"Expected all tokens to be 0, got {finished_req.generated_tokens}"
 
         # Verify engine state is clean after completion.
+        assert max_position_seen < env.engine.context.max_sequence_length_for_model
+        if num_tokens_to_generate == 2 and num_speculative_tokens == 3:
+            assert max_position_seen >= max_sequence_length
+        if num_tokens_to_generate == 5 and num_speculative_tokens == 3:
+            assert max_position_seen == env.engine.context.max_sequence_length_for_model - 1
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 
