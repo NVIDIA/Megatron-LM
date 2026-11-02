@@ -82,7 +82,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -1373,6 +1373,8 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    batch_invariant_mode: bool = False
+    batch_invariant_backend: str = "te_native"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -1401,6 +1403,7 @@ class DynamicEngineTestConfig:
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    normalization: str = "LayerNorm"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
@@ -1415,6 +1418,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
     # A repeated (rather than per-depth) MTP head is one of the gates on
     # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
     mtp_use_repeated_layer: bool = False
@@ -1454,6 +1458,11 @@ class DynamicEngineTestConfig:
             self.position_embedding_type = (
                 "none" if self.num_speculative_tokens else "learned_absolute"
             )
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -1650,7 +1659,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1692,6 +1701,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1714,7 +1729,7 @@ class DynamicInferenceEngineTestBase:
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
-                    else "LayerNorm"
+                    else test_config.normalization
                 ),
                 softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
@@ -1729,13 +1744,15 @@ class DynamicInferenceEngineTestBase:
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts, normalization=transformer_config.normalization
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -1763,7 +1780,7 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1794,6 +1811,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1818,9 +1841,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -2875,6 +2898,81 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
         image_embeddings=refreshed_embeddings,
         image_token_mask=checkpointed_request.image_token_mask,
     )
+
+
+@pytest.mark.parametrize("scored_before", [0, 2])
+def test_cached_prompt_log_probs_wait_for_preceding_scores(scored_before):
+    """Cached rows for a later chunk are placed only after the scores before them."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(detokenize=lambda token_ids: f"tok_{token_ids[0]}")
+    )
+    start = scored_before + 2
+    request = types.SimpleNamespace(
+        prompt_log_probs=[-float(i) for i in range(scored_before)] or None,
+        prompt_top_n_logprobs=[{f"tok_{i}": -float(i)} for i in range(scored_before)] or None,
+        sampling_params=types.SimpleNamespace(top_n_logprobs=1),
+        cached_prompt_log_probs=[
+            (
+                start,
+                torch.tensor([-start, -start - 1.0]).numpy(),
+                torch.tensor([[-start], [-start - 1.0]]).numpy(),
+                torch.tensor([[start], [start + 1]]).numpy(),
+            )
+        ],
+    )
+
+    # The two computed rows before the cached run have not arrived yet.
+    engine._place_cached_prompt_log_probs(request)
+    assert len(request.prompt_log_probs or []) == scored_before
+
+    request.prompt_log_probs = (request.prompt_log_probs or []) + [
+        -float(scored_before),
+        -float(scored_before + 1),
+    ]
+    request.prompt_top_n_logprobs = (request.prompt_top_n_logprobs or []) + [{}, {}]
+    engine._place_cached_prompt_log_probs(request)
+    assert request.prompt_log_probs == [-float(i) for i in range(start + 2)]
+    assert request.prompt_top_n_logprobs[start:] == [
+        {f"tok_{start}": -float(start)},
+        {f"tok_{start + 1}": -float(start + 1)},
+    ]
+    assert not request.cached_prompt_log_probs
+
+
+def test_recomputed_prompt_scores_repair_the_original_segment():
+    """Scores lost to a checkpoint are restored from the first complete recomputation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    original = DynamicInferenceRequest(
+        request_id=3,
+        prompt_tokens=torch.arange(9),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=4,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=3,
+        ),
+    )
+    # The request was checkpointed after one generated token, before its scores arrived.
+    original.generated_tokens = [9]
+    record = DynamicInferenceRequestRecord.from_request(original)
+    record.checkpoint()
+    recomputed = record[-1]
+    entry = RequestEntry(record=record, future=mock.Mock())
+
+    # A partial recomputation leaves the original segment untouched.
+    recomputed.prompt_log_probs = [-float(i) for i in range(4)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(4)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs is None
+
+    # The recomputed prompt includes the generated token, so it has one extra row.
+    recomputed.prompt_log_probs = [-float(i) for i in range(9)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(9)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs == recomputed.prompt_log_probs[:8]
+    assert original.prompt_top_n_logprobs == recomputed.prompt_top_n_logprobs[:8]
+    assert original.prompt_log_probs is not recomputed.prompt_log_probs
 
 
 def test_streaming_partials_are_sent():
@@ -6210,6 +6308,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
 
+        if kv_cache_management_mode == "recompute":
+            allocator = context.kv_block_allocator
+            next_block_id = allocator.block_bag[allocator.pool_avail - 1].item()
+            context.memory_buffer[1, :, next_block_id] = float("nan")
+            context.add_request(env.requests[0])
+            assert context.request_last_kv_block_id[0].item() == next_block_id
+            assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -6978,9 +7084,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
-            # Disable positional embeddings so speculative position IDs
-            # beyond max_sequence_length don't cause out-of-bounds lookups.
-            position_embedding_type="none",
+            position_embedding_type="rope",
+            use_flashinfer_fused_rope=False,
             sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
@@ -6992,8 +7097,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # then replace the output logits with deterministic values so all
         # speculative tokens are accepted and sampling is predictable.
         real_forward = unwrapped_model.forward
+        max_position_seen = -1
 
         def deterministic_forward(*args, **kwargs):
+            nonlocal max_position_seen
+            position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
+            assert position_ids is not None
+            max_position_seen = max(max_position_seen, int(position_ids.max().item()))
             logits = real_forward(*args, **kwargs)
             # Overwrite with deterministic logits: always predict token 0.
             logits.zero_()
@@ -7054,6 +7164,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), f"Expected all tokens to be 0, got {finished_req.generated_tokens}"
 
         # Verify engine state is clean after completion.
+        assert max_position_seen < env.engine.context.max_sequence_length_for_model
+        if num_tokens_to_generate == 2 and num_speculative_tokens == 3:
+            assert max_position_seen >= max_sequence_length
+        if num_tokens_to_generate == 5 and num_speculative_tokens == 3:
+            assert max_position_seen == env.engine.context.max_sequence_length_for_model - 1
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 

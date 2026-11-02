@@ -363,15 +363,16 @@ def test_the_flips_keep_their_legacy_conditions(monkeypatch, run_config, warning
     zero_jump = _inference_container(replication_jump=0)
     zero_jump.finalize()
     assert zero_jump.checkpoint.replication_jump == 0
-    # --skip-train keeps the optimizer load under an RL step.
+    # --skip-train only evaluates, under an RL step too (rollout collection without updates is
+    # --rl-rollout-only, which keeps its optimizer): the optimizer load is disabled, once.
     run_config.validation.skip_train = True
     run_config.rl.perform_rl_step = True
     run_config.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
     run_config.finalize()
-    assert run_config.checkpoint.load_optim is True
-    assert warnings_log == []
+    assert run_config.checkpoint.load_optim is False
+    assert warnings_log == ['enabling --no-load-optim when skipping training.']
 
 
 def test_set_global_variables_finalizes_an_inference_container(monkeypatch):

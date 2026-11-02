@@ -193,6 +193,23 @@ class SchedulerConfig:
     lr_warmup_samples: int = 0
     """number of samples to linearly warmup learning rate over."""
 
+    step_lr_rescale_schedule: str | None = None
+    """Step-wise LR multipliers in ``SAMPLES:MULTIPLIER`` format.
+
+    Entries may be comma- or whitespace-separated. The first threshold must be zero and all
+    subsequent thresholds must be strictly increasing. Thresholds use the same sample clock as
+    ``lr_warmup_samples`` and ``lr_decay_samples``. When unset, LR rescaling is disabled.
+    Example: ``0:0.5,1000:1.0``.
+    """
+
+    step_lr_rescale_warmup_samples: int = 0
+    """Number of samples used to linearly transition between step LR multipliers.
+
+    This applies to every transition after the initial schedule entry. The initial LR warmup is
+    still controlled by ``lr_warmup_samples``. A value of zero preserves instantaneous step
+    transitions.
+    """
+
     lr_warmup_init: float = 0.0
     """Initial value for learning rate warmup. The scheduler starts warmup from this value."""
 
@@ -385,6 +402,12 @@ class LoggerConfig:
 
     wandb_entity: str | None = None
     """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
+
+    wandb_run_id: str | None = None
+    """The wandb run id, which is what a relaunch resumes. Defaults to the experiment
+    name with any character wandb rejects in a run id replaced by '-'. Set it explicitly
+    when two runs would otherwise derive the same id, or to resume a run whose
+    experiment name has since changed."""
 
     logging_level: int | None = None
     """Set default logging level"""
