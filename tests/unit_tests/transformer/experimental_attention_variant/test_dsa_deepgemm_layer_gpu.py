@@ -184,14 +184,14 @@ class _PinnedTopk:
         self.first = None
         real = dsa_cudnn_kernels._deepgemm_logits_topk
 
-        def pinned(logits, lengths, topk_k, topk_backend):
+        def pinned(logits, lengths, topk_k, topk_backend, topk_scratch_bytes=None):
             self.calls += 1
             columns = torch.arange(logits.size(1), device=logits.device).view(1, -1)
             seen = torch.where(
                 columns < lengths.view(-1, 1).long(), logits, torch.zeros_like(logits)
             )
             if self.first is None:
-                indices, values = real(logits, lengths, topk_k, topk_backend)
+                indices, values = real(logits, lengths, topk_k, topk_backend, topk_scratch_bytes)
                 self.first = (seen.clone(), lengths.clone(), indices.clone(), values.clone())
                 return indices, values
             first_seen, first_lengths, indices, values = self.first
@@ -229,8 +229,8 @@ class _GraphTopkRecorder:
         self.pinned = None
         real = dsa_cudnn_kernels._deepgemm_logits_topk
 
-        def recorded(logits, lengths, topk_k, topk_backend):
-            indices, values = real(logits, lengths, topk_k, topk_backend)
+        def recorded(logits, lengths, topk_k, topk_backend, topk_scratch_bytes=None):
+            indices, values = real(logits, lengths, topk_k, topk_backend, topk_scratch_bytes)
             columns = torch.arange(logits.size(1), device=logits.device).view(1, -1)
             seen = torch.where(
                 columns < lengths.view(-1, 1).long(), logits, torch.zeros_like(logits)

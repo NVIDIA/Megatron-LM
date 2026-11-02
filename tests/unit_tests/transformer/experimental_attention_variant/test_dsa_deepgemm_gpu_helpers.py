@@ -277,7 +277,7 @@ def fake_capture(monkeypatch):
     return state
 
 
-def _fake_topk(logits, lengths, topk_k, topk_backend):
+def _fake_topk(logits, lengths, topk_k, topk_backend, topk_scratch_bytes=None):
     values, indices = logits.float().topk(topk_k, dim=-1)
     return indices.int(), values
 

@@ -530,7 +530,8 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk_backend: Literal["cudnn", "deepselect"] = "cudnn"
     """Kernel of the non-deterministic DSA indexer top-k on the cuDNN fused DSA path.
 
-    ``'cudnn'`` runs the cuDNN frontend radix top-k in scratch-bounded row chunks.
+    ``'cudnn'`` runs the cuDNN frontend radix top-k in row chunks whose scratch fits
+    ``dsa_cudnn_topk_scratch_gib``.
     ``'deepselect'`` selects every row in one DeepSelect launch with no scratch, using the
     tuned ``ds_tune`` build if it imports, else upstream ``deep_select``. On GB300 (CUDA
     graph) ``ds_tune`` took 5.90 ms against 14.34 ms per 1M-token CP64 rank-0 call
@@ -560,6 +561,31 @@ class TransformerConfig(ModelParallelConfig):
     cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
     selection (``dsa_indexer_kpool > 1``) does not run this top-k, so the option has no
     effect there."""
+
+    dsa_cudnn_topk_scratch_gib: float = 2.0
+    """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
+
+    Each cuDNN top-k launch allocates a transient int32 scratch of ``rows x 2 x cols`` (twice
+    the FP32 scores of its rows), and the indexer runs the top-k in row chunks sized to this
+    budget, at least one 32-byte-aligned row group per launch (at most 8 rows of FP32 or 16 of
+    BF16 scores). The frontend also limits a launch to 2**31 scratch elements (8 GiB), so
+    budgets above 8 GiB give no larger launches. Larger budgets give fewer, fuller launches on
+    long rows: on GB300 (cuDNN frontend 1.31, top-k 2048, CUDA graph) 8 GiB took the 1M-token
+    CP64 rank-0 call (16384 x 1048576 scores) from 21.05 ms (64 launches of 256 rows at 2 GiB)
+    to 14.26 ms (16 launches of 1024 rows), and runs all 4096 rows of the 128K CP32 rank-0 call
+    in one launch (0.593 to 0.566 ms). Budgets above 2 GiB only change the executors that hand
+    the top-k a whole score buffer: the general packed THD scorer (cuDNN scores or DeepGEMM
+    logits) and the dense indexer loss (loss on, ``dsa_indexer_use_sparse_loss=False``). The
+    plain causal, unfused bounds and single-sequence packed CP executors score in chunks of at
+    most 1 GiB of FP32 scores, whose top-k needs at most 2 GiB of scratch, so the default
+    already runs each chunk in one launch there. The cost is transient memory, eagerly and
+    inside CUDA graph memory pools: every call takes up to min(budget, twice its FP32 score
+    buffer), so a budget above the default costs more on every whole-buffer call whose FP32
+    scores exceed 1 GiB, e.g. 8 GiB instead of 2 GiB for a 32K-token CP1 packed THD call with
+    4 GiB of scores. The scratch is sized as for FP32 scores, which over-estimates BF16 ones.
+    Applies with ``dsa_kernel_backend='cudnn'`` to every cuDNN top-k of the DSA indexer; the
+    DeepSelect top-k (``dsa_indexer_topk_backend``) needs no scratch, and the ``dsv4_hybrid``
+    CSA paths size their own."""
 
     dsa_indexer_scorer_backend: Literal["cudnn", "deepgemm"] = "cudnn"
     """Kernel of the DSA indexer's MXFP8 selection scorer (``dsa_indexer_precision='mxfp8'``).
@@ -2949,6 +2975,13 @@ class TransformerConfig(ModelParallelConfig):
                 "indexer and requires experimental_attention_variant='dsa' with "
                 f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
                 f"{self.dsa_kernel_backend!r}."
+            )
+        if not (
+            math.isfinite(self.dsa_cudnn_topk_scratch_gib) and self.dsa_cudnn_topk_scratch_gib > 0
+        ):
+            raise ValueError(
+                "dsa_cudnn_topk_scratch_gib must be a positive number of GiB, "
+                f"got {self.dsa_cudnn_topk_scratch_gib!r}."
             )
         if self.dsa_indexer_scorer_backend not in ("cudnn", "deepgemm"):
             raise ValueError(

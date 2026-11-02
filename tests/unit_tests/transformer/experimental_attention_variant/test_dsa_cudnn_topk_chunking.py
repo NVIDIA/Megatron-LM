@@ -1,11 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Row chunking of the cuDNN indexer top-k wrapper (scratch budget, int32 limit, alignment)."""
+"""Row chunking of the cuDNN indexer top-k wrapper (scratch budget, int32 limit, alignment),
+and ``dsa_cudnn_topk_scratch_gib`` from the config to every top-k launch."""
+
+import math
+from argparse import ArgumentParser
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.transformer.experimental_attention_variant import dsa_cudnn_fe_fakes as fakes
 
 _GIB = 1024**3
 _FP32_BYTES = 4
@@ -182,13 +189,15 @@ def _run_recorded_topk(monkeypatch, rows, num_cols, budget_gib, return_topk_scor
     fake = _RecordingTopK()
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", fake)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
-    if budget_gib is not None:
-        monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", budget_gib * _GIB)
     scores = torch.empty((rows, num_cols), dtype=torch.float32, device="meta")
     seq_lens = torch.empty((rows,), dtype=torch.int32, device="meta")
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
-        scores, seq_lens, topk_k=2048, return_topk_scores=return_topk_scores
+        scores,
+        seq_lens,
+        topk_k=2048,
+        return_topk_scores=return_topk_scores,
+        topk_scratch_bytes=None if budget_gib is None else budget_gib * _GIB,
     )
     return fake.calls, result
 
@@ -236,3 +245,169 @@ def test_topk_wrapper_keeps_unaligned_chunk_starts_32_byte_aligned(
 
     assert [launch_rows for launch_rows, _ in calls] == expected_launches
     assert all(offset_bytes % 32 == 0 for _, offset_bytes in calls)
+
+
+def test_topk_wrapper_budget_argument_overrides_the_module_default(monkeypatch):
+    monkeypatch.setattr(dsa_cudnn_kernels, "_TOPK_WRAPPER_MAX_SCRATCH_BYTES", 1 * _GIB)
+
+    default_calls, _ = _run_recorded_topk(monkeypatch, 16384, 1048576, None)
+    explicit_calls, _ = _run_recorded_topk(monkeypatch, 16384, 1048576, 8)
+
+    assert [launch_rows for launch_rows, _ in default_calls] == [128] * 128
+    assert [launch_rows for launch_rows, _ in explicit_calls] == [1024] * 16
+
+
+# ------------------------------------------------------------------- dsa_cudnn_topk_scratch_gib
+
+
+def _transformer_config(**overrides):
+    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4, **overrides)
+
+
+def test_topk_scratch_budget_config_defaults_to_2gib():
+    config = _transformer_config()
+
+    assert config.dsa_cudnn_topk_scratch_gib == 2.0
+    options = dsa_cudnn_kernels._scorer_options_from_config(config)
+    assert options.topk_scratch_bytes == 2 * _GIB
+    assert options.topk_scratch_bytes == dsa_cudnn_kernels._TOPK_WRAPPER_MAX_SCRATCH_BYTES
+
+
+def test_config_accepts_a_larger_topk_scratch_budget():
+    config = _transformer_config(dsa_cudnn_topk_scratch_gib=8.0)
+
+    assert dsa_cudnn_kernels._scorer_options_from_config(config).topk_scratch_bytes == 8 * _GIB
+
+
+def test_topk_scratch_budget_has_a_cli_flag():
+    from megatron.training.arguments import add_megatron_arguments
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    assert parser.parse_args([]).dsa_cudnn_topk_scratch_gib == 2.0
+    args = parser.parse_args(["--dsa-cudnn-topk-scratch-gib", "8"])
+    assert args.dsa_cudnn_topk_scratch_gib == 8.0
+
+
+@pytest.mark.parametrize("scratch_gib", [0, -1.0, math.nan, math.inf])
+def test_config_rejects_a_topk_scratch_budget_that_is_not_positive(scratch_gib):
+    with pytest.raises(ValueError, match="dsa_cudnn_topk_scratch_gib"):
+        _transformer_config(dsa_cudnn_topk_scratch_gib=scratch_gib)
+
+
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        (SimpleNamespace(dsa_cudnn_topk_scratch_gib=8), 8 * _GIB),
+        (SimpleNamespace(dsa_cudnn_topk_scratch_gib=4.75), int(4.75 * _GIB)),
+        (SimpleNamespace(), None),
+        (None, None),
+    ],
+    ids=["8gib", "fractional", "unset", "no_config"],
+)
+def test_scorer_options_read_the_topk_scratch_budget(config, expected):
+    assert dsa_cudnn_kernels._scorer_options_from_config(config).topk_scratch_bytes == expected
+
+
+_BUDGET = 3 * _GIB
+
+
+@pytest.fixture
+def recorded_budgets(monkeypatch):
+    """A fake cuDNN frontend 1.31 and the budget that every top-k wrapper call receives."""
+    fakes.Fe131DSA.reset()
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", fakes.Fe131DSA)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", lambda: (1, 31))
+    budgets = []
+    wrapper = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked
+
+    def record(*args, **kwargs):
+        budgets.append(kwargs.get("topk_scratch_bytes"))
+        return wrapper(*args, **kwargs)
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_top_k_wrapper_chunked", record)
+    return budgets
+
+
+def _indexer_inputs(sq, sk, heads=4, dim=8, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    q = torch.randn((1, sq, heads, dim), generator=generator).to(torch.bfloat16)
+    k = torch.randn((1, sk, dim), generator=generator).to(torch.bfloat16)
+    w = torch.rand((1, sq, heads), generator=generator).to(torch.bfloat16)
+    return q, k, w
+
+
+def _packed_kwargs(seq_lens):
+    cu, starts, ends = [0], [], []
+    for length in seq_lens:
+        starts += [cu[-1]] * length
+        ends += [cu[-1] + position + 1 for position in range(length)]
+        cu.append(cu[-1] + length)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+    return dict(
+        varlen_starts=torch.tensor(starts),
+        varlen_ends=torch.tensor(ends),
+        use_local_indexer_varlen=True,
+        packed_cu_seqlens_q=cu_seqlens,
+        packed_cu_seqlens_k=cu_seqlens,
+        packed_max_seqlen_q=max(seq_lens),
+        packed_max_seqlen_k=max(seq_lens),
+        packed_cp_size=1,
+        local_packed_cp_rank=0,
+    )
+
+
+@pytest.mark.parametrize("return_scores", [False, True], ids=["topk_only", "dense_scores"])
+@pytest.mark.parametrize("layout", ["plain_causal", "bounds", "packed_thd"])
+def test_every_bshd_executor_launches_with_the_configured_budget(
+    recorded_budgets, layout, return_scores
+):
+    if layout == "packed_thd" and return_scores:
+        pytest.skip("the packed THD executor returns no dense scores")
+    sq = 12
+    q, k, w = _indexer_inputs(sq, sq, seed=7)
+    kwargs = {}
+    if layout == "bounds":
+        kwargs = dict(
+            varlen_starts=torch.zeros(sq, dtype=torch.int64),
+            varlen_ends=torch.arange(1, sq + 1, dtype=torch.int64),
+        )
+    elif layout == "packed_thd":
+        kwargs = _packed_kwargs((7, 5))
+    options = dsa_cudnn_kernels.IndexerScorerOptions(topk_scratch_bytes=_BUDGET)
+
+    dsa_cudnn_kernels._indexer_topk_bshd(
+        q,
+        k,
+        w,
+        4,
+        return_scores=return_scores,
+        return_topk_scores=not return_scores,
+        scorer_options=options,
+        **kwargs,
+    )
+
+    assert recorded_budgets and all(budget == _BUDGET for budget in recorded_budgets)
+
+
+def test_single_packed_cp_segments_launch_with_the_given_budget(recorded_budgets):
+    cp_size, local_sq = 2, 8
+    q, k, w = _indexer_inputs(local_sq, local_sq * cp_size, seed=3)
+
+    dsa_cudnn_kernels._indexer_topk_single_packed_cp_segments(
+        q, k.unsqueeze(2), w, 4, True, cp_size, 1, topk_scratch_bytes=_BUDGET
+    )
+
+    assert len(recorded_budgets) >= 2 and all(budget == _BUDGET for budget in recorded_budgets)
+
+
+def test_deepgemm_logits_top_k_launches_with_the_given_budget(recorded_budgets):
+    logits = torch.randn((16, 64)).to(torch.bfloat16)
+    lengths = torch.full((16,), 64, dtype=torch.int32)
+
+    indices, values = dsa_cudnn_kernels._deepgemm_logits_topk(logits, lengths, 8, "cudnn", _BUDGET)
+
+    assert recorded_budgets == [_BUDGET]
+    assert indices.shape == (16, 8) and values.dtype == torch.bfloat16
