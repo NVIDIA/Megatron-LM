@@ -6,6 +6,7 @@
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import logging
 from collections import namedtuple
 from collections.abc import Callable
@@ -627,7 +628,8 @@ _TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
-_TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+# transformer_engine_torch.rmsnorm_fwd, captured while batch-invariant mode rebinds it.
+_TE_RMSNORM_FWD_ORIGS: Dict[str, Any] = {}
 _TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
@@ -666,29 +668,15 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
     if not skip_gemm:
-        # Patch general_gemm once
+        # Replace TE's dense general_gemm wherever a loaded TE module binds it: Linear,
+        # LayerNormLinear, LayerNormMLP, the op fuser's BasicLinear and fused ops, and
+        # cpp_extensions itself. Fails closed like the grouped GEMMs below.
         if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
             _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
-            te_cpp.general_gemm = _te_general_gemm_patched
-
-        # Also patch the symbol imported inside TE's module.linear
-        # (from ..cpp_extensions import general_gemm)
-        import transformer_engine.pytorch.module.linear as te_linear_mod
-
-        if hasattr(te_linear_mod, "general_gemm"):
-            if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-                _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
-                te_linear_mod.general_gemm = _te_general_gemm_patched
-
-        # Also patch the symbol imported inside TE's module.layernorm_linear
-        import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
-
-        if hasattr(te_layernorm_linear_mod, "general_gemm"):
-            if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-                _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
-                    te_layernorm_linear_mod.general_gemm
-                )
-                te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
+        if _TE_GENERAL_GEMM_ORIG is not None:
+            _te_rebind_or_raise(
+                "TE's general_gemm", {_TE_GENERAL_GEMM_ORIG: _te_general_gemm_patched}
+            )
 
         # Also patch the symbol imported into Megatron's TE wrapper module
         import megatron.core.extensions.transformer_engine as meg_te
@@ -778,6 +766,15 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             _TE_APPLY_NORM_ORIGS[key] = mod.apply_normalization
             mod.apply_normalization = _te_apply_normalization_patched
 
+    # The op fuser's te.ops.RMSNorm imports transformer_engine_torch.rmsnorm_fwd by name
+    # (ops/basic/rmsnorm.py) instead of calling the module functions patched above.
+    tex = _import_module_if_available("transformer_engine_torch")
+    if tex is not None and hasattr(tex, "rmsnorm_fwd"):
+        _TE_RMSNORM_FWD_ORIGS.setdefault("rmsnorm_fwd", tex.rmsnorm_fwd)
+        _te_rebind_or_raise(
+            "TE's rmsnorm_fwd", {_TE_RMSNORM_FWD_ORIGS["rmsnorm_fwd"]: _te_rmsnorm_fwd_patched}
+        )
+
 
 def _loaded_te_modules() -> list:
     """Every Transformer Engine module imported so far."""
@@ -816,6 +813,21 @@ def _te_bindings_of(objects) -> List[str]:
     ]
 
 
+def _te_rebind_or_raise(what: str, replacements: Dict[Callable, Callable]) -> None:
+    """Rebind every loaded TE module global that is a key of ``replacements`` to its value.
+
+    Fails closed: raises if any TE module still binds one of the originals afterwards,
+    rather than let that call site bypass batch-invariant mode.
+    """
+    _te_rebind({id(old): (old, new) for old, new in replacements.items()})
+    unpatched = _te_bindings_of(list(replacements))
+    if unpatched:
+        raise RuntimeError(
+            f"Batch-invariant mode could not replace {what} at {', '.join(unpatched)}; "
+            "those calls would bypass it."
+        )
+
+
 def _te_grouped_gemm_replacements() -> Dict[str, Callable]:
     """TE's grouped GEMM entry points (cpp_extensions.gemm names) and their replacements."""
     return {
@@ -844,15 +856,10 @@ def _te_patch_general_grouped_gemm() -> None:
     for name in replacements:
         if name not in _TE_GROUPED_GEMM_FUNC_ORIGS and hasattr(gemm, name):
             _TE_GROUPED_GEMM_FUNC_ORIGS[name] = getattr(gemm, name)
-    _te_rebind(
-        {id(orig): (orig, replacements[name]) for name, orig in _TE_GROUPED_GEMM_FUNC_ORIGS.items()}
+    _te_rebind_or_raise(
+        "TE's grouped GEMM",
+        {orig: replacements[name] for name, orig in _TE_GROUPED_GEMM_FUNC_ORIGS.items()},
     )
-    unpatched = _te_bindings_of(list(_TE_GROUPED_GEMM_FUNC_ORIGS.values()))
-    if unpatched:
-        raise RuntimeError(
-            "Batch-invariant mode could not replace TE's grouped GEMM at "
-            f"{', '.join(unpatched)}; those calls would run TE's cuBLASLt grouped GEMM."
-        )
 
 
 def _te_unpatch_general_grouped_gemm() -> None:
@@ -1166,9 +1173,14 @@ def _te_unpatch_for_batch_invariant():
         _MEG_TE_GENERAL_GEMM_ORIG = None
         return
 
-    if _TE_GENERAL_GEMM_ORIG is not None and hasattr(te_cpp, "general_gemm"):
-        te_cpp.general_gemm = _TE_GENERAL_GEMM_ORIG
+    if _TE_GENERAL_GEMM_ORIG is not None:
+        _te_rebind(
+            {id(_te_general_gemm_patched): (_te_general_gemm_patched, _TE_GENERAL_GEMM_ORIG)}
+        )
         _TE_GENERAL_GEMM_ORIG = None
+    for orig in _TE_RMSNORM_FWD_ORIGS.values():
+        _te_rebind({id(_te_rmsnorm_fwd_patched): (_te_rmsnorm_fwd_patched, orig)})
+    _TE_RMSNORM_FWD_ORIGS.clear()
 
     rms_cls = getattr(te, "RMSNorm", None)
     if rms_cls is None:
@@ -1207,51 +1219,8 @@ def _te_unpatch_for_batch_invariant():
     else:
         _TE_RMSNORM_FUNC_ORIGS.clear()
 
-    # Restore TE module.linear imported symbol for general_gemm if patched
-    te_linear_mod = _import_module_if_available("transformer_engine.pytorch.module.linear")
-    key = "module.linear.general_gemm"
-    if (
-        te_linear_mod is not None
-        and key in _TE_GEMM_FUNC_ORIGS
-        and hasattr(te_linear_mod, "general_gemm")
-    ):
-        te_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]
-        _TE_GEMM_FUNC_ORIGS.pop(key, None)
-    else:
-        _TE_GEMM_FUNC_ORIGS.pop(key, None)
-
-    # Restore TE module.layernorm_linear imported symbol for general_gemm if patched
-    te_layernorm_linear_mod = _import_module_if_available(
-        "transformer_engine.pytorch.module.layernorm_linear"
-    )
-    key = "module.layernorm_linear.general_gemm"
-    if (
-        te_layernorm_linear_mod is not None
-        and key in _TE_GEMM_FUNC_ORIGS
-        and hasattr(te_layernorm_linear_mod, "general_gemm")
-    ):
-        te_layernorm_linear_mod.general_gemm = _TE_GEMM_FUNC_ORIGS[key]
-        _TE_GEMM_FUNC_ORIGS.pop(key, None)
-    else:
-        _TE_GEMM_FUNC_ORIGS.pop(key, None)
-
     # Restore TE general_grouped_gemm at every patched import site.
     _te_unpatch_general_grouped_gemm()
-
-
-def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
-    """Utility to parse TE general_gemm flexible signature.
-
-    Returns (A, B, out_dtype, layout, out, bias, grad).
-    """
-    A = args[0] if len(args) > 0 else kwargs.get("A")
-    B = args[1] if len(args) > 1 else kwargs.get("B")
-    out_dtype = kwargs.get("out_dtype")
-    layout = kwargs.get("layout", "TN")
-    out = kwargs.get("out")
-    bias = kwargs.get("bias")
-    grad = kwargs.get("grad", False)
-    return A, B, out_dtype, layout, out, bias, grad
 
 
 def _is_supported_dtype_for_bik(t: torch.dtype) -> bool:
@@ -1382,6 +1351,39 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         return dA, dB, dbias, None, None
 
 
+def _rmsnorm_batch_invariant_fp32(x, weight, eps, zero_centered_gamma) -> tuple:
+    """Batch-invariant RMSNorm of the rows of ``x`` in fp32: (output, rsigma with keepdim)."""
+    x_fp32 = x.float()
+    w_fp32 = weight.float()
+    if zero_centered_gamma:
+        w_fp32 = w_fp32 + 1.0
+    ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
+    rsigma = torch.rsqrt(ms + eps)
+    return (x_fp32 * rsigma) * w_fp32, rsigma
+
+
+def _te_rmsnorm_fwd_patched(
+    input, weight, eps, ln_out, quantizer, otype, sm_margin, zero_centered_gamma
+):  # pylint: disable=redefined-builtin
+    """Batch-invariant replacement for transformer_engine_torch.rmsnorm_fwd.
+
+    Bound where TE imports the function by name (the op fuser's RMSNorm). Computes the
+    same RMSNorm as the patched fused-module normalization and returns ``(out, None,
+    rsigma)`` with fp32 rsigma of shape [rows], which TE's rmsnorm_bwd consumes.
+    """
+    del sm_margin  # The batch-invariant kernel does not reserve SMs.
+    if quantizer is not None:
+        raise RuntimeError("Batch-invariant RMSNorm does not support a quantized output.")
+    from transformer_engine.pytorch.constants import TE_DType_To_Torch
+
+    out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(input, weight, eps, zero_centered_gamma)
+    if ln_out is not None:
+        ln_out.copy_(out_fp32)
+    else:
+        ln_out = out_fp32.to(TE_DType_To_Torch[otype])
+    return ln_out, None, rsigma.squeeze(-1)
+
+
 def _te_apply_normalization_patched(
     inputmat,
     ln_out,
@@ -1425,13 +1427,7 @@ def _te_apply_normalization_patched(
             zero_centered_gamma,
         )
 
-    x_fp32 = inputmat.float()
-    w_fp32 = ln_weight.float()
-    if zero_centered_gamma:
-        w_fp32 = w_fp32 + 1.0
-    ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
-    rsigma = torch.rsqrt(ms + eps)
-    out_fp32 = (x_fp32 * rsigma) * w_fp32
+    out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(inputmat, ln_weight, eps, zero_centered_gamma)
 
     # The fused-module callers (layernorm_linear / layernorm_mlp) pass a torch.dtype
     # output_dtype (inputmat.dtype); assert that so we never silently ignore a TE
@@ -1448,21 +1444,43 @@ def _te_apply_normalization_patched(
     return ln_out, None, rsigma.squeeze(-1)
 
 
+@lru_cache(maxsize=None)
+def _te_general_gemm_parameters(general_gemm) -> tuple:
+    """Parameter names of TE's general_gemm, in order, and their defaults."""
+    params = inspect.signature(general_gemm).parameters
+    defaults = {name: p.default for name, p in params.items() if p.default is not p.empty}
+    return tuple(params), defaults
+
+
+@lru_cache(maxsize=None)
+def _te_quantized_tensor_types() -> tuple:
+    """TE's quantized tensor base classes (renamed across TE releases)."""
+    te_tensor = _import_module_if_available("transformer_engine.pytorch.tensor")
+    names = ("QuantizedTensorStorage", "QuantizedTensorBase")
+    return tuple(getattr(te_tensor, name) for name in names if hasattr(te_tensor, name))
+
+
 def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
+    """Batch-invariant replacement for TE general_gemm.
+
+    Computes ``alpha * op(A) @ op(B) + beta * out + bias`` like TE, with the product from
+    the batch-invariant GEMM: ``accumulate`` adds into ``out`` (``beta`` defaults to 1, as
+    in TE), and ``alpha``/``beta`` scale the product and ``out``. Calls it cannot serve
+    (GELU fusion, output quantization, quantized operands, Userbuffers overlap) fail
+    rather than run TE's cuBLASLt GEMM. Returns (gemm_out, bias_grad, gelu_input,
+    extra_output) like TE.
     """
-    Batch-invariant replacement for TE general_gemm.
-    Returns a list of tensors to match TE's API: (gemm_out, bias_grad, gelu_input, extra_output)
-    """
-    global _TE_GENERAL_GEMM_ORIG
-    # If original not captured, do nothing
     if _TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
-
-    A, B, out_dtype, layout, out, bias, grad = _extract_te_gemm_args(args, kwargs)
-    extra_output = kwargs.get("extra_output", None)
-    ub = kwargs.get("ub", None)
-    ub_type = kwargs.get("ub_type", None)
-    bulk_overlap = kwargs.get("bulk_overlap", False)
+    names, defaults = _te_general_gemm_parameters(_TE_GENERAL_GEMM_ORIG)
+    unknown = set(kwargs) - set(names)
+    if len(args) > len(names) or unknown:
+        raise TypeError(f"general_gemm got unexpected arguments {sorted(unknown)}")
+    p = dict(defaults)
+    p.update(zip(names, args))
+    p.update(kwargs)
+    A, B, out_dtype, layout = p["A"], p["B"], p["out_dtype"], p["layout"]
+    out, bias, grad, accumulate = p["out"], p["bias"], p["grad"], p["accumulate"]
 
     # Guardrails: validate inputs
     if A is None or B is None:
@@ -1471,16 +1489,50 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise RuntimeError("Batch-invariant GEMM requires CUDA tensors.")
     if not _is_supported_dtype_for_bik(A.dtype) or not _is_supported_dtype_for_bik(B.dtype):
         raise RuntimeError(f"Unsupported dtype for batch-invariant GEMM: {A.dtype}, {B.dtype}")
-
+    quantized = _te_quantized_tensor_types()
+    if (
+        isinstance(A, quantized)
+        or isinstance(B, quantized)
+        or p.get("quantization_params") is not None
+        or p.get("gelu")
+    ):
+        raise RuntimeError(
+            "Batch-invariant GEMM does not support quantized operands, output quantization "
+            "or GELU fusion."
+        )
     # Disallow GEMM-comm overlap in batch-invariant mode
-    if extra_output is not None or ub is not None or ub_type is not None or bulk_overlap:
+    extra_output = p.get("extra_output")
+    if (
+        extra_output is not None
+        or p.get("ub") is not None
+        or p.get("ub_type") is not None
+        or p.get("bulk_overlap")
+    ):
         raise RuntimeError(
             "Batch-invariant GEMM does not support Userbuffers/overlap "
             "(extra_output/ub/ub_type/bulk_overlap)."
         )
+    alpha = float(p.get("alpha", 1.0))
+    beta = p.get("beta")
+    if accumulate:
+        beta = 1.0 if beta is None else float(beta)
+    elif beta not in (None, 0, 0.0):
+        raise ValueError("beta must be zero unless the GEMM accumulates into out.")
+    if accumulate and out is None:
+        raise ValueError("Accumulating GEMM requires an out tensor.")
 
-    # Compute via autograd-aware function matching TE's layout semantics
-    result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
+    epilogue_bias = bias if not grad else None
+    if alpha == 1.0 and not accumulate:
+        # Compute via autograd-aware function matching TE's layout semantics
+        result = BatchInvariantTEGemmFn.apply(A, B, epilogue_bias, out_dtype, layout)
+    else:
+        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once.
+        result = alpha * BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
+        if epilogue_bias is not None:
+            result = result + epilogue_bias.float()
+        if accumulate:
+            result = result + beta * out.float()
+        result = result.to(out.dtype if out is not None else (out_dtype or A.dtype))
 
     bias_grad = None
     if grad and bias is not None:

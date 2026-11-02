@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -27,7 +28,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_lts_ci_image
 
 try:
     import flash_attn_3
@@ -891,3 +892,171 @@ def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
         )
 
     assert torch.equal(full, chunks)
+
+
+# ============================================================================
+# TE operation fuser (use_transformer_engine_op_fuser) under batch invariance
+# ============================================================================
+
+# DeepGEMM ships only in the dev CI image; there the deepgemm cases fail without it.
+_OP_FUSER_BACKENDS = [
+    "triton",
+    pytest.param(
+        "deepgemm",
+        marks=pytest.mark.skipif(is_lts_ci_image(), reason="DeepGEMM is not in the LTS image."),
+    ),
+]
+
+
+def _forbid_te_dense_gemm(monkeypatch):
+    """Make TE's cuBLASLt dense GEMM raise, so a bypass of the batch-invariant GEMM fails."""
+    import transformer_engine_torch as tex
+
+    def raise_(*args, **kwargs):
+        raise AssertionError("tex.generic_gemm ran under batch-invariant mode")
+
+    monkeypatch.setattr(tex, "generic_gemm", raise_)
+
+
+@pytest.mark.parametrize("backend", _OP_FUSER_BACKENDS)
+def test_te_op_fuser_mlp_batch_invariant(monkeypatch, backend):
+    """TEFusedMLP (the op fuser's RMSNorm, BasicLinear, bias, SwiGLU, BasicLinear) gives a
+    token the same bits whatever its co-batch, and never runs TE's cuBLASLt GEMM."""
+    import transformer_engine.pytorch.ops.basic.rmsnorm as te_ops_rmsnorm
+
+    from megatron.core.extensions.transformer_engine import TEFusedMLP
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+    from megatron.core.transformer.mlp import MLPSubmodules
+
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            ffn_hidden_size=512,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            flash_attention_version=_BIK_FA_VERSION,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            attention_backend=AttnBackend.flash,
+            use_transformer_engine_op_fuser=True,
+        )
+        mlp = (
+            TEFusedMLP.as_mlp_submodule(
+                submodules=MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                ),
+                config=cfg,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+                is_mtp_layer=False,
+            )
+            .cuda()
+            .eval()
+        )
+        torch.manual_seed(7)
+        target = torch.randn(8, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+        _forbid_te_dense_gemm(monkeypatch)
+        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
+            assert te_ops_rmsnorm.rmsnorm_fwd is bik._te_rmsnorm_fwd_patched
+            alone, _ = mlp(target)
+            assert alone.abs().max() > 0
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(
+                    left + right, 1, cfg.hidden_size, device="cuda", dtype=torch.bfloat16
+                )
+                batch = torch.cat([filler[:left], target, filler[left:]])
+                out, _ = mlp(batch)
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        assert te_ops_rmsnorm.rmsnorm_fwd is not bik._te_rmsnorm_fwd_patched
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("backend", _OP_FUSER_BACKENDS)
+@pytest.mark.parametrize("case", ["accumulate-fp32", "alpha-beta-bias", "alpha"])
+def test_bik_te_general_gemm_honors_accumulate_alpha_beta(backend, case):
+    """The batch-invariant general_gemm computes what TE's computes with accumulate, alpha
+    and beta: it adds into out (a weight gradient into fp32 main_grad, a scaled linear
+    into a residual) instead of overwriting it."""
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    torch.manual_seed(5)
+    bf16 = _device(torch.bfloat16)
+    if case == "accumulate-fp32":
+        # Weight gradient (NT) of x [64, 128] and dy [64, 96], added into fp32 main_grad.
+        A, B = torch.randn(64, 128, **bf16), torch.randn(64, 96, **bf16)
+        out0 = torch.randn(96, 128, device="cuda", dtype=torch.float32)
+        kwargs = dict(out_dtype=torch.float32, accumulate=True, layout="NT", grad=True)
+    elif case == "alpha-beta-bias":
+        # Scaled linear plus bias, added into a scaled bf16 residual.
+        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
+        out0 = torch.randn(64, 96, **bf16)
+        bias = torch.randn(96, **bf16)
+        kwargs = dict(out_dtype=torch.bfloat16, accumulate=True, alpha=0.5, beta=2.0, bias=bias)
+    else:
+        A, B = torch.randn(96, 128, **bf16), torch.randn(64, 128, **bf16)
+        out0 = torch.randn(64, 96, **bf16)
+        kwargs = dict(out_dtype=torch.bfloat16, alpha=0.25)
+    reference = out0.clone()
+    te_cpp.general_gemm(A, B, out=reference, **kwargs)
+    actual = out0.clone()
+    with set_batch_invariant_mode(True, backend=backend):
+        result = te_cpp.general_gemm(A, B, out=actual, **kwargs)[0]
+    assert result is actual
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=2e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("zero_centered_gamma", [False, True])
+def test_te_op_fuser_rmsnorm_batch_invariant(zero_centered_gamma):
+    """The op fuser's te.ops.RMSNorm, which imports TE's rmsnorm_fwd by name, runs the
+    batch-invariant RMSNorm in forward and still back-propagates through TE's rmsnorm_bwd."""
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.ops.basic.rmsnorm as te_ops_rmsnorm
+
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    hidden, eps = 256, 1e-5
+    norm = te.ops.RMSNorm(
+        hidden,
+        eps=eps,
+        zero_centered_gamma=zero_centered_gamma,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(11)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(hidden) * 0.1 + (0.0 if zero_centered_gamma else 1.0))
+    target = torch.randn(8, hidden, device="cuda", dtype=torch.bfloat16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        assert te_ops_rmsnorm.rmsnorm_fwd is bik._te_rmsnorm_fwd_patched
+        with torch.no_grad():
+            alone = norm(target)
+            expected, _ = bik._rmsnorm_batch_invariant_fp32(
+                target, norm.weight, eps, zero_centered_gamma
+            )
+            assert torch.equal(alone, expected.to(torch.bfloat16))
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(left + right, hidden, device="cuda", dtype=torch.bfloat16)
+                out = norm(torch.cat([filler[:left], target, filler[left:]]))
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        x = target.clone().requires_grad_(True)
+        dy = torch.randn_like(target)
+        norm(x).backward(dy)
+    assert te_ops_rmsnorm.rmsnorm_fwd is not bik._te_rmsnorm_fwd_patched
+    x64 = target.double().requires_grad_(True)
+    w64 = norm.weight.detach().double() + (1.0 if zero_centered_gamma else 0.0)
+    (x64 * torch.rsqrt(x64.pow(2).mean(-1, keepdim=True) + eps) * w64).backward(dy.double())
+    torch.testing.assert_close(x.grad.double(), x64.grad, rtol=2e-2, atol=2e-2)

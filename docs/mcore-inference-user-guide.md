@@ -165,8 +165,11 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment. Under
 > `deepgemm` and `triton`, `moe_use_grouped_tensor=True` runs the same DeepGEMM
 > grouped GEMMs as the legacy path instead.
-> Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
-> not promise bitwise-identical gradients across different minibatches.
+> The TE operation fuser (`use_transformer_engine_op_fuser=True`) is batch-invariant
+> under `deepgemm` and `triton` with RMSNorm and a tensor-parallel size of 1 or 2: its
+> GEMMs and RMSNorm run the batch-invariant kernels, but its own tensor-parallel
+> reductions call NCCL directly. `te_native` rejects it for MoE. Forward batch
+> invariance does not promise bitwise-identical gradients across different minibatches.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
