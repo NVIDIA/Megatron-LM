@@ -1361,6 +1361,14 @@ def _rmsnorm_batch_invariant_fp32(x, weight, eps, zero_centered_gamma) -> tuple:
     return (x_fp32 * rsigma) * w_fp32, rsigma
 
 
+@lru_cache(maxsize=None)
+def _te_dtype_to_torch() -> dict:
+    """TE's map from its DType enum to torch dtypes."""
+    from transformer_engine.pytorch.constants import TE_DType_To_Torch
+
+    return TE_DType_To_Torch
+
+
 def _te_rmsnorm_fwd_patched(
     input, weight, eps, ln_out, quantizer, otype, sm_margin, zero_centered_gamma
 ):  # pylint: disable=redefined-builtin
@@ -1373,13 +1381,11 @@ def _te_rmsnorm_fwd_patched(
     del sm_margin  # The batch-invariant kernel does not reserve SMs.
     if quantizer is not None:
         raise RuntimeError("Batch-invariant RMSNorm does not support a quantized output.")
-    from transformer_engine.pytorch.constants import TE_DType_To_Torch
-
     out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(input, weight, eps, zero_centered_gamma)
     if ln_out is not None:
         ln_out.copy_(out_fp32)
     else:
-        ln_out = out_fp32.to(TE_DType_To_Torch[otype])
+        ln_out = out_fp32.to(_te_dtype_to_torch()[otype])
     return ln_out, None, rsigma.squeeze(-1)
 
 
