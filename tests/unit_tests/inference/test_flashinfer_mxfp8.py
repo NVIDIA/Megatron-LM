@@ -168,6 +168,7 @@ def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
     assert captured["final_scales"].shape == (8, 2)
     assert captured["kwargs"]["use_mxfp8_act_scaling"] is True
     assert captured["kwargs"]["swizzled_input_sf"] is True
+    assert captured["kwargs"]["use_fused_finalize"] is True
     assert captured["kwargs"]["ep_size"] == 4
     assert captured["kwargs"]["ep_rank"] == 1
     assert torch.equal(captured["kwargs"]["clamped_relu2_limit"], torch.tensor([16.0]))
@@ -615,6 +616,66 @@ def test_bf16_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch
         experts.InferenceGroupedMLP._flashinfer_forward(
             grouped_mlp,
             torch.empty(4, 8, dtype=torch.bfloat16),
+            torch.zeros(4, 2, dtype=torch.int64),
+            torch.zeros(4, 2, dtype=torch.float32),
+        )
+
+    # FlashInfer defaults use_fused_finalize to True.
+    assert captured.get("use_fused_finalize", True) is (mode == "default")
+
+
+@pytest.mark.parametrize("mode", ["default", "deterministic", "batch_invariant"])
+def test_cutlass_mxfp8_flashinfer_rules_out_fused_finalize_when_deterministic(monkeypatch, mode):
+    """The CUTLASS MXFP8 experts (ClampedRelu2) call cutlass_fused_moe too, whose fused-finalize
+    GEMM2 tactics sum the top-k routes with atomics; the autotuner must not be able to select
+    them in deterministic or batch-invariant mode."""
+    from megatron.core.transformer.moe import experts
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    captured = {}
+
+    def cutlass_fused_moe(*args, **kwargs):
+        captured.update(kwargs)
+        return [torch.empty(4, 128, dtype=torch.bfloat16)]
+
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "cutlass_fused_moe", cutlass_fused_moe, raising=False
+    )
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module,
+        "mxfp8_quantize",
+        lambda hidden, *args: (hidden.to(torch.float8_e4m3fn), torch.zeros(16, dtype=torch.uint8)),
+        raising=False,
+    )
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER_UNFUSED_FINALIZE", True)
+    monkeypatch.setattr(
+        experts, "is_batch_invariant_mode_enabled", lambda: mode == "batch_invariant"
+    )
+
+    def weight():
+        return FlashInferCutlassMXFP8Weight(
+            data=torch.zeros(2, 128, 128, dtype=torch.float8_e4m3fn),
+            scale=torch.zeros(2, 128, 1, dtype=torch.int32),
+            input_scale=torch.ones(2),
+            logical_rows=128,
+            logical_cols=128,
+        )
+
+    grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=True,
+        _fc1_weight=weight(),
+        _fc2_weight=weight(),
+        _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
+        _flashinfer_clamp_limit=None,
+        _nvls_dispatcher=False,
+        ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+    )
+    with deterministic_algorithms(mode == "deterministic"):
+        experts.InferenceGroupedMLP._flashinfer_forward(
+            grouped_mlp,
+            torch.empty(4, 128, dtype=torch.bfloat16),
             torch.zeros(4, 2, dtype=torch.int64),
             torch.zeros(4, 2, dtype=torch.float32),
         )

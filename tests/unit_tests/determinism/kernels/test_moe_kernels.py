@@ -40,6 +40,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
+    InferenceGroupedMLP,
     SequentialMLP,
     TEGroupedMLP,
     _te_supports_scaled_tanh_srelu,
@@ -1418,6 +1419,80 @@ class TestMoEModules:
                 assert bytes_equal(
                     outputs["out"][_PROBE_ROW], probe
                 ), f"{what}: a token's output changed with its batch"
+        assert None in runnable and 2 * len(runnable) >= len(
+            tactics
+        ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"
+
+    def test_inference_flashinfer_cutlass_mxfp8_experts_replay_for_every_gemm2_tactic(
+        self, flashinfer_gemm2_tactic
+    ):
+        """CUTLASS MXFP8 ClampedRelu2 experts (top-4) replay bit-exactly under deterministic
+        algorithms whichever GEMM2 tactic FlashInfer's autotuner holds. Their call goes through
+        cutlass_fused_moe too, whose fused-finalize GEMM2 tactics sum the top-k routes with
+        atomics, so those must not be selectable."""
+        if torch.cuda.get_device_capability()[0] != 10:
+            pytest.skip("FlashInfer ClampedRelu2 needs SM10x")
+        fused_moe = pytest.importorskip("flashinfer.fused_moe")
+        from flashinfer.fused_moe import ActivationType
+
+        if not hasattr(ActivationType, "ClampedRelu2") or "clamped_relu2_limit" not in (
+            inspect.signature(fused_moe.cutlass_fused_moe).parameters
+        ):
+            pytest.skip("FlashInfer has no ClampedRelu2 cutlass_fused_moe")
+        from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_cutlass_mxfp8_weights
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        seeded()
+        num_experts, hidden_size, ffn_hidden_size, topk = 8, 512, 512, 4
+
+        def cutlass_mxfp8_weight(rows, cols):
+            weights = torch.randn(num_experts, rows, cols, device="cuda") / cols**0.5
+            parts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in weights.bfloat16()]
+            return prepare_cutlass_mxfp8_weights(
+                MXFP8Tensor(
+                    data=torch.stack([p.data for p in parts]),
+                    scale=torch.stack([p.scale for p in parts]),
+                    backend="triton",
+                    dtype=torch.bfloat16,
+                )
+            )
+
+        experts = SimpleNamespace(  # the attributes InferenceGroupedMLP._flashinfer_forward reads
+            _uses_mxfp8_weights=True,
+            _fc1_weight=cutlass_mxfp8_weight(ffn_hidden_size, hidden_size),
+            _fc2_weight=cutlass_mxfp8_weight(hidden_size, ffn_hidden_size),
+            _flashinfer_activation_type=ActivationType.ClampedRelu2,
+            _activation_clamp_scale=0.5,
+            _flashinfer_clamp_limit=torch.full((1,), 0.5, device="cuda", dtype=torch.float32),
+            _nvls_dispatcher=False,
+            ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        )
+
+        def forward(hidden, routing_map, probs):
+            return InferenceGroupedMLP._flashinfer_forward(experts, hidden, routing_map, probs)[0]
+
+        batch, _ = _routed_tokens(4096, num_experts, topk, hidden_size)
+        runnable = []
+        with torch.no_grad(), deterministic_algorithms(True):
+            forward(*batch)
+            assert (
+                flashinfer_gemm2_tactic.fused_finalize is False
+            ), "FlashInfer offers fused-finalize GEMM2 tactics to CUTLASS MXFP8 experts"
+            tactics = [None, *range(flashinfer_gemm2_tactic.count)]
+            for tactic in tactics:
+                flashinfer_gemm2_tactic.tactic = tactic
+                try:
+                    forward(*batch)
+                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
+                    continue
+                runnable.append(tactic)
+                assert_replays_bit_exact(
+                    forward,
+                    batch,
+                    replays=3,
+                    backward=False,
+                    what=f"FlashInfer CUTLASS MXFP8 experts[GEMM2 tactic {tactic}]",
+                )
         assert None in runnable and 2 * len(runnable) >= len(
             tactics
         ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"

@@ -149,6 +149,22 @@ def _require_te_tanh_clamp_support(config) -> None:
     )
 
 
+def _cutlass_fused_moe_finalize_kwargs() -> dict:
+    """Keyword arguments that keep a FlashInfer cutlass_fused_moe call deterministic.
+
+    FlashInfer's autotuner may select a GEMM2 tactic with a fused finalize, which accumulates
+    each token's top-k routes with output-dtype atomics in no fixed order. Under deterministic
+    algorithms or batch-invariant mode, use_fused_finalize=False rules those tactics out; the
+    separate finalize kernel reduces each token's routes in order. FlashInfer without the option
+    is rejected when the weights are built if the config asks for determinism.
+    """
+    if HAVE_FLASHINFER_UNFUSED_FINALIZE and (
+        torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled()
+    ):
+        return {"use_fused_finalize": False}
+    return {}
+
+
 def _require_flashinfer_unfused_finalize(config) -> None:
     """Raise if a deterministic config's BF16 FlashInfer MoE cannot rule out the fused finalize."""
     if HAVE_FLASHINFER_UNFUSED_FINALIZE or not (
@@ -1787,6 +1803,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     activation_type=self._flashinfer_activation_type,
                     out=out,
                     activation_clamp_limit=self._flashinfer_clamp_limit,
+                    **_cutlass_fused_moe_finalize_kwargs(),
                 )
             else:
                 output = flashinfer_routed_mxfp8_moe(
@@ -1817,16 +1834,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
-        # FlashInfer's autotuner may select a GEMM2 tactic with a fused finalize, which
-        # accumulates each token's top-k routes with output-dtype atomics in no fixed order.
-        # use_fused_finalize=False rules those tactics out; the separate finalize kernel
-        # reduces each token's routes in order. FlashInfer without the option is rejected
-        # when the weights are built if the config asks for determinism.
-        finalize_kwargs = {}
-        if HAVE_FLASHINFER_UNFUSED_FINALIZE and (
-            torch.are_deterministic_algorithms_enabled() or is_batch_invariant_mode_enabled()
-        ):
-            finalize_kwargs["use_fused_finalize"] = False
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
             routing_map.int(),
@@ -1847,7 +1854,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
             # token_combine() copies it into the symmetric FP32 buffer.
             output=None,
-            **finalize_kwargs,
+            **_cutlass_fused_moe_finalize_kwargs(),
         )[0]
         return output, None
 
