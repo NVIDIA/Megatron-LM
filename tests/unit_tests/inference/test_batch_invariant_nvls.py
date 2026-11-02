@@ -1,5 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real NVLS invariance at EP = world size; each collective/backend needs a fresh interpreter."""
+"""Real NVLS batch invariance at EP = world size.
+
+Both combine collectives run in one process; each test enables and disables the mode around a
+freshly built layer. MCORE_BI_TEST_BACKEND selects the GEMM backend (default te_native). In this
+layer the backend changes only the router's TE GEMM: the dispatch, the experts and the combine
+run the same Triton or DeepGEMM kernels under every backend.
+"""
 
 import os
 
@@ -30,9 +36,9 @@ pytestmark = [
 
 
 @pytest.fixture
-def nvls_runtime():
+def nvls_runtime(request):
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "te_native")
-    collective = os.environ.get("MCORE_BI_TEST_COLLECTIVE", "ordered")
+    collective = getattr(request, "param", "ordered")
     assert not bik.is_batch_invariant_mode_enabled(), "inherited a live BI backend"
     try:
         # Explicit global selection precedes model construction. The layer runs no aten GEMM
@@ -58,8 +64,10 @@ def nvls_runtime():
 
 def _build_nvls_layer(backend, collective, grouped_backend):
     """Build the shared native NVLS layer and target."""
-    if grouped_backend == "torch" and not bik.HAVE_DEEPGEMM_BF16:
-        pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+    # The CI images ship DeepGEMM; without it the torch cases fail here rather than skip.
+    assert (
+        grouped_backend != "torch" or bik.HAVE_DEEPGEMM_BF16
+    ), "The batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels."
     torch.manual_seed(321)
     model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
     config = _make_base_config(
@@ -107,7 +115,8 @@ def test_nvls_empty_router_width(nvls_runtime, monkeypatch):
 
     monkeypatch.setattr(moe_utils, "te_general_gemm", observe)
     rank = torch.distributed.get_rank()
-    counts = (64, 128, 64) if rank == 0 else (0, 32 * rank, 0)
+    # Peers gate 32, 64 or 96 tokens, within the 128-token per-rank buffers.
+    counts = (64, 128, 64) if rank == 0 else (0, 32 * (1 + (rank - 1) % 3), 0)
     reference = None
     for count in counts:
         inputs = target[:1].repeat(count, 1, 1)
@@ -126,6 +135,7 @@ def test_nvls_empty_router_width(nvls_runtime, monkeypatch):
     assert calls == [(count, config.hidden_size) for count in counts]
 
 
+@pytest.mark.parametrize("nvls_runtime", ["ordered", "multimem"], indirect=True)
 @pytest.mark.parametrize("grouped_backend", ["vllm", "torch"])
 @pytest.mark.parametrize("peers", ["idle", "uneven"])
 @torch.inference_mode()
