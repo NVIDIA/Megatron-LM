@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from typing import List, Literal, Optional, Tuple
 
 import torch
@@ -171,8 +172,12 @@ class T5Model(LanguageModule):
             if _pg not in vars(pg_collection):
                 raise ValueError(f"T5Model pg_collection must have {_pg}")
         if 'embd' not in vars(pg_collection):
-            raise ValueError(
-                "T5Model pg_collection must have embd; explicitly set it to None when unused"
+            warnings.warn(
+                "T5Model was given a pg_collection without an embd field and treats it as "
+                "embd=None. Set embd explicitly, to None when it is unused; a missing embd "
+                "becomes an error in Megatron Core 0.23.",
+                FutureWarning,
+                stacklevel=2,
             )
         if (
             share_embeddings_and_output_weights
