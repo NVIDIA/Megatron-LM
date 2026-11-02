@@ -1640,6 +1640,15 @@ def validate_args(args, defaults={}):
                 f'must be >= single sequence max length ({args.seq_length})'
             )
 
+    if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
+        assert args.use_varlen_dataset and args.micro_batch_size == 1, (
+            "Scheduler CUDA graphs require one variable-length sample per dataset item "
+            "and --micro-batch-size 1."
+        )
+        assert args.step_batch_size_schedule is None, (
+            "Scheduler CUDA graphs require a fixed source global batch size."
+        )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -2421,9 +2430,6 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
@@ -2435,6 +2441,7 @@ def _add_network_size_args(parser):
         "sequence_packing_scheduler",
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
+        "pad_packed_seq_alignment",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3208,6 +3215,9 @@ def _add_distributed_args(parser):
                        help='Enables hybrid context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
+    group.add_argument('--pad-packed-seq-alignment', default=None,
+                       help="Pad packed THD inputs to a CP-local multiple or 'max'. "
+                       "MXFP8 additionally aligns to 32 tokens after SP sharding.")
     group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \

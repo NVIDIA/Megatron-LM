@@ -1,10 +1,115 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, List
+from math import lcm
+from typing import Dict, List, Optional, TypeVar
 
 import torch
 
 from megatron.core.rerun_state_machine import RerunDataIterator
+
+_SequenceLength = TypeVar('_SequenceLength', int, torch.Tensor)
+
+
+def get_packed_sequence_alignment(config, tp_size: int) -> tuple[int, bool]:
+    """Return CP-local alignment and whether post-pack padding is enabled.
+
+    The user-facing alignment is in pre-SP units. MXFP8's quantization
+    block constraint applies after SP and must therefore include the TP size.
+    """
+    requested = getattr(config, 'pad_packed_seq_alignment', None)
+    mxfp8 = (
+        getattr(config, 'fp8', None) is not None and getattr(config, 'fp8_recipe', None) == 'mxfp8'
+    )
+    sp_size = tp_size if getattr(config, 'sequence_parallel', False) else 1
+    alignment = lcm(2 * sp_size, 32 * sp_size if mxfp8 else 1)
+    if requested not in (None, 'max'):
+        if int(requested) <= 0:
+            raise ValueError("pad_packed_seq_alignment must be positive")
+        alignment = lcm(alignment, int(requested))
+    return alignment, requested is not None or mxfp8
+
+
+def get_packed_sequence_length(
+    seq_len: _SequenceLength, cp_size: int, pad_sequences: bool
+) -> _SequenceLength:
+    """Return the physical length used by eager per-sequence zigzag padding."""
+    alignment = 2 * cp_size if pad_sequences and cp_size > 1 else 1
+    return seq_len + (-seq_len % alignment)
+
+
+def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None:
+    """Fix metadata shapes without treating physical padding as real tokens."""
+    if max_num_seqs is None:
+        return
+    for key in ("cu_seqlens", "cu_seqlens_padded"):
+        offsets = batch[key]
+        remaining = max_num_seqs + 1 - offsets.numel()
+        if remaining < 0:
+            raise ValueError("Packed documents exceed cuda_graph_thd_max_packed_sequences.")
+        if remaining:
+            batch[key] = torch.cat((offsets, offsets[-1:].expand(remaining)))
+    # A stable upper bound is needed by TE capture even when document lengths vary.
+    batch["max_seqlen"] = batch["cu_seqlens_padded"][-1].to(torch.int32)
+
+
+def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
+    """Pad global THD data and metadata before constructing any CP layout.
+
+    Preserve compact logical boundaries and existing physical gaps. Align each
+    physical sequence for zigzag CP, then append a masked dummy sequence to
+    reach the requested CP-local alignment. For fixed graph metadata the dummy
+    has zero logical length; the ordinary main padding contract is unchanged.
+    """
+    alignment, enabled = get_packed_sequence_alignment(config, tp_size)
+    max_num_seqs = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+    if not enabled:
+        _pad_packed_graph_metadata(batch, max_num_seqs)
+        return
+    logical = batch['cu_seqlens']
+    physical = batch['cu_seqlens_padded']
+    lengths = physical.diff()
+    padded_lengths = get_packed_sequence_length(lengths, cp_size, pad_sequences=True)
+    global_length = int(padded_lengths.sum().item())
+    local_length = (global_length + cp_size - 1) // cp_size
+    limit = getattr(config, 'max_seqlen_per_dp_cp_rank', None)
+    if getattr(config, 'pad_packed_seq_alignment', None) == 'max':
+        if limit is None or limit % alignment:
+            raise ValueError(
+                f"Packed padding target must be a multiple of {alignment}, got {limit}"
+            )
+        target = limit
+    else:
+        target = local_length + (-local_length % alignment)
+    if target < local_length or (limit is not None and target > limit):
+        raise ValueError(
+            f"Padded CP-local length {target} (input {local_length}) exceeds "
+            f"max_seqlen_per_dp_cp_rank={limit}; increase the limit or reduce packing."
+        )
+
+    padded_boundaries = torch.cat((physical[:1], padded_lengths.cumsum(0, dtype=physical.dtype)))
+    positions = torch.arange(global_length, device=physical.device)
+    seq_ids = torch.searchsorted(padded_boundaries[1:], positions, right=True)
+    offsets = positions - padded_boundaries[seq_ids]
+    source_indices = physical[seq_ids] + offsets
+    within_source = offsets < lengths[seq_ids]
+    source_indices = source_indices.clamp(max=int(physical[-1].item()) - 1).long()
+    tail = target * cp_size - global_length
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+        tensor = batch.get(key)
+        if tensor is None:
+            continue
+        fill = key == 'padding_mask'
+        padded = tensor.index_select(0, source_indices).masked_fill(~within_source, fill)
+        batch[key] = torch.cat((padded, tensor.new_full((tail,), fill))) if tail else padded
+
+    if tail:
+        logical_tail = tail if max_num_seqs is None else 0
+        logical = torch.cat((logical, logical[-1:] + logical_tail))
+        padded_boundaries = torch.cat((padded_boundaries, padded_boundaries[-1:] + tail))
+    batch['cu_seqlens'] = logical
+    batch['cu_seqlens_padded'] = padded_boundaries
+    batch['max_seqlen'] = padded_boundaries.diff().max().to(torch.int32)
+    _pad_packed_graph_metadata(batch, max_num_seqs)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:

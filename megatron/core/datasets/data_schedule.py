@@ -14,6 +14,9 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_packed_sequence_alignment,
+    get_packed_sequence_length,
+    pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -361,6 +364,8 @@ class BasePackingScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        pad_sequences: bool = False,
+        max_num_seqs: Optional[int] = None,
     ):
         """
         Args:
@@ -369,11 +374,15 @@ class BasePackingScheduler:
             dp_size: The data parallel size.
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
+            pad_sequences: Account for per-sequence zigzag padding when packing.
+            max_num_seqs: Bound packed documents for fixed CUDA-graph metadata.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.pad_sequences = pad_sequences
+        self.max_num_seqs = max_num_seqs
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -444,13 +453,20 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+            seq_len = get_packed_sequence_length(
+                sample_id_seqlens[i][1], self.cp_size, self.pad_sequences
+            )
+            if seq_len > self.max_seq_len_all_ranks:
+                raise ValueError("A padded sequence exceeds the static CP packing capacity")
+            if sum_seqlen + seq_len <= self.max_seq_len_all_ranks and (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
+            ):
                 single_microbatch.append(i)
-                sum_seqlen += sample_id_seqlens[i][1]
+                sum_seqlen += seq_len
             else:
                 packed_id_groups.append(single_microbatch)
                 single_microbatch = [i]
-                sum_seqlen = sample_id_seqlens[i][1]
+                sum_seqlen = seq_len
         if len(single_microbatch) > 0:
             packed_id_groups.append(single_microbatch)
 
@@ -710,8 +726,24 @@ def wrap_data_iterator(
     scheduler_type = config.sequence_packing_scheduler
     scheduler_type = PackingSchedulerEnum[scheduler_type.upper()]
 
+    scheduler_kwargs = {}
+    capacity = config.max_seqlen_per_dp_cp_rank
+    alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
+    scheduler_kwargs['pad_sequences'] = pad_enabled
+    if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
+        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+        if metadata_capacity is not None:
+            # Main's implicit MXFP8 alignment can append a dummy document too.
+            scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
+            if scheduler_kwargs["max_num_seqs"] < 1:
+                raise ValueError("THD metadata capacity must leave room for a real document.")
+    if pad_enabled:
+        capacity -= capacity % alignment
+        if capacity < alignment:
+            raise ValueError(f"Packed sequence capacity must fit alignment {alignment}")
+
     scheduler = scheduler_map[scheduler_type](
-        config.max_seqlen_per_dp_cp_rank,
+        capacity,
         cp_size,
         dp_size,
         # When VPP is enabled, align num_micro_batches to this multiple.
@@ -720,6 +752,7 @@ def wrap_data_iterator(
             if config.virtual_pipeline_model_parallel_size is None
             else config.microbatch_group_size_per_vp_stage
         ),
+        **scheduler_kwargs,
     )
 
     (
@@ -745,6 +778,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -803,6 +837,8 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
+        if config is not None:
+            pad_packed_batch_before_cp_slice(batch, config, cp_group.size(), tp_group.size())
 
     # Partition padding_mask for context parallel on every PP stage. Partition
     # token-like tensors only on stages that own them.
@@ -911,14 +947,17 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
     # get the correct result.
     # TODO: Revert this workaround once TE fixes the issue.
+    graph_metadata = getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None
+    logical_offsets = cu_seqlens if graph_metadata else cu_seqlens_padded
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=logical_offsets,
+        cu_seqlens_kv=logical_offsets,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        pad_between_seqs=True if graph_metadata else None,
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
