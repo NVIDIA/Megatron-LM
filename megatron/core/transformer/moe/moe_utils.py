@@ -803,6 +803,8 @@ class _BatchInvariantSigmoidTopK(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, expert_bias, topk, scaling_factor):
         """Route with the kernel; returns probs [tokens, topk] and int64 indices."""
+        # The backward always normalizes; the reference leaves top-1 scores unnormalized.
+        assert topk > 1, "the batch-invariant sigmoid top-k path requires topk > 1"
         probs, top_indices = sigmoid_topk_routing(
             logits, expert_bias, topk, scaling_factor, batch_invariant=True
         )
@@ -839,6 +841,8 @@ def _use_batch_invariant_sigmoid_topk(
         is_batch_invariant_mode_enabled()
         and HAVE_SIGMOID_TOPK_KERNEL
         and score_function == "sigmoid"
+        # Top-1 keeps unnormalized scores in the reference, which this path does not.
+        and topk > 1
         and expert_bias is not None
         and not use_pre_softmax
         and num_groups is None

@@ -138,15 +138,24 @@ def test_unsupported_configurations_keep_reference_routing(monkeypatch, override
     logits, bias = _inputs(64, 128)
     logits = logits.to(overrides.get("dtype", torch.float32))
     with set_batch_invariant_mode(True):
-        topk_routing_with_score_function(
-            logits,
-            overrides.get("topk", 6),
-            scaling_factor=2.5,
-            score_function="sigmoid",
-            expert_bias=overrides.get("expert_bias", bias),
-            num_groups=overrides.get("num_groups"),
-            group_topk=overrides.get("group_topk"),
-        )
+        # Both the no-grad forward and the training (autograd) path.
+        for requires_grad in (False, True):
+            topk_routing_with_score_function(
+                logits.detach().requires_grad_(requires_grad),
+                overrides.get("topk", 6),
+                scaling_factor=2.5,
+                score_function="sigmoid",
+                expert_bias=overrides.get("expert_bias", bias),
+                num_groups=overrides.get("num_groups"),
+                group_topk=overrides.get("group_topk"),
+            )
+
+
+def test_kernel_autograd_rejects_top1():
+    """Top-1 keeps unnormalized scores in the reference; the kernel's backward normalizes."""
+    logits, bias = _inputs(8, 128)
+    with pytest.raises(AssertionError, match="topk > 1"):
+        moe_utils._BatchInvariantSigmoidTopK.apply(logits.requires_grad_(True), bias, 1, 2.5)
 
 
 def test_opt_out_keeps_reference_routing(monkeypatch):
