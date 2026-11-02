@@ -941,18 +941,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+      gb200-enabled: ${{ steps.parse-unit-tests.outputs.gb200-enabled }}
     needs:
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
+      - cicd-parse-unit-tests-gb200
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && (
-        success()
+        (needs.pre-flight.result == 'success' && needs.configure.result == 'success' && needs.cicd-wait-in-queue.result == 'success' && needs.cicd-container-build.result == 'success')
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -965,9 +967,13 @@ jobs:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
+        env:
+          UNIT_TEST_GB200_ENABLED: ${{ needs.cicd-parse-unit-tests-gb200.outputs.gb200-enabled || 'false' }}
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          # GB200 may be skipped or unavailable; that keeps every H100 bucket.
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | python tests/unit_tests/gb200_placement.py filter-buckets --platform h100 --enabled "$UNIT_TEST_GB200_ENABLED" > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+          echo "gb200-enabled=$UNIT_TEST_GB200_ENABLED" >> "$GITHUB_OUTPUT"
 
   cicd-unit-tests-latest:
     needs:
@@ -998,6 +1004,7 @@ jobs:
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
+      unit_test_gb200_enabled: ${{ needs.cicd-parse-unit-tests.outputs.gb200-enabled || 'false' }}
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
       unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
@@ -1006,6 +1013,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+      gb200-enabled: ${{ steps.parse-unit-tests.outputs.gb200-enabled }}
       container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
@@ -1034,9 +1042,12 @@ jobs:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
+        env:
+          UNIT_TEST_GB200_ENABLED: ${{ needs.cicd-container-build.result == 'success' && needs.configure.outputs.lts != 'true' && 'true' || 'false' }}
         run: |
-          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | python tests/unit_tests/gb200_placement.py filter-buckets --platform gb200 --enabled "$UNIT_TEST_GB200_ENABLED" > unit-tests-gb200.json
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+          echo "gb200-enabled=$UNIT_TEST_GB200_ENABLED" >> "$GITHUB_OUTPUT"
 
   cicd-unit-tests-latest-gb200:
     needs:
@@ -1070,6 +1081,7 @@ jobs:
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}
+      unit_test_gb200_enabled: ${{ needs.cicd-parse-unit-tests-gb200.outputs.gb200-enabled || 'false' }}
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
       unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
@@ -1080,7 +1092,7 @@ jobs:
   #       (PR-push env approval), OR we're in a regime where it skips by
   #       design: merge_group, ci_workload (schedule / workflow_dispatch),
   #       or an explicit force_run_all override.
-  #   (B) Unit-test gate — unit tests must have succeeded on PR push and
+  #   (B) Unit-test gate — both enabled unit-test lanes must succeed on PR push and
   #       merge_group; scheduled / force-run workflows bypass this for
   #       full nightly coverage.
   # H100 applies its PR-specific functional-test selection after the original
@@ -1093,12 +1105,15 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+      - cicd-unit-tests-latest-gb200
+      - is-not-external-contributor
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && needs.cicd-unit-tests-latest-gb200.result != 'cancelled'
       && !cancelled()
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
@@ -1108,6 +1123,8 @@ jobs:
         env:
           WAIT_RESULT: ${{ needs.cicd-wait-in-queue.result }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
+          UNIT_GB200_REQUIRED: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && vars.ENABLE_GB200_TESTING == 'true' }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
@@ -1125,7 +1142,7 @@ jobs:
           fi
           # (B) Unit-test gate
           unit=false
-          if [ "$UNIT_RESULT" = "success" ] \
+          if { [ "$UNIT_RESULT" = "success" ] && { [ "$UNIT_GB200_REQUIRED" != "true" ] || [ "$UNIT_GB200_RESULT" = "success" ]; }; } \
              || [ "$IS_CI_WORKLOAD" = "true" ] \
              || [ "$FORCE_RUN_ALL" = "true" ]; then
             unit=true
@@ -1136,8 +1153,7 @@ jobs:
             should_run=false
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
-          # Preserve the pre-traffic-split GB200 gate: after approval and
-          # successful unit tests, GB200 functional tests run whenever enabled.
+          # GB200 functional tests share the approval and unit-test gates.
           if [ "$approval" = "true" ] && [ "$unit" = "true" ]; then
             should_run_gb200=true
           else
@@ -1145,7 +1161,7 @@ jobs:
           fi
           echo "should_run_gb200=$should_run_gb200" >> "$GITHUB_OUTPUT"
           echo "approval=$approval unit=$unit run_h100_functional=$RUN_H100_FUNCTIONAL -> H100=$should_run GB200=$should_run_gb200"
-          echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
+          echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT, unit-tests-gb200=$UNIT_GB200_RESULT,"
           echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
           echo "   force_run_all=$FORCE_RUN_ALL)"
 
@@ -1232,6 +1248,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
+          script: ""
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
@@ -1332,6 +1349,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
+          script: ""
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest

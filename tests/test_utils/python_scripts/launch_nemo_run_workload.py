@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import pathlib
+import runpy
 import sys
 import threading
 from typing import Optional
@@ -12,6 +13,12 @@ import click
 import nemo_run as run
 
 from tests.test_utils.python_scripts import recipe_parser
+
+# The host launcher runs outside the GPU container. Load the metadata without
+# executing tests.unit_tests.__init__, which imports Torch.
+NEW_GB200_BUCKETS = runpy.run_path(
+    str(pathlib.Path(__file__).resolve().parents[2] / "unit_tests/gb200_placement.py")
+)["NEW_GB200_BUCKETS"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -187,10 +194,25 @@ def main(
     cadence: Optional[str] = None,
 ):
     cadence_arg = cadence or None
+    gb200_enabled = (
+        os.environ.get("UNIT_TEST_GB200_ENABLED") == "true"
+        and model == "unit-tests"
+        and environment == "dev"
+        and tag == "latest"
+    )
+    recipe_scope = scope
+    if (
+        gb200_enabled
+        and platform == "dgx_gb200"
+        and scope == "unit-tests"
+        and test_case in NEW_GB200_BUCKETS
+    ):
+        # Keep GitHub-only portable buckets out of the existing GitLab scope.
+        recipe_scope = "unit-tests-github-portable"
 
     workloads = recipe_parser.load_workloads(
         container_image="none",
-        scope=scope,
+        scope=recipe_scope,
         model=model,
         test_case=test_case,
         environment=environment,
@@ -232,6 +254,7 @@ def main(
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "UNIT_TESTMON_MODE": unit_testmon_mode,
+            "UNIT_TEST_GB200_ENABLED": str(gb200_enabled).lower(),
             "FORCE_COLOR": "1",
             "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
@@ -252,11 +275,12 @@ def main(
         and test_case == "tests/unit_tests/transformer/**/*.py"
         and environment == "dev"
         and tag == "latest"
-        and platform == "dgx_h100"
+        and platform in ("dgx_h100", "dgx_gb200")
     ):
         # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
         # PyTorch start every communicator's finalization before waiting, avoiding
         # cyclic waits between the CP group's P2P and collective communicators (#7744).
+        # Preserve this setting when portable transformer tests move to GB200.
         executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
         executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
         executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
