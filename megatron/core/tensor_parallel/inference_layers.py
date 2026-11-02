@@ -77,6 +77,33 @@ def _apply_linear(
     return torch.matmul(x, weight.t(), **kwargs)
 
 
+def _reduce_scatter_in_rank_order(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """
+    Reduce-scatter along the first dimension with a reduction order that does not depend
+    on a row's position, for batch-invariant mode.
+
+    NCCL's ring reduce-scatter adds each output chunk's partials in an order that starts
+    at the chunk's owner and rounds after every hop, so with three or more ranks a token's
+    sum depends on which chunk, and so on which position in the step, it lands in. Here each
+    rank receives every rank's partial of its own chunk and adds them in ascending rank
+    order in fp32, rounding once. With two ranks the result equals NCCL's single add.
+    """
+    tp_size = dist.get_world_size(tp_group)
+    assert (
+        x.size(0) % tp_size == 0
+    ), f"first dimension ({x.size(0)}) must be divisible by tp_size ({tp_size})"
+    x = x.contiguous()
+    partials = torch.empty_like(x)
+    dist.all_to_all_single(partials, x, group=tp_group)
+    partials = partials.view(tp_size, x.size(0) // tp_size, *x.shape[1:])
+    output = partials[0].float()
+    for partial in partials[1:]:
+        output += partial
+    return output.to(x.dtype)
+
+
 class InferenceLinear(TELinear):
     """Inference optimized version of TELinear."""
 
@@ -463,7 +490,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Multiplies x by the weight matrix and performs a reduce-scatter.
         It will first try to write the matmul output to symmetric memory
         and perform an NVLS multicast reduce-scatter. If that is not possible,
-        it will revert to torch.dist (NCCL) reduce-scatter.
+        it will revert to torch.dist (NCCL) reduce-scatter, or in batch-invariant
+        mode to _reduce_scatter_in_rank_order.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
@@ -477,8 +505,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
-        # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-        # the training reduction path. This does not affect MoE EP NVLS.
+        # TP sequence-parallel RS: batch-invariant mode reduces in rank order
+        # instead (see _reduce_scatter_in_rank_order). This does not affect MoE EP NVLS.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
@@ -520,9 +548,12 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 #    written into symm_mem_buffer["tensor"] and will be accessible there.
                 return residual
         else:
-            # revert to torch dist (NCCL) reduce-scatter
             x = _apply_linear(x, self.weight, self.config)
-            x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
+            if is_batch_invariant_mode_enabled():
+                x = _reduce_scatter_in_rank_order(x, self.tp_group)
+            else:
+                # revert to torch dist (NCCL) reduce-scatter
+                x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
@@ -620,6 +651,7 @@ def inference_reduce_scatter_to_sequence_parallel_region(
 
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
+    Batch-invariant mode uses `_reduce_scatter_in_rank_order` instead.
     """
     # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
     # to use this function for its non-fused NVLS reduce-scatter path.
@@ -627,17 +659,16 @@ def inference_reduce_scatter_to_sequence_parallel_region(
     if tp_size == 1:
         return x
 
+    # TP sequence-parallel RS: a token's sum must not depend on its position in
+    # batch-invariant mode. This does not affect MoE EP NVLS.
+    if is_batch_invariant_mode_enabled():
+        return _reduce_scatter_in_rank_order(x, tp_group)
+
     triton_nvls_kernels_allowed = not getattr(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-    # training. This does not affect MoE EP NVLS.
-    if (
-        triton_nvls_kernels_allowed
-        and SymmetricMemoryManager.is_initialized("tp")
-        and not is_batch_invariant_mode_enabled()
-    ):
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
 
