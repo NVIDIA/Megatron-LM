@@ -29,7 +29,11 @@ from megatron.core.transformer.transformer_config import TransformerConfig, Wide
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
-from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import (
+    destroy_model_parallel,
+    units_unsharding_all_planes_in_backward,
+    wrap_with_fsdp_v2,
+)
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -277,6 +281,57 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+
+
+@pytest.mark.parametrize(
+    "recompute_modules, expected_units",
+    [
+        # Neither the attention layer nor the MoE layer runs a dense MLP.
+        pytest.param(["mlp"], set(), id="mlp"),
+        pytest.param(["moe"], {"decoder.layers.1"}, id="moe"),
+        pytest.param(["shared_experts"], {"decoder.layers.1"}, id="shared_experts"),
+        # Experts recompute through their own unit's hooks.
+        pytest.param(["moe_act"], set(), id="moe_act"),
+    ],
+)
+def test_unshard_all_planes_in_backward_follows_moe_recompute(
+    process_group_collections, recompute_modules, expected_units
+):
+    """The adapter opts in only the MoE layer whose weights recomputation uses without re-entry."""
+    process_group_collection, _ = process_group_collections
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        attention_backend=AttnBackend.unfused,
+        recompute_granularity="selective",
+        recompute_modules=recompute_modules,
+    )
+    stack_spec = deepcopy(hybrid_stack_spec)
+    stack_spec.submodules.moe_layer.submodules.mlp = get_moe_module_spec(
+        use_te=True, num_experts=config.num_moe_experts, moe_grouped_gemm=True
+    )
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E",
+        pg_collection=process_group_collection,
+    ).cuda()
+    model = wrap_with_fsdp_v2(model, config, process_group_collection)
+    assert units_unsharding_all_planes_in_backward(model) == expected_units
 
 
 def _sync_model_parameters(reference_model, model):
