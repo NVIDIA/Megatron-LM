@@ -1056,15 +1056,16 @@ def _pipeline(rng):
                 local_rows = [SharedPrefixRow(i, *batch[row]) for i, row in enumerate(local)]
                 costs = [_round_up(local_row.total_length, multiple) for local_row in local_rows]
                 ranks.append((local_rows, costs))
+            largest_first = iteration % 2 == 1
             for mode, options in WORKER_MODES.items():
                 for forward_only, evaluation in ((False, False), (True, False), (True, True)):
                     if evaluation and not options:
                         continue
-                    largest_first = iteration % 2 == 1
                     context = dict(mode=mode, forward_only=forward_only, evaluation=evaluation)
                     with note(iteration=iteration, chunk=chunk, **context):
-                        flags = (forward_only, evaluation, largest_first)
-                        _check_rank_plans(ranks, options, *flags, **limits)
+                        _check_rank_plans(
+                            ranks, options, forward_only, evaluation, largest_first, **limits
+                        )
             with note(iteration=iteration, chunk=chunk, mode="dense-bins"):
                 _check_dense_bins(ranks, **limits)
 
