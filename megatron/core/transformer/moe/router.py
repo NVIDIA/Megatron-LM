@@ -470,6 +470,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+                # The histogram is only supplied while accumulating, so every pass must
+                # use the reference router to stay bitwise identical across passes.
+                allow_batch_invariant_sigmoid_topk=False,
             )
 
         assert (
@@ -1429,6 +1432,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        allow_batch_invariant_sigmoid_topk=True,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1443,6 +1447,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=allow_batch_invariant_sigmoid_topk,
         )
 
     def _uses_sigmoid_topk_kernel(
@@ -1526,6 +1531,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

@@ -865,6 +865,7 @@ def topk_routing_with_score_function(
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    allow_batch_invariant_sigmoid_topk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -899,6 +900,9 @@ def topk_routing_with_score_function(
                                                 K3 Quantile Balancing histogram bounds.
         topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
                                                [num_tokens, topk]. Only used by the fused TE path.
+        allow_batch_invariant_sigmoid_topk (bool): Allow the batch-invariant Triton sigmoid top-k
+            optimization. Set False when routing must keep the reference implementation across
+            passes. Defaults to True.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -985,7 +989,8 @@ def topk_routing_with_score_function(
         return fused_topk_with_score_function(**kwargs)
 
     if (
-        router_replay is None
+        allow_batch_invariant_sigmoid_topk
+        and router_replay is None
         and precomputed_indices is None
         and not use_quantile_balancing
         and _use_batch_invariant_sigmoid_topk(

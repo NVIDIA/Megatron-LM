@@ -149,6 +149,34 @@ def test_unsupported_configurations_keep_reference_routing(monkeypatch, override
         )
 
 
+def test_opt_out_keeps_reference_routing(monkeypatch):
+    """Callers that must stay on the reference router (global-batch QB) can opt out of the kernel."""
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("opting out must keep the reference routing")
+
+    monkeypatch.setattr(moe_utils, "sigmoid_topk_routing", unexpected)
+    logits, bias = _inputs(64, 128)
+    with set_batch_invariant_mode(True):
+        topk_routing_with_score_function(
+            logits,
+            6,
+            scaling_factor=2.5,
+            score_function="sigmoid",
+            expert_bias=bias,
+            allow_batch_invariant_sigmoid_topk=False,
+        )
+        logits.requires_grad_(True)
+        topk_routing_with_score_function(
+            logits,
+            6,
+            scaling_factor=2.5,
+            score_function="sigmoid",
+            expert_bias=bias,
+            allow_batch_invariant_sigmoid_topk=False,
+        )
+
+
 def test_default_mode_keeps_reference_routing(monkeypatch):
     def unexpected(*args, **kwargs):
         pytest.fail("routing outside batch-invariant mode must not change")
