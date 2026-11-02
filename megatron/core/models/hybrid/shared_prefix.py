@@ -8,8 +8,8 @@ to opt in. This module validates the stack and runs its layers in order; the lay
 execution lives with the layers. Mamba layers run
 :func:`megatron.core.ssm.mamba_shared_prefix.forward_mamba_layer_shared_prefix`, which calls the
 layer and scans each prefix once, forking its state into the completion branches. Attention
-layers run the exact-backward forest attention in
-:mod:`megatron.core.transformer.shared_prefix_attention`.
+layers run the exact-backward forest attention in :mod:`megatron.core.ops.attention.shared_prefix`
+after :mod:`megatron.core.transformer.shared_prefix_attention` validates them.
 Unsupported topology or model features fail before executing a partial forward.
 
 CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The
@@ -237,7 +237,7 @@ def _validate_hybrid_stack(
             "shared-prefix Hybrid adapter does not support sliding-window attention"
         )
     if stack.config.softmax_type != "vanilla":
-        raise NotImplementedError("shared-prefix fused attention supports only vanilla softmax")
+        raise NotImplementedError("shared-prefix forest attention supports only vanilla softmax")
 
     num_moe_experts = stack.config.num_moe_experts
     expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
@@ -372,7 +372,7 @@ def forward_hybrid_stack_shared_prefix(
     stack validation is then not repeated; the length implied by ``hidden_states`` must match.
     """
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
+        raise TypeError("shared-prefix forest attention requires fp16 or bf16 hidden states")
     if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
         raise ValueError(
             "shared-prefix Hybrid input must have shape [sequence/(TP*CP), 1, hidden] "
