@@ -806,6 +806,97 @@ def test_kda_gate_jit_path_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
 
 
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_deterministic_mode_pins_fla_autotuners(monkeypatch, two_stage_gates):
+    """KDA has no non-FLA core kernel, so deterministic mode runs it on FLA's autotuned kernels,
+    some of whose candidates give different bits (the L2 norm, the gated output norm and the
+    gate cumsum). The policy pins every FLA autotuner the layer reaches, without timing any."""
+    pytest.importorskip("transformer_engine")
+    import torch.nn.functional as F
+    from triton.runtime.autotuner import Autotuner
+
+    from megatron.core import parallel_state
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net.kda import HAVE_FLA_KDA, KimiDeltaAttention
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+    from megatron.core.tuning import selection
+    from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
+
+    if not HAVE_FLA_KDA:
+        pytest.skip("needs FLA with KDA")
+
+    reached = set()
+    run = Autotuner.run
+
+    def record_fla_autotuners(tuner, *args, **kwargs):
+        qualified = f"{selection.kernel_module(tuner)}.{selection.kernel_name(tuner)}"
+        if qualified.startswith("fla.") and len(tuner.configs) > 1:
+            reached.add(qualified)
+        return run(tuner, *args, **kwargs)
+
+    def forbid_benchmark(*args, **kwargs):
+        raise AssertionError("deterministic KDA benchmarked a config")
+
+    monkeypatch.setattr(Autotuner, "run", record_fla_autotuners)
+    monkeypatch.setattr(Autotuner, "_bench", forbid_benchmark)
+    seeded()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = KDALayerConfig(
+            hidden_size=512,
+            num_layers=1,
+            num_attention_heads=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            kda_two_stage_gates=two_stage_gates,
+            kda_safe_gate=True,
+            kda_lower_bound=-5.0,
+            normalization="RMSNorm",
+            activation_func=F.silu,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            experimental_attention_variant="kda",
+            is_hybrid_model=True,
+            deterministic_mode=True,
+        )
+        spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
+        layer = KimiDeltaAttention(
+            config,
+            submodules=spec.submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                cp=parallel_state.get_context_parallel_group(),
+            ),
+        )
+        hidden = torch.randn(
+            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                layer, (hidden, None), replays=2, contention=True, what="deterministic KDA"
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+    expected = {"fla.ops.kda.gate.kda_gate_chunk_cumsum_vector_kernel"}
+    if two_stage_gates:
+        expected |= {
+            "fla.modules.l2norm.l2norm_fwd_kernel",
+            "fla.modules.fused_norm_gate.layer_norm_gated_fwd_kernel",
+        }
+    assert expected <= reached, sorted(reached)
+    for qualified in sorted(reached):
+        choices = [value for key, value in choice_log().items() if f"|{qualified}|" in key]
+        assert choices and all(value.endswith(";pinned") for value in choices), qualified
+
+
 def test_kda_fp8_opt_out_scope_is_replay_safe():
     """KDA-only FP8 initialization selection remains stable across the dispatch path."""
     from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled

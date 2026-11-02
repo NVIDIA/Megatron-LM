@@ -327,6 +327,21 @@ def test_module_scope_respects_package_boundaries(isolated_policy, monkeypatch):
     assert tuner.run(None, 128) == 128
 
 
+@pytest.mark.parametrize(
+    "module", ["fla.modules.l2norm", "fla.modules.fused_norm_gate", "fla.ops.kda.gate"]
+)
+def test_deterministic_mode_pins_the_fla_kernels_kda_runs(isolated_policy, monkeypatch, module):
+    """KDA runs on FLA kernels in deterministic mode, and the candidates of these give different
+    bits, so the default scope pins FLA's autotuners without timing them."""
+    tuner, _ = make_tuner(module=module)
+    monkeypatch.setattr(tuner, "_bench", forbid_benchmark)
+    interception.install(AutotunePolicy(), deterministic=True)
+    assert tuner.run(None, 128) == 32
+    assert list(interception.choice_log().values()) == [
+        f"{selection.config_signature(tuner.configs[0])};pinned"
+    ]
+
+
 def test_record_mode_keeps_autotuning_and_captures_the_winner(
     isolated_policy, monkeypatch, tmp_path
 ):

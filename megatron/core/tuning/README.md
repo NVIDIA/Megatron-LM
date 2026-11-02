@@ -85,11 +85,12 @@ The static fallback is reproducible for identical candidates and inputs. Its
 cost estimate is not a throughput model and cannot predict every compile-time
 resource failure. Invalid selections raise; they never retry with timing.
 
-By default the adapter covers `mamba_ssm`, `transformer_engine`, and
-`megatron.core`, including submodules, so every in-tree Triton autotuner (SSM
-ops and fusions such as the MLA RoPE and mHC kernels) is covered, including those
-imported before model configuration. Override `modules` to include another
-package; this replaces the default list.
+By default the adapter covers `mamba_ssm`, `transformer_engine`,
+`megatron.core`, and `fla` (flash-linear-attention), including submodules, so
+every in-tree Triton autotuner (SSM ops and fusions such as the MLA RoPE and mHC
+kernels) is covered, including those imported before model configuration, and so
+are the FLA kernels that KDA runs in deterministic mode. Override `modules` to
+include another package; this replaces the default list.
 
 Some covered kernels produce the same values whatever configuration they run.
 `config_invariant` lists them by qualified name (`module.function`); they keep
@@ -211,7 +212,7 @@ The training arguments are generated from `AutotunePolicy`: each field has a
 `--triton-autotune-<field>` argument (underscores become hyphens) whose help is
 the field's docstring, for example `--triton-autotune-on-miss error` or
 `--triton-autotune-verify-strict`. Tuple fields take several values
-(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core my_package`),
+(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core fla my_package`),
 `--triton-autotune-config-invariant` without names pins every kernel in scope,
 and `--triton-autotune-block-sizes` takes `NAME=VALUE` pairs such as
 `BLOCK_C=512 BLOCK_S=1`.

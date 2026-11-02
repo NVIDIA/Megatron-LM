@@ -555,7 +555,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
-        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
+        notes="GDN and GDN2 require gdn_kernel_backend='torch' under deterministic_mode, which "
+        "selects their torch chunk kernels over FLA (recorded non-deterministic). KDA has no "
+        "non-FLA core kernel: under deterministic_mode it still runs FLA's chunk_kda (and, with "
+        "two-stage gates, FLA's L2 norm and gated RMSNorm; single-stage gates swap in "
+        "torch_l2norm and F.conv1d), and the autotune policy pins every FLA autotuner ('fla' is "
+        "in its default modules), checked by test_kda_deterministic_mode_pins_fla_autotuners. "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "

@@ -24,7 +24,10 @@ import torch
 
 _deterministic_override = None
 
-DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core")
+# ``fla`` (flash-linear-attention) is in scope because KDA runs on its kernels in deterministic
+# mode too, and some of them, such as its L2 norm and gated output norm, round differently
+# from one candidate to the next.
+DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core", "fla")
 
 # Kernels whose outputs do not depend on the launch configuration, so a timed choice
 # cannot change results and pinning would only cost throughput. Only pure data movement
