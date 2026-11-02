@@ -44,13 +44,15 @@ class _Boundary(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, options, consumer_weight, residual, *values):
-        streams, replay_manager, mxfp8_handoff, mxfp8_consumer, epsilon = options
+        streams, replay_manager, mxfp8_handoff, mxfp8_consumer, epsilon, update_count = options
         from .forward_kernel import forward
 
-        count = (len(values) - 2) // 3
-        updates = values[:count]
-        write, retain = values[count : count + 2]
-        reads, gammas = values[count + 2 : 2 * count + 2], values[2 * count + 2 :]
+        # values: updates, write, retain, then one read and one gamma per reader.
+        count = (len(values) - 2 - update_count) // 2
+        updates = values[:update_count]
+        write, retain = values[update_count : update_count + 2]
+        reads = values[update_count + 2 : update_count + 2 + count]
+        gammas = values[update_count + 2 + count :]
         hidden = updates[0].shape[-1]
         validate_input(residual, hidden, streams, inference=ctx is None)
         leading = residual.shape[:-1]
@@ -85,7 +87,13 @@ class _Boundary(torch.autograd.Function):
         ctx.save_for_backward(
             residual, saved.update, saved.coefficients, *saved.gammas, *saved.rstd
         )
-        ctx.boundary_spec = (saved.controller_sizes, saved.has_retention, streams, leading)
+        ctx.boundary_spec = (
+            saved.controller_sizes,
+            saved.has_retention,
+            streams,
+            leading,
+            update_count,
+        )
         ctx.mxfp8_reader = None
         if mxfp8_handoff:
             from .mxfp8_handoff import Reader
@@ -100,7 +108,7 @@ class _Boundary(torch.autograd.Function):
         from .backward_kernel import backward
         from .kernel_utils import SavedWrite
 
-        sizes, has_retention, streams, leading = ctx.boundary_spec
+        sizes, has_retention, streams, leading, update_count = ctx.boundary_spec
         previous, update, coefficients, *readers = ctx.saved_tensors
         ctx.previous.ensure()
         count = len(dys)
@@ -112,6 +120,7 @@ class _Boundary(torch.autograd.Function):
             sizes,
             num_streams=streams,
             has_retention=has_retention,
+            num_updates=update_count,
         )
         hidden = update.shape[1]
         previous = previous.view(-1, streams * hidden)
@@ -147,11 +156,11 @@ class _Boundary(torch.autograd.Function):
         # or norm weight, even when the internal kernel materializes zero dy.
         for index, grad in enumerate(dys):
             if grad is None:
-                grads[count + 3 + index] = None
-                grads[2 * count + 3 + index] = None
+                grads[update_count + 3 + index] = None
+                grads[update_count + 3 + count + index] = None
         # Memoize views so shared update gradients preserve Tensor identity.
         views = {}
-        for i, grad in enumerate(grads[: count + 1]):
+        for i, grad in enumerate(grads[: update_count + 1]):
             if grad is not None:
                 if id(grad) not in views:
                     views[id(grad)] = grad.view(*leading, streams * hidden if i == 0 else hidden)
@@ -162,16 +171,16 @@ class _Boundary(torch.autograd.Function):
 
 
 def _apply_boundary(
-    inputs, *, num_streams, mxfp8_handoff=False, mxfp8_consumer=None, epsilon=1.0e-5
+    inputs, updates, *, num_streams, mxfp8_handoff=False, mxfp8_consumer=None, epsilon=1.0e-5
 ):
     mxfp8 = bool(mxfp8_handoff or mxfp8_consumer is not None)
     if not torch.is_grad_enabled():
-        options = (num_streams, None, mxfp8, mxfp8_consumer, epsilon)
+        options = (num_streams, None, mxfp8, mxfp8_consumer, epsilon, updates)
         return _Boundary.forward(None, options, None, *inputs)
     if mxfp8_handoff and mxfp8_consumer is None:
         raise ValueError("training shortcut MXFP8 requires an explicit deferred consumer")
     # The explicit weight edge orders AccumulateGrad after the deferred TE wgrad.
-    options = (num_streams, current_manager(), mxfp8, mxfp8_consumer, epsilon)
+    options = (num_streams, current_manager(), mxfp8, mxfp8_consumer, epsilon, updates)
     weight = None if mxfp8_consumer is None else mxfp8_consumer.weight
     return _Boundary.apply(options, weight, *inputs)
 
@@ -196,30 +205,34 @@ def wide_residual_write_read_rmsnorm_quant(residual, update, write, retain, read
     Training MXFP8 calls require this consumer; standalone column reconstruction
     is not supported. Unused residual and reader outputs are supported.
     """
-    return _apply_boundary((residual, update, write, retain, read, gamma), **options)
+    return _apply_boundary((residual, update, write, retain, read, gamma), 1, **options)
 
 
 @dataclass(frozen=True)
 class PendingShortcutAdd:
-    """A MoE output not yet added to the wide residual.
+    """A branch output not yet written to the wide residual.
 
-    ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` applies it together with the
-    next pair's two read/RMSNorms. ``write``/``retain`` are the MoE write's logits (``retain`` is
-    None for fixed identity retention).
+    ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` writes it together with the
+    next pair's two read/RMSNorms. A MoE output is a shortcut add of ``routed`` and ``shared``;
+    a single branch update (for example a lone Mamba layer's output before a shortcut pair)
+    leaves ``shared`` None. ``write``/``retain`` are the writing connection's logits
+    (``retain`` is None for fixed identity retention).
     """
 
     residual: torch.Tensor
     routed: torch.Tensor
-    shared: torch.Tensor
+    shared: torch.Tensor | None
     write: torch.Tensor
     retain: torch.Tensor | None
 
 
 def shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(pending, reads, gammas, **options):
-    """Fuse the shortcut add (MoE write) and the next pair's two independent read/RMSNorms.
+    """Fuse a pending write and the next pair's two independent read/RMSNorms.
 
-    MXFP8 options have the same exclusivity contract as ``wide_residual_write_read_rmsnorm_quant``.
-    Only reader zero uses MXFP8; the router (reader one) remains BF16.
+    The write is a shortcut add (BF16 ``routed + shared``, as a MoE write) or, with
+    ``pending.shared`` None, a single update. MXFP8 options have the same exclusivity contract
+    as ``wide_residual_write_read_rmsnorm_quant``. Only reader zero uses MXFP8; the router
+    (reader one) remains BF16.
     """
     if len(reads) != 2 or len(gammas) != 2:
         raise ValueError(
@@ -227,6 +240,7 @@ def shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(pending, reads, ga
             "controllers and two RMSNorm weights"
         )
     p = pending
+    updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     return _apply_boundary(
-        (p.residual, p.routed, p.shared, p.write, p.retain, *reads, *gammas), **options
+        (p.residual, *updates, p.write, p.retain, *reads, *gammas), len(updates), **options
     )

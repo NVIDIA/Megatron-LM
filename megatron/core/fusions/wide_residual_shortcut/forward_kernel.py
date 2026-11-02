@@ -32,9 +32,9 @@ class _WriteArgs(NamedTuple):
     Attributes:
         residual: Previous FP32 residual, ``[M, STREAMS * H]``.
         update: First BF16 branch update, ``[M, H]``.
-        other_update: Second BF16 branch update with two readers (the first update again with one).
+        other_update: Second BF16 branch update of a shortcut add, or None for a single update.
         output: Current FP32 residual written by the kernel, ``[M, STREAMS * H]``.
-        summed_update: BF16 sum of the two-reader updates saved for backward, or None.
+        summed_update: BF16 sum of a shortcut add's updates saved for backward, or None.
     """
 
     residual: object
@@ -205,7 +205,36 @@ def _inference_leaf(m, h, streams, readers, mxfp8):
     return (4096, 2, 0, True, 0, 16, None, True), 1
 
 
-def _inference_config(m, h, streams, readers, mxfp8):
+def _single_write_leaf(m, h, streams, mxfp8):
+    """Return the inference leaf for one update read twice where it differs from the tree's.
+
+    Elsewhere the two-update (shortcut add) leaves serve one update as well. Fit to a GB300
+    sweep of the 16 recipes for one update and two readers (Nano/Super/Ultra, BF16/MXFP8, rows
+    32-1024), where these regions were up to 1.21x slower on the shortcut add's leaves, then
+    restricted to the widths and stream counts where no point of a 240-point check (hidden
+    4096-16384, 1-6 streams, the leaf vs the shortcut add's) was slower: 35 points at
+    1.05-1.30x (MXFP8, 3584 < H <= 5632) and 20 at 1.00-1.47x (H = 10240, 161-256 rows).
+    Wider rows spill the second leaf's registers, and widths with a partial 2048-column
+    segment (9984) lost up to 15%. On 28 further points (hidden 3840/4864/10240, 3-5
+    streams) the leaves were 1.00-1.34x faster.
+
+    Args:
+        m: Rows.
+        h: Hidden width.
+        streams: Residual streams.
+        mxfp8: Whether reader 0 is handed off as MXFP8.
+
+    Returns:
+        The leading ``_ForwardConfig`` fields, or None to use ``_inference_leaf``.
+    """
+    if mxfp8 and 3584 < h <= 5632 and m > 88 and (streams == 3 or (streams == 4 and h > 4096)):
+        return (4096, 2, 0, True, 0, 16, None, True)
+    if h == 10240 and 160 < m <= 256:
+        return (2048, 2, 1, True, 0, 8, 128, False)
+    return None
+
+
+def _inference_config(m, h, streams, readers, mxfp8, updates=None):
     """Return the LOADS_FIRST row config for an inference launch.
 
     Decode rows (<= 64 with one reader, <= 32 with two) of residuals with at least 8K columns use a cluster per row
@@ -219,6 +248,7 @@ def _inference_config(m, h, streams, readers, mxfp8):
         streams: Residual streams.
         readers: Reader count (1 or 2).
         mxfp8: Whether reader 0 is handed off as MXFP8.
+        updates: Branch updates written (2 for a shortcut add); None means one per reader.
 
     Returns:
         The ``_ForwardConfig`` to launch.
@@ -233,6 +263,9 @@ def _inference_config(m, h, streams, readers, mxfp8):
                     columns, 0, 0, False, 0, warps, None, True, 1, split, True, h // columns
                 )
     fields, replicas = _inference_leaf(m, h, streams, readers, mxfp8)
+    if readers == 2 and updates == 1:
+        single = _single_write_leaf(m, h, streams, mxfp8)
+        fields, replicas = (single, 1) if single is not None else (fields, replicas)
     split = replicas > 1 and readers == 2
     # Whole 32-column groups keep both data and MXFP8 scale ownership exhaustive.
     parts = min(replicas // (1 + split), (h // 32) & -(h // 32)) if h % 32 == 0 else 1
@@ -306,12 +339,15 @@ def _programmatic_launch(device):
     return torch.cuda.get_device_capability(device)[0] >= 9
 
 
-def choose_forward_config(m, h, streams, readers=1, *, mxfp8=False, inference=False):
+def choose_forward_config(m, h, streams, readers=1, *, mxfp8=False, inference=False, updates=None):
     """Choose the GB300 row forward kernel schedule.
 
-    Inference rows up to 1024 (hidden 3072-16384, up to 6 streams) use ``_inference_config``.
-    Training and long prefill use ``_FORWARD_CONFIGS`` for Nano/Super/Ultra and
-    ``_training_config`` for other covered shapes from 2048 rows. Everything else falls back
+    Inference rows up to 1024 (hidden 3072-16384, up to 6 streams) use ``_inference_config``;
+    one update read twice refines a few of its leaves (``_single_write_leaf``). Training and
+    long prefill use ``_FORWARD_CONFIGS`` for Nano/Super/Ultra and ``_training_config`` for
+    other covered shapes from 2048 rows; two readers share these configs between one and two
+    updates (one update was within 1.4% of the best of 32 recipes at Nano/Super/Ultra
+    2K-16K rows). Everything else falls back
     to profile heuristics fitted from decision trees over a 13K-trial config sweep.
 
     Args:
@@ -321,12 +357,13 @@ def choose_forward_config(m, h, streams, readers=1, *, mxfp8=False, inference=Fa
         readers: Reader count (1 or 2).
         mxfp8: Whether reader 0 is handed off as MXFP8.
         inference: Whether the launch skips backward state.
+        updates: Branch updates written (2 for a shortcut add); None means one per reader.
 
     Returns:
         The ``_ForwardConfig`` to launch.
     """
     if inference and m <= 1024 and 3072 <= h <= 16384 and streams <= 6:
-        return _inference_config(m, h, streams, readers, mxfp8)
+        return _inference_config(m, h, streams, readers, mxfp8, updates)
     width = max(32, triton.next_power_of_2(h))
     tile = min(width, 4096)
     if inference and m <= 1024:
@@ -383,9 +420,10 @@ def forward(
 ):
     """Write the current residual and the folded RMSNorm reader operands.
 
-    The update/reader count selects one or two readers. Inference skips backward state
-    (coefficients, the two-reader BF16 update sum and reader statistics), returning saved=None.
-    The residual writer rounds the two-reader BF16 update sum before writing the residual.
+    One or two readers (``reads``/``gammas``) consume the write of one update, or of a
+    shortcut add of two updates (two readers only). Inference skips backward state
+    (coefficients, the shortcut add's BF16 update sum and reader statistics), returning
+    saved=None. A shortcut add rounds its BF16 update sum before writing the residual.
     Residuals and temporary readers use FP32.
     Operands belong to forward consumers, not the tape. The exclusive MXFP8
     handoff quantizes reader zero; every other reader returns BF16.
@@ -397,7 +435,7 @@ def forward(
 
     Args:
         residual: Previous FP32 residual, ``[M, num_streams * H]``.
-        updates: One or two BF16 branch updates, each ``[M, H]``.
+        updates: One BF16 branch update, or two summed by a shortcut add, each ``[M, H]``.
         write: FP32 write-gate logits.
         retain: FP32 retention logits, or None for fixed identity retention.
         reads: FP32 mixing logits, one tensor per reader.
@@ -415,9 +453,10 @@ def forward(
         ValueError: If the inputs' counts, shapes, devices or MXFP8 alignment are invalid.
     """
     validate_num_streams(num_streams)
-    n = len(updates)
-    if n not in (1, 2) or len(reads) != n or len(gammas) != n:
-        raise ValueError("one update needs one read; two updates need two")
+    n = len(reads)
+    if n not in (1, 2) or len(gammas) != n or len(updates) not in range(1, n + 1):
+        raise ValueError("one or two readers write one update; two readers may add two")
+    shortcut_add = len(updates) == 2
     if not residual.is_cuda or updates[0].ndim != 2:
         raise ValueError("expected CUDA [M,H] updates")
     m, h = updates[0].shape
@@ -433,7 +472,9 @@ def forward(
         _tensor(controller, controller.shape, torch.float32, device, "controller")
     for gamma in gammas:
         _tensor(gamma, (h,), torch.bfloat16, device, "gamma")
-    config = choose_forward_config(m, h, num_streams, n, mxfp8=mxfp8_handoff, inference=inference)
+    config = choose_forward_config(
+        m, h, num_streams, n, mxfp8=mxfp8_handoff, inference=inference, updates=len(updates)
+    )
     c = None if inference else torch.empty((8 * num_streams,), device=device, dtype=torch.float32)
 
     if h % 4 == 0 and type(residual).__name__ not in ("FakeTensor", "FunctionalTensor"):
@@ -443,7 +484,7 @@ def forward(
 
     output_bf16 = (False, True)[:n] if mxfp8_handoff else (True,) * n
     current = torch.empty_like(residual)
-    summed = torch.empty_like(updates[0]) if n == 2 and not inference else None
+    summed = torch.empty_like(updates[0]) if shortcut_add and not inference else None
     stats = tuple(
         None if inference else torch.empty(m, dtype=torch.float32, device=device) for _ in range(n)
     )
@@ -466,13 +507,16 @@ def forward(
             tuple(0 if v is None else v.numel() for v in (write, retain, *reads)),
             num_streams,
             retain is not None,
+            len(updates),
         )
     )
     # A runtime unit retention coefficient preserves Ultra register occupancy.
     # Short rows duplicate reductions for occupancy; stores have one owner.
     dependent = inference and _programmatic_launch(device)
     grid = (m, 2 if config.SPLIT else 1, config.PARTS)
-    write_args = _WriteArgs(residual, updates[0], updates[-1], current, summed)
+    write_args = _WriteArgs(
+        residual, updates[0], updates[1] if shortcut_add else None, current, summed
+    )
     kwargs = dict(
         read_tensors=_ReadArgs(gammas, stats, *operand_buffers(qs, columnwise=False)),
         GEOMETRY=_Geometry(h, num_streams, retain is not None or h == 10240),
@@ -733,14 +777,7 @@ def _load_residual(write_tensors, row, stream, cols, GEOMETRY: gl.constexpr, CON
 
 
 @g.jit
-def _load_fragment(
-    write_tensors,
-    row,
-    cols,
-    GEOMETRY: gl.constexpr,
-    TWO_READERS: gl.constexpr,
-    CONFIG: gl.constexpr,
-):
+def _load_fragment(write_tensors, row, cols, GEOMETRY: gl.constexpr, CONFIG: gl.constexpr):
     """Issue one fragment's update loads, plus every stream's residual load with LOADS_FIRST.
 
     Args:
@@ -748,18 +785,18 @@ def _load_fragment(
         row: Row index.
         cols: Column indices of the fragment.
         GEOMETRY: ``_Geometry``.
-        TWO_READERS: Whether there are two updates.
         CONFIG: ``_ForwardConfig``.
 
     Returns:
-        ``(update, other, olds)``: the BF16 updates (``other`` repeats ``update`` with one reader) and,
-        with LOADS_FIRST, each stream's residual values (else an empty tuple).
+        ``(update, other, olds)``: the BF16 updates (``other`` repeats ``update`` without a
+        shortcut add) and, with LOADS_FIRST, each stream's residual values (else an empty
+        tuple).
     """
     H: gl.constexpr = GEOMETRY.H
     mask = cols < H
     update = gl.load(write_tensors.update + (row * H + cols), mask, 0)
-    other = update  # unused with one reader
-    if TWO_READERS:
+    other = update  # unused without a shortcut add
+    if write_tensors.other_update is not None:
         other = gl.load(write_tensors.other_update + (row * H + cols), mask, 0)
     NUM_STREAMS: gl.constexpr = GEOMETRY.STREAMS
     olds = ()
@@ -792,7 +829,7 @@ def _mix_fragment(
         row: Row index.
         cols: Column indices of the fragment.
         GEOMETRY: ``_Geometry``.
-        TWO_READERS: Whether there are two updates and readers.
+        TWO_READERS: Whether there is a second reader.
         CONFIG: ``_ForwardConfig``.
         OWNER: Mask of the columns this CTA stores.
         LOADED: Loads already issued by ``_load_fragment``, or None to load here.
@@ -805,10 +842,10 @@ def _mix_fragment(
     HAS_RETENTION: gl.constexpr = GEOMETRY.HAS_RETENTION
     mask = cols < H
     if LOADED is None:
-        LOADED = _load_fragment(write_tensors, row, cols, GEOMETRY, TWO_READERS, CONFIG)
+        LOADED = _load_fragment(write_tensors, row, cols, GEOMETRY, CONFIG)
     update, other, olds = LOADED
     update = update.to(gl.float32)
-    if TWO_READERS:
+    if write_tensors.other_update is not None:  # shortcut add
         other = other.to(gl.float32)
         update = (update + other).to(gl.bfloat16).to(gl.float32)
         if write_tensors.summed_update is not None:
@@ -992,7 +1029,7 @@ def _forward(
         gdc_wait()  # PDL: wait for the preceding grid before any memory access
     H: gl.constexpr = GEOMETRY.H
     gammas = read_tensors.gammas
-    TWO_READERS: gl.constexpr = len(gammas) == 2  # Still combines two updates when split.
+    TWO_READERS: gl.constexpr = len(gammas) == 2  # Split CTAs still mix both updates.
     partition: gl.constexpr = (CONFIG.PARTS, CONFIG.SPLIT, CONFIG.CLUSTER)
     K: gl.constexpr = CONFIG.CLUSTER
     if CONFIG.SPLIT:
@@ -1028,9 +1065,7 @@ def _forward(
     if CONFIG.LOADS_FIRST:
         for segment in gl.static_range(NUM_SEGMENTS):
             loaded += (
-                _load_fragment(
-                    write_tensors, row, cols + segment * width, GEOMETRY, TWO_READERS, CONFIG
-                ),
+                _load_fragment(write_tensors, row, cols + segment * width, GEOMETRY, CONFIG),
             )
     if EXCHANGE is not None:
         # With the loads in flight, arm this CTA's exchange barrier and signal the cluster.

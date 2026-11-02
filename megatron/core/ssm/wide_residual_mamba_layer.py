@@ -31,6 +31,10 @@ class WideResidualMambaLayer(MambaLayer):
     # residual read/norm and write: the layer takes a normalized input and returns the raw
     # mixer output.
     using_shortcut_moe_fused_residual_kernel: bool = False
+    # Set by group_layers_into_shortcut_blocks on a lone layer directly before a fused
+    # ShortcutMoEBlock: the layer returns its residual write as a PendingShortcutAdd (single
+    # update) that the block's two-reader kernel writes with its compute and shortcut reads.
+    defers_write_to_shortcut_block: bool = False
 
     def __init__(
         self,
@@ -137,6 +141,8 @@ class WideResidualMambaLayer(MambaLayer):
 
         if self.using_shortcut_moe_fused_residual_kernel:
             return mixer_out_with_bias
+        if self.defers_write_to_shortcut_block:
+            return self._pending_write(mixer_out_with_bias, state)
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
         if recompute_context is not None and not recompute_context.is_block_end:
@@ -155,6 +161,24 @@ class WideResidualMambaLayer(MambaLayer):
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
             )
+
+    def _pending_write(self, mixer_out_with_bias, state: ResidualConnectionState):
+        """Return the residual write for the following fused block instead of applying it."""
+        from megatron.core.fusions.wide_residual_shortcut import PendingShortcutAdd
+
+        update, bias = mixer_out_with_bias
+        if bias is not None:
+            raise ValueError("a deferred shortcut write requires a bias-free mixer projection")
+        if state is None:
+            raise RuntimeError("Missing state for the Mamba residual connection.")
+        write = self.residual_write
+        return PendingShortcutAdd(
+            state[0],
+            update,
+            None,
+            write.write_map(return_logits=True).float(),
+            None if write.retention is None else write.retention(return_logits=True).float(),
+        )
 
     def _pack_two_stage_output(
         self, ssm_output: Tensor, state: ResidualConnectionState

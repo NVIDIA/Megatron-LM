@@ -43,11 +43,18 @@ class SavedWrite:
     num_streams: int = 3
     # None is a structural mode, never inferred from a learned coefficient value.
     has_retention: bool = True
+    # Branch updates summed into ``update`` (two for a shortcut add); None means one per reader.
+    num_updates: int | None = None
 
     @property
     def reader_count(self):
         """Return the number of readers produced by this write."""
         return len(self.gammas)
+
+    @property
+    def update_count(self):
+        """Return the number of branch updates whose (BF16) sum is ``update``."""
+        return self.reader_count if self.num_updates is None else self.num_updates
 
 
 def validate_num_streams(num_streams):

@@ -710,8 +710,10 @@ class HybridStack(MegatronModule):
                 )
             else:
                 # A fused shortcut block hands its unwritten MoE output to an immediately
-                # following fused block, whose two-reader kernel applies it; any other successor (or the
-                # end of the stack) receives the written residual.
+                # following fused block, whose two-reader kernel applies it; any other successor
+                # (or the end of the stack) receives the written residual. A lone layer flagged
+                # defers_write_to_shortcut_block likewise hands its single update to the next
+                # (fused) block.
                 fused = [
                     getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
                     for layer in self.layers
@@ -848,13 +850,17 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                 )
 
-                        if isinstance(hidden_states, tuple):
-                            hidden_states = hidden_states[0]
-                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                        if cp_layout_state is not None:
-                            hidden_states = cp_layout_state.finalize_layer(
-                                physical_layer_idx, hidden_states
-                            )
+                        if getattr(layer, "defers_write_to_shortcut_block", False):
+                            # Unwritten: the next fused block's two-reader kernel writes it.
+                            pending_shortcut_add, hidden_states = hidden_states, None
+                        else:
+                            if isinstance(hidden_states, tuple):
+                                hidden_states = hidden_states[0]
+                            observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                            if cp_layout_state is not None:
+                                hidden_states = cp_layout_state.finalize_layer(
+                                    physical_layer_idx, hidden_states
+                                )
 
                     if residual_stream_recompute_context is not None:
                         residual_stream_recompute_context.finalize(hidden_states)

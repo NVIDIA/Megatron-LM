@@ -2,7 +2,8 @@
 """Kernel and API contracts of the fused wide-residual shortcut boundaries.
 
 ``wide_residual_write_read_rmsnorm_quant`` (one reader) and
-``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` (two readers): independent FP64
+``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` (two readers of a shortcut add, or of
+a single write when the pending add has no shared update): independent FP64
 and autograd references, backward schedules and scratch ownership, configs and shapes,
 checkpoint replay, inference, and the MXFP8 handoff to Transformer Engine (including real GTP
 sharding under ``torchrun --nproc-per-node 2 -m pytest <this file> -k gtp``). Bitwise determinism
@@ -89,14 +90,20 @@ MX_SHAPES = [
     (8192, 13312),
 ]
 
+# Seams as (readers, updates): one reader, a shortcut add read twice, a single write read twice.
+SEAMS = [(1, 1), (2, 2), (2, 1)]
+
 # ---------------------------------------------------------------- shared inputs and runners
 
 
-def inputs(streams, readers, hidden=96, tokens=1024, *, retention=True, seed=917, pad=2):
+def inputs(
+    streams, readers, hidden=96, tokens=1024, *, retention=True, seed=917, pad=2, updates=None
+):
     """Seeded leaves (residual, updates, controllers, gammas).
 
-    Controllers carry ``pad`` unused trailing logits; retention=False drops the retain
-    controller (static identity) after drawing it.
+    ``updates`` defaults to one per reader (two readers: a shortcut add). Controllers carry
+    ``pad`` unused trailing logits; retention=False drops the retain controller (static
+    identity) after drawing it.
     """
     torch.manual_seed(seed)
     bf16 = torch.bfloat16
@@ -105,7 +112,7 @@ def inputs(streams, readers, hidden=96, tokens=1024, *, retention=True, seed=917
         return torch.randn(*shape, device="cuda", dtype=dtype, requires_grad=True)
 
     residual = leaf(tokens, streams * hidden)
-    updates = tuple(leaf(tokens, hidden, dtype=bf16) for _ in range(readers))
+    updates = tuple(leaf(tokens, hidden, dtype=bf16) for _ in range(updates or readers))
     controllers = tuple(leaf(streams + pad) for _ in range(2 + readers))
     gammas = tuple(leaf(hidden, dtype=bf16) for _ in range(readers))
     if not retention:
@@ -113,21 +120,25 @@ def inputs(streams, readers, hidden=96, tokens=1024, *, retention=True, seed=917
     return residual, updates, controllers, gammas
 
 
-def mx_inputs(m, h, readers):
+def mx_inputs(m, h, readers, updates=None):
     """Three-stream MXFP8 handoff inputs with unpadded controllers."""
-    return inputs(3, readers, h, m, seed=319, pad=0)
+    return inputs(3, readers, h, m, seed=319, pad=0, updates=updates)
 
 
 def run(raw, streams=3, epsilon=1e-5, **options):
-    """Call the one-reader or two-reader public API."""
+    """Call the one-reader or two-reader public API (a shortcut add with two updates)."""
     residual, updates, controllers, gammas = raw
     options.update(num_streams=streams, epsilon=epsilon)
-    if len(updates) == 1:
+    if len(gammas) == 1:
         return wide_residual_write_read_rmsnorm_quant(
             residual, updates[0], *controllers, gammas[0], **options
         )
+    shared = updates[1] if len(updates) == 2 else None
     return shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
-        PendingShortcutAdd(residual, *updates, *controllers[:2]), controllers[2:], gammas, **options
+        PendingShortcutAdd(residual, updates[0], shared, *controllers[:2]),
+        controllers[2:],
+        gammas,
+        **options,
     )
 
 
@@ -154,7 +165,7 @@ def fwd(raw, streams=3, **options):
 def backward_args(raw, streams=3, **options):
     """Forward, then random reader/carry gradients: (current, (saved, previous, dys, carry))."""
     current, saved, _ = fwd(raw, streams, **options)
-    dys = tuple(torch.randn_like(u) for u in raw[1])
+    dys = tuple(torch.randn_like(raw[1][0]) for _ in raw[3])
     return current, (saved, raw[0], dys, torch.randn_like(current))
 
 
@@ -258,7 +269,7 @@ def run_with_scratch(backward, *args, **kwargs):
     )
 
 
-def capture_backward_config(m, h, streams, readers, *, columns, retention, grid):
+def capture_backward_config(m, h, streams, readers, *, columns, retention, grid, updates=None):
     """Inspect real backward scheduling while replacing allocation and GPU launch."""
 
     class Captured(Exception):
@@ -274,6 +285,7 @@ def capture_backward_config(m, h, streams, readers, *, columns, retention, grid)
         update=SimpleNamespace(shape=(m, h), device="cuda", dtype=torch.bfloat16),
         coefficients=SimpleNamespace(new_empty=lambda *args, **kwargs: object()),
         reader_count=readers,
+        update_count=updates or readers,
         num_streams=streams,
         has_retention=retention,
         controller_sizes=(streams, streams if retention else 0) + (streams,) * readers,
@@ -416,7 +428,7 @@ def standard_backward(saved, previous, dys, carry, *, prepare_wgrad=None):
             gradient[:streams] = value.float()
         control_grads.append(gradient)
     return (
-        (residual_grad, *((update_grad,) * readers), *control_grads, *gamma_grads),
+        (residual_grad, *((update_grad,) * saved.update_count), *control_grads, *gamma_grads),
         tuple(columns),
     )
 
@@ -443,33 +455,35 @@ def assert_columns_equal(actual, expected):
 WIDEST = (11264, 13312, 14336, 16384)
 FORWARD_CASES = (
     [
-        (s, n, h, m, 1e-5, T)
+        (s, n, u, h, m, 1e-5, T)
         for s in range(1, 7)
-        for n in (1, 2)
+        for n, u in SEAMS
         for h, m in ((32, 1024), (96, 1024), (128, 2048), (1024, 1024), (3072, 1024), (4128, 1024))
     ]
     # Production widths and a second RMSNorm epsilon; (3072, 1e-5) is listed above.
     + [
-        (3, n, h, 1024, e, T)
+        (3, n, u, h, 1024, e, T)
         for h in (3072, 4096, 10240)
-        for n in (1, 2)
+        for n, u in SEAMS
         for e in (1e-5, 1e-3)
         if (h, e) != (3072, 1e-5)
     ]
     # Widest admitted widths leave near-cancelling controller sums to the contribution bound.
-    + [(s, n, h, 1024, 1e-5, F) for h in WIDEST for n in (1, 2) for s in (1, 3, 6)]
+    + [(s, n, u, h, 1024, 1e-5, F) for h in WIDEST for n, u in SEAMS for s in (1, 3, 6)]
 )
 
 
 @GPU
-@pytest.mark.parametrize("streams,readers,hidden,tokens,epsilon,controllers", FORWARD_CASES)
-def test_forward_and_complete_backward(streams, readers, hidden, tokens, epsilon, controllers):
+@pytest.mark.parametrize("streams,readers,updates,hidden,tokens,epsilon,controllers", FORWARD_CASES)
+def test_forward_and_complete_backward(
+    streams, readers, updates, hidden, tokens, epsilon, controllers
+):
     """Outputs and autograd gradients against the FP64 formula."""
-    raw = inputs(streams, readers, hidden, tokens)
+    raw = inputs(streams, readers, hidden, tokens, updates=updates)
     originals = (raw[0], *raw[1], *raw[2], *raw[3])
     cloned = tuple(t.detach().clone().requires_grad_(True) for t in originals)
-    n = readers
-    ref_raw = (cloned[0], cloned[1 : 1 + n], cloned[1 + n : 3 + 2 * n], cloned[3 + 2 * n :])
+    n, u = readers, updates
+    ref_raw = (cloned[0], cloned[1 : 1 + u], cloned[1 + u : 3 + u + n], cloned[3 + u + n :])
     actual, expected = run(raw, streams, epsilon), reference(ref_raw, streams, epsilon)
     torch.testing.assert_close(actual[0], expected[0], rtol=2e-6, atol=2e-6)
     for a, b in zip(actual[1:], expected[1:]):
@@ -673,17 +687,45 @@ def test_shared_update_gradients(native, hidden):
         all_bytes_equal(native_backward(*args, **options)[0], native_backward(*args, **options)[0])
 
 
+@GPU
+@pytest.mark.parametrize("native", [False, pytest.param(True, marks=QUALIFIED)])
+@pytest.mark.parametrize("hidden", [3072, 4096, 10240])
+def test_single_write_two_reader_gradients(native, hidden):
+    """A single write read twice returns one update gradient and saves the update itself."""
+    raw = inputs(3, 2, hidden, 1024, updates=1)
+    with torch.no_grad():
+        _, args = backward_args(raw)
+    saved = args[0]
+    # The tape keeps the caller's update (no BF16 sum is materialized).
+    assert saved.update_count == 1 and saved.update.data_ptr() == raw[1][0].data_ptr()
+    with torch.no_grad():
+        grads, _ = backward_kernel.backward(*args, config=hidden // 128 if native else "auto")
+        expected, _ = standard_backward(*args)
+    # dR, du, write, retain, two reads, two gammas.
+    assert len(grads) == len(expected) == 8
+    assert_grads_close(grads, expected)
+    outputs = run(raw)
+    gradients = torch.autograd.grad(
+        outputs, (raw[0], raw[1][0], *raw[2], *raw[3]), [torch.ones_like(t) for t in outputs]
+    )
+    assert all(g is not None for g in gradients)
+    # Without a shortcut add the inference API also takes a single update.
+    with torch.no_grad():
+        inference = run(raw)
+    assert torch.equal(inference[0], outputs[0])
+
+
 @QUALIFIED
 @pytest.mark.parametrize(
     "shape", MX_SHAPES[3:10] + [(2048, h) for h in WIDEST[:3]] + [(1024, 4128)]
 )
-@pytest.mark.parametrize("readers", [1, 2])
+@pytest.mark.parametrize("readers,updates", SEAMS)
 @pytest.mark.parametrize("columns", [False, True])
 @pytest.mark.parametrize("retention", [False, True])
-def test_expanded_native_backward(shape, readers, columns, retention):
+def test_expanded_native_backward(shape, readers, updates, columns, retention):
     """Native backward and its MXFP8 columns match the FP64/TE reference on expanded shapes."""
     m, h = shape
-    raw = inputs(3, readers, h, m, retention=retention)
+    raw = inputs(3, readers, h, m, retention=retention, updates=updates)
     _, args = backward_args(raw, mxfp8_handoff=columns)
     expected = standard_backward(*args, prepare_wgrad=(columns,) + (False,) * (readers - 1))
     actual = backward_kernel.backward(*args, save_columns=columns)
@@ -831,13 +873,13 @@ def test_inference_config_domain():
     Up to 1024 rows at widths 3072-16384, every heuristic tree leaf is a valid LOADS_FIRST
     config; training, long rows and untuned widths keep the original load order.
     """
-    tree_rows = (1, 16, 32, 40, 41, 72, 73, 88, 89, 128, 129, 512, 1024)
-    for hidden, streams, readers, quantized in itertools.product(
-        range(3072, 16385, 1024), range(1, 7), (1, 2), (False, True)
+    tree_rows = (1, 16, 32, 40, 41, 72, 73, 88, 89, 128, 129, 160, 161, 448, 449, 512, 1024)
+    for hidden, streams, (readers, updates), quantized in itertools.product(
+        range(3072, 16385, 512), range(1, 7), SEAMS, (False, True)
     ):
         for m in tree_rows:
             cfg = forward_kernel.choose_forward_config(
-                m, hidden, streams, readers, mxfp8=quantized, inference=True
+                m, hidden, streams, readers, mxfp8=quantized, inference=True, updates=updates
             )
             assert cfg.LOADS_FIRST and cfg.WIDTH & (cfg.WIDTH - 1) == 0
             assert cfg.WIDTH >= 128 * cfg.NUM_WARPS
@@ -847,11 +889,21 @@ def test_inference_config_domain():
             if cfg.CLUSTER > 1:
                 assert cfg.CLUSTER <= 8 and cfg.PARTS == 1 and hidden % cfg.CLUSTER == 0
                 assert (hidden // cfg.CLUSTER) % cfg.WIDTH == 0
+            # The update count only refines inference leaves of two readers past decode rows.
+            shortcut_add = forward_kernel.choose_forward_config(
+                m, hidden, streams, readers, mxfp8=quantized, inference=True
+            )
+            if readers == 1 or updates == 2 or cfg.CLUSTER > 1:
+                assert cfg == shortcut_add
         for m, h, inference in ((32, hidden, False), (1025, hidden, True), (32, 2048, True)):
             cfg = forward_kernel.choose_forward_config(
-                m, h, streams, readers, mxfp8=quantized, inference=inference
+                m, h, streams, readers, mxfp8=quantized, inference=inference, updates=updates
             )
             assert not cfg.LOADS_FIRST
+            # Training and long prefill share the shortcut add's configs.
+            assert cfg == forward_kernel.choose_forward_config(
+                m, h, streams, readers, mxfp8=quantized, inference=inference
+            )
     replicas_by_rows = ((1, 8), (16, 8), (17, 4), (32, 4), (33, 2), (64, 2), (65, 1))
     replicas_by_rows += ((1024, 1), (1025, 1), (8192, 1), (16384, 1))
     for hidden, readers, (tokens, replicas), quantized in itertools.product(
@@ -1144,13 +1196,13 @@ def test_mixed_fused_native_retained_backward(prune):
 # 16-layer intervals: one partial, one full, and two full plus a partial tail.
 @GPU
 @pytest.mark.parametrize("depth", [1, 16, 40])
-@pytest.mark.parametrize("readers", [1, 2])
-def test_deep_fused_replay_matches_saved_predecessors(depth, readers):
+@pytest.mark.parametrize("readers,updates", SEAMS)
+def test_deep_fused_replay_matches_saved_predecessors(depth, readers, updates):
     """Physical intervals and short tails preserve forward states and all gradients."""
     torch.manual_seed(853)
     original = [
         torch.randn(1024, 96, device="cuda"),
-        *[torch.randn(1024, 32, device="cuda", dtype=torch.bfloat16) for _ in range(readers)],
+        *[torch.randn(1024, 32, device="cuda", dtype=torch.bfloat16) for _ in range(updates)],
         torch.randn(3, device="cuda"),
         torch.full((3,), -0.8, device="cuda"),
         *[torch.randn(3, device="cuda") for _ in range(readers)],
@@ -1159,9 +1211,9 @@ def test_deep_fused_replay_matches_saved_predecessors(depth, readers):
 
     def execute(recompute):
         leaves = [value.detach().clone().requires_grad_() for value in original]
-        current, us = leaves[0], leaves[1 : readers + 1]
-        controllers = tuple(leaves[readers + 1 : 2 * readers + 3])
-        gammas = leaves[2 * readers + 3 :]
+        current, us = leaves[0], leaves[1 : updates + 1]
+        controllers = tuple(leaves[updates + 1 : updates + readers + 3])
+        gammas = leaves[updates + readers + 3 :]
         losses, slots, states = [], [], []
         with residual_replay_scope(replay_config(16 if recompute else 1), True) as manager:
             for _ in range(depth):
@@ -1339,10 +1391,12 @@ INFERENCE_BOUNDARY = [pytest.param(*c, marks=QUALIFIED) if c[2] else c for c in 
 
 @GPU
 @pytest.mark.parametrize("tokens,hidden,quantized,retention", INFERENCE_BOUNDARY)
-@pytest.mark.parametrize("readers", [1, 2])
-def test_megatron_inference_boundary(monkeypatch, tokens, hidden, quantized, retention, readers):
+@pytest.mark.parametrize("readers,updates", SEAMS)
+def test_megatron_inference_boundary(
+    monkeypatch, tokens, hidden, quantized, retention, readers, updates
+):
     """Megatron inference matches the taped forward bit for bit without backward state."""
-    raw = inputs(3, readers, hidden, tokens, retention=retention)
+    raw = inputs(3, readers, hidden, tokens, retention=retention, updates=updates)
     current, _, operands = taped_forward(fwd, raw, mxfp8_handoff=quantized)
     expected = list(buffers((current, *operands)))
     observed = forbid_backward_state(monkeypatch)
@@ -1360,10 +1414,10 @@ def test_megatron_inference_boundary(monkeypatch, tokens, hidden, quantized, ret
 @QUALIFIED
 @pytest.mark.parametrize("tokens", [32, 64, 96, 1024])
 @pytest.mark.parametrize("hidden", [3072, 4096, 10240])
-@pytest.mark.parametrize("readers", [1, 2])
-def test_megatron_inference_te_consumer(monkeypatch, tokens, hidden, readers):
+@pytest.mark.parametrize("readers,updates", SEAMS)
+def test_megatron_inference_te_consumer(monkeypatch, tokens, hidden, readers, updates):
     """A Transformer Engine MXFP8 linear consumes the inference handoff like the taped one."""
-    raw = inputs(3, readers, hidden, tokens)
+    raw = inputs(3, readers, hidden, tokens, updates=updates)
     _, _, operands = taped_forward(fwd, raw, mxfp8_handoff=True)
     layer = linear(hidden, mcore=True).eval()
     observed = forbid_backward_state(monkeypatch)

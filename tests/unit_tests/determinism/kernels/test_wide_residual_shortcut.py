@@ -24,6 +24,7 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401
     GPU,
     MX_SHAPES,
     QUALIFIED,
+    SEAMS,
     F,
     T,
     all_bytes_equal,
@@ -75,7 +76,8 @@ def assert_poisoned_graph(execute, expected, fill=poison_bytes):
 def forward_state(current, saved, operands):
     """Forward outputs and every saved-tape tensor, for byte comparisons."""
     data, scales = kernel_utils.operand_buffers(operands, columnwise=False)
-    tape = ((saved.update,) if saved.reader_count == 2 else ()) + (saved.coefficients, *saved.rstd)
+    # Only a shortcut add's BF16 update sum is written by the kernel.
+    tape = ((saved.update,) if saved.update_count == 2 else ()) + (saved.coefficients, *saved.rstd)
     return (current, *tape, *data, *(scale for scale in scales if scale is not None))
 
 
@@ -83,26 +85,26 @@ def forward_state(current, saved, operands):
 
 
 @pytest.mark.parametrize(
-    "streams,readers,retention,rows,hidden",
+    "streams,readers,updates,retention,rows,hidden",
     [
-        (s, n, t, 1024, h)
+        (s, n, u, t, 1024, h)
         for h in (96, 128, 288)
         for s in range(1, 7)
-        for n in (1, 2)
+        for n, u in SEAMS
         for t in (F, T)
     ]
     # Production shapes cover the fused forward layouts and the learned one-reader profile.
     + [
-        pytest.param(3, n, t, m, h, marks=QUALIFIED)
+        pytest.param(3, n, u, t, m, h, marks=QUALIFIED)
         for m, h in kernel_utils.FLAGSHIPS
-        for n in (1, 2)
+        for n, u in SEAMS
         for t in (F, T)
     ]
     # Production-size dispatch for other stream counts (three streams is listed above).
-    + [pytest.param(s, 2, T, 8192, 4096, marks=QUALIFIED) for s in (2, 5, 6)],
+    + [pytest.param(s, 2, u, T, 8192, 4096, marks=QUALIFIED) for s in (2, 5, 6) for u in (1, 2)],
 )
-def test_standard_boundaries_replay(streams, readers, retention, rows, hidden):
-    raw = inputs(streams, readers, hidden, rows, retention=retention)
+def test_standard_boundaries_replay(streams, readers, updates, retention, rows, hidden):
+    raw = inputs(streams, readers, hidden, rows, retention=retention, updates=updates)
     assert_replays_bit_exact(lambda *args: run(args, streams), raw, replays=3)
 
 
@@ -132,16 +134,18 @@ def test_checkpoint_chain_replay(streams, retention, hidden):
 @QUALIFIED
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("retention", [False, True])
-@pytest.mark.parametrize("readers", [1, 2])
+@pytest.mark.parametrize("readers,updates", SEAMS)
 @pytest.mark.parametrize(
     "rows,hidden",
     [*kernel_utils.FLAGSHIPS, (2048, 2048), (3072, 5120), (4096, 8192), (12288, 13312)]
     + [(2048, 16384), (32, 6144)],
 )
 @pytest.mark.parametrize("epsilon", [1e-5, 1e-3])
-def test_packet_forward_poisoned_replay(quantized, retention, readers, rows, hidden, epsilon):
+def test_packet_forward_poisoned_replay(
+    quantized, retention, readers, updates, rows, hidden, epsilon
+):
     """Production and heuristic forward schedules overwrite all outputs on replay."""
-    raw = inputs(3, readers, hidden, rows, retention=retention)
+    raw = inputs(3, readers, hidden, rows, retention=retention, updates=updates)
 
     def execute():
         return forward_state(*fwd(raw, mxfp8_handoff=quantized, epsilon=epsilon))
@@ -195,30 +199,35 @@ def test_packet_forward_offset_views(quantized, readers, operand, hidden, stream
 # a multiple of four use an offset residual; odd stream counts drop retention. MXFP8 covers
 # generic streams and initializes both row and column scale padding.
 GENERAL_FORWARD = [
-    (33 if inf else 64, h, s, n, inf, F)
+    (33 if inf else 64, h, s, n, u, inf, F)
     for h in (1, 48, 288, 1025, 2052, 18432, 32768)
     for s in range(1, 7)
-    for n in (1, 2)
+    for n, u in SEAMS
     for inf in (F, T)
 ] + [
-    pytest.param(m, h, s, 2, inf, T, marks=QUALIFIED)
+    pytest.param(m, h, s, 2, u, inf, T, marks=QUALIFIED)
     for m, h in ((32, 32), (64, 96), (96, 288), (160, 18432))
     for s in (1, 2, 4, 6)
+    for u in (1, 2)
     for inf in (F, T)
 ]
 
 
-@pytest.mark.parametrize("tokens,hidden,streams,readers,inference,quantized", GENERAL_FORWARD)
-def test_general_forward_replay(tokens, hidden, streams, readers, inference, quantized):
+@pytest.mark.parametrize(
+    "tokens,hidden,streams,readers,updates,inference,quantized", GENERAL_FORWARD
+)
+def test_general_forward_replay(tokens, hidden, streams, readers, updates, inference, quantized):
     """Arbitrary widths/streams match FP64; replay restores every poisoned saved/output byte."""
-    raw = inputs(streams, readers, hidden, tokens, retention=quantized or not streams % 2)
+    raw = inputs(
+        streams, readers, hidden, tokens, retention=quantized or not streams % 2, updates=updates
+    )
     if not quantized and hidden % 4:
         raw = (offset_view(raw[0]), *raw[1:])
 
     def execute():
         current, saved, outputs = fwd(raw, streams, inference=inference, mxfp8_handoff=quantized)
         tape = () if saved is None else (saved.coefficients, *saved.rstd)
-        if saved is not None and readers == 2:
+        if saved is not None and updates == 2:
             tape += (saved.update,)
         return current, *outputs, *tape
 
@@ -241,12 +250,12 @@ def test_general_forward_replay(tokens, hidden, streams, readers, inference, qua
 # forced retention (10240), and the widest profile.
 @pytest.mark.parametrize("tokens", [32, 64, 96, 320, 1024])
 @pytest.mark.parametrize("hidden", [3072, 4096, 7168, 10240, 13312, 14336])
-@pytest.mark.parametrize("readers", [1, 2])
+@pytest.mark.parametrize("readers,updates", SEAMS)
 @pytest.mark.parametrize("quantized", [False, pytest.param(True, marks=QUALIFIED)])
-def test_inference_poisoned_replay(monkeypatch, tokens, hidden, readers, quantized):
+def test_inference_poisoned_replay(monkeypatch, tokens, hidden, readers, updates, quantized):
     """Replay inference launches (including split two-reader schedules) without backward
     state; every poisoned output byte is restored."""
-    raw = inputs(3, readers, hidden, tokens)
+    raw = inputs(3, readers, hidden, tokens, updates=updates)
     observed = forbid_backward_state(monkeypatch)
     with torch.inference_mode(), InferenceMode.active():
         expected = [t.clone() for t in buffers(invoke(raw, quantized))]
@@ -284,13 +293,22 @@ POISONED_BACKWARD = (
         for c in (F, T)
     ]
 )
+# Two readers of a single write: the same kernel with one update gradient.
+POISONED_BACKWARD = [(*case, 2 if case[1] == 2 else 1) for case in POISONED_BACKWARD] + [
+    (s, 2, h, m, T, grid, (T, F), 1)
+    for s, h, m, grid in ((3, 4128, 1024, "auto"), (6, 96, 160, "auto"), (2, 3072, 1024, 24))
+    + tuple((3, h, m, "auto") for m, h in kernel_utils.FLAGSHIPS)
+]
 
 
 @QUALIFIED
-@pytest.mark.parametrize("streams,readers,hidden,rows,retention,grid,routes", POISONED_BACKWARD)
-def test_poisoned_backward_replay(streams, readers, hidden, rows, retention, grid, routes):
+@pytest.mark.parametrize(
+    "streams,readers,hidden,rows,retention,grid,routes,updates", POISONED_BACKWARD
+)
+def test_poisoned_backward_replay(streams, readers, hidden, rows, retention, grid, routes, updates):
     """A captured backward restores its eager outputs after all scratch is poisoned."""
-    _, args = backward_args(inputs(streams, readers, hidden, rows, retention=retention), streams)
+    raw = inputs(streams, readers, hidden, rows, retention=retention, updates=updates)
+    _, args = backward_args(raw, streams)
     options = dict(config=grid, prepare_wgrad=routes)
     execute = lambda: run_with_scratch(backward_kernel.backward, *args, **options)[1]
     eager = execute()

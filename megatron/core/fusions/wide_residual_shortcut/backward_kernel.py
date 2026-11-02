@@ -105,12 +105,16 @@ def backward(
     prepare_wgrad=None,
     on_columns_ready=None,
 ):
-    """Execute backward; both branches of a summed update share one gradient tensor.
+    """Execute backward; both updates of a shortcut add share one gradient tensor.
+
+    Returns ``(grads, columns)``: grads holds the residual gradient, one update gradient per
+    branch update, the controller gradients (write, retain, then one read per reader) and one
+    RMSNorm weight gradient per reader. Only the reader count shapes the kernel.
 
     Explicit config supports correctness/stress tests. on_columns_ready submits
     dependent weight GEMMs before the fused kernel, which never reads the columns.
     """
-    n, streams = saved.reader_count, saved.num_streams
+    n, streams, updates = saved.reader_count, saved.num_streams, saved.update_count
     m, h = saved.update.shape
     validate_num_streams(streams)
     if m <= 0 or m % 32 or h < 32 or h > 16384 or h % 32:
@@ -119,6 +123,8 @@ def backward(
         )
     if n not in (1, 2):
         raise ValueError("backward requires one or two readers")
+    if updates not in range(1, n + 1):
+        raise ValueError("backward requires one update, or two summed for two readers")
     if len(dys) != n:
         raise ValueError("backward requires one gradient slot per reader")
     if carry is None:
@@ -152,12 +158,12 @@ def backward(
         on_columns_ready(columns)
     knobs = get_backward_knobs(m, h, streams, n, grid=grid)
     grid = knobs.TARGET_CTAS
-    # Outputs and scratch belong to this invocation; summed updates share one gradient.
+    # Outputs and scratch belong to this invocation; a shortcut add's updates share one gradient.
     empty = saved.coefficients.new_empty
     du = empty((m, h), dtype=torch.bfloat16)
     grads = (
         empty((m, streams * h)),
-        *((du,) * n),
+        *((du,) * updates),
         *(empty((size,)) if size else None for size in saved.controller_sizes),
         *(empty((h,)) for _ in range(n)),
     )
@@ -242,7 +248,9 @@ def backward(
         *((1 + retention + r, (chunks[raw_b + r], write, retain)) for r in range(n)),
     )
     final = [(p, g, 0, 8, 0, None) for p, g in zip(gp, grads[-n:])]
-    for kind, (output, (index, combo)) in enumerate(zip(grads[1 + n : 3 + 2 * n], kinds)):
+    for kind, (output, (index, combo)) in enumerate(
+        zip(grads[1 + updates : 3 + updates + n], kinds)
+    ):
         if output is not None:
             final.append((plane(index), output, 1, 1, 0, coefficients(4 + kind), combo))
     reduce_jobs([(controllers, chunks, 1, 1, 1024, None)])

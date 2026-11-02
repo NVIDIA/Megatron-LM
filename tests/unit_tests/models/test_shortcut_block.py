@@ -961,12 +961,13 @@ def _run_blocks(blocks, x, manager=None):
     return x
 
 
-def _explicit_pairs(blocks, residual, manager=None):
+def _explicit_pairs(blocks, residual, manager=None, prepared=None):
     """Serial scheduling oracle using the same one-/two-reader arithmetic contract.
 
-    Independent of ShortcutMoEBlock.forward and its overlap/handoff logic.
+    Independent of ShortcutMoEBlock.forward and its overlap/handoff logic. ``prepared`` holds
+    the first block's normalized (compute, shortcut) inputs when a two-reader boundary already
+    produced them.
     """
-    prepared = None
     for i, block in enumerate(blocks):
         if manager is not None:
             manager.advance(2)
@@ -1125,6 +1126,166 @@ def test_fused_schedule_matches_serial_oracle(
             assert bytes_equal(a.grad, b.grad), name
 
 
+def _lone_then_blocks(
+    streams=3, retention=True, pairs=2, hidden=128, enabled=True, lone_last=False
+):
+    """A lone wide-residual Mamba layer followed by fused blocks (M -> [* E] [* E] ...).
+
+    ``lone_last`` moves the lone layer after the blocks instead.
+    """
+    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+    config = _fused_config(
+        num_layers=1 + 2 * pairs,
+        hidden_size=hidden,
+        num_attention_heads=4,
+        num_moe_experts=1,
+        moe_shared_expert_intermediate_size=128,
+        moe_shortcut_wide_residual_norm_fusion=enabled,
+        wide_residual=WideResidualConfig(num_streams=streams, learned_retention=retention),
+    )
+    pg = ProcessGroupCollection(tp=None)
+    submodules = MambaLayerSubmodules(mixer=_TanhMixer, norm=_BF16Norm)
+    physical, symbols = torch.nn.ModuleList(), []
+    for index in range(1, 2 * pairs + 2):
+        lone = index == (2 * pairs + 1 if lone_last else 1)
+        pair_index = index - (0 if lone_last else 1)
+        if lone or pair_index % 2:
+            physical.append(
+                WideResidualMambaLayer(config, submodules, layer_number=index, pg_collection=pg)
+            )
+            symbols.append(LayerSymbols.MAMBA if lone else LayerSymbols.GDN)
+        else:
+            physical.append(_WideMoE(config, index, pg))
+            symbols.append(LayerSymbols.MOE)
+    return group_layers_into_shortcut_blocks(physical, symbols, config).cuda()
+
+
+def _run_stack(layers, x, manager=None):
+    """Drive a lone layer and fused blocks like HybridStack's eager loop."""
+    pending = None
+    for i, layer in enumerate(layers):
+        block = isinstance(layer, ShortcutMoEBlock)
+        if manager is not None:
+            manager.advance(2 if block else 1)
+        if block:
+            defer = i + 1 < len(layers)
+            x = _run_block(layer, pending if pending is not None else x, defer=defer)
+            pending, x = (x, None) if defer else (None, x)
+        else:
+            x = layer(x)
+            if layer.defers_write_to_shortcut_block:
+                assert isinstance(x, PendingShortcutAdd) and x.shared is None
+                pending, x = x, None
+    return x
+
+
+def _two_reader_from_lone(lone, block, residual, pending):
+    """The lone layer's write plus ``block``'s compute and shortcut reads, from the kernel API."""
+    write = lone.residual_write
+    return kernels.shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
+        PendingShortcutAdd(
+            residual,
+            pending.routed,
+            None,
+            write.write_map(return_logits=True),
+            ShortcutMoEBlock._logits(write, "retention"),
+        ),
+        (
+            block.compute_layer.residual_read.read_map(return_logits=True),
+            block.shortcut_residual_read.read_map(return_logits=True),
+        ),
+        (block.compute_layer.norm.weight, block.shortcut_pre_mlp_layernorm.weight),
+        num_streams=block.config.wide_residual.num_streams,
+    )
+
+
+@GPU
+@pytest.mark.parametrize(
+    "streams,retention,interval",
+    [(2, False, None), (3, True, None), (3, True, 16), (6, True, None)],
+)
+def test_lone_layer_write_fuses_into_next_block(streams, retention, interval):
+    """M -> [* E]: the lone layer's write and the block's two reads are one two-reader kernel.
+
+    Outputs and all gradients match a serial oracle bit for bit, and the deferred write equals
+    the lone layer's own (unfused) residual write.
+    """
+    torch.manual_seed(4321)
+    layers = _lone_then_blocks(streams, retention, pairs=9 if interval else 2)
+    lone, blocks = layers[0], layers[1:]
+    assert lone.defers_write_to_shortcut_block
+    assert not any(b.compute_layer.defers_write_to_shortcut_block for b in blocks)
+    blocks[0].config.residual_stream_recompute_num_layers = interval
+    explicit = copy.deepcopy(layers)
+    hidden = blocks[0].config.hidden_size
+    r = torch.randn(1024, 1, streams * hidden, device="cuda", requires_grad=True)
+    other = r.detach().clone().requires_grad_(True)
+    with residual_replay_scope(blocks[0].config, True) as manager:
+        actual = _run_stack(layers, r, manager)
+
+    class FirstPairAdvanced:
+        """Forward the oracle's advances except the first pair's, already taken here."""
+
+        def __init__(self, inner):
+            self.inner, self.skip = inner, True
+
+        def advance(self, count):
+            if self.skip:
+                self.skip = False
+            else:
+                self.inner.advance(count)
+
+    with residual_replay_scope(explicit[1].config, True) as manager:
+        if manager is not None:
+            manager.advance(1)
+        pending = explicit[0](other)
+        if manager is not None:
+            manager.advance(2)
+        residual, *prepared = _two_reader_from_lone(explicit[0], explicit[1], other, pending)
+        expected = _explicit_pairs(
+            explicit[1:],
+            residual,
+            FirstPairAdvanced(manager) if manager is not None else None,
+            tuple(prepared),
+        )
+    assert bytes_equal(actual, expected), "stack output"
+    incoming = torch.randn_like(actual)
+    actual.backward(incoming)
+    expected.backward(incoming)
+    assert torch.isfinite(r.grad).all()
+    assert bytes_equal(r.grad, other.grad), "input gradient"
+    for (name, a), (other_name, b) in zip(layers.named_parameters(), explicit.named_parameters()):
+        assert name == other_name
+        if a.grad is None or b.grad is None:
+            assert a.grad is None and b.grad is None, name
+        else:
+            assert torch.isfinite(a.grad).all(), name
+            assert bytes_equal(a.grad, b.grad), name
+    # The deferred write reproduces the lone layer's own residual write.
+    with torch.no_grad():
+        current = _two_reader_from_lone(lone, blocks[0], r, lone(r))[0]
+        lone.defers_write_to_shortcut_block = False
+        try:
+            written = lone(r)
+        finally:
+            lone.defers_write_to_shortcut_block = True
+    torch.testing.assert_close(current, written, rtol=2e-6, atol=2e-6)
+
+
+@GPU
+def test_lone_write_deferral_scope():
+    """Only a lone wide-residual Mamba layer directly before a fused block defers its write."""
+    layers = _lone_then_blocks(pairs=1)
+    assert isinstance(layers[1], ShortcutMoEBlock)
+    assert layers[0].defers_write_to_shortcut_block
+    unfused = _lone_then_blocks(pairs=1, enabled=False)
+    assert not unfused[1].using_shortcut_moe_fused_residual_kernel
+    assert not unfused[0].defers_write_to_shortcut_block
+    trailing = _lone_then_blocks(pairs=1, lone_last=True)
+    assert isinstance(trailing[0], ShortcutMoEBlock)
+    assert not trailing[1].defers_write_to_shortcut_block
+
+
 def taped_forward(forward, *args, **kwargs):
     """Launch ``forward`` with a backward tape under the inference schedule, one CTA per row."""
     choose = forward_kernel.choose_forward_config
@@ -1251,9 +1412,10 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _hybrid_model(mixer, optimized, hidden, dynamic):
+def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None):
+    pattern = pattern or ("GEGE" if mixer == "gdn" else "MEME") + ("*" if dynamic else "")
     config = _fused_config(
-        num_layers=5 if dynamic else 4,
+        num_layers=len(pattern),
         hidden_size=hidden,
         num_attention_heads=hidden // 64,
         mamba_num_heads=4,
@@ -1283,19 +1445,18 @@ def _hybrid_model(mixer, optimized, hidden, dynamic):
         spec = spec if optimized else specs.gated_delta_product_stack_spec
     else:
         spec = specs.hybrid_inference_stack_spec if optimized else specs.hybrid_stack_spec
-    pattern = ("GEGE" if mixer == "gdn" else "MEME") + ("*" if dynamic else "")
     model = HybridModel(
         config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
     )
     model = model.cuda().eval()
-    assert all(
+    assert sum(
         isinstance(b, ShortcutMoEBlock) and b.using_shortcut_moe_fused_residual_kernel
-        for b in model.decoder.layers[:2]
-    )
+        for b in model.decoder.layers
+    ) == pattern.count("E")
     return model
 
 
-def _static_prefill_decode(model):
+def _static_prefill_decode(model, keys=(1, 3)):
     ids = torch.randint(0, 128, (2, 99), device="cuda")
     positions = torch.arange(99, device="cuda").expand(2, -1)
 
@@ -1317,7 +1478,7 @@ def _static_prefill_decode(model):
             outputs.append(result.clone())
             memory = context.key_value_memory_dict
             states.append({k: tuple(v.clone() for v in vs) for k, vs in memory.items()})
-        assert set(states[0]) == {1, 3}
+        assert set(states[0]) == set(keys)
         return outputs, states
 
     return execute
@@ -1412,6 +1573,30 @@ def test_hybrid_inference_prefill_decode(monkeypatch, dynamic, mixer, optimized,
     # Recurrent caches advance on every step.
     for before, after in zip(states, states[1:]):
         assert all(not torch.equal(before[k][1], after[k][1]) for k in before)
+    assert all(torch.equal(a, b) for a, b in zip(outputs, taped_outputs, strict=True))
+    for a, b in zip(states, taped_states, strict=True):
+        for key in a:
+            assert all(torch.equal(av, bv) for av, bv in zip(a[key], b[key]))
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("hidden", [256, 3072])
+def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden):
+    """HybridModel M -> [M E] [M E]: the lone Mamba layer's write runs in the first block's
+    two-reader kernel (a single update read twice) during prefill and decode, bit for bit with
+    the taped forward."""
+    model = _hybrid_model("mamba", False, hidden, False, pattern="MMEME")
+    lone, first = model.decoder.layers[0], model.decoder.layers[1]
+    assert lone.defers_write_to_shortcut_block and isinstance(first, ShortcutMoEBlock)
+    execute = _static_prefill_decode(model, keys=(1, 2, 4))
+    with torch.inference_mode(), InferenceMode.active():
+        (outputs, states), (taped_outputs, taped_states), calls = _inference_and_taped(
+            monkeypatch, execute
+        )
+    # Per step: block 1's two-reader write of the lone update, its one-reader, then block 2's
+    # shortcut add (two updates) and one-reader.
+    assert calls == [1, 1, 2, 1] * 4
     assert all(torch.equal(a, b) for a, b in zip(outputs, taped_outputs, strict=True))
     for a, b in zip(states, taped_states, strict=True):
         for key in a:

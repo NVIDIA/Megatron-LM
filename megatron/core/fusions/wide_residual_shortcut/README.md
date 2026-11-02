@@ -8,11 +8,20 @@ emits the RMSNorm readers that consume it — directly as MXFP8 for an exclusive
 MXFP8 recipe, otherwise BF16. `wide_residual_write_read_rmsnorm_quant` writes the Mamba/GDN/attention
 output and produces the shared expert's normalized input; `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`
 adds the routed and shared MoE outputs (the shortcut add, passed between blocks as a `PendingShortcutAdd`) and
-produces the next block's compute-layer and shortcut-routing inputs. The matching backward is one fused
-kernel per seam; with `--residual-stream-recompute-num-layers N` the residuals are rebuilt by bit-exact
-checkpoint replay instead of being saved. Residual writes are bit-identical to replay and across kernel
+produces the next block's compute-layer and shortcut-routing inputs. The shortcut add is optional: a
+`PendingShortcutAdd` without a shared update is a single write read twice, which a lone wide-residual Mamba
+layer directly before a fused block uses (M → [* E]) so that block's two-reader kernel writes its update and
+emits both inputs. The matching backward is one fused kernel per seam; with
+`--residual-stream-recompute-num-layers N` the residuals are rebuilt by bit-exact checkpoint replay instead
+of being saved. Residual writes are bit-identical to replay and across kernel
 schedules, reader outputs differ by at most one BF16 ulp between schedules, and the tests check every
 output and gradient against independent FP64/autograd references.
+
+| boundary | updates | readers | kernel |
+|---|--:|--:|---|
+| lone layer → lone layer, compute → MoE inside a block, block → lone layer | 1 | 1 | `wide_residual_write_read_rmsnorm_quant` |
+| block → block (shortcut add) | 2 (routed + shared) | 2 | `shortcut_add_..._two_reader_rmsnorm_quant` |
+| lone layer → block (M → [* E]) | 1 | 2 | `shortcut_add_..._two_reader_rmsnorm_quant`, no shared update |
 
 ## Performance
 
@@ -125,3 +134,57 @@ Below 32 tokens the forward is the inference kernel (no backward state) and MXFP
 | Ultra (10240) | 1K | 390.2 | 88.0 | 4.43x | 66% | 391.0 | 114.4 | 3.42x | 52% |
 | Ultra (10240) | 4K | 1421.1 | 297.1 | 4.78x | 78% | 1418.2 | 388.3 | 3.65x | 61% |
 | Ultra (10240) | 8K | 2789.8 | 616.6 | 4.52x | 76% | 2786.4 | 792.7 | 3.51x | 60% |
+
+A single write read twice (M → [* E]) moves one BF16 update fewer than the shortcut add and saves no
+update sum. Its forward uses the two-reader configs (training within 1.4% of the best of 32 recipes) and
+a few dedicated inference leaves; its backward is the two-reader kernel with one update gradient.
+Unfused here is `streamwise_sigmoid_writeback` of the one update, then the two reads and RMSNorms.
+
+### Forward: `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant` without a shared update (single write, two readers)
+
+| model (hidden) | tokens | BF16 unfused us | BF16 fused us | BF16 speedup | BF16 %SOL | MXFP8 unfused us | MXFP8 fused us | MXFP8 speedup | MXFP8 %SOL |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| Nano (3072) | 1 | 49.3 | 1.9 | 26.49x | 1% | – | – | – | – |
+| Nano (3072) | 4 | 54.5 | 1.9 | 28.11x | 2% | – | – | – | – |
+| Nano (3072) | 16 | 57.6 | 2.0 | 29.05x | 9% | – | – | – | – |
+| Nano (3072) | 64 | 59.9 | 3.1 | 19.57x | 24% | 63.7 | 4.1 | 15.55x | 18% |
+| Nano (3072) | 256 | 22.5 | 5.0 | 4.50x | 60% | 26.5 | 5.3 | 4.99x | 54% |
+| Nano (3072) | 1K | 49.7 | 14.5 | 3.42x | 82% | 52.4 | 14.8 | 3.54x | 78% |
+| Nano (3072) | 4K | 174.8 | 55.6 | 3.14x | 86% | 184.8 | 55.6 | 3.33x | 83% |
+| Nano (3072) | 8K | 343.3 | 107.5 | 3.19x | 89% | 358.1 | 106.9 | 3.35x | 86% |
+| Super (4096) | 1 | 52.4 | 1.9 | 28.00x | 1% | – | – | – | – |
+| Super (4096) | 4 | 54.2 | 2.0 | 27.21x | 3% | – | – | – | – |
+| Super (4096) | 16 | 54.5 | 2.0 | 27.19x | 12% | – | – | – | – |
+| Super (4096) | 64 | 57.5 | 3.5 | 16.31x | 28% | 61.2 | 4.5 | 13.74x | 22% |
+| Super (4096) | 256 | 21.7 | 6.9 | 3.14x | 57% | 25.8 | 7.2 | 3.57x | 53% |
+| Super (4096) | 1K | 47.2 | 21.3 | 2.22x | 75% | 50.2 | 22.3 | 2.25x | 69% |
+| Super (4096) | 4K | 184.5 | 73.8 | 2.50x | 86% | 195.4 | 72.5 | 2.70x | 85% |
+| Super (4096) | 8K | 343.4 | 143.6 | 2.39x | 88% | 365.2 | 139.7 | 2.61x | 88% |
+| Ultra (10240) | 1 | 65.4 | 2.0 | 32.16x | 2% | – | – | – | – |
+| Ultra (10240) | 4 | 70.9 | 2.1 | 33.51x | 7% | – | – | – | – |
+| Ultra (10240) | 16 | 72.9 | 2.6 | 28.17x | 24% | – | – | – | – |
+| Ultra (10240) | 64 | 88.8 | 6.5 | 13.72x | 38% | 92.1 | 8.5 | 10.84x | 28% |
+| Ultra (10240) | 256 | 57.7 | 16.2 | 3.56x | 61% | 63.4 | 15.2 | 4.17x | 63% |
+| Ultra (10240) | 1K | 175.5 | 65.9 | 2.66x | 60% | 182.0 | 60.9 | 2.99x | 63% |
+| Ultra (10240) | 4K | 660.0 | 180.2 | 3.66x | 88% | 687.4 | 175.4 | 3.92x | 88% |
+| Ultra (10240) | 8K | 1289.3 | 356.0 | 3.62x | 89% | 1341.1 | 344.1 | 3.90x | 89% |
+
+### Backward: `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant` without a shared update (single write, two readers)
+
+| model (hidden) | tokens | BF16 unfused us | BF16 fused us | BF16 speedup | BF16 %SOL | MXFP8 unfused us | MXFP8 fused us | MXFP8 speedup | MXFP8 %SOL |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| Nano (3072) | 64 | 341.6 | 12.7 | 26.83x | 9% | 341.6 | 14.9 | 22.93x | 7% |
+| Nano (3072) | 256 | 65.9 | 17.9 | 3.68x | 24% | 65.5 | 20.7 | 3.17x | 22% |
+| Nano (3072) | 1K | 146.7 | 36.6 | 4.01x | 48% | 140.6 | 39.5 | 3.56x | 45% |
+| Nano (3072) | 4K | 429.7 | 94.6 | 4.54x | 74% | 429.3 | 126.3 | 3.40x | 57% |
+| Nano (3072) | 8K | 821.7 | 175.1 | 4.69x | 80% | 819.4 | 232.2 | 3.53x | 62% |
+| Super (4096) | 64 | 366.6 | 13.3 | 27.56x | 11% | 362.7 | 15.5 | 23.37x | 10% |
+| Super (4096) | 256 | 60.9 | 18.5 | 3.29x | 31% | 59.9 | 21.8 | 2.74x | 27% |
+| Super (4096) | 1K | 146.5 | 47.4 | 3.09x | 49% | 140.7 | 53.3 | 2.64x | 45% |
+| Super (4096) | 4K | 478.8 | 122.3 | 3.92x | 76% | 479.8 | 161.7 | 2.97x | 59% |
+| Super (4096) | 8K | 925.2 | 227.8 | 4.06x | 82% | 924.0 | 302.6 | 3.05x | 63% |
+| Ultra (10240) | 64 | 457.6 | 17.9 | 25.60x | 20% | 456.8 | 21.0 | 21.73x | 18% |
+| Ultra (10240) | 256 | 138.8 | 36.0 | 3.86x | 40% | 138.8 | 41.2 | 3.37x | 36% |
+| Ultra (10240) | 1K | 396.9 | 90.0 | 4.41x | 65% | 391.3 | 114.2 | 3.43x | 52% |
+| Ultra (10240) | 4K | 1418.8 | 298.3 | 4.76x | 78% | 1421.8 | 386.4 | 3.68x | 62% |
+| Ultra (10240) | 8K | 2784.5 | 618.7 | 4.50x | 75% | 2784.7 | 792.7 | 3.51x | 60% |
