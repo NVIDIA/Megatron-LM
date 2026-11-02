@@ -14,8 +14,13 @@ from tests.unit_tests.inference.engines import test_dynamic_engine as engines
 
 # Decide hardware support at collection so every rank skips the same rows.
 MXFP8, NVFP4 = check_mxfp8_support(), check_nvfp4_support()
-# CI builds FlashMLA with FLASH_MLA_DISABLE_SM90=1, so its decode kernel needs SM100.
-FLASH_MLA = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+# The mla row requires FlashMLA's dense decode kernel, which exists only for SM90: FlashMLA's
+# SM100 kernels are sparse-only, so Blackwell needs another MLA decode kernel.
+FLASH_MLA = (
+    attention.HAVE_FMLA
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability() == (9, 0)
+)
 
 
 @pytest.mark.internal
@@ -68,7 +73,10 @@ async def test_routed_dense_backends_match_direct(monkeypatch, backend, version,
 @pytest.mark.parametrize(
     "mode",
     [
-        pytest.param("mla", marks=pytest.mark.skipif(not FLASH_MLA, reason="FlashMLA needs SM100")),
+        pytest.param(
+            "mla",
+            marks=pytest.mark.skipif(not FLASH_MLA, reason="FlashMLA's dense decode needs SM90"),
+        ),
         pytest.param("mxfp8", marks=pytest.mark.skipif(not MXFP8[0], reason=MXFP8[1])),
         pytest.param("nvfp4", marks=pytest.mark.skipif(not NVFP4[0], reason=NVFP4[1])),
     ],
