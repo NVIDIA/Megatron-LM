@@ -57,10 +57,12 @@ class MTPContextMixin:
             return True
 
         # The reserved slot holds one layer's KV, so a head with a second attention layer would
-        # have both depths read and write the same plane.
+        # have both depths read and write the same plane. A head with a recurrent mixer (Mamba,
+        # GDN, KDA) drafts without the context, which holds no draft state for that mixer.
         attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+        recurrent_symbols = (Symbols.MAMBA, Symbols.GDN, Symbols.KDA)
         num_attention = sum(t in attention_symbols for t in mtp_layer_type_list)
-        has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_layer_type_list)
+        has_recurrent = any(t in recurrent_symbols for t in mtp_layer_type_list)
         return num_attention == 1 and not has_recurrent
 
     def _mtp_initialize_kv_cache(

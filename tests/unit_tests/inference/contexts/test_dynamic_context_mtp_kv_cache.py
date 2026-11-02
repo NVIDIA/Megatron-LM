@@ -144,8 +144,19 @@ class TestMtpKvCacheGating:
             {"mtp_layer_type_list": [Symbols.MAMBA, Symbols.MLP]},
             {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.ATTENTION]},
             {"mtp_layer_type_list": [Symbols.MAMBA]},
+            {"mtp_layer_type_list": [Symbols.KDA, Symbols.ATTENTION]},
+            {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.KDA]},
         ],
-        ids=["no-drafts", "no-head", "per-depth", "recurrent-mlp", "two-attentions", "recurrent"],
+        ids=[
+            "no-drafts",
+            "no-head",
+            "per-depth",
+            "recurrent-mlp",
+            "two-attentions",
+            "recurrent",
+            "kda-attention",
+            "attention-kda",
+        ],
     )
     def test_unsupported_config_has_no_draft_kv_plane(self, kwargs):
         """Head patterns also gate attention-only backbones, which have no Mamba metadata."""

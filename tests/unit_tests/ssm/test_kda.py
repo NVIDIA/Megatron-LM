@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_confi
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA, KimiDeltaAttention
+from megatron.core.ssm.gated_delta_net import kda as kda_module
 from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
@@ -280,6 +281,62 @@ def test_kda_single_token_sequences_in_cuda_graph(monkeypatch, two_stage_gates, 
                 lambda: kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
             )
         # The recurrent and chunked kernels round their bf16 intermediates differently.
+        torch.testing.assert_close(
+            packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_single_token_sequences_keep_g_reads_in_bounds(monkeypatch, two_stage_gates):
+    """FLA's recurrent KDA kernel before 0.6.0 loads every row of g next_power_of_2(K) wide
+    without a mask, so with a head dim of 96 it reads 32 elements past the last row. The
+    single-token path hands it a g followed by that many zeros, laid out with row stride K, and
+    every token still gets the output it has as a sequence of its own."""
+    head_dim = 96
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(
+            _make_config(
+                two_stage_gates=two_stage_gates,
+                kv_channels=head_dim,
+                linear_key_head_dim=head_dim,
+                linear_value_head_dim=head_dim,
+            )
+        )
+        num_tokens = 6
+        hidden_states = torch.randn(
+            (num_tokens, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+        decay_gates = []
+        fused_recurrent_kda = kda_module.fused_recurrent_kda
+
+        def record_decay_gate(q, k, v, g, *args, **kwargs):
+            decay_gates.append(g)
+            return fused_recurrent_kda(q, k, v, g, *args, **kwargs)
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone_output = torch.cat(
+                [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
+            )
+            monkeypatch.setattr(kda_module, "fused_recurrent_kda", record_decay_gate)
+            packed_output = kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
+
+            (g,) = decay_gates
+            assert g.shape[-1] == head_dim and g.is_contiguous()
+            overrun = 128 - head_dim
+            g_end = g.storage_offset() + g.numel()
+            assert g.untyped_storage().nbytes() // g.element_size() - g_end >= overrun
+            assert not g.as_strided((overrun,), (1,), g_end).any()
         torch.testing.assert_close(
             packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
         )
