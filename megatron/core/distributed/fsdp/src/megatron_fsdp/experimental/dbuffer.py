@@ -433,9 +433,14 @@ class DBuffer:
         new_placements = tuple(new_placements)
         changed_axes = [
             axis
-            for axis, (old, new) in enumerate(zip(self.placements, new_placements))
+            for axis, (old, new) in enumerate(zip(self.placements, new_placements, strict=True))
             if old != new
         ]
+        if changed_axes and all(
+            self.placements[axis].is_shard() and new_placements[axis].is_replicate()
+            for axis in changed_axes
+        ):
+            return self.allgather(changed_axes, out=out)
         if can_redistribute_locally(self.mesh, self.placements, new_placements):
             view = self.view(new_placements)
             if out is None:
@@ -444,11 +449,6 @@ class DBuffer:
             out.local_buffer.copy_(view.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=new_placements)
-        if all(
-            self.placements[axis].is_shard() and new_placements[axis].is_replicate()
-            for axis in changed_axes
-        ):
-            return self.allgather(changed_axes, out=out)
         if len(changed_axes) != 1:
             raise NotImplementedError(
                 "Only all-gather and sharding views support multiple changed placement axes."
@@ -480,6 +480,7 @@ class DBuffer:
 
         Gather outer-to-inner, writing each intermediate into a view of the final
         output. This reuses existing mesh groups without allocating scratch storage.
+        If every gathered axis has size one, return a view or fill the explicit ``out``.
         """
         axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(sorted(mesh_axis))
         assert axes, "allgather() requires at least one mesh axis."
@@ -490,8 +491,12 @@ class DBuffer:
             if not isinstance(placements[axis], Shard):
                 raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
             placements[axis] = Replicate()
-        if can_redistribute_locally(self.mesh, self.placements, placements):
-            return self.redistribute(placements, out=out)
+        if all(self.mesh.size(axis) == 1 for axis in axes):
+            if out is None:
+                return self.view(placements)
+            out = self._create_or_validate_out(out, placements=placements)
+            out.local_buffer.copy_(self.local_buffer)
+            return out
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
         placements = list(self.placements)
