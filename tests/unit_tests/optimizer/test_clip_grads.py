@@ -1,9 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
+
+import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.optimizer.clip_grads import count_zeros_fp32
+from megatron.core.optimizer.clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    multi_tensor_scale_tensor_impl,
+)
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -59,3 +66,39 @@ class TestCountZerosFp32GtpPadding:
         )
 
         assert num_zeros == grad.numel() - 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="clipping kernels need a GPU")
+@pytest.mark.skipif(
+    multi_tensor_scale_tensor_impl is None, reason="tensor-scale kernel (Transformer Engine) needed"
+)
+# 0.3 is not a power of two: a reciprocal-and-multiply coefficient would differ from the division.
+@pytest.mark.parametrize("max_norm", [1.0, 0.5, 0.3])
+def test_float64_device_norm_clips_like_the_python_float_path(max_norm):
+    """ChainedOptimizer combines its optimizers' norms into a float64 device tensor. Clipping
+    with it must scale the gradients bit for bit like the Python-float path."""
+    torch.manual_seed(0)
+    for trial in range(32):
+        # Norms straddle max_norm so both the clipped and the unclipped branch are exercised.
+        grads = [
+            torch.randn(size, device="cuda") * (0.02 + 0.06 * (trial % 4))
+            for size in (7, 128, 1000)
+        ]
+        # Per-optimizer norms as get_grad_norm_fp32 returns them: float32 tensors of shape (1,).
+        norms = [torch.linalg.vector_norm(g).reshape(1) for g in grads]
+        squares = sum(x**2 for x in norms)
+        python_norm = math.sqrt(squares)
+        device_norm = torch.sqrt(squares.to(torch.float64))
+        assert device_norm.item() == python_norm
+
+        def clip(total_norm):
+            params = []
+            for grad in grads:
+                param = torch.nn.Parameter(torch.zeros_like(grad))
+                param.grad = grad.clone()
+                params.append(param)
+            clip_grad_by_total_norm_fp32(params, max_norm, total_norm)
+            return [param.grad for param in params]
+
+        for got, want in zip(clip(device_norm), clip(python_norm)):
+            assert torch.equal(got, want)

@@ -2205,11 +2205,21 @@ class ChainedOptimizer(MegatronOptimizer):
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
         else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+            grad_norms = [
+                _grad_norm
+                for _grad_norm in (opt.get_grad_norm() for opt in self.chained_optimizers)
+                if _grad_norm is not None
+            ]
+            if not grad_norms:
+                grad_norm = 0.0
+            elif any(isinstance(x, torch.Tensor) for x in grad_norms):
+                # Same arithmetic as ``math.sqrt(float(sum(x**2)))``, but on the device, so an
+                # optimizer-step CUDA graph capture needs no host synchronization.
+                # clip_grad_by_total_norm_fp32 forms the clip coefficient in float64 and rounds it
+                # once to fp32 for the scale kernel, as the Python-float path does.
+                grad_norm = torch.sqrt(sum(x**2 for x in grad_norms).to(torch.float64))
+            else:
+                grad_norm = math.sqrt(sum(x**2 for x in grad_norms))
         return grad_norm
 
     @override

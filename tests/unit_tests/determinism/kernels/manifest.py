@@ -604,6 +604,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_optimizer_kernels.py",
+            "tests/unit_tests/optimizer/test_clip_grads.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/test_layer_wise_compact_layout.py",
         ),
