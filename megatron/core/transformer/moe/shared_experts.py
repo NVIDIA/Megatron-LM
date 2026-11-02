@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from megatron.core.activations import situ_glu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -22,10 +24,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_utils import (
-    ProcessGroupCollection,
-    get_align_size_for_quantization,
-)
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
@@ -50,17 +49,18 @@ def get_shared_expert_alignment(config: TransformerConfig) -> int:
     """Token-count alignment the shared expert needs for a quantized forward.
 
     TE's FP8/FP4 GEMMs require the product of all dimensions except the last to be a
-    multiple of the recipe alignment (16 for blockwise/hybrid FP8, 32 for MXFP8, ...), and
-    THD packing leaves the per-microbatch token count arbitrary. The routed experts are
-    aligned by the token dispatcher; the shared expert runs per-token TE linears on the
-    full token set, so it pads itself. Returns 1 when no padding is required, which also
-    keeps the BF16 path a no-op even though the dispatcher helper reports the routed
-    experts' 256-token grouping alignment whenever the grouped kernels are enabled.
+    multiple of the recipe alignment (16 for blockwise/hybrid FP8, 32 for MXFP8, 128 for
+    FP4), and THD packing leaves the per-microbatch token count arbitrary. The routed
+    experts are aligned by the token dispatcher; the shared expert runs per-token TE
+    linears on the full token set, so it pads itself. Only the GEMM alignment applies here,
+    not the 256-token grouping alignment of the routed experts' grouped kernels. Returns 1
+    without FP8 or FP4, which keeps the BF16 path a no-op.
     """
-    if not (config.fp8 or config.fp4):
-        return 1
-    align = get_align_size_for_quantization(config)
-    return align if align is not None and align > 1 else 1
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    if config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 1
 
 
 def pad_shared_expert_tokens(hidden_states: torch.Tensor, align: int) -> tuple[torch.Tensor, int]:

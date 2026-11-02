@@ -396,6 +396,16 @@ def test_shared_expert_alignment_is_a_noop_without_quantization():
     )
     assert get_shared_expert_alignment(_quantization_config(fp8="hybrid")) == 16
     assert get_shared_expert_alignment(_quantization_config(fp8="hybrid", fp8_recipe="mxfp8")) == 32
+    assert get_shared_expert_alignment(_quantization_config(fp4=True)) == 128
+    # With the grouped kernels on, FP8 still needs only the GEMM alignment, not 256.
+    assert (
+        get_shared_expert_alignment(
+            _quantization_config(
+                fp8="hybrid", use_transformer_engine_op_fuser=True, moe_use_grouped_tensor=True
+            )
+        )
+        == 16
+    )
 
 
 def test_shared_expert_token_padding_restores_shape_and_values():
