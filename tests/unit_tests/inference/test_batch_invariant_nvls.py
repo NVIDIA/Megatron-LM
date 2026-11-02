@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real EP4 NVLS invariance; each collective/backend needs a fresh interpreter."""
+"""Real NVLS invariance at EP = world size; each collective/backend needs a fresh interpreter."""
 
 import os
 
@@ -10,7 +10,7 @@ from megatron.core.inference.moe import batch_invariant
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
-from megatron.core.parallel_state import get_expert_model_parallel_group
+from megatron.core.parallel_state import get_expert_tensor_and_model_parallel_group
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend
@@ -19,24 +19,27 @@ from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGath
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import _make_base_config
 from tests.unit_tests.test_utilities import Utils
 
-# A dedicated four-rank launch runs this manifest; other world sizes skip on every rank.
-pytestmark = pytest.mark.skipif(
-    Utils.world_size != 4, reason="this manifest requires four real NVLink EP ranks"
-)
+# Experts span every rank: EP 8 in the H100 bucket, EP 4 in the GB200 bucket.
+pytestmark = [
+    pytest.mark.launch_on_gb200,
+    pytest.mark.skipif(
+        Utils.world_size < 2 or Utils.world_size & (Utils.world_size - 1),
+        reason="NVLS Triton symmetric-memory barrier requires a power-of-two EP size > 1.",
+    ),
+]
 
 
 @pytest.fixture
 def nvls_runtime():
-    assert Utils.world_size == 4, "this manifest requires four real NVLink EP ranks"
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "te_native")
     collective = os.environ.get("MCORE_BI_TEST_COLLECTIVE", "ordered")
-    if backend == "te_native":
-        assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
     assert not bik.is_batch_invariant_mode_enabled(), "inherited a live BI backend"
     try:
-        # Explicit global selection precedes model construction and the first GEMM.
+        # Explicit global selection precedes model construction. The layer runs no aten GEMM
+        # (the router GEMM is TE's, the experts and combine are Triton or DeepGEMM), so
+        # te_native needs no CUBLASLT_WORKSPACE_SIZE pin from before the process's first GEMM.
         bik.enable_batch_invariant_mode(backend=backend, collective=collective)
-        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=4)
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         assert bik.get_batch_invariant_backend() == backend
         assert bik.get_batch_invariant_collective() == collective
         yield backend, collective
@@ -55,10 +58,12 @@ def nvls_runtime():
 
 def _build_nvls_layer(backend, collective, grouped_backend):
     """Build the shared native NVLS layer and target."""
+    if grouped_backend == "torch" and not bik.HAVE_DEEPGEMM_BF16:
+        pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
     torch.manual_seed(321)
     model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
     config = _make_base_config(
-        expert_model_parallel_size=4,
+        expert_model_parallel_size=Utils.world_size,
         inference_grouped_gemm_backend=grouped_backend,
         inference_moe_token_dispatcher_type="nvls",
         batch_invariant_mode=True,
@@ -74,7 +79,7 @@ def _build_nvls_layer(backend, collective, grouped_backend):
         per_rank_worst_case_token_count=128,
         topk=config.moe_router_topk,
         hidden_size=config.hidden_size,
-        ep_group=get_expert_model_parallel_group(),
+        tp_ep_group=get_expert_tensor_and_model_parallel_group(),
     )
     layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
     dispatcher = layer._inference_token_dispatcher
@@ -209,7 +214,7 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         # Independent oracle for the real target partials written by each rank's
         # experts into symmetric memory; NCCL here only gathers oracle inputs.
         partial = NVLSAllGatherVDispatcher._get_rsv_tensor()[target_row : target_row + 8].clone()
-        partials = [torch.empty_like(partial) for _ in range(4)]
+        partials = [torch.empty_like(partial) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(partials, partial)
         phase["partial_sums"] = [contribution.double().sum().item() for contribution in partials]
         if collective == "multimem":
@@ -226,13 +231,18 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
             phase["output_bits"] = selected.view(torch.int16).long().sum().item()
         evidence.append(dict(phase))
 
-    run([64, 0, 0, 0], 0)
-    wide = [128, 0, 0, 0] if peers == "idle" else [128, 32, 64, 96]
+    idle_peers = [0] * (Utils.world_size - 1)
+    run([64] + idle_peers, 0)
+    if peers == "idle":
+        wide = [128] + idle_peers
+    else:
+        # Peers bring 32, 64 or 96 tokens, within the 128-token per-rank buffers.
+        wide = [128] + [32 * (1 + peer % 3) for peer in range(Utils.world_size - 1)]
     run(wide, 120)
     run(wide, 0)
     # Return to the smaller shape with idle peers: stale expert/symmetric-buffer
     # data from the preceding wide execution must not affect the target.
-    run([64, 0, 0, 0], 0)
+    run([64] + idle_peers, 0)
     for actual in evidence[1:]:
         assert torch.equal(actual["target_probs"], evidence[0]["target_probs"])
         assert torch.equal(actual["target_experts"], evidence[0]["target_experts"])
