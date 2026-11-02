@@ -43,6 +43,7 @@ def test_forward_binds_dynamic_cp_singleton_before_projection(attention_cls, mon
         pg_collection=SimpleNamespace(cp=static_group),
         _build_time_cp_group=static_group,
         offload_qkv_linear=False,
+        core_attention=SimpleNamespace(),
     )
 
     class ProjectionReached(Exception):
