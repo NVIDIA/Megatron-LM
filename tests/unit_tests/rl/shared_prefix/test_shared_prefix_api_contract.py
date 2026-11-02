@@ -41,7 +41,7 @@ NEMO_RL_CONTRACT = {
     },
     "shared_prefix_cost": {
         "estimate_shared_prefix_row_work": "group_ids sequence_lengths prompt_lengths"
-        " physical_weight expanded_weight row_slot_ids"
+        " physical_weight expanded_weight"
     },
     "shared_prefix_dense_bins": {
         "plan_dense_training_bins": "costs bin_capacity dense_packer",
@@ -50,17 +50,13 @@ NEMO_RL_CONTRACT = {
     "shared_prefix_execution": {
         "SharedPrefixExecutionPlan": "units .units .num_units .max_physical_length",
         "SharedPrefixExecutionUnit": "row_indices shared_layout physical_length",
-        "plan_shared_prefix_execution_units": "rows row_slots bin_capacity padding_multiple"
-        " pack_groups repack_groups pack_dense_fallbacks merge_dense_fallbacks forward_only"
-        " evaluation_packing dense_packer largest_first",
+        "plan_shared_prefix_execution_units": "rows bin_capacity padding_multiple pack_groups"
+        " pack_dense_fallbacks merge_dense_fallbacks forward_only evaluation_packing"
+        " dense_packer largest_first",
         "validate_shared_prefix_execution_units": "units batch_size",
     },
     "shared_prefix_metadata": {
-        "FixedExecutionSlotPlan": ".row_slot_ids",
         "GroupCoherentShardPlan": ".shard_indices .rank_order_permutation",
-        "get_prescribed_shared_prefix_slots": "group_ids slot_ids",
-        "plan_fixed_execution_slots": "group_ids sequence_lengths bin_capacity batch_size"
-        " sequence_length_pad_multiple",
         "plan_group_coherent_shards": "group_ids sequence_lengths num_shards batch_size",
     },
     "shared_prefix_packing": {

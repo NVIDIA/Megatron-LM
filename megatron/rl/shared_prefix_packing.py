@@ -31,9 +31,7 @@ MAX_SHARED_PREFIX_BRANCHES = 16
 """Default number of completion branches stored behind one prompt copy.
 
 This is a planning policy, not a kernel limit. Planners that accept a branch
-limit default to this value; larger exact-prompt groups are split evenly, except
-by ``plan_shared_prefix_execution_units`` without ``pack_groups``, which keeps an
-oversized prescribed slot as one dense forward.
+limit default to this value and split larger exact-prompt groups evenly.
 """
 
 

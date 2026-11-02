@@ -13,11 +13,11 @@ a star-only execution backend accepts. Arbitrary-depth trajectory-tree execution
 still requires backend work.
 Rows share a prefix only when their group identities **and exact prompt token
 sequences** match. Single-completion groups remain conventional dense units.
-The slot and shard planners require every prompt group within a logical batch
-chunk to have the same number of rows. Dense-bin reconstruction and dense
-fallback merging can still run one row as a single-completion forest root next
-to other stars: a one-row fragment of a group split across bins, or a merged
-fallback row.
+The shard planner requires every prompt group within a logical batch chunk to
+have the same number of rows. Dense-bin reconstruction and dense fallback
+merging can still run one row as a single-completion forest root next to other
+stars: a one-row fragment of a group split across bins, or a merged fallback
+row.
 The representation is independent of the RL objective: GRPO and PPO adapters
 can supply the same row contract without changing their losses or advantages.
 
@@ -66,14 +66,14 @@ adding backend support and generalized source-row/loss mappings.
 - `shared_prefix_tensors`: conventional-batch row construction; token gathering,
   completion/predecessor/scatter maps; TP/CP alignment and zigzag context-parallel
   tensor shards. It builds no dense attention masks.
-- `shared_prefix_metadata`: group-coherent sharding and equal real-row execution
-  slots. `GroupCoherentShardPlan.rank_order_permutation` maps each position of
-  the rank-major concatenation to its source row, the forward permutation that
+- `shared_prefix_metadata`: group-coherent sharding.
+  `GroupCoherentShardPlan.rank_order_permutation` maps each position of the
+  rank-major concatenation to its source row, the forward permutation that
   restores source order.
 - `shared_prefix_cost`: backbone plus expanded-token estimates for balancing.
-- `shared_prefix_execution`: execution units and plans; prescribed-slot
-  resolution; training and evaluation budgets; dense fallback repacking and
-  MTP-normalization-preserving fallback merging.
+- `shared_prefix_execution`: execution units and plans; local splitting of each
+  prompt group into execution slots; training and evaluation budgets; dense
+  fallback repacking and MTP-normalization-preserving fallback merging.
 - `shared_prefix_alignment`: real-row splits to a caller-agreed distributed
   forward count, with conservative or prefix-preserving reconstruction.
 - `shared_prefix_dense_bins`: expanded-row packing followed by shared-prefix
@@ -83,9 +83,7 @@ adding backend support and generalized source-row/loss mappings.
 behind one prompt copy. It is a planning policy, not a kernel limit, and planners
 that take a branch limit default to it. Planners split a larger exact-prompt
 group evenly: 17 rows become stars of 9 and 8, not a 16-completion star and an
-unshared singleton. The exception is `plan_shared_prefix_execution_units`
-without `pack_groups`, which keeps an oversized prescribed slot as one dense
-forward.
+unshared singleton.
 
 The layout, execution, metadata, alignment and cost modules require only the
 Python standard library. Tensor materialization additionally requires Torch.
@@ -95,25 +93,28 @@ generation request API.
 ## Minimal packing example
 
 ```python
-from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
-from megatron.rl.shared_prefix_execution import plan_shared_prefix_execution_units
+from megatron.rl.shared_prefix_dense_bins import (
+    plan_dense_training_bins,
+    share_prefixes_in_dense_training_bins,
+)
 from megatron.rl.shared_prefix_packing import SharedPrefixRow
 
 rows = [
     SharedPrefixRow(0, "prompt-a", (10, 11, 12), 2),
     SharedPrefixRow(1, "prompt-a", (10, 11, 12), 3),
 ]
-schedule = plan_fixed_execution_slots(
-    group_ids=[row.group_id for row in rows],
-    sequence_lengths=[row.total_length for row in rows],
-    bin_capacity=12,
-)
-slots = tuple(
-    tuple(i for i, slot in enumerate(schedule.row_slot_ids) if slot == slot_id)
-    for slot_id in range(schedule.units_per_group_by_chunk[0])
-)
-units = plan_shared_prefix_execution_units(
-    rows, row_slots=slots, bin_capacity=12, padding_multiple=1
+costs = [row.total_length for row in rows]  # dense lengths 5 and 6
+
+
+def pack(costs):
+    """Stand-in for the caller's deterministic length-only packer."""
+    return [list(range(len(costs)))]
+
+
+dense = plan_dense_training_bins(costs=costs, bin_capacity=12, dense_packer=pack)
+# A distributed caller agrees on the forward count and aligns the dense bins here.
+units = share_prefixes_in_dense_training_bins(
+    rows, dense, costs=costs, padding_multiple=1, bin_capacity=12
 )
 assert len(units) == 1
 assert units[0].physical_length == 8  # prompt once plus both completions
