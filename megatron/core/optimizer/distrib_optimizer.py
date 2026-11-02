@@ -1024,6 +1024,61 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state_dict
 
+    def _can_use_torch_optimizer_loader(self, state_dict: Dict[str, Any]) -> bool:
+        """Check whether ordinary TE Adam state needs no TE-specific conversion."""
+        opt = self.optimizer
+        if not (
+            USING_TE_OPTIMIZER
+            and type(opt) is Adam
+            and not self.config.use_precision_aware_optimizer
+            and getattr(opt, "master_weights", None) is False
+            and getattr(opt, "capturable", None) is False
+            and getattr(opt, "exp_avg_dtype", None) == torch.float32
+            and getattr(opt, "exp_avg_sq_dtype", None) == torch.float32
+        ):
+            return False
+
+        # A subclass or load hook may rely on TE's postprocessing. Missing hook
+        # registries also retain the public TE loader if PyTorch changes them.
+        for name in (
+            "_optimizer_load_state_dict_pre_hooks",
+            "_optimizer_load_state_dict_post_hooks",
+        ):
+            if getattr(opt, name, None) != {}:
+                return False
+
+        for group, saved_group in zip(opt.param_groups, state_dict["param_groups"], strict=True):
+            for param, param_id in zip(group["params"], saved_group["params"], strict=True):
+                # Tensor subclasses can carry quantization or distributed layouts
+                # that require TE's state conversion even with a nominal FP32 dtype.
+                if (
+                    type(param) not in (torch.Tensor, torch.nn.Parameter)
+                    or param.dtype != torch.float32
+                ):
+                    return False
+                state = state_dict["state"].get(param_id, {})
+                if set(state) != {"exp_avg", "exp_avg_sq"}:
+                    return False
+                for value in state.values():
+                    if (
+                        type(value) is not torch.Tensor
+                        or value.dtype != torch.float32
+                        or value.device != param.device
+                        or value.shape != param.shape
+                    ):
+                        return False
+        return True
+
+    def _load_inner_optimizer_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Restore compatible FP32 Adam state without rebuilding its tensor storage."""
+        if self._can_use_torch_optimizer_loader(state_dict):
+            # The public PyTorch loader restores groups and parameter IDs while
+            # retaining tensors whose dtype/device already match the FP32 shards.
+            # TE's override would subsequently clear and reallocate both moments.
+            torch.optim.Optimizer.load_state_dict(self.optimizer, state_dict)
+        else:
+            self.optimizer.load_state_dict(state_dict)
+
     def load_state_dict(self, state_dict):
         """Load the state dict.
 
@@ -1040,6 +1095,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         so this method also must populate the loaded state dict with dummy
         tensor data (i.e., via torch.empty() below). This will be overwritten
         during load_parameter_state().
+
+        Ordinary TE Adam with compatible FP32 shards uses the PyTorch loader to
+        retain those tensors when constructing load targets and when restoring
+        metadata after checkpoint reads. Other representations use the inner optimizer's loader.
 
         ** Note: Torch optimizer's state structure. **
         The Torch optimizer stores its state in two levels. The top level is a
@@ -1176,7 +1235,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
+        self._load_inner_optimizer_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
 
