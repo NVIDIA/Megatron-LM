@@ -155,12 +155,7 @@ class TestSharedPrefixExpertBiasCounts:
         hidden = torch.randn(40, 1, 64, device="cuda").bfloat16().requires_grad_()
         multiplicities = torch.randint(0, 4, (40,), device="cuda").float()
         router.local_tokens_per_expert.zero_()
-        layer._shared_prefix_token_multiplicities = multiplicities
-        try:
-            output, _ = layer(hidden)
-        finally:
-            # The shared-prefix stack removes the scope before backward runs.
-            del layer._shared_prefix_token_multiplicities
+        output, _ = layer(hidden, shared_prefix_token_multiplicities=multiplicities)
         output.float().pow(2).sum().backward()
         counted = router.local_tokens_per_expert.clone()
         router.local_tokens_per_expert.zero_()

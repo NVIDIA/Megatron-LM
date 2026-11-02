@@ -176,15 +176,14 @@ class TestSharedPrefixMoELayerExactness:
             return layer(hidden_states=x, attention_mask=None)
 
         def shared(x):
-            # The scoping forward_hybrid_stack_shared_prefix applies around every MoE layer.
-            layer.mlp._shared_prefix_token_multiplicities = layout.padded_token_multiplicities(
-                x.shape[0], x.device
-            )
-            try:
-                with router_gating_token_blocks():
-                    return layer(hidden_states=x, attention_mask=None)
-            finally:
-                del layer.mlp._shared_prefix_token_multiplicities
+            # As forward_hybrid_stack_shared_prefix calls every MoE layer.
+            multiplicities = layout.padded_token_multiplicities(x.shape[0], x.device)
+            with router_gating_token_blocks():
+                return layer(
+                    hidden_states=x,
+                    attention_mask=None,
+                    shared_prefix_token_multiplicities=multiplicities,
+                )
 
         # MoE is token-wise, so the dense rows run as one packed sequence without padding rows
         # (padding rows of a [max_len, rows] batch would be routed and counted).

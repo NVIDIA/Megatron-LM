@@ -355,9 +355,11 @@ def forward_hybrid_stack_shared_prefix(
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
-    Normal ``HybridStack.forward`` and ``Attention.forward`` behavior is unchanged unless this
-    function installs its scoped private forest descriptor. The descriptor is always removed in a
-    ``finally`` block, including when a layer raises.
+    Normal ``HybridStack.forward`` behavior is unchanged. Each layer receives its shared-prefix
+    input as a keyword argument of its own call: self-attention layers ``shared_prefix_forest``,
+    Mamba layers ``shared_prefix_call`` (built by :func:`forward_mamba_layer_shared_prefix`), and,
+    with expert bias, MoE layers ``shared_prefix_token_multiplicities``. No module state is set,
+    so recomputation replays a layer with the arguments of its own call.
 
     ``exclude_sequence_padding_from_expert_bias`` states the caller's dense expert-bias
     convention for per-branch padding rows. ``True`` excludes them, as a dense forward with the
@@ -434,42 +436,31 @@ def forward_hybrid_stack_shared_prefix(
                 "shared-prefix token multiplicity ownership does not match the local hidden rows"
             )
 
+    # Self-attention takes the layout as a forest; a single star is a forest with one root.
+    attention_forest = (
+        layout
+        if isinstance(layout, SharedPrefixForestLayout)
+        else SharedPrefixForestLayout((layout,))
+    )
+
     @router_gating_token_blocks()
     def forward_layer_range(hidden_states: Tensor, start: int, end: int) -> Tensor:
         for layer in stack.layers[start:end]:
-            moe_layer = (
-                layer.mlp if expert_bias_enabled and getattr(layer, "is_moe_layer", False) else None
-            )
-            if moe_layer is not None:
-                if moe_layer._shared_prefix_token_multiplicities is not None:
-                    raise RuntimeError("nested shared-prefix MoE dispatch is not supported")
-                moe_layer._shared_prefix_token_multiplicities = token_multiplicities
-            try:
-                if isinstance(layer, MambaLayer):
-                    # Runs the layer through MambaLayer.__call__ and MambaMixer.__call__, like the
-                    # attention branch below, so module hooks fire as on the dense path. Every
-                    # topology and root count honors NRL_SP_MAMBA_IMPL.
-                    hidden_states = forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
-                elif isinstance(layer.self_attention, IdentityOp):
-                    hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
-                else:
-                    attention = layer.self_attention
-                    if attention._shared_prefix_forest is not None:
-                        raise RuntimeError(
-                            "nested shared-prefix attention dispatch is not supported"
-                        )
-                    attention._shared_prefix_forest = layout.forest
-                    try:
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=None,
-                            rotary_pos_emb=rotary_pos_emb,
-                        )
-                    finally:
-                        del attention._shared_prefix_forest
-            finally:
-                if moe_layer is not None:
-                    del moe_layer._shared_prefix_token_multiplicities
+            if isinstance(layer, MambaLayer):
+                # Runs the layer through MambaLayer.__call__ and MambaMixer.__call__, like the
+                # other layers below, so module hooks fire as on the dense path. Every
+                # topology and root count honors NRL_SP_MAMBA_IMPL.
+                hidden_states = forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
+            else:
+                layer_kwargs = {}
+                if not isinstance(layer.self_attention, IdentityOp):
+                    layer_kwargs["rotary_pos_emb"] = rotary_pos_emb
+                    layer_kwargs["shared_prefix_forest"] = attention_forest
+                if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
+                    layer_kwargs["shared_prefix_token_multiplicities"] = token_multiplicities
+                hidden_states = layer(
+                    hidden_states=hidden_states, attention_mask=None, **layer_kwargs
+                )
 
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
@@ -481,7 +472,8 @@ def forward_hybrid_stack_shared_prefix(
             end = min(start + chunk_size, len(stack.layers))
 
             def custom_forward(hidden_states: Tensor, start=start, end=end) -> Tensor:
-                # Scopes live inside the callable so backward replay reconstructs them.
+                # The router scope and the layer calls, with their shared-prefix arguments, live
+                # inside the callable, so backward replay reconstructs them.
                 return forward_layer_range(hidden_states, start, end)
 
             hidden_states = tensor_parallel.checkpoint(
