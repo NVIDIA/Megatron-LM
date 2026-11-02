@@ -2663,3 +2663,136 @@ class TestFusedMLAKVRoPEQuant:
         ):
             attention(hidden_states, None)
         assert kernel.call_count == 0
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    get_device_arch_version() < 10,
+    reason="FlashAttention-4 loads whole latent pages on the split-KV path only on Blackwell",
+)
+class TestDynamicMLAUnwrittenLatentRows:
+    """Unwritten rows of a request's last latent page must not reach the attention output.
+
+    On Blackwell, FlashAttention-4 split-KV for (192, 128) head dims lowers its key tile to 64
+    tokens, the latent page size, which selects the paged TMA path: it loads whole pages and
+    multiplies the masked (zero) probabilities by the unwritten tail of a request's last page.
+    A NaN there would make the output NaN, so newly acquired latent pages are zeroed. The step
+    decodes one token of a long request A (so that FA4 splits) while request B prefills, on a
+    latent pool filled with NaN or zeros before any request arrives.
+    """
+
+    max_sequence_length = 8448
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        import megatron.core.transformer.attention as attention_module
+
+        if not attention_module.HAVE_FA4:
+            pytest.skip("flash-attn-4 is not installed")
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_attention():
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+        from megatron.core.transformer.spec_utils import build_module
+
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,  # few query tiles, so FA4 splits the keys
+            q_lora_rank=256,
+            kv_lora_rank=512,
+            qk_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            transformer_impl="inference_optimized",
+            rope_type="rope",
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            cache_mla_latents=True,
+        )
+        spec = hybrid_inference_stack_spec.submodules.mla_layer.submodules.self_attention
+        attention = build_module(spec, config=config, layer_number=1, pp_layer_offset=0)
+        assert isinstance(attention, MLASelfAttention)
+        return attention.cuda().eval()
+
+    def _mixed_step_output(self, attention, pool_fill, len_a, len_b):
+        """Real-token rows of a step where A decodes one token and B prefills len_b tokens."""
+        from megatron.core.inference.config import InferenceConfig
+        from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.sampling_params import SamplingParams
+        from megatron.core.inference.utils import InferenceMode
+
+        context = DynamicInferenceContext(
+            model_config=attention.config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.max_sequence_length,
+                buffer_size_gb=0.03,
+                paused_buffer_size_gb=0.002,
+                block_size_tokens=64,
+                max_tokens=self.max_sequence_length,
+                max_requests=8,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+        context.memory_buffer.fill_(pool_fill)  # stale pool contents
+
+        def add_request(request_id, length):
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(1, length + 1, device="cpu") % 1000 + 1,
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
+            )
+            context.initialize_attention_state()
+
+        def forward(seed):
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+            hidden_states = torch.randn(
+                context.padded_active_token_count,
+                1,
+                attention.config.hidden_size,
+                generator=generator,
+                device="cuda",
+            ).to(torch.bfloat16)
+            with torch.no_grad(), InferenceMode.active():
+                output, _ = attention(hidden_states, attention_mask=None, inference_context=context)
+            return output
+
+        add_request(0, len_a)
+        forward(seed=1)  # prefill A
+        context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
+            new_tokens=torch.tensor([5], device="cuda"),
+        )
+        add_request(1, len_b)
+        assert not context.is_decode_only()
+        assert int(context.cu_kv_lengths()[2]) == len_a + 1
+        return forward(seed=2)[: 1 + len_b].float()
+
+    def _assert_matches_zero_pool(self, len_a, len_b):
+        attention = self._build_attention()
+        clean = self._mixed_step_output(attention, 0.0, len_a, len_b)
+        assert torch.isfinite(clean).all()
+        stale = self._mixed_step_output(attention, float("nan"), len_a, len_b)
+        assert torch.isfinite(stale).all(), "unwritten latent rows reached the output"
+        torch.testing.assert_close(stale, clean, rtol=1e-2, atol=1e-2)
+
+    def test_page_aligned_requests_ignore_stale_pool(self):
+        # A ends exactly on a page boundary after its decode token; B fills one page.
+        self._assert_matches_zero_pool(len_a=8255, len_b=64)
+
+    def test_partial_last_page_ignores_stale_pool(self):
+        # A's last page holds 2 of 64 rows after its decode token.
+        self._assert_matches_zero_pool(len_a=8257, len_b=2)

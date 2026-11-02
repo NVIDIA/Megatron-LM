@@ -175,10 +175,16 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
             memory_buffer=torch.full((2, 1, 256, 4, 1, 1), 7.0),
             cache_mla_latent=False,
+            _pending_kv_page_ids=[],
+            _kv_page_ids_cpu=torch.empty(256, dtype=torch.int64),
+            _kv_page_ids_gpu=torch.empty(256, dtype=torch.int64),
         )
-        self.context._initialize_mha_value_pages = partial(
-            DynamicInferenceContext._initialize_mha_value_pages, self.context
-        )
+        for method in ("_initialize_kv_pages", "_zero_pending_kv_pages"):
+            setattr(
+                self.context,
+                method,
+                partial(getattr(DynamicInferenceContext, method), self.context),
+            )
         self._kv_transfer_agent = _TransferAgent()
         if hybrid:
             self._ssm_transfer_agents = {"conv": _TransferAgent(), "recurrent": _TransferAgent()}
@@ -1612,6 +1618,8 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine._kv_transfer_agent.calls == [(kv_meta, [102], [12])]
     assert pending.local_blocks == [10, 11, 12]
     assert pending.cached_prefix_block_count == 2
+    # The continuation pages are zeroed by the publish ahead of the next forward.
+    engine.context._zero_pending_kv_pages()
     values = engine.context.memory_buffer[1, :, pending.continuation_blocks]
     assert pending.continuation_blocks == [13] and torch.count_nonzero(values) == 0
     assert torch.count_nonzero(engine.context.memory_buffer != 7) == values.numel()

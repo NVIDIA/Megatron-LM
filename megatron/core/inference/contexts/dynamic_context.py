@@ -1162,13 +1162,42 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.memory_buffer, device="cpu"
             ).pin_memory()
 
-    def _initialize_mha_value_pages(self, block_ids: Sequence[int] | Tensor) -> None:
-        """Zero newly acquired MHA value-cache pages before their first model write."""
-        # Paged attention can read masked V tails; initialize only newly private pages.
-        if self.cache_mla_latent or len(block_ids) == 0:
+    def _initialize_kv_pages(self, block_ids: Sequence[int] | Tensor) -> None:
+        """Zero newly acquired KV pages before their first model write.
+
+        Paged attention multiplies the masked (zero) probabilities of a request's last page by
+        that page's unwritten rows, and 0 * NaN is NaN, so those rows must be finite. The pages
+        are queued here and zeroed by the next transfer_bookkeeping_to_gpu(), ahead of the
+        forward that first writes them: acquiring a block (e.g. in the async-scheduling prepare,
+        while the previous forward is in flight) must not wait on the GPU.
+        """
+        if len(block_ids) > 0:
+            self._pending_kv_page_ids.append(
+                torch.as_tensor(block_ids, device='cpu').to(torch.int64, copy=True)
+            )
+
+    def _zero_pending_kv_pages(self) -> None:
+        """Zero the KV pages queued by `_initialize_kv_pages` since the last publish.
+
+        Runs ahead of the bookkeeping H2D in transfer_bookkeeping_to_gpu(). That copy either
+        blocks or is tracked by the event async scheduling synchronizes before re-staging, which
+        also guards the reuse of the pinned id buffer.
+        """
+        if not self._pending_kv_page_ids:
             return
-        block_ids = torch.as_tensor(block_ids, dtype=torch.int64, device=self.memory_buffer.device)
-        self.memory_buffer[1].index_fill_(1, block_ids, 0)
+        block_ids = torch.cat(self._pending_kv_page_ids)
+        self._pending_kv_page_ids.clear()
+        if block_ids.numel() > self._kv_page_ids_cpu.numel():
+            # A block released and acquired again since the last publish is queued twice.
+            block_ids = torch.unique(block_ids)
+        count = block_ids.numel()
+        self._kv_page_ids_cpu[:count] = block_ids
+        page_ids = self._kv_page_ids_gpu[:count]
+        page_ids.copy_(self._kv_page_ids_cpu[:count], non_blocking=True)
+        # MHA keys need no initialization (masked scores are assigned, not multiplied); MLA
+        # latents hold the values, so latent pages are zeroed whole.
+        pages = self.memory_buffer if self.cache_mla_latent else self.memory_buffer[1]
+        pages.index_fill_(1, page_ids, 0)
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
@@ -1689,6 +1718,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+
+        # Deferred KV page initialization. Populated wherever KV blocks are acquired
+        # (CPU phase), executed by transfer_bookkeeping_to_gpu(), which stages the
+        # block ids through pinned memory. One slot per block bounds a step's ids.
+        self._pending_kv_page_ids: List[Tensor] = []
+        self._kv_page_ids_cpu = torch.empty(
+            self.kv_block_allocator.pool_size, dtype=torch.int64, device='cpu', pin_memory=True
+        )
+        self._kv_page_ids_gpu = torch.empty(
+            self.kv_block_allocator.pool_size, dtype=torch.int64, device=torch.cuda.current_device()
+        )
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -3032,6 +3072,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
         )
 
+        # Zero the KV pages acquired since the last publish before this step's
+        # forward writes them.
+        self._zero_pending_kv_pages()
+
         # Coalesced H2D: one copy for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
@@ -3662,7 +3706,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
-            self._initialize_mha_value_pages(new_block_ids)
+            self._initialize_kv_pages(new_block_ids)
 
         # Track prefix cache hits only after allocation succeeds. Matched blocks
         # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
@@ -4231,7 +4275,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     assert (
                         block_ids is not None and block_ids.numel() == num_new_blocks
                     ), f"failed to allocate {num_new_blocks} blocks for resumed requests"
-                    self._initialize_mha_value_pages(block_ids)
+                    self._initialize_kv_pages(block_ids)
 
                     # Apply updates only to the requests that required a new block
                     relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
@@ -4471,7 +4515,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     raise RuntimeError(
                         "Async scheduling cannot evict requests to allocate new blocks."
                     )
-                self._initialize_mha_value_pages(block_ids)
+                self._initialize_kv_pages(block_ids)
 
             self.active_token_count = active_request_count * tokens_per_request
             active_token_slice = slice(0, self.active_token_count)
