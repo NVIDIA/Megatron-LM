@@ -398,6 +398,28 @@ class TestMXFP8Tensor:
         assert torch.equal(tensor.data, expected.data)
         assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
+    def test_triton_copy_reads_strided_source_in_place(self, monkeypatch):
+        """The Triton path quantizes a strided source as is, without a contiguous copy."""
+        from megatron.core.inference.quantization import mxfp8_tensor
+
+        update = torch.randn(160, 129, device="cuda", dtype=torch.bfloat16).t()
+        tensor = MXFP8Tensor.from_bf16(torch.zeros_like(update), backend="triton")
+        expected = MXFP8Tensor.from_bf16(update.contiguous(), backend="triton")
+        quantizer_inputs = []
+        quantize_into = mxfp8_tensor.mcore_mxfp8_quantize_into
+
+        def recording_quantize_into(x, out_data, out_scale):
+            quantizer_inputs.append(x)
+            quantize_into(x, out_data, out_scale)
+
+        monkeypatch.setattr(mxfp8_tensor, "mcore_mxfp8_quantize_into", recording_quantize_into)
+
+        tensor.copy_(update)
+
+        assert [x.data_ptr() for x in quantizer_inputs] == [update.data_ptr()]
+        assert torch.equal(tensor.data.view(torch.uint8), expected.data.view(torch.uint8))
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
     def test_copy_requires_backend(self):
         source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
         quantized = MXFP8Tensor.from_bf16(source, backend="triton")
@@ -774,6 +796,14 @@ class TestSquaredReluAndQuantizeMxfp8:
         assert torch.equal(fused.data.view(torch.uint8).cpu(), expected_data.view(torch.uint8))
         assert torch.equal(fused.scale.view(torch.uint8).cpu(), ref_swizzle(expected_scales))
 
+    def test_rejects_strided_input(self):
+        """The kernel addresses rows densely, so a strided view is rejected, not misread."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)[:, :128]
+        with pytest.raises(AssertionError, match="contiguous"):
+            squared_relu_and_quantize_mxfp8(x, _make_permutation_map(128), _vt(128))
+
 
 CLAMP_SCALE = 16.0
 
@@ -1046,6 +1076,16 @@ class TestPermuteAndQuantizeMxfp8:
         )
         # The first 128 x 4 scale tile holds the scales of these rows.
         assert torch.equal(fused.scale.view(torch.uint8)[:512].cpu(), ref_swizzle(expected_scales))
+
+    def test_rejects_strided_input(self):
+        """The kernel addresses tokens densely, so a strided view is rejected, not misread."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(16, 256, 2, 8)
+        with pytest.raises(AssertionError, match="contiguous"):
+            permute_and_quantize_mxfp8(
+                hidden[:, :128], probs, routing_map, 0, 8, _vt(16), alignment=128
+            )
 
     def test_returns_mxfp8_tensor(self):
         """Result is an MXFP8Tensor with correct backend."""

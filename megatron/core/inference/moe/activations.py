@@ -367,6 +367,7 @@ def squared_relu_and_quantize_mxfp8(
 
     M, K = x.shape
     assert K % MXFP8_BLOCK_SIZE == 0
+    assert x.is_contiguous(), "x must be contiguous: the kernel addresses row r at r * K"
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)

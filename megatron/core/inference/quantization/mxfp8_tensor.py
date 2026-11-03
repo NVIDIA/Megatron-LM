@@ -183,9 +183,11 @@ class MXFP8Tensor:
         if self.backend is None:
             raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
         value = value.to(device=self.device)
-        if self.backend == "flashinfer" and value.dtype == torch.float32:
-            value = value.to(dtype=torch.bfloat16)
-        value = value.contiguous()
+        if self.backend == "flashinfer":
+            # FlashInfer takes dense FP16/BF16 input; the Triton quantizer reads any strides.
+            if value.dtype == torch.float32:
+                value = value.to(dtype=torch.bfloat16)
+            value = value.contiguous()
         if (
             self.backend == "triton"
             and self.data.dtype == torch.float8_e4m3fn

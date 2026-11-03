@@ -743,6 +743,9 @@ def permute_and_quantize_mxfp8(
     max_tokens, K = hidden_states.shape
     topk = probs.shape[1]
     assert K % MXFP8_BLOCK_SIZE == 0
+    assert (
+        hidden_states.is_contiguous()
+    ), "hidden_states must be contiguous: the kernel addresses token t at t * K"
 
     # Count how many (token, topk) pairs are routed to each local expert.
     # Rows beyond valid_tokens are ignored.
