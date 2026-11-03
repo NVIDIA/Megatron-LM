@@ -14,6 +14,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts.zero_padding_rows_kernel import zero_padding_rows
 from megatron.core.inference.utils import InferenceMode, missing_flashinfer_prebuilt_kernels
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1432,6 +1433,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
                         )
+                # Padding requests (KV length 0) come last and have no query rows in
+                # cu_seqlens_q. The decode kernels can leave their output rows non-finite
+                # (TRTLLM-GEN does at 48 heads or fewer), and those rows flow on into later
+                # norms and MoE routing, so zero every row from cu_seqlens_q[-1] on. The count
+                # is read on device: no host sync, and it follows each CUDA-graph replay.
+                zero_padding_rows(
+                    output_total.view(output_total.shape[0] * output_total.shape[1], -1),
+                    cu_seqlens_q[-1:],
+                )
             else:
                 if use_fa4:
                     softmax_scale = self.get_softmax_scale(q)

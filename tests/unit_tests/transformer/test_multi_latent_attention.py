@@ -2913,13 +2913,17 @@ def _latent_decode_inputs(lengths, tokens_per_request, num_heads, unwritten=None
     seqlens_k = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
     cu_seqlens_k[1:] = torch.cumsum(seqlens_k, 0)
+    # As in the dynamic context, padding requests have no query rows.
+    query_lengths = (seqlens_k > 0).to(torch.int32) * tokens_per_request
+    cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_q[1:] = torch.cumsum(query_lengths, 0)
     return dict(
         q=q,
         k=latents,
         v=None,
         max_seqlen_q=tokens_per_request,
         max_seqlen_k=max(lengths),
-        cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32, device="cuda") * tokens_per_request,
+        cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqlens_k=seqlens_k,
         block_table=block_table,
@@ -2978,11 +2982,11 @@ class TestMLAAbsorbedDecode:
     @staticmethod
     def _assert_matches(out, reference, lengths):
         """Each request's output is within 2% (relative L2) of the reference, and a padding slot's
-        (length 0) output is finite: its rows flow on through the layer."""
+        (length 0) output is zero: its rows flow on through the layer."""
         out = out.view(reference.shape)
         for request, length in enumerate(lengths):
             if length == 0:
-                assert torch.isfinite(out[request]).all(), f"padding slot {request} is not finite"
+                assert torch.count_nonzero(out[request]) == 0, f"padding slot {request} is not zero"
                 continue
             expected = reference[request]
             error = ((out[request].float() - expected).norm() / expected.norm()).item()
