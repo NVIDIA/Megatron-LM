@@ -127,3 +127,12 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+
+  # Keep Blackwell GDP/FlashAttention compilation coverage in its own process.
+  - test_case: [tests/unit_tests/ssm/test_gdp_dynamic_inference.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]

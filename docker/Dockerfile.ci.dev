@@ -384,6 +384,15 @@ RUN --mount=type=bind,source=docker/common/triton_block_ptr_compat.py,target=/op
     python -c 'import triton.language as tl; assert callable(tl.advance)'
 EOF
 
+# Backport FlashAttention#2787 for the image's CuTe code and pinned Quack0.6.5.
+# https://github.com/Dao-AILab/flash-attention/commit/145b1010051dbfd4bdc41a0ae55d495b08d7a458
+RUN --mount=type=bind,source=docker/patches/flash-attn-quack-api.patch,target=/opt/flash-attn-quack-api.patch \
+    bash -ex <<"EOF"
+    FLASH_ATTN_SITE_PACKAGES=$(python -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("flash_attn").origin).parent.parent)')
+    patch --batch --forward --fuzz=0 -d "${FLASH_ATTN_SITE_PACKAGES}" -p1 < /opt/flash-attn-quack-api.patch
+    python -c 'import cutlass.cute as cute; from flash_attn.cute.utils import ex2_emulation_2; assert callable(cute.arch.sub_packed_f32x2)'
+EOF
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION
