@@ -1651,6 +1651,15 @@ class TransformerConfig(ModelParallelConfig):
     gdp_num_householder: int = 3
     """The number of Householder reflections used in Gated Delta Product layers."""
 
+    gdp_g_clamp_value: Optional[float] = None
+    """Optional positive magnitude of the lower bound on GDP's per-token log decay.
+
+    For example, 50 clamps g to a minimum of -50 before the recurrent kernel in
+    training and inference. None leaves g unchanged. GDP gate metrics report raw g.
+    When loading checkpoint arguments, a saved value is restored if this is omitted;
+    an explicit CLI value takes precedence.
+    """
+
     mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
     None causes the states to follow the activation dtype."""
@@ -1943,6 +1952,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
             )
+
+        if self.gdp_g_clamp_value is not None and (
+            not math.isfinite(self.gdp_g_clamp_value) or self.gdp_g_clamp_value <= 0
+        ):
+            raise ValueError("gdp_g_clamp_value must be finite and positive when set.")
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
