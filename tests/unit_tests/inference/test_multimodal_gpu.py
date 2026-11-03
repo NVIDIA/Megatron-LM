@@ -507,6 +507,8 @@ def _run_request(engine, request_id, media, trace, prompt=None, num_tokens=1):
         **media,
     )
     admitted = engine.get_request(request_id)
+    # Main defers a dynamic-resolution image's encode to the pre-prefill batch; run it now.
+    engine._encode_waiting_images()
     admission = {
         "key": admitted.media_cache_key,
         "tokens": admitted.prompt_tokens.detach().cpu().clone(),
