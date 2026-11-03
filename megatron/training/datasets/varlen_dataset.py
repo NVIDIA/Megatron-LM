@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Variable-length packed (THD) dataset for SFT-style instruction data.
 
@@ -774,8 +774,12 @@ class VarlenDataset(SFTDataset):
         keep = min(len(tokens), max_len + 1)
         if tokens[keep - 1] == eod:
             eod_at = None
-        elif keep < len(tokens):
-            eod_at = keep - 1  # truncated: overwrite the last kept token
+        elif keep < len(tokens) or keep == max_len + 1:
+            # Truncated, or exactly ``max_len + 1`` tokens without a trailing
+            # EOD: overwrite the last kept token instead of appending past the
+            # ``sequence_length + 1`` budget (the shift below drops one token,
+            # so appending would emit a ``sequence_length + 1`` sample).
+            eod_at = keep - 1
         else:
             eod_at = keep  # append
         length = keep + 1 if eod_at == keep else keep
