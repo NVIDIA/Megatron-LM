@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from math import isqrt
 from typing import Optional
 
@@ -16,6 +17,7 @@ from examples.mimo.utils.hetero import get_data_lane_rank, get_language_batch_pa
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.utils import get_pg_rank
 from megatron.training.global_vars import get_run_config
 
 _ENCODER_SEED_OFFSET = 10_000
@@ -23,14 +25,24 @@ _LANGUAGE_SEED_OFFSET = 20_000
 _SPLIT_SEED_OFFSETS = (0, 100_000, 200_000)
 
 
-def add_mock_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def add_mock_data_args(
+    parser: argparse.ArgumentParser, *, dataset_providers=("mock",)
+) -> argparse.ArgumentParser:
     """Register the mock-dataset arguments consumed by this module's loaders."""
     group = parser.add_argument_group("mimo mock data")
-    group.add_argument("--dataset-provider", choices=("mock",), default="mock")
+    group.add_argument("--dataset-provider", choices=dataset_providers, default="mock")
     group.add_argument("--image-token-id", type=int, default=511)
     group.add_argument("--image-seq-length", type=int, default=None)
     group.add_argument("--mock-dataset-size", type=int, default=10_000)
     return parser
+
+
+def add_mimo_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Keep mock defaults and register an opt-in native Energon application."""
+    from examples.mimo.training.energon_provider import add_energon_data_args
+
+    add_mock_data_args(parser, dataset_providers=("mock", "energon"))
+    return add_energon_data_args(parser)
 
 
 def _dynamic_patch_grid(num_patches: int, require_even: bool) -> tuple[int, int]:
@@ -286,8 +298,10 @@ def _collate_mock_batch(batch: list[dict[str, object]]) -> dict[str, object]:
 
 def build_train_valid_test_data_loaders(
     args: argparse.Namespace, topology: HeteroTopology
-) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
-    """Build independent mock DataLoaders for the data-consuming rank role."""
+) -> tuple[Optional[Iterable], Optional[Iterable], Optional[Iterable]]:
+    """Build role-specific external loaders for the selected mock or Energon provider."""
+    if getattr(args, "dataset_provider", "mock") == "energon":
+        return _build_energon_data_loaders(args, topology)
     if getattr(args, "dataset_provider", "mock") != "mock":
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
@@ -336,6 +350,69 @@ def build_train_valid_test_data_loaders(
             encoder_name=None,
         )
     return (None, None, None)
+
+
+def _build_energon_data_loaders(args, topology):
+    """Map the existing disjoint MIMO topology to native Energon sample lanes."""
+    from pathlib import Path
+
+    from examples.mimo.training.energon_provider import build_energon_iterator
+    from examples.multimodal.dataloader_resume import (
+        is_initial_checkpoint_load_without_dataloader_state,
+    )
+    from megatron.training import get_train_state
+    from megatron.training.checkpointing import get_checkpoint_name
+
+    language = topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid()
+    encoder_names = [name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY]
+    if len(encoder_names) > 1:
+        raise ValueError("the MIMO example supports at most one encoder grid")
+    encoder = next(
+        (name for name in encoder_names if topology.grids[name].is_current_rank_in_grid()), None
+    )
+    if language and encoder is not None:
+        raise ValueError("Energon MIMO requires disjoint module grids")
+    if not language and encoder is None:
+        return None, None, None
+    lanes = get_language_batch_parallel_size(args)
+    if language:
+        lane_ids = (get_data_lane_rank(topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY]),)
+    else:
+        rank = get_pg_rank(topology.module_pgs[encoder].dp)
+        fanout = lanes // args.mimo_encoder_dp
+        lane_ids = tuple(range(rank * fanout, (rank + 1) * fanout))
+    checkpoint_paths = None
+    allow_missing = False
+    if args.load is not None:
+        iteration = get_train_state().iteration
+        checkpoint_paths = {
+            lane: Path(
+                get_checkpoint_name(
+                    args.energon_dataloader_load or args.load,
+                    iteration,
+                    pipeline_parallel=False,
+                    tensor_rank=0,
+                    pipeline_rank=0,
+                    expert_parallel=False,
+                    expert_rank=0,
+                    basename=f"train_dataloader_dprank{lane:03d}.pt",
+                )
+            )
+            for lane in lane_ids
+        }
+        allow_missing = is_initial_checkpoint_load_without_dataloader_state(args, iteration)
+    return (
+        build_energon_iterator(
+            args,
+            lane_ids=lane_ids,
+            language_lanes=lanes,
+            module_name=encoder,
+            checkpoint_paths=checkpoint_paths,
+            allow_missing_checkpoint=allow_missing,
+        ),
+        None,
+        None,
+    )
 
 
 def _build_split_loaders(
