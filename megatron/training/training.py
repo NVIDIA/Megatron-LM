@@ -5694,6 +5694,12 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    # Return training's cached blocks to the driver. Evaluation can route tokens very unevenly
+    # across experts, so its allocations do not match the training-shaped cache and would
+    # otherwise map new memory on top of it.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
+
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
@@ -5868,6 +5874,12 @@ def evaluate(
     # Move model back to the train mode.
     for model_module in model:
         model_module.train()
+
+    # Return evaluation's cached blocks to the driver. The caching allocator frees its cache and
+    # retries when its own allocations fail, but NCCL allocates from the driver directly, so a
+    # checkpoint save right after evaluation can otherwise fail to allocate collective buffers.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
