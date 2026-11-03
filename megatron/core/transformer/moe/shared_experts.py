@@ -16,7 +16,6 @@ from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
 )
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_recipe
 from megatron.core.fp8_utils import get_fp8_recipe
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
