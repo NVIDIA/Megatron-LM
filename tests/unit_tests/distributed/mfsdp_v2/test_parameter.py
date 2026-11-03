@@ -212,9 +212,15 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, torch.full_like(output, 96.0))
 
 
-@pytest.mark.parametrize("singleton", [False, True], ids=["gathered", "shared"])
+@pytest.mark.parametrize(
+    "singleton,parameter_placement",
+    [(False, Shard(0)), (True, Shard(0)), (False, Replicate())],
+    ids=["gathered", "singleton", "replicated"],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup, singleton, dtype):
+def test_non_leaf_parameter_view_survives_storage_resize(
+    distributed_setup, singleton, parameter_placement, dtype
+):
     """Saved weight views survive temporary-storage release or persistent-storage reuse."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -226,28 +232,32 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup, sing
     model = NonLeafViewModel().to(device=device, dtype=dtype)
     nn.init.constant_(model.weight, 2.0)
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=Placements([0], [parameter_placement], [Shard(0)], [Shard(0)]),
+        )
 
     group = model.parameter_groups[0]
     unsharded = group._unsharded_model_weight
     assert unsharded.placements == (Replicate(),)
-    assert unsharded is not group.model_weight
+    shared = singleton or parameter_placement.is_replicate()
     assert (
         unsharded.local_buffer.untyped_storage()
         is group.model_weight.local_buffer.untyped_storage()
-    ) == singleton
+    ) == shared
     for _ in range(2):
         model.zero_grad(set_to_none=True)
         x = torch.randn(8, device=device, dtype=dtype, requires_grad=True)
         loss = model(x).sum()
-        assert unsharded.is_allocated == singleton
+        assert unsharded.is_allocated == shared
         assert group.model_weight.is_allocated
 
         loss.backward()
 
         torch.testing.assert_close(x.grad, torch.full_like(x, 2.0), rtol=0, atol=0)
         assert group.main_grad is not None
-        assert unsharded.is_allocated == singleton
+        assert unsharded.is_allocated == shared
         assert group.model_weight.is_allocated
 
 

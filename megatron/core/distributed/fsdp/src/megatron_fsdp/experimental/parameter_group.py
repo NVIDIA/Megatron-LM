@@ -484,7 +484,7 @@ class FsdpParameterGroup:
             self._allgather_model_weight(
                 rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
-            # Borrowed storage can already contain both planes. Install every
+            # Shared storage can already contain both planes. Install every
             # available phase that does not yet have a readiness event.
             ready_phases = tuple(
                 p
@@ -533,7 +533,7 @@ class FsdpParameterGroup:
                 )
 
     def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
-        """Materialize the compute buffer; borrowed storage needs no allocation or copy.
+        """Materialize the compute buffer; shared storage needs no allocation or copy.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
         compute weights ignore them and gather their whole buffer.
@@ -588,7 +588,17 @@ class FsdpParameterGroup:
 
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
-            unsharded_model_weight.release_storage()
+            # Local redistribution can return a view of persistent model weights.
+            if (
+                unsharded_model_weight.local_buffer.untyped_storage()
+                is not self.model_weight.local_buffer.untyped_storage()
+            ):
+                unsharded_model_weight.release_storage()
+            return
+        if any(
+            gathered.local_buffer.untyped_storage() is persistent.local_buffer.untyped_storage()
+            for gathered, persistent in zip(unsharded_model_weight.planes, self.model_weight.planes)
+        ):
             return
         unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
         for parameter in self.fsdp_parameters:
@@ -596,23 +606,13 @@ class FsdpParameterGroup:
             # TE #3518 requires padded scale copies on the Parameter, separate
             # from the buffer's compact scales. Release these copies too.
             # https://github.com/NVIDIA/TransformerEngine/issues/3518
-            if (
-                not unsharded_model_weight.is_rowwise_allocated
-                and weight._rowwise_scale_inv is not None
-            ):
+            if weight._rowwise_scale_inv is not None:
                 weight._rowwise_scale_inv.untyped_storage().resize_(0)
-            if (
-                not unsharded_model_weight.is_columnwise_allocated
-                and weight._columnwise_scale_inv is not None
-            ):
+            if not rowwise_only and weight._columnwise_scale_inv is not None:
                 weight._columnwise_scale_inv.untyped_storage().resize_(0)
             # Keep an empty data view for TE's device queries when neither plane
             # remains. Otherwise, remove the released plane from the tensor.
-            if (
-                rowwise_only
-                and not unsharded_model_weight.is_rowwise_allocated
-                and weight._columnwise_data is not None
-            ):
+            if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
     @property
