@@ -111,9 +111,9 @@ class FsdpParameterGroup:
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     # This is None exactly when main_grad is None.
     pre_optimizer_main_grad: DBuffer | None
-    # zero_grad(set_to_none=False) clears only the current optimizer view. If final
-    # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
-    # storage is stale and must be cleared before the next accumulation begins.
+    # Final reduction ends accumulation and exposes the optimizer's gradient view.
+    # Before accumulating the next step, main_grad must be zeroed or overwritten:
+    # zero_grad(False) may zero only the optimizer's smaller view of this buffer.
     _main_grad_is_stale: bool
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
@@ -697,12 +697,20 @@ class FsdpParameterGroup:
     def _prepare_main_grad(self) -> bool:
         """Clear stale storage and report whether this backward must accumulate."""
         assert self.main_grad is not None
+        # Missing .grad fields select overwrite; installed .grad views select add.
+        # zero_grad(True) removes those views, while zero_grad(False) keeps them.
+        # After the first contribution, both paths install views for accumulation.
         has_sharded_grads = self._has_sharded_grads()
         if self._main_grad_is_stale:
-            # zero_grad(False) only zeros the optimizer view, which can be smaller.
-            # With zero_grad(True), this backward overwrites every parameter instead.
+            # Final reduction left .grad pointing at the optimizer's view of main_grad.
+            # In ZeRO-1/HFSDP that view can cover only part of the buffer. For example,
+            # zero_grad(False) might leave main_grad as [0, 0, old, old]. Adding the
+            # next step's first contribution would include those old values, so clear
+            # the whole buffer first. If .grad is None, the caller instead overwrites
+            # every parameter's gradient and no clearing is needed.
             if has_sharded_grads:
                 self.main_grad.local_buffer.zero_()
+            # Later microbatches must preserve the contributions already accumulated.
             self._main_grad_is_stale = False
         return has_sharded_grads
 
