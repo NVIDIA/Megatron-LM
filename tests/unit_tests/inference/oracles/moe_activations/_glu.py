@@ -231,11 +231,40 @@ the rows the persistent grid's programs start and wrap at (multiples of 512, plu
 the first and last rows; 10% at random; every row."""
 
 
+ROUTES_PER_TOKEN = 2
+"""Top-k of the expert-grouped maps below: every token appears in this many expert blocks."""
+EXPERT_BLOCKS = 4
+"""Experts (blocks) of the expert-grouped maps below."""
+
+
+def expert_grouped_token_indices(rows: int) -> torch.Tensor:
+    """The live-row values of ``permutation_map`` as ``permute_tokens`` fills it: the original
+    token index of each row of the expert-grouped buffer.
+
+    ``ceil(rows / ROUTES_PER_TOKEN)`` tokens, each routed to ``ROUTES_PER_TOKEN`` distinct
+    experts out of ``EXPERT_BLOCKS``, listed expert by expert (tokens in increasing order inside
+    a block); the first ``rows`` routes fill the buffer. Row ``r`` holds a token index that is in
+    general not ``r`` and repeats across experts, so a kernel that indexes per-row data
+    (``x``, ``probs``) through the map instead of by the row reads another row's data. Drawn
+    from a CPU generator of its own, seeded by ``rows``, so the caller's generator stream (the
+    inputs drawn after the map) is unchanged.
+    """
+    g = torch.Generator().manual_seed(ou.DEFAULT_SEED + rows)
+    tokens = -(-rows // ROUTES_PER_TOKEN)
+    keys = torch.rand(tokens, EXPERT_BLOCKS, generator=g)
+    experts = keys.argsort(-1)[:, :ROUTES_PER_TOKEN].reshape(-1)
+    token_of_route = torch.arange(tokens).repeat_interleave(ROUTES_PER_TOKEN)
+    order = torch.argsort(experts * tokens + token_of_route)
+    return token_of_route[order][:rows].clone()
+
+
 def permutation_map(
     rows: int, pattern: str, dtype: torch.dtype, generator: torch.Generator, device: Any
 ) -> torch.Tensor:
-    """A permutation map (token index, or -1 for an alignment-padding row) of ``rows`` rows."""
-    perm = torch.arange(rows, dtype=torch.int64)
+    """A permutation map of ``rows`` rows: the original token index of each live row in
+    expert-grouped order (``expert_grouped_token_indices``, not the identity), or -1 for an
+    alignment-padding row placed by ``pattern`` (``PADDING_PATTERNS``)."""
+    perm = expert_grouped_token_indices(rows)
     if pattern == "runs":
         for start in range(3, rows, 37):
             perm[start : start + 5] = -1
