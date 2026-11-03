@@ -483,7 +483,7 @@ class FsdpModule:
                 if partial_grad is None:
                     self._accumulate_local_gradients(group)
                 else:
-                    self._reduce_packed_gradients(group, partial_grad)
+                    self._reduce_inner_gradients(group, partial_grad)
 
                 if not context.is_last_microbatch:
                     continue
@@ -509,7 +509,7 @@ class FsdpModule:
         with torch.cuda.stream(inner_reduction_stream):
             group.accumulate_local_gradients()
 
-    def _reduce_packed_gradients(self, group: FsdpParameterGroup, partial_grad: DBuffer) -> None:
+    def _reduce_inner_gradients(self, group: FsdpParameterGroup, partial_grad: DBuffer) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
 
         The caller allocates partial_grad on the inner stream. On return, that
