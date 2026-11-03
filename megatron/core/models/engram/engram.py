@@ -339,6 +339,11 @@ class Engram(MegatronModule):
             ep_group=pg_collection.ep,
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
+            capacity_factor=(
+                engram_config.ep_capacity_factor
+                if getattr(config, "cuda_graph_impl", "none") == "full_iteration"
+                else None
+            ),
         )
         if engram_config.freeze_embedding:
             for table in self.embedding.tables:
@@ -626,13 +631,24 @@ class Engram(MegatronModule):
             hash_ids = slice_hashes_for_sequence_parallel(
                 hash_ids, hidden_states.shape[0], self.tp_group
             )
+            # Slots added by THD padding hash to the same n-grams; keep them out of the lookup
+            # so they do not pile into one fixed-capacity bucket. Their memory is zero.
+            padding_mask = getattr(packed_seq_params, "padding_mask", None)
+            valid = None
+            if padding_mask is not None:
+                valid = ~slice_hashes_for_sequence_parallel(
+                    padding_mask.unsqueeze(-1), hidden_states.shape[0], self.tp_group
+                ).squeeze(-1)
         finally:
             nvtx_range_pop(message)
 
         message = "engram.lookup"
         nvtx_range_push(message)
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            memory = self.embedding(hash_ids, valid=valid)
+            if valid is not None:
+                memory = memory * valid[..., None, None].to(memory.dtype)
+            memory = memory.flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
         if self._use_fused_dense(hidden_states):

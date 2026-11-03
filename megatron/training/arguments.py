@@ -1674,6 +1674,51 @@ def validate_args(args, defaults={}):
             'captured with static THD inputs.'
         )
 
+    # Full-iteration CUDA graphs also capture get_batch, so packed (THD) inputs are accepted
+    # only in the form the pre-graph batch transform of pretrain_hybrid.py produces: the --sft
+    # packed path under the static THD contract, at CP = 1 and PP = 1. Placed after the
+    # scheduler auto-select logic so it sees the resolved scheduler.
+    if args.cuda_graph_impl == "full_iteration":
+        static_thd_contract = (
+            "the --sft packed path with the static THD contract (--pad-packed-seq-alignment max "
+            "and --thd-max-packed-sequences)"
+        )
+        if args.dynamic_context_parallel:
+            raise ValueError(
+                "--cuda-graph-impl full_iteration does not support --dynamic-context-parallel; "
+                f"packed inputs are supported only through {static_thd_contract} at CP = 1."
+            )
+        if args.sequence_packing_scheduler is not None:
+            raise ValueError(
+                "--cuda-graph-impl full_iteration does not support the sequence-packing "
+                f"schedulers (--sequence-packing-scheduler={args.sequence_packing_scheduler}, "
+                f"also selected by --use-varlen-dataset); use {static_thd_contract}."
+            )
+        if args.sft:
+            if args.thd_max_packed_sequences is None or args.pad_packed_seq_alignment is None:
+                raise ValueError(
+                    "--cuda-graph-impl full_iteration with --sft requires the static THD "
+                    "contract (--pad-packed-seq-alignment max and --thd-max-packed-sequences); "
+                    "dynamic THD is not supported."
+                )
+            if args.context_parallel_size > 1:
+                raise ValueError(
+                    "--cuda-graph-impl full_iteration with packed (THD) inputs supports "
+                    f"--context-parallel-size 1 only, got {args.context_parallel_size}."
+                )
+            if args.pipeline_model_parallel_size > 1:
+                raise ValueError(
+                    "--cuda-graph-impl full_iteration with packed (THD) inputs supports "
+                    "--pipeline-model-parallel-size 1 only: the static THD contract is not "
+                    "implemented for middle pipeline stages."
+                )
+            tail_policy = getattr(args, "thd_tail_padding_policy", None) or "append_dummy_seq"
+            if tail_policy != "append_dummy_seq":
+                raise ValueError(
+                    "--cuda-graph-impl full_iteration with packed (THD) inputs requires "
+                    f"--thd-tail-padding-policy append_dummy_seq, got {tail_policy}."
+                )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -3604,6 +3649,15 @@ def _add_engram_args(parser):
         default=None,
         help='HF config.vocab_size bounding the qwen-variant hash multipliers; the padded '
         'vocabulary must not exceed it.',
+    )
+    group.add_argument(
+        '--engram-ep-capacity-factor',
+        type=float,
+        default=2.0,
+        help='Under --cuda-graph-impl full_iteration, the EP lookup sends each (owner rank, '
+        'table) bucket ceil(factor * tokens / ep_size) fixed slots. A bucket that overflows '
+        'fails the run (a device-side assert once the step is captured); a factor >= the EP '
+        'size can never overflow.',
     )
     group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
     group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)

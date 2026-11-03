@@ -269,8 +269,7 @@ def test_cuda_graph_scopes_that_keep_the_engram_layer_eager_are_accepted(tmp_pat
         # Whole-layer TE capture (no explicit scope) stays rejected.
         ("transformer_engine", [], "explicit"),
         ("transformer_engine", None, "explicit"),
-        # Full-iteration and local capture do not go through the per-layer decision.
-        ("full_iteration", None, "full_iteration"),
+        # Local capture does not go through the per-layer decision.
         ("local", ["attn"], "local"),
     ],
 )
@@ -281,4 +280,53 @@ def test_cuda_graph_modes_that_capture_the_engram_layer_are_rejected(
     with pytest.raises(ValueError, match=match):
         config.validate_startup(
             _startup_transformer_config(cuda_graph_impl=impl, cuda_graph_modules=modules), 16
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # EP 1: the lookup is local and has no exchange that could overflow.
+        {},
+        # EP > 1: the fixed-capacity exchange, whatever the MoE implementation; a bucket
+        # overflow fails at run time.
+        {"expert_model_parallel_size": 4},
+    ],
+)
+def test_full_iteration_capture_is_accepted_with_a_capture_safe_lookup(tmp_path, overrides):
+    config = _cuda_graph_engram_config(tmp_path)
+    config.validate_startup(
+        _startup_transformer_config(cuda_graph_impl="full_iteration", **overrides), 16
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        # The deterministic table backward has data-dependent sizes.
+        ({"deterministic_mode": True}, "deterministic_mode")
+    ],
+)
+def test_full_iteration_capture_rejects_unsupported_lookups(tmp_path, overrides, match):
+    config = _cuda_graph_engram_config(tmp_path)
+    with pytest.raises(ValueError, match=match):
+        config.validate_startup(
+            _startup_transformer_config(cuda_graph_impl="full_iteration", **overrides), 16
+        )
+
+
+def test_ep_capacity_factor_must_be_positive(tmp_path):
+    artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=16, layer_ids=(1,))
+    with pytest.raises(ValueError, match="engram_ep_capacity_factor"):
+        EngramConfig(
+            global_vocab_sizes=(17, 19),
+            layer_ids=(1,),
+            max_ngram_order=3,
+            num_hash_heads=2,
+            memory_dim=8,
+            kernel_size=4,
+            hash_seed=0,
+            boundary_token_id=0,
+            tokenizer_map_path=str(artifact),
+            ep_capacity_factor=0.0,
         )

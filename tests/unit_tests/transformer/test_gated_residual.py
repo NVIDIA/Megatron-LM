@@ -443,6 +443,75 @@ class TestGatedResidualRecompute:
             torch.testing.assert_close(grads_c[name], grads_ref[name], msg=name)
 
 
+class TestGatedResidualCudaGraph:
+    """One gated-residual block captured in a CUDA graph must replay like eager."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _block(module, inner, x):
+        """Aggregate -> inner layer -> fused (Triton) write-back, as a hybrid layer runs it."""
+        mixed, h_res, g_write, residual = module(x)
+        y = inner(mixed)
+        return module.fused_h_res_h_post_bda(
+            h_res, residual, g_write, (y, None), dropout_prob=0.0, training=True, fused=True
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_captured_forward_backward_matches_eager(self, dtype):
+        module, _ = make_modules(dtype, use_combine=True)
+        inner = nn.Linear(HIDDEN, HIDDEN, bias=False, device="cuda", dtype=dtype)
+        params = [*module.parameters(), *inner.parameters()]
+        static_x = make_input(dtype, requires_grad=True)
+        grad_out = torch.randn(SEQ, BATCH, STREAMS * HIDDEN, device="cuda", dtype=dtype)
+
+        def run(x):
+            for param in params:
+                param.grad = None
+            out = self._block(module, inner, x)
+            out.backward(grad_out)
+            return out
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                static_x.grad = None
+                run(static_x)
+        torch.cuda.current_stream().wait_stream(side)
+        static_x.grad = None
+        for param in params:
+            param.grad = None
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = self._block(module, inner, static_x)
+            static_out.backward(grad_out)
+        # The graph owns these gradient tensors; the eager reference below rebinds .grad.
+        static_grads = [static_x.grad, *[param.grad for param in params]]
+
+        for seed in (11, 12):
+            torch.manual_seed(seed)
+            new_x = torch.randn_like(static_x)
+            with torch.no_grad():
+                static_x.copy_(new_x)
+            graph.replay()
+            torch.cuda.synchronize()
+            graph_out = static_out.detach().clone()
+            graph_grads = [grad.clone() for grad in static_grads]
+
+            eager_x = new_x.detach().clone().requires_grad_(True)
+            eager_out = run(eager_x)
+            eager_grads = [eager_x.grad, *[param.grad for param in params]]
+            torch.testing.assert_close(graph_out, eager_out.detach(), **TOLS[dtype])
+            for graph_grad, eager_grad in zip(graph_grads, eager_grads):
+                torch.testing.assert_close(graph_grad, eager_grad, **TOLS[dtype])
+
+
 class TestGatedResidualConfigValidation:
 
     def test_variant_must_be_known(self):
@@ -477,9 +546,11 @@ class TestGatedResidualConfigValidation:
         with pytest.raises(ValueError, match="partial"):
             make_config(cuda_graph_impl="local")
 
-    def test_cuda_graphs_rejected_for_full_iteration_capture(self):
-        with pytest.raises(ValueError, match="partial"):
-            make_config(cuda_graph_impl="full_iteration")
+    def test_full_iteration_cuda_graph_accepted(self):
+        # Full-iteration capture packs no per-layer graph outputs; validated against eager
+        # on the Qwen3.8 proxy.
+        cfg = make_config(cuda_graph_impl="full_iteration")
+        assert cfg.cuda_graph_impl == "full_iteration"
 
     def test_cuda_graphs_rejected_when_every_layer_is_captured(self):
         # An empty cuda_graph_modules (or the deprecated "full") means "capture the whole

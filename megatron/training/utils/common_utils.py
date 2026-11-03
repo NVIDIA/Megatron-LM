@@ -752,6 +752,53 @@ class PipelineTokenPrefetchIterator:
             raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
         return self._pipeline_tokens.popleft()
 
+    # Wrappers that drain the schedule's microbatches up front and hand the scheduler a replay
+    # iterator (FullCudaGraphWrapper) go through take_batches / with_batches,
+    # so the replay iterator still exposes this microbatch's tokens to get_batch.
+
+    def take_batches(self, num_microbatches: int) -> list[Any]:
+        """Remove and return the schedule's batches; empty on ranks that own no data."""
+        batches = []
+        for _ in range(num_microbatches):
+            if self._prefetched_batches:
+                batches.append(self._prefetched_batches.popleft())
+            elif self._data_iterator is None:
+                break
+            else:
+                batches.append(next(self._data_iterator))
+        return batches
+
+    def with_batches(
+        self, batches: list[Any], static_stage: Optional[str] = None
+    ) -> "PipelineTokenPrefetchIterator":
+        """Return a wrapper that replays ``batches`` with this schedule's tokens.
+
+        With ``static_stage`` set, distributed tokens are first copied into a persistent buffer
+        for that stage, so a captured CUDA graph reads this step's tokens on every replay. In
+        ``token_spec`` mode the tokens are derived from the replayed batch itself, which the
+        caller already keeps in static buffers.
+        """
+        tokens = list(self._pipeline_tokens)
+        if static_stage is not None and tokens:
+            stacked = torch.stack(tokens)
+            static = _STATIC_PIPELINE_TOKENS.get(static_stage)
+            if static is None or static.shape != stacked.shape or static.device != stacked.device:
+                static = stacked.clone()
+                _STATIC_PIPELINE_TOKENS[static_stage] = static
+            else:
+                static.copy_(stacked)
+            tokens = list(static.unbind(0))
+        return PipelineTokenPrefetchIterator(
+            data_iterator=None,
+            prefetched_batches=batches,
+            pipeline_tokens=tokens,
+            token_spec=self._token_spec,
+        )
+
+
+# Per-stage ("training"/"validation") token buffers read by captured full-iteration graphs.
+_STATIC_PIPELINE_TOKENS: dict[str, torch.Tensor] = {}
+
 
 def prepare_tokens_for_pipeline(
     data_iterator,

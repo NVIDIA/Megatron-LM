@@ -2309,6 +2309,8 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    static_cu_seqlens_entries: Optional[int] = None,
+    has_padding_mask: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2349,6 +2351,12 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        static_cu_seqlens_entries (Optional[int]): Static THD contract: ``cu_seqlens`` has
+            exactly this many entries per sample, so it is broadcast without the length
+            prefix and receivers never read a device value. Required under full-iteration
+            CUDA graphs, where the broadcast is captured.
+        has_padding_mask (bool): Also broadcast the batch's ``padding_mask`` (a bool tensor
+            shaped like ``tokens``) wherever tokens or labels are broadcast.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2364,6 +2372,15 @@ def get_batch_on_this_tp_rank(
     if tp_rank == 0:
 
         def _broadcast_cu_seqlens(cu_seqlens):
+            if static_cu_seqlens_entries is not None:
+                assert isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.shape[-1] == (
+                    static_cu_seqlens_entries
+                ), (
+                    f"Static THD cu_seqlens must have {static_cu_seqlens_entries} entries, got "
+                    f"{None if cu_seqlens is None else tuple(cu_seqlens.shape)}"
+                )
+                _broadcast(cu_seqlens)
+                return
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
             n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
@@ -2389,6 +2406,8 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
             if has_cu_seqlens or dynamic_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2405,6 +2424,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2419,6 +2440,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            if has_padding_mask:
+                _broadcast(batch['padding_mask'])
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2454,6 +2477,11 @@ def get_batch_on_this_tp_rank(
         labels = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         loss_mask = torch.empty(shape, dtype=torch.float32, device=torch.cuda.current_device())
         position_ids = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
+        padding_mask = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if has_padding_mask
+            else None
+        )
         cu_seqlens = None
         cu_seqlens_padded = None
         max_seqlen = None
@@ -2476,6 +2504,13 @@ def get_batch_on_this_tp_rank(
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
+
+            if static_cu_seqlens_entries is not None:
+                cu_seqlens = torch.empty(
+                    (micro_batch_size, static_cu_seqlens_entries), dtype=torch.int32, device=dev
+                )
+                _broadcast(cu_seqlens)
+                return cu_seqlens
 
             n = torch.empty((), dtype=torch.int64, device=dev)
             _broadcast(n)
@@ -2510,6 +2545,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
+            _broadcast(padding_mask)
             if has_cu_seqlens or dynamic_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2526,6 +2562,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
+            _broadcast(padding_mask)
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2540,6 +2577,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(padding_mask)
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2554,6 +2592,7 @@ def get_batch_on_this_tp_rank(
             labels = None
             loss_mask = None
             position_ids = None
+            padding_mask = None
 
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
@@ -2565,6 +2604,7 @@ def get_batch_on_this_tp_rank(
             'labels': labels,
             'loss_mask': loss_mask,
             'position_ids': position_ids,
+            'padding_mask': padding_mask,
             'attention_mask': attention_mask,
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded,

@@ -358,6 +358,9 @@ class QSAIndexer(MegatronModule):
                 tail_pos = (
                     torch.arange(blocks_so_far, nb_max, device=device) - last_doc_blocks
                 ) * r
+                # The rotary table only spans the longest document, which these positions
+                # can pass; the rows are never visible, so any in-table position works.
+                tail_pos = tail_pos.clamp_(max=rotary_pos_emb.shape[0] - 1)
                 freq_parts.append(rotary_pos_emb.index_select(0, tail_pos))
             pooled = self.k_layernorm(torch.cat(pooled_parts, dim=0))
             block_keys = apply_rotary_pos_emb(
@@ -1055,6 +1058,14 @@ class QSASelfAttention(SelfAttention):
             loss_cu_seqlens = (
                 packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
             )
+            padding_mask = getattr(packed_seq_params, "padding_mask", None)
+            if padding_mask is not None:
+                # Slots added by THD padding are not data: keep their rows out of the KL sum
+                # and of the row count that normalizes it.
+                picked = selection.picked
+                selection = selection._replace(
+                    picked=picked & ~padding_mask.reshape(picked.shape[0], -1, 1)
+                )
             indexer_loss = self._compute_indexer_loss(
                 hidden_states, freqs, selection, loss_coeff, cu_seqlens=loss_cu_seqlens
             )

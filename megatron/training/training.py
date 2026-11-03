@@ -282,6 +282,10 @@ stimer = StragglerDetector()
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
+# Set when an update was captured into a full-iteration CUDA graph. A replay accumulates into
+# the same device tensor without running the Python update, so the flag that would gate
+# ``consume_*`` is never set again; this one keeps the stats consumed on every replayed step.
+_seqlen_stats_in_graph: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -769,8 +773,43 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     )
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    _mark_seqlen_stats_updated()
+
+
+def _mark_seqlen_stats_updated():
+    global _seqlen_stats_active, _seqlen_stats_are_global, _seqlen_stats_in_graph
     _seqlen_stats_active = True
     _seqlen_stats_are_global = False
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        _seqlen_stats_in_graph = True
+
+
+def update_seqlen_stats_from_static_thd(cu_seqlens, padding_mask):
+    """Add the REAL ``sum(L_i)`` and ``sum(L_i ** 2)`` of one static-THD micro-batch.
+
+    Under the static THD contract (``pad_sequence_for_thd`` with ``append_dummy_seq`` tail
+    padding and a fixed ``cu_seqlens`` capacity), ``cu_seqlens`` ends with one dummy sequence
+    that covers the padded tail, followed by zero-length repeats of its endpoint. The dummy's
+    length is the number of padded tokens, so the real stats are the padded ones minus the
+    dummy's contribution: no host sync and no data-dependent shape, which keeps this usable
+    inside a full-iteration CUDA graph.
+
+    Args:
+        cu_seqlens: 1-D ``int32`` static ``cu_seqlens`` (valid coordinates, dummy included).
+        padding_mask: bool tensor, True at the padded tail tokens.
+    """
+    global _seqlen_stats_in_iteration
+    if _seqlen_stats_in_iteration is None:
+        _seqlen_stats_in_iteration = torch.zeros(
+            2, dtype=torch.float64, device=torch.device(f'cuda:{torch.cuda.current_device()}')
+        )
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
+        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
+    )
+    dummy_len = padding_mask.sum(dtype=torch.float64).to(_seqlen_stats_in_iteration.device)
+    _seqlen_stats_in_iteration[0] += seqlens.sum() - dummy_len
+    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum() - dummy_len * dummy_len
+    _mark_seqlen_stats_updated()
 
 
 def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
@@ -813,7 +852,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     factor of ``TP * CP * PP``, which we divide out.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
-    if not _seqlen_stats_active:
+    if not (_seqlen_stats_active or _seqlen_stats_in_graph):
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
@@ -4446,6 +4485,9 @@ def training_log(
         )
         if cfg.logger.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            if total_real_tokens_in_batch is not None:
+                # Packed (THD) runs: unpadded tokens of the last iteration's global batch.
+                log_string += f' real tokens: {int(total_real_tokens_in_batch)} |'
             if cfg.logger.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)

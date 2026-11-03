@@ -28,8 +28,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.full_cuda_graph import set_pre_graph_batch_transform
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import (
+    PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
     resolve_thd_tail_padding_policy,
@@ -69,7 +71,10 @@ from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
 )
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_static_thd,
+)
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     get_pipeline_prefetched_tokens,
@@ -113,7 +118,13 @@ def _engram_tokens(data_iterator, tokens):
     """
     args = get_args()
     prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
-    if args.engram_verify_training and tokens is not None:
+    # The cross-check synchronizes with the host, which a CUDA graph capture cannot do. Under
+    # full-iteration capture it runs on the eager warmup steps; replays never re-run Python.
+    if (
+        args.engram_verify_training
+        and tokens is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         # This rank consumed its own iterator for labels; its tokens must match the batch
         # broadcast from the first stage or the sampler states diverged. Packed rows are
         # compared on the common prefix, since the local row is still unpadded here.
@@ -198,10 +209,18 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             packed_seq_params_by_layout={config.linear_cp_layout: None},
         )
 
+    # Under full-iteration graphs the static THD contract is applied before the graph's data
+    # read (_static_thd_graph_batch), so the batch already has its captured shapes.
+    static_graph_batch = _uses_static_thd_graph_batches(args)
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
-        for key in BATCH_KEYS:
+        if static_graph_batch:
+            assert batch.get("static_thd", False), (
+                "Full-iteration CUDA graphs with the static THD contract expect batches padded "
+                "by the pre-graph batch transform."
+            )
+        for key in BATCH_KEYS + (["padding_mask"] if static_graph_batch else []):
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
                 if key in batch and batch[key] is not None
@@ -217,19 +236,30 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        # A static batch is already flattened into one row of the static token capacity.
+        micro_batch_size=1 if static_graph_batch else args.micro_batch_size,
+        seq_length=args.max_seqlen_per_dp_cp_rank if static_graph_batch else args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        static_cu_seqlens_entries=(
+            args.thd_max_packed_sequences + 1 if static_graph_batch else None
+        ),
+        has_padding_mask=static_graph_batch,
     )
 
-    if args.engram_enabled:
+    if args.engram_enabled and not static_graph_batch:
         # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
         # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
         # shape and silently misalign tokens against labels.
+        # A static THD graph batch is already flattened (micro_batch_size rows merged into one
+        # pack) and every TP rank holds it (PP = 1 under the contract), so its own tokens are
+        # the memory's tokens; the pre-schedule token prefetch describes the unflattened rows.
         batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
+    if static_graph_batch:
+        return _static_thd_graph_cp_batch(batch, config)
 
     batch = flatten_batch_for_packed_sequences(batch)
 
@@ -334,6 +364,127 @@ def _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch: ContextParallelB
     )
     return ContextParallelBatch.from_single_layout(
         cp_batch.boundary_layout, batch, packed_seq_params
+    )
+
+
+def _uses_static_thd_graph_batches(args) -> bool:
+    """Whether the static THD contract is applied before full-iteration graph data reads.
+
+    Full-iteration capture records ``get_batch`` too, so the padding that eager static-THD runs
+    do in ``forward_step`` (host syncs, data-dependent shapes) moves to the pre-graph batch
+    transform, and ``get_batch`` only reads the padded batch.
+    """
+    return (
+        args.cuda_graph_impl == "full_iteration"
+        and args.sft
+        and getattr(args, "pad_packed_seq_alignment", None) is not None
+        and getattr(args, "thd_max_packed_sequences", None) is not None
+    )
+
+
+_STATIC_THD_CONFIG = None
+
+
+def _static_thd_graph_batch(batch):
+    """Pad one drained SFT packed microbatch to the static THD contract (pre-graph transform).
+
+    Runs eagerly in the full-iteration data read, before the batch is copied to the graph's
+    static buffers. It flattens the microbatch and pads it with the same code eager static-THD
+    runs use in ``forward_step``, so both see identical tensors, and returns a batch with
+    data-independent shapes: tokens, labels, loss mask, position ids and padding mask of
+    ``max_seqlen_per_dp_cp_rank`` tokens and ``cu_seqlens`` of ``thd_max_packed_sequences + 1``
+    entries. A pack with more sequences than that raises. Already padded batches are returned
+    unchanged.
+    """
+    global _STATIC_THD_CONFIG
+    if batch.get("static_thd", False):
+        return batch
+    args = get_args()
+    if _STATIC_THD_CONFIG is None:
+        _STATIC_THD_CONFIG = core_transformer_config_from_args(args)
+    config = _STATIC_THD_CONFIG
+    raw = {
+        key: (batch[key].cuda(non_blocking=True) if batch.get(key) is not None else None)
+        for key in BATCH_KEYS
+    }
+    raw = flatten_batch_for_packed_sequences(raw)
+    cu_seqlens = raw["cu_seqlens"].squeeze(0)
+    # The padded tail becomes one more (dummy) sequence.
+    num_seqs = (
+        cu_seqlens.numel() - 1 + int(raw["tokens"].shape[-1] < config.max_seqlen_per_dp_cp_rank)
+    )
+    if num_seqs > config.thd_max_packed_sequences:
+        raise ValueError(
+            f"Packed microbatch needs {num_seqs} sequences including the padding tail, more "
+            f"than --thd-max-packed-sequences ({config.thd_max_packed_sequences}); raise it."
+        )
+    # CP = 1 and PP = 1 under the contract: the same metadata get_batch builds eagerly.
+    padded = _pad_packed_batch_to_static_thd(
+        config,
+        None,
+        get_batches_on_this_cp_rank(
+            raw,
+            boundary_layout=config.linear_cp_layout,
+            dynamic_cp=False,
+            cp_group=None,
+            tokens_per_sample=args.seq_length,
+        ),
+    )
+    padded_batch = padded.get_batch()
+    padded_params = padded.get_packed_seq_params()
+    # get_batch rebuilds PackedSeqParams from config values (_static_thd_packed_seq_params);
+    # check that it describes exactly what the eager padding produced.
+    target_len = config.max_seqlen_per_dp_cp_rank
+    tokens = padded_batch["tokens"]
+    assert (
+        padded_params.cu_seqlens_kv is padded_params.cu_seqlens_q
+        and padded_params.cu_seqlens_q_padded is None
+        and padded_params.cu_seqlens_kv_padded is None
+        and padded_params.max_seqlen_q == padded_params.max_seqlen_kv == target_len
+        and padded_params.total_tokens is None
+        and padded_params.pad_between_seqs is True
+        and tokens.shape == (1, target_len)
+    ), "Unexpected static THD padding result."
+    return {
+        "tokens": tokens,
+        "labels": padded_batch["labels"],
+        "loss_mask": padded_batch["loss_mask"],
+        "position_ids": padded_batch["position_ids"],
+        "padding_mask": padded_batch["padding_mask"],
+        "cu_seqlens": padded_params.cu_seqlens_q.unsqueeze(0),
+        "max_seqlen": torch.full((1,), target_len, dtype=torch.int32, device=tokens.device),
+        "static_thd": True,
+    }
+
+
+def _static_thd_packed_seq_params(cu_seqlens, padding_mask, config):
+    """PackedSeqParams of a static THD batch, built from config values only (no host sync)."""
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=config.max_seqlen_per_dp_cp_rank,
+        max_seqlen_kv=config.max_seqlen_per_dp_cp_rank,
+        pad_between_seqs=True,
+        padding_mask=padding_mask,
+    )
+
+
+def _static_thd_graph_cp_batch(batch, config):
+    """Return get_batch's ContextParallelBatch for a batch padded by ``_static_thd_graph_batch``.
+
+    ``cu_seqlens`` moves into the PackedSeqParams and is cleared from the batch dict, so
+    ``forward_step`` takes the static (dummy-tail aware) FLOPs accounting path.
+    """
+    packed_seq_params = _static_thd_packed_seq_params(
+        batch["cu_seqlens"].squeeze(0), batch["padding_mask"], config
+    )
+    static_batch = {**dict.fromkeys(BATCH_KEYS), **batch}
+    static_batch.pop("static_thd", None)
+    static_batch["cu_seqlens"] = None
+    static_batch["max_seqlen"] = None
+    return ContextParallelBatch.from_single_layout(
+        config.linear_cp_layout, static_batch, packed_seq_params
     )
 
 
@@ -456,7 +607,13 @@ def forward_step(data_iterator, model: HybridModel):
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
         config = get_attr_wrapped_model(model, "config")
-        if cp_batch.get_packed_seq_params() is not None and _uses_static_thd_contract(config):
+        # A full-iteration graph batch was padded before the graph's data read.
+        static_graph_batch = _uses_static_thd_graph_batches(get_args())
+        if (
+            not static_graph_batch
+            and cp_batch.get_packed_seq_params() is not None
+            and _uses_static_thd_contract(config)
+        ):
             cp_batch = _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
@@ -467,7 +624,10 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        if static_graph_batch:
+            # The static batch's cu_seqlens include the dummy tail sequence.
+            update_seqlen_stats_from_static_thd(packed_seq_params.cu_seqlens_q, padding_mask)
+        elif cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
@@ -719,6 +879,8 @@ if __name__ == "__main__":
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
+    if _uses_static_thd_graph_batches(args):
+        set_pre_graph_batch_transform(_static_thd_graph_batch)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

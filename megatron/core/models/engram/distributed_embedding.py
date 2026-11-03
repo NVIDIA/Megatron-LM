@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 import torch
@@ -15,12 +16,43 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 
+def _check_bucket_capacity(peak_requests: Tensor, capacity: int, num_tokens: int, ep_size: int):
+    """Fail when a fixed-capacity bucket received more requests than it holds.
+
+    Eagerly (graph warmup) this reads the peak on the host and raises with the factor that
+    would have fit. Under CUDA graph capture the host cannot read it, so a device-side assert is
+    recorded instead and every replay checks it; an overflowing replay aborts the process.
+    """
+    message = (
+        "Engram fixed-capacity EP lookup overflowed a bucket; raise "
+        f"--engram-ep-capacity-factor (no overflow is possible at >= the EP size, {ep_size})."
+    )
+    if torch.cuda.is_current_stream_capturing():
+        torch._assert_async(peak_requests <= capacity, message)
+        return
+    peak = int(peak_requests.item())
+    if peak > capacity:
+        needed = peak * ep_size / num_tokens
+        raise ValueError(
+            f"{message} A bucket received {peak} requests for {capacity} slots; a factor of "
+            f"at least {needed:.2f} would have fit this step."
+        )
+
+
 class _DifferentiableEngramAllToAll(torch.autograd.Function):
-    """Variable-split all-to-all with Engram-specific forward/backward NVTX ranges."""
+    """All-to-all with Engram-specific forward/backward NVTX ranges.
+
+    ``None`` splits mean equal splits (the fixed-capacity exchange).
+    """
 
     @staticmethod
-    def _exchange(group, input_: Tensor, output_splits: list[int], input_splits: list[int]):
-        output = input_.new_empty((sum(output_splits), *input_.shape[1:]))
+    def _exchange(
+        group, input_: Tensor, output_splits: Optional[list[int]], input_splits: Optional[list[int]]
+    ):
+        if output_splits is None:
+            output = torch.empty_like(input_)
+        else:
+            output = input_.new_empty((sum(output_splits), *input_.shape[1:]))
         torch.distributed.all_to_all_single(
             output,
             input_.contiguous(),
@@ -233,8 +265,14 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         ep_group=None,
         tp_group=None,
         expt_dp_group=None,
+        capacity_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
+        if capacity_factor is not None and capacity_factor <= 0:
+            raise ValueError(f"capacity_factor must be positive, got {capacity_factor}.")
+        # Set: exchange through fixed-size (owner, table) buckets with no host synchronization,
+        # as a captured CUDA graph requires. None: exact, variable-split exchange.
+        self.capacity_factor = capacity_factor
         self.table_sizes = tuple(table_sizes)
         self.embedding_dim = embedding_dim
         self.ep_group = ep_group
@@ -317,11 +355,123 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         output.index_copy_(0, order, torch.cat(values))
         return output
 
-    def forward(self, hash_ids: Tensor) -> Tensor:
+    def _table_ids(self, shape: torch.Size, device) -> Tensor:
+        """Table index of every flattened request of a ``[..., num_tables]`` hash tensor."""
+        return (
+            torch.arange(len(self.tables), device=device, dtype=torch.int64)
+            .view(*([1] * (len(shape) - 1)), -1)
+            .expand(shape)
+            .reshape(-1)
+        )
+
+    def _owner_map(self, rows: Tensor, table_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Return each request's owning EP rank and its row index within the owner's shard."""
+        # Balanced contiguous partition: ranks below `remainder` own `base + 1` rows and the
+        # rest own `base`, so the owner of a global row follows in O(1) per request.
+        base = self.table_row_base.index_select(0, table_ids)
+        remainder = self.table_row_remainder.index_select(0, table_ids)
+        large_region_end = (base + 1) * remainder
+        owners = torch.where(
+            rows < large_region_end,
+            rows // (base + 1),
+            remainder + (rows - large_region_end) // base.clamp_min(1),
+        )
+        owner_starts = owners * base + torch.minimum(owners, remainder)
+        return owners, rows - owner_starts
+
+    def bucket_capacity(self, num_tokens: int) -> int:
+        """Slots per (owner, table) bucket for a lookup over ``num_tokens`` tokens."""
+        return max(1, math.ceil(self.capacity_factor * num_tokens / self.ep_size))
+
+    def _forward_fixed_capacity(self, hash_ids: Tensor, valid: Tensor | None = None) -> Tensor:
+        """EP lookup through fixed-size buckets; every shape follows from ``hash_ids.shape``.
+
+        Each (owner, table) bucket holds ``bucket_capacity`` requests. Requests travel in a
+        ``[ep, num_tables, capacity]`` layout, so the table of a slot is implicit in its position
+        and the owner gathers each table's slots with one embedding call. Unused slots look up
+        row 0 and are never read back, so they contribute no gradient. A bucket that overflows
+        is an error (see ``_check_bucket_capacity``): the capacity factor is too small. Requests
+        of tokens where ``valid`` is False take no slot; their returned rows are arbitrary and
+        must be discarded by the caller.
+        """
+        original_shape = hash_ids.shape
+        num_tables = len(self.tables)
+        rows = hash_ids.reshape(-1).to(torch.int64)
+        num_requests = rows.numel()
+        capacity = self.bucket_capacity(num_requests // num_tables)
+        num_slots = self.ep_size * num_tables * capacity
+        device = hash_ids.device
+
+        message = "engram.lookup.owner-map"
+        nvtx_range_push(message)
+        try:
+            table_ids = self._table_ids(original_shape, device)
+            owners, local_rows = self._owner_map(rows, table_ids)
+            num_buckets = self.ep_size * num_tables
+            buckets = owners * num_tables + table_ids
+            if valid is not None:
+                # Invalid requests go to one extra bucket that is never sent.
+                valid = valid.unsqueeze(-1).expand(original_shape).reshape(-1)
+                buckets = torch.where(valid, buckets, num_buckets)
+            # Rank of each request within its bucket, from a stable sort and per-bucket starts.
+            order = torch.argsort(buckets, stable=True)
+            counts = torch.zeros(num_buckets + 1, dtype=torch.int64, device=device)
+            counts.scatter_add_(0, buckets, torch.ones_like(buckets))
+            starts = torch.cumsum(counts, 0) - counts
+            sorted_positions = torch.arange(
+                num_requests, device=device, dtype=torch.int64
+            ) - starts.index_select(0, buckets.index_select(0, order))
+            positions = torch.empty_like(sorted_positions).scatter_(0, order, sorted_positions)
+            fits = positions < capacity
+            if valid is not None:
+                fits = fits & valid
+                buckets = torch.where(valid, buckets, 0)
+            _check_bucket_capacity(
+                counts[:num_buckets].max(), capacity, num_requests // num_tables, self.ep_size
+            )
+            slots = buckets * capacity + positions.clamp_max(capacity - 1)
+            # Invalid (and, before the capacity check fails, excess) requests write to one
+            # spare slot past the end that is never sent.
+            send = torch.zeros(num_slots + 1, dtype=torch.int64, device=device)
+            send.scatter_(0, torch.where(fits, slots, num_slots), local_rows)
+            send = send[:num_slots]
+            received = torch.empty_like(send)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup.request-a2a"
+        nvtx_range_push(message)
+        try:
+            torch.distributed.all_to_all_single(received, send, group=self.ep_group)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup.local-embedding"
+        nvtx_range_push(message)
+        try:
+            received = received.view(self.ep_size, num_tables, capacity)
+            owner_embeddings = torch.stack(
+                [
+                    table(received[:, table_id].reshape(-1)).view(
+                        self.ep_size, capacity, self.embedding_dim
+                    )
+                    for table_id, table in enumerate(self.tables)
+                ],
+                dim=1,
+            ).view(num_slots, self.embedding_dim)
+        finally:
+            nvtx_range_pop(message)
+        responses = _DifferentiableEngramAllToAll.apply(self.ep_group, owner_embeddings, None, None)
+        return responses.index_select(0, slots).view(*original_shape, self.embedding_dim)
+
+    def forward(self, hash_ids: Tensor, valid: Tensor | None = None) -> Tensor:
         """Route global table rows to owners and restore token/head ordering.
 
         Args:
             hash_ids: Per-table row IDs with shape ``[..., num_tables]``.
+            valid: Optional bool mask of shape ``hash_ids.shape[:-1]``. The fixed-capacity
+                exchange gives tokens where it is False no bucket slot; their returned rows
+                are arbitrary and must be discarded by the caller.
 
         Returns:
             Retrieved embeddings with shape ``[..., num_tables, embedding_dim]``.
@@ -340,30 +490,16 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             ]
             return torch.stack(values, dim=-2).view(*original_shape, self.embedding_dim)
 
+        if self.capacity_factor is not None:
+            return self._forward_fixed_capacity(hash_ids, valid)
+
         rows = hash_ids.reshape(-1).to(torch.int64)
-        table_ids = (
-            torch.arange(len(self.tables), device=hash_ids.device, dtype=torch.int64)
-            .view(*([1] * (hash_ids.ndim - 1)), -1)
-            .expand(original_shape)
-            .reshape(-1)
-        )
+        table_ids = self._table_ids(original_shape, hash_ids.device)
 
         message = "engram.lookup.owner-map"
         nvtx_range_push(message)
         try:
-            # Balanced contiguous partition: ranks below `remainder` own `base + 1` rows and the
-            # rest own `base`, so the owner of a global row follows in O(1) per request.
-            base = self.table_row_base.index_select(0, table_ids)
-            remainder = self.table_row_remainder.index_select(0, table_ids)
-            large_region_end = (base + 1) * remainder
-            owners = torch.where(
-                rows < large_region_end,
-                rows // (base + 1),
-                remainder + (rows - large_region_end) // base.clamp_min(1),
-            )
-            owner_starts = owners * base + torch.minimum(owners, remainder)
-            local_rows = rows - owner_starts
-
+            owners, local_rows = self._owner_map(rows, table_ids)
             owner_order = torch.argsort(owners, stable=True)
             sorted_owners = owners.index_select(0, owner_order)
             requests = torch.stack(

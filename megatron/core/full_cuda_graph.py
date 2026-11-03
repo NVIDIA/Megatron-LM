@@ -192,6 +192,53 @@ def clone_tensors_in_struct(tgt, src):
         raise Exception(f"Expect top-level as container type but got: {type(src)}")
 
 
+# Optional callable applied to every drained microbatch before it reaches the schedule (see
+# set_pre_graph_batch_transform).
+_pre_graph_batch_transform = None
+
+
+def set_pre_graph_batch_transform(transform):
+    """Register a transform applied to every microbatch drained for a full-iteration step.
+
+    ``FullCudaGraphWrapper`` drains the schedule's microbatches before running it; the transform
+    runs there, eagerly and outside any capture, so it may synchronize with the host and
+    allocate data-dependent shapes. It must return a batch whose tensor shapes do not depend on
+    the data (they become static graph inputs). Pass None to clear it.
+    """
+    global _pre_graph_batch_transform
+    _pre_graph_batch_transform = transform
+
+
+def drain_microbatches(data_iterator, num_microbatches):
+    """Read the schedule's microbatches from ``data_iterator``.
+
+    An iterator that carries per-schedule state for ``forward_step`` (it defines
+    ``take_batches`` / ``with_batches``, e.g. the Engram token-prefetch wrapper) drains itself,
+    and may own no batches on ranks that read no data. A registered pre-graph batch transform
+    is applied to every batch.
+    """
+    take_batches = getattr(data_iterator, 'take_batches', None)
+    if take_batches is not None:
+        batches = take_batches(num_microbatches)
+    else:
+        batches = [next(data_iterator) for _ in range(num_microbatches)]
+    if _pre_graph_batch_transform is not None:
+        batches = [_pre_graph_batch_transform(batch) for batch in batches]
+    return batches
+
+
+def replay_iterator(data_iterator, batches, static_stage=None):
+    """Return an iterator over ``batches`` that keeps ``data_iterator``'s per-schedule state.
+
+    ``static_stage`` asks the wrapper to keep any state that ``forward_step`` reads in static
+    buffers for that stage, because a captured graph replays against those addresses.
+    """
+    with_batches = getattr(data_iterator, 'with_batches', None)
+    if with_batches is not None:
+        return with_batches(batches, static_stage)
+    return iter(batches)
+
+
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
 # maintains separate static buffers for training and validation CUDA graphs.
 class StaticBufferLoader:
@@ -248,35 +295,25 @@ class FullCudaGraphWrapper:
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        stage = 'training' if training else 'validation'
+
+        def _static_replay(iterator):
+            batches = drain_microbatches(iterator, num_microbatches)
+            static_batches = [
+                self.static_loader(batch, stage, b) for b, batch in enumerate(batches)
+            ]
+            return replay_iterator(iterator, static_batches, static_stage=stage)
+
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
             iterator0 = data_iterator if not isinstance(data_iterator, list) else data_iterator[0]
-            data_list = []
-            if iterator0 is not None:
-                for b in range(num_microbatches):
-                    data_list.append(
-                        self.static_loader(
-                            next(iterator0), 'training' if training else 'validation', b
-                        )
-                    )
-                data_list = [iter(data_list)]
-            else:
-                data_list.append(None)
+            data_list = [_static_replay(iterator0) if iterator0 is not None else None]
         else:
             assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
-            data_list = []
-            for i in range(len(model)):
-                if data_iterator[i] is not None:
-                    data_list_i = []
-                    for b in range(num_microbatches):
-                        data_list_i.append(
-                            self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
-                            )
-                        )
-                    data_list.append(iter(data_list_i))
-                else:
-                    data_list.append(None)
+            data_list = [
+                _static_replay(iterator) if iterator is not None else None
+                for iterator in data_iterator
+            ]
         return data_list
 
     def __call__(self, *args, **kwargs):

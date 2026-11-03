@@ -3471,21 +3471,25 @@ class TransformerConfig(ModelParallelConfig):
             # The variant's h_res slot is None (GatedResidualModule.produces_h_res). The
             # hybrid hyper-connection wrapper's TE per-layer capture keys on produces_h_res
             # and omits the slot from its partial-MoE graph outputs, so that capture is
-            # supported. The `local` implementation and full-iteration capture have not been
-            # validated against the 4-tuple contract.
+            # supported. Full-iteration capture records the whole step and packs no per-layer
+            # graph outputs, so the 4-tuple contract does not arise there; it was validated
+            # against eager on the Qwen3.8 proxy. The `local` implementation captures the
+            # whole layer through per-layer graph outputs and has not been validated against
+            # that contract.
             if (
-                self.cuda_graph_impl not in ("none", "transformer_engine")
+                self.cuda_graph_impl not in ("none", "transformer_engine", "full_iteration")
                 or self.enable_cuda_graph
                 or self.external_cuda_graph
             ):
                 raise ValueError(
                     "CUDA graphs with mhc_connection_variant='gated_residual' are "
                     "supported only as cuda_graph_impl='transformer_engine' partial "
-                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    "capture or cuda_graph_impl='full_iteration', got "
+                    f"cuda_graph_impl={self.cuda_graph_impl!r}"
                     f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
                     f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
-                    "Whole-layer and full-iteration capture have not been validated "
-                    "against the 4-tuple contract."
+                    "Whole-layer local capture has not been validated against the 4-tuple "
+                    "contract."
                 )
             if self.cuda_graph_impl == "transformer_engine":
                 # ``attn`` captures each attention-type hybrid layer as one whole-wrapper
