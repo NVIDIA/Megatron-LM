@@ -475,20 +475,21 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
+                partial_grad = None
                 if group.requires_inner_reduction:
                     with torch.cuda.stream(inner_reduction_stream):
                         partial_grad = group.allocate_partial_grad_buffer()
 
-                    current_stream.wait_stream(inner_reduction_stream)
+                current_stream.wait_stream(inner_reduction_stream)
+                if partial_grad is None:
+                    group.accumulate_local_gradients()
+                else:
                     group.copy_gradients_to_partial_buffer(partial_grad)
 
-                    inner_reduction_stream.wait_stream(current_stream)
+                inner_reduction_stream.wait_stream(current_stream)
+                if partial_grad is not None:
                     with torch.cuda.stream(inner_reduction_stream):
                         group.reduce_inner_gradients(partial_grad)
-                else:
-                    current_stream.wait_stream(inner_reduction_stream)
-                    group.accumulate_local_gradients()
-                    inner_reduction_stream.wait_stream(current_stream)
 
                 if not context.is_last_microbatch:
                     continue
