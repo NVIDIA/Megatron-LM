@@ -91,25 +91,35 @@ def test_full_mean_under_batch_invariant_mode():
     torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
 
 
-_LOG_SOFTMAX_SHAPES = [(3, 0), (0, 0), (2, 3, 0), (0, 5), (2, 0, 7), ()]
+_LOG_SOFTMAX_CASES = [
+    *[
+        pytest.param(shape, None, id="x".join(map(str, shape)))
+        for shape in [(0,), (3, 0), (0, 0), (2, 3, 0), (0, 5), (2, 0, 7)]
+    ],
+    pytest.param((), None, id="0d"),
+    *[pytest.param((), value, id=f"0d-{value}") for value in ("inf", "-inf", "nan")],
+]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("shape", _LOG_SOFTMAX_SHAPES, ids=lambda s: "x".join(map(str, s)) or "0d")
-def test_log_softmax_handles_empty_and_0d_inputs(shape):
+@pytest.mark.parametrize(("shape", "value"), _LOG_SOFTMAX_CASES)
+def test_log_softmax_handles_empty_and_0d_inputs(shape, value):
     """Empty dims and 0-dim inputs give what torch.log_softmax gives, also under BI mode.
 
-    The last dim can be named by -1 or by its index (0 for a 0-dim input).
+    The last dim can be named by -1 or by its index (0 for a 0-dim input). A non-finite
+    0-dim input gives NaN, as in torch.
     """
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    if value is not None:
+        x.fill_(float(value))
     expected = torch.log_softmax(x, dim=-1)
     for dim in (-1, max(x.ndim, 1) - 1):
         out = log_softmax(x, dim=dim)
         assert out.shape == expected.shape and out.dtype == expected.dtype
-        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
         with set_batch_invariant_mode(True):
             out = torch.log_softmax(x, dim=dim)
-        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
 
 
 # ============================================================================
