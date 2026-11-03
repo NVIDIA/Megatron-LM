@@ -679,6 +679,11 @@ class TestGDPSpeculativeDecode:
             def is_dynamic_batching(self):
                 return True
 
+            # The context's padding-row zeroing, which leaves this unquantized mixer's output.
+            zero_padding_tokens_for_quantization = (
+                DynamicInferenceContext.zero_padding_tokens_for_quantization
+            )
+
             def mamba_states_cache(self, layer, intermediate=False):
                 assert layer == self_mixer.layer_number - self_mixer.pp_layer_offset
                 return actual_snapshots if intermediate else (actual_conv, actual_ssm)
