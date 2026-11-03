@@ -339,7 +339,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
-        if not hasattr(pg_collection, 'dp_cp'):
+        # vars(), not hasattr: an unset field reads as None, so hasattr is always True.
+        if vars(pg_collection).get("dp_cp") is None:
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
         if "residual_stream" in (config.recompute_modules or []):
