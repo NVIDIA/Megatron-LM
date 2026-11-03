@@ -42,7 +42,10 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    gather_from_tensor_model_parallel_region,
+)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -2365,9 +2368,46 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if is_te_min_version("0.12.0", check_equality=False):
             self.te_forward_mask_type = True
 
+        num_attention_heads = self.config.num_attention_heads
+        # Batch-invariant CP exchanges sequence for heads around a CP=1 TE call (see
+        # _a2a_cp_forward), so TE is built for this rank's share of the heads and no CP group.
+        self._a2a_cp_group = None
+        if self.config.batch_invariant_mode and self.config.context_parallel_size > 1:
+            assert (
+                self.config.softmax_type == "vanilla"
+            ), "Batch-invariant context parallelism supports only softmax_type='vanilla'."
+            assert not (self.config.qk_clip or self.config.log_max_attention_logit), (
+                "Batch-invariant context parallelism does not support qk_clip or "
+                "log_max_attention_logit."
+            )
+            cp_size = self.config.context_parallel_size
+            tp_size = self.config.tensor_model_parallel_size
+            heads_per_tp_rank = num_attention_heads // tp_size
+            groups_per_tp_rank = self.config.num_query_groups // tp_size
+            assert heads_per_tp_rank % cp_size == 0, (
+                f"Batch-invariant context parallelism needs the {heads_per_tp_rank} attention "
+                f"heads per tensor-parallel rank to divide by context_parallel_size={cp_size}."
+            )
+            # K/V heads are split like the query heads when they divide by CP; otherwise
+            # each CP rank gathers the full sequence of the one K/V head its query heads use.
+            assert groups_per_tp_rank % cp_size == 0 or cp_size % groups_per_tp_rank == 0, (
+                f"Batch-invariant context parallelism needs the {groups_per_tp_rank} query "
+                "groups per tensor-parallel rank to divide by, or divide, "
+                f"context_parallel_size={cp_size}."
+            )
+            assert pg_collection.cp is not None, (
+                "Batch-invariant context parallelism needs the context-parallel group at "
+                "construction."
+            )
+            self._a2a_cp_group = pg_collection.cp
+            self._a2a_cp_split_kv = groups_per_tp_rank % cp_size == 0
+            num_attention_heads //= cp_size
+            groups_per_cp_rank = groups_per_tp_rank // cp_size if self._a2a_cp_split_kv else 1
+            extra_kwargs["num_gqa_groups"] = groups_per_cp_rank * tp_size
+
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
-        if self.config.context_parallel_size > 1:
+        if self.config.context_parallel_size > 1 and self._a2a_cp_group is None:
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
@@ -2474,7 +2514,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.current_max_attn_logits = None
 
         super().__init__(
-            num_attention_heads=self.config.num_attention_heads,
+            num_attention_heads=num_attention_heads,
             kv_channels=kv_channels,
             attention_dropout=(
                 self.config.attention_dropout if attention_dropout is None else attention_dropout
@@ -2543,6 +2583,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if self._a2a_cp_group is not None:
+            return self._a2a_cp_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
         with self._temporary_runtime_context_parallel_group(packed_seq_params):
             return self._forward(
                 query,
@@ -2655,6 +2707,95 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
+
+    def _a2a_cp_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> Tensor:
+        """Batch-invariant context-parallel attention.
+
+        Each CP rank trades its load-balanced sequence shard of every head for the full
+        sequence of 1/CP of the heads, restores the original token order, and runs TE's CP=1
+        attention on it, so every head sees the same kernel call as without CP.
+        """
+        from megatron.core.ssm.mamba_context_parallel import (
+            _all_to_all_cp2hp,
+            _all_to_all_hp2cp,
+            _redo_attention_load_balancing,
+            _undo_attention_load_balancing,
+        )
+
+        assert (
+            attention_bias is None
+        ), "Batch-invariant context parallelism does not support attention_bias."
+        assert (
+            packed_seq_params is None or packed_seq_params.local_cp_size is None
+        ), "Batch-invariant context parallelism does not support dynamic context parallelism."
+        qkv_format = (
+            packed_seq_params.qkv_format if packed_seq_params is not None else self.qkv_format
+        )
+        assert qkv_format in (
+            "sbhd",
+            "thd",
+        ), f"Batch-invariant context parallelism does not support qkv_format={qkv_format!r}."
+        is_thd = qkv_format == "thd"
+        reorder_params = packed_seq_params if is_thd else None
+        cp_group = self._a2a_cp_group
+        cp_size = cp_group.size()
+
+        def to_seq_hidden(x: Tensor) -> Tensor:
+            # [s, b, h, d] or [t, h, d] -> [s, b, h * d] with b == 1 for thd.
+            return (x.unsqueeze(1) if is_thd else x).flatten(2)
+
+        def to_heads(x: Tensor, head_dim: int) -> Tensor:
+            x = x.unflatten(-1, (-1, head_dim))
+            return x.squeeze(1) if is_thd else x
+
+        def seq_to_heads(x: Tensor) -> Tensor:
+            out = _all_to_all_cp2hp(to_seq_hidden(x), cp_group)
+            out = _undo_attention_load_balancing(out, cp_size, reorder_params)
+            return to_heads(out, x.size(-1))
+
+        def gather_kv_head(x: Tensor) -> Tensor:
+            out = gather_from_sequence_parallel_region(
+                to_seq_hidden(x), tensor_parallel_output_grad=True, group=cp_group
+            )
+            out = _undo_attention_load_balancing(out, cp_size, reorder_params)
+            out = to_heads(out, x.size(-1))
+            # Query heads are split contiguously, so this rank's heads share one K/V head.
+            ranks_per_kv_head = cp_size // x.size(-2)
+            head = cp_group.rank() // ranks_per_kv_head
+            return out.narrow(-2, head, 1).contiguous()
+
+        query = seq_to_heads(query)
+        if self._a2a_cp_split_kv:
+            key, value = seq_to_heads(key), seq_to_heads(value)
+        else:
+            key, value = gather_kv_head(key), gather_kv_head(value)
+
+        core_attn_out = self._forward(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            bf16_backward=bf16_backward,
+        )
+
+        out = core_attn_out.unsqueeze(1) if is_thd else core_attn_out
+        out = _redo_attention_load_balancing(out, cp_size, reorder_params)
+        out = _all_to_all_hp2cp(out, cp_group)
+        return out.squeeze(1) if is_thd else out
 
     def sharded_state_dict(
         self,
