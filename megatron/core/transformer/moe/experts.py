@@ -1820,16 +1820,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
+    def _ep_invariant_leaves(self) -> Optional[int]:
+        """``moe_ep_invariant_combine``: leaves of this rank's subtree of the combine tree
+        (token_combine sums the rank partials over the rest of the tree), else None."""
+        if not self.config.moe_ep_invariant_combine:
+            return None
+        return num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size()
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
-        ep_invariant_leaves = None
-        if self.config.moe_ep_invariant_combine:
-            # This rank's subtree of the EP-invariant combine tree; token_combine sums the
-            # rank partials over the rest of the tree.
-            ep_invariant_leaves = (
-                num_leaf_blocks(self.config.num_moe_experts) // self.ep_group.size()
-            )
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1843,7 +1843,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
-            ep_invariant_leaves=ep_invariant_leaves,
+            ep_invariant_leaves=self._ep_invariant_leaves(),
         )
         return output, None
 
@@ -1863,6 +1863,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            ep_invariant_leaves=self._ep_invariant_leaves(),
         )
         return output, None
 

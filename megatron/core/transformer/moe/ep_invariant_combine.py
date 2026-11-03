@@ -323,6 +323,99 @@ def _tree_combine_backward_kernel(
                 tl.store(d_slot_probs_ptr + tok * K + j, tl.sum(dot, 0))
 
 
+@triton.jit
+def _tree_combine_topk_kernel(
+    rows_ptr,  # [T * TOPK, H] expert output rows, row t * TOPK + k for slot k of token t
+    routing_map_ptr,  # [T, TOPK] global expert of each slot
+    valid_tokens_ptr,  # scalar int32: tokens >= this are skipped (not written)
+    out_ptr,  # [T, H]
+    hidden,
+    local_expert_start,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    LEVELS: tl.constexpr,  # log2(number of leaves on this rank)
+    LEAF_SIZE: tl.constexpr,  # local experts per leaf
+    TOPK: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """This rank's subtree for rows laid out per top-k slot (the vLLM grouped GEMM).
+
+    The token's local routes are visited in expert order by repeatedly taking the
+    smallest remaining local expert of its routing-map row, so the tree is the one
+    ``_tree_combine_kernel`` evaluates on the same rows and gives the same bits.
+    """
+    tok = tl.program_id(0).to(tl.int64)
+    if tok < tl.load(valid_tokens_ptr):
+        offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs < hidden
+        zero = tl.zeros([BLOCK_H], dtype=tl.float32)
+        slots = tl.arange(0, TOPK_POW2)
+        local = (
+            tl.load(routing_map_ptr + tok * TOPK + slots, mask=slots < TOPK, other=-1)
+            - local_expert_start
+        )
+        is_local = (local >= 0) & (local < NUM_LOCAL_EXPERTS) & (slots < TOPK)
+        key = tl.where(is_local, local, NUM_LOCAL_EXPERTS).to(tl.int32)
+        pending = ()
+        for _ in tl.static_range(LEVELS):
+            pending = pending + (zero,)
+        occupied = tl.full([], 0, tl.int32)
+        acc = zero
+        cur_leaf = tl.full([], -1, tl.int32)
+        for _ in tl.range(0, tl.sum(is_local.to(tl.int32), 0)):
+            expert = tl.min(key, 0)
+            slot = tl.min(tl.where(key == expert, slots, TOPK_POW2), 0)
+            key = tl.where(slots == slot, NUM_LOCAL_EXPERTS, key)
+            v = tl.load(rows_ptr + (tok * TOPK + slot) * hidden + offs, mask=mask_h, other=0.0)
+            acc, pending, occupied, cur_leaf = _add_to_leaf(
+                acc, pending, occupied, cur_leaf, expert // LEAF_SIZE, v.to(tl.float32), LEVELS
+            )
+        acc = _fold_below(acc, pending, occupied, LEVELS, LEVELS)
+        tl.store(out_ptr + tok * hidden + offs, acc, mask=mask_h)
+
+
+def tree_combine_topk_forward(
+    rows: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    num_leaves: int,
+    valid_tokens: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """This rank's fp32 subtree partial per token, from rows laid out per top-k slot.
+
+    ``rows`` [T * topk, H]: row t * topk + k is token t's slot k (rows of slots routed to
+    other ranks are ignored). ``routing_map`` [T, topk] global experts; ``num_leaves``
+    leaves over the ``num_local_experts`` experts from ``local_expert_start``. Writes the
+    first ``valid_tokens`` rows of ``out`` [T, H] (cast to its dtype), like
+    ``tree_combine_forward`` on the equivalent dense map.
+    """
+    assert HAVE_TRITON, "moe_ep_invariant_combine requires Triton."
+    assert num_leaves & (num_leaves - 1) == 0 and num_local_experts % num_leaves == 0
+    num_tokens, topk = routing_map.shape
+    hidden = rows.shape[-1]
+    if num_tokens == 0:
+        return out
+    block_h = min(triton.next_power_of_2(hidden), 1024)
+    _tree_combine_topk_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        rows,
+        routing_map.contiguous(),
+        valid_tokens,
+        out,
+        hidden,
+        local_expert_start,
+        NUM_LOCAL_EXPERTS=num_local_experts,
+        LEVELS=num_leaves.bit_length() - 1,
+        LEAF_SIZE=num_local_experts // num_leaves,
+        TOPK=topk,
+        TOPK_POW2=triton.next_power_of_2(topk),
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
+    return out
+
+
 def _routes_block_h(hidden: int, num_slots: int) -> int:
     """Hidden tile for the route kernels: all K slot rows live in registers at once, so
     keep K * BLOCK_H / 128 threads at about 96 values per thread (powers of two)."""

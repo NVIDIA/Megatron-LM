@@ -1503,7 +1503,7 @@ class TransformerConfig(ModelParallelConfig):
     partials added in rank order, so MoE outputs are bitwise identical at every power-of-two
     expert-parallel size dividing num_moe_experts (e.g. training and inference with
     different EP). Covers the training AllToAll combine and the inference NVLS combine of
-    the 'torch' grouped-GEMM backend with expert_tensor_parallel_size=1, which uses the
+    the 'torch' and 'vllm' grouped-GEMM backends with expert_tensor_parallel_size=1, which use the
     ordered fp32 combine (whatever the batch-invariant collective) and moves no extra
     bytes."""
 
@@ -4702,11 +4702,13 @@ class TransformerConfig(ModelParallelConfig):
 
                 check_ep_size(self.num_moe_experts, self.expert_model_parallel_size)
             if self.transformer_impl == "inference_optimized" and (
-                self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH
+                self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
             ):
                 raise ValueError(
                     "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
-                    "'torch' for inference-optimized MoE."
+                    "'torch' or 'vllm' for inference-optimized MoE: FlashInfer sums a "
+                    "token's routes inside its kernel."
                 )
             if (
                 self.transformer_impl == "inference_optimized"

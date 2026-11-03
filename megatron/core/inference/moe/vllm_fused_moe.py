@@ -39,6 +39,7 @@ from megatron.core.inference.moe.permute import (
     compute_expert_offsets,
     compute_local_tokens_per_expert,
 )
+from megatron.core.transformer.moe.ep_invariant_combine import tree_combine_topk_forward
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
@@ -716,6 +717,7 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
+    ep_invariant_leaves: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -743,6 +745,9 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
+        ep_invariant_leaves: batch-invariant mode only (``moe_ep_invariant_combine``):
+            sum each token over this rank's subtree of the EP-invariant combine tree,
+            which has this many leaves over the local experts, instead of in top-k order.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -889,6 +894,21 @@ def vllm_fused_moe(
     # non-local expert slots. Batch-invariant mode uses training's invariant
     # within-rank accumulation (fp64).
     accumulate_in_fp64 = batch_invariant_mode
+    if ep_invariant_leaves is not None:
+        assert batch_invariant_mode, "moe_ep_invariant_combine requires batch-invariant mode"
+        if out is None:
+            out = VllmFusedMoeBuffers.get(
+                "moe_sum_out", (max_tokens, K), torch.float32, hidden_states.device
+            )
+        return tree_combine_topk_forward(
+            intermediate3,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            ep_invariant_leaves,
+            valid_tokens,
+            out,
+        )
 
     return _moe_sum(
         intermediate3,

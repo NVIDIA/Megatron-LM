@@ -959,13 +959,51 @@ class TestNVLSAllGatherVDispatcher:
             training_output.contiguous().view(torch.uint8),
         )
 
+    @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm"])
     @pytest.mark.parametrize("mxfp8_swiglu", [False, True])
-    def test_ep_invariant_combine_moe_matches_training(self, mxfp8_swiglu):
+    def test_ep_invariant_combine_moe_matches_training(
+        self, monkeypatch, grouped_gemm_backend, mxfp8_swiglu
+    ):
         """moe_ep_invariant_combine: the engine's subtree partials and pairwise RSV combine
-        match the training AllToAll combine tree bitwise."""
+        match the training AllToAll combine tree bitwise.
+
+        Sums of a few bf16 rows are often exact in fp32 in any order, so the layer-level
+        equality alone can pass on the default combine; also require the engine to run the
+        tree (bit sensitivity is in test_moe_ep_invariant_combine.py).
+        """
+        import importlib
+
+        from megatron.core.inference.moe import batch_invariant as inference_bi
+
+        # The package re-exports the function under the module's name.
+        vllm_moe = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+
+        calls = []
+        for module, name in (
+            (inference_bi, "tree_combine_forward"),
+            (vllm_moe, "tree_combine_topk_forward"),
+        ):
+            real = getattr(module, name)
+
+            def spy(*args, _real=real, _name=name, **kwargs):
+                calls.append(_name)
+                return _real(*args, **kwargs)
+
+            monkeypatch.setattr(module, name, spy)
         self.test_batch_invariant_moe_matches_training(
-            "torch", None, mxfp8_swiglu, False, config_overrides={"moe_ep_invariant_combine": True}
+            grouped_gemm_backend,
+            None,
+            mxfp8_swiglu,
+            False,
+            config_overrides={"moe_ep_invariant_combine": True},
         )
+        # vLLM runs MXFP8 experts through the MCore grouped GEMM (dense-map tree).
+        expected = (
+            "tree_combine_topk_forward"
+            if grouped_gemm_backend == "vllm" and not mxfp8_swiglu
+            else "tree_combine_forward"
+        )
+        assert expected in calls, calls
 
     @staticmethod
     def _make_nvfp4_inference_layer(**overrides):

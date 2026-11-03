@@ -259,6 +259,45 @@ def test_inference_unpermute_same_bits_at_every_ep(monkeypatch):
     assert rank_out(1, 0, None).dtype == torch.float32
 
 
+@needs_cuda
+@pytest.mark.parametrize("experts,topk", [(64, 6), (96, 8), (512, 22)])
+def test_topk_layout_matches_dense_kernel(experts, topk):
+    """vLLM's rows (one per top-k slot, slots in top-k order) give the dense kernel's rank
+    partials bit for bit at every EP; slots on other ranks and padded tokens are ignored."""
+    tokens, hidden = 37, 384
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    routing_map = torch.rand(tokens, experts, device="cuda", generator=gen).topk(topk, 1).indices
+    vals = _rows(tokens * topk, hidden, gen).view(tokens, topk, hidden)
+    valid = torch.tensor([tokens - 4], dtype=torch.int32, device="cuda")
+    n = valid.item()
+    for ep in (1, 2, 4, 8):
+        local = experts // ep
+        leaves = eic.num_leaf_blocks(experts) // ep
+        for rank in range(ep):
+            start = rank * local
+            on_rank = (routing_map >= start) & (routing_map < start + local)
+            # vLLM layout: row t * topk + k; rows of other ranks' slots hold garbage.
+            rows = vals.to(torch.bfloat16).clone()
+            rows[~on_rank] = float("nan")
+            sentinel = torch.full((tokens, hidden), 7.0, device="cuda")
+            out = eic.tree_combine_topk_forward(
+                rows.view(tokens * topk, hidden),
+                routing_map.int(),
+                start,
+                local,
+                leaves,
+                valid,
+                sentinel,
+            )
+            # Torch layout: dense [T, local] map over the same rows.
+            t, k = on_rank.nonzero(as_tuple=True)
+            inv = torch.full((tokens, local), -1, dtype=torch.int32, device="cuda")
+            inv[t, routing_map[t, k] - start] = (t * topk + k).int()
+            ref = eic.tree_combine_forward(rows.view(tokens * topk, hidden), inv, leaves)
+            assert torch.equal(_bits(out[:n]), _bits(ref[:n])), (ep, rank)
+            assert (out[n:] == 7.0).all()  # padded tokens are not written
+
+
 def test_config_validation():
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -314,6 +353,25 @@ def test_config_rejects_expert_tensor_parallel_inference():
     _ep_invariant_moe_config(
         expert_tensor_parallel_size=2, tensor_model_parallel_size=2, sequence_parallel=True
     )
+
+
+def test_config_inference_grouped_gemm_backends():
+    """The torch and vLLM grouped GEMMs hand the combine one row per route; FlashInfer
+    sums a token's routes inside its kernel, so it cannot run the tree."""
+    inference = dict(
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        inference_moe_token_dispatcher_type="nvls",
+    )
+    with pytest.raises(ValueError, match="'torch' or 'vllm'"):
+        _ep_invariant_moe_config(
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_nvfp4_recipe="per_token",
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            **inference,
+        )
+    _ep_invariant_moe_config(inference_grouped_gemm_backend="vllm", **inference)
 
 
 class TestEPInvariantCollectives:
