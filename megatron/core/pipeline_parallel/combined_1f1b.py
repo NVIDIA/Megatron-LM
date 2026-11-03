@@ -486,7 +486,16 @@ def combined_forward_backward_step(
     # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
     # control which layer will be fp8 or bf16
     use_outer_fp8_context = config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
-    outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
+    if use_outer_fp8_context:
+        # Under delayed scaling the layers open no context of their own, so this context sets
+        # the amax reduction group of the modules whose forward runs inside it: those of the
+        # forward model chunk, or of the backward chunk in a backward-only step.
+        model_chunk = f_model if f_model is not None else b_model
+        outer_fp8_context = get_fp8_context(
+            config, pg_collection=get_attr_wrapped_model(model_chunk, "pg_collection")
+        )
+    else:
+        outer_fp8_context = nullcontext()
 
     b_grad = b_output_tensor_grad[0] if b_model else None
     # combined forward and backward model chunk execution of two micro-batches
