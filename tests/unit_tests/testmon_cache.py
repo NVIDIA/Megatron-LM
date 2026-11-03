@@ -27,7 +27,12 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-COMPATIBILITY_FILES: set[str] = {"tests/test_utils/python_scripts/download_unit_tests_dataset.py"}
+COMPATIBILITY_FILES: set[str] = {
+    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
+    "tests/unit_tests/gb200_placement.py",
+    "tests/unit_tests/gb200_placement_plugin.py",
+    "tests/unit_tests/find_test_cases.py",
+}
 COMPATIBILITY_GLOBS: tuple[str, ...] = ()
 DATABASE_TABLES = {
     "metadata",

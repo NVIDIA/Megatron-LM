@@ -22,6 +22,10 @@ on:
       sha:
         type: string
         required: true
+      unit_test_gb200_enabled:
+        description: Enable the portable dev/latest GB200 unit-test placement
+        type: string
+        default: "false"
       unit_testmon_mode:
         type: string
         default: full
@@ -67,6 +71,7 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
+          unit_test_gb200_enabled: ${{ inputs.unit_test_gb200_enabled }}
           # Select and execute on the same GPU workers using main's baseline.
           unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}

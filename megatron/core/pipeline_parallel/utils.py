@@ -329,10 +329,12 @@ class ScheduleNode:
                 if isinstance(input, torch.Tensor):
                     real_input = make_viewless(input).detach()
                     real_input.requires_grad_(input.requires_grad)
-                    # Backward releases retained inputs after enqueueing their kernels.
-                    # Protect every input until this consumer stream finishes, even
-                    # when the detached leaf keeps its storage through forward.
-                    input.record_stream(self.stream)
+                    # Retained dense inputs can be released while expert wgrad is still
+                    # running on the compute stream. Prevent reuse by the next dispatch.
+                    # Retained tensor subclasses keep their existing lifetime handling;
+                    # record_stream may materialize them instead of tracking backing buffers.
+                    if self.free_input or type(input) is torch.Tensor:
+                        input.record_stream(self.stream)
                     if self.free_input:
                         grad_source = ScheduleNodeInputWrapper(real_input)
                         real_input = grad_source.unwrap_real_tensor()

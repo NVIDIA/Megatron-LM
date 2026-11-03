@@ -71,9 +71,7 @@ def test_source_edits_preserve_identity(source_tree):
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
-@pytest.mark.parametrize(
-    "changed", ["tests/test_utils/python_scripts/download_unit_tests_dataset.py"]
-)
+@pytest.mark.parametrize("changed", sorted(cache.COMPATIBILITY_FILES))
 def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generation(
     source_tree, generation, changed
 ):

@@ -44,7 +44,6 @@ from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = [
     pytest.mark.internal,
-    pytest.mark.launch_on_gb200,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
 ]
 
@@ -535,6 +534,7 @@ class TestGroupedTensorDispatcherNumerics:
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_alltoall_grouped_tensor_moe_parity(
         self, single_grouped_weight, use_bias, single_grouped_bias
@@ -551,6 +551,7 @@ class TestGroupedTensorDispatcherNumerics:
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
     @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_deepep_grouped_tensor_moe_parity(
         self, dispatcher, single_grouped_weight, use_bias, single_grouped_bias
@@ -566,6 +567,7 @@ class TestGroupedTensorDispatcherNumerics:
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_hybridep_grouped_tensor_moe_parity(
         self, single_grouped_weight, use_bias, single_grouped_bias
@@ -578,6 +580,8 @@ class TestGroupedTensorDispatcherNumerics:
             single_grouped_bias=single_grouped_bias,
         )
 
+    # NCCL-EP requires blocking communicators; the GB200 transformer bucket uses
+    # nonblocking NCCL for its context-parallel graph tests. Keep NCCL-EP on H100.
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
@@ -593,17 +597,20 @@ class TestGroupedTensorDispatcherNumerics:
             single_grouped_bias=single_grouped_bias,
         )
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_alltoall_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
         _run_padding_lifecycle_case("alltoall", monkeypatch)
 
     @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_deepep_grouped_tensor_padding_lifecycle(self, dispatcher, monkeypatch):
         """DeepEP fused local permutation pads, and local unpermute removes those rows."""
         _run_padding_lifecycle_case(dispatcher, monkeypatch)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.timeout(180)
     def test_hybridep_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """HybridEP fused dispatch pads, and fused combine returns the original token shape."""

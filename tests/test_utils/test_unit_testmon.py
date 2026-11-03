@@ -237,6 +237,54 @@ def test_new_case_in_existing_file_is_discovered_from_old_baseline(project, cach
     assert _snapshot(cache / "prod") == before
 
 
+@pytest.mark.parametrize(
+    "enabled,marker,expected",
+    [
+        ("true", "not gb200_only", {"test_existing_gb200", "test_retained"}),
+        ("true", "launch_on_gb200", {"test_portable", "test_existing_gb200"}),
+        ("false", "not flaky_in_dev", {"test_portable", "test_existing_gb200", "test_retained"}),
+        ("false", "launch_on_gb200", {"test_existing_gb200"}),
+    ],
+)
+def test_native_selection_preserves_portable_placement(
+    project, tmp_path, monkeypatch, enabled, marker, expected
+):
+    for test_file in (project / "tests").glob("test_*.py"):
+        test_file.unlink()
+    directory = project / "tests/unit_tests"
+    directory.mkdir()
+    (directory / "test_model_configs.py").write_text(
+        "from app import active\n\ndef test_portable():\n    assert active(1) == 2\n"
+    )
+    (directory / "test_unmigrated.py").write_text(
+        "import pytest\nfrom app import active\n\n"
+        "@pytest.mark.launch_on_gb200\n"
+        "def test_existing_gb200():\n    assert active(1) == 2\n\n"
+        "def test_retained():\n    assert active(1) == 2\n"
+    )
+    (project / "pytest.ini").write_text(
+        "[pytest]\nmarkers =\n"
+        "    launch_on_gb200: existing additive GB200 coverage\n"
+        "    flaky_in_dev: flaky case\n"
+    )
+    plugin_args = ("-p", "tests.unit_tests.gb200_placement_plugin")
+    cache = tmp_path / "placement-cache"
+    # H100's main baseline deliberately includes portable and retained cases.
+    monkeypatch.setenv("UNIT_TEST_GB200_ENABLED", "false")
+    baseline = _invoke(project, cache, "baseline", pytest_args=plugin_args)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    before = _snapshot(cache / "prod")
+    # Every case depends on this changed function. Collection must select the
+    # platform's cases without executing their now-failing assertions.
+    (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    monkeypatch.setenv("UNIT_TEST_GB200_ENABLED", enabled)
+    result = _invoke(project, cache, "select", pytest_args=(*plugin_args, "-m", marker))
+    assert result.returncode == 0, result.stdout + result.stderr
+    selected = cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert {node.rsplit("::", 1)[-1] for node in selected.read_text().splitlines()} == expected
+    assert _snapshot(cache / "prod") == before
+
+
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(

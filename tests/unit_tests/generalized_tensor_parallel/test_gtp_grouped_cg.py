@@ -42,15 +42,22 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 
 
+def _reset_communication_streams():
+    # Synchronization completes kernels but does not retire GTP's Python work handles.
+    # Drain before clearing: a later warmup drain of an old AG also creates an unused
+    # RS stream for its old group, which a full graph cannot join during capture.
+    gtp.wait_async_comms()
+    torch.cuda.synchronize()
+    gtp._AG_STREAMS.clear()
+    gtp._RS_STREAMS.clear()
+
+
 @pytest.fixture
 def expert_group():
     """Isolate each model's process groups and communication streams."""
     if torch.distributed.get_world_size() != 4:
         pytest.skip("requires torchrun --nproc-per-node=4")
-    torch.cuda.synchronize()
-    # Full graphs must not join uncaptured streams from earlier test models.
-    gtp._AG_STREAMS.clear()
-    gtp._RS_STREAMS.clear()
+    _reset_communication_streams()
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(gtp_remat_size=4, expert_gtp_remat_size=4)
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -58,9 +65,7 @@ def expert_group():
     try:
         yield ps.get_expert_gtp_weight_remat_group()
     finally:
-        torch.cuda.synchronize()
-        gtp._AG_STREAMS.clear()
-        gtp._RS_STREAMS.clear()
+        _reset_communication_streams()
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
 
@@ -274,6 +279,30 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
         finally:
             graph.reset()
             torch.cuda.synchronize()
+
+
+def test_capture_after_unconsumed_prefetch(expert_group):
+    """A completed prefetch from a prior model must not leave an uncaptured RS stream."""
+    layer = _make_gtp_linear(128, 128, torch.distributed.group.WORLD)
+    weight = layer.weight
+    _, weight._prefetch_handle = weight._all_gather_weight(async_op=True, fwd=True)
+    assert weight in gtp._inflight_comm_params
+
+    _reset_communication_streams()
+    # Mirror the first eager warmup of the next model. Without draining before the
+    # stream reset, this retires the old AG and creates its unused RS stream.
+    gtp.wait_for_gtp_grad_reduction_on_current_stream()
+    output = torch.zeros(1, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            output.add_(1)
+            gtp.wait_for_gtp_grad_reduction_on_current_stream()
+        graph.replay()
+        torch.testing.assert_close(output, torch.ones_like(output))
+    finally:
+        graph.reset()
+        torch.cuda.synchronize()
 
 
 def test_grouped_local_graph_replay(expert_group):

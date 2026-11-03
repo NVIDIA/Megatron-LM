@@ -1,9 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+from gb200_placement import active_buckets, candidate_files
 
 # Platforms whose unit-test selection is driven by a pytest marker rather than
 # by the full recipe bucket. Only files carrying the marker are launched.
@@ -22,8 +25,16 @@ def file_has_marker(filepath, marker):
         marker: The pytest marker name to look for (e.g. ``launch_on_gb200``).
 
     Returns:
-        True if the marker name appears anywhere in the file, else False.
+        True if the file carries the marker or has enabled portable cases.
     """
+    if marker == "launch_on_gb200" and os.environ.get("UNIT_TEST_GB200_ENABLED") == "true":
+        try:
+            relative = Path(filepath).resolve().relative_to(Path(__file__).resolve().parents[2])
+        except ValueError:
+            pass
+        else:
+            if relative.as_posix() in candidate_files():
+                return True
     try:
         return marker in Path(filepath).read_text()
     except (OSError, UnicodeDecodeError):
@@ -78,6 +89,10 @@ def main():
     YAML_FILE = f'tests/test_utils/recipes/{GPU_TYPE}/unit-tests.yaml'
 
     all_test_cases = get_test_cases(YAML_FILE)
+    if GPU_TYPE == "gb200":
+        all_test_cases = active_buckets(
+            all_test_cases, GPU_TYPE, os.environ.get("UNIT_TEST_GB200_ENABLED") == "true"
+        )
     bucket_files = set(expand_pattern(BUCKET))
 
     # Collect files from child test cases to ignore

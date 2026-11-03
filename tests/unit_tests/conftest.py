@@ -11,6 +11,7 @@ import torch.distributed
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
+from tests.unit_tests import gb200_placement_plugin
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import (
     Utils,
@@ -34,6 +35,12 @@ def pytest_configure(config):
     """
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    gb200_placement_plugin.pytest_configure(config)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    gb200_placement_plugin.pytest_collection_modifyitems(items)
 
 
 def pytest_addoption(parser):
