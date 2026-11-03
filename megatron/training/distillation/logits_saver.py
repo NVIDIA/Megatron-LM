@@ -184,7 +184,9 @@ class LogitsSaverHooks:
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
         pg_collection: Process groups of the model the hooks attach to; the
             saver uses its ``tp``, ``cp``, ``dp_gtp_remat`` and ``tp_dp_cp``
-            groups.  ``None`` selects the groups of the global parallel state.
+            groups.  Omitting it is deprecated: the groups of the global
+            parallel state are then selected, with a
+            ``ProcessGroupFallbackWarning``.
     """
 
     _DTYPE_MAP = {

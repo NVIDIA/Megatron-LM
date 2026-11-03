@@ -215,8 +215,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     Shard discovery refreshes the directory listing after known shards are
     exhausted so a concurrent writer can publish more data; remote refreshes
     use a per-PP-stage rank-0 broadcast (TP×DP×CP group, ``tp_dp_cp_group``;
-    ``None`` selects the group of the global parallel state) to avoid
-    object-store list storms without deadlocking under PP>1.
+    omitting it is deprecated and selects the group of the global parallel
+    state, with a ``ProcessGroupFallbackWarning``) to avoid object-store list
+    storms without deadlocking under PP>1.
 
     Yields ``(start_sample, values_list, indices_list)``, one entry per load
     iteration (lists have one entry per load microbatch step), with CP
@@ -1064,8 +1065,9 @@ def make_teacher_tar_dataset(
     *tp_dp_cp_group*, then broadcast) to read ``saver.format_version``;
     instantiates :class:`TeacherTarDataset` for v2 tars and
     :class:`LegacyTeacherTarDataset` for v1.  Callers should always go through
-    this factory rather than constructing the classes directly.  ``None``
-    selects the TP×DP×CP group of the global parallel state.
+    this factory rather than constructing the classes directly.  Omitting
+    *tp_dp_cp_group* is deprecated: the TP×DP×CP group of the global parallel
+    state is then selected, with a ``ProcessGroupFallbackWarning``.
     """
     meta = peek_first_logprobs_metadata(logprobs_dir, tp_dp_cp_group=tp_dp_cp_group)
     fmt = (meta or {}).get("saver", {}).get("format_version", 1)
@@ -1197,8 +1199,9 @@ class CachedLogitsKDLoss:
             shard objects to materialize into the MSC cache ahead of
             sequential tar consumption.
         pg_collection: Process groups of the student model; the loss uses its
-            ``tp``, ``cp``, ``dp_gtp_remat`` and ``tp_dp_cp`` groups.  ``None``
-            selects the groups of the global parallel state.
+            ``tp``, ``cp``, ``dp_gtp_remat`` and ``tp_dp_cp`` groups.  Omitting
+            it is deprecated: the groups of the global parallel state are then
+            selected, with a ``ProcessGroupFallbackWarning``.
     """
 
     def __init__(

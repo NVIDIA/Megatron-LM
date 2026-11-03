@@ -47,7 +47,10 @@ except ImportError:
 
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.training import get_args, get_train_state
 from megatron.training.global_vars import get_run_config
 from megatron.training.utils import get_blend_and_blend_per_split
@@ -199,14 +202,16 @@ def resolve_distillation_process_groups(
     remote directory listings.
 
     Args:
-        pg_collection: Process groups of the model. ``None`` selects the
-            groups of the global parallel state.
-        owner: Name of the caller, used in error messages.
+        pg_collection: Process groups of the model. Omitting it is deprecated:
+            the groups of the global parallel state are then selected, with a
+            ``ProcessGroupFallbackWarning``.
+        owner: Name of the caller, used in the warning and in error messages.
 
     Raises:
         ValueError: If *pg_collection* does not set one of the four groups.
     """
     if pg_collection is None:
+        warn_global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=list(_DISTILLATION_PROCESS_GROUPS)
         )
@@ -229,12 +234,16 @@ def _broadcast_without_pp(
     deadlock under PP>1.  All ranks on the calling stage must enter this
     collective.  On a single process, just calls *factory* locally.
 
-    *tp_dp_cp_group* is that group in the model's grid; ``None`` selects the
-    group of the global parallel state.
+    *tp_dp_cp_group* is that group in the model's grid. Omitting it is
+    deprecated: the group of the global parallel state is then used, with a
+    ``ProcessGroupFallbackWarning``.
     """
     if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
         return factory()
     if tp_dp_cp_group is None:
+        warn_global_process_group_fallback(
+            "_broadcast_without_pp", "tp_dp_cp_group", deprecated_in="0.21", removed_in="0.23"
+        )
         tp_dp_cp_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
     src = dist.get_process_group_ranks(tp_dp_cp_group)[0]
     payload = [factory() if dist.get_rank() == src else None]
