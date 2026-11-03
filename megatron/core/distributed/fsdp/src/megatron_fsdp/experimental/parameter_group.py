@@ -665,15 +665,15 @@ class FsdpParameterGroup:
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
             destination = self.main_grad.get_tensor_view(index)
-            if not has_sharded_grads:
-                destination.copy_(grad)
-                if self.grad_scale != 1:
-                    destination.mul_(self.grad_scale)
-            else:
+            if has_sharded_grads:
                 if self.grad_scale != 1:
                     # Scale in the accumulation dtype, independently of grad_comm_dtype.
                     grad = grad.to(destination.dtype) * self.grad_scale
                 destination.add_(grad)
+            else:
+                destination.copy_(grad)
+                if self.grad_scale != 1:
+                    destination.mul_(self.grad_scale)
         self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
