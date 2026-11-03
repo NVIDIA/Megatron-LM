@@ -1,7 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import logging
 import os
+import random
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Protocol, Tuple
+from datetime import datetime
+from functools import partial
+from typing import Any, Callable, Dict, Protocol, Tuple
 
 import torch
 
@@ -12,6 +17,8 @@ except ModuleNotFoundError:
     pass
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+
+logger = logging.getLogger(__name__)
 
 S3_PREFIX = "s3://"
 MSC_PREFIX = "msc://"
@@ -240,7 +247,13 @@ def dataset_exists(path_prefix: str, idx_path: str, bin_path: str) -> bool:
         raise ValueError(f"Invalid path: {path_prefix}")
 
 
-def cache_index_file(remote_path: str, local_path: str) -> None:
+def cache_index_file(
+    remote_path: str,
+    local_path: str,
+    num_max_retries: int = 3,
+    sleep_duration_start: float = 10.0,
+    jitter: float = 0.5,
+) -> None:
     """Download a file from object storage to a local path with distributed training support.
     The download only happens on Rank 0, and other ranks will wait for the file to be available.
 
@@ -248,13 +261,29 @@ def cache_index_file(remote_path: str, local_path: str) -> None:
     in blended_megatron_dataset_builder.py) is responsible for ensuring proper synchronization
     between ranks using torch.distributed.barrier() after this function returns.
 
+    A download that raises, and a file that a rank other than Rank 0 cannot see yet, are both
+    retried with exponential backoff. With the default arguments the waits are 10, 20 and 40
+    seconds, each lengthened by a random fraction of itself so that the ranks do not come back
+    to the store together.
+
     Args:
         remote_path (str): The URL of the file to download (e.g., s3://bucket/path/file.idx
             or msc://profile/path/file.idx)
+
         local_path (str): The local destination path where the file should be saved
+
+        num_max_retries (int): The number of retries after the first attempt
+
+        sleep_duration_start (float): The number of seconds to wait before the first retry.
+            It doubles before each later one.
+
+        jitter (float): The largest fraction of a wait to add to it at random. 0.0 waits
+            exactly the backoff, the way the data (.bin) file reader does.
 
     Raises:
         ValueError: If the remote_path is not a valid S3 or MSC path
+
+        FileNotFoundError: If the file is still not at local_path once the retries are spent
     """
     torch_dist_enabled = torch.distributed.is_initialized()
 
@@ -263,19 +292,40 @@ def cache_index_file(remote_path: str, local_path: str) -> None:
     else:
         rank = 0
 
+    download: Callable[[], None]
     if _is_s3_path(remote_path):
-        s3_client = boto3.client("s3")
-
-        if not torch_dist_enabled or rank == 0:
-            _s3_download_file(s3_client, remote_path, local_path)
-
-        assert os.path.exists(local_path)
+        download = partial(_s3_download_file, boto3.client("s3"), remote_path, local_path)
     elif _is_msc_path(remote_path):
         msc = MultiStorageClientFeature.import_package()
-
-        if not torch_dist_enabled or rank == 0:
-            msc.download_file(remote_path, local_path)
-
-        assert os.path.exists(local_path)
+        download = partial(msc.download_file, remote_path, local_path)
     else:
+        # An unusable path is not worth retrying.
         raise ValueError(f"Invalid path: {remote_path}")
+
+    sleep_duration = sleep_duration_start
+    for i in range(num_max_retries + 1):
+        try:
+            if not torch_dist_enabled or rank == 0:
+                download()
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"{remote_path} has not been cached to {local_path}")
+            return
+        except Exception as e:
+            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+            if i == num_max_retries:
+                logger.warning(
+                    f"[{time_str}] {num_max_retries+1} total tries to cache the index file "
+                    f"failed; going to abort and re-raise exception \"{e}\"..."
+                )
+                # Re-raise exception if in last iteration of for loop.
+                raise e
+            sleep_duration_jittered = sleep_duration * (1.0 + random.uniform(0.0, jitter))
+            logger.warning(
+                f"[{time_str}] Attempt {i+1}/{num_max_retries+1} to cache the index file "
+                f"failed with exception \"{e}\"; going to sleep for "
+                f"{sleep_duration_jittered:.1f} seconds and then re-try..."
+            )
+            time.sleep(sleep_duration_jittered)
+            sleep_duration = sleep_duration * 2
+
+    raise RuntimeError("Should not reach here!")
