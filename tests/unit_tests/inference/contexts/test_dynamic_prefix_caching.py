@@ -1219,7 +1219,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("batch_invariant_mode", [False, True])
-    @pytest.mark.parametrize("num_decode", [0, 1, 40, 63])
+    @pytest.mark.parametrize("num_decode", [0, 1, 63, 150])
     def test_batch_invariant_mamba_chunked_prefill_budget_excludes_decode(
         self, batch_invariant_mode, num_decode
     ):
@@ -1229,7 +1229,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             enable_prefix_caching=False,
             enable_chunked_prefill=True,
             max_tokens=256,
-            max_requests=64,
+            max_requests=160,
         )
         chunk = ctx.mamba_chunk_size
         assert ctx.max_prefill_tokens == 256
@@ -1255,8 +1255,11 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         admitted = req.finished_chunk_token_count
         assert ctx.active_token_count == num_decode + admitted <= ctx.max_tokens
         if batch_invariant_mode:
-            # A full SSM-chunk-aligned prefill budget, regardless of the decode tokens.
-            assert admitted == 256 and admitted % chunk == 0
+            # The full prefill budget while the decode tokens fit in the SSM-chunk headroom;
+            # beyond it, the remaining step capacity rounded down to an SSM chunk.
+            expected = min(256, (256 + chunk - num_decode) // chunk * chunk)
+            assert admitted == expected and admitted % chunk == 0
+            assert admitted >= 256 - num_decode  # never less than without batch invariance
         else:
             assert admitted == 256 - num_decode
 

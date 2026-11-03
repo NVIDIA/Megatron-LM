@@ -942,6 +942,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+                # Prefill-only steps fill at most the prefill budget: capture it exactly
+                # rather than padding those steps to the larger mixed-step capacity.
+                extra_prefill_token_counts=(
+                    (self.max_prefill_tokens,) if self.max_prefill_tokens < self.max_tokens else ()
+                ),
             )
         )
 
