@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""TEDotProductAttention hands Transformer Engine q, k and v in the layout TE reads them with.
+"""Static-batching TE attention with strided q, k or v matches an fp32 reference.
 
 TE's ``get_qkv_layout`` takes a tensor that is not a view of a packed QKV or KV buffer to be dense
 in its format (``sbhd_sbhd_sbhd``) without checking its strides, and the fused (cuDNN) backend
@@ -9,9 +9,11 @@ the query as a strided view of the fused QKV projection when a rank has one quer
 group (MHA) or one KV group (MQA), next to k and v from the separate static KV cache. A batch
 smaller than the context's ``max_batch_size`` passes strided batch slices of that cache.
 
-The GPU cases compare against an fp32 attention over the very q, k and v Megatron hands its TE
+The cases compare against an fp32 attention over the very q, k and v Megatron hands its TE
 wrapper. Their bound, rel L2 1e-2, is five times the bf16 error measured on H100 for these shapes
-(1.7e-3 to 2.3e-3); a query read with dense strides misses by 0.1 to 0.25.
+(1.7e-3 to 2.3e-3); a query read with dense strides misses by 0.1 to 0.25. They use only public
+API, so they also run on releases without the fix. The rule itself is tested on CPU in
+``test_te_attention_qkv_layout_rule.py``.
 """
 
 from types import SimpleNamespace
@@ -19,104 +21,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE, _dense_unpacked_qkv
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
-
-# Leading dimensions of q/k/v ([..., heads, head_dim]) in each format TEDotProductAttention takes.
-FORMATS = {"sbhd": (5, 2), "bshd": (2, 5), "thd": (7,)}
-
-
-def _strided_view(*leading, heads=4, dim=8):
-    """A [*leading, heads, dim] view of a wider buffer: strided, at storage offset 0."""
-    return torch.randn(*leading, heads, 3 * dim)[..., :dim]
-
-
-def _assert_dense_copy(made, original):
-    assert made is not original and made.is_contiguous()
-    assert torch.equal(made, original)
-
-
-@pytest.mark.parametrize("fmt", FORMATS)
-class TestDenseUnpackedQKV:
-    """Which inputs the TE wrapper makes dense, and which it passes to TE as they are."""
-
-    def test_dense_inputs_are_passed_through(self, fmt):
-        q, k, v = (torch.randn(*FORMATS[fmt], 4, 8) for _ in range(3))
-        assert all(a is b for a, b in zip(_dense_unpacked_qkv(q, k, v), (q, k, v)))
-
-    def test_fused_qkv_views_are_passed_through(self, fmt):
-        """Views of one fused QKV projection (TE detects sb3hd/sbh3d etc.) are never copied."""
-        leading = FORMATS[fmt]
-        q, k, v = torch.randn(*leading, 4, 3 * 8).split(8, dim=-1)  # MHA: [np, hn] per head
-        assert not q.is_contiguous()
-        assert all(a is b for a, b in zip(_dense_unpacked_qkv(q, k, v), (q, k, v)))
-
-        # MQA: one KV group holding every query head, as get_query_key_value_tensors splits it.
-        q, k, v = torch.randn(*leading, 1, (4 + 2) * 8).split([4 * 8, 8, 8], dim=-1)
-        q = q.reshape(*leading, 4, 8)
-        assert not q.is_contiguous()
-        assert all(a is b for a, b in zip(_dense_unpacked_qkv(q, k, v), (q, k, v)))
-
-    def test_fused_kv_views_are_passed_through(self, fmt):
-        """k and v of one fused KV projection (TE detects sbhd_sbh2d etc.) are never copied,
-        and only a strided query beside them is made dense."""
-        leading = FORMATS[fmt]
-        k, v = torch.randn(*leading, 4, 2 * 8).chunk(2, dim=-1)
-        q = torch.randn(*leading, 4, 8)
-        assert all(a is b for a, b in zip(_dense_unpacked_qkv(q, k, v), (q, k, v)))
-
-        q = _strided_view(*leading)
-        q_out, k_out, v_out = _dense_unpacked_qkv(q, k, v)
-        _assert_dense_copy(q_out, q)
-        assert k_out is k and v_out is v
-
-    def test_strided_query_beside_separate_kv_is_made_dense(self, fmt):
-        """Static inference without RoPE: the query is a view of the fused QKV projection,
-        k and v come from the separate KV cache."""
-        leading = FORMATS[fmt]
-        q, k, v = _strided_view(*leading), torch.randn(*leading, 4, 8), torch.randn(*leading, 4, 8)
-        q_out, k_out, v_out = _dense_unpacked_qkv(q, k, v)
-        _assert_dense_copy(q_out, q)
-        assert k_out is k and v_out is v
-
-    def test_strided_separate_kv_are_made_dense(self, fmt):
-        leading = FORMATS[fmt]
-        q, k, v = torch.randn(*leading, 4, 8), _strided_view(*leading), _strided_view(*leading)
-        q_out, k_out, v_out = _dense_unpacked_qkv(q, k, v)
-        assert q_out is q
-        _assert_dense_copy(k_out, k)
-        _assert_dense_copy(v_out, v)
-
-    def test_query_and_key_sharing_a_buffer_are_made_dense(self, fmt):
-        """q and k in one buffer without v is not a packed layout TE knows: each is made dense."""
-        leading = FORMATS[fmt]
-        q, k = torch.randn(*leading, 4, 2 * 8).chunk(2, dim=-1)
-        v = torch.randn(*leading, 4, 8)
-        q_out, k_out, v_out = _dense_unpacked_qkv(q, k, v)
-        _assert_dense_copy(q_out, q)
-        _assert_dense_copy(k_out, k)
-        assert v_out is v
-
-
-def test_static_kv_cache_batch_slices_are_made_dense():
-    """A batch smaller than the cache's max_batch_size reads strided slices of the cache."""
-    key_cache, value_cache = (torch.randn(64, 4, 2, 8) for _ in range(2))  # [seq, batch, g, hn]
-    k, v = key_cache[:16, 0:2], value_cache[:16, 0:2]
-    q = torch.randn(16, 2, 4, 8)
-    q_out, k_out, v_out = _dense_unpacked_qkv(q, k, v)
-    assert q_out is q
-    _assert_dense_copy(k_out, k)
-    _assert_dense_copy(v_out, v)
-
-
-# ---------------------------------------------------------------------------------------------
-# GPU: static-batching attention and the TE wrapper against an fp32 reference
-# ---------------------------------------------------------------------------------------------
 
 BATCH = 2
 PROMPT = 16
@@ -287,7 +198,8 @@ def _te_wrapper_attention(strided_query):
 def _run(fn, backend):
     try:
         return fn()
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
+        # TE raises ValueError("No dot product attention backend is available ...").
         if backend == "cudnn" and "backend" in str(error).lower():
             pytest.skip(f"FusedAttention is unavailable for this shape: {error}")
         raise
