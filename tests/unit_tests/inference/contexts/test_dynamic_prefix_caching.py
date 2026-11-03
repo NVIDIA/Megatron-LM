@@ -1581,8 +1581,8 @@ class TestPromptLogprobCaching(PrefixCachingTestBase):
             write.block_ids, np.repeat(blocks, [bs, bs, len(prompt) - 1 - 2 * bs])
         )
         np.testing.assert_array_equal(write.next_token_ids, prompt[1:].cpu())
-        # Blocks stay pinned until the rows are stored.
-        assert torch.equal(alloc.block_ref_counts[blocks], ref_counts + 1)
+        # The capture pins nothing; the commit checks each block instead.
+        assert torch.equal(alloc.block_ref_counts[blocks], ref_counts)
 
         rows = [-float(i) for i in range(len(prompt))]
         top_n = {
@@ -1603,6 +1603,31 @@ class TestPromptLogprobCaching(PrefixCachingTestBase):
 
         follower = self._req(ctx, prompt.clone(), 2, sampling_params=_prompt_logprob_params(1))
         assert ctx._compute_prefix_match(follower, len(prompt)).prefix_skip_tokens == 2 * bs
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "policy", [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO]
+    )
+    def test_commit_skips_rows_whose_blocks_were_released(self, policy):
+        ctx = self._ctx(prefix_caching_eviction_policy=policy)
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+        prompt = self._prompt(2 * bs + 3)
+        ctx.add_request(self._req(ctx, prompt.clone(), sampling_params=_prompt_logprob_params()))
+        ctx.initialize_attention_state()
+        blocks = self._block_ids(ctx, 0, 3)
+        [write] = ctx.capture_prompt_logprob_writes()
+
+        # The request finishes before the rows arrive, as under async scheduling.
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.commit_prompt_logprob_writes([write], [[-float(i) for i in range(len(prompt))]], None)
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            # Its full blocks stay cached under the same hashes; its partial block is gone.
+            assert set(blocks[:2]) <= alloc.block_prompt_logprobs.keys()
+            assert blocks[2] not in alloc.block_prompt_logprobs
+        else:
+            # REF_ZERO deregistered every block, and the pool may already reuse them.
+            assert not set(blocks) & alloc.block_prompt_logprobs.keys()
 
     @pytest.mark.internal
     def test_partial_chunk_caches_its_boundary_row(self):

@@ -288,8 +288,9 @@ class PromptLogprobsWrite:
         block_ids (Tensor): Block holding each row's source token.
         slots (Tensor): Position of each row's source token within its block.
         next_token_ids (Tensor): Token each row scores.
-        pinned_block_ids (Tensor): Blocks pinned until the rows are stored: the request's
-            blocks from its first through the last row's block.
+        request_id (int): Request that produced the rows.
+        block_indices (Tensor): Index of each row's block in the request's block table.
+        block_hashes (Tensor): Hash of each row's block at capture; -1 if unregistered.
     """
 
     request_index: int
@@ -298,7 +299,9 @@ class PromptLogprobsWrite:
     block_ids: Tensor
     slots: Tensor
     next_token_ids: Tensor
-    pinned_block_ids: Tensor
+    request_id: int
+    block_indices: Tensor
+    block_hashes: Tensor
 
 
 class DynamoHelper:
@@ -5313,14 +5316,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         return [lp.tolist() for lp in selected_log_probs_list], log_probs
 
     def capture_prompt_logprob_writes(self) -> List[PromptLogprobsWrite]:
-        """Record where this step's prompt log-prob rows will be cached, and pin those blocks.
+        """Record where this step's prompt log-prob rows will be cached.
 
         Must run before `update_requests`, while the active layout still describes
-        the forward that produced the rows. The pin keeps a finished request's
-        blocks from being evicted and reused before `commit_prompt_logprob_writes`
-        stores the rows, which under async scheduling happens after admission.
-        It covers each request's earlier blocks too: block hashes are parent-chained,
-        and prefix matching assumes that a cached block's ancestors are cached.
+        the forward that produced the rows. No block is pinned: a pin held through
+        the step's update and admission, where async scheduling stores the rows,
+        would keep a finished request's blocks from requests that need them, and a
+        partial pin would leave cached blocks whose parents were released.
+        `commit_prompt_logprob_writes` instead stores only rows whose blocks still
+        hold their tokens.
 
         Returns:
             List[PromptLogprobsWrite]: One entry per prefill request with prompt rows.
@@ -5359,25 +5363,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 next_token_ids = torch.cat(
                     (next_token_ids, torch.tensor([self.chunked_prefill_next_prompt_token_id]))
                 )
-            block_table = self.request_to_kv_block_ids[self.paused_request_count + request_index]
+            row = self.paused_request_count + request_index
             row_blocks = positions // self.block_size_tokens
+            block_ids = self.request_to_kv_block_ids[row][row_blocks].clone()
             writes.append(
                 PromptLogprobsWrite(
                     request_index=request_index,
                     num_rows=num_prompt_rows,
                     top_n=int(top_n[request_index]),
-                    block_ids=block_table[row_blocks].clone(),
+                    block_ids=block_ids,
                     slots=positions % self.block_size_tokens,
                     next_token_ids=next_token_ids,
-                    pinned_block_ids=block_table[: int(row_blocks.max()) + 1].clone(),
+                    request_id=int(self.request_ids[row]),
+                    block_indices=row_blocks.clone(),
+                    block_hashes=self.kv_block_allocator.block_hashes[block_ids.long()].clone(),
                 )
-            )
-        if writes:
-            # Pinning only the rows' blocks would let a request that finishes before the
-            # commit release its earlier blocks, and REF_ZERO would deregister those
-            # ancestors while their pinned descendants stay cached.
-            self.kv_block_allocator.retain_memory_blocks(
-                torch.cat([write.pinned_block_ids for write in writes]).unique().tolist()
             )
         return writes
 
@@ -5387,7 +5387,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         log_probs: Optional[List[List[float]]],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
     ) -> None:
-        """Cache captured prompt log-prob rows on their blocks and release the pins.
+        """Cache captured prompt log-prob rows on blocks that still hold their tokens.
+
+        Under async scheduling this runs after the step's update and admission, so a
+        captured block may have been released and reused. A row is stored only while
+        its block still belongs to the same request, or is still cached under the hash
+        it had at capture; other rows are dropped, and only cache reuse is lost.
 
         Args:
             writes: Destinations returned by `capture_prompt_logprob_writes`.
@@ -5397,27 +5402,44 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if not writes:
             return
         allocator = self.kv_block_allocator
-        try:
-            for write in writes:
-                rows = log_probs[write.request_index][: write.num_rows]
-                if write.top_n > 0:
-                    top_n_rows = top_n_logprobs[write.request_index][: write.num_rows]
-                    top_n_values = torch.stack([values for values, _ in top_n_rows])
-                    top_n_ids = torch.stack([token_ids for _, token_ids in top_n_rows])
-                else:
-                    top_n_values = torch.empty((write.num_rows, 0), dtype=torch.float32)
-                    top_n_ids = torch.empty((write.num_rows, 0), dtype=torch.int64)
-                allocator.store_prompt_logprobs(
-                    block_ids=write.block_ids.numpy(),
-                    slots=write.slots.numpy(),
-                    log_probs=torch.tensor(rows, dtype=torch.float32).numpy(),
-                    top_n_log_probs=top_n_values.float().numpy(),
-                    top_n_token_ids=top_n_ids.long().numpy(),
-                    next_token_ids=write.next_token_ids.numpy(),
-                )
-        finally:
-            allocator.release_memory_blocks(
-                torch.cat([write.pinned_block_ids for write in writes]).unique()
+        live_rows = {
+            request_id: row
+            for row, request_id in enumerate(self.request_ids[: self.total_request_count].tolist())
+        }
+        chunked_index = self.get_index_of_chunked_prefill_request(safe=False)
+        if chunked_index >= self.total_request_count:
+            # A partial chunk waiting for its next chunk keeps its row past the active rows.
+            live_rows[self.chunked_prefill_request_id] = chunked_index
+        for write in writes:
+            row = live_rows.get(write.request_id)
+            owned = (
+                self.request_to_kv_block_ids[row][write.block_indices] == write.block_ids
+                if row is not None
+                else torch.zeros(write.num_rows, dtype=torch.bool)
+            )
+            cached = (write.block_hashes != -1) & (
+                allocator.block_hashes[write.block_ids.long()] == write.block_hashes
+            )
+            keep = owned | cached
+            if not keep.any():
+                continue
+            rows = torch.tensor(
+                log_probs[write.request_index][: write.num_rows], dtype=torch.float32
+            )
+            if write.top_n > 0:
+                top_n_rows = top_n_logprobs[write.request_index][: write.num_rows]
+                top_n_values = torch.stack([values for values, _ in top_n_rows]).float()
+                top_n_ids = torch.stack([token_ids for _, token_ids in top_n_rows]).long()
+            else:
+                top_n_values = torch.empty((write.num_rows, 0), dtype=torch.float32)
+                top_n_ids = torch.empty((write.num_rows, 0), dtype=torch.int64)
+            allocator.store_prompt_logprobs(
+                block_ids=write.block_ids[keep].numpy(),
+                slots=write.slots[keep].numpy(),
+                log_probs=rows[keep].numpy(),
+                top_n_log_probs=top_n_values[keep].numpy(),
+                top_n_token_ids=top_n_ids[keep].numpy(),
+                next_token_ids=write.next_token_ids[keep].numpy(),
             )
 
     def get_kvcache_utilization_stats(self) -> dict:

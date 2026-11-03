@@ -3156,7 +3156,7 @@ class TextGenerationController(MTPControllerMixin):
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
                 # The rows arrive after update and admission, so record their
-                # blocks now and pin them until the rows are stored.
+                # blocks now; the commit stores only rows whose blocks still hold them.
                 prompt_logprob_writes = context.capture_prompt_logprob_writes()
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
