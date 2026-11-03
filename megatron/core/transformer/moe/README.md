@@ -105,6 +105,45 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, add the following 
 
 Detailed documentation for each feature is available in the [Feature Documentation](#feature-documentation) section.
 
+### Global-batch quantile balancing in logit space
+
+Use `--moe-router-qb-bias-space logit` with `quantile_balancing`,
+`--moe-router-quantile-balancing-estimation-scope global_batch`, sigmoid scores,
+and `--moe-aux-loss-coeff 0`. The default bias space remains `score`.
+
+Logit mode selects the top-k experts using `logits + expert_bias`. Contribution
+weights still come from the original `sigmoid(logits)`, normalized over the
+selected experts when k > 1 and multiplied by the configured scaling factor.
+Bias changes selection only. This avoids compressing low sigmoid scores into
+very few histogram bins, but does not increase their contribution weights.
+
+For each token, the histogram records `cutoff - logits`, where `cutoff` is the
+(k+1)-th largest biased logit. Histograms are pooled over all microbatches and
+participating ranks before the usual k/E quantile update. Repeated calls to a
+shared router accumulate into the same histogram. No forward-pass collective
+is added; the per-router logit range is reduced at the global-batch boundary.
+
+Histogram bounds start at [-16, 16], configurable with
+`--moe-router-qb-logit-initial-bound`. The next bounds are
+`[min(bias) - 1.1 * span, max(bias) + 1.1 * span]`, where `span` is the largest
+within-token logit range observed across the global batch (floored at 1e-3).
+Common token-wide logit shifts do not widen the range. Samples outside the
+current bounds enter the edge bins; an abrupt range increase can affect one
+update before the next batch uses wider bounds. Nonfinite observed logits
+preserve the previous bias and bounds.
+
+The unfused implementation works without new dependencies. `--moe-router-fusion`
+requires a Transformer Engine router exposing `qb_bias_space`; older versions
+raise an actionable error. The score-only Triton inference router is bypassed
+for logit mode. Group-limited routing and micro-batch QB are not supported in
+logit mode.
+
+Logit checkpoints use `logit_expert_bias` and `logit_qb_bin_bounds`. Loading bias
+from the other space is rejected, including Core loads with `strict=False`.
+Score-space checkpoints keep their existing keys and defaults. Switching an
+existing model requires separately recalibrating bias on representative inputs;
+there is no universal elementwise conversion preserving the selected experts.
+
 ### Use the pre-defined config to train the popular MoE models
 We have provided some pre-defined config to train the popular MoE models in the [Megatron-MoE-Model-Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo/tree/main) repository. You can use them as a reference to configure your training script. Currently we have added the config for Mixtral 8x7B, Mixtral 8x22B, DeepSeek-V3, Qwen3-30B-A3B, Qwen3-235B-A22B.
 
@@ -729,6 +768,8 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-load-balancing-type | Load balancing: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, quantile_balancing, none | aux_loss |
 | --moe-router-quantile-balancing-estimation-scope | Quantile population: micro_batch or global_batch | micro_batch |
 | --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
+| --moe-router-qb-bias-space | Global-batch QB selection and histogram space: score or logit | score |
+| --moe-router-qb-logit-initial-bound | Initial symmetric histogram bound for logit-space QB | 16.0 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
 | --moe-router-pre-softmax | Softmax before top-k | False |

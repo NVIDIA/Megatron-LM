@@ -1037,6 +1037,21 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_qb_num_bins: int = 1000
     """Number of persistent uniform histogram bins per expert for global-batch QB."""
 
+    moe_router_qb_bias_space: Literal['score', 'logit'] = 'score'
+    """Space in which global-batch QB selects experts and estimates its additive bias.
+
+    ``score`` uses sigmoid(logits) + bias (the existing behavior). ``logit`` uses
+    logits + bias; contribution weights still use the original, unbiased sigmoid scores.
+    Logit-space QB uses the unfused router or TE with logit-bias support. Distinct checkpoint
+    keys prevent interpreting a score-space bias as a logit-space bias.
+    """
+
+    moe_router_qb_logit_initial_bound: float = 16.0
+    """Initial logit-space QB histogram bounds are +/- this value. Subsequent bounds adapt
+    to the globally observed within-token logit range and updated bias, with 10% headroom.
+    Samples outside the current bounds are clamped into the edge bins, as in score-space QB.
+    """
+
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
@@ -2795,6 +2810,16 @@ class TransformerConfig(ModelParallelConfig):
             and "quantile_balancing" in self.moe_router_load_balancing_type
         ):
             raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_qb_bias_space not in ("score", "logit"):
+            raise ValueError("moe_router_qb_bias_space must be 'score' or 'logit'.")
+        if self.moe_router_qb_bias_space == "logit":
+            if (
+                self.moe_router_load_balancing_type != "quantile_balancing"
+                or self.moe_router_quantile_balancing_estimation_scope != "global_batch"
+            ):
+                raise ValueError("Logit-space QB requires global_batch quantile_balancing.")
+            if not 0.0 < self.moe_router_qb_logit_initial_bound < float("inf"):
+                raise ValueError("moe_router_qb_logit_initial_bound must be positive and finite.")
         if self.moe_router_load_balancing_type == "quantile_balancing":
             aux_coeffs = (
                 self.moe_aux_loss_coeff

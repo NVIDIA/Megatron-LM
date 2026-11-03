@@ -378,6 +378,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
+            if getattr(module, 'qb_logit_span', None) is not None:
+                module.qb_logit_span.zero_()
 
 
 def _update_router_expert_bias(
@@ -472,6 +474,7 @@ def _update_router_expert_bias_with_quantile(
     expert_bias_list = []
     qb_histogram_list = []
     qb_bin_bounds_list = []
+    qb_logit_span_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if (
@@ -482,6 +485,8 @@ def _update_router_expert_bias_with_quantile(
                 expert_bias_list.append(module.expert_bias)
                 qb_histogram_list.append(module.qb_histogram)
                 qb_bin_bounds_list.append(module.qb_bin_bounds)
+                if getattr(module, 'qb_logit_span', None) is not None:
+                    qb_logit_span_list.append(module.qb_logit_span)
 
     if not expert_bias_list:
         return
@@ -489,11 +494,25 @@ def _update_router_expert_bias_with_quantile(
     stacked_bias = torch.stack(expert_bias_list, dim=0)
     stacked_histogram = torch.stack(qb_histogram_list, dim=0)
     stacked_bin_bounds = torch.stack(qb_bin_bounds_list, dim=0)
+    stacked_logit_span = None
+    if qb_logit_span_list:
+        assert len(qb_logit_span_list) == len(
+            expert_bias_list
+        ), "Cannot mix QB bias spaces in one model."
+        stacked_logit_span = torch.stack(qb_logit_span_list)
     for group in reduction_groups:
         if get_pg_size(group) > 1:
             torch.distributed.all_reduce(stacked_histogram, group=group)
+            if stacked_logit_span is not None:
+                torch.distributed.all_reduce(
+                    stacked_logit_span, op=torch.distributed.ReduceOp.MAX, group=group
+                )
     updated_bias, updated_bin_bounds = get_updated_expert_bias_with_quantile(
-        stacked_histogram, stacked_bin_bounds, stacked_bias, config.moe_router_topk
+        stacked_histogram,
+        stacked_bin_bounds,
+        stacked_bias,
+        config.moe_router_topk,
+        logit_span=stacked_logit_span,
     )
     for bias, bounds, next_bias, next_bounds in zip(
         expert_bias_list, qb_bin_bounds_list, updated_bias, updated_bin_bounds

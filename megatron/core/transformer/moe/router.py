@@ -221,6 +221,8 @@ class TopKRouter(Router):
         self.input_jitter = None
         self.frozen_expert_bias = False
         self.qb_estimation_scope = self.config.moe_router_quantile_balancing_estimation_scope
+        self.qb_bias_space = self.config.moe_router_qb_bias_space
+        self.register_buffer('qb_logit_span', None, persistent=False)
         self.mtp_layer_number: Optional[int] = None
         self.is_hash_layer = False
         self.register_buffer('tid2eid', None)
@@ -293,10 +295,23 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+            initial_bound = (
+                self.config.moe_router_qb_logit_initial_bound
+                if self.qb_bias_space == "logit"
+                else 1.0
+            )
             self.register_buffer(
                 'qb_bin_bounds',
-                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+                torch.tensor(
+                    [-initial_bound, initial_bound],
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
             )
+            if self.qb_bias_space == "logit":
+                self.qb_logit_span = torch.zeros(
+                    (), dtype=torch.float32, device=torch.cuda.current_device()
+                )
         # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
         # and reset each global batch.
@@ -401,6 +416,9 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
             if self.qb_bin_bounds.dtype != torch.float32:
                 self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
+        if getattr(self, 'qb_logit_span', None) is not None:
+            if self.qb_logit_span.dtype != torch.float32:
+                self.qb_logit_span.data = self.qb_logit_span.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -470,6 +488,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+                qb_bias_space=self.qb_bias_space,
+                qb_logit_span=self.qb_logit_span if accumulate_histogram else None,
+                dense_output=dense_output,
             )
 
         assert (
@@ -1148,7 +1169,12 @@ class TopKRouter(Router):
             assert (
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
-            probs, routing_map = self.quantile_balancing(logits, dense_output=dense_output)
+            # QB's compact output includes compact probabilities. Ordinary Flex transports
+            # require full-width probabilities; only the virtual-expert planner consumes
+            # the compact pair. Boolean routing maps remain supported by all transports.
+            probs, routing_map = self.quantile_balancing(
+                logits, dense_output=dense_output and self.config.moe_virtual_expert_load_balance
+            )
         else:
             # TE capability controls the implementation, not the requested output format.
             fused = self.config.moe_router_fusion and (
@@ -1206,11 +1232,9 @@ class TopKRouter(Router):
                     padding_mask=padding_mask,
                 )
             if observe_router_diagnostics:
-                # Report the additive selection correction: QB subtracts beta from logits,
-                # whereas ordinary bias routing adds expert_bias to the routing scores.
-                selection_bias = (
-                    -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
-                )
+                # Micro-batch QB subtracts beta; global-batch QB adds expert_bias
+                # in the configured score or logit units.
+                selection_bias = -self.qb_beta if self.qb_beta is not None else self.expert_bias
                 actual_routing_map = routing_map
                 if actual_routing_map.dtype != torch.bool:
                     # Dense top-k indices [num_tokens, topk] (flex dispatcher backends): the
@@ -1357,15 +1381,34 @@ class TopKRouter(Router):
 
         return probs, routing_map
 
-    def _load_from_state_dict(self, *args, **kwargs):
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         """Load the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before loading
-        return super()._load_from_state_dict(*args, **kwargs)
+        # Bias units are not interchangeable. Distinct keys also protect Core callers
+        # and distributed checkpoints, which need not carry Megatron training args.
+        if self.qb_bias_space == "logit":
+            if prefix + "expert_bias" in state_dict:
+                raise RuntimeError(
+                    "Cannot load score-space expert_bias into logit-space QB; "
+                    "recalibrate the bias first."
+                )
+            state_dict = state_dict.copy()
+            for name in ("expert_bias", "qb_bin_bounds"):
+                key = prefix + "logit_" + name
+                if key in state_dict:
+                    state_dict[prefix + name] = state_dict.pop(key)
+        elif prefix + "logit_expert_bias" in state_dict:
+            raise RuntimeError("Cannot load logit-space QB bias into a score-space router.")
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def _save_to_state_dict(self, *args, **kwargs):
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
         """Save the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before saving
-        return super()._save_to_state_dict(*args, **kwargs)
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.qb_bias_space == "logit":
+            for name in ("expert_bias", "qb_bin_bounds"):
+                if prefix + name in destination:  # Hash layers disable learned expert bias.
+                    destination[prefix + "logit_" + name] = destination.pop(prefix + name)
 
 
 class InferenceTopKRouter(TopKRouter):
@@ -1429,6 +1472,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        qb_bias_space="score",
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1443,6 +1487,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            qb_bias_space=qb_bias_space,
         )
 
     def _uses_sigmoid_topk_kernel(
@@ -1461,6 +1506,7 @@ class InferenceTopKRouter(TopKRouter):
         """
         return (
             self.config.inference_moe_router_backend == 'triton'
+            and self.qb_bias_space == 'score'
             and HAVE_SIGMOID_TOPK_KERNEL
             and logits.is_cuda
             and logits.dtype == torch.float32
@@ -1524,6 +1570,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            qb_bias_space=self.qb_bias_space,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

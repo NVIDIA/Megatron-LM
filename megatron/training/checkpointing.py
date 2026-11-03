@@ -2465,6 +2465,11 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_aux_loss_coeff', force=True)
     _set_arg('moe_router_quantile_balancing_estimation_scope', force=True)
     _set_arg('moe_router_qb_num_bins', force=True)
+    # Checkpoints predating logit-space QB used score-space global-batch bias.
+    if not hasattr(checkpoint_args, 'moe_router_qb_bias_space'):
+        checkpoint_args.moe_router_qb_bias_space = 'score'
+    _set_arg('moe_router_qb_bias_space', force=True)
+    _set_arg('moe_router_qb_logit_initial_bound', force=True)
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
