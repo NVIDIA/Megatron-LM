@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -185,6 +187,25 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     assert args.csa_compress_ratios == expected_ratios
     assert config_kwargs["csa_compress_ratios"] == expected_ratios
     assert _get_indexer_logging_layer_counts(args) == (6, 3)
+
+
+def test_training_import_does_not_load_megatron_rl():
+    """Importing the training loop must not load megatron.rl's agent and inference stack.
+
+    Editable megatron-core installs expose all of megatron.rl, so the training loop must not
+    import it; the RL entry point (train_rl.py) imports the RL hooks and registers them as
+    callbacks. This keeps non-RL users (for example NeMo-RL's Megatron workers) from importing it.
+    """
+    code = """
+import sys
+
+import megatron.training.training  # noqa: F401
+
+for name in ("megatron.rl.rl_utils", "megatron.rl.inference", "megatron.rl.training_setup"):
+    assert name not in sys.modules, f"{name} loaded at import"
+"""
+    repo = Path(__file__).resolve().parents[2]
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=repo)
 
 
 class TestTraining:
