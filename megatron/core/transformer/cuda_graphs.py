@@ -651,6 +651,11 @@ class _CudagraphGlobalRecord:
     @classmethod
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
+        # Forward-only schedules can reach this before training records any graphs.
+        # Keep observing saved tensors until there is a capture to complete.
+        if not cls.cudagraph_created and not cls.cudagraph_record:
+            return
+
         try:
             return cls._create_cudagraphs()
         finally:
