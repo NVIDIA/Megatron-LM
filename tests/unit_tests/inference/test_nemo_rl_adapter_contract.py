@@ -144,7 +144,7 @@ def _as_adapter_client_rank():
 
 
 class _InProcessInferenceClient:
-    def __init__(self, engine, expected_requests, first_request_id, witness):
+    def __init__(self, engine, expected_requests, first_request_id, witness) -> None:
         self.engine = engine
         self.expected_requests = expected_requests
         self.next_request_id = first_request_id
