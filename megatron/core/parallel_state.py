@@ -30,6 +30,7 @@
     See ``docs/developer/parallel-state-deprecation.md``.
 """
 
+import enum
 import logging
 import os
 import warnings
@@ -192,10 +193,44 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 
-# List of all process groups
-# Used for updating the timeout for all process groups
-# None represents the default process group
+# Member groups recorded by create_group, in creation order, for timeout updates
+# and teardown. The first entry, None, represents the default process group.
 _global_process_group_list = None
+
+
+class TeardownStage(enum.IntEnum):
+    """Stages of destroy_model_parallel(), in execution order."""
+
+    VALIDATE = 0
+    """Raise if teardown must not start. Runs before anything is released."""
+
+    RELEASE_COMMUNICATION = 1
+    """Release contexts and buffers that use model-parallel communicators."""
+
+    RELEASE_CUDA_GRAPHS = 2
+    """Release captured CUDA graphs, which keep the communicators they captured alive."""
+
+    RESET_STATE = 3
+    """Reset library state that refers to the ending lifetime's process groups."""
+
+
+# Teardown callbacks by stage. See register_model_parallel_teardown().
+_MODEL_PARALLEL_TEARDOWN_CALLBACKS = {stage: [] for stage in TeardownStage}
+
+
+def register_model_parallel_teardown(stage: TeardownStage, callback: Callable[[], None]) -> None:
+    """Run ``callback`` at ``stage`` of every destroy_model_parallel() call.
+
+    Modules that cache resources bound to model-parallel process groups register a
+    callback when they are imported, so this module does not depend on them. Callbacks
+    run whether or not their resource exists, so they must be cheap and idempotent.
+    Within a stage, callbacks run in reverse registration order: a module registers
+    after the modules it imports, so it releases its resources before theirs.
+    Registering the same callback again has no effect.
+    """
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS[stage]
+    if callback not in callbacks:
+        callbacks.append(callback)
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -294,7 +329,7 @@ def create_group(
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
-    if torch.distributed.get_rank() in ranks:
+    if group is not None and group != torch.distributed.GroupMember.NON_GROUP_MEMBER:
         _global_process_group_list.append(group)
     return group
 
@@ -1024,6 +1059,10 @@ def build_process_group_collection(
 
     if get_position_embedding_ranks is None:
         get_position_embedding_ranks = default_position_embedding_ranks
+
+    # Finalization may run on a different thread during in-process restart. DTensor
+    # caches are thread-local, so invalidate them on the model's thread as well.
+    _clear_dtensor_sharding_cache()
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -3278,29 +3317,89 @@ def get_all_ranks():
     return "_".join(map(lambda x: str(x or 0), ranks))
 
 
-def destroy_model_parallel():
-    """Set the groups to none."""
-    # MoonEP's symmetric-memory windows must be released while their expert process group
-    # is still alive. Idempotent and a no-op when virtual experts were never initialized.
-    try:
-        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-            VirtualExpertLoadBalancer,
-        )
+def _destroy_created_process_groups():
+    """Destroy this rank's created groups in reverse order, preserving WORLD."""
+    global _global_process_group_list
+    # create_group records each creation once; aliases do not add entries. None is
+    # the default group used by update_pg_timeout, which this function does not own.
+    groups = _global_process_group_list or []
+    _global_process_group_list = None
+    first_error = None
+    for group in reversed(groups):
+        if group is not None and group in torch.distributed.distributed_c10d._world.pg_map:
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception as error:
+                logger.warning("Failed to destroy a model-parallel process group.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
 
-        VirtualExpertLoadBalancer.finalize()
-    except Exception:
-        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
 
-    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
-    # process group's communicator is torn down. TE registers an atexit ep_finalize that would
-    # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped.
-    try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+def _clear_dtensor_sharding_cache():
+    """Invalidate this thread's sharding specs, which can name a previous lifetime's groups."""
+    from torch.distributed.tensor import DTensor
 
-        nccl_ep_finalize()
-    except Exception:  # finalize must never block teardown
-        pass
+    cache = DTensor._op_dispatcher.sharding_propagator.propagate_op_sharding
+    if is_torch_min_version("2.10.0"):
+        cache.cache_clear()
+        # The C++ dispatch fast path keeps its own sharding cache in front of the LRU.
+        torch._C._clear_DTensor_sharding_propagator_cache()
+    else:
+        # LocalLRUCache exposes cache_clear() from torch 2.10; before that, clear the LRU
+        # it wraps.
+        cache.cache.cache_clear()
+
+
+def destroy_model_parallel() -> None:
+    """Destroy model-parallel process groups and clear their global state.
+
+    Call on every member of each group after communications and Transformer Engine
+    autocast contexts have finished. Release any CUDA graphs managed by the caller
+    (including TE graphed callables) before invoking this function. The default
+    process group is preserved.
+
+    Teardown runs the registered TeardownStage.VALIDATE callbacks, runs the remaining
+    stages' callbacks in stage order while the groups still exist, clears this module's
+    state, and destroys the created groups last. See register_model_parallel_teardown().
+
+    Raises:
+        RuntimeError: A validation callback refused teardown, for example because a TE
+            autocast context is still active. Nothing has been released.
+        Exception: A resource or process group could not be released. If a callback
+            fails, the remaining callbacks still run, and the first failure is raised
+            before any group is destroyed or module state is cleared. Group destruction
+            attempts all registered groups before reporting the first failure.
+    """
+    callbacks = _MODEL_PARALLEL_TEARDOWN_CALLBACKS
+    for validate in reversed(callbacks[TeardownStage.VALIDATE]):
+        validate()
+
+    # Release cached resources while their process groups still exist. Run every
+    # callback even if one fails: some releases rendezvous with peer ranks, which run
+    # all of them.
+    first_error = None
+    for stage in (
+        TeardownStage.RELEASE_COMMUNICATION,
+        TeardownStage.RELEASE_CUDA_GRAPHS,
+        TeardownStage.RESET_STATE,
+    ):
+        for release in reversed(callbacks[stage]):
+            try:
+                release()
+            except Exception as error:
+                logger.warning("Failed to release a model-parallel resource.", exc_info=True)
+                if first_error is None:
+                    first_error = error
+    # A resource that failed to release may still use its communicator, so destroying
+    # the group could wait forever. Keep the groups and this module's state.
+    if first_error is not None:
+        raise first_error
+
+    # DTensor's sharding cache compares meshes by layout, not process-group identity.
+    # A later initialization with the same layout would reuse specs naming dead groups.
+    _clear_dtensor_sharding_cache()
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
@@ -3333,6 +3432,15 @@ def destroy_model_parallel():
 
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+
+    global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
@@ -3385,23 +3493,9 @@ def destroy_model_parallel():
     destroy_global_memory_buffer()
 
     global _DATA_PARALLEL_GROUP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
     _DATA_PARALLEL_GROUP_GLOO = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     # Destroy parallel state related to expert parallelism.
@@ -3448,28 +3542,12 @@ def destroy_model_parallel():
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -3479,7 +3557,8 @@ def destroy_model_parallel():
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
-    global _global_process_group_list
-    _global_process_group_list = None
-
     SymmetricMemoryManager.destroy()
+
+    # Destroy the tracked process groups last, after every cache above has released the
+    # resources it held on their communicators.
+    _destroy_created_process_groups()
