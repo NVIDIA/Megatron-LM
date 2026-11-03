@@ -1233,7 +1233,7 @@ def _build_synced_model(dispatcher_type, ep_size):
             per_rank_worst_case_token_count=_MTP_MOE_PER_RANK_MAX_TOKENS,
             topk=_MTP_MOE_TOPK,
             hidden_size=_MTP_MOE_HIDDEN,
-            ep_group=get_expert_model_parallel_group(),
+            tp_ep_group=get_expert_model_parallel_group(),
         )
     return model
 
@@ -1463,6 +1463,11 @@ class TestMTPDispatcherMetadata:
                         InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
                     )
                 )
+            # Assert on the eager forwards before capturing, and release the graph before
+            # asserting on its replay: a failed test's frames outlive it, and a live graph that
+            # captured an NCCL collective blocks destroying that communicator at teardown.
+            assert [int(seen[m].item()) for m in decoder_moe] == [main_tokens * ep_size] * 2
+            assert eager_counts == [([mtp_rows * ep_size], mtp_rows * ep_size)] * 2
 
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -1471,16 +1476,17 @@ class TestMTPDispatcherMetadata:
                     mtp_forward(0)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                mtp_forward(0)
-            # Replay after a main forward, as each step does.
-            main_forward()
-            seen[mtp_moe[0][0]].fill_(-1)
-            graph.replay()
-            torch.cuda.synchronize()
+            try:
+                with torch.cuda.graph(graph):
+                    mtp_forward(0)
+                # Replay after a main forward, as each step does.
+                main_forward()
+                seen[mtp_moe[0][0]].fill_(-1)
+                graph.replay()
+                torch.cuda.synchronize()
+            finally:
+                graph.reset()
 
-        assert [int(seen[m].item()) for m in decoder_moe] == [main_tokens * ep_size] * 2
-        assert eager_counts == [([mtp_rows * ep_size], mtp_rows * ep_size)] * 2
         assert int(seen[mtp_moe[0][0]].item()) == mtp_rows * ep_size
 
 
