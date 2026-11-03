@@ -999,6 +999,7 @@ jobs:
     with:
       buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
+      selection-runner: ${{ (needs.configure.outputs.h100_build_runner == 'nvidia-ci-aws-cpu' || needs.configure.outputs.h100_build_runner == 'nvidia-ci-gcp-cpu-h100') && toJSON(needs.configure.outputs.h100_build_runner) || '' }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
@@ -1070,6 +1071,7 @@ jobs:
     with:
       buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
       runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
+      selection-runner: '"nvidia-ci-aws-cpu-arm64"'
       container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}

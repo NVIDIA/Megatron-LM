@@ -78,11 +78,15 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     usage
 fi
 
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" && "$UNIT_TESTMON_MODE" != "select-only" && "$UNIT_TESTMON_MODE" != "preselected" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
 if [[ "$UNIT_TESTMON_MODE" != "full" && ( "$TAG" != "latest" || "$ENVIRONMENT" != "dev" ) ]]; then
+    if [[ "$UNIT_TESTMON_MODE" == "select-only" ]]; then
+        echo "CPU collection requires the latest dev suite."
+        exit 1
+    fi
     echo "Testmon is only enabled for the latest dev suite; running the full bucket."
     UNIT_TESTMON_MODE=full
 fi
@@ -334,30 +338,15 @@ run_selected_phase() {
     return "$rc"
 }
 
-run_enforced_tests() {
-    local target prod_count experimental_count mandatory_count
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
-        || ! run_testmon_phase select prod \
-            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections prod \
-        || ! apply_mandatory_tests prod \
-        || ! run_testmon_phase select experimental \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
-        || ! merge_rank_selections experimental \
-        || ! apply_mandatory_tests experimental; then
-        write_testmon_summary "full fallback: Testmon selection failed"
-        run_full_tests
-        return
-    fi
+native_selection_transport() {
+    uv run --no-sync python tests/unit_tests/testmon_selection.py "$1" \
+        --cache-dir "$UNIT_TESTMON_CACHE_DIR" --bucket "$BUCKET" \
+        --platform "dgx_$PLATFORM" --source-sha "$(git rev-parse HEAD)" \
+        --image-id "${UNIT_TESTMON_IMAGE_ID:-unknown}" \
+        --world-size "$((NUM_NODES * GPUS_PER_NODE))" --check-runtime
+}
 
-    prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
-    experimental_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/experimental/selected-tests")
-    mandatory_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/mandatory-tests")
-    for i in $(seq "$UNIT_TEST_REPEAT"); do
-        run_selected_phase prod
-        run_selected_phase experimental
-    done
+ensure_testmon_coverage() {
     if ! compgen -G '.coverage.unit_tests*' > /dev/null; then
         # Keep the downstream coverage aggregation valid when Testmon selects
         # only experimental tests (or no tests) for this bucket.
@@ -371,6 +360,56 @@ data.write()
 '
     fi
     coverage combine -q
+}
+
+run_enforced_tests() {
+    local target prod_count experimental_count mandatory_count
+    local mode="${UNIT_TESTMON_MODE:-enforce}"
+    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    if [[ "$mode" == "select-only" ]]; then
+        if ! rm -f -- "$UNIT_TESTMON_CACHE_DIR/selection.json"; then
+            write_testmon_summary "CPU native collection failed; GPU validation is required"
+            return 1
+        fi
+    fi
+    if [[ "$mode" == "preselected" ]] && native_selection_transport prepare; then
+        echo "Using the validated native CPU selection."
+    else
+        if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
+            || ! run_testmon_phase select prod \
+                -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections prod \
+            || ! apply_mandatory_tests prod \
+            || ! run_testmon_phase select experimental \
+                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target" \
+            || ! merge_rank_selections experimental \
+            || ! apply_mandatory_tests experimental; then
+            if [[ "$mode" == "select-only" ]]; then
+                write_testmon_summary "CPU native collection failed; GPU validation is required"
+                return 1
+            fi
+            write_testmon_summary "full fallback: Testmon selection failed"
+            run_full_tests
+            return
+        fi
+    fi
+
+    prod_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/selected-tests")
+    experimental_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/experimental/selected-tests")
+    mandatory_count=$(wc -l < "$UNIT_TESTMON_CACHE_DIR/.testmon-work/prod/mandatory-tests")
+    if [[ "$mode" == "select-only" ]]; then
+        native_selection_transport export || return
+        if [[ "$prod_count" -eq 0 && "$experimental_count" -eq 0 ]]; then
+            ensure_testmon_coverage
+        fi
+        write_testmon_summary "CPU native collection completed" "$((prod_count + experimental_count))" "$mandatory_count"
+        return
+    fi
+    for i in $(seq "$UNIT_TEST_REPEAT"); do
+        run_selected_phase prod
+        run_selected_phase experimental
+    done
+    ensure_testmon_coverage
     write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))" "$mandatory_count"
 }
 
@@ -381,7 +420,7 @@ full)
 baseline)
     run_baseline_tests
     ;;
-enforce)
+enforce|select-only|preselected)
     run_enforced_tests
     ;;
 esac

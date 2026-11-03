@@ -4,6 +4,8 @@ import io
 import logging
 import os
 import pathlib
+import re
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -147,7 +149,7 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
     "--unit-testmon-mode",
-    type=click.Choice(["full", "enforce", "baseline"]),
+    type=click.Choice(["full", "enforce", "baseline", "select-only", "preselected"]),
     default="full",
     show_default=True,
     help="Selective unit-test mode.",
@@ -186,6 +188,11 @@ def main(
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
+    if unit_testmon_mode == "select-only" and (
+        test_case == "tests/unit_tests/inference/test_batch_invariant_fp8.py"
+        or (test_case.startswith("tests/unit_tests/inference/") and "/test_disagg_" in test_case)
+    ):
+        raise click.UsageError("This bucket requires full GPU execution and cannot collect on CPU")
     cadence_arg = cadence or None
 
     workloads = recipe_parser.load_workloads(
@@ -223,15 +230,42 @@ def main(
     if hf_home:
         artifacts.append(f"{pathlib.Path(hf_home)}:/mnt/hf_home")
 
+    executor_image = container_image
+    image_id = os.environ.get("UNIT_TESTMON_IMAGE_ID", "unknown")
+    if unit_testmon_mode in {"select-only", "preselected"}:
+        if model != "unit-tests":
+            raise click.UsageError("Native Testmon handoff modes require unit-test workloads")
+        try:
+            actual_image_id = subprocess.check_output(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", container_image], text=True
+            ).strip()
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", actual_image_id):
+                raise ValueError("Docker did not return an immutable image ID")
+            if image_id != "unknown" and image_id != actual_image_id:
+                raise ValueError("The selected Docker image changed before launch")
+            image_id = actual_image_id
+            # The scheduler re-pulls tags; pin the verified local image to avoid
+            # a different image running after the handoff identity check.
+            executor_image = actual_image_id
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            if unit_testmon_mode == "select-only":
+                raise click.ClickException(
+                    f"Cannot identify CPU collection image: {error}"
+                ) from error
+            logger.warning("CPU selection image unavailable; using native GPU selection: %s", error)
+            unit_testmon_mode = "enforce"
+
     executor = run.DockerExecutor(
-        container_image=container_image,
-        num_gpus=-1,
-        runtime="nvidia",
+        container_image=executor_image,
+        num_gpus=0 if unit_testmon_mode == "select-only" else -1,
+        runtime="runc" if unit_testmon_mode == "select-only" else "nvidia",
         ipc_mode="host",
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "UNIT_TESTMON_MODE": unit_testmon_mode,
+            "UNIT_TESTMON_IMAGE_ID": image_id,
+            "UNIT_TESTMON_CACHE_KEY": os.environ.get("UNIT_TESTMON_CACHE_KEY", ""),
             "FORCE_COLOR": "1",
             "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),

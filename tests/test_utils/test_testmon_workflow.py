@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -766,27 +765,53 @@ def test_full_test_guards_override_selective_requests(
     assert "| `unit_testmon_eligible` | `false` |" in summary
 
 
+def _evaluate_workflow_expression(expression, **contexts):
+    """Evaluate the small expression subset used by the bucket's routing guards."""
+    expression = expression.removeprefix("${{").removesuffix("}}")
+    expression = re.sub(
+        r"\b(?:inputs|needs|steps)(?:\.[A-Za-z_][A-Za-z0-9_-]*)+",
+        lambda match: "contexts" + "".join(f"[{part!r}]" for part in match[0].split(".")),
+        expression,
+    )
+    expression = expression.replace("&&", "and").replace("||", "or")
+    expression = re.sub(r"!(?!=)", "not ", expression)
+    return eval(
+        expression,
+        {"__builtins__": {}},
+        {
+            "contexts": contexts,
+            "cancelled": lambda: contexts.get("cancelled", False),
+            "always": lambda: True,
+            "startsWith": lambda value, prefix: value.startswith(prefix),
+            "contains": lambda value, item: item in value,
+            "toJSON": json.dumps,
+        },
+    )
+
+
 @pytest.mark.parametrize("platform", ["h100", "gb200"])
-def test_unit_tests_select_and_execute_in_each_existing_gpu_bucket(
+def test_unit_tests_keep_the_full_bucket_matrix_with_isolated_cpu_gpu_handoffs(
     tmp_path, shell_environment, platform
 ):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert set(workflow["jobs"]) == {"run"}
-    job = workflow["jobs"]["run"]
+    assert set(workflow["jobs"]) == {"bucket"}
+    job = workflow["jobs"]["bucket"]
     assert "needs" not in job and "if" not in job
-    assert job["runs-on"] == "${{ fromJSON(inputs.runner) }}"
     assert job["strategy"]["fail-fast"] is False
     assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.buckets) }}"
-    action = job["steps"][-1]["with"]
-    assert action["container-image"] == "${{ inputs.container-image }}"
-    assert action["test_case"] == "${{ matrix.bucket }}"
-    assert action["timeout"] == "${{ matrix.timeout || 30 }}"
-    assert action["sha"] == "${{ inputs.sha }}"
-    assert (
-        action["unit_test_pr_files_artifact_id"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
+    assert job["uses"] == "./.github/workflows/_unit-test-bucket.yml"
+    dispatch = job["with"]
+    assert dispatch["bucket"] == "${{ matrix.bucket }}"
+    assert dispatch["runner"] == "${{ inputs.runner }}"
+    assert dispatch["selection-runner"] == "${{ inputs.selection-runner }}"
+    assert dispatch["container-image"] == "${{ inputs.container-image }}"
+    assert dispatch["timeout"] == "${{ matrix.timeout || 30 }}"
+    assert dispatch["sha"] == "${{ inputs.sha }}"
+    assert dispatch["unit_test_pr_files_artifact_id"] == (
+        "${{ inputs.unit_test_pr_files_artifact_id }}"
     )
-    assert "unit_testmon_plan_artifact" not in action
-    assert "UNIT_TESTMON_COMPARE_SELECTIONS" not in yaml.safe_dump(workflow)
+    assert "unit_testmon_plan_artifact" not in dispatch
+    assert "select_unit_tests.py" not in yaml.safe_dump(workflow)
 
     callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
     suffix = "" if platform == "h100" else "-gb200"
@@ -816,17 +841,265 @@ def test_unit_tests_select_and_execute_in_each_existing_gpu_bucket(
     ]
 
 
+def test_cpu_selection_and_gpu_execution_use_the_same_bucket_image_and_source():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    assert set(workflow["jobs"]) == {"select", "run"}
+    select = workflow["jobs"]["select"]
+    run = workflow["jobs"]["run"]
+    assert select["runs-on"] == "${{ fromJSON(inputs.selection-runner) }}"
+    assert run["runs-on"] == "${{ fromJSON(inputs.runner) }}"
+    assert run["needs"] in ("select", ["select"])
+    select_action = next(
+        step for step in select["steps"] if step.get("uses") == "./.github/actions"
+    )
+    run_action = next(step for step in run["steps"] if step.get("uses") == "./.github/actions")
+    assert select_action["continue-on-error"] is True
+    assert (
+        int(select_action["with"]["timeout"])
+        < select_action["timeout-minutes"]
+        < select["timeout-minutes"]
+    )
+    for action in (select_action, run_action):
+        assert action["with"]["test_case"] == "${{ inputs.bucket }}"
+        assert action["with"]["container-image"] == "${{ inputs.container-image }}"
+        assert action["with"]["platform"] == "${{ inputs.platform }}"
+        assert action["with"]["sha"] == "${{ inputs.sha }}"
+        assert action["with"]["unit_test_pr_files_artifact_id"] == (
+            "${{ inputs.unit_test_pr_files_artifact_id }}"
+        )
+    assert select_action["with"]["unit_testmon_mode"] == "select-only"
+    assert run_action["with"]["unit_testmon_selection_artifact_id"] == (
+        "${{ needs.select.outputs.artifact_id }}"
+    )
+    assert "verify-cpu-selection" not in yaml.safe_dump(workflow)
+    assert "select_unit_tests.py" not in yaml.safe_dump(workflow)
+    assert "testmon_plan.py" not in yaml.safe_dump(workflow)
+
+
 @pytest.mark.parametrize("mode", ["enforce", "full"])
 @pytest.mark.parametrize("branch", ["main", "dev", "core_r0.20.0", "pull-request/8523", ""])
-def test_gpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
+def test_cpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    action = workflow["jobs"]["run"]["steps"][-1]["with"]
-    expression = action["unit_testmon_mode"].removeprefix("${{").removesuffix("}}")
-    expression = expression.replace("&&", "and").replace("||", "or")
-    inputs = SimpleNamespace(unit_testmon_mode=mode, unit_testmon_target_branch=branch)
-    assert eval(expression, {"__builtins__": {}}, {"inputs": inputs}) == (
-        "enforce" if mode == "enforce" and branch == "main" else "full"
+    dispatch = workflow["jobs"]["bucket"]["with"]
+    assert dispatch["unit_testmon_mode"] == "${{ inputs.unit_testmon_mode }}"
+    bucket_workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    action = bucket_workflow["jobs"]["run"]["steps"][-1]["with"]
+    assert _evaluate_workflow_expression(
+        action["unit_testmon_mode"],
+        inputs={"unit_testmon_mode": mode, "unit_testmon_target_branch": branch},
+    ) == ("enforce" if mode == "enforce" and branch == "main" else "full")
+
+
+@pytest.mark.parametrize(
+    ("mode", "branch", "runner", "bucket", "expected"),
+    [
+        ("enforce", "main", '"nvidia-ci-aws-cpu"', "tests/unit_tests/models/**/*.py", True),
+        ("full", "main", '"nvidia-ci-aws-cpu"', "tests/unit_tests/models/**/*.py", False),
+        ("enforce", "dev", '"nvidia-ci-aws-cpu"', "tests/unit_tests/models/**/*.py", False),
+        ("enforce", "main", "", "tests/unit_tests/models/**/*.py", False),
+        (
+            "enforce",
+            "main",
+            '"nvidia-ci-aws-cpu"',
+            "tests/unit_tests/inference/test_batch_invariant_fp8.py",
+            False,
+        ),
+        (
+            "enforce",
+            "main",
+            '"nvidia-ci-aws-cpu"',
+            "tests/unit_tests/inference/test_disagg_transfer_pairwise.py",
+            False,
+        ),
+        (
+            "enforce",
+            "main",
+            '"nvidia-ci-aws-cpu"',
+            "tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py",
+            False,
+        ),
+    ],
+)
+def test_cpu_selection_only_schedules_supported_requests(mode, branch, runner, bucket, expected):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    assert (
+        bool(
+            _evaluate_workflow_expression(
+                workflow["jobs"]["select"]["if"],
+                inputs={
+                    "unit_testmon_mode": mode,
+                    "unit_testmon_target_branch": branch,
+                    "selection-runner": runner,
+                    "bucket": bucket,
+                },
+            )
+        )
+        is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("result", "artifact_id", "has_tests", "cancelled", "expected"),
+    [
+        ("success", "1234", "false", False, False),
+        ("success", "1234", "true", False, True),
+        ("failure", "", "", False, True),
+        ("failure", "1234", "false", False, True),
+        ("success", "", "false", False, True),
+        ("success", "1234", "", False, True),
+        ("skipped", "", "", False, True),
+        ("success", "1234", "true", True, False),
+        ("failure", "", "", True, False),
+    ],
+)
+def test_only_successful_uploaded_empty_cpu_selection_skips_gpu(
+    result, artifact_id, has_tests, cancelled, expected
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    assert (
+        bool(
+            _evaluate_workflow_expression(
+                workflow["jobs"]["run"]["if"],
+                needs={
+                    "select": {
+                        "result": result,
+                        "outputs": {"artifact_id": artifact_id, "has_tests": has_tests},
+                    }
+                },
+                cancelled=cancelled,
+            )
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "skipped", "cancelled"])
+def test_cpu_failure_cannot_publish_a_gpu_skipping_artifact_id(outcome):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    output = workflow["jobs"]["select"]["outputs"]["artifact_id"]
+    assert _evaluate_workflow_expression(
+        output,
+        steps={
+            "selection": {
+                "outcome": outcome,
+                "outputs": {"unit_testmon_selection_artifact_id": "1234"},
+            }
+        },
+    ) == ("1234" if outcome == "success" else "")
+
+
+@pytest.mark.parametrize(
+    ("build_runner", "expected"),
+    [
+        ("nvidia-ci-aws-cpu", "nvidia-ci-aws-cpu"),
+        ("nvidia-ci-gcp-cpu-h100", "nvidia-ci-gcp-cpu-h100"),
+        ("nvidia-ci-aws-gpu-x8-ephemeral", None),
+        ("ephe-v2-test-a2", None),
+    ],
+)
+def test_cpu_runner_routes_preserve_architecture_and_external_isolation(build_runner, expected):
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    cpu_runner = _evaluate_workflow_expression(
+        callers["cicd-unit-tests-latest"]["with"]["selection-runner"],
+        needs={"configure": {"outputs": {"h100_build_runner": build_runner}}},
+    )
+    assert (json.loads(cpu_runner) if cpu_runner else None) == expected
+    assert json.loads(callers["cicd-unit-tests-latest-gb200"]["with"]["selection-runner"]) == (
+        "nvidia-ci-aws-cpu-arm64"
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform", "image", "region", "gar"),
+    [
+        (
+            "dgx_h100",
+            "766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:sha",
+            "us-east-1",
+            False,
+        ),
+        (
+            "dgx_gb200",
+            "766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm:sha",
+            "us-east-2",
+            False,
+        ),
+        (
+            "dgx_h100",
+            "asia-southeast1-docker.pkg.dev/example/megatron-lm/image:sha",
+            "us-east-1",
+            True,
+        ),
+    ],
+)
+def test_cpu_selection_reuses_the_cloud_registry_authentication(platform, image, region, gar):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    steps = workflow["jobs"]["select"]["steps"]
+    gar_auth = next(step for step in steps if step["name"] == "Configure GAR Docker authentication")
+    ecr_auth = next(step for step in steps if step["name"] == "Login to ECR")
+    context = {"inputs": {"platform": platform, "container-image": image}}
+    assert _evaluate_workflow_expression(gar_auth["if"], **context) is gar
+    assert _evaluate_workflow_expression(ecr_auth["if"], **context) is not gar
+    assert _evaluate_workflow_expression(ecr_auth["env"]["AWS_REGION"], **context) == region
+    assert ecr_auth["uses"] == (
+        "aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd"
+    )
+    for step in (gar_auth, ecr_auth):
+        assert step["continue-on-error"] is True
+
+
+def test_cpu_selection_configures_the_exact_gar_host(tmp_path, shell_environment):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    auth = next(
+        step
+        for step in workflow["jobs"]["select"]["steps"]
+        if step["name"] == "Configure GAR Docker authentication"
+    )
+    helper = tmp_path / "bin/docker-credential-gcr"
+    helper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CREDENTIAL_LOG"\n')
+    helper.chmod(0o755)
+    log = tmp_path / "credential-commands"
+    result, _ = _run(
+        auth["run"],
+        tmp_path,
+        {
+            **shell_environment,
+            "CONTAINER_IMAGE": "asia-southeast1-docker.pkg.dev/project/repo/image:sha",
+            "CREDENTIAL_LOG": str(log),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.read_text().splitlines() == [
+        "configure-docker --registries=asia-southeast1-docker.pkg.dev",
+        "get",
+    ]
+
+
+def test_cpu_cache_restore_uses_the_existing_gpu_gzip_format(tmp_path, shell_environment):
+    step = _step("_unit-test-bucket.yml", "select", "cache-compression")
+    real_zstd = tmp_path / "bin/zstd"
+    real_zstd.write_text("#!/bin/sh\nexit 0\n")
+    real_zstd.chmod(0o755)
+    github_path = tmp_path / "github-path"
+    result, _ = _run(
+        step["run"],
+        tmp_path,
+        {**shell_environment, "RUNNER_TEMP": str(tmp_path), "GITHUB_PATH": str(github_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    cache_bin = Path(github_path.read_text().strip())
+    probe = subprocess.run(
+        ["zstd", "--version"],
+        env={**os.environ, "PATH": f"{cache_bin}{os.pathsep}{shell_environment['PATH']}"},
+        check=False,
+    )
+    assert probe.returncode == 1
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-test-bucket.yml").read_text())
+    steps = workflow["jobs"]["select"]["steps"]
+    assert steps.index(step) < next(
+        i for i, item in enumerate(steps) if item.get("id") == "selection"
+    )
+    assert all(item.get("id") != "cache-compression" for item in workflow["jobs"]["run"]["steps"])
 
 
 @pytest.mark.parametrize("has_coverage", [True, False])

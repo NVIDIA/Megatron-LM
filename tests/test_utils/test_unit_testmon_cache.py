@@ -336,7 +336,9 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
     assert consumer["image_id"] == "unknown"
     assert consumer["cache_prefix"] == producer["cache_prefix"]
     assert consumer["compatibility"] == producer["compatibility"]
-    assert output.read_text().strip() == f"cache_prefix={producer['cache_prefix']}"
+    assert output.read_text().splitlines() == [f"cache_prefix={producer['cache_prefix']}"] + (
+        ["image_id=unknown"] if diagnostic == "failed-inspection" else []
+    )
     manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
     assert manifest["source_sha"] == "b" * 40
     assert _snapshot(directory) == before
@@ -375,6 +377,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
     "restore",
     [
         "valid",
+        "invalid-cpu-snapshot",
         "different-image",
         "missing-image",
         "changed-config",
@@ -408,8 +411,9 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "wrong-sha",
     ],
 )
+@pytest.mark.parametrize("requested_mode", ["enforce", "select-only"])
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
-    generation, source_tree, tmp_path, restore
+    generation, source_tree, tmp_path, restore, requested_mode
 ):
     directory, identity = generation
     # Every bucket consumes the same immutable artifact without querying GitHub
@@ -506,11 +510,13 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "PR_FILES_DIR": "" if restore == "empty-artifact-dir" else str(pr_files_dir),
             # The tested PR commit is deliberately independent of baseline b*40.
             "TESTED_SHA": "c" * 40,
-            "REQUESTED_MODE": "enforce",
+            "REQUESTED_MODE": requested_mode,
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
             "MATCHED_KEY": "" if restore == "miss" else identity["cache_prefix"] + "123-1",
             "CACHE_HIT": "false",
+            "CPU_SELECTION_OUTCOME": "failure" if restore == "invalid-cpu-snapshot" else "",
+            "CPU_SELECTION_CACHE_KEY": "invalid-snapshot-key",
             "RUNNER_TEMP": str(runtime_dir),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
@@ -519,16 +525,21 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         text=True,
         check=False,
     )
-    assert result.returncode == 0, result.stderr
     valid = restore in {
         "valid",
+        "invalid-cpu-snapshot",
         "different-image",
         "missing-image",
         "empty-pr",
         "renamed-files",
         "maximum-renames",
     }
-    assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
+    if requested_mode == "select-only" and not valid:
+        assert result.returncode != 0
+        assert not output.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert output.read_text().strip() == (f"mode={requested_mode}" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
     changed_files = after.pop("changed-files", None)
@@ -541,7 +552,8 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         assert changed_files is not None
         assert changed_files[0].decode().splitlines() == expected_files
     else:
-        assert "without recording or saving" in summary.read_text()
+        message = result.stdout if requested_mode == "select-only" else summary.read_text()
+        assert "without recording or saving" in message
         assert changed_files is None
 
 
@@ -586,3 +598,89 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
         check=False,
     )
     assert (result.returncode == 0) is allowed
+
+
+def test_gpu_selection_uses_validated_cpu_baseline_instead_of_a_new_restore(tmp_path):
+    output = tmp_path / "output"
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", _action_script("Resolve unit Testmon mode")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "REQUESTED_MODE": "enforce",
+            "IDENTITY_OUTCOME": "success",
+            "RESTORE_OUTCOME": "skipped",
+            "MATCHED_KEY": "unrelated-newer-generation",
+            "PR_FILES_OUTCOME": "skipped",
+            "PR_FILES_DIR": "",
+            "TESTED_SHA": "c" * 40,
+            "CPU_SELECTION_OUTCOME": "success",
+            "CPU_SELECTION_CACHE_KEY": "cpu-baseline-generation",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == "mode=preselected"
+    assert "cpu-baseline-generation" in summary.read_text()
+    assert "unrelated-newer-generation" not in summary.read_text()
+
+
+def test_snapshot_handoff_validates_before_restoring_and_uploads_its_baseline():
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    steps = action["runs"]["steps"]
+    keyed = {step.get("id"): step for step in steps if step.get("id")}
+    assert (
+        steps.index(keyed["unit-testmon-identity"])
+        < steps.index(keyed["download-unit-testmon-selection"])
+        < steps.index(keyed["validate-unit-testmon-selection"])
+        < steps.index(keyed["restore-unit-testmon"])
+    )
+    assert (
+        "steps.validate-unit-testmon-selection.outcome != 'success'"
+        in keyed["restore-unit-testmon"]["if"]
+    )
+    assert keyed["download-unit-testmon-selection"]["with"]["artifact-ids"] == (
+        "${{ inputs.unit_testmon_selection_artifact_id }}"
+    )
+    assert keyed["download-unit-testmon-selection"]["with"]["merge-multiple"] is True
+    assert keyed["download-unit-testmon-selection"]["continue-on-error"] is True
+    assert keyed["validate-unit-testmon-selection"]["continue-on-error"] is True
+    assert "--source-sha" in keyed["validate-unit-testmon-selection"]["run"]
+    assert "docker image inspect" in keyed["validate-unit-testmon-selection"]["run"]
+    upload = keyed["upload-unit-testmon-selection"]
+    assert upload["if"] == "steps.validate-unit-testmon-export.outcome == 'success'"
+    assert upload["with"]["include-hidden-files"] is True
+    assert set(upload["with"]["path"].splitlines()) == {
+        "assets_dir/testmon/selection.json",
+        "assets_dir/testmon/manifest.json",
+        "assets_dir/testmon/changed-files",
+        "assets_dir/testmon/prod/.testmondata",
+        "assets_dir/testmon/prod/metadata.json",
+        "assets_dir/testmon/experimental/.testmondata",
+        "assets_dir/testmon/experimental/metadata.json",
+    }
+    assert (
+        "steps.upload-unit-testmon-selection.outputs.artifact-id"
+        in action["outputs"]["unit_testmon_selection_artifact_id"]["value"]
+    )
+    assert (
+        "steps.upload-unit-testmon-selection.outcome == 'success'"
+        in action["outputs"]["unit_testmon_has_tests"]["value"]
+    )
+
+
+def test_cpu_collection_does_not_turn_always_full_buckets_into_cpu_execution():
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    resolver = next(step for step in action["runs"]["steps"] if step.get("id") == "unit-testmon")
+    assert "inputs.unit_testmon_mode != 'select-only'" in resolver["env"]["REQUESTED_MODE"]
+    identity = next(
+        step for step in action["runs"]["steps"] if step.get("id") == "unit-testmon-identity"
+    )
+    assert "inputs.unit_testmon_mode == 'select-only'" in identity["if"]
+    assert "test_batch_invariant_fp8.py" in identity["if"]
+    assert "'/test_disagg_'" in identity["if"]

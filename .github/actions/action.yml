@@ -67,7 +67,7 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce, or baseline (main producer only)."
+    description: "Unit-test mode: full, enforce, select-only (CPU collection), or baseline (main producer only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
@@ -78,6 +78,17 @@ inputs:
     description: "Artifact containing the validated PR file list from the configure job."
     required: false
     default: ""
+  unit_testmon_selection_artifact_id:
+    description: "Artifact ID containing native CPU Testmon selection and its baseline snapshot."
+    required: false
+    default: ""
+outputs:
+  unit_testmon_selection_artifact_id:
+    description: "Artifact ID for a successfully collected and validated CPU selection."
+    value: ${{ steps.upload-unit-testmon-selection.outputs.artifact-id }}
+  unit_testmon_has_tests:
+    description: "Whether the successfully uploaded CPU selection contains tests."
+    value: ${{ steps.upload-unit-testmon-selection.outcome == 'success' && steps.validate-unit-testmon-export.outputs.has_tests || '' }}
 runs:
   using: "composite"
   steps:
@@ -151,7 +162,7 @@ runs:
 
     - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
-      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'baseline') && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'select-only' || inputs.unit_testmon_mode == 'baseline') && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       env:
@@ -167,12 +178,45 @@ runs:
         python tests/unit_tests/testmon_cache.py identity \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
+        echo "image_id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Download native CPU Testmon selection
+      id: download-unit-testmon-selection
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_selection_artifact_id != '' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ inputs.unit_testmon_selection_artifact_id }}
+        path: assets_dir/testmon
+        merge-multiple: true
+
+    - name: Validate native CPU Testmon selection
+      id: validate-unit-testmon-selection
+      if: steps.download-unit-testmon-selection.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+      run: |
+        python tests/unit_tests/testmon_selection.py validate \
+          --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+          --source-sha "$TESTED_SHA" \
+          --image-id "$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE")" \
+          | tee -a "$GITHUB_OUTPUT"
+
+    - name: Clear invalid CPU Testmon snapshot
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_selection_artifact_id != '' && steps.validate-unit-testmon-selection.outcome != 'success'
+      shell: bash -e -u -o pipefail {0}
+      run: sudo rm -rf -- assets_dir/testmon
 
     # Only main publishes this namespace. Synthetic PR pushes can read caches
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'select-only') && steps.unit-testmon-identity.outcome == 'success' && steps.validate-unit-testmon-selection.outcome != 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
@@ -182,7 +226,7 @@ runs:
 
     - name: Prepare PR file download
       id: unit-test-pr-files-directory
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'select-only') && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       run: |
@@ -207,13 +251,15 @@ runs:
       shell: bash -e -u -o pipefail {0}
       env:
         # Precision profiles and disaggregation collectives must always run in full.
-        REQUESTED_MODE: ${{ (inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' || (startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))) && 'full' || inputs.unit_testmon_mode }}
+        REQUESTED_MODE: ${{ inputs.unit_testmon_mode != 'select-only' && (inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' || (startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))) && 'full' || inputs.unit_testmon_mode }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
         PR_FILES_OUTCOME: ${{ steps.download-unit-test-pr-files.outcome }}
         PR_FILES_DIR: ${{ steps.unit-test-pr-files-directory.outputs.path }}
         TESTED_SHA: ${{ inputs.sha || github.sha }}
+        CPU_SELECTION_OUTCOME: ${{ steps.validate-unit-testmon-selection.outcome }}
+        CPU_SELECTION_CACHE_KEY: ${{ steps.validate-unit-testmon-selection.outputs.cache_key }}
       run: |
         FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
@@ -224,8 +270,13 @@ runs:
             [[ "$IDENTITY_OUTCOME" == "success" ]]
             EFFECTIVE_MODE=baseline
             ;;
-          enforce)
-            if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
+          enforce|select-only)
+            if [[ "$REQUESTED_MODE" == "enforce" && "${CPU_SELECTION_OUTCOME:-}" == "success" ]]; then
+              # The artifact contains the exact baseline used by CPU discovery.
+              # Do not replace it with a newer independently restored baseline.
+              MATCHED_KEY=$CPU_SELECTION_CACHE_KEY
+              EFFECTIVE_MODE=preselected
+            elif [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
               && python tests/unit_tests/testmon_cache.py validate \
                 --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
                 --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
@@ -240,7 +291,7 @@ runs:
                 && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
                 && [[ "$CHANGED_PATHS" == "$PR_CHANGED_PATHS" ]] \
                 && cp "$PR_FILES_DIR/changed-files" assets_dir/testmon/changed-files; then
-                EFFECTIVE_MODE=enforce
+                EFFECTIVE_MODE=$REQUESTED_MODE
               else
                 EFFECTIVE_MODE=full
                 FALLBACK_REASON="unable to read the complete PR changed-file list for the tested commit; running the full bucket without recording or saving"
@@ -250,6 +301,10 @@ runs:
               EFFECTIVE_MODE=full
               FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
               echo "::notice::Testmon baseline unavailable or invalid; running the full unit-test bucket."
+            fi
+            if [[ "$REQUESTED_MODE" == "select-only" && "$EFFECTIVE_MODE" != "select-only" ]]; then
+              echo "::notice::CPU collection unavailable: $FALLBACK_REASON"
+              exit 1
             fi
             ;;
           *)
@@ -265,10 +320,10 @@ runs:
           echo
           echo "- Requested mode: $REQUESTED_MODE"
           echo "- Effective mode: $EFFECTIVE_MODE"
-          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
+          if [[ "$REQUESTED_MODE" == "enforce" || "$REQUESTED_MODE" == "select-only" ]]; then
             echo "- Restored cache key: ${MATCHED_KEY:-none}"
           fi
-          if [[ "$EFFECTIVE_MODE" == "enforce" ]]; then
+          if [[ "$EFFECTIVE_MODE" == "enforce" || "$EFFECTIVE_MODE" == "select-only" ]]; then
             echo "- Changed paths in PR: ${CHANGED_PATHS}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
@@ -290,6 +345,8 @@ runs:
         export PIP_DEFAULT_TIMEOUT=120
         export PIP_RETRIES=5
         export UV_HTTP_TIMEOUT=120
+        export UNIT_TESTMON_IMAGE_ID="${{ steps.unit-testmon-identity.outputs.image_id }}"
+        export UNIT_TESTMON_CACHE_KEY="${{ steps.validate-unit-testmon-selection.outputs.cache_key || steps.restore-unit-testmon.outputs.cache-matched-key }}"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -376,6 +433,40 @@ runs:
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
         exit $EXIT_CODE
+
+    - name: Validate exported native CPU Testmon selection
+      id: validate-unit-testmon-export
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'select-only' && steps.run-main-script.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        TESTED_SHA: ${{ inputs.sha || github.sha }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" assets_dir/testmon
+        python tests/unit_tests/testmon_selection.py validate \
+          --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+          --source-sha "$TESTED_SHA" \
+          --image-id "$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE")" \
+          | tee -a "$GITHUB_OUTPUT"
+
+    - name: Upload native CPU Testmon selection
+      id: upload-unit-testmon-selection
+      if: steps.validate-unit-testmon-export.outcome == 'success'
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      with:
+        name: unit-test-selection-${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          assets_dir/testmon/selection.json
+          assets_dir/testmon/manifest.json
+          assets_dir/testmon/changed-files
+          assets_dir/testmon/prod/.testmondata
+          assets_dir/testmon/prod/metadata.json
+          assets_dir/testmon/experimental/.testmondata
+          assets_dir/testmon/experimental/metadata.json
+        include-hidden-files: true
+        if-no-files-found: error
 
     - name: Prepare unit Testmon baseline cache
       id: prepare-unit-testmon-cache

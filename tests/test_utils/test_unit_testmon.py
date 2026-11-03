@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
 ROOT = Path(__file__).parents[2]
 WRAPPER_PATH = ROOT / "tests/unit_tests/testmon_selector.py"
@@ -443,7 +444,8 @@ def test_native_selection_uses_recipe_topology(tmp_path, recipe_gpus):
         "mandatory/experimental",
     ],
 )
-def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step):
+@pytest.mark.parametrize("mode", ["enforce", "select-only"])
+def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step, mode):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     cache = tmp_path / "cache"
     stale = cache / ".testmon-work/stale"
@@ -466,8 +468,10 @@ def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step
             'apply_mandatory_tests() { event mandatory "$1" || return; '
             ': > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
             'run_full_tests() { echo full >> "$EVENTS"; }',
+            'native_selection_transport() { echo "transport/$1" >> "$EVENTS"; }',
             'run_selected_phase() { event execute "$1"; }',
             "coverage() { return 0; }",
+            "ensure_testmon_coverage() { return 0; }",
             'write_testmon_summary() { echo "$1" >> "$EVENTS"; }',
             "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
             "run_enforced_tests",
@@ -482,32 +486,47 @@ def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step
             **os.environ,
             "UNIT_TESTMON_CACHE_DIR": str(cache),
             "FAILED_STEP": failed_step,
+            "UNIT_TESTMON_MODE": mode,
             "EVENTS": str(events),
         },
         text=True,
         capture_output=True,
         timeout=10,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == (1 if mode == "select-only" and failed_step else 0), (
+        result.stdout + result.stderr
+    )
     executed = events.read_text().splitlines()
     assert stale.exists() == (failed_step == "cleanup")
     if failed_step:
-        assert executed[-3:] == [failed_step, "full fallback: Testmon selection failed", "full"]
+        if mode == "select-only":
+            assert executed[-2:] == [
+                failed_step,
+                "CPU native collection failed; GPU validation is required",
+            ]
+            assert "full" not in executed
+        else:
+            assert executed[-3:] == [failed_step, "full fallback: Testmon selection failed", "full"]
         assert not any(event.startswith("execute/") for event in executed)
     else:
-        assert executed == [
+        collection = [
             "collect/prod",
             "merge/prod",
             "mandatory/prod",
             "collect/experimental",
             "merge/experimental",
             "mandatory/experimental",
-            "execute/prod",
-            "execute/experimental",
-            "execute/prod",
-            "execute/experimental",
-            "selective tests passed",
         ]
+        if mode == "select-only":
+            assert executed == collection + ["transport/export", "CPU native collection completed"]
+        else:
+            assert executed == collection + [
+                "execute/prod",
+                "execute/experimental",
+                "execute/prod",
+                "execute/experimental",
+                "selective tests passed",
+            ]
 
 
 def test_missing_rank_selection_cannot_be_accepted(tmp_path):
@@ -611,5 +630,217 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '["full", "enforce", "baseline"]' in launcher
+    assert '["full", "enforce", "baseline", "select-only", "preselected"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
+
+
+@pytest.fixture
+def launch_executor(monkeypatch):
+    """Capture actual executor options without requiring Docker, CUDA, or nemo-run."""
+    captured = {}
+
+    def executor(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("executor captured")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_run",
+        SimpleNamespace(
+            Script=lambda **kwargs: kwargs,
+            Packager=lambda: None,
+            DockerExecutor=executor,
+            Experiment=object,
+        ),
+    )
+    spec = importlib.util.spec_from_file_location(
+        "native_selection_launcher",
+        ROOT / "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
+    )
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    workload = SimpleNamespace(
+        type="basic", spec={"name": "unit", "script": "echo unit", "test_case": "example"}
+    )
+    monkeypatch.setattr(launcher.recipe_parser, "load_workloads", lambda **kwargs: [workload])
+    monkeypatch.delenv("UNIT_TESTMON_IMAGE_ID", raising=False)
+    monkeypatch.setenv("UNIT_TESTMON_CACHE_KEY", "baseline-key")
+    monkeypatch.setattr(
+        launcher.subprocess, "check_output", lambda *args, **kwargs: "sha256:" + "a" * 64
+    )
+    return launcher, captured
+
+
+@pytest.mark.parametrize("mode", ["full", "enforce", "baseline", "select-only", "preselected"])
+def test_only_cpu_native_collection_uses_no_gpu_executor(launch_executor, mode):
+    launcher, captured = launch_executor
+    with pytest.raises(RuntimeError, match="executor captured"):
+        launcher.main.callback(
+            scope="unit-tests",
+            model="unit-tests",
+            test_case="example",
+            environment="dev",
+            platform="dgx_h100",
+            container_image="ci-image",
+            unit_testmon_mode=mode,
+        )
+    cpu = mode == "select-only"
+    assert captured["runtime"] == ("runc" if cpu else "nvidia")
+    assert captured["num_gpus"] == (0 if cpu else -1)
+    assert captured["container_image"] == (
+        "sha256:" + "a" * 64 if mode in {"select-only", "preselected"} else "ci-image"
+    )
+    assert captured["env_vars"]["UNIT_TESTMON_MODE"] == mode
+    assert captured["env_vars"]["UNIT_TESTMON_CACHE_KEY"] == "baseline-key"
+    if mode in {"select-only", "preselected"}:
+        assert captured["env_vars"]["UNIT_TESTMON_IMAGE_ID"] == "sha256:" + "a" * 64
+
+
+@pytest.mark.parametrize("mode", ["select-only", "preselected"])
+def test_handoff_requires_actual_container_identity(launch_executor, monkeypatch, mode):
+    launcher, captured = launch_executor
+    monkeypatch.setattr(launcher.subprocess, "check_output", lambda *args, **kwargs: "unknown")
+    with pytest.raises(
+        launcher.click.ClickException if mode == "select-only" else RuntimeError,
+        match=(
+            "Cannot identify CPU collection image" if mode == "select-only" else "executor captured"
+        ),
+    ):
+        launcher.main.callback(
+            scope="unit-tests",
+            model="unit-tests",
+            test_case="example",
+            environment="dev",
+            platform="dgx_h100",
+            container_image="ci-image",
+            unit_testmon_mode=mode,
+        )
+    if mode == "select-only":
+        assert not captured
+    else:
+        assert captured["env_vars"]["UNIT_TESTMON_MODE"] == "enforce"
+        assert captured["runtime"] == "nvidia"
+        assert captured["container_image"] == "ci-image"
+
+
+@pytest.mark.parametrize("cpu_status", [0, 2])
+def test_preselected_mode_only_skips_native_collection_for_valid_cpu_handoff(tmp_path, cpu_status):
+    cache = tmp_path / "cache"
+    for phase in ("prod", "experimental"):
+        directory = cache / ".testmon-work" / phase
+        directory.mkdir(parents=True)
+        (directory / "selected-tests").write_text("tests/unit_tests/test_one.py::test_one\n")
+        (directory / "mandatory-tests").write_text("")
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "BUCKET=tests/unit_tests/example UNIT_TEST_REPEAT=1",
+            'native_selection_transport() { return "$CPU_STATUS"; }',
+            'run_testmon_phase() { echo "collect/$2"; }',
+            'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
+            'echo tests/unit_tests/test_one.py::test_gpu > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+            'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
+            'run_selected_phase() { echo "execute/$1"; }',
+            'ensure_testmon_coverage() { return 0; }',
+            'write_testmon_summary() { return 0; }',
+            "IGNORE_ARGS=() MARKER_ARG='not flaky'",
+            "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+            "run_enforced_tests",
+        )
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "UNIT_TESTMON_MODE": "preselected",
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+            "CPU_STATUS": str(cpu_status),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("collect/prod" in result.stdout) == (cpu_status != 0)
+    assert "execute/prod" in result.stdout and "execute/experimental" in result.stdout
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_cpu_collection_exports_without_execution_and_only_empty_runs_emit_coverage(
+    tmp_path, nonempty
+):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "BUCKET=tests/unit_tests/example UNIT_TEST_REPEAT=1 IGNORE_ARGS=() MARKER_ARG='not flaky'",
+            "run_testmon_phase() { return 0; }",
+            'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
+            ': > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; '
+            'if [[ "$NONEMPTY" == true ]]; then echo tests/unit_tests/test_case.py::test_one '
+            '> "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; fi; }',
+            'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
+            'native_selection_transport() { [[ "$1" == export ]]; echo EXPORTED; }',
+            'run_selected_phase() { echo UNEXPECTED_GPU_EXECUTION; return 99; }',
+            'run_full_tests() { echo UNEXPECTED_FULL_BUCKET; return 99; }',
+            'write_testmon_summary() { return 0; }',
+            'uv() { shift 3; "$TEST_PYTHON" "$@"; }',
+            'coverage() { "$TEST_PYTHON" -m coverage "$@"; }',
+            "ensure_testmon_coverage() {" + _function(runner, "ensure_testmon_coverage") + "\n}",
+            "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+            "run_enforced_tests",
+        )
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "UNIT_TESTMON_MODE": "select-only",
+            "TEST_PYTHON": sys.executable,
+            "UNIT_TESTMON_CACHE_DIR": str(tmp_path / "cache"),
+            "NONEMPTY": str(nonempty).lower(),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "EXPORTED" in result.stdout
+    assert "UNEXPECTED" not in result.stdout
+    assert (tmp_path / ".coverage").exists() is (not nonempty)
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    [
+        "tests/unit_tests/inference/test_batch_invariant_fp8.py",
+        "tests/unit_tests/inference/engines/test_disagg_kv_cache.py",
+    ],
+)
+def test_cpu_collection_cli_rejects_always_full_special_buckets(launch_executor, bucket):
+    launcher, captured = launch_executor
+    result = CliRunner().invoke(
+        launcher.main,
+        [
+            "--scope",
+            "unit-tests",
+            "--model",
+            "unit-tests",
+            "--test-case",
+            bucket,
+            "--environment",
+            "dev",
+            "--platform",
+            "dgx_h100",
+            "--container-image",
+            "ci-image",
+            "--unit-testmon-mode",
+            "select-only",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "requires full GPU execution and cannot collect on CPU" in result.output
+    assert not captured

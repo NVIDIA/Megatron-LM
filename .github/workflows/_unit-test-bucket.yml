@@ -1,0 +1,151 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Unit-test bucket
+
+on:
+  workflow_call:
+    inputs:
+      bucket:
+        type: string
+        required: true
+      platform:
+        type: string
+        default: dgx_h100
+      runner:
+        description: JSON-encoded GPU runner
+        type: string
+        required: true
+      selection-runner:
+        description: JSON-encoded CPU runner with the image's native architecture
+        type: string
+        default: ""
+      container-image:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      timeout:
+        type: number
+        default: 30
+      unit_testmon_mode:
+        type: string
+        default: full
+      unit_testmon_target_branch:
+        type: string
+        default: ""
+      unit_test_pr_files_artifact_id:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  select:
+    name: Native Testmon selection on CPU
+    if: >-
+      inputs.unit_testmon_mode == 'enforce'
+      && inputs.unit_testmon_target_branch == 'main'
+      && inputs.selection-runner != ''
+      && inputs.bucket != 'tests/unit_tests/inference/test_batch_invariant_fp8.py'
+      && !(startsWith(inputs.bucket, 'tests/unit_tests/inference/') && contains(inputs.bucket, '/test_disagg_'))
+    runs-on: ${{ fromJSON(inputs.selection-runner) }}
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.selection.outcome == 'success' && steps.selection.outputs.unit_testmon_selection_artifact_id || '' }}
+      has_tests: ${{ steps.selection.outputs.unit_testmon_has_tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Configure GAR Docker authentication
+        if: startsWith(inputs.container-image, 'asia-southeast1-docker.pkg.dev/')
+        continue-on-error: true
+        shell: bash -e -u -o pipefail {0}
+        env:
+          CONTAINER_IMAGE: ${{ inputs.container-image }}
+        run: |
+          GAR_HOST="${CONTAINER_IMAGE%%/*}"
+          docker-credential-gcr configure-docker --registries="$GAR_HOST"
+          docker-credential-gcr get <<< "https://$GAR_HOST" >/dev/null
+
+      - name: Login to ECR
+        if: contains(inputs.container-image, '.dkr.ecr.')
+        continue-on-error: true
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        env:
+          AWS_REGION: ${{ inputs.platform == 'dgx_gb200' && 'us-east-2' || 'us-east-1' }}
+
+      - name: Match the GPU baseline cache compression
+        id: cache-compression
+        continue-on-error: true
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          # The existing GPU baseline namespace uses gzip; CPU runners may have zstd.
+          TESTMON_CACHE_BIN=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$TESTMON_CACHE_BIN/zstd"
+          chmod +x "$TESTMON_CACHE_BIN/zstd"
+          echo "$TESTMON_CACHE_BIN" >> "$GITHUB_PATH"
+
+      - name: Collect native selections in the CI container without GPUs
+        id: selection
+        continue-on-error: true
+        timeout-minutes: 20
+        uses: ./.github/actions
+        with:
+          script: ""
+          test_case: ${{ inputs.bucket }}
+          tag: latest
+          timeout: "15"
+          is_unit_test: "true"
+          container-image: ${{ inputs.container-image }}
+          platform: ${{ inputs.platform }}
+          sha: ${{ inputs.sha }}
+          unit_testmon_mode: select-only
+          unit_testmon_target_branch: main
+          unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
+
+      - name: Report CPU collection fallback
+        if: steps.selection.outcome != 'success'
+        shell: bash
+        run: echo '::notice::CPU collection unavailable; this bucket will use native GPU selection.'
+
+  run:
+    name: Run tests on GPU
+    needs: select
+    # Only a successful, complete native CPU selection may skip GPU allocation.
+    if: >-
+      ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.artifact_id == ''
+          || needs.select.outputs.has_tests != 'false') }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Run unit-test bucket
+        uses: ./.github/actions
+        with:
+          script: ""
+          test_case: ${{ inputs.bucket }}
+          tag: latest
+          timeout: ${{ inputs.timeout }}
+          is_unit_test: "true"
+          container-image: ${{ inputs.container-image }}
+          platform: ${{ inputs.platform }}
+          sha: ${{ inputs.sha }}
+          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
+          unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
+          unit_testmon_selection_artifact_id: ${{ needs.select.outputs.artifact_id }}
