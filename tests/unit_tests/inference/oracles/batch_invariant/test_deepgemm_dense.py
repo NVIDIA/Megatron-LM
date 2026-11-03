@@ -10,7 +10,8 @@ inference-optimized linears, `F.linear`, and TE linears through the patched `gen
 
 Contract (written from the aten ops it replaces and the backend's promise of batch invariance):
 - With batch-invariant mode on and `backend="deepgemm"`, `torch.mm(a, b)` for bf16 a [M, K] and
-  b [K, N] (any strides torch accepts) returns D[m, n] = bf16(sum_k a[m, k] b[k, n]), accumulated
+  b [K, N] (any strides and storage offsets torch accepts: the backend replaces aten::mm for
+  every caller in the process) returns D[m, n] = bf16(sum_k a[m, k] b[k, n]), accumulated
   in fp32 and rounded once, as a new contiguous [M, N] bf16 tensor. `torch.addmm(bias, a, b)`
   returns D + bias; the backend adds the bias to the rounded product in bf16 (a second rounding,
   documented; the bound below still holds). Degenerate shapes follow aten: M = 0 or N = 0 give an
@@ -38,6 +39,11 @@ production sizes, K around block_k = 64 and unaligned (8, 60, 63, 65), N small, 
 60, 129) and production, and int32-overflowing A offsets (`large`).
 
 Main vs open PRs:
+- An operand whose data pointer is not 16-byte aligned (a view at an odd storage offset) makes
+  `_mm_deepgemm` raise on main: it checks only the outer stride and hands the pointer to
+  DeepGEMM, whose cuBLASLt dispatch picks an algorithm for aligned buffers and fails with
+  CUBLAS_STATUS_NOT_SUPPORTED (finding O8a-N5; `test_misaligned_operands_match_fp64`). #8867
+  copies such operands to an aligned buffer and passes.
 - At the pinned DeepGEMM, `bf16_gemm_nt`/`nn` forward to cuBLASLt's heuristic algorithm unless
   `deep_gemm.use_deterministic_algorithms(True)` is set (`csrc/apis/gemm.hpp:498`), and main never
   sets it. On main the batch-invariance tests therefore run cuBLASLt and are expected to fail
@@ -70,7 +76,7 @@ M_SIZES = ou.boundary_sizes(
 )
 K_SIZES = (8, 60, BLOCK_K - 1, BLOCK_K, BLOCK_K + 1, 128, 4096, 16384)
 N_SIZES = (8, 50, 60, 64, 128, 129, 4096)
-LAYOUTS = ("row_major", "weight_t", "padded", "offset")
+LAYOUTS = ("row_major", "weight_t", "padded")  # misaligned bases: test_misaligned_operands_*
 
 
 @pytest.fixture(autouse=True)
@@ -98,13 +104,14 @@ def _randn(shape, seed, scale=1.0):
     return (torch.randn(*shape, device=_DEVICE, generator=g) * scale).to(torch.bfloat16)
 
 
-def place(t: torch.Tensor, layout: str) -> torch.Tensor:
+def place(t: torch.Tensor, layout: str, offset: int = 1) -> torch.Tensor:
     """The values of the 2-D tensor ``t`` in the requested memory layout.
 
     row_major: contiguous. weight_t: the transpose of a contiguous [cols, rows] tensor, as
     ``w.t()`` reaches aten::mm from a linear. padded: rows with an outer stride padded by 3
-    elements (not 16-byte aligned). offset: contiguous, at a storage offset of one element (a
-    base address that is not 16-byte aligned).
+    elements (not 16-byte aligned). offset / weight_t_offset: row_major / weight_t, starting
+    ``offset`` elements into a fresh allocation (a base address that is not 16-byte aligned for
+    offset % 8 != 0).
     """
     rows, cols = t.shape
     if layout == "row_major":
@@ -115,11 +122,15 @@ def place(t: torch.Tensor, layout: str) -> torch.Tensor:
         buf = torch.zeros(rows, cols + 3, device=t.device, dtype=t.dtype)
         buf[:, :cols] = t
         return buf[:, :cols]
-    if layout == "offset":
-        flat = torch.zeros(rows * cols + 1, device=t.device, dtype=t.dtype)
-        view = flat[1:].view(rows, cols)
-        view.copy_(t)
-        return view
+    if layout in ("offset", "weight_t_offset"):
+        flat = torch.zeros(rows * cols + offset, device=t.device, dtype=t.dtype)
+        if layout == "offset":
+            view = flat[offset:].view(rows, cols)
+            view.copy_(t)
+            return view
+        view = flat[offset:].view(cols, rows)
+        view.copy_(t.t())
+        return view.t()
     raise ValueError(layout)
 
 
@@ -144,7 +155,7 @@ def _id(case):
 
 
 _MM_CASES = ou.pairwise_cases(
-    {"m": M_SIZES, "k": K_SIZES, "n": N_SIZES, "a": LAYOUTS[:1] + LAYOUTS[2:], "b": LAYOUTS}
+    {"m": M_SIZES, "k": K_SIZES, "n": N_SIZES, "a": ("row_major", "padded"), "b": LAYOUTS}
 )
 
 
@@ -160,6 +171,41 @@ def test_mm_matches_fp64(case):
     ou.assert_exact(a, a_before, what="a is read-only")
     ou.assert_exact(b, b_before, what="b is read-only")
     _check_mm(out, a, b, f"mm {_id(case)}")
+
+
+_MISALIGNED = [
+    # (operand, layout of that operand, element offset, m, k, n)
+    ("a", "offset", 1, 64, 64, 64),
+    ("a", "offset", 4, 17, 4096, 64),
+    ("b", "offset", 1, 64, 64, 64),
+    ("b", "weight_t_offset", 1, 1, 4096, 4096),
+    ("b", "weight_t_offset", 3, 129, 4096, 136),
+    ("both", "offset", 7, 33, 128, 256),
+]
+
+
+@pytest.mark.parametrize(
+    "operand,layout,offset,m,k,n",
+    _MISALIGNED,
+    ids=[f"{o}-{lay}{off}-m{m}-k{k}-n{n}" for o, lay, off, m, k, n in _MISALIGNED],
+)
+def test_misaligned_operands_match_fp64(operand, layout, offset, m, k, n):
+    """Operands whose data pointer is not 16-byte aligned: the result aten::mm gives, in bf16.
+
+    Finding O8a-N5: fails on main, where `_mm_deepgemm` passes the pointer to DeepGEMM and its
+    cuBLASLt dispatch raises CUBLAS_STATUS_NOT_SUPPORTED (H100 and GB200, run dfw 21220462 /
+    hsg 8571400); passes with #8867, which copies such operands to an aligned buffer. The
+    `weight_t_offset` cases pass on main too (main copies every transposed weight); they guard
+    #8867, which reads `w.t()` in place.
+    """
+    a, b = _randn((m, k), 1), _randn((k, n), 2)
+    a_layout = layout if operand in ("a", "both") else "row_major"
+    b_layout = layout if operand in ("b", "both") else "row_major"
+    a = place(a, a_layout.replace("weight_t_", ""), offset)
+    b = place(b, b_layout, offset)
+    with deepgemm_mode():
+        out = torch.mm(a, b)
+    _check_mm(out, a, b, f"misaligned {operand} ({layout}, {offset} elements)")
 
 
 @pytest.mark.parametrize(

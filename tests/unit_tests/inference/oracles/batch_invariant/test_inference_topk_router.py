@@ -191,33 +191,33 @@ def sinkhorn_reference(logits, topk):
     return act.gather(-1, experts), experts
 
 
-def bf16_grid(num_experts, span):
-    """``num_experts`` distinct bf16 values spread over [-span/2, span/2], ascending."""
-    dense = torch.linspace(-span / 2, span / 2, 8 * num_experts + 1, dtype=torch.float64)
-    candidates = torch.unique(dense.to(torch.bfloat16).double())
-    assert candidates.numel() >= num_experts, "not enough distinct bf16 values in the span"
-    pick = torch.linspace(0, candidates.numel() - 1, num_experts, dtype=torch.float64)
-    grid = candidates[pick.round().long()]
-    assert torch.unique(grid).numel() == num_experts
-    return grid
+def bf16_pool(span):
+    """Every bf16 value v with 2**-4 <= |v| <= span / 2, ascending (1792 values for span 16)."""
+    bits = torch.arange(0, 0x7F80, dtype=torch.int32).to(torch.int16)  # positive finite bf16
+    values = bits.view(torch.bfloat16).double()
+    values = values[(values >= 2.0**-4) & (values <= span / 2)]
+    return torch.cat([-values.flip(0), values])
 
 
 def make_logits(tokens, num_experts, topk, kind, bias, seed):
-    """bf16-exact logits, each token a permutation of a grid, with a selection margin.
+    """bf16-exact logits with a selection margin, a different set of values for every token.
 
-    Every grid value is a bf16 value, so the logits (and the identity gating GEMM's fp32
-    output) are exact. A token is resampled until its k-th and (k+1)-th selection keys differ by
-    more than 1e-4 of the k-th, far above fp32 rounding, so no correct implementation can select
-    differently.
+    Each token draws ``num_experts`` distinct bf16 values (in random order) from a pool, so the
+    logits (and the identity gating GEMM's fp32 output) are exact and the probs differ from token
+    to token: with one shared set, every token's probs would repeat the same few values and an
+    rms bound would rest on those few. A token is redrawn until its k-th and (k+1)-th selection
+    keys differ by more than 1e-4 of the k-th, far above fp32 rounding, so no correct
+    implementation can select differently.
     """
     span = 16.0 if KINDS[kind]["score"] == "softmax" else 8.0
-    grid = bf16_grid(num_experts, span)
+    pool = bf16_pool(span)
+    assert pool.numel() >= num_experts, "not enough distinct bf16 values in the span"
     bias = None if bias is None else bias.detach().double().cpu()
     g = ou.make_generator(seed)
     rows = []
     for _ in range(tokens):
         for _attempt in range(1000):
-            row = grid[torch.randperm(num_experts, generator=g)]
+            row = pool[torch.randperm(pool.numel(), generator=g)[:num_experts]]
             if topk >= num_experts:
                 break
             keys = selection_keys(row[None], kind, bias)
@@ -509,7 +509,9 @@ def test_gating_logits_are_fp32(bi_backend):
     """
     if bi_backend == "deepgemm":
         assert bik.HAVE_DEEPGEMM_BF16, "the deepgemm backend needs DeepGEMM's bf16 bindings"
-    assert not torch.backends.cuda.matmul.allow_tf32, "TF32 would change the fp32 trusted GEMM"
+    # The trusted fp32 GEMM multiplies bf16 values, which TF32 represents exactly, and TF32
+    # tensor cores accumulate in fp32: its result does not depend on TF32 being allowed (the
+    # H100 CI image reports torch.backends.cuda.matmul.allow_tf32 = True).
     hidden, num_experts, tokens = 1024, 64, 129
     router = build_router(num_experts, 6, "sigmoid_bias", hidden=hidden)
     g = ou.make_generator(7, device=_DEVICE)

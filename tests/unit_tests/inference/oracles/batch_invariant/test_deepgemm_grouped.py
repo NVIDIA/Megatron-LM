@@ -17,7 +17,10 @@ Contract (written from the callers' semantics):
   The result y [M_total, N] bf16 has y[r] = bf16(a[r] @ w[e]^T), accumulated in fp32 and rounded
   once, for every row r of block e. A block's rows past the expert's live tokens are padding
   whose content is undefined (NaN here); they must not reach a live row. Rows r >= offs[E-1]
-  belong to no expert: they are neither computed into live rows nor written. Inputs are read only.
+  belong to no expert: their output rows are unspecified (DeepGEMM computes them with expert 0's
+  weights, and its own tests mask them; the wasted work is observation O8a-N6), but no write leaves the [M_total, N] output and their
+  input never reaches a live row. The callers allow this: the output is a fresh `torch.empty`
+  of M_total rows, and the activation and unpermute stop at offs[-1]. Inputs are read only.
 - `_bf16_grouped_gemm_contiguous(a, w, m_indices, counts)` with rows grouped by expert and
   sum(counts) == M_total (no alignment): the same y[r] for every row.
 - Batch invariance: a row's bits depend only on a[r] and w[e]: not on the other experts' counts,
@@ -28,7 +31,8 @@ Contract (written from the callers' semantics):
 
 Reference: a per-expert fp64 loop. Trusted implementation: per-expert `torch.mm` in bf16 on the
 same device (cuBLAS). Tolerance class: floating point, bounded per row (default factor);
-bit-exact for the batch-invariance properties; exact for the untouched tail rows (NaN poison).
+bit-exact for the batch-invariance properties; guard bands of one alignment block of rows around
+DeepGEMM's output (exact).
 
 Structure (read after the contract): `_offs_to_m_indices` maps rows to expert ids
 (searchsorted, -1 past offs[-1]); DeepGEMM (pin ea2b7805) reads a block's expert from its first
@@ -140,18 +144,33 @@ def _check_experts(out, a, rows_per_expert, w, what):
 
 
 class _DeepGemmSpy:
-    """Counts DeepGEMM grouped calls and NaN-poisons their output first, so rows the kernel does
-    not write stay NaN."""
+    """Counts DeepGEMM grouped calls and runs each into a guarded, NaN-poisoned output.
+
+    The guard bands hold one alignment block of rows on each side (the largest tile DeepGEMM
+    stores); the result is copied into the caller's output afterwards.
+    """
 
     def __init__(self, monkeypatch):
         self.calls = 0
+        self.violations = []
         self._real = bik.deep_gemm.m_grouped_bf16_gemm_nt_contiguous
         monkeypatch.setattr(bik.deep_gemm, "m_grouped_bf16_gemm_nt_contiguous", self)
 
     def __call__(self, a, b, d, *args, **kwargs):
         self.calls += 1
-        ou.poison_(d)
-        return self._real(a, b, d, *args, **kwargs)
+        rows = bik.grouped_gemm_batch_invariant_alignment()
+        guarded = ou.guarded_empty(
+            d.shape, d.dtype, device=d.device, guard_bytes=rows * d.shape[1] * d.element_size()
+        )
+        result = self._real(a, b, guarded.tensor, *args, **kwargs)
+        self.violations += guarded.violations()
+        d.copy_(guarded.tensor)
+        return result
+
+    def check(self):
+        assert not self.violations, "DeepGEMM wrote outside its output: " + "; ".join(
+            self.violations
+        )
 
 
 def _id(case):
@@ -165,7 +184,8 @@ _CASES = ou.pairwise_cases(
 
 @pytest.mark.parametrize("case", _CASES, ids=[_id(c) for c in _CASES])
 def test_aligned_grouped_gemm_matches_fp64(case, monkeypatch):
-    """Inference entry point: live rows against fp64; padding never leaks; the tail is untouched."""
+    """Inference entry point: live rows against fp64; padding and tail rows never leak into them;
+    no write leaves the output."""
     align = _alignment()
     counts = expert_counts(case["e"], case["pattern"], align)
     tail = {"none": 0, "one": 1, "block": align}[case["tail"]]
@@ -178,11 +198,10 @@ def test_aligned_grouped_gemm_matches_fp64(case, monkeypatch):
     assert spy.calls == (1 if batch.m_total else 0), f"DeepGEMM ran {spy.calls} times"
     ou.assert_exact(batch.a, a_before, what="a is read-only")
     ou.assert_exact(w, w_before, what="w is read-only")
+    spy.check()
     _check_experts(
         out, batch.a, [batch.live(e) for e in range(case["e"])], w, f"aligned {_id(case)}"
     )
-    if batch.m_total > batch.n_used:
-        ou.assert_poisoned(out[batch.n_used :], what="rows past offs[-1]")
 
 
 @pytest.mark.parametrize("case", _CASES[::2], ids=[_id(c) for c in _CASES[::2]])
@@ -315,7 +334,7 @@ def test_sanitizer_case(monkeypatch):
     align = _alignment()
     batch = AlignedBatch([3, align + 1], 64, align, 2, seed=1)
     w = _weights(2, 128, 64)
-    _DeepGemmSpy(monkeypatch)
+    spy = _DeepGemmSpy(monkeypatch)
     out = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+    spy.check()
     _check_experts(out, batch.a, [batch.live(e) for e in range(2)], w, "sanitizer")
-    ou.assert_poisoned(out[batch.n_used :], what="rows past offs[-1]")
