@@ -128,6 +128,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -625,75 +626,94 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
         x_full = full_input(dtype, (tokens, 1, HIDDEN), seed=seed)
         return x_full, tp_shard(x_full)
 
-    with torch.no_grad(), InferenceMode.active():
-        if case.startswith("full_iteration"):
-            graphs = []
-            for tokens in sizes:
-                _, x = step_input(tokens, seed=tokens)
+    captured = []  # every CUDAGraph, released before the verdict
+    try:
+        with torch.no_grad(), InferenceMode.active():
+            if case.startswith("full_iteration"):
+                graphs = []
+                for tokens in sizes:
+                    _, x = step_input(tokens, seed=tokens)
+                    x_buf = x.clone()
+                    _warm_up(lambda: block(hidden_states=x_buf.clone(), attention_mask=None))
+                    trace.clear()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=pool):
+                        out = block(hidden_states=x_buf, attention_mask=None)
+                    what = f"capture T = {tokens}: "
+                    _check_fused_norms(
+                        block.layers, trace.fused_norms, fits(tokens), problems, what
+                    )
+                    branches.append(list(trace.branches))
+                    captured.append(graph)
+                graphs.append((tokens, graph, x_buf, out, list(trace.gemm_inputs)))
+                for rnd in range(2):
+                    for tokens, graph, x_buf, out, records in graphs:
+                        x_full, x = step_input(tokens, seed=1000 * (rnd + 1) + tokens)
+                        x_buf.copy_(x)
+                        _poison_tp_buffer(tp)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        what = f"replay {rnd} T = {tokens}: "
+                        _check_exact(out, x, f"{what}block output", problems)
+                        _check_gemm_inputs(
+                            block.layers, trace, x_full, eps, problems, records=records, what=what
+                        )
+            else:
+                graph_tokens, eager_tokens = sizes
+                _, x = step_input(graph_tokens, seed=graph_tokens)
                 x_buf = x.clone()
                 _warm_up(lambda: block(hidden_states=x_buf.clone(), attention_mask=None))
                 trace.clear()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool):
-                    out = block(hidden_states=x_buf, attention_mask=None)
-                what = f"capture T = {tokens}: "
-                _check_fused_norms(block.layers, trace.fused_norms, fits(tokens), problems, what)
+                graphs, outs, h = [], [], x_buf
+                for layer in block.layers:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=pool):
+                        h, _ = layer(hidden_states=h, attention_mask=None)
+                    graphs.append(graph)
+                    captured.append(graph)
+                    outs.append(h)
+                what = f"capture T = {graph_tokens}: "
+                _check_fused_norms(
+                    block.layers, trace.fused_norms, fits(graph_tokens), problems, what
+                )
                 branches.append(list(trace.branches))
-                graphs.append((tokens, graph, x_buf, out, list(trace.gemm_inputs)))
-            for rnd in range(2):
-                for tokens, graph, x_buf, out, records in graphs:
-                    x_full, x = step_input(tokens, seed=1000 * (rnd + 1) + tokens)
+                records = list(trace.gemm_inputs)
+                for rnd in range(2):
+                    x_full, x = step_input(graph_tokens, seed=1000 * (rnd + 1))
                     x_buf.copy_(x)
                     _poison_tp_buffer(tp)
-                    graph.replay()
+                    for graph in graphs:
+                        graph.replay()
                     torch.cuda.synchronize()
-                    what = f"replay {rnd} T = {tokens}: "
-                    _check_exact(out, x, f"{what}block output", problems)
+                    what = f"replay {rnd} T = {graph_tokens}: "
+                    for i, out in enumerate(outs):
+                        _check_exact(out, x, f"{what}layer {i} output", problems)
                     _check_gemm_inputs(
                         block.layers, trace, x_full, eps, problems, records=records, what=what
                     )
-        else:
-            graph_tokens, eager_tokens = sizes
-            _, x = step_input(graph_tokens, seed=graph_tokens)
-            x_buf = x.clone()
-            _warm_up(lambda: block(hidden_states=x_buf.clone(), attention_mask=None))
-            trace.clear()
-            graphs, outs, h = [], [], x_buf
-            for layer in block.layers:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool):
-                    h, _ = layer(hidden_states=h, attention_mask=None)
-                graphs.append(graph)
-                outs.append(h)
-            what = f"capture T = {graph_tokens}: "
-            _check_fused_norms(block.layers, trace.fused_norms, fits(graph_tokens), problems, what)
-            branches.append(list(trace.branches))
-            records = list(trace.gemm_inputs)
-            for rnd in range(2):
-                x_full, x = step_input(graph_tokens, seed=1000 * (rnd + 1))
-                x_buf.copy_(x)
-                _poison_tp_buffer(tp)
-                for graph in graphs:
-                    graph.replay()
-                torch.cuda.synchronize()
-                what = f"replay {rnd} T = {graph_tokens}: "
-                for i, out in enumerate(outs):
-                    _check_exact(out, x, f"{what}layer {i} output", problems)
-                _check_gemm_inputs(
-                    block.layers, trace, x_full, eps, problems, records=records, what=what
-                )
-                x_full, x = step_input(eager_tokens, seed=1000 * (rnd + 1) + 1)
-                _poison_tp_buffer(tp)
-                trace.clear()
-                out = block(hidden_states=x.clone(), attention_mask=None)
-                torch.cuda.synchronize()
-                what = f"eager step {rnd} T = {eager_tokens}: "
-                _check_exact(out, x, f"{what}block output", problems)
-                _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
-                _check_fused_norms(
-                    block.layers, trace.fused_norms, fits(eager_tokens), problems, what
-                )
-                branches.append(list(trace.branches))
+                    x_full, x = step_input(eager_tokens, seed=1000 * (rnd + 1) + 1)
+                    _poison_tp_buffer(tp)
+                    trace.clear()
+                    out = block(hidden_states=x.clone(), attention_mask=None)
+                    torch.cuda.synchronize()
+                    what = f"eager step {rnd} T = {eager_tokens}: "
+                    _check_exact(out, x, f"{what}block output", problems)
+                    _check_gemm_inputs(block.layers, trace, x_full, eps, problems, what=what)
+                    _check_fused_norms(
+                        block.layers, trace.fused_norms, fits(eager_tokens), problems, what
+                    )
+                    branches.append(list(trace.branches))
+    finally:
+        # Release the graphs before anything can fail or tear down: a graph that captured an
+        # NCCL fallback (the *_capacity sizes) keeps the communicator busy, and destroying the
+        # process groups under it hangs (pdx 7856500: the failing case timed out in teardown).
+        torch.cuda.synchronize()
+        for graph in captured:
+            graph.reset()
+        captured.clear()
+        torch.cuda.synchronize()
+        dist.barrier()
+
     _verdict(case, branches, problems)
 
 
@@ -734,6 +754,10 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
         inference_rng_tracker=True,
         cuda_graph_impl="local" if graphs else "none",
         inference_cuda_graph_scope=scope,
+        # Pinned: auto-selection picks FA4 when installed, and on Hopper main then asks FA4 for
+        # split-KV, which its SM90 forward rejects (#8584, n2). The attention backend is not what
+        # this test is about; FA3 (FA2 where it is absent) runs the paged KV cache on Hopper.
+        flash_attention_version=3 if attention_module.HAVE_FA3 else 2,
     )
     model = GPTModel(
         config=config,
