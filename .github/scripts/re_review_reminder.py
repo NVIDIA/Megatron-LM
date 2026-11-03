@@ -34,6 +34,8 @@ GITHUB_API_URL = "https://api.github.com"
 EXPECTED_REPOSITORY = "NVIDIA/Megatron-LM"
 EXPECTED_BASE_BRANCH = "main"
 MCORE_ENGINEERS_TEAM = "mcore-engineers"
+# These service accounts have GitHub type "User", but no human Slack identity.
+SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
 SUBMITTED_REVIEW_STATES = {"COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 PER_PAGE = 100
 REQUEST_TIMEOUT_SECONDS = 30
@@ -102,6 +104,10 @@ def _extract_review_request(event: dict) -> ReviewRequest | None:
     reviewer = str(requested_reviewer.get("login", "")).strip()
     if not requester or not reviewer:
         raise NotifierError("Review-request payload is missing the requester or reviewer")
+
+    if requested_reviewer.get("type") == "Bot" or reviewer.casefold() in SERVICE_ACCOUNT_LOGINS:
+        logger.info("Skipping review request for bot or service account %s", reviewer)
+        return None
 
     if requester.casefold() == reviewer.casefold():
         logger.info("Skipping review request because the requester and reviewer are the same user")
