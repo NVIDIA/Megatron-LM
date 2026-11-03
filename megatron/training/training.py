@@ -90,7 +90,10 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     tag_params_for_buffer_routing,
 )
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.optimizer.optimizer_cuda_graph import (
+    OptimizerCudaGraphWrapper,
+    check_weight_decay_constant_for_optimizer_cuda_graph,
+)
 from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
@@ -5004,6 +5007,7 @@ def train(
             forward_backward_func,
         )
     if cfg.optimizer.optimizer_cuda_graph:
+        check_weight_decay_constant_for_optimizer_cuda_graph(optimizer, opt_param_scheduler)
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,

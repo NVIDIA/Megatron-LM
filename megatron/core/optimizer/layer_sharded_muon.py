@@ -389,6 +389,7 @@ class LayerShardedMuon(TensorParallelMuon):
         qkv_split_shapes: list[int] | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
+        capturable: bool = False,
     ) -> None:
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
@@ -439,6 +440,7 @@ class LayerShardedMuon(TensorParallelMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            capturable=capturable,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
@@ -503,7 +505,9 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_shared_domain = False
         self._plans.clear()
 
-    def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
+    def _apply_update(
+        self, p: torch.Tensor, update: torch.Tensor, lr: float | torch.Tensor
+    ) -> None:
         """Apply one weight update through the base-class hook points.
 
         ``OrthogonalizedOptimizer.step()`` brackets every ``p.add_`` with
@@ -515,12 +519,13 @@ class LayerShardedMuon(TensorParallelMuon):
         multiply-add in the promoted
         precision and downcasts once on store, so casting here first would give
         bf16 params different rounding on the layer-sharded paths than on the
-        fallback and than TensorParallelMuon's duplicated mode. TODO: forward
+        fallback and than TensorParallelMuon's duplicated mode. A tensor ``lr`` (capturable
+        mode) is read on the device. TODO: forward
         the ``weight_update_hook`` constructor parameter once the
         emerging-optimizers pin moves past EO #224.
         """
         self.pre_weight_update_fn_inplace(p, update)
-        p.add_(update, alpha=-lr)
+        self._add_scaled_update(p, update, lr)
         self.post_weight_update_fn_inplace(p)
 
     def _run_ns(self, full_by_k: dict) -> dict:

@@ -39,6 +39,7 @@ try:
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    from emerging_optimizers.utils import fp32_matmul_precision
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -255,7 +256,16 @@ def _select_tp_mode(
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
-    """Tensor Parallel Muon optimizer."""
+    """Tensor Parallel Muon optimizer.
+
+    With ``capturable=True`` (set under ``--optimizer-cuda-graph``) every param group keeps
+    ``lr`` in a 0-dim CUDA tensor, as TE FusedAdam does when capturable: a captured ``step()``
+    reads it on each replay and ``OptimizerParamScheduler`` updates it in place, where a Python
+    float would be baked into the graph at capture time. The tensor-scaled update rounds the
+    product before the add, where ``add_(alpha=)`` fuses them, so the two paths agree up to
+    fp32 rounding. ``weight_decay`` stays a float, which the training config keeps constant
+    under the optimizer graph.
+    """
 
     def __init__(
         self,
@@ -276,6 +286,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        capturable: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -351,6 +362,67 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+        self.capturable = capturable
+        if capturable:
+            self._lr_to_tensors()
+
+    def _lr_to_tensors(self) -> None:
+        """Hold each group's ``lr`` in a 0-dim fp32 CUDA tensor."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        for group in self.param_groups:
+            lr = group["lr"]
+            if not (isinstance(lr, torch.Tensor) and lr.device == device):
+                group["lr"] = torch.tensor(float(lr), dtype=torch.float32, device=device)
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Load the state, keeping ``lr`` a tensor when capturable."""
+        super().load_state_dict(state_dict)
+        if self.capturable:
+            self._lr_to_tensors()
+
+    def _apply_weight_decay_inplace(
+        self, p: torch.Tensor, grad: torch.Tensor, lr: float | torch.Tensor, weight_decay: float
+    ) -> None:
+        """``WeightDecayMixin._apply_weight_decay_inplace`` that also takes a tensor ``lr``."""
+        method = getattr(self, "weight_decay_method", "l2")
+        if not isinstance(lr, torch.Tensor) or method not in ("decoupled", "palm"):
+            super()._apply_weight_decay_inplace(p, grad, lr, weight_decay)
+        elif weight_decay != 0.0:
+            p.addcmul_(p, lr if method == "decoupled" else lr * lr, value=-weight_decay)
+
+    @staticmethod
+    def _add_scaled_update(p: torch.Tensor, update: torch.Tensor, lr: float | torch.Tensor) -> None:
+        """``p -= lr * update``; a tensor ``lr`` is read on the device."""
+        if isinstance(lr, torch.Tensor):
+            p.addcmul_(update, lr, value=-1)
+        else:
+            p.add_(update, alpha=-lr)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """``OrthogonalizedOptimizer.step``; when capturable, with a tensor ``lr`` (see the
+        class docstring)."""
+        if not self.capturable:
+            return OrthogonalizedOptimizer.step(self, closure)
+        if closure is not None:
+            raise ValueError("closure is not supported")
+        for group in self.param_groups:
+            self._init_group(group)
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                buf = self.state[p]["momentum_buffer"]
+                self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+                buf.lerp_(grad, 1 - group["momentum"])
+                grad = grad.lerp(buf, group["momentum"]) if self.nesterov else buf
+                with fp32_matmul_precision(self.fp32_matmul_prec):
+                    orth_grad = self.orthogonalize(p, grad, **group_kwargs)
+                self.pre_weight_update_fn_inplace(p, orth_grad)
+                self._add_scaled_update(p, orth_grad, group["lr"])
+                self.post_weight_update_fn_inplace(p)
+        return None
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
@@ -777,6 +849,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
+    kwargs["capturable"] = config.optimizer_cuda_graph
     return kwargs
 
 
@@ -805,6 +878,9 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    # AdaptiveMuon.step reads lr as a float: no capturable mode (OptimizerConfig rejects
+    # adaptive_muon under the optimizer graph).
+    kwargs.pop("capturable")
     kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
     return kwargs
 

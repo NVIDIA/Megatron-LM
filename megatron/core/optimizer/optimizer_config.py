@@ -479,6 +479,18 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+            # The captured step must read lr from a device tensor, or every replay reuses the
+            # capture-time lr: capturable Adam and Muon do, the other optimizers read a float.
+            if self.optimizer not in ('adam', 'muon', 'dist_muon'):
+                raise ValueError(
+                    f"optimizer_cuda_graph supports optimizer='adam' or 'muon', got "
+                    f"{self.optimizer!r}."
+                )
+            if self.optimizer != 'adam' and self.muon_scalar_optimizer != 'adam':
+                raise ValueError(
+                    "optimizer_cuda_graph with Muon requires muon_scalar_optimizer='adam', got "
+                    f"{self.muon_scalar_optimizer!r}."
+                )
 
         # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
         # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
