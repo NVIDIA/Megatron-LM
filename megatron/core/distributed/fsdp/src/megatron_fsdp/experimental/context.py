@@ -15,7 +15,9 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
+from collections import deque
 from collections.abc import Callable
+from typing import NamedTuple
 from weakref import WeakKeyDictionary
 
 import torch
@@ -31,6 +33,14 @@ class PrefetchOrder(enum.Enum):
 
     REGISTRATION = enum.auto()
     RECORDED = enum.auto()
+
+
+class _GradBufferBatch(NamedTuple):
+    """Inputs and their last-consumer event, owned by the allocation stream."""
+
+    buffers: tuple[torch.Tensor, ...]
+    done: torch.cuda.Event
+    allocation_stream: torch.cuda.Stream
 
 
 class FsdpContext:
@@ -96,6 +106,7 @@ class FsdpContext:
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
+        self._pending_grad_buffers: deque[_GradBufferBatch] = deque()
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -216,6 +227,24 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+        self._release_grad_buffers()
+
+    def _retain_grad_buffers(
+        self, buffers: list[torch.Tensor], allocation_stream: torch.cuda.Stream
+    ) -> None:
+        """Keep module inputs alive through inner reduction and local accumulation."""
+        if buffers:
+            # DP-outer reduction consumes persistent main_grad, not these inputs.
+            done = self.inner_reduction_stream.record_event()
+            self._pending_grad_buffers.append(
+                _GradBufferBatch(tuple(buffers), done, allocation_stream)
+            )
+
+    def _release_grad_buffers(self, *, keep: int = 0) -> None:
+        """Order storage reuse on its allocation stream before dropping references."""
+        while len(self._pending_grad_buffers) > keep:
+            batch = self._pending_grad_buffers.popleft()
+            batch.allocation_stream.wait_event(batch.done)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""

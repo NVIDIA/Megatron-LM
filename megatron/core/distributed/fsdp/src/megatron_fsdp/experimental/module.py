@@ -465,31 +465,35 @@ class FsdpModule:
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
-            for group in self._parameter_groups:
-                if not group.requires_grad:
-                    continue
-
-                with torch.cuda.stream(inner_reduction_stream):
+            groups = [group for group in self._parameter_groups if group.requires_grad]
+            if not groups:
+                return
+            # One retained module plus this module bounds staging to two batches.
+            context._release_grad_buffers(keep=1)
+            buffers = []
+            try:
+                for group in groups:
                     partial_grad = group.allocate_partial_grad_buffer()
+                    buffers.append(partial_grad.local_buffer)
+                    group.copy_gradients_to_partial_buffer(partial_grad)
 
-                current_stream.wait_stream(inner_reduction_stream)
-                group.copy_gradients_to_partial_buffer(partial_grad)
+                    inner_reduction_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(inner_reduction_stream):
+                        group.reduce_inner_gradients(partial_grad)
 
-                inner_reduction_stream.wait_stream(current_stream)
-                with torch.cuda.stream(inner_reduction_stream):
-                    group.reduce_inner_gradients(partial_grad)
-
-                if not context.is_last_microbatch:
-                    continue
-                # Finalize the DP-outer reduction. When overlap is enabled its stream is
-                # distinct, so it overlaps the following group's DP-inner reduce; the
-                # persistent accumulator and its optimizer-layout view stay alive across
-                # the handoff. When disabled the stream aliases inner_reduction_stream and
-                # this stays serialized.
-                if context.outer_reduction_stream is not inner_reduction_stream:
-                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
-                with torch.cuda.stream(context.outer_reduction_stream):
-                    group.reduce_outer_gradients()
+                    if not context.is_last_microbatch:
+                        continue
+                    # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                    # distinct, so it overlaps the following group's DP-inner reduce; the
+                    # persistent accumulator and its optimizer-layout view stay alive across
+                    # the handoff. When disabled the stream aliases inner_reduction_stream and
+                    # this stays serialized.
+                    if context.outer_reduction_stream is not inner_reduction_stream:
+                        context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                    with torch.cuda.stream(context.outer_reduction_stream):
+                        group.reduce_outer_gradients()
+            finally:
+                context._retain_grad_buffers(buffers, current_stream)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
