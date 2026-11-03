@@ -660,7 +660,7 @@ class TestMoEEGTPCorrectness:
                 "quantizes re-gathered BF16 weights (ops/fused/grouped_mlp.py "
                 "_quantize_unquantized_weights)"
             )
-        request.getfixturevalue("require_te_fused_grouped_mlp")
+        request.getfixturevalue("require_te_fused_srelu_mlp")
         _run_distributed(_worker_egtp_quantized_precision_override_backward, 4, egtp_remat_size)
 
 

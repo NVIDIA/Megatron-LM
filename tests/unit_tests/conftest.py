@@ -66,7 +66,7 @@ def experimental(request):
 
 
 @pytest.fixture
-def require_te_fused_grouped_mlp(monkeypatch):
+def require_te_fused_srelu_mlp(monkeypatch):
     """Enable real SReLU grouped-MLP fusion, including TE with import-time gates."""
     from transformer_engine.pytorch.ops.fused import grouped_mlp
     from transformer_engine.pytorch.ops.fuser import (

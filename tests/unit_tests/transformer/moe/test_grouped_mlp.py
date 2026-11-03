@@ -2023,7 +2023,7 @@ class TestTEGroupedMLP:
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         self._skip_unless_quantized_override_testable()
-        request.getfixturevalue("require_te_fused_grouped_mlp")
+        request.getfixturevalue("require_te_fused_srelu_mlp")
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
         hidden, ffn = 128, 256
