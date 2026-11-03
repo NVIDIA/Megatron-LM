@@ -50,7 +50,13 @@ from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
+
+    try:
+        from emerging_optimizers.soap import SOAP
+    except ModuleNotFoundError as error:
+        if error.name != 'emerging_optimizers.soap':
+            raise
+        from emerging_optimizers.legacy_soap import SOAP
 
     from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 else:
