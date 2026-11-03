@@ -2,6 +2,7 @@
 
 import logging
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -86,15 +87,14 @@ def test_warmup_preserves_rng_and_live_storage(
     live = torch.full((1024,), 7.0, pin_memory=True)
     address = live.data_ptr()
     calls = []
-    host_memory = getattr(getattr(torch, "accelerator", None), "memory", None)
-    original = getattr(host_memory, "empty_host_cache", None)
+    original = kernel_warmup._resolve_empty_host_cache()
+    assert original is not None, "this PyTorch build cannot release the pinned host cache"
 
     def trim():
         calls.append(True)
         original()
 
-    if original is not None:
-        monkeypatch.setattr(host_memory, "empty_host_cache", trim)
+    monkeypatch.setattr(kernel_warmup, "_resolve_empty_host_cache", lambda: trim)
     layouts = []
     label_layouts = []
     calculate_gradients = fused_cross_entropy.calculate_gradients
@@ -120,7 +120,7 @@ def test_warmup_preserves_rng_and_live_storage(
     layouts.clear()
     warmup_label_layouts = label_layouts.copy()
     label_layouts.clear()
-    assert calls == ([True] if original is not None else [])
+    assert calls == [True]
     assert torch.equal(cpu_rng, torch.get_rng_state())
     assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
     assert live.data_ptr() == address and torch.all(live == 7.0)
@@ -159,6 +159,23 @@ def test_warmup_preserves_rng_and_live_storage(
     expected_grad = expected_grad[..., tp_group.rank() * 128 : (tp_group.rank() + 1) * 128]
     torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(grad, expected_grad.to(logits_dtype), rtol=1e-5, atol=1e-5)
+
+
+def test_empty_host_cache_resolution_order(monkeypatch):
+    # The public accelerator API wins; builds without it (PyTorch <= 2.12.0a0)
+    # must still release the warm-up's pinned staging blocks through the
+    # private CUDA binding instead of leaving them cached for the whole run.
+    public = object()
+    private = object()
+    monkeypatch.setattr(
+        torch, "accelerator", SimpleNamespace(memory=SimpleNamespace(empty_host_cache=public))
+    )
+    assert kernel_warmup._resolve_empty_host_cache() is public
+    monkeypatch.setattr(torch, "accelerator", SimpleNamespace(memory=SimpleNamespace()))
+    monkeypatch.setattr(torch._C, "_host_emptyCache", private, raising=False)
+    assert kernel_warmup._resolve_empty_host_cache() is private
+    monkeypatch.delattr(torch._C, "_host_emptyCache", raising=False)
+    assert kernel_warmup._resolve_empty_host_cache() is None
 
 
 def test_warmup_rejects_invalid_shape(tp_group):

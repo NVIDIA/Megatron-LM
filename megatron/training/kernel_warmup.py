@@ -177,6 +177,26 @@ def _shutdown_compile_workers() -> None:
             logger.warning("This PyTorch build lacks compiler-worker shutdown")
 
 
+def _resolve_empty_host_cache():
+    """Return the callable that frees the host allocator's cached pinned blocks, or None.
+
+    Inductor's autotuner stages every mutated kernel argument in pinned host
+    memory when the device has no proven headroom (max_memory_allocated minus
+    memory_allocated), which is always the case this early in the process. The
+    staging copies are freed, but the CUDA caching host allocator keeps them
+    (rounded up to powers of two) until a caller empties its cache; for a
+    full-size cross-entropy warm-up that is tens of GiB per rank.
+    """
+    host_memory = getattr(getattr(torch, "accelerator", None), "memory", None)
+    release = getattr(host_memory, "empty_host_cache", None)
+    if release is None:
+        # torch.accelerator.memory.empty_host_cache is newer than PyTorch 2.12.0a0.
+        # CUDA builds expose the same CachingHostAllocator_emptyCache() through
+        # this private binding; prefer it over leaving the cache behind.
+        release = getattr(torch._C, "_host_emptyCache", None)
+    return release
+
+
 def warmup_training_kernels(
     model_config,
     tp_group: torch.distributed.ProcessGroup,
@@ -313,8 +333,7 @@ def _warmup_training_kernels(
     torch.cuda.synchronize()
     _shutdown_compile_workers()
     gc.collect()
-    host_memory = getattr(getattr(torch, "accelerator", None), "memory", None)
-    empty_host_cache = getattr(host_memory, "empty_host_cache", None)
+    empty_host_cache = _resolve_empty_host_cache()
     if empty_host_cache is not None:
         empty_host_cache()
     else:
