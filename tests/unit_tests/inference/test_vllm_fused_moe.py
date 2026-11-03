@@ -757,6 +757,77 @@ class TestVllmFusedMoe:
 
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
 
+    # hidden/ffn sizes are not multiples of BLOCK_SIZE_N/K, so the last N-tile of
+    # each expert spills into the next expert's rows and the last K-tile runs past K.
+    @pytest.mark.parametrize("max_tokens", [1, 128])
+    @pytest.mark.parametrize("hidden_size,ffn_hidden", [(200, 72), (136, 200)])
+    def test_tma_weights_match_pointer_path(self, monkeypatch, max_tokens, hidden_size, ffn_hidden):
+        """The TMA weight-descriptor path is bitwise identical to the pointer path."""
+        import importlib
+
+        from megatron.core.inference.moe.fused_moe import ActivationType
+
+        # The package re-exports a function named vllm_fused_moe that shadows the submodule.
+        vfm = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+        topk, num_experts = 4, 8
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        if vfm._weight_descriptor(fc1_weight, 64, 64) is None:
+            pytest.skip("TMA weight descriptors need sm90+")
+
+        def run():
+            return vfm.vllm_fused_moe(
+                hidden,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                _vt(max_tokens),
+                routing_map,
+            )
+
+        # Exercise production buffer reuse, and restore any previous pool at teardown.
+        monkeypatch.setattr(vfm.VllmFusedMoeBuffers, "_buffers", None)
+        vfm.VllmFusedMoeBuffers.allocate_buffers(
+            max_tokens, topk, ffn_hidden, hidden_size, num_experts, hidden.device
+        )
+        # The backend caches its output buffer; preserve it before the next call.
+        tma_result = run().clone()
+        monkeypatch.setattr(vfm, "_USE_TMA_WEIGHTS", False)
+        assert torch.equal(tma_result, run())
+
+    @pytest.mark.parametrize("reason", ["disabled", "pre_hopper"])
+    def test_tma_unavailable_uses_pointer_path(self, monkeypatch, reason):
+        import importlib
+
+        vfm = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+        weights = torch.empty(2, 64, 64, device="cuda", dtype=torch.bfloat16)
+        if reason == "disabled":
+            monkeypatch.setattr(vfm, "_USE_TMA_WEIGHTS", False)
+        else:
+            monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 0))
+        assert vfm._weight_descriptor(weights, 64, 64) is None
+
+    @pytest.mark.parametrize(
+        "layout", ["strided_rows", "strided_k", "row_alignment", "base_alignment"]
+    )
+    def test_tma_unsupported_layout_uses_pointer_path(self, layout):
+        from megatron.core.inference.moe.vllm_fused_moe import _weight_descriptor
+
+        weights = torch.empty(2, 128, 128, device="cuda", dtype=torch.bfloat16)
+        if layout == "strided_rows":
+            weights = weights[:, ::2, :]
+        elif layout == "strided_k":
+            weights = weights[:, :, ::2]
+        elif layout == "row_alignment":
+            weights = weights[:, :, :127].contiguous()
+        else:
+            weights = weights.flatten()[1 : 1 + 2 * 64 * 64].view(2, 64, 64)
+        assert _weight_descriptor(weights, 64, 64) is None
+
 
 # ──────────────────────────────────────────────────────────────────────
 # CUDA graph capture + replay

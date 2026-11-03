@@ -25,7 +25,9 @@ try:
 except ImportError:
     HAVE_TRITON = False
 
-if not HAVE_TRITON:
+if HAVE_TRITON:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+else:
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
@@ -129,6 +131,7 @@ def _fused_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_SQUARED_RELU: tl.constexpr,
     CLAMP_ACTIVATION: tl.constexpr,
+    USE_TMA_B: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -140,13 +143,22 @@ def _fused_moe_kernel(
     Body mirrors vLLM's `fused_moe_kernel` verbatim except for the
     `FUSE_SQUARED_RELU` branch (Megatron applies relu+square in fp32 on
     the accumulator before the bf16 cast — strictly more accurate than
-    upstream's separate post-FC1 activation kernel).
+    upstream's separate post-FC1 activation kernel) and the `USE_TMA_B`
+    weight-load path described below.
 
     Grid is sized host-side from `num_tokens_hint` (the typical-case token
     count), not the worst-case buffer length, so launch overhead at decode
     stays small. When the actual padded length exceeds the hinted grid
     size (rare prefill spikes), each CTA strides over multiple tiles via
     the outer `tl.range` loop.
+
+    When `USE_TMA_B`, `b_ptr` is a single TMA descriptor over the expert
+    weights viewed as [E * N, K].  This relies on all experts living in one
+    contiguous buffer: expert e's N-tile is just a row offset of `e * N`, so
+    one host-side descriptor serves every tile with no per-tile address math.
+    TMA zero-fills past K and past row E * N.  A last N-tile that spills into
+    the next expert's rows only feeds output columns >= N, which the C-store
+    mask drops.
     """
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -179,18 +191,20 @@ def _fused_moe_kernel(
             offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
             token_mask = offs_token < num_valid_tokens
 
-            # `% N` keeps overflow lanes in-bounds; matching C-store mask drops
-            # their contribution.  Saves a 2-D bounds check inside the K loop.
-            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
-
             a_ptrs = a_ptr + (
                 offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
-            b_ptrs = (
-                b_ptr
-                + off_experts * stride_be
-                + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-            )
+            if USE_TMA_B:
+                b_row = (off_experts * N + pid_n * BLOCK_SIZE_N).to(tl.int32)
+            else:
+                # `% N` keeps overflow lanes in-bounds; matching C-store mask drops
+                # their contribution.  Saves a 2-D bounds check inside the K loop.
+                offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+                b_ptrs = (
+                    b_ptr
+                    + off_experts * stride_be
+                    + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+                )
 
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
             for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -199,10 +213,13 @@ def _fused_moe_kernel(
                     mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0,
                 )
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                if USE_TMA_B:
+                    b = b_ptr.load([b_row, k * BLOCK_SIZE_K]).T
+                else:
+                    b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                    b_ptrs += BLOCK_SIZE_K * stride_bk
                 accumulator += tl.dot(a, b)
                 a_ptrs += BLOCK_SIZE_K * stride_ak
-                b_ptrs += BLOCK_SIZE_K * stride_bk
 
             # Megatron-only: squared-relu fused on the fp32 accumulator before
             # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
@@ -505,6 +522,27 @@ def _moe_align_block_size_cuda_graphable(
 # ---------------------------------------------------------------------------
 
 
+# Kill switch for the TMA weight path (falls back to pointer loads when False).
+_USE_TMA_WEIGHTS = True
+
+
+def _weight_descriptor(B: torch.Tensor, block_n: int, block_k: int) -> Optional["TensorDescriptor"]:
+    """One TMA descriptor over all experts of B ([E, N, K]) viewed as [E * N, K].
+
+    Returns None when TMA is unavailable (pre-Hopper) or B's layout does not
+    allow it: experts must share one contiguous buffer, and TMA needs 16-byte
+    aligned base and row stride.
+    """
+    if not _USE_TMA_WEIGHTS:
+        return None
+    if torch.cuda.get_device_capability(B.device)[0] < 9 or not B.is_contiguous():
+        return None
+    E, N, K = B.shape
+    if B.data_ptr() % 16 != 0 or (K * B.element_size()) % 16 != 0:
+        return None
+    return TensorDescriptor.from_tensor(B.view(E * N, K), [block_n, block_k])
+
+
 def _invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -525,7 +563,8 @@ def _invoke_fused_moe_kernel(
     Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
     tile, raw pointer arithmetic with `% N` on the N axis), apart from the
     optional fused squared-relu activation in fp32 and its optional tanh
-    soft clamp.
+    soft clamp, and loading expert weights through one TMA descriptor when
+    `_weight_descriptor` allows it.
 
     `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
     at decode is small.  When the actual padded length exceeds the hinted
@@ -535,10 +574,11 @@ def _invoke_fused_moe_kernel(
     """
     M = A.size(0)
     num_tokens = M * top_k
+    b_desc = _weight_descriptor(B, config['BLOCK_SIZE_N'], config['BLOCK_SIZE_K'])
 
     _fused_moe_kernel[(grid_size,)](
         A,
-        B,
+        b_desc if b_desc is not None else B,
         C,
         topk_weights,
         sorted_token_ids,
@@ -558,6 +598,7 @@ def _invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         CLAMP_ACTIVATION=fuse_squared_relu and activation_clamp_scale is not None,
+        USE_TMA_B=b_desc is not None,
         top_k=top_k,
         BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
         BLOCK_SIZE_N=config['BLOCK_SIZE_N'],

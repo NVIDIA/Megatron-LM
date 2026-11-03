@@ -768,9 +768,17 @@ def test_inference_default_unpermute_is_the_racy_path():
 # --- vLLM-derived fused MoE ---------------------------------------------------------------
 
 
-def test_vllm_fused_moe_and_moe_sum_replay():
+@pytest.mark.parametrize("use_tma_weights", [True, False], ids=["tma_weights", "pointer_weights"])
+def test_vllm_fused_moe_and_moe_sum_replay(monkeypatch, use_tma_weights):
+    import importlib
+
     from megatron.core.inference.moe.fused_moe import ActivationType
     from megatron.core.inference.moe.vllm_fused_moe import _moe_sum, vllm_fused_moe
+
+    # The package re-exports a function named vllm_fused_moe that shadows the submodule.
+    vfm = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+    # TMA weight descriptors apply on sm90+; elsewhere both cases take the pointer path.
+    monkeypatch.setattr(vfm, "_USE_TMA_WEIGHTS", use_tma_weights)
 
     seeded()
     max_tokens, hidden, ffn, topk, experts = 4096, 4096, 2048, 8, 32
