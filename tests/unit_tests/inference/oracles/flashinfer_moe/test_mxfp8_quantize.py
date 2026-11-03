@@ -45,6 +45,26 @@ from tests.unit_tests.inference.oracles.flashinfer_moe import spec
 
 ROUTED_ALIGN = 128  # quantize_routed_mxfp8_input pads to fc1_weight.padded_cols (128-aligned)
 
+# FlashInfer's NaN and -inf handling (O4b-N1, O4b-N2) has no Megatron fix: those cases are strict
+# xfails up to the FlashInfer the CI image pins (flashinfer-python in uv.lock).
+FLASHINFER_IN_CI = "0.7.2.post1"
+XFAIL_O4B_N1 = ou.xfail_upstream(
+    "O4b-N1",
+    "flashinfer-python",
+    fixed_after=FLASHINFER_IN_CI,
+    reason="mxfp8_quantize's amax and saturating clamp turn NaN into +448; drafted patch"
+    " audit/fixes/upstream/flashinfer-mxfp8-quantize-nan.diff",
+    raises=AssertionError,
+)
+XFAIL_O4B_N2 = ou.xfail_upstream(
+    "O4b-N2",
+    "flashinfer-python",
+    fixed_after=FLASHINFER_IN_CI,
+    reason="mxfp8_quantize decodes -inf as +448 * 2**127; drafted patch"
+    " audit/fixes/upstream/flashinfer-mxfp8-quantize-neg-inf.diff",
+    raises=AssertionError,
+)
+
 
 def _hidden(rows: int, cols: int, generator: torch.Generator) -> torch.Tensor:
     """BF16 activations, Gaussian with row magnitudes spread over 12 decades (CPU)."""
@@ -274,13 +294,15 @@ def _assert_other_blocks_exact(x: torch.Tensor, row: int, block: int, what: str)
     ou.assert_exact(scales.cpu()[keep], ref_scales[keep], what=f"scales outside the {what} block")
 
 
+@XFAIL_O4B_N1
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
 def test_nan_element_stays_nan_and_is_isolated():
     """A NaN element must decode to NaN (E4M3 0x7F/0xFF or an E8M0 0xFF scale), as the OCP FP8
     conversion and torch's float8 cast keep NaN. FlashInfer 0.7.2.post1 gives a finite value
     (finding O4b-N1, GB200): its amax ignores NaN (``__hmax2``) and its saturating clamp
-    (``fminf``/``fmaxf``) turns the NaN into +448."""
+    (``fminf``/``fmaxf``) turns the NaN into +448. No Megatron change can fix it: a strict xfail
+    up to the FlashInfer the CI image pins (``XFAIL_O4B_N1``)."""
     spec.require_flashinfer()
     x = _hidden(4, 128, ou.make_generator())
     x[1, 37] = float("nan")
@@ -294,13 +316,16 @@ def test_nan_element_stays_nan_and_is_isolated():
 
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
-@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["+inf", "-inf"])
+@pytest.mark.parametrize(
+    "sign", [pytest.param(1.0, id="+inf"), pytest.param(-1.0, id="-inf", marks=XFAIL_O4B_N2)]
+)
 def test_infinite_element_saturates_with_its_sign_and_is_isolated(sign):
     """An infinite element must decode to NaN or to the largest MXFP8 magnitude with its sign
     (saturating conversion; FlashInfer's own comment: "inf / overflow map to the max finite
     value"). FlashInfer 0.7.2.post1 turns -inf into +448 * 2**127 (finding O4b-N2, GB200): the
     scale saturates to 2**127, ``rcp.approx.ftz`` of it flushes to 0, ``-inf * 0`` is NaN and the
-    clamp makes it +448."""
+    clamp makes it +448. No Megatron change can fix it: ``[-inf]`` is a strict xfail up to the
+    FlashInfer the CI image pins (``XFAIL_O4B_N2``)."""
     spec.require_flashinfer()
     x = _hidden(4, 128, ou.make_generator())
     x[2, 70] = sign * float("inf")
