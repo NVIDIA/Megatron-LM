@@ -106,10 +106,12 @@ def tp2_collection():
     )
 
 
-def _partial_collection(collection, *names, **explicit):
-    """A collection that sets only the named fields of `collection`, plus `explicit` values."""
-    fields = {name: vars(collection)[name] for name in names}
-    fields.update(explicit)
+def _without(collection, name, explicit_none):
+    """`collection` without its field `name`, or with it set to None if `explicit_none`."""
+    fields = dict(vars(collection))
+    del fields[name]
+    if explicit_none:
+        fields[name] = None
     return ProcessGroupCollection(**fields)
 
 
@@ -123,7 +125,10 @@ def _wrapper(pg_collection):
 
 
 class TestInferenceWrapperProcessGroups:
-    """`AbstractModelInferenceWrapper` takes TP and PP from its collection and requires both."""
+    """`AbstractModelInferenceWrapper` takes TP and PP from its collection.
+
+    The inference config requires tp, pp, dp and mp to be process groups.
+    """
 
     def test_uses_collection_groups(self, tp2_collection):
         with forbid_global_process_groups():
@@ -133,15 +138,13 @@ class TestInferenceWrapperProcessGroups:
         assert wrapper.pp_group is tp2_collection.pp
         assert wrapper.tp_size == 2
 
-    @pytest.mark.parametrize("unset", ["tp", "pp"])
+    @pytest.mark.parametrize("unset", ["tp", "pp", "dp", "mp"])
     @pytest.mark.parametrize("explicit_none", [False, True], ids=["absent", "none"])
     def test_rejects_unset_group(self, tp2_collection, unset, explicit_none):
-        kept = [name for name in ("tp", "pp") if name != unset]
-        explicit = {unset: None} if explicit_none else {}
-        pg_collection = _partial_collection(tp2_collection, *kept, **explicit)
+        pg_collection = _without(tp2_collection, unset, explicit_none)
 
         with forbid_global_process_groups():
-            with pytest.raises(ValueError, match=f"needs the {unset} process group"):
+            with pytest.raises(ValueError, match=rf"requires pg_collection to set {unset}\b"):
                 _wrapper(pg_collection)
 
 
@@ -157,29 +160,6 @@ class TestTextGenerationControllerProcessGroups:
         assert controller.dp_group is tp2_collection.dp
         seed = wrapper.model.config.inference_sampling_seed
         assert controller.sampling_rng.initial_seed() == seed + tp2_collection.dp.rank()
-
-    def test_seed_offset_rejects_unset_dp(self, tp2_collection):
-        wrapper = _wrapper(_partial_collection(tp2_collection, "tp", "pp"))
-        assert wrapper.inference_context.config.offset_sampling_seed_by_dp_rank
-
-        with forbid_global_process_groups():
-            with pytest.raises(ValueError, match="needs a data-parallel group"):
-                TextGenerationController(wrapper, SimpleNamespace(eod=0))
-
-    @pytest.mark.parametrize("seed_offset_off_by", ["config", "deterministic_mode"])
-    def test_unset_dp_is_allowed_without_seed_offset(self, tp2_collection, seed_offset_off_by):
-        wrapper = _wrapper(_partial_collection(tp2_collection, "tp", "pp"))
-        if seed_offset_off_by == "config":
-            wrapper.inference_context.config.offset_sampling_seed_by_dp_rank = False
-        else:
-            wrapper.model.config.deterministic_mode = True
-
-        with forbid_global_process_groups():
-            controller = TextGenerationController(wrapper, SimpleNamespace(eod=0))
-
-        assert controller.dp_group is None
-        seed = wrapper.model.config.inference_sampling_seed
-        assert controller.sampling_rng.initial_seed() == seed
 
 
 class _StubGroup:

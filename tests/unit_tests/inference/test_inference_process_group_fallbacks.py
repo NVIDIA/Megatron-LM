@@ -6,7 +6,8 @@
 components, and the pipeline helpers in `megatron.core.inference.communication_utils` take the
 caller's pipeline group. Each fallback to the global grid emits one `ProcessGroupFallbackWarning`.
 Callers that pass their groups never warn, and every read of the global grid raises while their
-code runs.
+code runs. A collection that lacks a group inference reads, or sets a group that inference runs
+collectives on to None, is rejected before any component uses it.
 """
 
 import contextlib
@@ -42,7 +43,11 @@ from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
 # The groups that inference reads from `InferenceConfig.pg_collection`.
-INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep")
+INFERENCE_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
+# The groups that inference runs collectives on; None would select the world group.
+COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
+# The groups whose None means that the axis is off.
+AXIS_GROUPS = ("ep", "cp", "expt_tp", "expt_dp")
 # The dynamic context and engine also read tp_ep. A configured collection may leave it unset; the
 # model's collection and the global fallback set it.
 RESOLVED_GROUPS = (*INFERENCE_GROUPS, "tp_ep")
@@ -145,6 +150,25 @@ def _check_single_fallback_warning(record, owner, argument):
 def _require_world_size_multiple_of(size):
     if Utils.world_size < size or Utils.world_size % size != 0:
         pytest.skip(f"needs a world size that is a multiple of {size}")
+
+
+# Passed to `_stand_in_collection` to leave a group unset.
+_ABSENT = object()
+
+
+def _stand_in_collection(**overrides):
+    """Return a collection that sets every group in `RESOLVED_GROUPS`, without creating any group.
+
+    The groups that inference runs collectives on are distinct stand-in objects, and the groups
+    whose axis may be off, tp_ep included, are None. An override replaces a group, and `_ABSENT`
+    leaves it unset.
+    """
+    groups = {name: object() for name in COMMUNICATION_GROUPS}
+    groups.update(dict.fromkeys((*AXIS_GROUPS, "tp_ep")))
+    groups.update(overrides)
+    return ProcessGroupCollection(
+        **{name: group for name, group in groups.items() if group is not _ABSENT}
+    )
 
 
 def _exchange_global_ranks(stage, num_stages, pp_group):
@@ -251,26 +275,29 @@ class TestInferenceConfigBoundary:
         assert pg_collection.dp is parallel_state.get_data_parallel_group(with_gtp_remat=False)
         assert pg_collection.mp is parallel_state.get_model_parallel_group()
         assert pg_collection.ep is parallel_state.get_expert_model_parallel_group()
+        assert pg_collection.cp is parallel_state.get_context_parallel_group()
+        assert pg_collection.expt_tp is parallel_state.get_expert_tensor_parallel_group()
+        assert pg_collection.expt_dp is parallel_state.get_expert_data_parallel_group(
+            with_gtp_remat=False
+        )
         assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_uses_collection_of_model(self):
-        # Every group that inference reads is set; None means the axis is off.
+        # Every group that inference reads, tp_ep included, is set; None means that an axis is off.
         model = torch.nn.Module()
-        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(RESOLVED_GROUPS))
+        model.pg_collection = _stand_in_collection()
         config = InferenceConfig()
 
         with forbid_global_process_groups(), no_fallback_warnings():
             assert config.resolve_pg_collection(model) is model.pg_collection
         assert config.pg_collection is model.pg_collection
 
-    # The second collection lacks only tp_ep, which would otherwise read as None (size 1).
-    @pytest.mark.parametrize("required_pgs", [["tp", "cp", "pp", "embd"], list(INFERENCE_GROUPS)])
-    def test_partial_model_collection_takes_the_fallback(self, required_pgs):
+    def test_partial_model_collection_takes_the_fallback(self):
         _require_world_size_multiple_of(2)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model = torch.nn.Module()
         model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=required_pgs
+            required_pgs=["tp", "cp", "pp", "embd"]
         )
         config = InferenceConfig()
 
@@ -280,17 +307,94 @@ class TestInferenceConfigBoundary:
         _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
         assert pg_collection is not model.pg_collection
         assert pg_collection.dp is parallel_state.get_data_parallel_group(with_gtp_remat=False)
+
+    def test_model_collection_without_context_and_expert_groups_takes_the_fallback(self):
+        # The disaggregated coordinator setup reads cp and expt_tp, and the Dynamo engine service
+        # reads expt_dp; a model collection without them would leave those reads at None.
+        Utils.initialize_model_parallel()
+        model = torch.nn.Module()
+        model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "pp", "dp", "mp", "ep"]
+        )
+        config = InferenceConfig()
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            pg_collection = config.resolve_pg_collection(model)
+
+        _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
+        assert pg_collection is not model.pg_collection
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
+
+    def test_model_collection_without_tp_ep_takes_the_fallback(self):
+        # The dynamic context and engine read tp_ep, the group that the MoE dispatchers span; a
+        # model collection without it would leave that read at None, which sizes the group to 1.
+        _require_world_size_multiple_of(2)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model = torch.nn.Module()
+        model.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=list(INFERENCE_GROUPS)
+        )
+        config = InferenceConfig()
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            pg_collection = config.resolve_pg_collection(model)
+
+        _check_single_fallback_warning(record, "InferenceConfig", "pg_collection")
+        assert pg_collection is not model.pg_collection
+        assert set(vars(pg_collection)) == set(RESOLVED_GROUPS)
         assert pg_collection.tp_ep is parallel_state.get_expert_tensor_and_model_parallel_group()
 
     def test_configured_collection_comes_first(self):
         # A configured collection is used as is, also without tp_ep.
-        configured = ProcessGroupCollection(**dict.fromkeys(INFERENCE_GROUPS))
+        configured = _stand_in_collection(tp_ep=_ABSENT)
         model = torch.nn.Module()
-        model.pg_collection = ProcessGroupCollection(**dict.fromkeys(RESOLVED_GROUPS))
+        model.pg_collection = _stand_in_collection()
         config = InferenceConfig(pg_collection=configured)
 
         with forbid_global_process_groups(), no_fallback_warnings():
             assert config.resolve_pg_collection(model) is configured
+
+    @pytest.mark.parametrize("value", [None, _ABSENT], ids=["none", "absent"])
+    @pytest.mark.parametrize("name", COMMUNICATION_GROUPS)
+    def test_configured_collection_requires_communication_groups(self, name, value):
+        # The dynamic engine broadcasts on dp and mp and then calls barrier(mp); a None group
+        # would make those world collectives, and a None tp or pp gives every rank rank 0.
+        config = InferenceConfig(pg_collection=_stand_in_collection(**{name: value}))
+
+        with forbid_global_process_groups(), no_fallback_warnings():
+            with pytest.raises(
+                ValueError, match=rf"InferenceConfig requires pg_collection to set {name}\b"
+            ):
+                config.resolve_pg_collection()
+
+    @pytest.mark.parametrize("name", AXIS_GROUPS)
+    def test_configured_collection_requires_every_group_inference_reads(self, name):
+        config = InferenceConfig(pg_collection=_stand_in_collection(**{name: _ABSENT}))
+
+        with forbid_global_process_groups(), no_fallback_warnings():
+            with pytest.raises(
+                ValueError, match=rf"InferenceConfig requires pg_collection to set {name}\."
+            ):
+                config.resolve_pg_collection()
+
+    def test_configured_collection_rejects_non_member_groups(self):
+        non_member = torch.distributed.GroupMember.NON_GROUP_MEMBER
+        config = InferenceConfig(pg_collection=_stand_in_collection(mp=non_member))
+
+        with forbid_global_process_groups(), no_fallback_warnings():
+            with pytest.raises(ValueError, match="sets mp to NON_GROUP_MEMBER"):
+                config.resolve_pg_collection()
+
+    def test_model_collection_with_none_mp_is_rejected(self):
+        model = torch.nn.Module()
+        model.pg_collection = _stand_in_collection(mp=None)
+        config = InferenceConfig()
+
+        with forbid_global_process_groups(), no_fallback_warnings():
+            with pytest.raises(ValueError, match="to set mp to a process group, not None"):
+                config.resolve_pg_collection(model)
+        # Nothing is stored, so a later call does not return the rejected collection.
+        assert config.pg_collection is None
 
 
 class TestComponentsShareOneCollection:
@@ -351,6 +455,42 @@ class TestComponentsShareOneCollection:
         assert wrapper.pp_group is pg_collection.pp
         assert controller.pp_group is pg_collection.pp
         assert controller.dp_group is pg_collection.dp
+
+    def test_dynamic_context_rejects_collection_without_mp(self):
+        # The engine built on this context would broadcast on mp and call barrier(mp); without mp
+        # both would run on the world group.
+        _require_world_size_multiple_of(2)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        groups = dict(
+            vars(
+                build_inference_pg_collection(
+                    Utils.world_size, tp_size=2, pp_size=1, cp_size=1, ep_size=1, expt_tp_size=1
+                )
+            )
+        )
+        del groups["mp"]
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=64,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            max_requests=8,
+            unified_memory_level=0,
+            pg_collection=ProcessGroupCollection(**groups),
+        )
+
+        with forbid_global_process_groups(), no_fallback_warnings():
+            with pytest.raises(
+                ValueError, match=r"InferenceConfig requires pg_collection to set mp\."
+            ):
+                DynamicInferenceContext(model_config, inference_config)
 
     def test_static_context_takes_collection_of_model(self):
         _require_world_size_multiple_of(2)
