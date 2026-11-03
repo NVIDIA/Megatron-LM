@@ -7,7 +7,7 @@ import warnings
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Sequence, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.inference_layers import (
         FusedTPHandoff,
         InferenceLayerNormColumnParallelLinear,
+        InferenceRowParallelLinear,
     )
 
 logger = logging.getLogger(__name__)
@@ -504,6 +505,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
+        # The sublayers whose residual add fused TP communication hands to their output
+        # projection (see _using_fused_tp_inference).
+        self._fused_tp_residual_sublayers = (
+            frozenset(
+                name
+                for name, (_, output_linear) in self._get_fused_tp_linears().items()
+                if output_linear is not None
+            )
+            if self.config.inference_fuse_tp_communication
+            else frozenset()
+        )
+
         # Split Hybrid mHC runs these base-layer norms through the wrapper's recompute manager.
         self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
         self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
@@ -702,7 +715,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 "without subclass-specific attention state."
             )
 
-        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference("self_attention")
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
@@ -832,7 +845,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
             )
 
-        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference("self_attention")
         if using_fused_tp_inference_kernel:
             # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
             # operation in attention's out_proj (linear_proj)
@@ -1037,7 +1050,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ``attn_state``. Base uses that state for an optional residual connection and
         otherwise performs the ordinary bias-dropout-add.
         """
-        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference("self_attention")
         residual_connection = self._get_self_attention_residual_connection(operation="write")
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
@@ -1462,7 +1475,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference("mlp")
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
@@ -1576,7 +1589,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             return self._legacy_forward_post_mlp(self, mlp_output_with_bias, residual)
 
-        using_fused_tp_inference_kernel = self._using_fused_tp_inference()
+        using_fused_tp_inference_kernel = self._using_fused_tp_inference("mlp")
 
         residual_connection = self._get_mlp_residual_connection(operation="write")
         recompute_context = (
@@ -1669,59 +1682,90 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def configure_fused_tp_inference(
         self,
-        qkv_fused_tp_handoff: Optional[FusedTPHandoff] = None,
-        fc2_next_layer_norm_weights: Optional[Tensor] = None,
+        input_fused_tp_handoff: Optional[FusedTPHandoff] = None,
+        next_layer_norm_weights: Optional[Tensor] = None,
     ):
         """
         Configure settings for fused TP communication in inference mode.
 
+        The fused kernel of an output projection applies the input norm of the linear that
+        reads its output, which then takes its input from symmetric memory when the
+        projection's handoff records that the kernel ran. Within the layer, attention's
+        linear_proj feeds the MLP's linear_fc1. A hybrid attention-only or MLP-only layer has
+        one of the two sublayers, which both takes the layer's input and gives its output.
+
         Args:
-            qkv_fused_tp_handoff (Optional[FusedTPHandoff]): Previous layer's MLP FC2
-                handoff, which records whether it applied linear_qkv's norm and all-gather.
-            fc2_next_layer_norm_weights (Optional[Tensor]): Next layer's QKV norm weights
-                for current layer's MLP FC2, or None if nothing after FC2 can take its
-                input from the fused kernel (last layer, or a next layer without a fusable
-                linear_qkv, such as MLA). FC2 then reduce-scatters and adds the residual.
+            input_fused_tp_handoff (Optional[FusedTPHandoff]): Previous layer's output handoff
+                (see get_fused_tp_output_handoff), for the linear that applies this layer's
+                input norm.
+            next_layer_norm_weights (Optional[Tensor]): Next layer's input norm weights (see
+                get_fused_tp_input_norm_weights) for this layer's last output projection, or
+                None if nothing after it can take its input from the fused kernel (last
+                layer, or a next layer that applies its own input norm, such as MLA). That
+                projection then reduce-scatters and adds the residual.
         """
-        # Only a fusable linear_qkv can take its input norm and all-gather over from the
-        # previous layer's FC2. Otherwise (e.g. MLA) get_qkv_layer_norm_weights gives that
-        # FC2 no weights and this layer applies its own input norm.
-        linear_qkv = self._get_fusable_linear_qkv()
-        if linear_qkv is not None:
-            linear_qkv.fused_tp_handoff = qkv_fused_tp_handoff
+        sublayers = list(self._get_fused_tp_linears().values())
+        handoff = input_fused_tp_handoff
+        for i, (input_linear, output_linear) in enumerate(sublayers):
+            if input_linear is not None:
+                input_linear.fused_tp_handoff = handoff
+            if i + 1 < len(sublayers):
+                next_input_linear = sublayers[i + 1][0]
+                weights = (
+                    next_input_linear.layer_norm_weight.data
+                    if next_input_linear is not None
+                    else None
+                )
+            else:
+                weights = next_layer_norm_weights
+            if output_linear is not None:
+                output_linear._set_next_layer_norm_weights(weights)
+                handoff = output_linear.fused_tp_handoff
+            else:
+                # The sublayer adds its residual itself, so what follows applies its own norm.
+                handoff = None
 
-        # Use current layer's own MLP FC1 norm weights for attention's/mixer's out_proj
-        mlp_fc1_weights = self.get_mlp_layer_norm_weights()
-        self._set_proj_next_layer_norm_weights(mlp_fc1_weights)
+    def get_fused_tp_input_norm_weights(self) -> Optional[Tensor]:
+        """
+        Get the norm weights of the linear that applies this layer's input norm (linear_qkv,
+        or linear_fc1 in an MLP-only layer), for the previous layer's fused kernel.
 
-        self.mlp.linear_fc1.fused_tp_handoff = self.self_attention.linear_proj.fused_tp_handoff
-        # Use next layer's attention norm weights for current layer's MLP FC2
-        self._set_fc2_next_layer_norm_weights(fc2_next_layer_norm_weights)
+        Returns:
+            Optional[Tensor]: The layer norm weight data, or None if the previous layer
+                cannot apply this layer's input norm (see _get_fused_tp_linears).
+        """
+        sublayers = list(self._get_fused_tp_linears().values())
+        input_linear = sublayers[0][0] if sublayers else None
+        return input_linear.layer_norm_weight.data if input_linear is not None else None
 
-    def get_fc2_fused_tp_handoff(self) -> FusedTPHandoff:
-        """Get the MLP FC2 handoff for the next layer's QKV."""
-        return self.mlp.linear_fc2.fused_tp_handoff
+    def get_fused_tp_output_handoff(self) -> Optional[FusedTPHandoff]:
+        """
+        Get the handoff of the projection that gives this layer's output (linear_fc2, or
+        linear_proj in an attention-only layer), for the next layer's input.
 
-    def _using_fused_tp_inference(self) -> bool:
-        """Whether attention's linear_proj and MLP's linear_fc2 own the residual adds.
+        Returns:
+            Optional[FusedTPHandoff]: The handoff, or None if the layer adds its last residual
+                itself (see _get_fused_tp_linears), so the next layer applies its own norm.
+        """
+        sublayers = list(self._get_fused_tp_linears().values())
+        output_linear = sublayers[-1][1] if sublayers else None
+        return output_linear.fused_tp_handoff if output_linear is not None else None
 
-        With fused TP communication they do in inference, but only in eval mode: in
-        training mode the inference linears run their training path, so the layer keeps
-        its own bias-dropout-add even while InferenceMode is active.
+    def _using_fused_tp_inference(self, sublayer: str) -> bool:
+        """Whether the output projection of ``sublayer`` ("self_attention" or "mlp") owns its
+        residual add.
+
+        With fused TP communication it does in inference if it is an InferenceRowParallelLinear
+        (see _get_fused_tp_linears), but only in eval mode: in training mode the inference
+        linears run their training path, so the layer keeps its own bias-dropout-add even
+        while InferenceMode is active.
         """
         return (
             self.config.inference_fuse_tp_communication
             and InferenceMode.is_active()
             and not self.training
+            and sublayer in self._fused_tp_residual_sublayers
         )
-
-    def _set_proj_next_layer_norm_weights(self, weights: Tensor):
-        """Set next layer norm weights for attention/mixer's linear_proj."""
-        self.self_attention.linear_proj._set_next_layer_norm_weights(weights)
-
-    def _set_fc2_next_layer_norm_weights(self, weights: Optional[Tensor]):
-        """Set next layer norm weights for MLP FC2 (None: reduce-scatter and residual add)."""
-        self.mlp.linear_fc2._set_next_layer_norm_weights(weights)
 
     def _set_proj_residual(self, residual: Tensor):
         """Set residual for attention's/mixer's out_proj (linear_proj)."""
@@ -1745,34 +1789,63 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Get the QKV layer norm weights.
 
         Returns:
-            Optional[Tensor]: The layer norm weight data, or None if the previous layer's
-                FC2 cannot apply this layer's input norm (see _get_fusable_linear_qkv).
+            Optional[Tensor]: The layer norm weight data, or None if the previous layer
+                cannot apply this layer's attention input norm (see _get_fused_tp_linears).
         """
-        linear_qkv = self._get_fusable_linear_qkv()
+        linear_qkv, _ = self._get_fused_tp_linears().get("self_attention", (None, None))
         return linear_qkv.layer_norm_weight.data if linear_qkv is not None else None
 
-    def _get_fusable_linear_qkv(self) -> Optional[InferenceLayerNormColumnParallelLinear]:
+    def _get_fused_tp_linears(
+        self,
+    ) -> dict[
+        str,
+        tuple[
+            Optional[InferenceLayerNormColumnParallelLinear], Optional[InferenceRowParallelLinear]
+        ],
+    ]:
         """
-        Get the attention's linear_qkv if the previous layer's FC2 can fuse its input norm
-        and all-gather. That holds only for an InferenceLayerNormColumnParallelLinear: in
+        Get the linears that fused TP communication works through, for each residual sublayer.
+
+        For self-attention and then the MLP, unless an IdentityOp stands in for it (as in
+        hybrid attention-only and MLP-only layers): the linear that applies the sublayer's
+        input norm (linear_qkv, linear_fc1) and its output projection (linear_proj,
+        linear_fc2).
+
+        The input linear is kept only if it is an InferenceLayerNormColumnParallelLinear: in
         inference it applies the same RMSNorm (layer_norm_weight, layernorm_epsilon) as the
         fused kernel, and reads its input from symmetric memory when its fused_tp_handoff
-        says the kernel ran.
-
-        Other attention inputs apply their own norm. For example, MLA has no linear_qkv: its
-        input_layernorm is a separate module, and its down projections take the normalized
-        sequence-parallel shard, not the all-gathered input.
+        says the kernel ran. The output projection is kept only if it is an
+        InferenceRowParallelLinear, which adds a residual handed to it, fused or not. Other
+        sublayers apply their own input norm or add their own residual. For example, MLA has
+        no linear_qkv: its input_layernorm is a separate module, and its down projections take
+        the normalized sequence-parallel shard, not the all-gathered input. GDN has neither:
+        its in_proj and out_proj are its own.
 
         Returns:
-            Optional[InferenceLayerNormColumnParallelLinear]: linear_qkv, or None.
+            dict: (input linear or None, output projection or None) by sublayer
+                attribute name ("self_attention", "mlp"), in execution order.
         """
         # Import here to avoid a circular import.
         from megatron.core.tensor_parallel import inference_layers
 
-        linear_qkv = getattr(self.self_attention, "linear_qkv", None)
-        if isinstance(linear_qkv, inference_layers.InferenceLayerNormColumnParallelLinear):
-            return linear_qkv
-        return None
+        linears = {}
+        for name, input_name, output_name in (
+            ("self_attention", "linear_qkv", "linear_proj"),
+            ("mlp", "linear_fc1", "linear_fc2"),
+        ):
+            sublayer = getattr(self, name)
+            if isinstance(sublayer, IdentityOp):
+                continue
+            input_linear = getattr(sublayer, input_name, None)
+            if not isinstance(
+                input_linear, inference_layers.InferenceLayerNormColumnParallelLinear
+            ):
+                input_linear = None
+            output_linear = getattr(sublayer, output_name, None)
+            if not isinstance(output_linear, inference_layers.InferenceRowParallelLinear):
+                output_linear = None
+            linears[name] = (input_linear, output_linear)
+        return linears
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -2276,6 +2349,47 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             List[Tensor]: A list of layernorm weight tensors.
         """
         return
+
+
+def configure_fused_tp_inference_for_layers(layers: Sequence[torch.nn.Module]) -> None:
+    """Set up fused TP communication in inference mode for layers that run back to back.
+
+    We have a fused reduce-scatter + add + layer-norm + all-gather operation, called from
+    within row parallel linear layers. Its layer-norm is the input norm of the column parallel
+    linear that reads the output, so each TransformerLayer's last output projection gets the
+    next layer's input norm weights, and the next layer gets the handoff that records whether
+    the kernel ran. A layer of another kind (e.g. a hybrid stack's MambaLayer) applies its own
+    input norm and adds its own residual, so no fusion crosses it.
+
+    Args:
+        layers (Sequence[torch.nn.Module]): The layers, in the order they run, with nothing
+            changing the hidden states between them.
+    """
+    for i, layer in enumerate(layers):
+        if not isinstance(layer, TransformerLayer):
+            continue
+
+        next_layer = layers[i + 1] if i + 1 < len(layers) else None
+        if isinstance(next_layer, TransformerLayer):
+            next_layer_norm_weights = next_layer.get_fused_tp_input_norm_weights()
+        else:
+            next_layer_norm_weights = None
+
+        # Let this layer take its input from the previous layer's output projection only if
+        # both layers are always replayed from CUDA graphs together or run eagerly together:
+        # the projection records whether it fused only when its Python runs.
+        prev_layer = layers[i - 1] if i > 0 else None
+        if isinstance(prev_layer, TransformerLayer) and hasattr(
+            prev_layer, "cudagraph_manager"
+        ) == hasattr(layer, "cudagraph_manager"):
+            input_fused_tp_handoff = prev_layer.get_fused_tp_output_handoff()
+        else:
+            input_fused_tp_handoff = None
+
+        layer.configure_fused_tp_inference(
+            input_fused_tp_handoff=input_fused_tp_handoff,
+            next_layer_norm_weights=next_layer_norm_weights,
+        )
 
 
 class MoETransformerLayer(TransformerLayer):

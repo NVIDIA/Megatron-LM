@@ -54,7 +54,10 @@ from megatron.core.transformer.residual_recompute import (
     finalize_recompute_block,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    configure_fused_tp_inference_for_layers,
+)
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
@@ -432,6 +435,13 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+        # A layer can take its input from the previous layer's fused reduce-scatter + add +
+        # norm + all-gather only if no context-parallel layout conversion runs between them.
+        if self.config.inference_fuse_tp_communication and (
+            self._cp_layout_manager is None or not self._cp_layout_manager.requires_conversion
+        ):
+            configure_fused_tp_inference_for_layers(self.layers)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
