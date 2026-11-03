@@ -1271,7 +1271,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "deterministic_mode=False runs the fused Triton kernels (fixed tiles, fixed-order "
         "partial sums, no atomics, no autotuning) around cuBLAS GEMMs; deterministic_mode=True "
         "keeps the torch.compile path. Both are replayed forward and backward, at kernel "
-        "level and through GatedResidualModule.",
+        "level and through GatedResidualModule, including the residual gradient the "
+        "write-back hands to the gates' backward and, with gradient-accumulation fusion, "
+        "the parameter gradients accumulated into main_grad.",
     ),
     # ==== end of the Qwen3.8-Flash-Next stack ====
 )

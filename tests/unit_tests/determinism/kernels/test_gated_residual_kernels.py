@@ -173,3 +173,25 @@ class TestGatedResidualModule:
         )
         assert len(outputs) == 1
         assert len(grads) == 4 + 2  # gamma, down, up, inject; hidden states, sublayer output
+
+    @needs_triton
+    def test_sublayer_main_grad_accumulation_replays(self):
+        """Gradient-accumulation fusion: the backward adds every parameter gradient into
+        ``main_grad`` (the harness zeroes the buffers between replays and compares them)."""
+        sublayer, inputs, grad_output = self._sublayer(deterministic_mode=False)
+        sublayer.gate.config.gradient_accumulation_fusion = True
+        for param in sublayer.parameters():
+            param.main_grad = torch.zeros(param.shape, device="cuda", dtype=torch.float32)
+            param.grad_added_to_main_grad = False
+        _, grads = assert_module_replays_bit_exact(
+            sublayer,
+            inputs,
+            replays=4,
+            grad_output=grad_output,
+            contention=True,
+            what="GatedResidualModule main_grad accumulation",
+        )
+        assert len(grads) == 4 + 2
+        for name, param in sublayer.named_parameters():
+            assert param.grad_added_to_main_grad, name
+            assert param.main_grad.abs().max().item() > 0, name
