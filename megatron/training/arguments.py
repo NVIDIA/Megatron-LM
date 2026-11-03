@@ -1066,7 +1066,7 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        if args.nccl_ub:
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
             args.fsdp_manual_registration = True
