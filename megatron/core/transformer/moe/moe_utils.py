@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -65,6 +65,22 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, False, None, None)
     fused_topk_with_score_function_supports_qb = False
+
+
+class IdentityWithBackwardCallback(torch.autograd.Function):
+    """Identity op whose backward calls ``callback(grad_output)`` before passing it through."""
+
+    @staticmethod
+    def forward(
+        ctx, tensor: torch.Tensor, callback: Callable[[torch.Tensor], None]
+    ) -> torch.Tensor:
+        ctx.callback = callback
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        ctx.callback(grad_output)
+        return grad_output, None
 
 
 def switch_load_balancing_loss_func(

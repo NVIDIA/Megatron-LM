@@ -47,6 +47,7 @@ from megatron.core.transformer.mlp import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    IdentityWithBackwardCallback,
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
@@ -915,6 +916,33 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_pre_hook
 
+    def _fused_impl_backward_pre_hook_modules(self) -> list[torch.nn.Module]:
+        """Submodules whose backward pre-hooks the fused backward must emulate."""
+        return [
+            submodule
+            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules())
+            if submodule._backward_pre_hooks
+        ]
+
+    def _replay_fused_impl_backward_pre_hooks(self, grad_output: torch.Tensor) -> None:
+        """Call the submodules' backward pre-hooks, which the fused backward bypasses."""
+        for submodule in self._fused_impl_backward_pre_hook_modules():
+            for hook in list(submodule._backward_pre_hooks.values()):
+                if hook(submodule, (grad_output,)) is not None:
+                    raise RuntimeError(
+                        f"Applying a fused implementation for {self.__class__.__name__}, "
+                        f"but a {submodule.__class__.__name__} submodule "
+                        "has a backward pre-hook that modifies the output gradient."
+                    )
+
+    def _attach_fused_impl_backward_pre_hooks(self, output: torch.Tensor) -> torch.Tensor:
+        """Make the fused output's backward replay submodule backward pre-hooks first."""
+        if not output.requires_grad or not self._fused_impl_backward_pre_hook_modules():
+            return output
+        return IdentityWithBackwardCallback.apply(
+            output, self._replay_fused_impl_backward_pre_hooks
+        )
+
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:
         """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
@@ -1064,7 +1092,8 @@ class TEGroupedMLP(MegatronModule):
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
-        return output
+        # The last forward op, so its backward runs before any fused backward step.
+        return self._attach_fused_impl_backward_pre_hooks(output)
 
     @staticmethod
     def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
