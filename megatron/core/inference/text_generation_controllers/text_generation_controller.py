@@ -411,6 +411,9 @@ class TextGenerationController(MTPControllerMixin):
         else:
             self._all_logits_cuda = None
         self._async_sched_forward = AsyncScheduleForwardState()
+        # Whether the last base forward a step launched processed only the bounded MoE rows; its
+        # MTP commit pass keeps that bound (see _dynamic_step_forward_logits).
+        self._base_forward_bounded_moe_rows = False
         # This buffer has a stable address across legacy, no-overlap, overlap,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -939,6 +942,12 @@ class TextGenerationController(MTPControllerMixin):
         """
         context = self.inference_wrapped_model.inference_context
         InferenceMode.set_bounded_mxfp8_rows(context.use_bounded_mxfp8_rows)
+        if not context.is_creating_cuda_graphs:
+            # This forward's MTP commit pass runs after it, or at the next step's entry with async
+            # scheduling, and an idle peer's dummy step mirrors it with its own base forward's
+            # bound. A CUDA graph capture or an engine resume can change the flag above in
+            # between, so the commit passes keep this one.
+            self._base_forward_bounded_moe_rows = context.use_bounded_mxfp8_rows
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:

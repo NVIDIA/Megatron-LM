@@ -293,10 +293,21 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
         Utils.destroy_model_parallel()
 
     @classmethod
-    def _run(cls, agreed, prompt_lengths, num_tokens_to_generate=4, **config):
-        """Run the prompts to completion. Returns the context's state before every step, the
-        hidden-chunk state seen by every idle dummy base step, and every launch as (its step,
-        the step's vote, whether the launch is decode-only)."""
+    def _run(
+        cls,
+        agreed,
+        prompt_lengths,
+        num_tokens_to_generate=4,
+        refused_chunk_steps=(),
+        dummy_steps=None,
+        **config,
+    ):
+        """Run the prompts to completion, refusing to continue a chunked prefill in the steps
+        `refused_chunk_steps`. Returns the context's state before every step, the hidden-chunk
+        state seen by every idle dummy base step, and every launch as (its step, the step's
+        vote, whether the launch is decode-only). The dummy step of a step that launches no
+        forward is appended to `dummy_steps`, if given, as (its step, the requests the context
+        holds before it, its forward's rows, the requests the context holds after it)."""
         env = cls._build_test_env(
             _DynamicEngineTestConfig(
                 num_requests=0,
@@ -348,6 +359,47 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
             context.agree_on_moe_decode_only = record_vote
             context.initialize_attention_state = record_launch
         assert context.moe_step_phase_is_agreed == agreed
+
+        if refused_chunk_steps:
+            # As when the continuing chunk gets no KV block or token budget in that step.
+            can_schedule_chunk = engine._can_schedule_chunked_prefill
+            engine._can_schedule_chunked_prefill = lambda req: (
+                len(trace) - 1 not in refused_chunk_steps and can_schedule_chunk(req)
+            )
+
+        if dummy_steps is not None:
+            run_dummy_step = controller._run_dummy_step
+            dummy_block = context.kv_block_allocator.dummy_block_idx
+
+            def held_requests():
+                """The request count, the chunk, and the first request row's KV blocks."""
+                return (
+                    context.total_request_count,
+                    context.chunked_prefill_request_id,
+                    context.request_to_kv_block_ids[0].tolist(),
+                )
+
+            def record_dummy_step():
+                before, forward_rows = held_requests(), []
+                end_dummy_step = context.end_expert_parallel_dummy_step
+
+                def record_end_dummy_step():
+                    # The dummy forward's request count, and whether row 0 is its dummy row.
+                    forward_rows.append(
+                        (
+                            context.total_request_count,
+                            context.request_to_kv_block_ids[0, 0].item() == dummy_block,
+                        )
+                    )
+                    end_dummy_step()
+
+                with mock.patch.object(
+                    context, "end_expert_parallel_dummy_step", record_end_dummy_step
+                ):
+                    run_dummy_step()
+                dummy_steps.append((len(trace) - 1, before, forward_rows, held_requests()))
+
+            controller._run_dummy_step = record_dummy_step
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
@@ -426,6 +478,43 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
         paused_steps = {step for step, (_, _, paused, *_) in enumerate(trace) if paused}
         paused_votes = [vote for step, vote, _ in launches if step in paused_steps]
         assert paused_votes and all(paused_votes)
+
+    @torch.inference_mode()
+    def test_step_that_cannot_continue_its_chunk_runs_a_dummy_step(self):
+        """A step whose only work is a hidden chunk that cannot continue launches no forward, so
+        it runs a dummy step for its tp_ep peers. The chunk's continuation is refused in two
+        steps: the first still updates the pending chunk and runs the idle dummy base step; the
+        second has nothing pending and runs the dummy step. That step sets the chunk aside for
+        its dummy row and gives back its row, count and KV blocks; its launch binds to the
+        decode-only vote the step cast; and the chunk then continues as without the agreement."""
+        refused = (2, 3)
+        expected, _, _ = self._run(
+            False, [256], refused_chunk_steps=refused, enable_chunked_prefill=True
+        )
+        dummy_steps = []
+        trace, dummy_base_steps, launches = self._run(
+            True,
+            [256],
+            refused_chunk_steps=refused,
+            dummy_steps=dummy_steps,
+            enable_chunked_prefill=True,
+        )
+        assert trace == expected
+        # The chunks run in steps 0, 1, 4 and 5; admitting the last one ends the chunked prefill.
+        assert [chunk for chunk, *_ in trace[:7]] == [-1, 0, 0, 0, 0, 0, -1]
+        assert dummy_base_steps[0] == 0
+        ((before, forward_rows, after),) = [
+            held for step, *held in dummy_steps if step == refused[1]
+        ]
+        # Only the hidden chunk was held: no active request, the chunk's id, its blocks on row 0.
+        assert before[:2] == (0, 0) and before[2][0] >= 0
+        assert forward_rows == [(1, True)]
+        assert after == before
+        assert [launch for launch in launches if launch[0] in refused] == [
+            (2, False, True),
+            (3, True, True),
+        ]
+        self._assert_votes_bind(launches)
 
 
 @pytest.mark.parametrize(

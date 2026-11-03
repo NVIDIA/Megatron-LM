@@ -224,6 +224,7 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
     controller._is_last_pp_stage = True
     controller.model_is_pipeline_parallel = False
     controller._mtp_resolved_padded_count = None
+    controller._base_forward_bounded_moe_rows = False
     controller._accepted_token_counts_per_request = torch.zeros(
         MAX_REQUESTS, dtype=torch.int64, device=DEVICE
     )
@@ -1510,6 +1511,65 @@ class TestExpertParallelForwardParity:
         drafts = bounds[1:]
         assert drafts and all(kind == "draft" and bounded for kind, bounded, _ in drafts)
         assert all(key[-1] is True for _, _, key in drafts)
+
+    @pytest.mark.parametrize("base_bounded", [False, True])
+    @pytest.mark.parametrize("dummy", [False, True])
+    def test_commit_pass_keeps_its_base_forward_bound_after_a_graph_capture(
+        self, dummy, base_bounded
+    ):
+        """With async scheduling a forward's commit pass runs at the next step's entry. A CUDA
+        graph capture before it leaves InferenceMode's flag at the last captured graph's bound,
+        but the commit pass, and an idle rank's dummy one mirroring it, keep the bound of their
+        step's base forward: a prefill's prompt rows are never cut to a decode graph's bounded
+        rows."""
+        if dummy:
+            context = _make_context(num_decode_requests=0)
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model)
+            controller.model_config.expert_model_parallel_size = 2
+        elif base_bounded:
+            controller, model, context, _ = _build_step(num_decode_requests=2, accepted=(2, 1))
+            base_position = torch.tensor([10, 12], device=DEVICE)
+        else:
+            # A pending prefill, whose commit pass seeds its prompt's draft KV.
+            controller, model, context, _ = _build_step(prefill=((4, 0, 200),))
+            base_position = torch.tensor([4], device=DEVICE)
+        # The step's base forward and the capture run the controller's forward on a stub model.
+        context.config = SimpleNamespace(materialize_only_last_token_logits=True)
+        context.num_last_token_logits = 1
+        context.has_vlm_data = False
+        controller._enable_cuda_graph = False
+        controller._select_async_sched_routing_buffer = lambda: None
+        controller.inference_wrapped_model.run_one_forward_step = lambda inference_input: (
+            torch.zeros((1, 1, VOCAB_SIZE), device=DEVICE)
+        )
+        tokens = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
+        commit_bounds = []
+        layer = model.mtp.layers[0]
+        commit_step = layer.forward_single_position
+        layer.forward_single_position = lambda **kwargs: (
+            commit_bounds.append(InferenceMode.use_bounded_mxfp8_rows()),
+            commit_step(**kwargs),
+        )[1]
+
+        with InferenceMode.active():
+            for bounded, capturing in ((base_bounded, False), (not base_bounded, True)):
+                context.use_bounded_mxfp8_rows = bounded
+                context.is_creating_cuda_graphs = capturing
+                controller._dynamic_step_forward_logits(tokens, tokens)
+            assert InferenceMode.use_bounded_mxfp8_rows() == (not base_bounded)
+            if dummy:
+                controller._run_dummy_serial_mtp_forward()
+            else:
+                controller._compute_serial_mtp_and_sample(base_position=base_position)
+
+        assert commit_bounds == [base_bounded]
 
     def test_dummy_rank_matches_a_real_rank_whose_commit_pass_was_empty(self):
         """All drafts rejected: the real rank runs a dummy slot, so the count still matches."""

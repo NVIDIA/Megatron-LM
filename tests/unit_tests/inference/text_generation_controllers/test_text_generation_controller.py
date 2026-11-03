@@ -1181,9 +1181,11 @@ def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
 
 @pytest.mark.parametrize("bounded", [False, True])
 def test_dynamic_step_forward_takes_bounded_moe_rows_from_the_context(bounded):
-    """The forward uses the bounded MoE rows exactly when the context decided so this step."""
+    """The forward uses the bounded MoE rows exactly when the context decided so this step, and
+    keeps that bound for its MTP commit pass."""
     context = _make_async_sched_context()
     context.use_bounded_mxfp8_rows = bounded
+    context.is_creating_cuda_graphs = False
     context.num_last_token_logits = 2
     context.has_vlm_data = False
     controller = _make_async_sched_controller(context)
@@ -1202,6 +1204,7 @@ def test_dynamic_step_forward_takes_bounded_moe_rows_from_the_context(bounded):
         controller._dynamic_step_forward_logits(tokens, tokens)
 
     assert seen == [bounded]
+    assert controller._base_forward_bounded_moe_rows is bounded
 
 
 def test_async_sched_router_returns_empty_result_without_active_requests():

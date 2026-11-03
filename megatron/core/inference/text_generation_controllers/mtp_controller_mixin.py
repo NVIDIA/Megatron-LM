@@ -511,18 +511,21 @@ class MTPControllerMixin:
         # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
         # last PP stage, where the gathered decoder hidden states exist.
         if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            issued_slot = self._mtp_commit_pass(
-                context,
-                unwrapped_model,
-                hidden_states,
-                num_decode_requests=active_request_count - context.num_prefill_requests,
-                active_request_count=active_request_count,
-                base_position=base_position,
-            )
-            if not issued_slot:
-                # EP consistency: every rank runs exactly one commit-pass forward per step (real
-                # above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+            # The commit pass's rows can be a prompt's, so it keeps the MoE row bound of the base
+            # forward it commits, whatever the flag holds now.
+            with InferenceMode.bounded_mxfp8_rows(self._base_forward_bounded_moe_rows):
+                issued_slot = self._mtp_commit_pass(
+                    context,
+                    unwrapped_model,
+                    hidden_states,
+                    num_decode_requests=active_request_count - context.num_prefill_requests,
+                    active_request_count=active_request_count,
+                    base_position=base_position,
+                )
+                if not issued_slot:
+                    # EP consistency: every rank runs exactly one commit-pass forward per step
+                    # (real above, or this dummy) so the MoE all-to-alls stay count-matched.
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -753,7 +756,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                # Mirrors the peers' commit pass, which keeps the MoE row bound of their base
+                # forward; this rank's last base forward ran in the same step and agreed on it.
+                with InferenceMode.bounded_mxfp8_rows(self._base_forward_bounded_moe_rows):
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
