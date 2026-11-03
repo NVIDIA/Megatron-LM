@@ -657,7 +657,8 @@ class FsdpParameterGroup:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
-        has_sharded_grads = self._prepare_main_grad()
+        has_sharded_grads = self._has_sharded_grads()
+        self._clear_stale_main_grad(has_sharded_grads)
         current_stream = torch.cuda.current_stream(self.main_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
@@ -683,6 +684,11 @@ class FsdpParameterGroup:
         self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
+        """Whether installed .grad views select accumulation instead of overwrite.
+
+        zero_grad(True) removes those views; zero_grad(False) keeps them. After
+        the first contribution, both paths install views for later accumulation.
+        """
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
@@ -694,13 +700,9 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def _prepare_main_grad(self) -> bool:
-        """Clear stale storage and report whether this backward must accumulate."""
+    def _clear_stale_main_grad(self, has_sharded_grads: bool) -> None:
+        """Clear stale values before adding a new step's first contribution."""
         assert self.main_grad is not None
-        # Missing .grad fields select overwrite; installed .grad views select add.
-        # zero_grad(True) removes those views, while zero_grad(False) keeps them.
-        # After the first contribution, both paths install views for accumulation.
-        has_sharded_grads = self._has_sharded_grads()
         if self._main_grad_is_stale:
             # Final reduction left .grad pointing at the optimizer's view of main_grad.
             # In ZeRO-1/HFSDP that view can cover only part of the buffer. For example,
@@ -712,7 +714,6 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.zero_()
             # Later microbatches must preserve the contributions already accumulated.
             self._main_grad_is_stale = False
-        return has_sharded_grads
 
     def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
@@ -726,7 +727,8 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        has_sharded_grads = self._prepare_main_grad()
+        has_sharded_grads = self._has_sharded_grads()
+        self._clear_stale_main_grad(has_sharded_grads)
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):
