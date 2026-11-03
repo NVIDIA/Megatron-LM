@@ -3602,9 +3602,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
                     continue
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 

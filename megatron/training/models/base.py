@@ -4,8 +4,9 @@ import abc
 import functools
 import importlib
 import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -282,7 +283,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -297,10 +297,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: Legacy boolean spelling of
-                ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
-                layout and ``False`` the legacy layout. ``None`` (default) defers to
-                ``ddp_config``.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

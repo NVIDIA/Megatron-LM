@@ -13,41 +13,23 @@ _SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params"
 
 # Data-parallel layouts for the parameters owned by LayerWiseDistributedOptimizer. See
 # DistributedDataParallelConfig.layer_wise_param_layout.
-LAYER_WISE_PARAM_LAYOUTS = ("padded", "compact", "legacy")
+LAYER_WISE_PARAM_LAYOUTS = ("padded", "compact")
 
 
-def resolve_layer_wise_param_layout(
-    layer_wise_param_layout: Optional[str] = None,
-    use_layer_wise_param_layout: Optional[bool] = None,
-) -> str:
-    """Resolve a LayerWise layout request to one of ``LAYER_WISE_PARAM_LAYOUTS``.
-
-    ``layer_wise_param_layout`` names the strategy. ``use_layer_wise_param_layout`` is the
-    original boolean spelling: ``True`` selects ``"padded"`` and ``False`` keeps its historical
-    meaning, ``"legacy"``. The boolean never selects ``"compact"``. ``None`` leaves either input
-    unspecified, and the default is ``"padded"``.
+def resolve_layer_wise_param_layout(layer_wise_param_layout: Optional[str] = None) -> str:
+    """Return the LayerWise layout named by ``layer_wise_param_layout``; ``None`` is ``"padded"``.
 
     Raises:
-        ValueError: If the strategy is unknown or the two inputs request different layouts.
+        ValueError: If the layout is not one of ``LAYER_WISE_PARAM_LAYOUTS``.
     """
-    if (
-        layer_wise_param_layout is not None
-        and layer_wise_param_layout not in LAYER_WISE_PARAM_LAYOUTS
-    ):
+    if layer_wise_param_layout is None:
+        return "padded"
+    if layer_wise_param_layout not in LAYER_WISE_PARAM_LAYOUTS:
         raise ValueError(
             f"layer_wise_param_layout must be one of {list(LAYER_WISE_PARAM_LAYOUTS)}, "
             f"got {layer_wise_param_layout!r}."
         )
-    if use_layer_wise_param_layout is None:
-        return layer_wise_param_layout or "padded"
-    requested = "padded" if use_layer_wise_param_layout else "legacy"
-    if layer_wise_param_layout is not None and layer_wise_param_layout != requested:
-        raise ValueError(
-            f"use_layer_wise_param_layout={use_layer_wise_param_layout} selects the "
-            f"{requested!r} LayerWise layout, but layer_wise_param_layout="
-            f"{layer_wise_param_layout!r}. Set only layer_wise_param_layout."
-        )
-    return requested
+    return layer_wise_param_layout
 
 
 @dataclass
@@ -91,10 +73,9 @@ class DistributedDataParallelConfig:
          all-reduced, every matrix has one owner rank chosen identically on all ranks, and
          owners all-gather the updated matrices with uneven sizes. Other parameters are still
          sharded byte-wise by a separate DistributedOptimizer.
-       - ``"legacy"``: no distributed optimizer and no precomputed layout. All parameters,
-         including the ones that the scalar optimizer (e.g. Adam) updates, are owned whole by
-         LayerWiseDistributedOptimizer. This is the layout selected by the original
-         ``use_layer_wise_param_layout=False`` option.
+
+       The two layouts store the same optimizer state, so a ``torch_dist`` checkpoint saved
+       with one loads with the other.
     """
 
     check_for_nan_in_grad: bool = False
@@ -371,8 +352,8 @@ class DistributedDataParallelConfig:
 
         - No gather is needed because every DP rank runs the same optimizer update.
         - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens for the ``"compact"`` and ``"legacy"`` layouts when parameter-gather overlap and
-          MXFP8 grad-buffer reuse are disabled. Each rank updates only its assigned parameters,
+          happens for the ``"compact"`` layout when parameter-gather overlap and MXFP8
+          grad-buffer reuse are disabled. Each rank updates only its assigned parameters,
           then the optimizer calls ``allgather_params()`` synchronously after the step.
 
         Under the ``"compact"`` layout, DDP evaluates this property on the per-buffer config of
@@ -381,7 +362,7 @@ class DistributedDataParallelConfig:
         if self.use_distributed_optimizer:
             return True
 
-        # When standard DistOpt is disabled, these flags select the legacy LayerWise
+        # Without standard DistOpt (the compact LayerWise buffers), these flags select the
         # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 

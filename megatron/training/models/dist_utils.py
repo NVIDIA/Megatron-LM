@@ -57,7 +57,6 @@ def unimodal_build_distributed_models(
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -87,9 +86,6 @@ def unimodal_build_distributed_models(
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: Legacy boolean spelling of
-            ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
-            layout and ``False`` the legacy layout. ``None`` (default) defers to ``ddp_config``.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -127,7 +123,6 @@ def unimodal_build_distributed_models(
         data_parallel_random_init=data_parallel_random_init,
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-        use_layer_wise_param_layout=use_layer_wise_param_layout,
     )
 
 
@@ -143,7 +138,6 @@ def prepare_existing_model_chunks_for_distributed_training(
     data_parallel_random_init: bool = False,
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -163,9 +157,6 @@ def prepare_existing_model_chunks_for_distributed_training(
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: Legacy boolean spelling of
-            ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
-            layout and ``False`` the legacy layout. ``None`` (default) defers to ``ddp_config``.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -215,7 +206,6 @@ def prepare_existing_model_chunks_for_distributed_training(
             use_torch_fsdp2=use_torch_fsdp2,
             pg_collection=pg_collection,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
     return model_list
@@ -279,7 +269,6 @@ def _ddp_wrap(
     *,
     pg_collection: ProcessGroupCollection,
     use_layer_wise_distributed_optimizer: bool = False,
-    use_layer_wise_param_layout: bool | None = None,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -293,10 +282,6 @@ def _ddp_wrap(
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: Legacy boolean spelling of
-            ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
-            layout and ``False`` the legacy ``allgather_params`` path. ``None`` (default)
-            defers to ``ddp_config``; a conflicting request raises ``ValueError``.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -338,7 +323,6 @@ def _ddp_wrap(
             model,
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl

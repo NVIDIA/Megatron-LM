@@ -62,6 +62,9 @@ class TestLayerWiseOptimizerCommonStateDict:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             mock_args.use_distributed_optimizer = False
+            # dist_muon chains a DistributedOptimizer next to LayerWise; the checkpoint metadata
+            # must name its sharding type.
+            mock_args.use_layer_wise_distributed_optimizer = optimizer_type == 'dist_muon'
             mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A

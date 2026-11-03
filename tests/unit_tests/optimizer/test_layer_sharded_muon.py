@@ -737,17 +737,19 @@ class _DenseAndExperts(torch.nn.Module):
 def _layer_wise_muon(ns_batch_size, nesterov):
     """TP1, expert TP1 and no GTP_remat (every domain one rank), with layer-sharded Muon
     for both dense and expert buckets."""
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed import DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer import TransformerConfig
+    from megatron.training.training import wrap_model_chunks_with_ddp
 
     torch.manual_seed(_SEED + 900)
-    model = DistributedDataParallel(
+    model = wrap_model_chunks_with_ddp(
+        [_DenseAndExperts(n_experts=64).bfloat16().cuda()],  # >= 4 per shape per rank at DP 8
         TransformerConfig(num_attention_heads=1, num_layers=1),
-        DistributedDataParallelConfig(use_distributed_optimizer=False),
-        _DenseAndExperts(n_experts=64).bfloat16().cuda(),  # >= 4 per shape per rank at DP 8
-    )
+        DistributedDataParallelConfig(layer_wise_param_layout='compact'),
+        use_layer_wise_distributed_optimizer=True,
+    )[0]
     config = OptimizerConfig(
         optimizer='muon',
         lr=1e-2,

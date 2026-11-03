@@ -143,9 +143,13 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = torch.nn.Module()
         model.config = SimpleNamespace(num_attention_heads=1, num_query_groups=1, kv_channels=4)
+        # A model wrapped for the compact LayerWise layout: every weight is a LayerWise matrix.
         model.ddp_config = SimpleNamespace(
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=True,
+            layer_wise_param_layout='compact',
+            num_distributed_optimizer_instances=1,
             overlap_param_gather=False,
+            reuse_grad_buf_for_mxfp8_param_ag=False,
             param_sync_via_bucket_group=False,
         )
         model.weights = torch.nn.ParameterList(
@@ -153,6 +157,7 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         )
         for index, param in enumerate(model.weights):
             param.allreduce = not (expert and index % 2)
+            param.is_managed_by_layer_wise_optimizer = True
         config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,

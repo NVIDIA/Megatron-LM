@@ -1449,7 +1449,8 @@ def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, co
     args = parser.parse_args([])
     args.micro_batch_size = 1
     args.global_batch_size = 1
-    args.ckpt_format = "torch"
+    # The step-overlap path needs the torch format; the layer-wise optimizer rejects it.
+    args.ckpt_format = "torch" if constraint == "vpp" else "torch_dist"
     args.use_distributed_optimizer = True
     args.optimizer = "adam" if constraint == "vpp" else "muon"
     args.overlap_param_gather = constraint == "vpp"
@@ -1477,7 +1478,6 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
     args.use_distributed_optimizer = True
     args.use_gloo_process_groups = False
     args.ckpt_format = "torch"
-    args.use_layer_wise_param_layout = False
     with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
         validate_args(args)
 

@@ -59,3 +59,24 @@ The following figures show the sharding scheme and the main steps of the paramet
 - Call all-gather on each DP rank.
 - The parameter buffer now contains all 16 updated `bf16` model parameter elements. Parameters in PyTorch modules already point to the correct views in this buffer, so forward passes can start after the all-gather completes.
 - At this point, you can zero the gradient buffer for the next iteration.
+
+## Layer-Wise Distributed Optimizer
+
+Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
+
+`--layer-wise-param-layout` selects how the Muon-managed matrices are laid out across data-parallel ranks:
+
+| Layout | Gradient reduction | Parameter gather | Buffers |
+| ------ | ------ | ------ | ------ |
+| `padded` (default) | reduce-scatter | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
+| `compact` | all-reduce | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. |
+
+Both layouts store the same optimizer state, so a `torch_dist` checkpoint saved with one layout loads with the other. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
+
+### Checkpoints of the removed legacy layout
+
+The legacy layout, selected with `--no-use-layer-wise-param-layout`, was removed together with the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags. It was also the only layout before the layer-wise optimizer gained its sibling distributed optimizer in May 2026. It kept the Adam-managed parameters inside the layer-wise optimizer, so its checkpoints store their optimizer state in a format that the current layouts do not read. Loading the optimizer state of such a checkpoint fails with a `KeyError` naming a `chained_*.optimizer.distributed.*` key.
+
+- To start a new run from such a checkpoint, such as fine-tuning, load only the model weights with `--no-load-optim`. The optimizer state starts fresh.
+- To resume an interrupted run, keep using the Megatron-LM version that wrote the checkpoint.
+- To carry the optimizer state over, convert the checkpoint yourself: the Muon state uses the same keys in every layout, and only the state of the Adam-managed parameters differs. Otherwise, open an issue describing the use case.

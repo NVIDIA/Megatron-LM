@@ -267,7 +267,7 @@ def setup_model_and_optimizer(
     bf16=True,
     dist_opt=True,
     optimizer='adam',
-    use_param_layout=False,
+    use_param_layout=True,
     muon_scalar_optimizer='adam',
     cp=1,
     ep=1,
@@ -288,13 +288,9 @@ def setup_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # When use_layer_wise is True and use_param_layout is False, route DDP
-    # construction through the legacy path (no precomputed param layout, no
-    # ``use_distributed_optimizer=True`` flip). LayerWiseDistributedOptimizer
-    # then syncs via its legacy ``allgather_params()`` codepath rather than
-    # ``start_param_sync``.
-    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
-    ddp_use_layer_wise = use_layer_wise and use_param_layout
+    # use_param_layout selects the LayerWise layout: 'compact', or the padded layout otherwise.
+    ddp_use_dist_opt = dist_opt
+    ddp_use_layer_wise = use_layer_wise
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -452,7 +448,7 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
     optimizer='adam',
-    use_param_layout=False,
+    use_param_layout=True,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -463,8 +459,8 @@ def setup_moe_model_and_optimizer(
         use_layer_wise = True
 
     # See setup_model_and_optimizer for the use_param_layout semantics.
-    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
-    ddp_use_layer_wise = use_layer_wise and use_param_layout
+    ddp_use_dist_opt = dist_opt
+    ddp_use_layer_wise = use_layer_wise
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):

@@ -4,7 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -543,8 +543,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
-    skip_megatron_wrapping: bool = False,
-) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
+) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
     Args:
@@ -560,24 +559,12 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer. Defaults to None.
         distributed_optimizer_instance_id (int, optional): Distributed optimizer instance. Defaults
             0.
-        skip_megatron_wrapping (bool): if True, return a
-            ``(optimizer, init_state_fn)`` tuple of the raw PyTorch optimizer
-            without any Megatron wrapping. Useful when the caller
-            (e.g. LayerWiseDistributedOptimizer) performs its own wrapping.
 
     Returns:
-        Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when
-        *skip_megatron_wrapping=True*.
+        Instance of MegatronOptimizer.
     """
     # All param_groups passed here must belong to the same optimizer type (adam / sgd).
     # Callers are responsible for splitting by optimizer type before calling this function.
-
-    if skip_megatron_wrapping and config.use_precision_aware_optimizer:
-        raise ValueError(
-            "skip_megatron_wrapping=True is incompatible with use_precision_aware_optimizer."
-        )
-    if skip_megatron_wrapping and config.optimizer_cpu_offload:
-        raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
     has_word_embedding = any(
         getattr(param, "is_word_embedding_parameter", False)
@@ -722,9 +709,6 @@ def _get_megatron_optimizer_based_on_param_groups(
     else:
         optimizer = None
         init_state_fn = None
-
-    if skip_megatron_wrapping:
-        return optimizer, init_state_fn
 
     # Grad scaler:
     #    if loss-scale is provided, instantiate the constant scaler.
@@ -945,21 +929,21 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Set up DistOpt process groups + filtered buffers once, only if we'll
-    # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
-    # The DistOpt-vs-LayerWise buffer split only happens when DDP was wrapped
-    # with ``use_distributed_optimizer=True`` (the padded and compact LayerWise
-    # layouts); in the legacy layout all params share unpadded DDP buffers that
-    # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
-    ddp_uses_distributed_optimizer = (
-        bool(getattr(model_chunks[0], 'ddp_config', None))
-        and model_chunks[0].ddp_config.use_distributed_optimizer
-    )
+    # In layer-wise mode a sibling DistributedOptimizer manages the non-Muon groups, so set up
+    # its process groups and filtered buffers once. The DistOpt-vs-LayerWise buffer split
+    # comes from wrapping DDP with a LayerWise layout (padded or compact), which turns on
+    # ``use_distributed_optimizer``.
     distopt_process_groups = None
     distopt_per_model_buffers = None
-    use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
+    if use_layer_wise:
+        ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+        if ddp_config is None or not ddp_config.use_distributed_optimizer:
+            raise ValueError(
+                f"optimizer={config.optimizer!r} resolves to the layer-wise distributed "
+                "optimizer, which needs model chunks wrapped with the padded or compact "
+                "LayerWise layout. Wrap them with use_layer_wise_distributed_optimizer=True "
+                "(see configure_ddp_for_layer_wise_optimizer)."
+            )
         assert ddp_config.num_distributed_optimizer_instances == 1, (
             "Layer-wise + DistributedOptimizer split path does not yet support "
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
@@ -988,13 +972,12 @@ def _get_megatron_emerging_optimizer(
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        owned_by_layer_wise = use_layer_wise and (
-            (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-            or not use_separate_distributed_optimizer
+        owned_by_layer_wise = (
+            use_layer_wise and opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS
         )
         is_expert = group['is_expert_parallel'] and not owned_by_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
-    if use_separate_distributed_optimizer and any(
+    if use_layer_wise and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
@@ -1065,7 +1048,7 @@ def _get_megatron_emerging_optimizer(
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
-            if use_separate_distributed_optimizer:
+            if use_layer_wise:
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise. Expert
                 # params shard over the expert data-parallel group, as in the standard
@@ -1097,7 +1080,6 @@ def _get_megatron_emerging_optimizer(
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
-                    skip_megatron_wrapping=False,
                 )
                 # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
                 # share the same config. Reset to the top-level config so the
@@ -1106,11 +1088,8 @@ def _get_megatron_emerging_optimizer(
                     result.config = config
                 results.append(result)
             else:
-                # Legacy ping-pong layer-wise path (use_layer_wise=True) or the
-                # non-layer-wise standard chain: keep ``use_distributed_optimizer``
-                # off; in layer-wise mode the raw torch optimizer (returned as a
-                # ``(optimizer, init_state_fn)`` tuple via ``skip_megatron_wrapping``)
-                # feeds into ``LayerWiseDistributedOptimizer``.
+                # Without the layer-wise optimizer the scalar groups join the standard chain
+                # with ``use_distributed_optimizer`` off.
                 fallback_config.use_distributed_optimizer = False
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -1118,14 +1097,10 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     model_parallel_group=model_parallel_group,
                     pg_collection=pg_collection,
-                    skip_megatron_wrapping=use_layer_wise,
                 )
-                if use_layer_wise:
-                    layer_wise_base_results.append(result)
-                else:
-                    if hasattr(result, 'config'):
-                        result.config = config
-                    results.append(result)
+                if hasattr(result, 'config'):
+                    result.config = config
+                results.append(result)
 
     if use_layer_wise:
         log_single_rank(

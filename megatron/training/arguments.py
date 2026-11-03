@@ -1292,9 +1292,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:
@@ -3088,7 +3086,7 @@ def _add_distributed_args(parser):
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")
     group.add_argument('--layer-wise-param-layout', type=str, default=None,
-                       choices=['padded', 'compact', 'legacy'],
+                       choices=['padded', 'compact'],
                        help='Data-parallel layout of the Muon-managed matrices when '
                        '--use-distributed-optimizer selects the layer-wise distributed '
                        'optimizer. padded (default): shard-aligned padded buffers with '
@@ -3096,19 +3094,11 @@ def _add_distributed_args(parser):
                        'compact: unpadded buffers with gradient all-reduce, whole-matrix '
                        'owners and uneven parameter all-gather. In both, the other '
                        'parameters (embeddings, biases, norms) are sharded by a separate '
-                       'distributed optimizer. legacy: no distributed optimizer; the '
-                       'layer-wise optimizer owns every parameter, including the ones the '
-                       'scalar optimizer updates (same as --no-use-layer-wise-param-layout). '
-                       'The layouts reduce gradients in different orders, so loss curves '
-                       'need not match bit-for-bit across layouts.')
-    group.add_argument('--no-use-layer-wise-param-layout',
-                       action='store_false',
-                       dest='use_layer_wise_param_layout',
-                       help='Original spelling of --layer-wise-param-layout legacy: fall back to '
-                       'the legacy LayerWise ping-pong path, where all params (including '
-                       'non-Muon embeddings, biases, layernorm) stay in the layer-wise '
-                       'optimizer and the optimizer uses the allgather_params() codepath. '
-                       'Does not select the compact layout.')
+                       'distributed optimizer, and torch_dist checkpoints load with either '
+                       'layout. The layouts reduce gradients in different orders, so loss '
+                       'curves need not match bit-for-bit across layouts. The legacy layout '
+                       '(--no-use-layer-wise-param-layout) was removed; see '
+                       'docs/user-guide/features/dist_optimizer.md.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'

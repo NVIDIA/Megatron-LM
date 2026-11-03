@@ -425,9 +425,14 @@ def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
             assert parameter.allreduce is False
             assert parameter.tensor_model_parallel is False
 
-        model = DistributedDataParallel(
-            model.config, DistributedDataParallelConfig(use_distributed_optimizer=False), model
-        )
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            model.config,
+            DistributedDataParallelConfig(),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
@@ -444,7 +449,12 @@ def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
             pg_collection=pg_collection,
         )
 
-        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        # The expert biases are Adam params of the expert-DP sibling DistOpt; the chain's norm
+        # must still count each of them once.
+        assert any(
+            isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            for sub_optimizer in optimizer.chained_optimizers
+        )
         assert pg_collection.tp.size() == tensor_parallel_size
         assert pg_collection.expt_tp.size() == expert_tensor_parallel_size
 
@@ -490,9 +500,14 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expe
             p.numel() * (1 if getattr(p, "allreduce", True) else expert_parallel_size)
             for p in model.parameters()
         )
-        model = DistributedDataParallel(
-            model.config, DistributedDataParallelConfig(overlap_param_gather=True), model
-        )
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            model.config,
+            DistributedDataParallelConfig(overlap_param_gather=True),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
@@ -506,8 +521,14 @@ def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expe
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
-        assert optimizer.overlap_param_gather
+        # The Adam params belong to sibling DistOpts, which mark their params DP-sharded too.
+        layer_wise_optimizers = [
+            sub_optimizer
+            for sub_optimizer in optimizer.chained_optimizers
+            if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+        ]
+        assert len(layer_wise_optimizers) == 1
+        assert layer_wise_optimizers[0].overlap_param_gather
         params = list(model.parameters())
         assert all(getattr(p, "main_param_sharded", False) for p in params)
         assert common_utils.calc_params_l2_norm(model) == pytest.approx(math.sqrt(expected_numel))
