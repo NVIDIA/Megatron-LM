@@ -71,8 +71,17 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     gtp_remat_group = _FakeProcessGroup()
     gtp_replica_group = _FakeProcessGroup()
     checkpoint_dp_cp_group = _FakeProcessGroup()
+    # The dummy router and token dispatcher read none of the other MoE layer groups.
     pg_collection = ProcessGroupCollection(
-        tp=tp_group, ep=ep_group, dp_cp=gtp_replica_group, gtp_remat=gtp_remat_group
+        tp=tp_group,
+        ep=ep_group,
+        dp_cp=gtp_replica_group,
+        gtp_remat=gtp_remat_group,
+        cp=None,
+        expt_tp=None,
+        tp_ep=None,
+        tp_cp=None,
+        tp_dp_cp=None,
     )
     checkpoint_calls = {}
     config = TransformerConfig(
