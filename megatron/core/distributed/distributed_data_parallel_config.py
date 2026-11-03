@@ -350,17 +350,20 @@ class DistributedDataParallelConfig:
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
         if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
-            if self.megatron_fsdp_main_grads_dtype != torch.float32 or (
-                self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32)
-            ):
+            if self.megatron_fsdp_main_grads_dtype != torch.float32:
                 raise ValueError(
                     "grad_reduce_in_fp32=True with Megatron-FSDP requires "
-                    "megatron_fsdp_main_grads_dtype=torch.float32 and "
+                    "megatron_fsdp_main_grads_dtype=torch.float32 for FP32 accumulation. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
+                )
+            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
                     "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
-                    "(inherit the main-gradient dtype). The legacy flag does not "
-                    "override MFSDP dtypes. Set these explicitly for FP32 accumulation "
-                    "and communication, or set grad_reduce_in_fp32=False to use "
-                    "the configured MFSDP precision policy."
+                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
