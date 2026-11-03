@@ -282,6 +282,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".in_proj") if name is not None else None,
         )
 
@@ -352,6 +353,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".out_proj") if name is not None else None,
         )
         # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
