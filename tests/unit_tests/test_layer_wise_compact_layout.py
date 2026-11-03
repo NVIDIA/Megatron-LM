@@ -9,7 +9,9 @@ steps with real NCCL collectives and checks the DDP structure, rank-consistent o
 updates against a non-distributed Muon reference.
 """
 
+import dataclasses
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,7 +20,7 @@ import torch.nn.functional as F
 from packaging.version import Version
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, param_and_grad_buffer
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -439,3 +441,52 @@ class TestPendingGatherPublication:
         # Training continues normally from the published state.
         _train_step(model, optimizer, step=1)
         _assert_replicas_equal(model)
+
+
+@pytest.mark.parametrize("layer_wise_first", [True, False])
+def test_bucket_groups_keep_the_config_of_their_buffer(monkeypatch, layer_wise_first):
+    """One fp8 LayerWise buffer next to a DistOpt buffer with reduce_scatter_with_fp32_accumulation
+    (singleton groups): every bucket group must run with the DDP config of its own buffer, in
+    either buffer order. The compact LayerWise buffers all-reduce, the DistOpt ones reduce-scatter.
+    """
+    # Building a group with reduce_scatter_with_fp32_accumulation swaps the module-level
+    # reduce-scatter function; keep the swap local to this test.
+    monkeypatch.setattr(
+        param_and_grad_buffer,
+        "dist_reduce_scatter_func",
+        param_and_grad_buffer.dist_reduce_scatter_func,
+    )
+    group = SimpleNamespace(rank=lambda: 0)
+    distopt_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, reduce_scatter_with_fp32_accumulation=True
+    )
+    layer_wise_config = dataclasses.replace(
+        distopt_config, use_distributed_optimizer=False, num_buckets=None
+    )
+
+    def fake_buffer(param_dtype, layer_wise, ddp_config):
+        params = [nn.Parameter(torch.zeros(2)) for _ in range(2)]
+        for param in params:
+            param.is_managed_by_layer_wise_optimizer = layer_wise
+        return SimpleNamespace(
+            params=params,
+            param_dtype=param_dtype,
+            ddp_config=ddp_config,
+            data_parallel_group=group,
+            data_parallel_world_size=1,
+            buckets=[SimpleNamespace(params_list=[param]) for param in params],
+        )
+
+    layer_wise = fake_buffer(torch.uint8, True, layer_wise_config)
+    distopt = fake_buffer(torch.bfloat16, False, distopt_config)
+    buffers = [layer_wise, distopt] if layer_wise_first else [distopt, layer_wise]
+    bucket_groups = param_and_grad_buffer.partition_buckets(
+        buffers, reduce_scatter_with_fp32_accumulation=True
+    )
+
+    assert sum(len(bucket_group.buckets) for bucket_group in bucket_groups) == 4
+    for bucket_group in bucket_groups:
+        assert len(bucket_group.buckets) == 1
+        (param,) = bucket_group.buckets[0].params_list
+        expected = layer_wise_config if param.is_managed_by_layer_wise_optimizer else distopt_config
+        assert bucket_group.ddp_config == expected
