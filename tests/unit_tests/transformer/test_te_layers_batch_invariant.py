@@ -469,6 +469,94 @@ def test_te_attention_layer_batch_invariant_randomized():
     Utils.destroy_model_parallel()
 
 
+def _causal_attention_fp32(q, k, v):
+    """fp32 causal attention for sbhd q/k/v; returns [s, b, heads * head_dim]."""
+    s, b, heads, dim = q.shape
+    scores = torch.einsum("sbhd,tbhd->bhst", q.float(), k.float()) * dim**-0.5
+    mask = torch.ones(s, s, dtype=torch.bool, device=q.device).triu(1)
+    probs = scores.masked_fill(mask, float("-inf")).softmax(-1)
+    return torch.einsum("bhst,tbhd->sbhd", probs, v.float()).reshape(s, b, heads * dim)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch_invariant"])
+@pytest.mark.parametrize("head_dim", [32, 128])
+def test_te_flash_attention_4_causal_matches_fp32(monkeypatch, batch_invariant, head_dim):
+    """TE's FlashAttention-4 backend computes causal attention, not an empty window.
+
+    TE before 2.21 passes FA4 the causal window (-1, 0) with -1 meaning unbounded. flash-attn-4
+    4.0.0b30 and later read -1 as a literal offset, an empty window, so every row came out zero
+    (rel. error 1). Batch-split invariance checks cannot see that: zeros are batch-invariant.
+    """
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Transformer Engine runs FlashAttention-4 on SM90 and newer")
+    import transformer_engine
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
+
+    if not FlashAttentionUtils.v4_is_installed:
+        pytest.skip("Transformer Engine finds no flash-attn-4")
+    if batch_invariant and not te_supports_batch_invariant_attention():
+        pytest.skip("this Transformer Engine has no batch-invariant attention")
+
+    backends = te_dpa._attention_backends
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        # Only TE's FlashAttention-4 backend, as attention_backend=flash with
+        # flash_attention_version=4 configures it. TE caches its backend choice, so select again.
+        for name, value in (
+            ("NVTE_FLASH_ATTN", "1"),
+            ("NVTE_FUSED_ATTN", "0"),
+            ("NVTE_UNFUSED_ATTN", "0"),
+            ("NVTE_FLASH_ATTN_V2", "0"),
+            ("NVTE_FLASH_ATTN_V3", "0"),
+            ("NVTE_FLASH_ATTN_V4", "1"),
+        ):
+            monkeypatch.setenv(name, value)
+        backends["attention_params"] = None
+        backends["backend_selection_requires_update"] = True
+        heads, seq, batch = 4, 24, 2
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            batch_invariant_mode=batch_invariant,
+            flash_attention_version=4,
+            attention_backend=AttnBackend.flash,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        attn = TEDotProductAttention(
+            config=config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+        )
+        # q, k and v as the training forward passes them: strided views of the fused projection.
+        g = torch.Generator(device="cuda").manual_seed(0)
+        mixed = torch.randn(seq, batch, heads, 3 * head_dim, generator=g, device="cuda").bfloat16()
+        q, k, v = mixed.split(head_dim, dim=-1)
+        with torch.no_grad(), set_batch_invariant_mode(batch_invariant):
+            out = attn(q, k, v, attention_mask=None, attn_mask_type=AttnMaskType.causal)
+        backend = backends.get("flash_attention_backend")
+        assert backends.get("use_flash_attention") and backend is not None and backend.major == 4, (
+            f"Transformer Engine did not run FlashAttention-4 (flash backend {backend}, "
+            f"fused {backends.get('use_fused_attention')}, "
+            f"unfused {backends.get('use_unfused_attention')})"
+        )
+        reference = _causal_attention_fp32(q, k, v)
+        error = ((out.float() - reference).norm() / reference.norm()).item()
+        assert error <= 2e-2, (
+            f"Transformer Engine {transformer_engine.__version__} on flash-attn-4 "
+            f"{FlashAttentionUtils.fa4_version} differs from fp32 causal attention by rel {error:.3g}"
+        )
+    finally:
+        backends["backend_selection_requires_update"] = True
+        Utils.destroy_model_parallel()
+
+
 # ============================================================================
 # Parity Tests: Batch-Invariant vs Regular TE Layers
 # ============================================================================

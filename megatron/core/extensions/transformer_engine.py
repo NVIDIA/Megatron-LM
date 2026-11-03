@@ -4133,12 +4133,16 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
-    try:
-        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
-            mark_qb_bin_bounds_validated,
-        )
-    except ImportError:
-        mark_qb_bin_bounds_validated = None
+    # TE 2.21 reads QB bin bounds on the device without validating them and deprecated
+    # mark_qb_bin_bounds_validated as a no-op, so only older TE needs bounds updates marked.
+    mark_qb_bin_bounds_validated = None
+    if not is_te_min_version("2.21.0"):
+        try:
+            from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+                mark_qb_bin_bounds_validated,
+            )
+        except ImportError:
+            pass
 
     try:
         _fused_topk_sig = inspect.signature(fused_topk_with_score_function)

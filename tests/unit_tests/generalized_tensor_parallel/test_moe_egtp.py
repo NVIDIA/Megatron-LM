@@ -503,3 +503,28 @@ class TestMoEEGTPPrecisionOverride:
             pytest.skip("Requires at least 4 CUDA devices")
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         _run_distributed(_worker_egtp_precision_override_backward, 4, 2, True)
+
+
+@pytest.mark.parametrize(
+    "te_version, supported",
+    [
+        ("2.20.2+44f31bbe", False),
+        ("2.21.0.dev0+45de18a6", False),
+        ("2.21.0+7457e47d", True),
+        ("2.22.0.dev0", True),
+    ],
+)
+def test_te_grouped_tensor_sharded_weight_support_follows_te_release(
+    monkeypatch, te_version, supported
+):
+    """GTP-sharded experts stay on TE's grouped-tensor path from TE 2.21.0, which ships #3517.
+
+    TE 2.21 also replaced the keyword arguments of _GroupedLinear._forward_grouped_tensor with
+    one argument bag, so an ``is_dist_weight`` signature probe can no longer see the support.
+    """
+    from packaging.version import Version
+
+    from megatron.core.transformer.moe import experts as experts_mod
+
+    monkeypatch.setattr("megatron.core.utils.get_te_version", lambda: Version(te_version))
+    assert experts_mod._te_grouped_tensor_supports_sharded_weights() == supported
