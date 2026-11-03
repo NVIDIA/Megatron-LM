@@ -124,7 +124,7 @@ def test_graph_scheduler_accounts_for_main_padding(monkeypatch, alignment, fp8, 
     assert observed == expected
 
 
-@pytest.mark.parametrize("cp_size", [1])
+@pytest.mark.parametrize("cp_size", [1, 2])
 @pytest.mark.parametrize("alignment,metadata_capacity", [("max", 4), (None, 4), (None, None)])
 def test_scheduler_loader_preserves_graph_logical_offsets(
     monkeypatch, alignment, metadata_capacity, cp_size
@@ -135,7 +135,8 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
     groups = ProcessGroupCollection(
         tp=group, pp=group, cp=SimpleNamespace(rank=lambda: 0, size=lambda: cp_size)
     )
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    if cp_size == 1:
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: group.size())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: group.rank())
@@ -150,6 +151,11 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
         "cu_seqlens_padded": torch.tensor([0, 4, 12], dtype=torch.int32),
         "max_seqlen": 8,
     }
+    if cp_size > 1:
+        batch = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
     config = SimpleNamespace(
         pad_packed_seq_alignment=alignment,
         cuda_graph_thd_max_packed_sequences=metadata_capacity,
@@ -159,13 +165,11 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
         sequence_parallel=False,
     )
     result = get_batch_on_this_rank_for_sequence_packing(
-        iter([batch]),
-        pg_collection=groups,
-        config=config,
+        iter([batch]), pg_collection=groups, config=config
     )
     tokens, _, loss_mask, _, _, params, padding_mask = result
     assert tokens.shape[-1] == (16 if alignment == "max" else 12 // cp_size)
-    expected_valid = 8 if cp_size == 1 or alignment == "max" else 5
+    expected_valid = 8 if cp_size == 1 else 3
     assert (~padding_mask).sum().item() == loss_mask.sum().item() == expected_valid
     if metadata_capacity is not None:
         assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == [0, 3, 8, 8, 8]
@@ -174,7 +178,7 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
         assert torch.equal(params.cu_seqlens_q_padded, params.cu_seqlens_kv_padded)
         assert params.max_seqlen_q == params.max_seqlen_kv == end
     else:
-        # Preserve main's ordinary ContextParallelBatch compatibility behavior.
+        # Preserve release's ordinary tuple-loader offset behavior.
         expected = [0, 4, 12]
         assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == expected
 

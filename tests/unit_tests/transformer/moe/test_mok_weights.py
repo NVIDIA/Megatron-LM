@@ -109,7 +109,6 @@ def test_native_single_grouped_weights_do_not_require_op_fuser():
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
         ({"moe_router_dtype": "fp64"}, "MOK does not support moe_router_dtype='fp64'"),
-        ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
         ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (
             {"overlap_moe_expert_parallel_comm": True},

@@ -14,13 +14,16 @@ from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
 
 
 @pytest.mark.parametrize("recompute", [False, True])
-def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recompute):
+@pytest.mark.parametrize("fp8", [None, "hybrid"])
+def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recompute, fp8):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.moe import moe_layer
 
     layer = moe_layer.MoELayer.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
-    layer.config = SimpleNamespace(moe_megakernel_backend="mok", sequence_parallel=False)
+    layer.config = SimpleNamespace(
+        moe_megakernel_backend="mok", sequence_parallel=False, fp8=fp8, fp4=None
+    )
     layer.attn_tp_group = SimpleNamespace(size=lambda: 1)
     layer.tp_group = object()
     layer.moe_layer_recompute = recompute
@@ -33,8 +36,12 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     layer.route = Mock(return_value=(probs, routes))
     layer.megakernel_experts = torch.nn.Identity()
     layer.megakernel_experts.forward = Mock(return_value=hidden)
-    checkpoint = Mock(side_effect=lambda fn, config, group, *args: fn(*args))
-    monkeypatch.setattr(moe_layer, "precision_aware_checkpoint", checkpoint)
+    if fp8:
+        checkpoint = Mock(side_effect=lambda fn, distribute, rng, group, *args: fn(*args))
+        monkeypatch.setattr(moe_layer, "te_checkpoint", checkpoint)
+    else:
+        checkpoint = Mock(side_effect=lambda fn, distribute, *args: fn(*args))
+        monkeypatch.setattr(moe_layer.tensor_parallel, "checkpoint", checkpoint)
 
     output, bias = layer(
         hidden, padding_mask=padding_mask, input_ids=input_ids, packed_seq_params=packed
