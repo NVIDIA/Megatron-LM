@@ -123,6 +123,7 @@ dev = [
 
 inference = [
     "torch-memory-saver",
+    "gigatoken==0.11.0",
     # Dynamic text generation server and data-parallel inference coordinator.
     # These are imported behind try/except, so a missing package only surfaces at runtime.
     "hypercorn",
