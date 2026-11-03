@@ -738,8 +738,12 @@ class TestFusedSharedExpertTrainingPaths:
 
     @pytest.mark.parametrize("clamp_value", [None, 0.5])
     @pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
-    def test_training_matches_unfused_shared_expert(self, monkeypatch, fused, clamp_value):
-        """On main, the unfused path raises TE's "one scale per input row" assertion."""
+    def test_training_matches_unfused_shared_expert(
+        self, monkeypatch, record_property, fused, clamp_value
+    ):
+        """On main, the unfused path raises TE's "one scale per input row" assertion.
+
+        The measured errors are recorded as test properties (JUnit XML)."""
         from transformer_engine.pytorch.ops.fused.grouped_mlp import GroupedMLP_CuTeGEMMGLU
 
         from megatron.core.extensions.transformer_engine import (
@@ -783,9 +787,15 @@ class TestFusedSharedExpertTrainingPaths:
             reference = SharedExpertMLP(
                 reference_config, submodules, gate=False, pg_collection=pg_collection
             ).cuda()
+            # Control: the same rows read as [gate | up], loaded before its first forward
+            # (TE caches a linear's quantized weight, so the weight cannot change afterwards).
+            misread_reference = SharedExpertMLP(
+                reference_config, submodules, gate=False, pg_collection=pg_collection
+            ).cuda()
         state = module.state_dict()
         stored = _permute_glu_rows(state["linear_fc1.weight"], self.interleave, 0, interleave=False)
         reference.load_state_dict({**state, "linear_fc1.weight": stored})
+        misread_reference.load_state_dict(state)
 
         # 256 tokens, the fused ops' alignment; FC1 outputs of std ~1, so the clamp bites.
         hidden_states = (
@@ -815,16 +825,23 @@ class TestFusedSharedExpertTrainingPaths:
             for op, _ in fuser._forward_ops
         )
         assert ran_fused is fused
-        assert _rel_err(output, expected[0]) < self.tol
-        assert _rel_err(input_grad, expected[1]) < self.grad_tol
-        fc1_grad = _permute_glu_rows(fc1_grad, self.interleave, 0, interleave=False)
-        assert _rel_err(fc1_grad, expected[2]) < self.grad_tol
-        assert _rel_err(fc2_grad, expected[3]) < self.grad_tol
-        # The comparison only discriminates if the FC1 layout matters.
         with torch.no_grad(), get_fp8_context(config):
-            reference.linear_fc1.weight.copy_(module.linear_fc1.weight)
-            misread = reference(hidden_states)
-        assert _rel_err(misread, expected[0]) > 10 * self.tol
+            misread = misread_reference(hidden_states)
+        fc1_grad = _permute_glu_rows(fc1_grad, self.interleave, 0, interleave=False)
+        errors = {
+            "output": _rel_err(output, expected[0]),
+            "input_grad": _rel_err(input_grad, expected[1]),
+            "fc1_weight_grad": _rel_err(fc1_grad, expected[2]),
+            "fc2_weight_grad": _rel_err(fc2_grad, expected[3]),
+            "misread_output": _rel_err(misread, expected[0]),
+        }
+        for name, error in errors.items():
+            record_property(f"rel_err_{name}", error)
+        assert errors["output"] < self.tol, errors
+        for name in ("input_grad", "fc1_weight_grad", "fc2_weight_grad"):
+            assert errors[name] < self.grad_tol, errors
+        # The comparison only discriminates if the FC1 layout matters.
+        assert errors["misread_output"] > 10 * self.tol, errors
 
 
 def _rel_err(actual, expected):
