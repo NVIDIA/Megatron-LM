@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -171,10 +172,10 @@ def _run_pretrain_gpt_forward(
     thd: bool,
     sequence_lengths: tuple[int, ...] = _EQUAL_SEQUENCE_LENGTHS,
     mtp: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     Utils.initialize_model_parallel(context_parallel_size=cp_size)
     try:
-        model = _build_model(cp_size, mtp)
+        model = _build_model(cp_size, mtp).train(mtp)
         micro_batch_size = 1 if thd else len(sequence_lengths)
         args = SimpleNamespace(
             context_parallel_size=cp_size,
@@ -246,10 +247,23 @@ def _run_pretrain_gpt_forward(
             patch.object(pretrain_gpt, "get_timers", return_value=timers),
             patch.object(pretrain_gpt, "stimer", _NullStragglerTimer()),
             patch.object(pretrain_gpt, "update_seqlen_stats_from_cu_seqlens"),
+            patch.object(MTPLossLoggingHelper, "save_metrics_to_tracker") as mtp_metrics,
         ):
             losses, _ = pretrain_gpt.forward_step(_make_data_iterator(thd, sequence_lengths), model)
 
-        return _gather_global_losses(losses, cp_size, thd, sequence_lengths).float().cpu()
+        global_losses = _gather_global_losses(losses, cp_size, thd, sequence_lengths).float().cpu()
+        auxiliary_loss = None
+        if mtp:
+            assert mtp_metrics.call_count == 1
+            local_loss, _, valid_tokens, *_ = mtp_metrics.call_args.args
+            assert torch.isfinite(local_loss)
+            # CP ranks can own different valid-token counts after padding and rolling.
+            # Combine the actual MTP head losses using those counts, not a rank mean.
+            totals = torch.stack((local_loss * valid_tokens, valid_tokens)).float()
+            dist.all_reduce(totals, group=parallel_state.get_context_parallel_group())
+            assert totals[1].item() == sum(sequence_lengths) - len(sequence_lengths)
+            auxiliary_loss = (totals[0] / totals[1]).cpu()
+        return global_losses, auxiliary_loss
     finally:
         Utils.destroy_model_parallel()
         torch.cuda.empty_cache()
@@ -261,7 +275,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 def test_pretrain_gpt_thd_cp1_smoke():
     """Exercise the synthetic THD forward path when only one GPU is available."""
-    losses = _run_pretrain_gpt_forward(cp_size=1, thd=True)
+    losses, _ = _run_pretrain_gpt_forward(cp_size=1, thd=True)
 
     assert losses.numel() == sum(_EQUAL_SEQUENCE_LENGTHS)
     assert torch.isfinite(losses).all()
@@ -272,9 +286,9 @@ def test_pretrain_gpt_thd_cp2_matches_bshd_cp2_and_thd_cp1():
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
         pytest.skip("THD context-parallel parity requires at least two ranks")
 
-    thd_cp1 = _run_pretrain_gpt_forward(cp_size=1, thd=True)
-    bshd_cp2 = _run_pretrain_gpt_forward(cp_size=2, thd=False)
-    thd_cp2 = _run_pretrain_gpt_forward(cp_size=2, thd=True)
+    thd_cp1, _ = _run_pretrain_gpt_forward(cp_size=1, thd=True)
+    bshd_cp2, _ = _run_pretrain_gpt_forward(cp_size=2, thd=False)
+    thd_cp2, _ = _run_pretrain_gpt_forward(cp_size=2, thd=True)
 
     assert thd_cp1.shape == bshd_cp2.shape == thd_cp2.shape
     _assert_close(thd_cp2, bshd_cp2)
@@ -286,10 +300,10 @@ def test_pretrain_gpt_uneven_thd_cp2_matches_thd_cp1():
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
         pytest.skip("THD context-parallel parity requires at least two ranks")
 
-    thd_cp1 = _run_pretrain_gpt_forward(
+    thd_cp1, _ = _run_pretrain_gpt_forward(
         cp_size=1, thd=True, sequence_lengths=_UNEVEN_SEQUENCE_LENGTHS
     )
-    thd_cp2 = _run_pretrain_gpt_forward(
+    thd_cp2, _ = _run_pretrain_gpt_forward(
         cp_size=2, thd=True, sequence_lengths=_UNEVEN_SEQUENCE_LENGTHS
     )
 
@@ -297,16 +311,28 @@ def test_pretrain_gpt_uneven_thd_cp2_matches_thd_cp1():
     _assert_close(thd_cp2, thd_cp1)
 
 
-def test_pretrain_gpt_thd_cp2_with_mtp_matches_thd_cp1():
-    """GPT MTP must consume the same zigzag THD view as the main attention block."""
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [_EQUAL_SEQUENCE_LENGTHS, _UNEVEN_SEQUENCE_LENGTHS],
+    ids=["aligned-documents", "padded-documents"],
+)
+def test_pretrain_gpt_thd_cp2_with_mtp_matches_thd_cp1(sequence_lengths):
+    """Compare the MTP head loss itself, which is invisible in the main LM output."""
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
         pytest.skip("THD context-parallel parity requires at least two ranks")
 
-    thd_cp1 = _run_pretrain_gpt_forward(cp_size=1, thd=True, mtp=True)
-    thd_cp2 = _run_pretrain_gpt_forward(cp_size=2, thd=True, mtp=True)
+    thd_cp1, mtp_cp1 = _run_pretrain_gpt_forward(
+        cp_size=1, thd=True, mtp=True, sequence_lengths=sequence_lengths
+    )
+    thd_cp2, mtp_cp2 = _run_pretrain_gpt_forward(
+        cp_size=2, thd=True, mtp=True, sequence_lengths=sequence_lengths
+    )
 
     assert thd_cp1.shape == thd_cp2.shape
     _assert_close(thd_cp2, thd_cp1)
+    assert torch.isfinite(mtp_cp1) and mtp_cp1 > 0
+    assert torch.isfinite(mtp_cp2) and mtp_cp2 > 0
+    _assert_close(mtp_cp2, mtp_cp1)
 
 
 @pytest.mark.parametrize(
