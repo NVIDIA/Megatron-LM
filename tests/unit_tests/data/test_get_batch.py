@@ -10,7 +10,7 @@ import torch
 
 import pretrain_hybrid
 from megatron.core import mpu
-from megatron.core.context_parallel import get_batches_on_this_cp_rank
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.context_parallel.utils import (
     _build_packed_seq_params,
     _get_batch_on_this_cp_rank_contiguous,
@@ -1005,14 +1005,17 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     position_ids = torch.tensor([[0, 1]])
     padding_mask = torch.zeros(1, 2, dtype=torch.bool)
     packed_seq_params = PackedSeqParams(qkv_format="thd")
-    scheduler_batch = (
-        tokens,
-        labels,
-        loss_mask,
-        None,
-        position_ids,
+    scheduler_batch = ContextParallelBatch.from_single_layout(
+        "zigzag",
+        {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "attention_mask": None,
+            "position_ids": position_ids,
+            "padding_mask": padding_mask,
+        },
         packed_seq_params,
-        padding_mask,
     )
     args = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
     config = SimpleNamespace(
@@ -1030,10 +1033,19 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
-        ),
+        ) as loader,
     ):
         cp_batch = get_batch(None)
 
+    loader.assert_called_once_with(
+        None,
+        vpp_size=None,
+        mtp_on_this_rank=True,
+        vp_stage=None,
+        config=config,
+        return_context_parallel_batch=True,
+    )
+    assert cp_batch is scheduler_batch
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
