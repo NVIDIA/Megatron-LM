@@ -314,7 +314,7 @@ class DBuffer:
             self.layout,
         )
 
-    def is_alias(self, other: "DBuffer") -> bool:
+    def is_alias_of(self, other: "DBuffer") -> bool:
         """Whether the local buffers share backing storage, including distinct views."""
         return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
 

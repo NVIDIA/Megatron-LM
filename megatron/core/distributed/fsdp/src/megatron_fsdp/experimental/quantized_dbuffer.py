@@ -367,10 +367,10 @@ class QuantizedDBuffer:
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
         )
 
-    def is_alias(self, other: "QuantizedDBuffer") -> bool:
+    def is_alias_of(self, other: "QuantizedDBuffer") -> bool:
         """Whether every corresponding plane shares backing storage."""
         return all(
-            plane.is_alias(other_plane) for plane, other_plane in zip(self.planes, other.planes)
+            plane.is_alias_of(other_plane) for plane, other_plane in zip(self.planes, other.planes)
         )
 
     def redistribute(

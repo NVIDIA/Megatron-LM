@@ -219,19 +219,19 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     tensor_view = buffer.get_tensor_view(0)
     sharded_view = buffer.view([RowAtomic()])
     separate = DBuffer(mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
-    assert buffer.is_alias(sharded_view)
-    assert sharded_view.is_alias(buffer)
-    assert not buffer.is_alias(separate)
+    assert buffer.is_alias_of(sharded_view)
+    assert sharded_view.is_alias_of(buffer)
+    assert not buffer.is_alias_of(separate)
 
     buffer.release_storage()
     separate.release_storage()
     assert buffer.local_buffer.untyped_storage().nbytes() == 0
     # Released buffers have null data pointers but retain distinct Storage objects.
-    assert buffer.is_alias(sharded_view)
-    assert not buffer.is_alias(separate)
+    assert buffer.is_alias_of(sharded_view)
+    assert not buffer.is_alias_of(separate)
 
     buffer.reallocate_storage()
-    assert buffer.is_alias(sharded_view)
+    assert buffer.is_alias_of(sharded_view)
     assert (
         buffer.local_buffer.untyped_storage().nbytes()
         == buffer.local_buffer.numel() * buffer.local_buffer.element_size()

@@ -276,8 +276,8 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
     view = source.view([BlockAtomic(32)])
     assert view.view([BlockAtomic(32)]) is view
-    assert source.is_alias(view)
-    assert view.is_alias(source)
+    assert source.is_alias_of(view)
+    assert view.is_alias_of(source)
     for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
         assert actual.placements == ((RowAtomic(),) if index == 3 else (BlockAtomic(32),))
         chunks = original.local_buffer.view(mesh.size(), -1)
@@ -294,11 +294,11 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     separate = QuantizedDBuffer.empty(
         mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
     )
-    assert not source.is_alias(separate)
+    assert not source.is_alias_of(separate)
     source.release_storage()
     separate.release_storage()
-    assert source.is_alias(view)
-    assert not source.is_alias(separate)
+    assert source.is_alias_of(view)
+    assert not source.is_alias_of(separate)
 
 
 @pytest.mark.parametrize("use_out", [False, True])
