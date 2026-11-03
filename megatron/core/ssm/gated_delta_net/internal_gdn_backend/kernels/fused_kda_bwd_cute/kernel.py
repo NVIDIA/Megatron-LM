@@ -258,7 +258,8 @@ def _ldg_f32x8(address, dst):
         [cutlass.Int64(address).ir_value()],
         "{ ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$8]; ld.global.nc.v4.b32 {$4, $5, $6, $7}, [$8+16]; }",
         ",".join(["=r"] * 8 + ["l"]),
-        has_side_effects=True,
+        # The gate tensor is read-only in the kernel, so the loads may be scheduled freely.
+        has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
@@ -304,7 +305,8 @@ def _ldg_f32(address):
         [cutlass.Int64(address).ir_value()],
         "ld.global.nc.b32 $0, [$1];",
         "=r,l",
-        has_side_effects=True,
+        # The gate tensor is read-only in the kernel, so the loads may be scheduled freely.
+        has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
