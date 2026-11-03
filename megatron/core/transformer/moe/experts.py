@@ -1420,7 +1420,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     ):
         # The config's parallel layout may have changed since it was validated (e.g. an RL
         # inference model's), so check this rank's expert shard shapes before building them.
-        config.validate_flashinfer_cutlass_mxfp8_expert_shapes()
+        config.validate_flashinfer_mxfp8_expert_shapes()
 
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
         super().__init__(
