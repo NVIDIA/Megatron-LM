@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from megatron.core.inference.moe.activations import (
+    GLUOptions,
     padded_squared_relu,
     padded_swiglu,
     squared_relu_and_quantize_mxfp8,
@@ -51,6 +52,13 @@ class ActivationType(Enum):
 
     SQUARED_RELU = "squared_relu"
     SWIGLU = "swiglu"
+    # relu(gate)^2 * up: activation_func=squared_relu with gated_linear_unit.
+    GATED_SQUARED_RELU = "gated_squared_relu"
+
+    @property
+    def is_gated(self) -> bool:
+        """Whether FC1 produces gate and linear halves that the activation combines."""
+        return self in (ActivationType.SWIGLU, ActivationType.GATED_SQUARED_RELU)
 
 
 def _bf16_grouped_mm(
@@ -89,6 +97,7 @@ def _get_activation_func(
         fused_quant: if True, return the fused activation + MXFP8 quantize kernel.
         activation_kwargs: activation-specific options, extracted per activation below.
             ``clamp_scale`` (squared ReLU): soft-clamp the pre-activation first.
+            ``glu_options`` (gated activations): clamp, linear offset and FC1 interleaving.
 
     Returns:
         The kernel, partially applied with whichever options the activation consumes.
@@ -98,15 +107,21 @@ def _get_activation_func(
         clamp_scale = activation_kwargs.get("clamp_scale")
         func = squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
-    elif activation_type == ActivationType.SWIGLU:
+    elif activation_type.is_gated:
         if fused_quant:
-            raise NotImplementedError("SWIGLU requires separate activation and MXFP8 quantization")
+            raise NotImplementedError(
+                f"{activation_type.name} requires separate activation and MXFP8 quantization"
+            )
         if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
-        return padded_swiglu
+        return partial(
+            padded_swiglu,
+            glu_options=activation_kwargs.get("glu_options", GLUOptions()),
+            squared_relu_gate=activation_type == ActivationType.GATED_SQUARED_RELU,
+        )
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
@@ -141,6 +156,8 @@ def mcore_fused_moe(
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
     activation_clamp_scale: Optional[float] = None,
+    glu_options: GLUOptions = GLUOptions(),
+    apply_probs_on_input: bool = False,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -170,6 +187,10 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
+        glu_options: Gated-activation clamp, linear offset and FC1 interleaving
+            (activation_func_clamp_value, glu_linear_offset, moe_mlp_glu_interleave_size).
+        apply_probs_on_input: config.moe_apply_probs_on_input. Scale each expert input row
+            by its routing probability instead of weighting the expert output.
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -214,7 +235,7 @@ def mcore_fused_moe(
     activation_func = _get_activation_func(
         activation_type,
         fused_quant=use_fused_activation_quant,
-        activation_kwargs={"clamp_scale": activation_clamp_scale},
+        activation_kwargs={"clamp_scale": activation_clamp_scale, "glu_options": glu_options},
     )
 
     # --- Pre-processing: permute ---
@@ -230,6 +251,7 @@ def mcore_fused_moe(
             alignment=expert_alignment,
             zero_padding=batch_invariant_mode,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            scale_by_probs=apply_probs_on_input,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
         batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
@@ -245,6 +267,7 @@ def mcore_fused_moe(
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
             zero_padding=batch_invariant_mode and use_mxfp8,
             return_batch_invariant_inverse_map=batch_invariant_mode,
+            scale_by_probs=apply_probs_on_input,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
         # Maps each (token, local expert) pair to its row in the expert-grouped buffer,
@@ -266,13 +289,19 @@ def mcore_fused_moe(
     n_used = offs[-1:]
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
-        if activation_type == ActivationType.SWIGLU:
+        if activation_type.is_gated:
             assert activation_clamp_scale is None, (
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_mxfp8
+                fc1_output,
+                permutation_map,
+                n_used,
+                permuted_probs,
+                zero_padding=use_mxfp8,
+                glu_options=glu_options,
+                squared_relu_gate=activation_type == ActivationType.GATED_SQUARED_RELU,
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(

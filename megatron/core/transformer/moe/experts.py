@@ -95,6 +95,7 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.activations import GLUOptions
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
@@ -1445,6 +1446,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
+        # Gated-activation options of the training path (TEGroupedMLP), which ignores them
+        # for non-gated activations.
+        self._glu_options = (
+            GLUOptions(
+                clamp_value=config.activation_func_clamp_value,
+                linear_offset=config.glu_linear_offset,
+                interleave_size=config.moe_mlp_glu_interleave_size,
+            )
+            if config.gated_linear_unit
+            else GLUOptions()
+        )
         # Allocate with the inference weights, after model-wide dtype conversion.
         # A registered floating-point buffer would be cast by Module.bfloat16(),
         # violating FlashInfer's FP32 ABI. Keep this graph-stable tensor unregistered.
@@ -1499,12 +1511,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _resolve_mcore_activation_type(self):
         """Map megatron activation config to mcore_fused_moe ActivationType."""
         func = self.config.activation_func
+        gated = self.config.gated_linear_unit
         if func == squared_relu:
+            # relu(gate)^2 * up with a gated linear unit, as in training's GLU.
+            if gated:
+                return McoreActivationType.GATED_SQUARED_RELU
             return McoreActivationType.SQUARED_RELU
-        if func == F.silu and self.config.gated_linear_unit:
+        if func == F.silu and gated:
             # gated SiLU -> SwiGLU (padded_swiglu / vllm silu_and_mul path)
             return McoreActivationType.SWIGLU
-        raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
+        raise ValueError(
+            f"No mcore_fused_moe ActivationType mapping for activation_func={func} "
+            f"with gated_linear_unit={gated}"
+        )
 
     @staticmethod
     def _unwrap_mxfp8_weight(weight: object) -> MXFP8Tensor | None:
@@ -1835,6 +1854,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            glu_options=self._glu_options,
+            apply_probs_on_input=self.config.moe_apply_probs_on_input,
         )
         return output, None
 
@@ -1854,6 +1875,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            glu_options=self._glu_options,
+            apply_probs_on_input=self.config.moe_apply_probs_on_input,
         )
         return output, None
 

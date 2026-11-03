@@ -416,7 +416,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; "
+        "InferenceGroupedMLP with SwiGLU options and gated squared ReLU on the torch and vLLM "
+        "backends.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -429,8 +431,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_shared_experts",
         sources=("megatron/core/transformer/moe/shared_experts.py",),
+        tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        exempt_reason="Composes TE linears and the registered activation fusions; no kernel of its own.",
+        notes="Composes TE linears and the registered activation fusions. Under InferenceMode the "
+        "fused shared expert (use_grouped_gemm_for_shared_expert) runs its linears and the "
+        "bounded_silu_mul Triton kernel; its forward and overlapped methods replay bit-exactly.",
     ),
     KernelEntry(
         name="moe_paged_stash",
@@ -675,6 +680,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
+        "SwiGLU options (clamp, linear offset, interleave), the squared-ReLU gate of the GLU kernels and "
+        "input-side routing probabilities replay too. The batch-invariant clamped SwiGLU matches "
+        "training's fused kernel, and the batch-invariant gated squared ReLU training's unfused GLU, "
+        "bit for bit. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(
