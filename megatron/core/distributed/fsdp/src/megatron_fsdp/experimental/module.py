@@ -49,8 +49,6 @@ class FsdpModule:
 
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _mesh: DeviceMesh
-    _main_grad_placements: tuple[Placement, ...]
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -80,8 +78,6 @@ class FsdpModule:
                 See ``fully_shard``.
         """
         self._context = context
-        self._mesh = mesh
-        self._main_grad_placements = main_grad_placements
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -501,12 +497,18 @@ class FsdpModule:
         """Whether this module's gradients need communication before accumulation.
 
         All groups share the mesh and gradient placements. Dtype-specific sharding
-        layouts do not change whether communication is needed.
+        layouts do not change whether communication is needed, so the first
+        trainable group determines the result.
         """
-        return any(
-            self._mesh.size(axis) > 1 and placement != Partial("avg")
-            for axis, placement in enumerate(self._main_grad_placements)
-        )
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            assert group.main_grad is not None
+            return any(
+                group.mesh.size(axis) > 1 and placement != Partial("avg")
+                for axis, placement in enumerate(group.main_grad.placements)
+            )
+        return False
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
