@@ -759,6 +759,7 @@ class FusedKdaBwdKernel:
                 )
             elif warp == _TMA_WARP:
                 self.run_tma(
+                    part,
                     head,
                     seq_start,
                     chunk_base,
@@ -841,6 +842,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def run_tma(
         self,
+        part,
         head,
         seq_start,
         chunk_base,
@@ -861,9 +863,8 @@ class FusedKdaBwdKernel:
     ):
         # v, dO, Akk and h are last read by MMA phase D, so the next chunk's
         # copies are issued as soon as it completes; q, k and Aqk (still read
-        # by the intra fold, the exact blocks and the epilogue) wait for FREE.
+        # by the owner's intra fold, exact blocks and epilogue) wait for FREE.
         early_bytes = 2 * _BT * _DK * 2 + _BT * _BT * 2 + _DK * _DV * 2
-        late_bytes = 2 * _BT * _DK * 2 + _BT * _BT * 2
         staged = self._plan.canonical_staged
         l_token, l_square, l_state = staged.token_direct, staged.square_direct, staged.state_direct
         s_q, s_k, s_v, s_do = (_view(m, l_token) for m in (smem.q, smem.k, smem.v, smem.do))
@@ -873,6 +874,16 @@ class FusedKdaBwdKernel:
         for it in cutlass.range(num_chunks):
             chunk = num_chunks - 1 - it
             row = seq_start + chunk * _BT
+            # A chunk this CTA does not own releases q, k and Aqk after phase B,
+            # so the next chunk's copies of them go first.
+            late_first = cutlass.Boolean(False)
+            if it > 0:
+                late_first = (it - 1) % self.split != part
+            if late_first:
+                self._wait(edges, _E_FREE, it - 1)
+                self._tma_late(
+                    smem, edges, tma_q, tma_k, tma_aqk, mma_token, mma_square, row, group
+                )
             if it > 0:
                 self._wait(edges, _E_DONE_D, it - 1)
             bar = edges + _E_LOAD_EARLY
@@ -890,14 +901,26 @@ class FusedKdaBwdKernel:
                 (cutlass.Int32(0), chunk_base + chunk, head),
                 bar,
             )
-            if it > 0:
-                self._wait(edges, _E_FREE, it - 1)
-            bar = edges + _E_LOAD
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(bar, late_bytes)
-            for info, tile in ((tma_q, s_q), (tma_k, s_k)):
-                self._tma(info, tile, mma_token, (_BT, _DK), row, group, bar)
-            self._tma(tma_aqk, s_aqk, mma_square, (_BT, _BT), row, group, bar)
+            if not late_first:
+                if it > 0:
+                    self._wait(edges, _E_FREE, it - 1)
+                self._tma_late(
+                    smem, edges, tma_q, tma_k, tma_aqk, mma_token, mma_square, row, group
+                )
+
+    @cute.jit
+    def _tma_late(self, smem, edges, tma_q, tma_k, tma_aqk, mma_token, mma_square, row, group):
+        """q, k and Aqk of one chunk on the LOAD edge."""
+        late_bytes = 2 * _BT * _DK * 2 + _BT * _BT * 2
+        staged = self._plan.canonical_staged
+        s_q, s_k = (_view(m, staged.token_direct) for m in (smem.q, smem.k))
+        s_aqk = _view(smem.aqk, staged.square_direct)
+        bar = edges + _E_LOAD
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, late_bytes)
+        for info, tile in ((tma_q, s_q), (tma_k, s_k)):
+            self._tma(info, tile, mma_token, (_BT, _DK), row, group, bar)
+        self._tma(tma_aqk, s_aqk, mma_square, (_BT, _BT), row, group, bar)
 
     # ---------------------------------------------------------------- MMA
 
@@ -1345,6 +1368,8 @@ class FusedKdaBwdKernel:
             self._stamp(trace, 1, 3, it)
             # MMA B does not read sKA; -(k beta G) is published with READY_C.
             self._cm_phase_b(1, ttidx, head, tok0, valid, smem, gc, s_beta)
+            if not owned:
+                self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
 
             # Phase C: vn -> sT21; D -> dv, dbeta(row), sKB; dAkk -> sSq.
             self._wait(edges, _E_DONE_B, it)
@@ -1513,7 +1538,8 @@ class FusedKdaBwdKernel:
                 )
                 if ttidx < valid:
                     dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
-            self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
+            if owned:
+                self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
             self._stamp(trace, 1, 10, it)
 
     # ----------------------------------------------------------------- CH
@@ -1607,6 +1633,9 @@ class FusedKdaBwdKernel:
             self._stamp(trace, 0, 3, it)
             self._cm_phase_b(0, tidx, head, tok0, valid, smem, gc, s_beta)
             self._arrive(edges, _E_READY_B, _BAR_CH, tidx)
+            if not owned:
+                # q, k and Aqk are not read again on a chunk this CTA does not own.
+                self._arrive(edges, _E_FREE, _BAR_CH, tidx)
             self._stamp(trace, 0, 4, it)
             self._wait(edges, _E_DONE_C, it)
             self._stamp(trace, 0, 5, it)
@@ -1695,7 +1724,8 @@ class FusedKdaBwdKernel:
                     trace,
                     it,
                 )
-            self._arrive(edges, _E_FREE, _BAR_CH, tidx)
+            if owned:
+                self._arrive(edges, _E_FREE, _BAR_CH, tidx)
             self._stamp(trace, 0, 8, it)
 
     # ------------------------------------------------- channel-major halves
