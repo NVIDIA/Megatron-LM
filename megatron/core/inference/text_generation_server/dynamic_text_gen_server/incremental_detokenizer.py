@@ -61,6 +61,11 @@ class HuggingFaceFastIncrementalDetokenizer:
             frozenset(huggingface_tokenizer.all_special_ids) - self._eos_token_ids
         )
         self._pending_eos_token_ids: list[int] = []
+        # The decoder withholds an incomplete UTF-8 character until a later token
+        # completes it. Track the withheld ids, and the ids of the decoder's last
+        # fragment as their context, so `finish` can flush them like a batch decode.
+        self._withheld_token_ids: list[int] = []
+        self._context_token_ids = self._kept(prompt_token_ids)
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0
@@ -90,20 +95,22 @@ class HuggingFaceFastIncrementalDetokenizer:
         return self._decode(decode_ids)
 
     def finish(self) -> str:
-        """Resolve buffered EOS tokens once their trailing position is known."""
+        """Resolve buffered EOS tokens and flush text the decoder still withholds."""
         if self._finished:
             return ""
         self._finished = True
         decode_ids = [] if self._remove_eos else self._pending_eos_token_ids
         self._pending_eos_token_ids = []
-        return self._decode(decode_ids)
+        return self._decode(decode_ids, flush=True)
 
-    def _decode(self, token_ids: list[int]) -> str:
+    def _decode(self, token_ids: list[int], *, flush: bool = False) -> str:
         fragments = []
         for token_id in token_ids:
             fragment = self._decode_next(token_id)
             if fragment:
                 fragments.append(fragment)
+        if flush and self._withheld_token_ids:
+            fragments.append(self._withheld_text())
 
         delta = "".join(fragments)
         if delta:
@@ -125,8 +132,23 @@ class HuggingFaceFastIncrementalDetokenizer:
                 token_id,
             )
             self._decode_stream = self._new_decode_stream()
+            self._withheld_token_ids, self._context_token_ids = [], []
             fragment = self._decode_stream.step(self._native_tokenizer, token_id)
+        if fragment:
+            self._context_token_ids = self._withheld_token_ids + [token_id]
+            self._withheld_token_ids = []
+        else:
+            self._withheld_token_ids.append(token_id)
         return fragment or ""
+
+    def _withheld_text(self) -> str:
+        """Decode the withheld ids as a batch decode would, e.g. a cut character as U+FFFD."""
+        context = self._native_tokenizer.decode(self._context_token_ids, skip_special_tokens=False)
+        text = self._native_tokenizer.decode(
+            self._context_token_ids + self._withheld_token_ids, skip_special_tokens=False
+        )
+        self._withheld_token_ids = []
+        return text[len(context) :] if text.startswith(context) else ""
 
     @property
     def text(self) -> str:
@@ -135,8 +157,11 @@ class HuggingFaceFastIncrementalDetokenizer:
 
     @property
     def text_length(self) -> int:
-        """Return the number of emitted characters."""
-        return self._text_length
+        """Return the text offset of the next token: emitted text plus held EOS text."""
+        held_eos_text = self._native_tokenizer.decode(
+            self._pending_eos_token_ids, skip_special_tokens=False
+        )
+        return self._text_length + len(held_eos_text)
 
 
 def detokenize_generated_tokens(
