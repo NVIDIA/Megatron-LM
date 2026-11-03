@@ -105,8 +105,8 @@ class TestGDPTritonProjectionNoCopy:
 
             original_mm = bik.mm_batch_invariant
 
-            def copying_mm(a, b):
-                return original_mm(a, b.contiguous())
+            def copying_mm(a, b, **kwargs):
+                return original_mm(a, b.contiguous(), **kwargs)
 
             # The old TE shim copied its transposed weight immediately before
             # mm_batch_invariant. Force exactly that copy for the reference.
