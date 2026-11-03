@@ -622,13 +622,16 @@ def test_batch_invariant_mxfp8_permute_replays():
 
 def test_inference_permute_valid_pairs_past_int32_replays():
     """``valid_tokens * topk`` past int32 (``valid_tokens`` at its int32 maximum): the count
-    kernels and both permute kernels form it in int64 and clamp it to the routing-map rows. They
-    replay bit-exactly and give the ``valid_tokens == rows`` result bit for bit."""
+    kernels, both permute kernels and the vLLM path's scatter form it in int64 and clamp it to
+    the routing-map rows. They replay bit-exactly and give the ``valid_tokens == rows`` result
+    bit for bit."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
     from megatron.core.inference.moe.permute import (
         compute_local_tokens_per_expert,
         permute_and_quantize_mxfp8,
         permute_tokens,
     )
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
 
     seeded()
     rows, hidden, topk, num_local = 1024, 1024, 8, 32
@@ -636,6 +639,8 @@ def test_inference_permute_valid_pairs_past_int32_replays():
     probs = torch.rand(rows, topk, device="cuda")
     tokens = torch.arange(rows, device="cuda")[:, None]
     routing_map = (tokens + 3 * torch.arange(topk, device="cuda")[None, :]) % num_local
+    fc1 = torch.randn(num_local, 256, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(num_local, hidden, 256, device="cuda", dtype=torch.bfloat16) * 0.02
 
     def logical_rows(hidden_states, probs, valid_tokens=2**31 - 1):
         valid = _dev_scalar(valid_tokens)
@@ -665,6 +670,17 @@ def test_inference_permute_valid_pairs_past_int32_replays():
             return_batch_invariant_inverse_map=True,
         )
         q_live = q_inverse_map[q_inverse_map >= 0].long()
+        moe_out = vllm_fused_moe(
+            hidden_states,
+            probs,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            num_local,
+            0,
+            valid,
+            routing_map,
+        )
         return (
             *counts,
             offs,
@@ -673,6 +689,7 @@ def test_inference_permute_valid_pairs_past_int32_replays():
             q_offs,
             quantized.data[q_live].view(torch.uint8),
             q_probs[q_live],
+            moe_out,
         )
 
     reference, _ = assert_replays_bit_exact(

@@ -376,10 +376,12 @@ def _scatter_token_indices_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = tl.minimum(valid_tokens * topk, max_pairs)
-    if pid * BLOCK_SIZE >= valid_pairs:
+    # int64, as in the count kernels: valid_tokens * topk can pass 2^31 before the clamp.
+    valid_pairs = tl.minimum(valid_tokens.to(tl.int64) * topk, max_pairs)
+    block_start = pid.to(tl.int64) * BLOCK_SIZE
+    if block_start >= valid_pairs:
         return
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offs < valid_pairs
 
     eids = tl.load(routing_map_ptr + offs, mask=mask, other=-1)
@@ -441,6 +443,8 @@ def _moe_align_block_size_cuda_graphable(
     device = routing_map.device
 
     max_sorted = max_tokens * topk + block_size * (num_local_experts + 1)
+    # sorted_token_ids (pair indices), the expert offsets and the padded count are int32.
+    assert max_sorted < 2**31, f"{max_sorted} sorted pair slots: pair indices are int32"
     max_blocks = _ceil_div(max_sorted, block_size)
     sentinel = max_tokens * topk
 
@@ -833,7 +837,7 @@ def vllm_fused_moe(
         activation_clamp_scale=activation_clamp_scale,
     )
     if batch_invariant_mode:
-        live_rows = (valid_tokens * topk).to(torch.int32)
+        live_rows = valid_tokens.to(torch.int64) * topk
         if is_swiglu:
             # Match training: routing probabilities multiply at the activation
             # (before FC2), with the training kernel's exact rounding sequence
@@ -859,7 +863,7 @@ def vllm_fused_moe(
     elif is_swiglu:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
-        intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
+        intermediate1 = bounded_silu_mul(intermediate1, valid_tokens.to(torch.int64) * topk)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Ordinary inference
     # multiplies each row by its routing probability in the GEMM epilogue, on

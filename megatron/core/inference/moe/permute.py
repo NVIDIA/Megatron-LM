@@ -413,6 +413,8 @@ def permute_tokens(
         max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
     )
     output_size = _ceil_div(unaligned_output_size, row_alignment) * row_alignment
+    # The expert offsets and the claimed row positions are int32.
+    assert output_size < 2**31, f"{output_size} permuted rows: offsets and positions are int32"
 
     permuted_hidden = torch.empty(
         output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
@@ -778,6 +780,8 @@ def permute_and_quantize_mxfp8(
     )
     # Keep data rows consistent with the swizzled scale layout's fixed row block.
     output_size = _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    # The expert offsets and the claimed row positions are int32.
+    assert output_size < 2**31, f"{output_size} permuted rows: offsets and positions are int32"
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(output_size, MXFP8_SCALE_ROW_BLOCK)

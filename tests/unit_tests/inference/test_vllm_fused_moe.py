@@ -325,6 +325,39 @@ class TestMoeAlignBlockSize:
         placed = sorted_ids[sorted_ids != sentinel]
         assert sorted(placed.tolist()) == list(range(sentinel))
 
+    def test_valid_pairs_past_int32(self):
+        """valid_tokens * topk past int32 (valid_tokens at its int32 maximum) still counts and
+        scatters every pair of the routing-map rows; computed in int32, the pair count wraps
+        negative and the scatter writes no pair."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+        max_tokens, topk, num_experts, block_size = 6, 8, 8, 16
+        torch.manual_seed(42)
+        # Rows past the view, in the same buffer, route one slot to the last expert.
+        buffer = torch.full((4 * max_tokens, topk), -1, dtype=torch.int64, device="cuda")
+        buffer[:, 0] = num_experts - 1
+        buffer[:max_tokens] = torch.randint(0, num_experts - 1, (max_tokens, topk), device="cuda")
+        routing_map = buffer[:max_tokens]
+        sorted_ids, _, num_post_padded = _moe_align_block_size_cuda_graphable(
+            routing_map, block_size, num_experts, 0, _vt(2**31 - 1)
+        )
+
+        counts = torch.bincount(routing_map.flatten(), minlength=num_experts)
+        aligned = (counts + block_size - 1) // block_size * block_size
+        assert num_post_padded.item() == aligned.sum().item()
+        sentinel = max_tokens * topk
+        placed = sorted_ids[sorted_ids != sentinel]
+        assert sorted(placed.tolist()) == list(range(sentinel))
+
+    def test_rejects_pair_tables_past_int32(self):
+        """A routing map whose padded pair table needs 2^31 or more int32 slots is rejected
+        on the host, before any launch (the map is a stride-0 view, so nothing is allocated)."""
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
+
+        routing_map = torch.zeros(1, 8, dtype=torch.int64, device="cuda").expand(2**28, 8)
+        with pytest.raises(AssertionError, match="int32"):
+            _moe_align_block_size_cuda_graphable(routing_map, 16, 8, 0, _vt(1))
+
     @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
     def test_expert_ids_cover_all_blocks(self, block_size):
         """expert_ids has a valid expert index for every block in [0, num_post_padded/block_size)."""
@@ -712,6 +745,63 @@ class TestVllmFusedMoe:
 
         torch.testing.assert_close(out_buffer[:max_tokens], expected, atol=5e-2, rtol=5e-2)
         assert torch.all(out_buffer[max_tokens:] == sentinel)
+
+    @pytest.mark.parametrize("batch_invariant", [False, True])
+    @pytest.mark.parametrize("activation", ["SQUARED_RELU", "SWIGLU"])
+    def test_valid_pairs_past_int32(self, activation, batch_invariant):
+        """valid_tokens * topk past int32 (valid_tokens at its int32 maximum) gives the
+        valid_tokens == rows output bit for bit. Computed in int32, the pair count and the
+        activation's live-row bound wrap negative, so no pair is computed.
+
+        The persistent intermediate buffers are filled with NaN before each call, so a row
+        that is summed but never computed shows up in the output.
+        """
+        from contextlib import nullcontext
+
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers, vllm_fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 5, 64, 128, 2, 4
+        make = _make_swiglu_inputs if activation == "SWIGLU" else _make_moe_inputs
+        hidden, probs, routing_map, fc1_weight, fc2_weight = make(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts, seed=7
+        )
+        VllmFusedMoeBuffers.allocate_buffers(
+            max_tokens, topk, fc1_weight.size(1), hidden_size, num_experts
+        )
+
+        def run(valid_tokens):
+            for name in ("intermediate1", "intermediate3"):
+                VllmFusedMoeBuffers._buffers[name].fill_(float("nan"))
+            out = torch.zeros(max_tokens, hidden_size, device="cuda")
+            vllm_fused_moe(
+                hidden,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                getattr(ActivationType, activation),
+                num_experts,
+                0,
+                _vt(valid_tokens),
+                routing_map,
+                out=out,
+            )
+            return out
+
+        mode = (
+            set_batch_invariant_mode(True, backend="triton") if batch_invariant else nullcontext()
+        )
+        try:
+            with mode:
+                actual = run(2**31 - 1)
+                expected = run(max_tokens)
+        finally:
+            VllmFusedMoeBuffers._delete_buffers()
+        assert not expected.isnan().any()
+        assert torch.equal(actual, expected)
 
     def test_output_buffer_reuse(self):
         """Output is written to provided buffer when out= is specified."""

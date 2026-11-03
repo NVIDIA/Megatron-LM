@@ -260,6 +260,25 @@ class TestComputeLocalTokensPerExpert:
         expected = _ref_tokens_per_expert(routing_map, 0, 8)
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
+    def test_block_offsets_past_int32(self):
+        """Programs whose 1024-pair block starts at 2^31 or later count nothing.
+
+        The kernel gets the grid and max_pairs of a 2^31 + 8-pair map, but only the 4 live rows
+        are backed by memory. With an int32 block offset, the last program's offsets wrap to
+        -2^31, pass the mask and read 8 GiB before the map (an illegal address or stray counts).
+        """
+        import triton
+
+        from megatron.core.inference.moe.permute import _count_local_tokens_kernel
+
+        topk, valid, num_local, max_pairs, block = 8, 4, 8, 2**31 + 8, 1024
+        routing_map = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(valid, 1)
+        counts = torch.zeros(num_local, dtype=torch.int32, device="cuda")
+        _count_local_tokens_kernel[(triton.cdiv(max_pairs, block),)](
+            routing_map, counts, _vt(valid), topk, max_pairs, 0, num_local, BLOCK_SIZE=block
+        )
+        assert counts.tolist() == [valid] * num_local
+
     @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
     def test_rejects_invalid_counter_buffer(self, invalid):
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
@@ -341,6 +360,29 @@ class TestComputeExpertOffsets:
             assert (
                 exc[i].item() % alignment == 0
             ), f"exc[{i}]={exc[i].item()} not aligned to {alignment}"
+
+
+@pytest.mark.internal
+class TestInitPermutationMap:
+
+    def test_block_offsets_past_int32(self):
+        """Programs whose 1024-entry block starts at 2^31 or later write nothing.
+
+        The kernel gets the grid of a 2^31 + 1-entry map, but only a small buffer backs its
+        head. With an int32 block offset, the last program's offsets wrap to -2^31, pass the
+        < n_used mask and write -1 8 GiB before the map (an illegal address or corruption).
+        """
+        import triton
+
+        from megatron.core.inference.moe.permute import _init_permutation_map_kernel
+
+        n_used, sentinel, block = 5, 0x5A5A5A5A, 1024
+        buffer = torch.full((2 * block,), sentinel, dtype=torch.int32, device="cuda")
+        _init_permutation_map_kernel[(triton.cdiv(2**31 + 1, block),)](
+            buffer, _vt(n_used), BLOCK_SIZE=block
+        )
+        assert (buffer[:n_used] == -1).all()
+        assert (buffer[n_used:] == sentinel).all()
 
 
 class TestPermuteTokens:
@@ -562,6 +604,20 @@ class TestPermuteTokens:
             token_expert = routed.nonzero()
             assert torch.equal(perm_map[rows.long()].long(), token_expert[:, 0])
             assert torch.equal(torch.searchsorted(offs, rows, right=True), token_expert[:, 1])
+
+    @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "mxfp8"])
+    def test_rejects_outputs_past_int32_rows(self, mxfp8):
+        """A permuted output of 2^31 or more rows is rejected: the expert offsets and claimed
+        row positions are int32. The inputs are stride-0 views, so nothing large is allocated."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8, permute_tokens
+
+        rows = 2**31
+        hidden = torch.zeros(1, 32, dtype=torch.bfloat16, device="cuda").expand(rows, 32)
+        probs = torch.ones(1, 1, device="cuda").expand(rows, 1)
+        routing_map = torch.zeros(1, 1, dtype=torch.int64, device="cuda").expand(rows, 1)
+        permute = permute_and_quantize_mxfp8 if mxfp8 else permute_tokens
+        with pytest.raises(AssertionError, match="int32"):
+            permute(hidden, probs, routing_map, 0, 1, _vt(1))
 
     @pytest.mark.parametrize("hidden_dim", [32, 64, 128, 256, 512, 1024, 2688])
     def test_various_hidden_dims(self, hidden_dim):
@@ -799,10 +855,15 @@ class TestInt32Limits:
     """
 
     @pytest.mark.parametrize("persistent", [False, True])
-    @pytest.mark.parametrize("pairs", [2**31 - 8, 2**31], ids=["cdiv-wraps", "count-wraps"])
+    @pytest.mark.parametrize(
+        "pairs",
+        [2**31 - 8, 2**31, 2**31 + 1024],
+        ids=["cdiv-wraps", "count-wraps", "offsets-past-int32"],
+    )
     def test_count_live_pairs(self, pairs, persistent):
         """Every live pair is counted when valid_tokens * topk is 2^31 - 8 (the persistent
-        kernel's cdiv adds 1023 to it) or 2^31."""
+        kernel's cdiv adds 1023 to it), 2^31, or 2^31 + 1024 (the last block's offsets, which
+        the persistent kernel reaches through block_id * BLOCK_SIZE, pass 2^31)."""
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
 
         topk = 8
