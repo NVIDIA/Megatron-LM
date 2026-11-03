@@ -3943,7 +3943,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         class LocalCopyAgent:
             is_push = False
 
-            def __init__(self):
+            def __init__(self) -> None:
                 self.copies = []
 
             def begin_pull_blocks(self, _meta, source_blocks, destination_blocks):
