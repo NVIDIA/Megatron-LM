@@ -280,6 +280,8 @@ class _Scenario:
                 self.layer(hidden, attention_mask=None, inference_context=context)
         finally:
             hook.remove()
+        # The token count this step ran with (set by initialize_attention_state above).
+        self.padded_tokens = context.padded_active_token_count
         out = captured[0].reshape(captured[0].shape[0], -1)
         rows = {rid: (o, n, out[s : s + n]) for rid, (o, n, s) in spans.items()}
         decode_only = context.is_decode_only()
@@ -296,15 +298,20 @@ class _Scenario:
 def _training_reference(twin, hidden_prefix: torch.Tensor, rows: slice):
     """(fp64 reference, trusted bf16) for ``rows`` of the twin's forward over a request's prefix."""
     captured = {}
+
+    def record(name, value):
+        # A forward pre-hook that returns a value replaces the module's arguments: return None.
+        captured.setdefault(name, value)
+
     hooks = [
         twin.core_attention.register_forward_pre_hook(
-            lambda mod, args: captured.setdefault("qkv", [a.detach().clone() for a in args[:3]])
+            lambda mod, args: record("qkv", [a.detach().clone() for a in args[:3]])
         ),
         twin.linear_kv_up_proj.register_forward_pre_hook(
-            lambda mod, args: captured.setdefault("latent", args[0].detach().clone())
+            lambda mod, args: record("latent", args[0].detach().clone())
         ),
         twin.linear_proj.register_forward_pre_hook(
-            lambda mod, args: captured.setdefault("out", args[0].detach().clone())
+            lambda mod, args: record("out", args[0].detach().clone())
         ),
     ]
     try:
@@ -421,8 +428,10 @@ def test_padding_rows_do_not_reach_live_rows(precision):
         )
         for rid, prompt in PROMPTS.items():
             _add_request(scenario.context, rid, prompt)
-        assert scenario.context.padded_active_token_count > sum(PROMPTS.values()), "no padding"
         rows, _ = scenario.step()
+        assert scenario.padded_tokens > sum(
+            PROMPTS.values()
+        ), f"no padding rows: {scenario.padded_tokens} tokens for {sum(PROMPTS.values())} live"
         results.append({rid: got for rid, (_, _, got) in rows.items()})
     for rid in PROMPTS:
         assert torch.isfinite(results[1][rid]).all(), f"request {rid}: padding NaN reached it"

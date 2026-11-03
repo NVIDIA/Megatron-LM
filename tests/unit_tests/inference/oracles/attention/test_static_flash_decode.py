@@ -45,6 +45,13 @@ Open PRs (written against main):
   in every step that runs TE attention (prefill, and decode with ``flash_decode`` off) and pass
   with it; ``[batch=full-mha_without_rope]`` (a strided query view of the fused QKV output, P4-N2)
   likewise.
+* Strided ``k``/``v`` (P4-N7, suspected): with a batch below ``B_max`` the static path hands TE
+  ``k``/``v`` as batch slices of the cache. TE (2.20's ``get_qkv_layout``) takes them as
+  ``sbhd_sbhd_sbhd`` without making them dense only when ``k`` and ``v`` have the same strides and
+  zero offsets; a RoPE'd key is a new dense tensor, so the RoPE cases above never reach it.
+  ``[batch=partial-gqa_without_rope]`` does (GQA keeps the query dense: its reshape copies), and
+  asserts that it does before comparing; it fails on main only if P4-N7 is real. The
+  flash-decode partial-batch cases reach it in their prefill (keys are RoPE'd before caching).
 * #8863 (t3-r11f5): HybridModel never builds ``rotary_pos_cos/sin``, so its flash-decode static
   generation applies no RoPE (R11-F5): ``test_model_static_generation[hybrid]`` fails on main and
   passes with #8863 (``[gpt]`` is the control). #8864 (t3-p4n1) keeps the GPT case passing.
@@ -76,7 +83,10 @@ def _require_fa2() -> None:
 
 @pytest.fixture
 def model_parallel():
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
     Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)  # the model tests' weight init forks this RNG
     yield
     Utils.destroy_model_parallel()
 
@@ -429,7 +439,66 @@ def _layer_cases():
             marks=ou.requires_sm(ou.HOPPER),
         )
     )
+    # GQA without RoPE, batch below B_max: dense query, k/v strided cache slices (P4-N7).
+    cases.append(
+        pytest.param(
+            dict(
+                flash_decode=False, gate=False, window=None, batch="partial", gqa_without_rope=True
+            ),
+            id="batch=partial-gqa_without_rope",
+            marks=ou.requires_sm(ou.HOPPER),
+        )
+    )
     return cases
+
+
+def _te_layout(q, k, v) -> str:
+    """The layout Transformer Engine's detection assigns to (q, k, v), for messages only."""
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import get_qkv_layout
+
+        return str(get_qkv_layout(q, k, v, qkv_format="sbhd")[0])
+    except Exception as error:  # noqa: BLE001  (version-dependent internals; report only)
+        return f"unknown ({type(error).__name__})"
+
+
+class _StridedKVProbe:
+    """Records, for every static TE core-attention call, whether it receives a dense query and
+    ``k``/``v`` that are strided views with the same strides and zero offsets: the inputs TE takes
+    as ``sbhd_sbhd_sbhd`` without making them dense."""
+
+    def __init__(self, attention):
+        self.calls = []
+        self._hook = attention.core_attention.register_forward_pre_hook(self._record)
+
+    def _record(self, module, args):
+        q, k, v = args[:3]
+        self.calls.append(
+            dict(
+                q_dense=q.is_contiguous(),
+                kv_strided=not k.is_contiguous() and not v.is_contiguous(),
+                kv_same_strides=k.stride() == v.stride(),
+                zero_offsets=all(x.storage_offset() == 0 for x in (q, k, v)),
+                te_layout=_te_layout(q, k, v),
+                shapes=[tuple(x.shape) for x in (q, k, v)],
+                strides=[x.stride() for x in (q, k, v)],
+            )
+        )
+
+    def remove(self):
+        self._hook.remove()
+
+    def assert_reached(self):
+        assert self.calls, "no static TE core-attention call was made"
+        for step, call in enumerate(self.calls):
+            reached = (
+                call["q_dense"]
+                and call["kv_strided"]
+                and call["kv_same_strides"]
+                and call["zero_offsets"]
+            )
+            assert reached, f"precondition not reached in step {step}: {call}"
+        print(f"P4-N7 probe: TE layout {self.calls[0]['te_layout']}; {self.calls[0]}")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -443,8 +512,8 @@ def test_static_steps_match_reference(case):
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
     head_dim, kv_heads, prompt, decode_steps, batch_max, seq_max = 64, 2, 12, 4, 3, 64
-    rope = not case.get("mha_without_rope", False)
-    if not rope:
+    rope = not (case.get("mha_without_rope") or case.get("gqa_without_rope"))
+    if case.get("mha_without_rope"):
         kv_heads = HEADS
     config = _config(
         kv_heads=kv_heads,
@@ -464,6 +533,7 @@ def test_static_steps_match_reference(case):
     )
     g = ou.make_generator(device="cuda")
     capture = _Capture(attention)
+    probe = _StridedKVProbe(attention) if case.get("gqa_without_rope") else None
     try:
         with torch.no_grad(), InferenceMode.active():
             for t, s in enumerate([prompt] + [1] * decode_steps):
@@ -486,6 +556,11 @@ def test_static_steps_match_reference(case):
                 context.increment_sequence_len_offset(s)
     finally:
         capture.remove()
+        if probe is not None:
+            probe.remove()
+    if probe is not None:
+        # The case must hand TE strided k/v slices it takes as dense, or it tests nothing.
+        probe.assert_reached()
     _static_oracle(attention, capture, case["window"], rope=rope, what=f"static steps {case}")
 
 
