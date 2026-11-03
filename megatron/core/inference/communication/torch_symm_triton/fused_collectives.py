@@ -252,6 +252,14 @@ def fused_multimem_rs_add_norm_ag(
     assert (
         rms_norm_weights.dtype == torch.bfloat16
     ), f"The RMSNorm weights must be bfloat16, got {rms_norm_weights.dtype}."
+    # The kernel addresses every tensor through a raw pointer as dense bf16 rows.
+    for name, tensor in (
+        ("input tensor", input_tensor),
+        ("residual output", residual_output_tensor),
+        ("residual input", residual_input_tensor),
+        ("RMSNorm weights", rms_norm_weights),
+    ):
+        assert tensor.is_contiguous(), f"The {name} must be contiguous."
 
     # this evaluates to 128 for bf16.
     # each thread will process 128 bits (8 bf16 values) at a time.

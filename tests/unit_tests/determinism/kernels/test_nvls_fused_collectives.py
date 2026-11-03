@@ -89,14 +89,20 @@ def test_launch_runs_one_token_per_block(monkeypatch, world_size, hidden, tokens
         ("weights-not-hidden-long", "RMSNorm weights, got"),
         ("residual-input-not-shard-sized", "residual input must hold"),
         ("residual-output-not-shard-sized", "residual output must hold"),
+        ("input-not-contiguous", "input tensor must be contiguous"),
+        ("residual-input-not-contiguous", "residual input must be contiguous"),
+        ("residual-output-not-contiguous", "residual output must be contiguous"),
+        ("weights-not-contiguous", "weights must be contiguous"),
     ],
 )
 def test_launcher_refuses_inputs_outside_the_contract(monkeypatch, case, error):
     """Inputs the kernel cannot process are refused before anything is launched: with a token
     count not divisible by the world size the last rank would reduce and normalize rows past the
     end and write them into every rank's buffer; with H % 8 != 0 every row after the first is
-    misaligned; weights that are not H bf16 values are misdecoded or read out of bounds; and
-    residuals that are not this rank's tokens are read and written out of bounds."""
+    misaligned; weights that are not H bf16 values are misdecoded or read out of bounds;
+    residuals that are not this rank's tokens are read and written out of bounds; and a strided
+    view with the right element count is addressed through its data pointer as dense rows, so
+    the wrong elements are read and written."""
     pytest.importorskip("triton")
     recorder = _LaunchRecorder()
     monkeypatch.setattr(fused_collectives, "_multimem_reduce_scatter_residual_add_kernel", recorder)
@@ -119,10 +125,29 @@ def test_launcher_refuses_inputs_outside_the_contract(monkeypatch, case, error):
         world_size=world_size, rank=world_size - 1, multicast_ptr=0, signal_pad_ptrs_dev=0
     )
     shard_rows = math.ceil(tokens / world_size)
-    symm = torch.empty(tokens, 1, hidden, dtype=torch.bfloat16)
-    residual_in = torch.empty(residual_in_rows or shard_rows, 1, hidden, dtype=torch.bfloat16)
-    residual_out = torch.empty(residual_out_rows or shard_rows, 1, hidden, dtype=torch.bfloat16)
-    weight = torch.empty(weight_len or hidden, dtype=weight_dtype)
+
+    def tensor(*shape, dtype=torch.bfloat16, contiguous=True):
+        if contiguous:
+            return torch.empty(*shape, dtype=dtype)
+        # Every other element of a twice-as-wide last dimension: the right element count.
+        return torch.empty(*shape[:-1], 2 * shape[-1], dtype=dtype)[..., ::2]
+
+    symm = tensor(tokens, 1, hidden, contiguous=case != "input-not-contiguous")
+    residual_in = tensor(
+        residual_in_rows or shard_rows,
+        1,
+        hidden,
+        contiguous=case != "residual-input-not-contiguous",
+    )
+    residual_out = tensor(
+        residual_out_rows or shard_rows,
+        1,
+        hidden,
+        contiguous=case != "residual-output-not-contiguous",
+    )
+    weight = tensor(
+        weight_len or hidden, dtype=weight_dtype, contiguous=case != "weights-not-contiguous"
+    )
 
     def launch():
         fused_collectives.fused_multimem_rs_add_norm_ag(
