@@ -61,11 +61,6 @@ def _wait_signal(addrs, sem: tl.constexpr):
     )
 
 
-@triton.constexpr_function
-def _next_power_of_2(n):
-    return 1 << (int(n) - 1).bit_length()
-
-
 @triton.jit
 def symm_mem_sync(
     signal_pad_ptrs,
@@ -110,7 +105,7 @@ def symm_mem_sync(
     # tl.arange needs a power-of-two length, so pad the rank vector for any other world size
     # (e.g. TP 3). Lane i is held by thread i and only threads below world_size signal (see
     # below), so the padded lanes never touch a signal pad; their loads are masked.
-    remote_ranks = tl.arange(0, _next_power_of_2(world_size))
+    remote_ranks = tl.arange(0, triton.next_power_of_2(world_size))
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
     remote_signal_pad_addrs = tl.load(
         signal_pad_ptrs + remote_ranks, mask=remote_ranks < world_size, other=0

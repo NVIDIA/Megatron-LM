@@ -423,8 +423,8 @@ def ordered_fold(
     Writes ``out`` (shape ``parts.shape[1:]``, contiguous; default dtype ``parts.dtype``).
     The TP slices may be strided apart; each is made contiguous if it is not.
 
-    The final step of the paths that gather the partials first (all-to-all, NCCL send/recv)
-    and of every TP 1 shard reduction (linear layers and the cross-entropy vocab sum).
+    The final step of the all-to-all fallback and of every TP 1 shard reduction (linear
+    layers and the cross-entropy vocab sum).
     """
     assert HAVE_TRITON and parts.is_cuda, "the ordered TP reductions need Triton on CUDA"
     tp = parts.shape[0]
@@ -685,6 +685,32 @@ def symm_ordered_reduce_scatter(
     return symm_ordered_reduce_scatter_shards(input_.unsqueeze(0), symm_mem_hdl, output, exact)
 
 
+def symm_ordered_reduce_scatter_shards(
+    parts: torch.Tensor,
+    symm_mem_hdl,
+    output: Optional[torch.Tensor] = None,
+    exact: Optional[bool] = None,
+) -> torch.Tensor:
+    """:func:`ordered_reduce_scatter_shards` of ``parts`` [c, M, ...] in the symmetric buffer.
+
+    ``parts`` is a contiguous tensor in the symmetric buffer. One pull kernel reads
+    the owned rows of every peer's c partials and folds them in global shard order into
+    ``output`` (allocated when None).
+
+    Used by ``InferenceRowParallelLinear._matmul_shards_reduce`` (the engine with several
+    ``batch_invariant_tp_shards`` per rank).
+    """
+    ws = symm_mem_hdl.world_size
+    c = parts.shape[0]
+    if output is None:
+        output = parts.new_empty((parts.shape[1] // ws, *parts.shape[2:]))
+    n_out = output.numel()
+    part_numel = parts[0].numel()
+    assert part_numel == n_out * ws and parts.is_contiguous() and output.is_contiguous()
+    assert parts.dtype == output.dtype
+    return _launch_pull(parts, output, symm_mem_hdl, exact, num_parts=c, part_stride=part_numel)
+
+
 # ── Fixed-shard row-parallel reductions (TP-invariant forward) ──────────────
 #
 # With ``batch_invariant_tp_shards = G`` a row-parallel output is defined independently of the
@@ -879,32 +905,6 @@ def tp_shard_row_linear(
     return _TPShardRowLinear.apply(
         x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad
     )
-
-
-def symm_ordered_reduce_scatter_shards(
-    parts: torch.Tensor,
-    symm_mem_hdl,
-    output: Optional[torch.Tensor] = None,
-    exact: Optional[bool] = None,
-) -> torch.Tensor:
-    """:func:`ordered_reduce_scatter_shards` of ``parts`` [c, M, ...] in the symmetric buffer.
-
-    ``parts`` is a contiguous tensor in the symmetric buffer. One pull kernel reads
-    the owned rows of every peer's c partials and folds them in global shard order into
-    ``output`` (allocated when None).
-
-    Used by ``InferenceRowParallelLinear._matmul_shards_reduce`` (the engine with several
-    ``batch_invariant_tp_shards`` per rank).
-    """
-    ws = symm_mem_hdl.world_size
-    c = parts.shape[0]
-    if output is None:
-        output = parts.new_empty((parts.shape[1] // ws, *parts.shape[2:]))
-    n_out = output.numel()
-    part_numel = parts[0].numel()
-    assert part_numel == n_out * ws and parts.is_contiguous() and output.is_contiguous()
-    assert parts.dtype == output.dtype
-    return _launch_pull(parts, output, symm_mem_hdl, exact, num_parts=c, part_stride=part_numel)
 
 
 # ── Vocab-parallel sums (cross entropy) ─────────────────────────────────────
