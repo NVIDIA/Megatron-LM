@@ -347,6 +347,18 @@ class TransformerConfig(ModelParallelConfig):
     ``elementwise`` projects one gate per attention output element. ``headwise`` projects one
     scalar gate per attention head and is currently supported only by Multi-Latent Attention.
     """
+
+    attention_output_gate_fusion: bool = False
+    """Fuse the elementwise ``attention_output_gate`` of Multi-Latent Attention (the FP32
+    sigmoid, its cast to the activation dtype and the multiply) into one Triton kernel per
+    direction (``megatron.core.fusions.fused_attention_output_gate``). Forward values and
+    gradients are bit-identical to the eager composition, which keeps the FP32 sigmoid output
+    and the cast scale alive until backward; the fusion keeps only the two gate inputs.
+    Requires ``attention_output_gate`` with ``gated_attention_proj_granularity='elementwise'``,
+    ``multi_latent_attention`` and Triton; the headwise gate and regular attention are not
+    supported yet.
+    """
+
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
@@ -2346,6 +2358,27 @@ class TransformerConfig(ModelParallelConfig):
                 "Regular attention does not support headwise "
                 "gated_attention_proj_granularity; use 'elementwise'."
             )
+        if self.attention_output_gate_fusion:
+            if not self.attention_output_gate:
+                raise ValueError("attention_output_gate_fusion requires attention_output_gate.")
+            if self.gated_attention_proj_granularity != 'elementwise':
+                raise ValueError(
+                    "attention_output_gate_fusion supports only "
+                    "gated_attention_proj_granularity='elementwise', got "
+                    f"{self.gated_attention_proj_granularity!r}."
+                )
+            if not self.multi_latent_attention:
+                raise ValueError(
+                    "attention_output_gate_fusion is currently supported only with "
+                    "multi_latent_attention."
+                )
+            from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
+
+            if not HAVE_TRITON:
+                raise ValueError(
+                    "attention_output_gate_fusion requires Triton >= 3.0 "
+                    "(triton.language.extra.libdevice)."
+                )
 
         if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
             raise ValueError(

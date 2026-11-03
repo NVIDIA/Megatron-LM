@@ -1140,6 +1140,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "in FP32 regardless of the parameter dtype, which "
         "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
     ),
+    KernelEntry(
+        name="mla_attention_output_gate_fusion",
+        sources=("megatron/core/fusions/fused_attention_output_gate.py",),
+        tests=(K + "test_attention_output_gate_fusion.py",),
+        kind="triton",
+        notes="Elementwise MLA output gate (core_attn_out * sigmoid(gate.float()) cast to the "
+        "activation dtype before the multiply): the forward and backward Triton kernels are "
+        "replayed bit-exactly for BF16 / FP16 / FP32 under serial and contended streams, and "
+        "compared bitwise with the eager composition; the full eager-parity grid lives in "
+        "tests/unit_tests/fusions/test_fused_attention_output_gate.py.",
+    ),
 )
 
 
