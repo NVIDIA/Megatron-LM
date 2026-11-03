@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
@@ -570,11 +570,24 @@ def test_partial_reduce_scatter_to_row_atomic_average_without_symm_mem_detector(
     _assert_dbuffer_local_tensors_close(replicated_buffer, [expected])
 
 
-def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
-    """Symmetric-memory reduce-scatter preserves AVG semantics."""
+@pytest.mark.parametrize("warmup_communicator", [False, True], ids=["cold", "warm"])
+def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(
+    distributed_setup, warmup_communicator
+):
+    """Cold registration and repeated rendezvous preserve AVG and the communicator."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
-    mesh = init_device_mesh(device.type, (world_size,))
-    dist.barrier(device_ids=[device.index])
+    if device.type != "cuda" or world_size < 2:
+        pytest.skip("Requires at least 2 CUDA ranks.")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    group = dist.new_group(backend="nccl")
+    mesh = DeviceMesh.from_group(group, device.type)
+    backend = group._get_backend(device)
+    assert not backend._is_initialized()
+    communicator = None
+    if warmup_communicator:
+        dist.barrier(group=group, device_ids=[device.index])
+        communicator = backend._comm_ptr()
     rank_scale = float(distributed_setup.rank + 1)
     tensors = [
         torch.full((5, 3), rank_scale, dtype=torch.float32, device=device),
@@ -585,8 +598,18 @@ def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(distribut
         partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")])
     assert symm_mem.is_symm_mem_tensor(partial_buffer.local_buffer)
 
+    assert backend._is_initialized() == warmup_communicator
+    partial_buffer.rendezvous(0)
+    assert backend._is_initialized()
+    if communicator is None:
+        communicator = backend._comm_ptr()
+    assert communicator != 0
+    partial_buffer.rendezvous(0)
+    assert backend._comm_ptr() == communicator
+
     sharded_buffer = partial_buffer.reduce_scatter(0, RowAtomic())
     replicated_buffer = sharded_buffer.allgather(0)
+    assert backend._comm_ptr() == communicator
 
     scale_average = (world_size + 1) / 2.0
     expected_tensors = [

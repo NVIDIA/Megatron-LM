@@ -204,6 +204,12 @@ class DBuffer:
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)
+        # NCCL window registration requires an initialized communicator, even
+        # when rendezvous is the first operation on this mesh-axis group.
+        # Eager connection creates a communicator, so reuse it after warmup.
+        backend = group._get_backend(self.device)
+        if not backend._is_initialized():
+            backend.eager_connect_single_device(self.device)
         symm_mem.rendezvous(self.local_buffer, group=group.group_name)
 
     def _resize_storage(self, numel: int) -> None:
