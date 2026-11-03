@@ -694,6 +694,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
     ),
     KernelEntry(
+        name="kda_pre_gated_delta_rule_fusion",
+        sources=("megatron/core/fusions/fused_pre_kda.py",),
+        kind="triton",
+        exempt_reason="KDA pre-GDR fusion is explicitly rejected with deterministic_mode=True "
+        "(KimiDeltaAttention._setup_variant_attrs). It reuses the pre-GDR module's timing-based "
+        "autotuned convolution kernels and its backward's atomic boundary-gradient and "
+        "causal_conv1d weight-gradient reductions; fused-vs-eager parity and the rejection guard "
+        "are covered by tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py.",
+    ),
+    KernelEntry(
         name="gdn_gated_output_norm_fusion",
         sources=("megatron/core/fusions/fused_gated_norm.py",),
         tests=(K + "test_gated_norm.py",),

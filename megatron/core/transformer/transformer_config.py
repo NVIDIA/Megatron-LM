@@ -656,7 +656,7 @@ class TransformerConfig(ModelParallelConfig):
     """Optional lower bound for KDA's bounded gate values."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
-    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+    """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
@@ -2915,15 +2915,13 @@ class TransformerConfig(ModelParallelConfig):
                             "build or set dsa_kernel_backend='none'."
                         )
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
-            raise NotImplementedError(
-                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-            )
-
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn'."
+                "experimental_attention_variant='gdn' or 'kda'."
             )
         if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
             raise ValueError(
