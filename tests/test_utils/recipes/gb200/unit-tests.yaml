@@ -113,6 +113,16 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Inference kernel oracles (tests/unit_tests/inference/oracles/README.md), apart from the rest of
+  # inference for the time limit. `-m launch_on_gb200` makes them target sm_10x: a missing
+  # package or kernel build fails them instead of skipping.
+  - test_case: [tests/unit_tests/inference/oracles/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
     products:
       - environment: [dev]

@@ -16,20 +16,23 @@ conventions):
   ``poison_`` / ``poisoned_empty`` / ``assert_poisoned`` (NaN-poisoned unused memory), and the
   ``sanitizer`` marker;
 * hardware: ``requires_sm`` / ``require_sm`` (skip off-target, fail when the run targets the
-  hardware);
+  hardware) and ``use_local_rank_device`` (one GPU per rank under ``torch.distributed.run``);
+* upstream bugs: ``xfail_upstream`` (strict, version-bounded) and ``drain_cuda_launch_error``;
 * samplers: ``assert_matches_distribution`` (chi-square), ``assert_counts_within_binomial_bounds``
   (exact binomial bounds), with a stated false-failure rate and a fixed seed.
 """
 
 import contextlib
+import importlib.metadata
 import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pytest
 import torch
+from packaging.version import Version
 
 from tests.unit_tests.find_test_cases import PLATFORM_MARKERS
 
@@ -904,6 +907,22 @@ def device_sm_major() -> Optional[int]:
     return torch.cuda.get_device_capability()[0]
 
 
+def use_local_rank_device(environ: Any = None) -> Optional[int]:
+    """Make ``LOCAL_RANK`` (modulo the visible devices) this process's CUDA device; return it.
+
+    CI runs each unit-test bucket under ``torch.distributed.run`` on every GPU of the node, and
+    every rank runs every test. Most oracles never set up process groups (which would pick the
+    rank's device), so without this every rank would run on device 0. A no-op outside
+    ``torch.distributed.run`` or without CUDA (returns None).
+    """
+    environ = os.environ if environ is None else environ
+    if "LOCAL_RANK" not in environ or not torch.cuda.is_available():
+        return None
+    index = int(environ["LOCAL_RANK"]) % torch.cuda.device_count()
+    torch.cuda.set_device(index)
+    return index
+
+
 def requires_sm(*majors: int) -> Any:
     """Marker: the test runs only on these compute-capability majors (``HOPPER``, ``BLACKWELL``).
 
@@ -969,6 +988,62 @@ def large_selected(markexpr: Optional[str] = None) -> bool:
     """True when the run opts into ``large`` tests: its ``-m`` expression names ``large``."""
     expr = _session["markexpr"] if markexpr is None else markexpr
     return re.search(r"\blarge\b", expr) is not None
+
+
+# ---------------------------------------------------------------------------------------------
+# Upstream bugs that no Megatron change can fix
+# ---------------------------------------------------------------------------------------------
+
+
+def installed_version(distribution: str) -> Optional[Version]:
+    """The installed version of a distribution (e.g. ``flashinfer-python``), or None."""
+    try:
+        return Version(importlib.metadata.version(distribution))
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def xfail_upstream(
+    finding: str,
+    package: str,
+    *,
+    fixed_after: str,
+    reason: str,
+    raises: Optional[Union[type, Tuple[type, ...]]] = None,
+) -> Any:
+    """Marker: the test fails on a confirmed bug in an upstream package, not in Megatron.
+
+    A strict xfail while the installed ``package`` (a distribution name) is at most
+    ``fixed_after``, the newest release known to have the bug (the one the CI image pins). A
+    newer release runs the test normally, and an XPASS fails, so the mark is removed once a
+    release fixes the bug. Without the package the mark does nothing (the test's dependency check
+    decides). ``reason`` names the drafted upstream patch; ``raises`` narrows the expected
+    failure where its type is known. Only for findings no Megatron change can fix (README.md,
+    "Markers"): a Megatron bug keeps a failing test until its fix PR lands.
+    """
+    installed = installed_version(package)
+    return pytest.mark.xfail(
+        installed is not None and installed <= Version(fixed_after),
+        reason=f"{finding}, upstream in {package} <= {fixed_after}: {reason}",
+        raises=raises,
+        strict=True,
+    )
+
+
+def drain_cuda_launch_error() -> Optional[str]:
+    """Clear a pending CUDA launch error; return its message, or None if there was none.
+
+    A kernel that fails to launch (e.g. asking for more shared memory than the GPU has) leaves
+    its error pending in the CUDA runtime, and the next kernel launch anywhere in the process
+    reports it. The conftest calls this after a test raises, so that error stays with its test.
+    """
+    if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return None
+    try:
+        torch.ones(1, device="cuda")  # a kernel launch, which reports and clears a pending error
+    except RuntimeError as error:
+        return str(error)
+    return None
 
 
 # ---------------------------------------------------------------------------------------------
