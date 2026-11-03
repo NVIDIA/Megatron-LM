@@ -7,6 +7,7 @@ wrapping decision and the rank-independent whole-parameter owners of the compact
 """
 
 import random
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -122,6 +123,30 @@ def test_layer_wise_rejects_chunks_without_a_layer_wise_layout():
         )
     # Direct construction without DDP-wrapped chunks owns and gathers whole params.
     assert LayerWiseDistributedOptimizer._resolve_param_layout(None, None) == "compact"
+
+
+@pytest.mark.parametrize(
+    ("kind", "reuse_grad_buf", "allowed"),
+    [
+        ("bf16", False, True),
+        ("mxfp8", True, True),
+        ("mxfp8", False, False),
+        ("blockwise", True, False),
+    ],
+)
+def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_grad_buf, allowed):
+    # The padded gather moves raw bytes; only MXFP8 staged through the grad buffer is
+    # requantized on every rank, so other FP8 params would keep stale scales off-owner.
+    optimizer = SimpleNamespace(param_groups=[{"params": [_param((8, 8))]}])
+    module = "megatron.core.optimizer.layer_wise_optimizer"
+    with (
+        mock.patch(f"{module}._param_uses_quantized_storage", return_value=kind != "bf16"),
+        mock.patch(f"{module}.is_mxfp8tensor", return_value=kind == "mxfp8"),
+        nullcontext() if allowed else pytest.raises(ValueError, match="compact"),
+    ):
+        LayerWiseDistributedOptimizer._check_padded_param_gather_storage(
+            [optimizer], SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf)
+        )
 
 
 # ---------------------------------------------------------------------------
