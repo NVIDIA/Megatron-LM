@@ -4744,6 +4744,15 @@ class TransformerConfig(ModelParallelConfig):
                 "Batch invariant mode does not support NVFP4: tensor-global "
                 "activation scaling depends on neighboring batch rows."
             )
+            # deepgemm and triton replace TE's GEMMs with BF16 batch-invariant kernels, which
+            # take no quantized operands. (Per-module quant_recipe precisions depend on module
+            # names, so the GEMM itself rejects those.)
+            if self.batch_invariant_backend in ("deepgemm", "triton"):
+                assert not (self.fp8 or self.fp4), (
+                    f"batch_invariant_backend={self.batch_invariant_backend!r} runs TE's GEMMs "
+                    "on BF16 batch-invariant kernels and does not support FP8/FP4; use "
+                    "batch_invariant_backend='te_native'."
+                )
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
