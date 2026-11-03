@@ -20,10 +20,11 @@ Contract (from the launchers' docstrings and `NVLSAllGatherVDispatcher.token_com
     batch_invariant_collective="multimem" (token_dispatcher_inference.py:666-675) needs a
     token's combined row to depend only on its partials: the same bits on every call, whatever
     its row position, the other tokens and the per-rank counts. It does not need correct
-    rounding, which the dispatcher's comment claims ("correctly-rounded (exact fp32 sum,
-    bitwise-equal to an fp64 reference)", :667-671): the first GPU run measured it on GB200 and
-    refuted it on H100, where the fp32 sum rounds after each add, in an order that also differs
-    between GPU sets (finding O5-N3; the comment should say what holds).
+    rounding. Megatron allows that collective only where the switch provides this: on
+    Blackwell. On Hopper the TransformerConfig refuses it, as deterministic training already
+    refuses NVLS on every Hopper GPU (NVLS reductions there can depend on the multicast objects
+    allocated before them, unless the driver and Fabric Manager carry the fix:
+    NVIDIA/nccl#2360; docs/user-guide/deterministic-training.md). Findings O5-N3 and O5-N4.
   * ordered: fp32 only; ((P_0 + P_1) + P_2) + ... in rank order, each add rounded to nearest in
     fp32, so the result depends on nothing else in the batch.
   Only rows [off_r, off_r + c_r) of the buffers are read and nothing but the output is written.
@@ -38,7 +39,9 @@ Tolerance classes:
   * multimem fp32 on N(0, 1) data: the derived bound of recursive fp32 summation in any order,
     element by element (``nu.assert_fp32_sum_within_bound``); bf16: bounded against the fp64 sum
     of the NCCL-gathered partials, calibrated by NCCL's fp32 all-reduce rounded once to bf16;
-  * multimem fp32 batch invariance: exact (bitwise) across calls, positions and co-batches;
+  * multimem fp32 batch invariance: exact (bitwise) across calls, positions and co-batches, on
+    Blackwell; on Hopper the config contract instead: "multimem" is refused (needs the fix PR
+    s4f-multimem-rounding-doc; fails on main);
   * ordered on N(0, 1) data: exact against the rank-order fp32 sum in torch.
 
 Structure-derived inputs: one block per token (grid min(per_rank_max, 128), grid-stride beyond
@@ -59,6 +62,8 @@ rank); `test_ordered_sum_is_rank_ordered` is the case it must pass, and it fails
 reordering happens on the target compiler. #8879 (t3-r09f1) runs the multimem combine at EP =
 world size inside the dispatcher and asserts the correctly-rounded claim; it passed on H100 because
 expert outputs carry few significant bits, so their fp32 sums are exact in any order.
+`test_hopper_refuses_batch_invariant_multimem` fails on main: it is the contract the fix PR
+s4f-multimem-rounding-doc adds (a config-time rejection on Hopper).
 """
 
 import pytest
@@ -82,6 +87,11 @@ BYTE_OFFSETS = [0, 1 << 20]
 def gpu_test(fn):
     """NVLS needs Hopper or Blackwell; GB200 CI launches the file through launch_on_gb200."""
     return pytest.mark.launch_on_gb200(ou.requires_sm(ou.HOPPER, ou.BLACKWELL)(fn))
+
+
+def blackwell_test(fn):
+    """Blackwell only: where Megatron allows batch-invariant "multimem"."""
+    return pytest.mark.launch_on_gb200(ou.requires_sm(ou.BLACKWELL)(fn))
 
 
 def sum_reference(parts):
@@ -263,7 +273,7 @@ SPREAD = dict(mantissa_bits=24, exponents=(-8, 8))
 the order of the adds shows in the bits (and their fp64 sums are exact)."""
 
 
-@gpu_test
+@blackwell_test
 @pytest.mark.parametrize("hidden", [7168, 128])
 @pytest.mark.parametrize("ws", nu.group_size_params())
 def test_multimem_fp32_combine_is_batch_invariant(nvls_groups, ws, hidden):
@@ -271,8 +281,9 @@ def test_multimem_fp32_combine_is_batch_invariant(nvls_groups, ws, hidden):
     each rank owns PROBES probe tokens with fixed partials (a request stays on its EP rank);
     over several calls the per-rank counts, the probes' row positions, the co-batched tokens
     and the timing (a random rank is delayed) change, and every probe's combined row must keep
-    its bits. Every call is also checked against the fp32 summation bound. Runs on every
-    architecture; correct rounding is not required (finding O5-N3)."""
+    its bits. Every call is also checked against the fp32 summation bound. Correct rounding is
+    not required. Blackwell only: on Hopper Megatron refuses the collective
+    (test_hopper_refuses_batch_invariant_multimem)."""
     g = nvls_groups.get(ws)
     symm = g.buffer()
     per_rank_max, probes, calls = 129, PROBES, 6
@@ -329,6 +340,48 @@ def test_multimem_fp32_combine_is_batch_invariant(nvls_groups, ws, hidden):
             )
 
     nu.agree(check, "batch-invariant fp32 combine")
+
+
+def batch_invariant_config(collective):
+    """A minimal TransformerConfig in batch-invariant mode with the given EP combine collective
+    (the rest set to what batch-invariant mode requires)."""
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4 if ou.device_sm_major() == ou.BLACKWELL else 3,
+        batch_invariant_mode=True,
+        batch_invariant_collective=collective,
+    )
+
+
+@ou.requires_sm(ou.HOPPER)
+def test_hopper_refuses_batch_invariant_multimem():
+    """On Hopper, batch-invariant mode with batch_invariant_collective="multimem" is refused when
+    the config is built ("ordered", the default, is accepted). The in-switch sum there is not
+    guaranteed to depend on a token's partials alone (NVLS reductions can depend on the
+    multicast objects allocated before them unless the driver and Fabric Manager carry the fix,
+    NVIDIA/nccl#2360), and Megatron does not check those versions, as for deterministic
+    training. Fails on main; the fix PR s4f-multimem-rounding-doc adds the rejection."""
+    batch_invariant_config("ordered")
+    with pytest.raises((AssertionError, ValueError)):
+        batch_invariant_config("multimem")
+
+
+@blackwell_test
+def test_blackwell_accepts_batch_invariant_multimem():
+    """On Blackwell both collectives are accepted: test_multimem_fp32_combine_is_batch_invariant
+    checks the in-switch sum gives what batch-invariant mode needs. Passes on main."""
+    assert batch_invariant_config("ordered").batch_invariant_collective == "ordered"
+    assert batch_invariant_config("multimem").batch_invariant_collective == "multimem"
 
 
 @gpu_test
