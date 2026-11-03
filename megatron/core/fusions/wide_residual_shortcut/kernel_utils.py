@@ -127,8 +127,8 @@ def allocate_operand(shape, device, bf16=False, *, columnwise=False):
     """Allocate a normalized reader operand with the requested TE orientation."""
     if bf16:
         return torch.empty(shape, dtype=torch.bfloat16, device=device)
-    from transformer_engine.pytorch.constants import DType
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+    from transformer_engine_torch import DType  # constants does not re-export it in every TE
 
     q = MXFP8Quantizer(DType.kFloat8E4M3, rowwise=not columnwise, columnwise=columnwise)
     q.optimize_for_gemm = True

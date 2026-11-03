@@ -60,8 +60,8 @@ from tests.unit_tests.test_utilities import Utils
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import MXFP8BlockScaling
-    from transformer_engine.pytorch.constants import DType
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+    from transformer_engine_torch import DType
 
     from megatron.core.extensions.transformer_engine import TELinear
 except ImportError:  # BF16-only tests do not need Transformer Engine.
