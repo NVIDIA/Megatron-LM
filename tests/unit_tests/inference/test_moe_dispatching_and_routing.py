@@ -959,8 +959,10 @@ class TestNVLSAllGatherVDispatcher:
             training_output.contiguous().view(torch.uint8),
         )
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm"])
-    @pytest.mark.parametrize("mxfp8_swiglu", [False, True])
+    # vLLM runs MXFP8 experts through the MCore grouped GEMM, which "torch" covers.
+    @pytest.mark.parametrize(
+        "grouped_gemm_backend,mxfp8_swiglu", [("torch", False), ("torch", True), ("vllm", False)]
+    )
     def test_ep_invariant_combine_moe_matches_training(
         self, monkeypatch, grouped_gemm_backend, mxfp8_swiglu
     ):
@@ -997,12 +999,9 @@ class TestNVLSAllGatherVDispatcher:
             False,
             config_overrides={"moe_ep_invariant_combine": True},
         )
-        # vLLM runs MXFP8 experts through the MCore grouped GEMM (dense-map tree).
-        expected = (
-            "tree_combine_topk_forward"
-            if grouped_gemm_backend == "vllm" and not mxfp8_swiglu
-            else "tree_combine_forward"
-        )
+        expected = {"torch": "tree_combine_forward", "vllm": "tree_combine_topk_forward"}[
+            grouped_gemm_backend
+        ]
         assert expected in calls, calls
 
     @staticmethod

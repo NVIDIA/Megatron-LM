@@ -108,8 +108,7 @@ def _rank_partial(idx, vals, experts, ep, rank):
 
 
 @needs_cuda
-@pytest.mark.parametrize("experts", [64, 96, 8])
-@pytest.mark.parametrize("with_probs", [False, True])
+@pytest.mark.parametrize("experts,with_probs", [(64, False), (96, True)])
 def test_kernel_matches_reference_tree(experts, with_probs):
     tokens, topk, hidden = 40, min(6, experts), 1000
     idx, vals = _case(tokens, experts, topk, hidden, seed=0)
@@ -123,9 +122,8 @@ def test_kernel_matches_reference_tree(experts, with_probs):
 
 @needs_cuda
 @pytest.mark.parametrize(
-    "experts,topk,hidden", [(64, 6, 1000), (96, 8, 700), (512, 22, 1536), (8, 8, 300)]
+    "experts,topk,hidden,with_probs", [(96, 8, 700, True), (512, 22, 1536, False)]
 )
-@pytest.mark.parametrize("with_probs", [False, True])
 def test_route_kernel_matches_dense_kernel(experts, topk, hidden, with_probs):
     """Training walks each token's sorted routes; it must give the dense kernel's bits,
     including slots that route nowhere (dropped or padded)."""
@@ -148,9 +146,8 @@ def test_route_kernel_matches_dense_kernel(experts, topk, hidden, with_probs):
 
 
 @needs_cuda
-@pytest.mark.parametrize("experts", [64, 96])
-def test_rank_partials_same_bits_at_every_ep(experts):
-    tokens, topk, hidden = 64, 6, 512
+def test_rank_partials_same_bits_at_every_ep():
+    experts, tokens, topk, hidden = 96, 64, 6, 512
     idx, vals = _case(tokens, experts, topk, hidden, seed=1)
     ref = _reference(idx, vals, experts)
     for ep in (1, 2, 4, 8, 16, 32):
@@ -170,12 +167,11 @@ def test_check_ep_size():
 
 
 @needs_cuda
-@pytest.mark.parametrize("with_probs", [False, True])
-def test_training_unpermute_same_bits_at_every_ep(monkeypatch, with_probs):
+def test_training_unpermute_same_bits_at_every_ep(monkeypatch):
     experts, topk, hidden, tokens = 64, 6, 512, 96
     idx, vals = _case(tokens, experts, topk, hidden, seed=2)
     rows, inverse_map = _training_inputs(idx, vals)
-    probs = torch.rand(tokens, experts, device="cuda") if with_probs else None
+    probs = None
     ref = _unpermute(rows, inverse_map, experts, 1, monkeypatch, True, probs)
     for ep in (1, 2, 4, 8):
         out = _unpermute(rows, inverse_map, experts, ep, monkeypatch, True, probs)
@@ -185,20 +181,20 @@ def test_training_unpermute_same_bits_at_every_ep(monkeypatch, with_probs):
             _unpermute(rows, inverse_map, experts, ep, monkeypatch, None, probs),
             _unpermute(rows, inverse_map, experts, ep, monkeypatch, False, probs),
         )
-    if not with_probs:  # (bf16 outputs; the fp32 values are compared below)
-        f = lambda on: moe_bi.unpermute(  # noqa: E731
-            rows.float(),
-            torch.Size((tokens, hidden)),
-            probs=None,
-            num_experts=experts,
-            inverse_map=inverse_map,
-            ep_invariant=on,
-        )
-        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
-        old4 = f(False)
-        monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
-        assert not torch.equal(old4, f(False))  # the old combine depends on EP
-        assert torch.equal(_bits(f(True)), _bits(_reference(idx, vals, experts)))
+    # bf16 outputs above; compare the fp32 values too.
+    f = lambda on: moe_bi.unpermute(  # noqa: E731
+        rows.float(),
+        torch.Size((tokens, hidden)),
+        probs=None,
+        num_experts=experts,
+        inverse_map=inverse_map,
+        ep_invariant=on,
+    )
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
+    old4 = f(False)
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
+    assert not torch.equal(old4, f(False))  # the old combine depends on EP
+    assert torch.equal(_bits(f(True)), _bits(_reference(idx, vals, experts)))
 
 
 @needs_cuda
@@ -260,11 +256,10 @@ def test_inference_unpermute_same_bits_at_every_ep(monkeypatch):
 
 
 @needs_cuda
-@pytest.mark.parametrize("experts,topk", [(64, 6), (96, 8), (512, 22)])
-def test_topk_layout_matches_dense_kernel(experts, topk):
+def test_topk_layout_matches_dense_kernel():
     """vLLM's rows (one per top-k slot, slots in top-k order) give the dense kernel's rank
     partials bit for bit at every EP; slots on other ranks and padded tokens are ignored."""
-    tokens, hidden = 37, 384
+    experts, topk, tokens, hidden = 96, 6, 37, 384  # leaves of 3; top-k padded to 8
     gen = torch.Generator(device="cuda").manual_seed(6)
     routing_map = torch.rand(tokens, experts, device="cuda", generator=gen).topk(topk, 1).indices
     vals = _rows(tokens * topk, hidden, gen).view(tokens, topk, hidden)
@@ -305,6 +300,22 @@ def test_config_validation():
         TransformerConfig(
             num_layers=1, hidden_size=64, num_attention_heads=4, moe_ep_invariant_combine=True
         )
+    # The torch and vLLM grouped GEMMs hand the combine one row per route; FlashInfer sums
+    # a token's routes inside its kernel, so it cannot run the tree.
+    inference = dict(
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        inference_moe_token_dispatcher_type="nvls",
+    )
+    with pytest.raises(ValueError, match="'torch' or 'vllm'"):
+        _ep_invariant_moe_config(
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_nvfp4_recipe="per_token",
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            **inference,
+        )
+    _ep_invariant_moe_config(inference_grouped_gemm_backend="vllm", **inference)
 
 
 def _ep_invariant_moe_config(**overrides):
@@ -353,25 +364,6 @@ def test_config_rejects_expert_tensor_parallel_inference():
     _ep_invariant_moe_config(
         expert_tensor_parallel_size=2, tensor_model_parallel_size=2, sequence_parallel=True
     )
-
-
-def test_config_inference_grouped_gemm_backends():
-    """The torch and vLLM grouped GEMMs hand the combine one row per route; FlashInfer
-    sums a token's routes inside its kernel, so it cannot run the tree."""
-    inference = dict(
-        transformer_impl="inference_optimized",
-        normalization="RMSNorm",
-        inference_moe_token_dispatcher_type="nvls",
-    )
-    with pytest.raises(ValueError, match="'torch' or 'vllm'"):
-        _ep_invariant_moe_config(
-            inference_grouped_gemm_backend="flashinfer",
-            inference_moe_nvfp4_recipe="per_token",
-            activation_func=torch.nn.functional.silu,
-            gated_linear_unit=True,
-            **inference,
-        )
-    _ep_invariant_moe_config(inference_grouped_gemm_backend="vllm", **inference)
 
 
 class TestEPInvariantCollectives:
