@@ -276,6 +276,8 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
     view = source.view([BlockAtomic(32)])
     assert view.view([BlockAtomic(32)]) is view
+    assert source.is_alias(view)
+    assert view.is_alias(source)
     for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
         assert actual.placements == ((RowAtomic(),) if index == 3 else (BlockAtomic(32),))
         chunks = original.local_buffer.view(mesh.size(), -1)
@@ -289,36 +291,14 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
             if rank != mesh.get_local_rank():
                 assert chunks[rank].eq(0).all()
 
-
-@pytest.mark.parametrize("singleton", [False, True])
-@pytest.mark.parametrize("placement", [Replicate(), BlockAtomic(32)])
-def test_quantized_prepared_redistribution_reuses_local_storage(
-    distributed_setup, singleton, placement
-):
-    """Each prepared MXFP8 plane shares local storage or receives a collective output."""
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (distributed_setup.world_size, 1),
-        mesh_dim_names=("dp", "local"),
-    )["local" if singleton else "dp"]
-    source = QuantizedDBuffer.empty(mesh, [placement], [(128, 64)], distributed_setup.device)
-    for index, plane in enumerate(source.planes):
-        plane.local_buffer.fill_(index + 1)
-    destination = source.prepare_redistribute([Replicate()])
-    shared = singleton or placement.is_replicate() or mesh.size() == 1
-    for original, prepared in zip(source.planes, destination.planes):
-        assert prepared.placements == (Replicate(),)
-        assert (
-            prepared.local_buffer.untyped_storage() is original.local_buffer.untyped_storage()
-        ) == shared
-
-    destination.reallocate_storage()
-    source.redistribute([Replicate()], out=destination)
-    for buffer in (source, destination):
-        for index, plane in enumerate(buffer.planes):
-            torch.testing.assert_close(
-                plane.local_buffer, torch.full_like(plane.local_buffer, index + 1)
-            )
+    separate = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    assert not source.is_alias(separate)
+    source.release_storage()
+    separate.release_storage()
+    assert source.is_alias(view)
+    assert not source.is_alias(separate)
 
 
 @pytest.mark.parametrize("use_out", [False, True])

@@ -367,14 +367,10 @@ class QuantizedDBuffer:
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
         )
 
-    def prepare_redistribute(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
-        """Prepare each plane's redistribution destination without communicating."""
-        placements = tuple(placements)
-        return self._from_planes(
-            self.rowwise_data.prepare_redistribute(placements),
-            self.columnwise_data.prepare_redistribute(placements),
-            self.rowwise_scale.prepare_redistribute(placements),
-            self.columnwise_scale.prepare_redistribute(_block_atomic_to_flat(placements)),
+    def is_alias(self, other: "QuantizedDBuffer") -> bool:
+        """Whether every corresponding plane shares backing storage."""
+        return all(
+            plane.is_alias(other_plane) for plane, other_plane in zip(self.planes, other.planes)
         )
 
     def redistribute(

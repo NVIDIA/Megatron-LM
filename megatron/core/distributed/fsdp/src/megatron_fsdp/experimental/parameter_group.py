@@ -350,10 +350,22 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = self.model_weight.prepare_redistribute(
-                unsharded_placements
-            )
+        if can_redistribute_locally(self.mesh, self.model_weight.placements, unsharded_placements):
+            self._unsharded_model_weight = self.model_weight.view(unsharded_placements)
+        else:
+            with self._symmetric_memory_context():
+                if isinstance(self.model_weight, DBuffer):
+                    self._unsharded_model_weight = DBuffer(
+                        mesh=self.mesh,
+                        placements=unsharded_placements,
+                        layout=layout,
+                        dtype=self.dtype,
+                        device=self.main_weight.device,
+                    )
+                else:
+                    self._unsharded_model_weight = QuantizedDBuffer(
+                        self.mesh, unsharded_placements, layout, self.main_weight.device
+                    )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -450,8 +462,10 @@ class FsdpParameterGroup:
 
     @property
     def is_rowwise_unsharded(self) -> bool:
-        """Whether MXFP8 rowwise planes are available for compute."""
+        """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight
+        if buffer.is_alias(self.model_weight):
+            return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
             return False
@@ -477,23 +491,16 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
 
-        if isinstance(self._unsharded_model_weight, DBuffer):
+        if self._unsharded_model_weight.is_alias(self.model_weight):
+            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
+        elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
             self._allgather_model_weight(
                 rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
-            # Shared storage can already contain both planes. Install every
-            # available phase that does not yet have a readiness event.
-            ready_phases = tuple(
-                p
-                for p, allocated in (
-                    (Phase.FORWARD, self._unsharded_model_weight.is_rowwise_allocated),
-                    (Phase.BACKWARD, self._unsharded_model_weight.is_columnwise_allocated),
-                )
-                if allocated and p not in self._unshard_events
-            )
+            ready_phases = missing_phases
         self._install_unsharded_parameters(
             rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
         )
@@ -533,7 +540,7 @@ class FsdpParameterGroup:
                 )
 
     def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
-        """Materialize the compute buffer; shared storage needs no allocation or copy.
+        """Allocate the gather buffer and fill it from sharded compute weights.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
         compute weights ignore them and gather their whole buffer.
@@ -586,19 +593,13 @@ class FsdpParameterGroup:
         else:
             self._unshard_events.clear()
 
+        # Clear readiness so the next unshard refreshes Parameter data/scales,
+        # but never free persistent compute weights or their padded scale copies.
+        if unsharded_model_weight.is_alias(self.model_weight):
+            return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
-            # Local redistribution can return a view of persistent model weights.
-            if (
-                unsharded_model_weight.local_buffer.untyped_storage()
-                is not self.model_weight.local_buffer.untyped_storage()
-            ):
-                unsharded_model_weight.release_storage()
-            return
-        if any(
-            gathered.local_buffer.untyped_storage() is persistent.local_buffer.untyped_storage()
-            for gathered, persistent in zip(unsharded_model_weight.planes, self.model_weight.planes)
-        ):
+            unsharded_model_weight.release_storage()
             return
         unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
         for parameter in self.fsdp_parameters:
@@ -743,7 +744,7 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
-        if self.pre_optimizer_main_grad.placements == self.main_grad.placements:
+        if self.pre_optimizer_main_grad is self.main_grad:
             # Optimizer layout equals the accumulation layout (e.g. plain DP): no
             # DP-outer axis to reduce, so grads already rest finalized.
             self._install_sharded_grads(self.main_grad)

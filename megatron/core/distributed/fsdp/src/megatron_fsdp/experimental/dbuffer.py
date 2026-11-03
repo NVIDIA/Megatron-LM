@@ -188,9 +188,7 @@ class DBuffer:
         return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
     def reallocate_storage(self) -> None:
-        """Restore the local buffer's backing storage if it was released."""
-        if self.is_allocated:
-            return
+        """Restore the local buffer's backing storage to its logical size."""
         # The allocator may hand back a different address than release_storage() freed.
         # Tensors sharing this Storage read its pointer on each access, so views into the
         # buffer -- including ones autograd saved -- follow it to the new allocation.
@@ -316,17 +314,9 @@ class DBuffer:
             self.layout,
         )
 
-    def prepare_redistribute(self, placements: Iterable[Placement]) -> "DBuffer":
-        """Prepare a reusable redistribution destination without communicating.
-
-        Local transitions share the source's storage. Otherwise, allocate an
-        uninitialized destination. Callers must preserve shared storage when
-        releasing a destination between redistributions.
-        """
-        placements = tuple(placements)
-        if can_redistribute_locally(self.mesh, self.placements, placements):
-            return self.view(placements)
-        return self._create_or_validate_out(None, placements=placements)
+    def is_alias(self, other: "DBuffer") -> bool:
+        """Whether the local buffers share backing storage, including distinct views."""
+        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
 
     @classmethod
     def distribute_tensors(
@@ -460,8 +450,7 @@ class DBuffer:
             if out is None:
                 return view
             out = self._create_or_validate_out(out, placements=new_placements)
-            if not out.local_buffer.is_set_to(view.local_buffer):
-                out.local_buffer.copy_(view.local_buffer)
+            out.local_buffer.copy_(view.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=new_placements)
         if len(changed_axes) != 1:
@@ -510,8 +499,7 @@ class DBuffer:
             if out is None:
                 return self.view(placements)
             out = self._create_or_validate_out(out, placements=placements)
-            if not out.local_buffer.is_set_to(self.local_buffer):
-                out.local_buffer.copy_(self.local_buffer)
+            out.local_buffer.copy_(self.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
