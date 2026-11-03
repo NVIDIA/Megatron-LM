@@ -754,7 +754,7 @@ _ASYNC_PAIR_SCENARIOS = (
             "moe_use_norm_before_up_proj": True,
         },
         signals=("ep1-moe", "inference-optimized", "latent-moe"),
-        prerequisite="flashinfer",
+        prerequisite="flashinfer-moe",
     ),
     _pair_scenario(
         "transformer-engine-fp8-moe",
@@ -977,6 +977,8 @@ _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
         pytest.importorskip("flashinfer")
+    elif scenario.prerequisite == "flashinfer-moe":
+        pytest.importorskip("flashinfer_jit_cache", reason="FlashInfer MoE needs prebuilt kernels")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:

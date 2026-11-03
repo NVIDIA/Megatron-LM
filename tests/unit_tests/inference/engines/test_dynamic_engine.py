@@ -3839,7 +3839,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context_max_requests=4,
             context_max_tokens=128,
             enable_prefix_caching=True,
-            flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
+            flash_attention_version=None,  # Newest installed FlashAttention: FA4 > FA3 > FA2.
             use_moe_layer_spec=True,
             transformer_impl="inference_optimized",
             top_k=1,
