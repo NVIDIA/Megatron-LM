@@ -606,7 +606,7 @@ class TestLaunchConfigs:
         entries = _TUNED_CONFIGS[key]
         monkeypatch.setattr(vllm_module, "_get_device_capability", lambda device: (10, 3))
         assert _get_launch_configs(1, 32, 6, 1856, 2688, "cuda") == entries[0][1:]
-        assert _get_launch_configs(9, 32, 6, 1856, 2688, "cuda") == entries[1][1:]
+        assert _get_launch_configs(9, 32, 6, 1856, 2688, "cuda") == entries[3][1:]
         last = entries[-1][0]
         assert _get_launch_configs(last, 32, 6, 1856, 2688, "cuda") == entries[-1][1:]
         default = _get_default_config(M=last + 1, E=32, top_k=6)
@@ -615,6 +615,11 @@ class TestLaunchConfigs:
         ep8 = _TUNED_CONFIGS[((10, 3), 16, 1856, 2688, 6)]
         assert _get_launch_configs(8, 16, 6, 1856, 2688, "cuda") == ep8[0][1:]
         assert _get_launch_configs(100, 16, 6, 1856, 2688, "cuda") == ep8[2][1:]
+        # Super and Ultra (top-22) have their own tables per EP size.
+        super_ep8 = _TUNED_CONFIGS[((10, 3), 64, 2688, 1024, 22)]
+        assert _get_launch_configs(1, 64, 22, 2688, 1024, "cuda") == super_ep8[0][1:]
+        ultra_ep4 = _TUNED_CONFIGS[((10, 3), 128, 5120, 2048, 22)]
+        assert _get_launch_configs(3, 128, 22, 5120, 2048, "cuda") == ultra_ep4[0][1:]
         # Other shapes and devices keep vLLM's heuristic.
         assert _get_launch_configs(8, 8, 6, 1856, 2688, "cuda")[0] == _get_default_config(
             M=8, E=8, top_k=6
@@ -1052,10 +1057,14 @@ class TestVllmFusedMoe:
 
 # Nemotron 3.5 Lightning experts at EP=4: 32 of 128 local experts, top-6.
 _MODEL_SHAPE = dict(hidden_size=2688, ffn_hidden=1856, topk=6, num_experts=128, num_local=32)
+# Nemotron 3 Super and Ultra latent experts: 512 experts, top-22.
+_SUPER_SHAPE = dict(hidden_size=1024, ffn_hidden=2688, topk=22, num_experts=512)
+_ULTRA_SHAPE = dict(hidden_size=2048, ffn_hidden=5120, topk=22, num_experts=512)
 
 
-def _model_shape_inputs(max_tokens, valid, local_start, seed=0, num_local=None):
-    s = dict(_MODEL_SHAPE, num_local=num_local or _MODEL_SHAPE["num_local"])
+def _model_shape_inputs(max_tokens, valid, local_start, seed=0, num_local=None, shape=None):
+    shape = shape or _MODEL_SHAPE
+    s = dict(shape, num_local=num_local or shape["num_local"])
     gen = torch.Generator(device="cuda").manual_seed(seed)
     hidden = torch.randn(max_tokens, s["hidden_size"], generator=gen, device="cuda").to(
         torch.bfloat16
@@ -1129,23 +1138,36 @@ class TestVllmFusedMoeModelShapes:
         assert torch.isfinite(out[:valid]).all()
         assert torch.isnan(out[valid:]).all(), "rows beyond valid_tokens must stay untouched"
 
-    @pytest.mark.parametrize("num_local", [32, 16])  # EP=4 and EP=8
     @pytest.mark.parametrize(
-        "hint", [1, 8, 16, 32, 64, 128, 256, 512, 1024, 1025, 2047, 2048, 2049, 4096, 8192]
+        "shape,num_local",
+        [
+            (_MODEL_SHAPE, 32),
+            (_MODEL_SHAPE, 16),
+            (_SUPER_SHAPE, 128),
+            (_SUPER_SHAPE, 64),
+            (_ULTRA_SHAPE, 128),
+            (_ULTRA_SHAPE, 64),
+        ],
+        ids=["nano-ep4", "nano-ep8", "super-ep4", "super-ep8", "ultra-ep4", "ultra-ep8"],
     )
-    def test_measured_configs_match_default_configs_bitwise(self, hint, num_local, monkeypatch):
+    @pytest.mark.parametrize(
+        "hint", [1, 2, 3, 8, 16, 32, 64, 128, 256, 512, 1024, 1025, 2047, 2048, 2049, 4096, 8192]
+    )
+    def test_measured_configs_match_default_configs_bitwise(
+        self, hint, shape, num_local, monkeypatch
+    ):
         """On the measured device, the tuned configs reproduce the default configs' bits."""
         from megatron.core.inference.moe import fused_moe
         from megatron.core.inference.moe.vllm_fused_moe import _TUNED_CONFIGS, vllm_fused_moe
 
         capability = torch.cuda.get_device_capability()
-        s = dict(_MODEL_SHAPE, num_local=num_local)
+        s = dict(shape, num_local=num_local)
         key = (capability, s["num_local"], s["ffn_hidden"], s["hidden_size"], s["topk"])
         if key not in _TUNED_CONFIGS:
             pytest.skip(f"no measured launch configs for {key}")
         max_tokens = max(hint, 16)
         hidden, probs, routing_map, fc1, fc2 = _model_shape_inputs(
-            max_tokens, hint, 0, num_local=num_local
+            max_tokens, hint, 0, num_local=num_local, shape=shape
         )
         # The package re-exports the vllm_fused_moe function under the module's name.
         module = importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
