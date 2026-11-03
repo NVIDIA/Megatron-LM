@@ -597,7 +597,6 @@ def _reroot_otel_interval():
     from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
-
     prev = _otel_interval_span
     links = []
     try:
@@ -622,7 +621,9 @@ def _reroot_otel_interval():
         _otel_interval_span = None
         _otel_interval_ctx_token = None
     try:
-        sp = get_telemetry().tracer.start_span('megatron.train', context=Context(), links=links)
+        sp = get_telemetry().tracer.start_span(
+            'megatron.train', context=Context(), links=links
+        )
         _otel_mark_goodput(sp)
         _otel_interval_span = sp
         _otel_interval_ctx_token = _octx.attach(_otr.set_span_in_context(sp))
@@ -649,7 +650,6 @@ def _end_otel_interval_span():
     if _otel_interval_span is not None:
         try:
             from opentelemetry import context as _octx
-
             if _otel_interval_ctx_token is not None:
                 _octx.detach(_otel_interval_ctx_token)
         except Exception:  # noqa: BLE001
@@ -712,7 +712,7 @@ def destroy_global_state():
 
 def print_datetime(string, override_timestamp=None):
     """Note that this call will sync across all ranks. Use override_timestamp if provided;
-    otherwise use current timestamp."""
+       otherwise use current timestamp."""
     torch.distributed.barrier()
     if override_timestamp is None:
         time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
@@ -939,13 +939,13 @@ def num_floating_point_operations(
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
-            4 * total_tokens * hidden_size * p * (hidden_size + hidden_size * (g / num_heads))
+            4 * total_tokens * hidden_size * p
+            * (hidden_size + hidden_size * (g / num_heads))
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
-    def mamba_layer_flops(
-        total_tokens, hidden_size, state_dim=16, head_dim=64, num_groups=1, num_heads=128
-    ):
+    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
+                          head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
         # but small percent of overall layer flops
@@ -956,7 +956,10 @@ def num_floating_point_operations(
             nheads = d_in // head_dim
         return (
             (
-                2 * total_tokens * hidden_size * (2 * d_in + 2 * num_groups * state_dim + nheads)
+                2
+                * total_tokens
+                * hidden_size
+                * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
             + (7 * total_tokens * d_in * state_dim)  # scan
             + (2 * total_tokens * d_in * hidden_size)  # out_proj
@@ -1014,15 +1017,13 @@ def num_floating_point_operations(
             # GDN in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
             in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
         return (
-            2
-            * total_tokens
-            * (
+            2 * total_tokens * (
                 # in_proj
                 hidden_size * in_proj_dim
                 # conv1d
                 + conv_kernel_dim * (2 * qk_dim + v_dim)
                 # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
-                + num_v_heads * (v_head_dim**2) * 4
+                + num_v_heads * (v_head_dim ** 2) * 4
                 # out_proj: v_dim -> hidden_size
                 + hidden_size * v_dim
             )
@@ -1249,7 +1250,9 @@ def num_floating_point_operations(
                 forward_backward_expansion_factor
                 * fma_expansion_factor
                 * (
-                    args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
+                    args.num_attention_heads
+                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    / 2
                     + args.num_attention_heads * args.v_head_dim / 2
                 )
             )
@@ -1274,7 +1277,8 @@ def num_floating_point_operations(
                         + gate_projection_size
                     )
                     ## out proj
-                    + query_projection_size * args.hidden_size
+                    + query_projection_size
+                    * args.hidden_size
                 )
             )
             # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
@@ -1337,13 +1341,18 @@ def num_floating_point_operations(
                     * fma_expansion_factor
                     * (
                         ## in proj
-                        args.hidden_size * in_proj_dim
+                        args.hidden_size
+                        * in_proj_dim
                         ## conv1d
-                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
                         ## gated delta rule
-                        + num_v_heads * (v_head_dim**2) * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
                         ## out proj
-                        + args.hidden_size * v_dim
+                        + args.hidden_size
+                        * v_dim
                     )
                 )
             else:
@@ -1376,7 +1385,8 @@ def num_floating_point_operations(
                 * args.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * ffn_expansion_factor) * num_dense_layers
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
                     # routed experts
                     + (
                         (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
@@ -1394,7 +1404,8 @@ def num_floating_point_operations(
                     )
                     * num_moe_layers
                     # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor) * num_moe_layers
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention (token-linear part).
                 + self_attn_term
@@ -1464,7 +1475,6 @@ def num_floating_point_operations(
 
     def _uses_gated_delta_product_spec(args):
         """Return True when the selected hybrid stack spec swaps Mamba layers to GDP."""
-
         def _split_spec_part(part):
             return str(part).replace('[', ' ').replace(']', ' ').replace(',', ' ').split()
 
@@ -1531,16 +1541,10 @@ def num_floating_point_operations(
             swiglu=args.swiglu,
             use_gated_delta_product=_uses_gated_delta_product_spec(args),
             moe_latent_size=args.moe_latent_size,
-            moe_ffn_hidden_size=(
-                args.moe_ffn_hidden_size
-                if args.moe_ffn_hidden_size is not None
-                else args.ffn_hidden_size
-            ),
-            shared_expert_ffn_hidden_size=(
-                0
-                if args.moe_shared_expert_intermediate_size is None
-                else args.moe_shared_expert_intermediate_size
-            ),
+            moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
+                                 else args.ffn_hidden_size),
+            shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
+                                           else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             gdn_qk_head_dim=args.linear_key_head_dim or 128,
             gdn_v_head_dim=args.linear_value_head_dim or 128,
@@ -1995,7 +1999,6 @@ def preprocess_common_state_dict(common_state_dict):
         preprocessed_common_state_dict['args']['use_distributed_optimizer']
         and "optimizer" in preprocessed_common_state_dict
     ):
-
         def reorder_inner_param_groups(optimizer_state_dict):
             # When distributed optimizer loading, source param groups will be reordered,
             # so we reorder the param groups here to prevent warning.
@@ -2011,7 +2014,6 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2019,7 +2021,6 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
-
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -2215,8 +2216,8 @@ def pretrain(
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
-
         set_ideal_affinity_for_current_gpu()
+
 
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
@@ -2299,7 +2300,6 @@ def pretrain(
         # ensures both spans still get ended and telemetry flushed. Idempotent, so
         # this doesn't double-flush if _end_otel_job_spans() already ran normally.
         import atexit
-
         atexit.register(_end_otel_job_spans)
 
         # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
@@ -2322,7 +2322,6 @@ def pretrain(
         def _otel_force_flush():
             try:
                 from opentelemetry import trace as _ot
-
                 _prov = _ot.get_tracer_provider()
                 if hasattr(_prov, 'force_flush'):
                     _prov.force_flush()
@@ -2334,9 +2333,9 @@ def pretrain(
                 _otel_sigterm_fired[0] = True
                 try:
                     if _otel_graceful_drain:
-                        _otel_force_flush()  # graceful drain: flush only, keep provider alive
+                        _otel_force_flush()      # graceful drain: flush only, keep provider alive
                     else:
-                        _end_otel_job_spans()  # hard terminate: end + export the tree now
+                        _end_otel_job_spans()    # hard terminate: end + export the tree now
                 except Exception:
                     pass
             # chain to whatever handler was already installed (ft/torchelastic drain, or default)
@@ -2356,9 +2355,7 @@ def pretrain(
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
     if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor(
-            [_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda'
-        )
+        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
     set_startup_timestamps(program_start=program_start_global)
@@ -2378,41 +2375,26 @@ def pretrain(
     # Print basic megatron init time (using global min start)
     # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
     print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(
-            megatron_init_end - _LEGACY_TRAIN_START_TIME
-        )
+        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
     )
 
     # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime(
-        'after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup
-    )
-    print_datetime(
-        'after in-job setup and before initialize_megatron', timestamp_after_in_job_setup
-    )
+    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
+    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
     if program_start is not None and main_entry is not None and pretrain_entry is not None:
         # Inject startup deltas into timers
         startup_timers = {
-            'startup-program-entry-spread': program_start
-            - program_start_global,  # Local program start timestamp vs the global earliest program start timestamp
-            'startup-library-setup': main_entry - program_start,  # Local library imports
-            'startup-program-setup': pretrain_entry
-            - main_entry,  # Local __main__ entry to pretrain entry
-            'startup-in-process-setup': timestamp_after_inprocess_setup
-            - pretrain_entry,  # Local in-process setup
-            'startup-in-job-setup': timestamp_after_in_job_setup
-            - timestamp_after_inprocess_setup,  # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron
-            - timestamp_after_in_job_setup,  # Local initialize megatron
-            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options
-            - timestamp_after_initialize_megatron,  # Local set JIT fusion options
-            'all-reduce-start-timestamps-tensor': megatron_init_end
-            - timestamp_after_set_jit_fusion_options,  # 2x All-reduce, first collective call
-            'startup-megatron-init-local': megatron_init_end
-            - pretrain_entry,  # Local megatron init
-            'startup-megatron-init-global': megatron_init_end
-            - program_start_global,  # Local megatron init vs the global earliest program start timestamp
+            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+            'startup-library-setup': main_entry - program_start, # Local library imports
+            'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
+            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
+            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
+            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
+            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
+            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
+            'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
+            'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
@@ -3071,6 +3053,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
+
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -3457,9 +3440,7 @@ def setup_model_and_optimizer(
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-    one_logger and one_logger.log_metrics(
-        {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
-    )
+    one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -3521,9 +3502,7 @@ def setup_model_and_optimizer(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
-        with _otel_managed_span(
-            'load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True
-        ):
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
             train_state.iteration, train_state.num_floating_point_operations_so_far = load_checkpoint(
@@ -3656,15 +3635,8 @@ def dummy_train_step(data_iterator):
     dynamic_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
-        "tokens",
-        "labels",
-        "loss_mask",
-        "position_ids",
-        "attention_mask",
-        "cu_seqlens",
-        "cu_seqlens_padded",
-        "max_seqlen",
-        "local_cp_size",
+        "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
+        "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size",
         "hybrid_cp_group",
     ]
 
@@ -3812,7 +3784,6 @@ def train_step(
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
         from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
         from nemo.lens.helpers import span_cm
-
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -4893,7 +4864,6 @@ def save_checkpoint_and_time(
     if _otel_sg_enabled('checkpoint'):
         from opentelemetry import context as _octx
         from opentelemetry import trace as _otr
-
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -4912,9 +4882,7 @@ def save_checkpoint_and_time(
         one_logger_utils.track_e2e_metrics()
         # Free overlap param-gather buffers so that the async checkpoint worker
         # process has enough GPU headroom for D2H tensor transfers.
-        with _otel_managed_span(
-            'checkpoint', 'megatron.checkpoint.reclaim_memory', is_goodput_span=True
-        ):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.reclaim_memory', is_goodput_span=True):
             for model_chunk in model:
                 if hasattr(model_chunk, 'free_overlap_buffers'):
                     model_chunk.free_overlap_buffers()
@@ -4993,9 +4961,7 @@ def save_checkpoint_and_time(
         # Log E2E metrics after save-checkpoint
         one_logger_utils.track_e2e_metrics()
 
-        one_logger_utils.on_save_checkpoint_end(
-            save_checkpoint_duration, iteration, args.async_save
-        )
+        one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
         if cfg.logger.log_progress and not non_persistent_ckpt:
             compute_throughputs_and_append_to_progress_log(
@@ -5014,7 +4980,6 @@ def save_checkpoint_and_time(
     finally:
         if _exposed_save_span is not None:
             from opentelemetry import context as _octx
-
             _octx.detach(_exposed_save_token)
             _exposed_save_span.end()
 
@@ -5049,7 +5014,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
-    nsys_nvtx_context=None,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -5382,10 +5347,8 @@ def train(
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
-        print_rank_0(
-            f"Overwriting rerun_state_machine.current_iteration from "
-            f"{rerun_state_machine.current_iteration} to {iteration}..."
-        )
+        print_rank_0(f"Overwriting rerun_state_machine.current_iteration from "
+                     f"{rerun_state_machine.current_iteration} to {iteration}...")
         rerun_state_machine.current_iteration = iteration
 
     # Track E2E metrics at the start of training.
@@ -5495,7 +5458,9 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    forward_backward_func = get_forward_backward_func(
+        schedule_pg_collection=pg_collection
+    )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -5539,7 +5504,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
-    nsys_nvtx_context = None  # reference to context for nsys profiling, so it can be cleaned up
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         cfg.profiling.use_pytorch_profiler
         and (len(cfg.profiling.profile_ranks) == 0 or
@@ -5548,17 +5513,13 @@ def train(
         if cfg.profiling.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{cfg.logger.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
-            et = torch.profiler.ExecutionTraceObserver().register_callback(
-                f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz"
-            )
+            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         else:
             et = None
-
         def trace_handler(p):
             profile_dir = Path(f"{cfg.logger.tensorboard_dir}/../torch_profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
-
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
                 wait=max(cfg.profiling.profile_step_start - 1, 0),
@@ -5646,18 +5607,14 @@ def train(
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
         # main-thread work that sits in the post-checkpoint gap alongside the
         # exit-duration barrier.
-        with _otel_managed_span(
-            'checkpoint', 'megatron.checkpoint.ft_heartbeat', is_goodput_span=True
-        ):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.ft_heartbeat', is_goodput_span=True):
             ft_integration.on_checkpointing_start()
         # Non-blocking finalize of the *previous* async checkpoint, on the
         # training critical path -- this is the "exposed" cost the async save
         # imposes back on the loop (the flip side of the background write span
         # on the worker), and shows up as a per-iteration gap near checkpoint
         # boundaries. Cheap most iterations, blocks when finalizing.
-        with _otel_managed_span(
-            'checkpoint', 'megatron.checkpoint.save.finalize', is_goodput_span=True
-        ):
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.finalize', is_goodput_span=True):
             maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
         # Update the timeout for all process groups after initialization
@@ -5786,9 +5743,7 @@ def train(
             # prefetch) that steady-state iterations don't pay.
             _first_iter_span_cm = (
                 _otel_managed_span(
-                    'first_iteration',
-                    'megatron.train.first_iteration',
-                    is_goodput_span=True,
+                    'first_iteration', 'megatron.train.first_iteration', is_goodput_span=True,
                     **{'megatron.iteration': iteration},
                 )
                 if is_first_iteration
@@ -5818,14 +5773,7 @@ def train(
                     samples_seen_in_iteration,
                     scheduled_num_microbatches,
                 ) = train_step(
-                    forward_step_func,
-                    train_data_iterator,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    config,
-                    forward_backward_func,
-                    iteration=iteration,
+                    forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                     tensor_metric_observer=tensor_metric_observer,
@@ -5909,12 +5857,14 @@ def train(
             getattr(args, "fsdp_manual_registration", False)
             and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
-            and iteration == start_iteration + 1
+            and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
                 if isinstance(
                     model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-                ) and getattr(model_chunk.ddp_config, "fsdp_manual_registration", False):
+                ) and getattr(
+                    model_chunk.ddp_config, "fsdp_manual_registration", False
+                ):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
@@ -5975,7 +5925,6 @@ def train(
         if _otel_sg_enabled('step'):
             from opentelemetry import context as _octx
             from opentelemetry import trace as _otr
-
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
@@ -6078,10 +6027,8 @@ def train(
         finally:
             if _report_span is not None:
                 from opentelemetry import context as _octx
-
                 _octx.detach(_report_token)
                 _report_span.end()
-
         is_first_iteration = False
 
         # Evaluation.
@@ -6184,9 +6131,7 @@ def train(
     # Finalize all unfinished async requests and terminate the persistent
     # async worker (if enabled) if the code is meant to exit and not return from this
     # function.
-    with _otel_managed_span(
-        'checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True
-    ):
+    with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
         maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
@@ -6205,9 +6150,7 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
-            args, 'gtp_expert_remat_nccl_ub', False
-        ):
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
             from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
             # Deregister the GTP symmetric-memory pools: windows left registered when the
@@ -6392,9 +6335,7 @@ def evaluate(
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
-                        total_loss_dict[key] = torch.tensor(
-                            [0.0, 0.0], dtype=torch.float, device='cuda'
-                        )
+                        total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float, device='cuda')
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
@@ -6455,12 +6396,12 @@ def evaluate(
 
     rerun_state_machine.set_mode(rerun_mode)
 
+
     # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
     # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
     # so this is safe whether or not the group is enabled or the decorator fell back to no-op.
     try:
         from opentelemetry import trace as _ot
-
         _ot.get_current_span().set_attribute(
             'megatron.eval_iters', eval_iters if eval_iters is not None else 0
         )
@@ -6564,9 +6505,7 @@ def evaluate_and_print_results(
             ppl = math.exp(min(20, total_loss_dict[key].item()))
             string += '{} PPL: {:.6E} | '.format(key, ppl)
             if writer:
-                writer.add_scalar(
-                    '{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration
-                )
+                writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
                 writer.add_scalar(
                     '{} validation{} vs samples'.format(key, suffix),
                     total_loss_dict[key].item(),
@@ -6657,9 +6596,7 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(
-    build_train_valid_test_datasets_provider, train_valid_test_num_samples=None
-):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
@@ -6816,9 +6753,7 @@ def build_train_valid_test_data_iterators(
                     cfg.validation.eval_iters = [None] * len(valid_dataloaders)
                 else:
                     local_eval_iters = [len(dl) for dl in valid_dataloaders]
-                    eval_iters_tensor = torch.tensor(
-                        local_eval_iters, dtype=torch.long, device='cuda'
-                    )
+                    eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
@@ -6827,9 +6762,7 @@ def build_train_valid_test_data_iterators(
                     cfg.validation.eval_iters = eval_iters_tensor.tolist()
             else:
                 local_eval_iters = len(valid_dataloaders[0])
-                eval_iters_tensor = torch.tensor(
-                    [local_eval_iters], dtype=torch.long, device='cuda'
-                )
+                eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
