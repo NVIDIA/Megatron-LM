@@ -495,7 +495,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
-        notes="mamba_chunk_scan_combined_varlen and selective_state_update under the pinned autotune / ordered workspace.",
+        notes="mamba_chunk_scan_combined_varlen and selective_state_update under the pinned "
+        "autotune / ordered workspace. selective_state_update replays with dt, A and dt_bias "
+        "broadcast over the head dim (TIE_HDIM, the mixer's layout) and dense (general branch).",
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
