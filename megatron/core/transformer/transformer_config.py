@@ -2281,8 +2281,19 @@ class TransformerConfig(ModelParallelConfig):
                         "cannot be combined with FP8 inference or fp4_param."
                     )
 
-            # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
-            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            if (
+                self.moe_apply_probs_on_input
+                and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            ):
+                raise ValueError(
+                    "moe_apply_probs_on_input is not supported with "
+                    "inference_grouped_gemm_backend='flashinfer': the FlashInfer MoE kernels "
+                    "apply routing probabilities only to the expert output. Select "
+                    "inference_grouped_gemm_backend 'torch' or 'vllm'."
+                )
+
+            # Gated linear units (SwiGLU, gated squared ReLU) are supported by the torch and
+            # vLLM grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
             if (
                 self.gated_linear_unit
                 and self.inference_grouped_gemm_backend
@@ -2291,10 +2302,34 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
-                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
-                    "or with inference_moe_nvfp4_recipe, "
+                    "(SwiGLU, gated squared ReLU) only with --inference-grouped-gemm-backend "
+                    "torch or vllm, or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
+
+            # The torch and vLLM backends implement squared ReLU (optionally tanh-clamped),
+            # gated squared ReLU and SwiGLU experts; InferenceGroupedMLP has no kernel for
+            # any other activation, nor for the tanh-clamped gated form (SiTU-GLU).
+            if self.inference_grouped_gemm_backend in (
+                InferenceGroupedGemmBackend.TORCH,
+                InferenceGroupedGemmBackend.VLLM,
+            ):
+                if self.activation_func not in (
+                    (squared_relu, F.silu) if self.gated_linear_unit else (squared_relu,)
+                ):
+                    raise ValueError(
+                        "--inference-grouped-gemm-backend "
+                        f"'{self.inference_grouped_gemm_backend.value}' supports only "
+                        "squared-ReLU experts (activation_func=squared_relu, with or without "
+                        "gated_linear_unit) and SwiGLU experts (activation_func=F.silu with "
+                        f"gated_linear_unit=True), got activation_func={self.activation_func} "
+                        f"with gated_linear_unit={self.gated_linear_unit}."
+                    )
+                if self.gated_linear_unit and self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "activation_func_tanh_clamp_scale with gated_linear_unit (SiTU-GLU) has "
+                        "no inference kernel in the torch and vllm grouped-GEMM backends."
+                    )
 
             if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
@@ -3708,6 +3743,26 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "use_te_activation_func must be False "
                     "when activation_func_clamp_value is not None for SwiGLU"
+                )
+
+        # The Transformer Engine GLU activations have no linear offset, so the paths that use
+        # them would train without glu_linear_offset while every other path applies it.
+        if self.gated_linear_unit and self.glu_linear_offset != 0.0:
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "glu_linear_offset is not supported with use_te_activation_func: the "
+                    "Transformer Engine GLU activations have no linear offset. Set "
+                    "use_te_activation_func=False."
+                )
+            if (
+                self.use_transformer_engine_op_fuser
+                and self.moe_grouped_gemm
+                and self.activation_func == F.silu
+            ):
+                raise ValueError(
+                    "glu_linear_offset with SwiGLU experts is not supported with "
+                    "use_transformer_engine_op_fuser: the fused grouped-MLP SwiGLU has no "
+                    "linear offset. Unset use_transformer_engine_op_fuser."
                 )
 
         if self.apply_rope_fusion:
