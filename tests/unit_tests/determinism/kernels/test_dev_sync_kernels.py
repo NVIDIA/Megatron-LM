@@ -7,6 +7,7 @@ requirements remain explicit; skipped Blackwell kernels are not qualified on Hop
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -316,11 +317,19 @@ def test_kda_low_rank_projection_replays():
         assert module.g_b_proj.weight.shape == (module.v_dim, gate_rank)
         assert module.beta_proj.weight.shape == (module.num_key_heads, config.hidden_size)
         assert module.gated_delta_rule is kda.chunk_kda
+        # The streamed pre-GDR fusion (gdn_pre_gated_delta_rule_fusion) is opt-in and rejected
+        # under deterministic_mode; the deterministic replay stays on pre_gated_delta_rule.
+        assert not module.gdn_pre_gated_delta_rule_fusion
 
         hidden_states = torch.randn(
             128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        with deterministic_algorithms(True):
+        with (
+            deterministic_algorithms(True),
+            patch.object(
+                kda.KimiDeltaAttention, "_fused_streamed_pre_kda", autospec=True
+            ) as fused_pre_kda,
+        ):
             outputs, grads = assert_module_replays_bit_exact(
                 module,
                 (hidden_states, None),
@@ -328,6 +337,7 @@ def test_kda_low_rank_projection_replays():
                 contention=True,
                 what="KDA low-rank F/G projections",
             )
+        assert fused_pre_kda.call_count == 0
         assert outputs["out[0]"].shape == hidden_states.shape
         assert "in[0]" in grads
         for name in ("in_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "beta_proj"):
