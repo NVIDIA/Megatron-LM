@@ -47,7 +47,7 @@ def _reference_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     groups = x.float().reshape(rows, cols // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
     max_abs = groups.abs().amax(dim=-1)
     exponent = (
-        torch.ceil(torch.log2(max_abs / torch.finfo(torch.float8_e4m3fn).max))
+        torch.ceil(torch.log2(max_abs.double() / torch.finfo(torch.float8_e4m3fn).max))
         .clamp(min=-127, max=127)
         .add(127)
         .to(torch.uint8)
