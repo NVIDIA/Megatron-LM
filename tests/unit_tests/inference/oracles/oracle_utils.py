@@ -137,7 +137,17 @@ def dyadic_tensor(
         dtype=torch.int64,
     )
     e = torch.randint(lo, hi + 1, tuple(shape), generator=generator, device=device)
-    return torch.ldexp(m.to(torch.float64), e.to(torch.float64)).to(dtype)
+    return (m.to(torch.float64) * pow2(e)).to(dtype)
+
+
+def pow2(e: torch.Tensor) -> torch.Tensor:
+    """Exactly ``2**e`` in fp64 for integer ``e``, clamped to the normal range [-1022, 1023].
+
+    Built from the exponent bits: ``torch.ldexp`` on CUDA multiplies by ``pow(2, e)``, which is
+    not always an exact power of two, so a grid built with it can be one ulp off.
+    """
+    e = e.to(torch.int64).clamp(-1022, 1023)
+    return ((e + 1023) << 52).view(torch.float64)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -166,7 +176,7 @@ def ulp(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     info = torch.finfo(dtype)
     x = x.to(torch.float64).abs()
     _, exponent = torch.frexp(x)
-    spacing = torch.ldexp(torch.full_like(x, info.eps), (exponent - 1).to(torch.float64))
+    spacing = info.eps * pow2(exponent - 1)
     return torch.where(x > 0, spacing.clamp(min=info.tiny * info.eps), torch.zeros_like(x))
 
 

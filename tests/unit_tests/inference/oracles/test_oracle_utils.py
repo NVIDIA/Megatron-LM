@@ -14,6 +14,8 @@ import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
 # ---------------------------------------------------------------------------------------------
 # fp64 references
 # ---------------------------------------------------------------------------------------------
@@ -144,11 +146,22 @@ def test_floor_covers_exact_trusted_results():
         ou.assert_close_to_reference(everywhere, reference, trusted)
 
 
-def test_ulp():
-    x = torch.tensor([1.0, 1.5, 2.0, -3.0, 0.0, 1e-40], dtype=torch.float64)
+@pytest.mark.parametrize("device", DEVICES)
+def test_ulp(device):
+    x = torch.tensor([1.0, 1.5, 2.0, -3.0, 0.0, 1e-40], dtype=torch.float64, device=device)
     expected = [2**-7, 2**-7, 2**-6, 2**-6, 0.0, 2**-133]
     assert ou.ulp(x, torch.bfloat16).tolist() == expected
     assert ou.ulp(x[:1], torch.float32).item() == 2**-23
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_pow2_is_exact(device):
+    # Exact on every device, unlike torch.ldexp on CUDA; grids built from it are exact too.
+    e = torch.arange(-1022, 1024, device=device)
+    assert ou.pow2(e).tolist() == [2.0**k for k in range(-1022, 1024)]
+    x = ou.dyadic_tensor((4096,), exponents=(-60, 60), dtype=torch.float32, device=device)
+    m, k = torch.frexp(x.double())
+    assert torch.equal((m * 2**5).frac(), torch.zeros_like(m))  # at most 4 mantissa bits
 
 
 def test_non_finite_values_must_match_the_reference():
@@ -325,8 +338,6 @@ def test_pairwise_cases_cover_every_pair():
 # ---------------------------------------------------------------------------------------------
 # Memory safety
 # ---------------------------------------------------------------------------------------------
-
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 @pytest.mark.parametrize("device", DEVICES)
