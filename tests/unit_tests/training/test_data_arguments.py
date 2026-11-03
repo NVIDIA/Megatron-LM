@@ -170,3 +170,21 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
+
+
+@pytest.mark.parametrize("packed_flag", ["--dataloader-inter-document-masking", "--sft"])
+def test_padded_static_cp_enables_pipeline_shape_exchange(monkeypatch, packed_flag):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args = _validated(
+        [packed_flag, "--context-parallel-size", "2", "--pipeline-model-parallel-size", "2"]
+    )
+
+    assert args.sequence_packing_scheduler is None
+    assert args.variable_seq_lengths is True
+
+
+def test_dense_static_cp_keeps_fixed_pipeline_shapes(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    args = _validated(["--context-parallel-size", "2", "--pipeline-model-parallel-size", "2"])
+
+    assert args.variable_seq_lengths is False
