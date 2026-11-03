@@ -1094,7 +1094,7 @@ class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
     """`selective_log_softmax` over vocab-parallel (TP-sharded) logits."""
 
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_tokens):
+    def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_tokens, out_dtype):
         """See `vocab_parallel_selective_log_softmax` for the contract."""
         orig_shape = target.shape
         partition_vocab_size = vocab_parallel_logits.size(-1)
@@ -1140,20 +1140,24 @@ class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
             )
         raw_target_logit.masked_fill_(target_mask, 0.0)
 
+        # global_lse = logsumexp_r(local_lse_r)
         if tp_world > 1:
-            # global_lse = logsumexp_r(local_lse_r): one MAX and one SUM all-reduce.
-            # NCCL picks the SUM's reduction order per message size, so this path is not
-            # batch-invariant; get_logprobs takes the gathered path under that mode.
-            rank_max = local_lse.clone()
-            torch.distributed.all_reduce(
-                rank_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            # All gather LSE and logits across ranks.
+            local_stats = torch.stack([local_lse, raw_target_logit])  # [2, n]
+            gathered = torch.empty(
+                tp_world * local_stats.numel(), dtype=torch.float32, device=local_stats.device
             )
-            combined = torch.stack([(local_lse - rank_max).exp_(), raw_target_logit])
-            torch.distributed.all_reduce(
-                combined, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
-            global_lse = rank_max + combined[0].log()
-            target_logit = combined[1]
+            torch.distributed.all_gather_into_tensor(gathered, local_stats.view(-1), group=tp_group)
+            rank_lse, rank_target = gathered.view(tp_world, 2, n).unbind(1)  # [tp_world, n] each
+            # Local calculations.
+            rank_max = rank_lse.amax(dim=0)
+            total = torch.zeros_like(rank_max)
+            target_logit = torch.zeros_like(rank_max)
+            # Loop bounded by TP; launch latency is hidden in CUDA graphs.
+            for r in range(tp_world):
+                total += (rank_lse[r] - rank_max).exp()
+                target_logit += rank_target[r]  # one nonzero term per row: the owner's logit
+            global_lse = rank_max + total.log()
         else:
             global_lse = local_lse
             target_logit = raw_target_logit
@@ -1163,7 +1167,7 @@ class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
 
         ctx.save_for_backward(vocab_parallel_logits, global_lse, target_mask, masked_target)
         ctx.vp_chunk = chunk
-        return logprobs.view(orig_shape).to(vocab_parallel_logits.dtype)
+        return logprobs.view(orig_shape).to(out_dtype)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
@@ -1191,7 +1195,7 @@ class _VocabParallelSelectiveLogProbs(torch.autograd.Function):
             arange = torch.arange(e - s, device=sm.device)
             sm[arange, masked_target[s:e]] += go * (~target_mask[s:e]).to(go.dtype)
             grad_2d[s:e] = sm.to(grad_input.dtype)
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 def vocab_parallel_selective_log_softmax(
@@ -1207,10 +1211,13 @@ def vocab_parallel_selective_log_softmax(
         chunk_tokens: tokens per chunk; used to restrict size of the temporary buffers.
 
     Returns:
-        Logprobs with the same shape as `index`.
+        Logprobs with the same shape as `index`; fp32 under `--batch-invariant-mode`,
+        otherwise the dtype of `vocab_parallel_logits`.
     """
+    # Same dtype contract as selective_log_softmax; compute_logprobs_batch asserts it.
+    out_dtype = torch.float32 if is_batch_invariant_mode_enabled() else vocab_parallel_logits.dtype
     return _VocabParallelSelectiveLogProbs.apply(
-        vocab_parallel_logits, index, tp_group, chunk_tokens
+        vocab_parallel_logits, index, tp_group, chunk_tokens, out_dtype
     )
 
 
@@ -1391,8 +1398,7 @@ def get_logprobs(
             set_model_config_attribute(model, "flash_decode", False)
             fp32_output = not (args.fp16 or args.bf16)
 
-            # Keep the logits TP-shared and compute logprobs without gathering the full vocab.
-            use_vp_logprobs = not is_batch_invariant_mode_enabled()
+            # Keep the logits TP-sharded and compute logprobs without gathering the full vocab.
 
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
@@ -1412,7 +1418,7 @@ def get_logprobs(
                     position_ids_in,
                     attention_mask_for_forward,
                     packed_seq_params=packed_seq_params_in,
-                    runtime_gather_output=not use_vp_logprobs,
+                    runtime_gather_output=False,
                     fp32_output=fp32_output,
                 )
 
@@ -1424,15 +1430,12 @@ def get_logprobs(
             return logits_or_hidden_states
 
         logits = logits_or_hidden_states
-        tp_group = pg_collection.tp if use_vp_logprobs else None
+        tp_group = pg_collection.tp
         with nvtx_range("rl/log-softmax", time=True):
             if cp_size > 1:
-                if use_vp_logprobs:
-                    local_logprobs = vocab_parallel_selective_log_softmax(
-                        logits, local_labels, tp_group
-                    )
-                else:
-                    local_logprobs = selective_log_softmax(logits, local_labels)
+                local_logprobs = vocab_parallel_selective_log_softmax(
+                    logits, local_labels, tp_group
+                )
                 # Differentiable all-gather so training pass can backprop through the reassembly.
                 # With no-grad, this acts as a plain all_gather.
                 gathered = torch.distributed.nn.functional.all_gather(
@@ -1443,12 +1446,9 @@ def get_logprobs(
                 logprobs = full[:, :-1]
             else:
                 # We do not need logprobs for the n+1 token.
-                if use_vp_logprobs:
-                    logprobs = vocab_parallel_selective_log_softmax(
-                        logits[:, :-1, :], tokens[:, 1:], tp_group
-                    )
-                else:
-                    logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                logprobs = vocab_parallel_selective_log_softmax(
+                    logits[:, :-1, :], tokens[:, 1:], tp_group
+                )
         return logprobs
 
 
@@ -2963,7 +2963,6 @@ def get_grpo_data_iterator(
 
 
 def evaluate_and_print_results_rl(
-    data_iterator: Iterator[TensorDataset],
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     iteration: int,
@@ -2973,7 +2972,6 @@ def evaluate_and_print_results_rl(
     """Helper function to evaluate and dump results on screen.
 
     Args:
-        data_iterator: Iterator over batches of evaluation dataset.
         model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
@@ -3087,6 +3085,68 @@ def evaluate_and_print_results_rl(
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
+
+
+def next_rollout_iterator(
+    iteration: int,
+    current_iterator: Any,
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    ref_state_dict: Optional[dict],
+    rl_config: Any,
+    train_config: Any,
+) -> Any:
+    """The rollout iterator for this iteration, rebuilt on the GRPO schedule."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    if optimizer is None:
+        # Release stale CUDA cached memory before inference.
+        torch.cuda.empty_cache()
+    with torch.no_grad():
+        return get_grpo_data_iterator(
+            model,
+            inference_model,
+            optimizer,
+            iteration,
+            ref_state_dict,
+            grpo_iterations=rl_config.grpo_iterations,
+            grpo_prompts_per_step=rl_config.grpo_prompts_per_step,
+            grpo_group_size=rl_config.grpo_group_size,
+            global_batch_size=train_config.global_batch_size,
+            sequence_packing=rl_config.rl_use_sequence_packing,
+            buffered_rollouts=current_iterator,
+            is_correction=rl_config.rl_inference_logprobs_is_correction,
+            optimizer_is_on_cpu=rl_config.rl_offload_optimizer_during_inference,
+        )
+
+
+def evaluate_rollouts(
+    *,
+    model: list,
+    inference_model: Optional[list],
+    optimizer: Any,
+    prefix: str,
+    iteration: int,
+    verbose: bool,
+    write_to_tensorboard: bool,
+) -> None:
+    """Run the RL evaluation rollouts, on the separate inference model when there is one."""
+    assert model is not None, "RLSetupCallback has not run; pass it in pretrain(callbacks=...)"
+    eval_model, training_model = model, None
+    if inference_model is not None:
+        # Swap the training weights onto the inference model first.
+        inf_core = unwrap_model(inference_model[0])
+        _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        refit_inference_model(model, inference_model, get_args())
+        eval_model, training_model = inference_model, model
+    evaluate_and_print_results_rl(
+        eval_model,
+        optimizer,
+        iteration,
+        write_to_tensorboard=write_to_tensorboard,
+        training_model=training_model,
+    )
 
 
 def calculate_grpo_loss(

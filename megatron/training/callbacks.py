@@ -89,6 +89,7 @@ class CallbackContext:
         elapsed_time_per_iteration: Seconds per iteration over the log interval. In on_log.
         throughput: TFLOP/s per GPU over the log interval, or None when not logged. In on_log.
         durable_iteration: Iteration of the durable checkpoint. In on_checkpoint_saved.
+        checkpointing_context: The loop's checkpointing context. From on_setup_start onwards.
     """
 
     model: list[MegatronModule] | None
@@ -109,6 +110,7 @@ class CallbackContext:
     elapsed_time_per_iteration: float | None = None
     throughput: float | None = None
     durable_iteration: int | None = None
+    checkpointing_context: dict | None = None
 
 
 class Callback:
@@ -252,6 +254,9 @@ class CallbackManager:
         Field Availability by Event:
             user_state: Available in all events.
             model, optimizer, scheduler: Available from on_data_init_start onward.
+            checkpointing_context: Available from on_setup_start onward.
+            batch_size, elapsed_time_per_iteration, throughput: Available in on_log.
+            durable_iteration: Available in on_checkpoint_saved.
             log_fragments, timers_to_log: Available from first on_log onward.
             loss_dict, grad_norm, skipped_iter: Available from first on_train_step_end onward.
             total_loss_dict: Available from first on_eval_end onward.

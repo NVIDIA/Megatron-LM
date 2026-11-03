@@ -30,9 +30,11 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
     MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,

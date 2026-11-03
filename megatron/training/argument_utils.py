@@ -38,6 +38,7 @@ from megatron.training.config import (
     TokenizerConfig,
     TrainingConfig,
     ValidationConfig,
+    MultiModalTokenizerConfig,
 )
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 
@@ -472,6 +473,9 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
+    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
+    kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -639,21 +643,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
@@ -851,6 +855,13 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:
+    if hasattr(args, "image_tag_type"):
+        return _default_config_from_args(MultiModalTokenizerConfig, args)
+    else:
+        return _default_config_from_args(TokenizerConfig, args)
+
+
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     # Legacy args retain these fields temporarily during the training-loop refactor;
@@ -901,7 +912,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         rl=_default_config_from_args(RLConfig, args),
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
@@ -962,7 +973,7 @@ def inference_cfg_container_from_args(
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        tokenizer=tokenizer_config_from_args(args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )

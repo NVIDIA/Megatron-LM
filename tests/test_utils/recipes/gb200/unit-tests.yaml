@@ -54,13 +54,18 @@ spec:
     fi
 
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --platform gb200 \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+          gb200 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --platform gb200 \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al
 
@@ -79,6 +84,14 @@ spec:
 # Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
 # symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
 products:
+  # This file runs in isolated one-rank processes; other buckets exclude it.
+  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
     products:
       - environment: [dev]

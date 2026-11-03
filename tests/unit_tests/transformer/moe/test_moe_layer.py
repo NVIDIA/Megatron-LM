@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -68,6 +70,25 @@ class TestMoELayerInit:
 
             assert layer.token_dispatcher is None
             assert layer.megakernel_experts is backend
+
+            hidden = torch.zeros((3, 2, config.hidden_size), dtype=torch.bfloat16)
+            padding_mask = torch.tensor([[0, 0, 1], [0, 1, 1]])
+            input_ids = torch.arange(6).view(2, 3)
+            probs = torch.ones((6, 1))
+            routing_map = torch.ones((6, 1), dtype=torch.bool)
+            router_forward = Mock(return_value=(probs, routing_map))
+            backend_forward = Mock(return_value=hidden)
+            monkeypatch.setattr(layer.router, "forward", router_forward)
+            monkeypatch.setattr(backend, "forward", backend_forward)
+
+            output, bias = layer(hidden, padding_mask=padding_mask, input_ids=input_ids)
+
+            assert output is hidden and bias is None
+            router_forward.assert_called_once()
+            assert router_forward.call_args.args[0] is hidden
+            torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
+            assert router_forward.call_args.kwargs["input_ids"] is input_ids
+            backend_forward.assert_called_once_with(hidden, probs, routing_map)
         finally:
             Utils.destroy_model_parallel()
 

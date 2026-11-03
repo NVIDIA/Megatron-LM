@@ -163,6 +163,15 @@ class ModelParallelConfig:
     each rank when sequence_packing_scheduler is not None.
     """
 
+    max_seq_length_per_sample: Optional[int] = None
+    """Maximum sequence length of one sample, or of one packed (THD) sequence: the training
+    sequence length (--seq-length). Communication backends that size their buffers once
+    (NCCL EP) derive the per-rank token bound from it when max_seqlen_per_dp_cp_rank is not
+    set. This is not the position-embedding capacity: GPTModelConfig.seq_length and
+    HybridModelConfig.seq_length hold that (GPTModel.max_sequence_length, filled from
+    --max-position-embeddings by the launcher) and are never read by core modules.
+    """
+
     dynamic_context_parallel: bool = False
     """
     If true, enables dynamic context parallel. This is used to balance the workload of

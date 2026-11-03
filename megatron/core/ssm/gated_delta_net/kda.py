@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -19,21 +20,25 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
+    _build_with_kda_fp8_disabled,
     _GDNBase,
+    _kda_fp8_disabled,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
     build_cp_context,
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
+    from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.kda import chunk_kda
 
     # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
@@ -49,13 +54,18 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
 
     beta_proj: ModuleSpec | type = IdentityOp
 
+    # Optional low-rank decay and output gates.
+    f_a_proj: ModuleSpec | type = IdentityOp
+    f_b_proj: ModuleSpec | type = IdentityOp
+    g_a_proj: ModuleSpec | type = IdentityOp
+    g_b_proj: ModuleSpec | type = IdentityOp
+
 
 class KimiDeltaAttention(_GDNBase):
     """Channel-wise Gated DeltaNet variant with direct Q/K/V/F/G projections.
 
-    The initial implementation supports training with equal query/key and value
-    head layouts. Optional low-rank F/B/G projections and recurrent inference
-    are intentionally outside this implementation.
+    Supports direct or two-stage gates with equal query/key and value heads.
+    Two-stage gates require a ``KDALayerConfig``. Recurrent inference is not implemented.
     """
 
     def __init__(
@@ -75,10 +85,17 @@ class KimiDeltaAttention(_GDNBase):
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
     ) -> None:
+        if isinstance(config, KDALayerConfig):
+            # Hybrid layer configs are copied with from_config, which skips __post_init__.
+            config.validate_kda()
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
             )
+
+        # Non-hybrid models build KDA from a plain TransformerConfig, which has no
+        # two-stage gate setting, so read it with a direct-gate default.
+        self.two_stage_gates = getattr(config, "kda_two_stage_gates", False)
 
         super().__init__(
             config=config,
@@ -98,7 +115,8 @@ class KimiDeltaAttention(_GDNBase):
 
         # KDA keeps beta in a separate projection so its checkpoint layout remains
         # independent from the direct Q/K/V/F/G projection.
-        self.beta_proj = build_module(
+        self.beta_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.beta_proj,
             self.hidden_size,
             self.num_key_heads,
@@ -121,6 +139,50 @@ class KimiDeltaAttention(_GDNBase):
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
 
+        # Low-rank gates are precomputed in FP32.
+        if self.two_stage_gates:
+            for prefix, head_dim, output_dim in (
+                ("f", self.key_head_dim, self.qk_dim),
+                ("g", self.value_head_dim, self.v_dim),
+            ):
+                a_name, b_name = f"{prefix}_a_proj", f"{prefix}_b_proj"
+                setattr(
+                    self,
+                    a_name,
+                    _build_with_kda_fp8_disabled(
+                        self.config,
+                        getattr(submodules, a_name),
+                        self.hidden_size,
+                        head_dim,
+                        config=self.config,
+                        init_method=self.config.init_method,
+                        bias=bias,
+                        skip_bias_add=False,
+                        skip_weight_param_allocation=False,
+                        parallel_mode="duplicated",
+                        name=f"{name}.{a_name}" if name is not None else None,
+                    ),
+                )
+                setattr(
+                    self,
+                    b_name,
+                    _build_with_kda_fp8_disabled(
+                        self.config,
+                        getattr(submodules, b_name),
+                        head_dim,
+                        output_dim,
+                        config=self.config,
+                        init_method=self.config.init_method,
+                        gather_output=False,
+                        bias=bias,
+                        skip_bias_add=False,
+                        is_expert=False,
+                        tp_comm_buffer_name=b_name,
+                        tp_group=self.pg_collection.tp,
+                        name=f"{name}.{b_name}" if name is not None else None,
+                    ),
+                )
+
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 
@@ -139,6 +201,10 @@ class KimiDeltaAttention(_GDNBase):
             self.qk_dim_local_tp,
             self.v_dim_local_tp,
         )
+        if self.two_stage_gates:
+            self.in_proj_extra_dim = 0
+            self.in_proj_split_names = self.in_proj_split_names[:3]
+            self.in_proj_split_sections = self.in_proj_split_sections[:3]
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
@@ -188,9 +254,31 @@ class KimiDeltaAttention(_GDNBase):
 
         x_dtype = x.dtype
         x = x.reshape(-1, self.value_head_dim)
+        if self.two_stage_gates:
+            # Round only after both normalization and sigmoid gating.
+            gate = gate.reshape(-1, self.value_head_dim)
+            weight = self.out_norm.weight
+            if self.config.layernorm_zero_centered_gamma:
+                weight = weight + 1
+            return rms_norm_gated(
+                x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
+            )
+        # Keep the direct-gate graph order (norm, then gate reshape) so the compiled
+        # rounding matches the pinned upstream primitive.
         x = self.out_norm(x)
         gate = gate.reshape(-1, self.value_head_dim)
         return apply_attention_output_gate(x, gate, 'elementwise', cast_mode='none').to(x_dtype)
+
+    def _proj(self, proj, x):
+        """Apply a projection GEMM, forcing BF16 when kda_disable_fp8 is set.
+
+        vLLM rollout keeps every KDA projection in BF16 (the checkpoint stores them
+        BF16 with no FP8 scales), so the actor must match to keep actor<->rollout
+        pearson sharp under FP8 hybrid training."""
+        if _kda_fp8_disabled(self.config):
+            with get_fp8_disabled_context(self.config):
+                return proj(x)
+        return proj(x)
 
     def forward(
         self,
@@ -204,7 +292,11 @@ class KimiDeltaAttention(_GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the direct-projection KDA training path."""
+        """Run the KDA training path with direct or two-stage gates.
+
+        Chunkwise CP converts its input to the contiguous layout here and restores the caller's
+        layout on output. Headwise CP expects zigzag-partitioned inputs.
+        """
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -273,6 +365,11 @@ class KimiDeltaAttention(_GDNBase):
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             if batch != 1:
                 raise ValueError("Packed KDA expects batch dimension to be 1.")
+            if self.config.deterministic_mode or causal_conv1d is None:
+                raise ValueError(
+                    "Packed KDA requires causal_conv1d and deterministic_mode=False. "
+                    "The convolution fallback does not support sequence boundaries."
+                )
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -298,8 +395,13 @@ class KimiDeltaAttention(_GDNBase):
                     "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
                 )
             if cu_seqlens_q is None:
+                # A runtime CP group can change between microbatches.  Its context embeds the
+                # communicator, so never reuse a cached SBHD context for dynamic CP metadata.
+                use_cached_context = packed_seq_params is None or packed_seq_params.cp_group is None
                 cache_key = (seq_len_global, batch)
-                cached = self._chunkwise_cp_context_cache.get(cache_key)
+                cached = (
+                    self._chunkwise_cp_context_cache.get(cache_key) if use_cached_context else None
+                )
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
@@ -313,7 +415,8 @@ class KimiDeltaAttention(_GDNBase):
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
-                    self._chunkwise_cp_context_cache[cache_key] = cached
+                    if use_cached_context:
+                        self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
                 chunkwise_cp_context = build_cp_context(
@@ -393,8 +496,8 @@ class KimiDeltaAttention(_GDNBase):
 
         # Input projections. Beta intentionally remains a separate matrix.
         nvtx_range_push(suffix="in_proj")
-        qkvfg, _ = self.in_proj(hidden_states)
-        beta, _ = self.beta_proj(hidden_states)
+        qkvfg, _ = self._proj(self.in_proj, hidden_states)
+        beta, _ = self._proj(self.beta_proj, hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
         qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
@@ -416,6 +519,31 @@ class KimiDeltaAttention(_GDNBase):
             packed_seq_params,
         )
 
+        raw_g = gate = None
+        if self.two_stage_gates:
+            f_a, _ = self._proj(self.f_a_proj, hidden_states)
+            raw_g, _ = self._proj(self.f_b_proj, f_a)
+            g_a, _ = self._proj(self.g_a_proj, hidden_states)
+            gate, _ = self._proj(self.g_b_proj, g_a)
+            raw_g, _ = a2a_cp_to_hp(
+                raw_g,
+                (self.qk_dim_local_tp,),
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
+            gate, _ = a2a_cp_to_hp(
+                gate,
+                (self.v_dim_local_tp,),
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
+
         if self.gdn_pre_gated_delta_rule_fusion:
             raise NotImplementedError(
                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
@@ -425,6 +553,12 @@ class KimiDeltaAttention(_GDNBase):
             raise ValueError(
                 "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
                 "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
+        if cp_size_chunkwise > 1 and (self.config.deterministic_mode or causal_conv1d is None):
+            raise NotImplementedError(
+                "KDA chunkwise CP requires the causal_conv1d path to exchange convolution "
+                "history across ranks; the deterministic/fallback convolution is not valid "
+                "for chunkwise CP."
             )
         if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
             raise ValueError(
@@ -443,6 +577,8 @@ class KimiDeltaAttention(_GDNBase):
             cu_seqlens_q,
             chunkwise_cp_context,
             packed_seq_params=packed_seq_params,
+            raw_g=raw_g,
+            gate=gate,
         )
         kernel_inputs = {
             "q": query,
@@ -460,10 +596,10 @@ class KimiDeltaAttention(_GDNBase):
             **kernel_inputs,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
             use_gate_in_kernel=self.use_gate_in_kernel,
-            safe_gate=self.config.kda_safe_gate,
-            lower_bound=self.config.kda_lower_bound,
+            safe_gate=getattr(self.config, "kda_safe_gate", False),
+            lower_bound=getattr(self.config, "kda_lower_bound", None),
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
         )
@@ -501,7 +637,7 @@ class KimiDeltaAttention(_GDNBase):
 
         # Output projection.
         nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
+        out, out_bias = self._proj(self.out_proj, norm_out)
         nvtx_range_pop(suffix="out_proj")
 
         if self.recompute_norm_out and self.training:
@@ -547,12 +683,26 @@ class KimiDeltaAttention(_GDNBase):
         cu_seqlens_q=None,
         chunkwise_cp_context=None,
         packed_seq_params=None,
+        *,
+        raw_g=None,
+        gate=None,
     ):
-        """Prepare QKV, output gate, beta, and raw decay tensors before KDA."""
+        """Prepare QKV, output gate, beta, and raw decay tensors before KDA.
+
+        With two-stage gates, ``qkvfg`` carries only Q/K/V and the precomputed ``raw_g`` and
+        ``gate`` tensors are passed separately.
+        """
 
         qkvfg = qkvfg.transpose(0, 1)
         beta = beta.transpose(0, 1)
-        qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
+        if self.two_stage_gates:
+            qkv = qkvfg
+            raw_g = raw_g.transpose(0, 1)
+            gate = gate.transpose(0, 1)
+        else:
+            qkv, raw_g, gate = torch.split(
+                qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1
+            )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         nvtx_range_push(suffix="conv1d")
@@ -632,6 +782,36 @@ class KimiDeltaAttention(_GDNBase):
         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
         dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
 
+        if self.two_stage_gates:
+            query_key, value = torch.split(
+                qkv,
+                [
+                    2 * self.qk_dim_local_tp // cp_size_headwise,
+                    self.v_dim_local_tp // cp_size_headwise,
+                ],
+                dim=-1,
+            )
+            query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
+            value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+            query, key = query_key.chunk(2, dim=2)
+            repeat_factor = self.num_value_heads // self.num_key_heads
+            if repeat_factor > 1:
+                query = query.repeat_interleave(repeat_factor, dim=2)
+                key = key.repeat_interleave(repeat_factor, dim=2)
+            num_key_heads = A_log_local_cp.numel()
+            raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
+            beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
+            return (
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                gate,
+                beta.contiguous(),
+                raw_g.contiguous(),
+                A_log_local_cp,
+                dt_bias_local_cp,
+            )
+
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
         kernel_inputs = self._prepare_input_for_gated_delta_rule(
             qkv,
@@ -687,3 +867,8 @@ class KimiDeltaAttention(_GDNBase):
 
         super().backward_dw()
         self.beta_proj.backward_dw()
+        if self.two_stage_gates:
+            self.f_a_proj.backward_dw()
+            self.f_b_proj.backward_dw()
+            self.g_a_proj.backward_dw()
+            self.g_b_proj.backward_dw()

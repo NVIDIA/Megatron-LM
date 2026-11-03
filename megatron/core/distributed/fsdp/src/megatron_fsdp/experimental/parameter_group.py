@@ -33,7 +33,7 @@ from .dbuffer import DBuffer, symmetric_memory_allocation
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic, TensorAtomic
+from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
@@ -126,6 +126,8 @@ class FsdpParameterGroup:
     _unshard_events: dict[Phase, torch.cuda.Event]
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_scale: float
+    # Padded (equal) or unpadded (unequal) segments for RowAtomic/BlockAtomic layouts.
+    shard_layout: ShardLayout
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class FsdpParameterGroup:
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -159,6 +162,8 @@ class FsdpParameterGroup:
             parameter_to_owner: Construction-time mapping from original parameters to
                 owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
                 entries for other parameters and non-TensorAtomic groups are ignored.
+            shard_layout: Whether RowAtomic/BlockAtomic layouts pad to equal rank segments
+                or pack without padding into generally unequal ones. See ``fully_shard``.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -167,6 +172,12 @@ class FsdpParameterGroup:
         self._unshard_events = {}
         self.mesh = mesh
         self.grad_scale = grad_scale
+        self.shard_layout = shard_layout
+        if shard_layout is ShardLayout.UNPADDED and use_symmetric_memory:
+            raise ValueError(
+                "ShardLayout.UNPADDED is incompatible with use_symmetric_memory: NCCL "
+                "symmetric-memory collectives require equal shard sizes."
+            )
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -241,8 +252,11 @@ class FsdpParameterGroup:
         shapes = (parameter.shape for parameter in parameters)
         if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
             # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
-            return layout_builder.build_for_row_atomic(
-                shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
+            return layout_builder.build_row_atomic_layout(
+                shapes,
+                dp_size=self.mesh.size(),
+                block_size=32 if self.dtype == torch.uint8 else 1,
+                shard_layout=self.shard_layout,
             )
         if _contains_any_placement_type(
             *placement_groups, placement_types=(RowAtomic, BlockAtomic)

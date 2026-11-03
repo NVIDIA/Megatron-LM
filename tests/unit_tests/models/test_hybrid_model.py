@@ -22,12 +22,13 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.hybrid_block import (
     HybridStack,
     HybridStackSubmodules,
     HyperConnectionHybridLayer,
 )
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_inference_stack_spec,
@@ -42,6 +43,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
@@ -269,6 +275,140 @@ def test_mrope_stored_cp_group_drives_unpacked_slicing():
         rotary(position_ids, mrope_section=[1, 1, 2])
 
     assert seen['cp_group'] is stub_cp_group
+
+
+@pytest.fixture
+def config_list_model_boundary(monkeypatch):
+    """Exercise model-owned config setup without allocating modules or process groups."""
+
+    class AllocationReached(Exception):
+        pass
+
+    def init_language_module(model, config, pg_collection=None):
+        torch.nn.Module.__init__(model)
+        model.config = config
+        model.pg_collection = SimpleNamespace(pp=None)
+
+    def allocation_reached(*args, **kwargs):
+        raise AllocationReached()
+
+    monkeypatch.setattr(LanguageModule, "__init__", init_language_module)
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_layer_allocation.select_pipeline_segment_from_config_list",
+        allocation_reached,
+    )
+
+    def build(config, layer_configs, position_embedding_type="rope"):
+        with pytest.raises(AllocationReached):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=16,
+                max_sequence_length=4,
+                hybrid_layer_config_list=layer_configs,
+                position_embedding_type=position_embedding_type,
+            )
+
+    return build
+
+
+@pytest.fixture
+def config_list_root():
+    return TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True
+    )
+
+
+@pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
+@pytest.mark.parametrize("in_mtp", [False, True])
+def test_config_list_rejects_shared_rotary_width_mismatch(
+    config_list_model_boundary, config_list_root, position_embedding_type, in_mtp
+):
+    attention = AttentionLayerConfig.from_config(config_list_root)
+    attention.kv_channels = 128
+    layers = (
+        [MLPLayerConfig.from_config(config_list_root), MTPSplit, attention]
+        if in_mtp
+        else [attention]
+    )
+    with pytest.raises(ValueError, match="kv_channels"):
+        config_list_model_boundary(config_list_root, layers, position_embedding_type)
+    assert config_list_root.kv_channels == 32
+    assert attention.kv_channels == 128
+
+
+@pytest.mark.parametrize(
+    "layer_type,kv_channels,position_embedding_type",
+    [
+        (AttentionLayerConfig, 32, "rope"),
+        (AttentionLayerConfig, 128, "none"),
+        (MLALayerConfig, 128, "rope"),
+    ],
+)
+def test_config_list_accepts_supported_rotary_layouts(
+    config_list_model_boundary, config_list_root, layer_type, kv_channels, position_embedding_type
+):
+    layer_config = layer_type.from_config(config_list_root)
+    layer_config.kv_channels = kv_channels
+    config_list_model_boundary(config_list_root, [layer_config], position_embedding_type)
+
+
+@pytest.mark.parametrize("layer_type", [DSALayerConfig, CSALayerConfig])
+@pytest.mark.parametrize("in_mtp", [False, True])
+def test_config_list_registers_indexer_loss_scaling(
+    monkeypatch, config_list_model_boundary, config_list_root, layer_type, in_mtp
+):
+    from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    layer_config = layer_type.from_config(config_list_root)
+    layer_config.dsa_indexer_loss_coeff = 1.0
+    if layer_type is CSALayerConfig:
+        layer_config.compress_ratio = 4
+    layers = (
+        [MLPLayerConfig.from_config(config_list_root), MTPSplit, layer_config]
+        if in_mtp
+        else [layer_config]
+    )
+    config_list_model_boundary(config_list_root, layers)
+    assert config_list_root.experimental_attention_variant is None
+    assert layer_config.experimental_attention_variant_loss_scale_func is None
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+    monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+    indexer_parameter = torch.tensor(2.0, requires_grad=True)
+    output = DSAIndexerLossAutoScaler.apply(
+        torch.tensor(1.0, requires_grad=True), indexer_parameter.square()
+    )
+    loss, _ = forward_step_calc_loss(
+        model=None,
+        output_tensor=output,
+        loss_func=lambda value: (value.clone(), {}),
+        config=config_list_root,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=8,
+        forward_data_store=[],
+        cp_group_size=1,
+        is_last_stage=True,
+    )
+    loss.backward()
+    torch.testing.assert_close(indexer_parameter.grad, torch.tensor(0.5))
+
+
+def test_config_list_preserves_explicit_indexer_scale_hook(
+    config_list_model_boundary, config_list_root
+):
+    def hook(scale):
+        pass
+
+    layer_config = DSALayerConfig.from_config(config_list_root)
+    config_list_root.experimental_attention_variant_loss_scale_func = hook
+    config_list_model_boundary(config_list_root, [layer_config])
+    assert config_list_root.experimental_attention_variant_loss_scale_func is hook
+    assert layer_config.experimental_attention_variant_loss_scale_func is None
 
 
 @pytest.mark.skipif(
