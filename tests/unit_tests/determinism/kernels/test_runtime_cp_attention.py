@@ -4,21 +4,25 @@
 
 Comparisons are bit-exact for repeated execution at the *same* CP size, including after
 intervening microbatches with other CP sizes. Different reduction topologies are not
-required to produce identical bits. The real RoPE, TE attention, and projection kernels
-run here; no compute kernel is mocked. Offload replays also compare against resident
-execution across warmup and steady state for supported Q/K input layouts.
+required to produce identical bits. Runtime CP replays run the real RoPE, TE attention,
+and projection kernels. Offload replays also compare against resident execution across
+warmup and steady state for supported Q/K input layouts. Dynamic padding replays start
+from projected QKV and exercise real FlashAttention and padding kernels.
 """
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.utils.deterministic
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
+    deterministic_algorithms,
     seeded,
 )
 
@@ -327,6 +331,158 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     )
                     _assert_same_replay(result, recovered)
                     assert_restored()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
+@pytest.mark.parametrize("flash_version", [2, 3])
+@pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
+def test_dynamic_bf16_attention_padding_replays(flash_version, softmax_type, monkeypatch):
+    """Unwritten varlen rows must not reach BF16 projection or downstream MoE routing.
+
+    Run real paged FlashAttention (including sink correction), then poison only its
+    unused output rows. The production forward boundary must preserve valid tokens
+    and clear padding regardless of allocator filling or the bytes left in that tail.
+    """
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer import attention as attention_module
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import is_te_min_version
+    from tests.unit_tests.test_utilities import Utils
+
+    if not HAVE_TE:
+        pytest.skip("requires Transformer Engine")
+    if flash_version == 2 and attention_module.flash_attn_varlen_func is None:
+        pytest.skip("requires FlashAttention 2")
+    if flash_version == 3 and not attention_module.HAVE_FA3:
+        pytest.skip("requires FlashAttention 3")
+    if softmax_type == "learnable" and not is_te_min_version("2.8.0"):
+        pytest.skip("learnable softmax requires Transformer Engine 2.8")
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        real_tokens, padded_tokens = 5, 64
+        heads, kv_heads, head_dim = 4, 2, 64
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=kv_heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            softmax_type=softmax_type,
+            flash_attention_version=flash_version,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        module = (
+            SelfAttention(config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal)
+            .cuda()
+            .eval()
+        )
+        hidden_states = torch.randn(
+            padded_tokens, 1, heads * head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        key, value = (
+            torch.randn(1, 256, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        cumulative_lengths = torch.tensor([0, real_tokens], device="cuda", dtype=torch.int32)
+        lengths = cumulative_lengths[1:]
+        block_table = torch.tensor([[0]], device="cuda", dtype=torch.int32)
+        context = SimpleNamespace(
+            is_dynamic_batching=lambda: True,
+            is_static_batching=lambda: False,
+            is_decode_only=lambda: False,
+            use_flashinfer_fused_rope=False,
+            cu_query_lengths=lambda: (cumulative_lengths, real_tokens),
+            cu_kv_lengths=lambda: (cumulative_lengths, lengths, real_tokens),
+            gpu_view=SimpleNamespace(real_token_count=lengths),
+            padding_slice=slice(real_tokens, padded_tokens),
+            active_token_count=real_tokens,
+            padded_active_token_count=padded_tokens,
+        )
+        context.zero_padding_tokens = lambda tensor: DynamicInferenceContext.zero_padding_tokens(
+            context, tensor
+        )
+
+        # Supply already projected QKV/cache metadata; all attention and padding kernels run.
+        monkeypatch.setattr(
+            module,
+            "get_query_key_value_tensors",
+            lambda hidden, *args, **kwargs: (
+                hidden.view(padded_tokens, 1, heads, head_dim),
+                key,
+                value,
+            ),
+        )
+        monkeypatch.setattr(
+            module,
+            "_adjust_key_value_for_inference",
+            lambda ctx, query, key, value, *args, **kwargs: (
+                query,
+                key,
+                value,
+                None,
+                AttnMaskType.causal,
+                block_table,
+            ),
+        )
+        flash_attention = module.flash_decode_and_prefill
+        valid_output = None
+        poison = float("nan")
+
+        def poisoned_attention(*args, **kwargs):
+            nonlocal valid_output
+            output = flash_attention(*args, **kwargs)
+            valid_output = output[:real_tokens].clone().reshape(real_tokens, 1, -1)
+            output[real_tokens:].fill_(poison)
+            return output
+
+        monkeypatch.setattr(module, "flash_decode_and_prefill", poisoned_attention)
+        calls = 0
+
+        def forward(hidden):
+            nonlocal calls, poison
+            # Exercise both possible allocator policies and both NaN and finite stale data.
+            fill, poison = (
+                (False, float("nan")),
+                (False, 10000.0),
+                (True, float("nan")),
+                (True, -10000.0),
+            )[calls % 4]
+            calls += 1
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.utils.deterministic, "fill_uninitialized_memory", fill)
+                with torch.no_grad(), InferenceMode.active(), deterministic_algorithms(True):
+                    output = module.forward_pre_attn_and_core_attn(
+                        hidden, attention_mask=None, inference_context=context
+                    )
+            assert bytes_equal(output[:real_tokens], valid_output), "valid attention rows changed"
+            assert torch.isfinite(output).all(), "non-finite poisoned padding escaped attention"
+            assert torch.count_nonzero(output[real_tokens:]) == 0, "padding was not cleared"
+            return output
+
+        assert_replays_bit_exact(
+            forward,
+            {"hidden": hidden_states},
+            replays=4,
+            backward=False,
+            contention=True,
+            what=f"BF16 dynamic attention padding [FA{flash_version}, {softmax_type}]",
+        )
     finally:
         Utils.destroy_model_parallel()
 
