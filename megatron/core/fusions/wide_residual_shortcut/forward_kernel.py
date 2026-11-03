@@ -112,8 +112,8 @@ class _ForwardConfig(NamedTuple):
         CLUSTER: CTAs per row in an sm_90+ cluster; each mixes H / CLUSTER columns and the
             cluster exchanges partial sums of squares (one cluster per reader with SPLIT).
             Needs LOADS_FIRST, PARTS == 1 and WIDTH dividing H / CLUSTER.
-        VECTOR: Contiguous columns per thread (4, or 8 for 16-byte BF16 residual accesses);
-            WIDTH must give every thread at least VECTOR columns.
+        VECTOR: Contiguous columns per thread (4, or 8 for 16-byte BF16 residual accesses).
+            A tile narrower than threads x VECTOR columns is replicated across threads.
     """
 
     WIDTH: int = 128
@@ -436,7 +436,7 @@ def choose_forward_config(
         if m >= 2048 and 3072 <= h <= 16384 and streams <= 6:
             return _training_config(h, streams, readers, mxfp8)
         if h * streams <= 10240:
-            profile = "compact" if h * streams <= 5125 else "paired"
+            profile = "compact" if h * streams <= 5120 else "paired"
         elif h <= 13312:
             profile = "pipelined" if m <= 128 else "streamed"
         else:
@@ -544,11 +544,24 @@ def forward(
         updates=len(updates),
         bf16_residual=residual.dtype == torch.bfloat16,
     )
+    if not inference and (config.PARTS != 1 or config.SPLIT):
+        # The saved coefficients and per-reader rstd have one writer per row (a cluster's lead
+        # CTA); replicated parts and split readers would overwrite them.
+        raise RuntimeError(f"training forward needs PARTS == 1 and no SPLIT, got {config}")
     c = None if inference else torch.empty((8 * num_streams,), device=device, dtype=torch.float32)
 
-    packets = h % 4 == 0 and residual.dtype == torch.float32
-    if packets and type(residual).__name__ not in ("FakeTensor", "FunctionalTensor"):
-        assert residual.data_ptr() % 16 == 0, "residual base must be 16-byte aligned"
+    if type(residual).__name__ not in ("FakeTensor", "FunctionalTensor"):
+        # FP32 residual packets are 16-byte vector loads. Training also saves the residual and
+        # updates for the backward, which reads them through 16-byte-aligned TMA descriptors (for
+        # the shapes the backward accepts: rows and H divisible by 32).
+        packets = h % 4 == 0 and residual.dtype == torch.float32
+        tma = not inference and m % 32 == 0 and h % 32 == 0
+        aligned = ((residual,) if packets or tma else ()) + (tuple(updates) if tma else ())
+        if any(t.data_ptr() % 16 for t in aligned):
+            raise ValueError(
+                "the residual (FP32 packets, training) and training updates must be 16-byte "
+                "aligned"
+            )
     if mxfp8_handoff and (m % 32 or h % 32):
         raise ValueError("MXFP8 handoff requires rows and hidden width divisible by 32")
 
@@ -625,8 +638,9 @@ def _as_cluster(write_args, grid, ctas, kwargs):
 
     ``_forward`` compiles as a single-CTA kernel; Triton's launcher runs gridX * num_ctas CTAs
     in clusters of num_ctas along x, taking num_ctas from the packed (warps, ctas, shared)
-    metadata. An exchange without its cluster peers would never complete, so an unexpected
-    metadata form makes the caller launch without a cluster.
+    metadata. That layout is private to Triton (checked against 3.7.0 and 3.7.1); an exchange
+    without its cluster peers would never complete, so an unexpected metadata form makes the
+    caller launch without a cluster.
 
     Args:
         write_args: ``_WriteArgs`` of the launch.

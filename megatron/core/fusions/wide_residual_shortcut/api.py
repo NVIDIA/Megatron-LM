@@ -7,6 +7,7 @@ No-grad calls bypass autograd and omit all tensors saved for backward.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -169,6 +170,13 @@ class _Boundary(torch.autograd.Function):
         )
 
 
+@lru_cache
+def _trains_on(device_index: int) -> bool:
+    from .kernel_utils import qualified_device
+
+    return qualified_device(torch.cuda.get_device_properties(device_index))
+
+
 def _apply_boundary(
     inputs, updates, *, num_streams, mxfp8_handoff=False, mxfp8_consumer=None, epsilon=1.0e-5
 ):
@@ -178,6 +186,13 @@ def _apply_boundary(
         return _Boundary.forward(None, options, None, *inputs)
     if mxfp8_handoff and mxfp8_consumer is None:
         raise ValueError("training shortcut MXFP8 requires an explicit deferred consumer")
+    residual = inputs[0]
+    if residual.is_cuda and not _trains_on(residual.device.index):
+        # Fail at the first boundary rather than after a whole forward pass.
+        raise ValueError(
+            "training through the fused shortcut seams requires a qualified GB300 (the fused "
+            f"backward is GB300-only); got {torch.cuda.get_device_name(residual.device)}"
+        )
     # The explicit weight edge orders AccumulateGrad after the deferred TE wgrad.
     options = (num_streams, current_manager(), mxfp8, mxfp8_consumer, epsilon, updates)
     weight = None if mxfp8_consumer is None else mxfp8_consumer.weight

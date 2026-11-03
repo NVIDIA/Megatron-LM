@@ -15,6 +15,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
     PendingShortcutAdd,
     api,
     forward_kernel,
+    kernel_utils,
     mxfp8_handoff,
     replay_kernel,
 )
@@ -48,6 +49,11 @@ from tests.unit_tests.test_utilities import Utils
 # Shortcut-owned norms are Transformer Engine norms, which need a GPU to build; the pairing
 # validation tests use only fake layers and run anywhere.
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="Transformer Engine norms")
+REQUIRES_FUSED_BACKWARD = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not kernel_utils.qualified_device(torch.cuda.get_device_properties(0)),
+    reason="the fused shortcut backward runs only on a qualified GB300",
+)
 
 
 def _shortcut_config(*, parallel: bool = False, wide_residual: WideResidualConfig | None = None):
@@ -1120,6 +1126,7 @@ def test_direct_mxfp8_handoff_always_declares_deferred_consumer(monkeypatch, che
         )
     ],
 )
+@REQUIRES_FUSED_BACKWARD
 def test_fused_schedule_matches_serial_oracle(
     streams, retention, overlap, interval, tokens, hidden, dtype
 ):
@@ -1240,6 +1247,7 @@ def _two_reader_from_lone(lone, block, residual, pending):
     "streams,retention,interval",
     [(2, False, None), (3, True, None), (3, True, 16), (6, True, None)],
 )
+@REQUIRES_FUSED_BACKWARD
 def test_lone_layer_write_fuses_into_next_block(streams, retention, interval):
     """M -> [* E]: the lone layer's write and the block's two reads are one two-reader kernel.
 
@@ -1728,6 +1736,7 @@ def test_hybrid_lone_seams_fuse(
 @GPU
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("fp32_residual", [True, False])
+@REQUIRES_FUSED_BACKWARD
 def test_hybrid_lone_seams_fuse_training(fp32_residual):
     """Training through the chained lone seams (forward and backward, 1024 tokens) matches the
     unchained model: outputs and every parameter gradient within BF16 noise."""
@@ -1777,6 +1786,7 @@ def test_hybrid_lone_seams_fuse_training(fp32_residual):
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("interval", [2, 4])
 @pytest.mark.parametrize("pattern", [stack[0] for stack in LONE_SEAM_STACKS])
+@REQUIRES_FUSED_BACKWARD
 def test_hybrid_lone_seams_checkpoint_replay(monkeypatch, pattern, interval):
     """Checkpoint replay intervals rebuild the chained seams' residuals bit for bit: outputs and
     every gradient equal training without replay."""
@@ -1983,6 +1993,7 @@ def test_fusion_spec_keeps_sharded_checkpoint_keys():
 
 @GPU
 @pytest.mark.usefixtures("model_parallel")
+@REQUIRES_FUSED_BACKWARD
 def test_fused_seams_run_norm_forward_pre_hooks():
     """Norms applied inside fused kernels still run their forward pre-hooks (e.g. DDP's
     overlapped parameter all-gather wait) before the kernel reads their weights."""
@@ -2016,6 +2027,7 @@ def test_layers_without_fused_seams_reject_pending_writes():
 
 @GPU
 @pytest.mark.usefixtures("model_parallel")
+@REQUIRES_FUSED_BACKWARD
 def test_fused_seams_use_the_norms_epsilon(monkeypatch):
     """Every fused seam normalizes with its RMSNorm's own epsilon, not the 1e-5 default."""
     model = _hybrid_model(

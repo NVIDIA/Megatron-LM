@@ -139,7 +139,10 @@ class ResidualLink:
         self.interval.materialize()
         stream = torch.cuda.current_stream(self.previous_slot.tensor.device)
         stream.wait_event(self.interval.ready)
-        column = self.interval.transitions[self.index].column
+        # Hand the column over: the interval no longer keeps it alive. A retained-graph second
+        # backward has no replay link and rebuilds its columns (replay_columns).
+        transition = self.interval.transitions[self.index]
+        column, transition.column = transition.column, None
         if column is not None:
             column._columnwise_data.record_stream(stream)
             column._columnwise_scale_inv.record_stream(stream)

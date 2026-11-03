@@ -25,6 +25,7 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (  # noqa: F401
     GPU,
     MX_SHAPES,
     QUALIFIED,
+    REQUIRES_FUSED_BACKWARD,
     SEAMS,
     F,
     T,
@@ -104,6 +105,7 @@ def forward_state(current, saved, operands):
     # Production-size dispatch for other stream counts (three streams is listed above).
     + [pytest.param(s, 2, u, T, 8192, 4096, marks=QUALIFIED) for s in (2, 5, 6) for u in (1, 2)],
 )
+@REQUIRES_FUSED_BACKWARD
 def test_standard_boundaries_replay(streams, readers, updates, retention, rows, hidden):
     raw = inputs(streams, readers, hidden, rows, retention=retention, updates=updates)
     assert_replays_bit_exact(lambda *args: run(args, streams), raw, replays=3)
@@ -115,6 +117,7 @@ def test_standard_boundaries_replay(streams, readers, updates, retention, rows, 
     [(3, 1024, 96), (6, 1024, 288)]
     + [pytest.param(3, m, h, marks=QUALIFIED) for m, h in kernel_utils.FLAGSHIPS],
 )
+@REQUIRES_FUSED_BACKWARD
 def test_bf16_stream_boundaries_replay(readers, updates, streams, rows, hidden):
     """A BF16 residual stream with BF16 logits replays outputs and gradients bit for bit."""
     bf16 = torch.bfloat16
@@ -127,6 +130,7 @@ def test_bf16_stream_boundaries_replay(readers, updates, streams, rows, hidden):
 @pytest.mark.parametrize("streams", [1, 2, 3, 5, 6])
 @pytest.mark.parametrize("retention", [False, True])
 @pytest.mark.parametrize("hidden", [96, 128, 288])
+@REQUIRES_FUSED_BACKWARD
 def test_checkpoint_chain_replay(streams, retention, hidden):
     def execute(residual, updates, controllers, gammas):
         with residual_replay_scope(replay_config(), True):
@@ -193,21 +197,32 @@ def test_packet_forward_poisoned_replay(
 # Offset 3 repeats offset 1's alignment class for both dtypes.
 @pytest.mark.parametrize("offset", [1, 2, 4])
 def test_packet_forward_offset_views(quantized, readers, operand, hidden, streams, offset):
-    """Only explicit residual packet loads require 16-byte alignment."""
+    """Inference accepts offset views except for the FP32 residual's packet loads; training also
+    needs aligned updates and residuals, which the backward reads through TMA descriptors."""
     residual, updates, controllers, gammas = inputs(streams, readers, hidden, 128)
     values = [residual, *updates, *gammas]
 
-    def execute(args):
+    def execute(args, inference):
         raw = args[0], args[1 : readers + 1], controllers, tuple(args[readers + 1 :])
-        return forward_state(*fwd(raw, streams, mxfp8_handoff=quantized))
+        current, saved, operands = fwd(raw, streams, mxfp8_handoff=quantized, inference=inference)
+        if inference:
+            data, scales = kernel_utils.operand_buffers(operands, columnwise=False)
+            return (current, *data, *(scale for scale in scales if scale is not None))
+        return forward_state(current, saved, operands)
 
-    expected = execute(values)
+    expected = {mode: execute(values, mode) for mode in (False, True)}
     values[operand] = offset_view(values[operand], offset)
-    if operand == 0 and values[0].data_ptr() % 16:
-        with pytest.raises(AssertionError, match="16-byte aligned"):
-            execute(values)
-    else:
-        all_bytes_equal(execute(values), expected)
+    misaligned = values[operand].data_ptr() % 16 != 0
+    for inference in (False, True):
+        packet_load = operand == 0 and values[0].dtype == torch.float32
+        backward_shape = hidden % 32 == 0  # 128 rows; the backward reads these through TMA
+        if misaligned and (
+            packet_load or (not inference and backward_shape and operand <= readers)
+        ):
+            with pytest.raises(ValueError, match="16-byte aligned"):
+                execute(values, inference)
+        else:
+            all_bytes_equal(execute(values, inference), expected[inference])
 
 
 # BF16: hidden 1 (<32) and 1025 (odd) use scalar loads; 48, 288, 2052 masked packets; 18432
@@ -370,6 +385,7 @@ def test_poisoned_backward_replay(
 
 @pytest.mark.parametrize("explicit_grid", [False, True])
 @pytest.mark.parametrize("rows,hidden,columns", [(1024, 4096, False), (8192, 10240, True)])
+@REQUIRES_FUSED_BACKWARD
 def test_backward_owns_independent_scratch(explicit_grid, rows, hidden, columns):
     """Independent calls and captured graphs cannot alias inputs or each other's scratch."""
     current, args = backward_args(inputs(3, 2, hidden, rows))

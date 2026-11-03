@@ -68,9 +68,14 @@ try:
 except ImportError:  # BF16-only tests do not need Transformer Engine.
     te = None
 
-# Host-only config tests run anywhere; every other test needs a GPU, and native schedules,
-# backward residency and the MXFP8 handoff need a qualified GB300.
+# Host-only config tests run anywhere; every other test needs a GPU. Native schedules, the
+# MXFP8 handoff and the fused backward (so every training round trip) need a qualified GB300.
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA shortcut fusion")
+REQUIRES_FUSED_BACKWARD = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not kernel_utils.qualified_device(torch.cuda.get_device_properties(0)),
+    reason="the fused shortcut backward runs only on a qualified GB300",
+)
 QUALIFIED = pytest.mark.skipif(
     te is None
     or not torch.cuda.is_available()
@@ -497,6 +502,7 @@ FORWARD_CASES = (
 
 @GPU
 @pytest.mark.parametrize("streams,readers,updates,hidden,tokens,epsilon,controllers", FORWARD_CASES)
+@REQUIRES_FUSED_BACKWARD
 def test_forward_and_complete_backward(
     streams, readers, updates, hidden, tokens, epsilon, controllers
 ):
@@ -533,6 +539,7 @@ BF16_STREAMS = [(BF16, BF16), (BF16, torch.float32), (torch.float32, BF16)]
     "streams,hidden,tokens",
     [(3, 96, 1024), (1, 128, 2048), (3, 4096, 1024), (6, 3072, 1024), (2, 10240, 1024)],
 )
+@REQUIRES_FUSED_BACKWARD
 def test_bf16_residual_and_logits(
     residual_dtype, logit_dtype, readers, updates, streams, hidden, tokens
 ):
@@ -611,6 +618,7 @@ CONTRIBUTION_CASES = [pytest.param(*c, marks=QUALIFIED) if c[-1] else c for c in
 @GPU
 @pytest.mark.parametrize("streams,readers,hidden,retention,native", CONTRIBUTION_CASES)
 @torch.no_grad()
+@REQUIRES_FUSED_BACKWARD
 def test_controller_contribution_bounds(streams, readers, hidden, retention, native):
     """FP64 controller error stays within the original absolute-contribution bound.
 
@@ -653,6 +661,7 @@ def test_controller_contribution_bounds(streams, readers, hidden, retention, nat
 @pytest.mark.parametrize("streams", [2, 3, 6])
 @pytest.mark.parametrize("route", [0, 1, 2])
 @pytest.mark.parametrize("retention", [False, True])
+@REQUIRES_FUSED_BACKWARD
 def test_unused_outputs_and_frozen_parameters(streams, route, retention):
     raw = inputs(streams, 2, retention=retention)
     for frozen in (raw[2][1], raw[3][1]):
@@ -698,6 +707,7 @@ def test_boundary_rejects_invalid_inputs_before_backward(invalid):
 @pytest.mark.parametrize("hidden", [4096, 10240])
 @pytest.mark.parametrize("readers", [1, 2])
 @pytest.mark.parametrize("columns", [False, True])
+@REQUIRES_FUSED_BACKWARD
 def test_six_stream_native_routing(hidden, readers, columns):
     """Six streams use the same complete backward and column ownership contract."""
     _, args = backward_args(inputs(6, readers, hidden, 1024), 6)
@@ -715,6 +725,7 @@ def test_six_stream_native_routing(hidden, readers, columns):
 
 
 @GPU
+@REQUIRES_FUSED_BACKWARD
 def test_native_counter_bounds_precede_launch():
     """Counter overflow remains rejected even for direct test-only schedule injection."""
     _, args = backward_args(inputs(3, 1, 4096, 128))
@@ -731,6 +742,7 @@ def test_native_counter_bounds_precede_launch():
 @pytest.mark.parametrize("columns", [False, True])
 @pytest.mark.parametrize("complete", [False, True])
 @torch.no_grad()
+@REQUIRES_FUSED_BACKWARD
 def test_model_backward_routes(streams, readers, columns, complete):
     """Automatic routes preserve reconstruction, column ownership and shared gradients."""
     raw = inputs(streams, readers, 4096, 8192)
@@ -749,6 +761,7 @@ def test_model_backward_routes(streams, readers, columns, complete):
 
 @GPU
 @pytest.mark.parametrize("missing", ["carry", "reader0", "reader1"])
+@REQUIRES_FUSED_BACKWARD
 def test_backward_materializes_pruned_gradients(missing):
     _, (saved, residual, dys, carry) = backward_args(inputs(3, 2, 96, 1024))
     dys = list(dys)
@@ -765,6 +778,7 @@ def test_backward_materializes_pruned_gradients(missing):
 @pytest.mark.parametrize("native", [False, pytest.param(True, marks=QUALIFIED)])
 @pytest.mark.parametrize("hidden", [3072, 4096, 10240])
 @torch.no_grad()
+@REQUIRES_FUSED_BACKWARD
 def test_shared_update_gradients(native, hidden):
     """Automatic and explicit schedules share updates and match FP64 derivatives.
 
@@ -784,6 +798,7 @@ def test_shared_update_gradients(native, hidden):
 @GPU
 @pytest.mark.parametrize("native", [False, pytest.param(True, marks=QUALIFIED)])
 @pytest.mark.parametrize("hidden", [3072, 4096, 10240])
+@REQUIRES_FUSED_BACKWARD
 def test_single_write_two_reader_gradients(native, hidden):
     """A single write read twice returns one update gradient and saves the update itself."""
     raw = inputs(3, 2, hidden, 1024, updates=1)
@@ -1051,6 +1066,7 @@ def _advance(previous, tape):
 @pytest.mark.parametrize("depth", [1, 16, 40])
 @pytest.mark.parametrize("retain", [0.0, 0.3, 1.0])
 @pytest.mark.parametrize("readers", [1, 2])
+@REQUIRES_FUSED_BACKWARD
 def test_deep_replay_independent_gradients(depth, retain, readers):
     """No inverse reference: retain=0 and 0.3 remain valid forward replay cases."""
     torch.manual_seed(1317)
@@ -1224,6 +1240,7 @@ def test_physical_layer_intervals_and_independent_workspaces():
 
 @GPU
 @pytest.mark.parametrize("prune", [False, True])
+@REQUIRES_FUSED_BACKWARD
 def test_mixed_fused_native_retained_backward(prune):
     """Replay must match saved predecessors across native boundaries and reuse."""
     torch.manual_seed(313)
@@ -1292,6 +1309,7 @@ def test_mixed_fused_native_retained_backward(prune):
 @pytest.mark.parametrize("depth", [1, 16, 40])
 @pytest.mark.parametrize("readers,updates", SEAMS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@REQUIRES_FUSED_BACKWARD
 def test_deep_fused_replay_matches_saved_predecessors(depth, readers, updates, dtype):
     """Physical intervals and short tails preserve forward states and all gradients (FP32 or
     BF16 residual streams and logits)."""
@@ -1334,6 +1352,7 @@ def test_deep_fused_replay_matches_saved_predecessors(depth, readers, updates, d
 
 @GPU
 @pytest.mark.parametrize("ordinary_bridge", [False, True])
+@REQUIRES_FUSED_BACKWARD
 def test_replay_slots_release_after_backward(ordinary_bridge):
     """Ordinary backward releases replay storage owners after their final launches."""
     residual, updates, controllers, gammas = inputs(3, 1, 128, 1024)

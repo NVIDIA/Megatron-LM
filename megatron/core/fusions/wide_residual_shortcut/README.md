@@ -13,7 +13,7 @@ adds the routed and shared MoE outputs (the shortcut add, passed between blocks 
 produces the next block's compute-layer and shortcut-routing inputs. The shortcut add is optional: a
 `PendingShortcutAdd` without a shared update is a single write read twice, which a lone wide-residual
 Mamba or MLP-only layer directly before a fused block uses (M → [* E], - → [* E]) so that block's
-two-reader kernel writes its update and emits both inputs. The matching backward is one fused kernel per seam; with
+two-reader kernel writes its update and emits both inputs. The matching backward is one fused kernel per seam (plus scratch resets and the final gradient reductions); with
 `--residual-stream-recompute-num-layers N` the residuals are rebuilt by bit-exact checkpoint replay instead
 of being saved. Residual writes are bit-identical to replay and across kernel
 schedules, reader outputs differ by at most one BF16 ulp between schedules, and the tests check every
