@@ -55,8 +55,6 @@ except ImportError:
 
 from utils import build_lm_batch_from_input_ids, get_hf_tokenizer
 
-from megatron.core import parallel_state
-from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -412,6 +410,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
     Returns the search_state dict produced by mtq.auto_quantize.
     """
     args = get_args()
+    pg_collection = unwrapped_model.pg_collection
 
     calib_dataloader = get_megatron_calibration_dataloader(
         tokenizer,
@@ -425,10 +424,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         return megatron_prefill(model, batch["input_ids"])
 
     def forward_backward_step(model, batch):
-        lm_batch = build_lm_batch_from_input_ids(
-            batch,
-            cp_group=get_context_parallel_group(),
-        )
+        lm_batch = build_lm_batch_from_input_ids(batch, cp_group=pg_collection.cp)
         loss = model.forward(
             input_ids=lm_batch["tokens"],
             position_ids=lm_batch["position_ids"],
@@ -446,7 +442,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         if "parent_class" not in entry
     ]
 
-    dp_world_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    dp_world_size = pg_collection.dp_gtp_remat.size() if torch.distributed.is_initialized() else 1
     num_calib_steps = len(calib_dataloader)
     score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
     num_score_steps = min(
@@ -505,6 +501,8 @@ if __name__ == "__main__":
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
+    # The calibration batches are split over the context-parallel group of the model.
+    pg_collection = unwrap_model(model)[0].pg_collection
 
     report_current_memory_info()
 
@@ -574,7 +572,7 @@ if __name__ == "__main__":
             )
             for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
                 sample = get_batch_on_this_cp_rank(
-                    sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                    sample, is_hybrid_cp=False, cp_group=pg_collection.cp
                 )
                 megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
