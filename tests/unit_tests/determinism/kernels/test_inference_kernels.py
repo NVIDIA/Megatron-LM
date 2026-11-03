@@ -258,6 +258,14 @@ def test_mxfp8_quantize_replays():
 
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
+    # A strided view is read in place, and groups at E8M0's smallest scale (2^-127) replay too.
+    y = (x[:1024] * 2.0**-121).t()
+    assert_replays_bit_exact(
+        fn, (y,), backward=False, what="mxfp8_quantize (strided, smallest scales)"
+    )
+    for got, expected in zip(fn(y), fn(y.contiguous())):
+        assert torch.equal(got, expected)
+
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_rows_replays():

@@ -633,6 +633,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
+        "MXFP8 quantization also replays on a strided input and at E8M0's smallest scale. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(

@@ -17,6 +17,7 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_COL_BLOCK,
     MXFP8_SCALE_ROW_BLOCK,
+    _mxfp8_group_scales,
 )
 from megatron.core.utils import null_decorator
 
@@ -662,11 +663,7 @@ def _permute_quantize_mxfp8_kernel(
                 x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
                 abs_grouped = tl.abs(x_grouped)
                 max_vals = tl.max(abs_grouped, axis=1)
-
-                dequant_scale = max_vals / 448.0
-                dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-                dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-                quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+                scale_exp, quant_scale = _mxfp8_group_scales(max_vals)
 
                 quantized = x_grouped * quant_scale[:, None]
                 quantized_flat = tl.reshape(quantized, [BLOCK_K])
@@ -676,7 +673,6 @@ def _permute_quantize_mxfp8_kernel(
                 tl.store(out_fp8_ptr + pos.to(tl.int64) * K + offs, out_fp8, mask=mask)
 
                 # Store swizzled scales at permuted position
-                scale_exp = (dequant_exp >> 23).to(tl.uint8)
                 col_offs = tl.arange(0, BLOCK_GROUPS)
                 col_mask = col_offs < REAL_GROUPS
 

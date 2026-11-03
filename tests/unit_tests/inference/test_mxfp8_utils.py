@@ -8,6 +8,8 @@ Tests cover:
 - MXFP8Tensor.scale_2d: reshape correctness
 """
 
+import math
+
 import pytest
 import torch
 
@@ -120,6 +122,26 @@ def ref_swizzle(input_matrix) -> torch.Tensor:
     rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
 
     return rearranged.flatten()
+
+
+def exact_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact MXFP8 encoding of a 2D tensor: E8M0 scale bytes [M, K // 32] and E4M3 data.
+
+    Each group of 32 takes the smallest power-of-two scale X >= 2^-127 (the smallest E8M0
+    value) with max |x| / X <= 448, and its elements are x / X rounded to nearest even. Unlike
+    ref_to_mxfp, which multiplies groups at the smallest scale by 1, it keeps x / X for them.
+    """
+    groups = x.detach().cpu().double().reshape(x.shape[0], -1, 32)
+    exponents = []
+    for amax in groups.abs().amax(dim=-1).flatten().tolist():
+        exponent = -127
+        while amax > math.ldexp(448.0, exponent):
+            exponent += 1
+        exponents.append(exponent)
+    inv_scales = torch.tensor([math.ldexp(1.0, -e) for e in exponents], dtype=torch.float64)
+    data = groups * inv_scales.reshape(groups.shape[:2] + (1,))
+    scales = torch.tensor(exponents).reshape(groups.shape[:2]) + 127
+    return scales.to(torch.uint8), data.float().to(torch.float8_e4m3fn).reshape(x.shape)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -259,6 +281,59 @@ class TestMxfp8Quantize:
         assert out_scale.data_ptr() == scale_ptr
         assert torch.equal(out_data, expected_data)
         assert torch.equal(out_scale.view(torch.uint8), expected_scale.view(torch.uint8))
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_tiny_groups_take_the_smallest_scale(self, dtype):
+        """Groups with max |x| <= 448 * 2^-127 take E8M0's smallest scale, 2^-127 (byte 0).
+
+        Their max / 448 is an fp32 subnormal, which rounding up to a power of two through its
+        bits took to 2^-126 (byte 1), halving the data. Rows hold such a group at that bound,
+        one value above it (scale 2^-126), and below it, next to an ordinary group.
+        """
+        int_dtype = torch.int16 if dtype == torch.bfloat16 else torch.int32
+        bound = torch.tensor(448.0 * 2.0**-127, dtype=dtype)
+        maxima = [
+            bound,
+            (bound.view(int_dtype) + 1).view(dtype),
+            torch.tensor(2.0**-127, dtype=dtype),
+            torch.tensor(1, dtype=int_dtype).view(dtype),  # the smallest subnormal
+        ]
+        torch.manual_seed(42)
+        x = torch.randn(len(maxima), 64, dtype=torch.float64)
+        for row, amax in enumerate(maxima):
+            x[row, :32] = torch.linspace(-1.0, 1.0, 32, dtype=torch.float64) * amax.double()
+        x = x.to(device="cuda", dtype=dtype)
+
+        data, scales = mxfp8_quantize(x)
+
+        expected_scales, expected_data = exact_mxfp8(x)
+        assert expected_scales[:, 0].tolist() == [0, 1, 0, 0]
+        assert torch.equal(data.view(torch.uint8).cpu(), expected_data.view(torch.uint8))
+        assert torch.equal(scales.view(torch.uint8).cpu(), ref_swizzle(expected_scales))
+
+    def test_strided_input_is_quantized_by_value(self):
+        """Views with any strides quantize their values through every entry point."""
+        torch.manual_seed(42)
+        base = torch.randn(256, 384, device="cuda", dtype=torch.bfloat16) * 4
+        views = {
+            "transposed": base.t(),
+            "column slice": base[:, 32:288],
+            "every other row": base[::2],
+        }
+        for name, x in views.items():
+            assert not x.is_contiguous()
+            expected_data, expected_scale = mxfp8_quantize(x.contiguous())
+            into_data = torch.empty_like(expected_data)
+            into_scale = torch.empty_like(expected_scale)
+            mxfp8_quantize_into(x, into_data, into_scale)
+            tensor = MXFP8Tensor.from_bf16(x, backend="triton")
+            for data, scale in (
+                mxfp8_quantize(x),
+                (into_data, into_scale),
+                (tensor.data, tensor.scale),
+            ):
+                assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8)), name
+                assert torch.equal(scale.view(torch.uint8), expected_scale.view(torch.uint8)), name
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -678,6 +753,27 @@ class TestSquaredReluAndQuantizeMxfp8:
             rtol=0,
         )
 
+    def test_tiny_groups_take_the_smallest_scale(self):
+        """Activation groups with max <= 448 * 2^-127 take E8M0's smallest scale, 2^-127."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        M, K = 4, 64
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        # Squared, row r's first group peaks at 2^-(120 + 2r), below 448 * 2^-127.
+        signs = 1 - 2 * (torch.arange(32, device="cuda") % 2)
+        ramp = torch.arange(1, 33, device="cuda") * signs
+        for row in range(M):
+            x[row, :32] = ramp * 2.0 ** -(65 + row)
+
+        fused = squared_relu_and_quantize_mxfp8(x, _make_permutation_map(M), _vt(M))
+
+        activated_ref = torch.relu(x.float()).pow(2).to(torch.bfloat16)
+        expected_scales, expected_data = exact_mxfp8(activated_ref)
+        assert not expected_scales[:, 0].any()
+        assert torch.equal(fused.data.view(torch.uint8).cpu(), expected_data.view(torch.uint8))
+        assert torch.equal(fused.scale.view(torch.uint8).cpu(), ref_swizzle(expected_scales))
+
 
 CLAMP_SCALE = 16.0
 
@@ -928,6 +1024,28 @@ class TestPermuteAndQuantizeMxfp8:
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         expected_count = local_mask.sum().item()
         assert real_count == expected_count
+
+    def test_tiny_groups_take_the_smallest_scale(self):
+        """Permuted rows whose groups have max <= 448 * 2^-127 take E8M0's smallest scale."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        # One expert: the 128 tokens fill exactly its first aligned block, in atomic order.
+        num_tokens, K = 128, 64
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, topk=1, num_experts=1)
+        hidden[:, :32] *= 2.0**-125
+
+        fused, _, perm_map, offs = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, 1, _vt(num_tokens), alignment=128
+        )
+
+        assert offs[-1].item() == num_tokens
+        expected_scales, expected_data = exact_mxfp8(hidden[perm_map[:num_tokens].long()])
+        assert not expected_scales[:, 0].any()
+        assert torch.equal(
+            fused.data[:num_tokens].view(torch.uint8).cpu(), expected_data.view(torch.uint8)
+        )
+        # The first 128 x 4 scale tile holds the scales of these rows.
+        assert torch.equal(fused.scale.view(torch.uint8)[:512].cpu(), ref_swizzle(expected_scales))
 
     def test_returns_mxfp8_tensor(self):
         """Result is an MXFP8Tensor with correct backend."""

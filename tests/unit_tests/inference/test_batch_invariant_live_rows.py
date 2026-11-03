@@ -93,6 +93,8 @@ class TestMxfp8QuantizeRows:
             data_buf.view(torch.float8_e4m3fn),
             scale_buf,
             src,
+            src.stride(0),
+            src.stride(1),
             torch.tensor([n], device="cuda", dtype=torch.int32),
             M,
             K,
@@ -107,10 +109,15 @@ class TestMxfp8QuantizeRows:
         assert torch.equal(scale_buf[:512], ref_scale.view(torch.uint8))
         assert torch.all(data_buf[M:] == 0xA5) and torch.all(scale_buf[512:] == 0xA5)
 
-    def test_rejects_non_contiguous_input(self):
-        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)[:, :64]
-        with pytest.raises(AssertionError, match="contiguous"):
-            mxfp8_quantize_rows(x, torch.tensor([128], device="cuda", dtype=torch.int32))
+    def test_strided_input_is_quantized_by_value(self):
+        torch.manual_seed(5)
+        base = torch.randn(384, 256, device="cuda", dtype=torch.bfloat16) * 4
+        n = 256
+        for x in (base[:, 64:192], base.t()):
+            data, scale = mxfp8_quantize_rows(
+                x, torch.tensor([n], device="cuda", dtype=torch.int32)
+            )
+            _check_rows(x.contiguous(), n, data, scale)
 
     def test_cuda_graph_replay_with_changing_count(self):
         torch.manual_seed(1)

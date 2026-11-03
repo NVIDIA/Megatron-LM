@@ -39,35 +39,20 @@ def _ceil_div(a, b):
 
 
 @triton.jit
-def _mxfp8_quant_swizzle_row(
-    row,
-    out_ptr,
-    scale_ptr,
-    src_ptr,
-    K,
-    n_col_blocks,
-    REAL_GROUPS: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_GROUPS: tl.constexpr,
-):
-    """Quantize one row (int64 index) to FP8 e4m3 and store its swizzled scales."""
-    src_row = src_ptr + row * K
-    out_row = out_ptr + row * K
+def _mxfp8_group_scales(max_vals):
+    """E8M0 scales of MXFP8 groups whose absolute maxima are ``max_vals`` (fp32).
 
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
-
-    # Load full row
-    x = tl.load(src_row + offs, mask=mask, other=0.0).to(tl.float32)
-
-    # Per-group-of-32 max
-    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
-    abs_grouped = tl.abs(x_grouped)
-    max_vals = tl.max(abs_grouped, axis=1)
-
+    Each scale is the smallest power of two X >= 2^-127 (the smallest E8M0 value) with
+    max_val / X <= 448. Returns the biased exponents of X (uint8) and the quantization
+    multipliers 1 / X.
+    """
     # 448 is the max representable value in FP8 e4m3.
     # dequant_scale = min scale s.t. max_val / scale <= 448.
     dequant_scale = max_vals / 448.0
+    # Groups with max_val <= 448 * 2^-127 take the smallest scale, 2^-127. Their
+    # max_val / 448 is an fp32 subnormal, which the rounding below would take to 2^-126,
+    # so use 0 instead: its exponent field, 0, is the E8M0 encoding of 2^-127.
+    dequant_scale = tl.where(max_vals <= 448.0 * 2.0**-127, 0.0, dequant_scale)
     # Round up to next power of 2 via integer bit manipulation:
     # Adding 0x007FFFFF (mantissa mask) before masking with 0x7F800000
     # (exponent-only mask) bumps the exponent if any mantissa bits are set.
@@ -75,8 +60,41 @@ def _mxfp8_quant_swizzle_row(
     dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
     # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
     dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+    # Quantization scale is the reciprocal. A zero exponent field encodes 2^-127, which
+    # reads as 0.0 here; its reciprocal is 2^127 (all-zero groups still quantize to zero).
+    quant_scale = tl.where(dequant_rounded == 0, 2.0**127, 1.0 / dequant_rounded)
+    return (dequant_exp >> 23).to(tl.uint8), quant_scale
+
+
+@triton.jit
+def _mxfp8_quant_swizzle_row(
+    row,
+    out_ptr,
+    scale_ptr,
+    src_ptr,
+    src_stride_m,
+    src_stride_k,
+    K,
+    n_col_blocks,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """Quantize one row (int64 index) to FP8 e4m3 and store its swizzled scales."""
+    src_row = src_ptr + row * src_stride_m
+    out_row = out_ptr + row * K
+
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+
+    # Load full row (int64 column offsets: a strided source can span more than 2^31 elements)
+    x = tl.load(src_row + offs.to(tl.int64) * src_stride_k, mask=mask, other=0.0).to(tl.float32)
+
+    # Per-group-of-32 max
+    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+    abs_grouped = tl.abs(x_grouped)
+    max_vals = tl.max(abs_grouped, axis=1)
+    scale_exp, quant_scale = _mxfp8_group_scales(max_vals)
 
     # Quantize
     quantized = x_grouped * quant_scale[:, None]
@@ -87,7 +105,6 @@ def _mxfp8_quant_swizzle_row(
     tl.store(out_row + offs, out_fp8, mask=mask)
 
     # Store swizzled scales
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
@@ -116,6 +133,8 @@ def _mxfp8_quant_swizzle_kernel(
     out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
     scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
     src_ptr,  # [M, K] input tensor in bf16/fp16/fp32
+    src_stride_m,  # element strides of the input (any layout)
+    src_stride_k,
     K,  # number of columns in the input (must be divisible by 32)
     n_col_blocks,  # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
     REAL_GROUPS: tl.constexpr,  # actual number of scale groups per row (K // 32)
@@ -175,7 +194,17 @@ def _mxfp8_quant_swizzle_kernel(
     """
     row = tl.program_id(0).to(tl.int64)
     _mxfp8_quant_swizzle_row(
-        row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS
+        row,
+        out_ptr,
+        scale_ptr,
+        src_ptr,
+        src_stride_m,
+        src_stride_k,
+        K,
+        n_col_blocks,
+        REAL_GROUPS,
+        BLOCK_K,
+        BLOCK_GROUPS,
     )
 
 
@@ -183,7 +212,7 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     """Quantize a 2D tensor into existing MXFP8 data and scale storage.
 
     Args:
-        x: [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
+        x: [M, K] tensor in bf16/fp16/fp32, any strides. K must be divisible by 32.
         out_data: [M, K] contiguous float8_e4m3fn output tensor.
         out_scale: Contiguous 1D scale storage in cuBLAS blocked layout. The
             dtype may be uint8 or float8_e8m0fnu.
@@ -217,6 +246,8 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
         out_data,
         out_scale_bytes,
         x,
+        x.stride(0),
+        x.stride(1),
         K,
         n_col_blocks,
         REAL_GROUPS=scale_cols,
@@ -230,6 +261,8 @@ def _mxfp8_quant_swizzle_rows_kernel(
     out_ptr,
     scale_ptr,
     src_ptr,
+    src_stride_m,
+    src_stride_k,
     n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, min(n_rows, M)) are quantized
     M,  # number of rows in src/out (the buffer height)
     K,
@@ -254,6 +287,8 @@ def _mxfp8_quant_swizzle_rows_kernel(
             out_ptr,
             scale_ptr,
             src_ptr,
+            src_stride_m,
+            src_stride_k,
             K,
             n_col_blocks,
             REAL_GROUPS,
@@ -274,7 +309,6 @@ def mxfp8_quantize_rows(
     clamped to ``M`` on device, so the result is then exactly ``mxfp8_quantize(x)``.
     """
     assert x.is_cuda and x.dim() == 2
-    assert x.is_contiguous(), "x must be contiguous: the kernel addresses row r at r * K"
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
@@ -291,6 +325,8 @@ def mxfp8_quantize_rows(
         out_data,
         out_scale,
         x,
+        x.stride(0),
+        x.stride(1),
         n_rows,
         M,
         K,
@@ -307,7 +343,7 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor to MXFP8 with fused scale swizzle.
 
     Args:
-        x: [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
+        x: [M, K] tensor in bf16/fp16/fp32, any strides. K must be divisible by 32.
 
     Returns:
         (data, swizzled_scales):
