@@ -19,9 +19,8 @@ tests/unit_tests/inference/oracles/
 
 A family package plugs in by existing: add the directory with an empty `__init__.py` and import
 the helpers with `from tests.unit_tests.inference.oracles import oracle_utils as ou`. The
-`conftest.py` here applies to it automatically. CI picks the modules up through the
-`tests/unit_tests/inference/**/*.py` buckets on H100 and, for modules that carry
-`launch_on_gb200`, on GB200.
+`conftest.py` here applies to it automatically, and CI runs it in this directory's bucket
+([CI](#ci)).
 
 ## One module per kernel
 
@@ -87,6 +86,33 @@ MCORE_ORACLE_TARGET_SM=9 pytest tests/unit_tests/inference/oracles
 ```
 
 The helper tests (`test_oracle_utils.py`) run on CPU.
+
+## CI
+
+- **Buckets.** This directory is one unit-test bucket, `tests/unit_tests/inference/oracles/**/*.py`,
+  on H100 and GB200 (`tests/test_utils/recipes/{h100,gb200}/unit-tests.yaml`, dev image), apart
+  from the rest of inference. A bucket has 30 minutes (`UNIT_TEST_TIMEOUT`), so a file that takes
+  more than about 5 minutes on H100 gets its own entry after the directory's;
+  `tests/unit_tests/find_test_cases.py` then leaves it out of the directory bucket.
+- **Ranks.** `run_ci_test.sh` runs a bucket under `torch.distributed.run` on every GPU of the node
+  (8 on H100, 4 on GB200) and every rank runs every test. The conftest gives each rank its own GPU
+  (`ou.use_local_rank_device`). A test that builds process groups sees that world size: TP 1 cases
+  run as data-parallel replicas, and multi-GPU cases must accept any world size their parallel
+  sizes divide.
+- **Selection.** H100 runs every test; GB200 runs only the tests marked `launch_on_gb200`. Neither
+  names `large` in `-m`, so those cases skip.
+- **Target hardware.** The H100 recipe exports `MCORE_ORACLE_TARGET_SM=9`, and GB200's
+  `-m launch_on_gb200` targets sm_10x, so a package or kernel build the CI image should ship fails
+  the bucket instead of skipping it.
+- **Reproducing a bucket.** In the CI image, with the tree at `/opt/megatron-lm`, run what the
+  H100 recipe runs (for GB200, export `GPUS_PER_NODE=4` instead of `MCORE_ORACLE_TARGET_SM` and
+  add `--platform gb200`):
+
+  ```bash
+  export NVTE_FLASH_ATTN_V4=0 MCORE_ORACLE_TARGET_SM=9
+  bash tests/unit_tests/run_ci_test.sh --tag latest --environment dev --unit-test-repeat 1 \
+    --bucket 'tests/unit_tests/inference/oracles/**/*.py' --log-dir /tmp/oracle-logs
+  ```
 
 ## Example
 

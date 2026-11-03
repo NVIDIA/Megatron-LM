@@ -454,6 +454,20 @@ def test_require_sm_skips_or_fails(monkeypatch):
         ou.require_sm(ou.BLACKWELL)
 
 
+def test_use_local_rank_device(monkeypatch):
+    chosen = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "set_device", chosen.append)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) == 3
+    assert ou.use_local_rank_device({"LOCAL_RANK": "11"}) == 3  # more ranks than GPUs: wrap
+    assert ou.use_local_rank_device({}) is None  # not under torch.distributed.run
+    assert chosen == [3, 3]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert ou.use_local_rank_device({"LOCAL_RANK": "3"}) is None
+    assert chosen == [3, 3]
+
+
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
 def test_requires_sm_marker_runs_on_blackwell_only():
