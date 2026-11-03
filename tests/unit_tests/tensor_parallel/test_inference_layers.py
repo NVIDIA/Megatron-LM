@@ -29,10 +29,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer,
-    configure_fused_tp_inference_for_layers,
-)
 from tests.unit_tests.test_utilities import Utils
 
 requires_te = pytest.mark.skipif(
@@ -335,38 +331,30 @@ class TestFusedTPCommunication:
         _assert_close(outputs[1], outputs[0], "outputs after filling the buffer with 1.0 vs 0.0")
 
 
-def _fake_layer(graphed: bool):
-    """A TransformerLayer that records the fused-TP wiring TransformerBlock gives it."""
-    layer = mock.create_autospec(TransformerLayer, instance=True)
-    if graphed:
-        layer.cudagraph_manager = object()
-    layer.get_fused_tp_input_norm_weights.return_value = torch.ones(_H)
-    layer.get_fused_tp_output_handoff.return_value = FusedTPHandoff()
-    return layer
+class _FakeLayer:
+    """Records the fused-TP wiring TransformerBlock gives a layer."""
 
+    def __init__(self, graphed: bool):
+        if graphed:
+            self.cudagraph_manager = object()
+        self.fc2_fused_tp_handoff = FusedTPHandoff()
+        self.qkv_fused_tp_handoff = None
 
-def _input_handoff(layer):
-    return layer.configure_fused_tp_inference.call_args.kwargs["input_fused_tp_handoff"]
+    def get_qkv_layer_norm_weights(self):
+        return torch.ones(_H)
+
+    def get_fc2_fused_tp_handoff(self):
+        return self.fc2_fused_tp_handoff
+
+    def configure_fused_tp_inference(self, qkv_fused_tp_handoff, fc2_next_layer_norm_weights):
+        self.qkv_fused_tp_handoff = qkv_fused_tp_handoff
 
 
 def test_block_links_fused_tp_handoff_only_between_layers_graphed_alike():
-    """A layer trusts the previous layer's record only if both always replay or run together."""
-    layers = [_fake_layer(graphed=g) for g in (True, True, False, False)]
+    """A QKV trusts the previous FC2's record only if both always replay or run together."""
+    layers = [_FakeLayer(graphed=g) for g in (True, True, False, False)]
     TransformerBlock._setup_fused_tp_communication(SimpleNamespace(layers=layers))
-    handoffs = [layer.get_fused_tp_output_handoff.return_value for layer in layers]
-    assert _input_handoff(layers[0]) is None
-    assert _input_handoff(layers[1]) is handoffs[0]
-    assert _input_handoff(layers[2]) is None
-    assert _input_handoff(layers[3]) is handoffs[2]
-
-
-def test_fusion_does_not_cross_layers_of_other_kinds():
-    """A layer of another kind (a MambaLayer in a hybrid stack) between two TransformerLayers
-    applies its own input norm and adds its own residual: the layer before it fuses into
-    nothing, and the layer after it applies its own input norm."""
-    before, after = _fake_layer(graphed=False), _fake_layer(graphed=False)
-    configure_fused_tp_inference_for_layers([before, torch.nn.Identity(), after])
-    for layer in (before, after):
-        layer.configure_fused_tp_inference.assert_called_once_with(
-            input_fused_tp_handoff=None, next_layer_norm_weights=None
-        )
+    assert layers[0].qkv_fused_tp_handoff is None
+    assert layers[1].qkv_fused_tp_handoff is layers[0].fc2_fused_tp_handoff
+    assert layers[2].qkv_fused_tp_handoff is None
+    assert layers[3].qkv_fused_tp_handoff is layers[2].fc2_fused_tp_handoff

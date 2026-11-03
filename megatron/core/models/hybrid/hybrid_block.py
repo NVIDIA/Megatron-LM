@@ -436,12 +436,30 @@ class HybridStack(MegatronModule):
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
 
-        # A layer can take its input from the previous layer's fused reduce-scatter + add +
-        # norm + all-gather only if no context-parallel layout conversion runs between them.
-        if self.config.inference_fuse_tp_communication and (
-            self._cp_layout_manager is None or not self._cp_layout_manager.requires_conversion
-        ):
-            configure_fused_tp_inference_for_layers(self.layers)
+        if self.config.inference_fuse_tp_communication:
+            self._setup_fused_tp_communication()
+
+    def _setup_fused_tp_communication(self):
+        """Link the layers for fused TP communication (see
+        configure_fused_tp_inference_for_layers).
+
+        A layer can take its input from the previous layer's fused reduce-scatter + add + norm
+        + all-gather only if no context-parallel layout conversion runs between them, so each
+        run of layers in one layout is linked on its own.
+        """
+        layouts = None
+        if self._cp_layout_manager is not None and self._cp_layout_manager.requires_conversion:
+            layouts = [
+                self._cp_layout_manager.layer_layouts[layer_index]
+                for layer_index in self._execution_layer_indices
+            ]
+        run = []
+        for i, layer in enumerate(self.layers):
+            if run and layouts is not None and layouts[i] != layouts[i - 1]:
+                configure_fused_tp_inference_for_layers(run)
+                run = []
+            run.append(layer)
+        configure_fused_tp_inference_for_layers(run)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""

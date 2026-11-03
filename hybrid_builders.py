@@ -20,9 +20,6 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec
-        assert (
-            not config.inference_fuse_tp_communication
-        ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
