@@ -813,8 +813,11 @@ def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
-    kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
-    kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    optimizer_cls = registry.get_optimizer_cls(eopt_name)
+    kwargs = _kwargs_from_config(optimizer_cls, eopt_name, config)
+    sig = inspect.signature(optimizer_cls.__init__)
+    if "betas" in sig.parameters:
+        kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
     return kwargs
 
 
