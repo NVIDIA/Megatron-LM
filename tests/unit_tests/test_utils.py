@@ -789,3 +789,14 @@ def test_experimental_fn_no_eol_warning_within_major_version(caplog):
             return success_string
 
     assert "has reached end of life" not in caplog.text
+
+
+def test_experimental_cls_no_eol_warning_within_major_version(caplog):
+    """A still-valid experimental class must not be flagged EOL."""
+    with caplog.at_level(logging.WARNING), patch.object(util, "mcore_version", "0.20.0"):
+
+        @util.experimental_cls(introduced_with_version="0.18.0")
+        class FreshClass:
+            pass
+
+    assert "has reached end of life" not in caplog.text

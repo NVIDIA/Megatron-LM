@@ -102,16 +102,11 @@ class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 
 
-def _experimental_reached_eol(introduced_with_version: str, max_lifetime: int) -> bool:
-    """Return True if an experimental API has outlived its allowed lifetime.
-
-    The lifetime is expressed in minor versions. Comparing only the minor
-    component silently breaks once the major version is bumped and the minor
-    resets to 0, so compare the (major, minor) pair instead.
-    """
+def _experimental_reached_eol(introduced_with_version: str, max_lifetime_minor: int) -> bool:
+    """Return True if an experimental API has outlived its allowed lifetime."""
     introduced = PkgVersion(introduced_with_version)
     current = PkgVersion(mcore_version)
-    return (introduced.major, introduced.minor + max_lifetime) < (current.major, current.minor)
+    return (introduced.major, introduced.minor + max_lifetime_minor) < (current.major, current.minor)
 
 
 def experimental_fn(introduced_with_version: str):
