@@ -109,7 +109,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
-        "and physical padding not represented by logical documents.",
+        "and physical padding not represented by logical documents. The same file replays the "
+        "Attention Residuals MTP output head: MultiTokenPredictionLayer._postprocess aggregating "
+        "the trunk depth-source tuple (MultiTokenPredictionInputs.attn_res_sources) with the "
+        "depth's final_attn_res before the final layernorm.",
     ),
     KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
@@ -335,6 +338,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
         "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
+    ),
+    KernelEntry(
+        name="attention_residual_aggregation",
+        sources=("megatron/core/transformer/attention_residual.py",),
+        tests=(K + "test_attn_res_aggregation.py", K + "test_dev_sync_kernels.py"),
+        kind="torch.compile",
+        notes="AttentionResidual depth-softmax aggregation (fp32 statistics, RMSNorm keys) on "
+        "its three attn_res_impl backends: the eager memory-lean custom Function (gemv "
+        "parameter-gradient reduction over tokens), the torch.compile plain-autograd math and "
+        "FLA's fused_attnres, including the fused output RMSNorm of attn_res_norm_fusion. "
+        "test_dev_sync_kernels.py replays the MTP depth output head built on it. The 'attn_res' "
+        "output-discarding recompute path (CheckpointWithoutOutput) re-runs the same kernels and "
+        "is covered functionally by tests/unit_tests/transformer/test_attention_residual.py.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
