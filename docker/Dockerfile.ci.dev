@@ -369,6 +369,21 @@ USER root
 # Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
 RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
 
+# PyTorch 2.15 defaults to eager NCCL2 communicators. Retain the previous backend's
+# lazy allocation and split semantics for the existing distributed test matrix.
+# See https://github.com/pytorch/pytorch/issues/199957.
+ENV TORCH_DIST_USE_NCCL2=0
+
+# Triton 3.9 removed block pointers used by the pinned FLA and GDP kernels.
+# Install the guarded compatibility lowering after native builds to retain their caches.
+RUN --mount=type=bind,source=docker/common/triton_block_ptr_compat.py,target=/opt/triton_block_ptr_compat.py \
+    bash -ex <<"EOF"
+    TRITON_LANGUAGE_DIR=$(python -c 'import pathlib, triton.language; print(pathlib.Path(triton.language.__file__).parent)')
+    install -m 0644 /opt/triton_block_ptr_compat.py "${TRITON_LANGUAGE_DIR}/_megatron_block_ptr_compat.py"
+    printf '\nfrom . import _megatron_block_ptr_compat\n' >> "${TRITON_LANGUAGE_DIR}/__init__.py"
+    python -c 'import triton.language as tl; assert callable(tl.advance)'
+EOF
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION
