@@ -35,6 +35,12 @@ Variants covered: positions ``0, 1, 127, 128, 129, 255, 256, 257, S_max - 1`` in
 head dim 64 and 128; NeoX and interleaved pairs; full and half rotary dim; no RoPE; softcap;
 learnable sink; window ``127, 128, 129``. Layer level: ``flash_decode`` on/off x output gate x
 window x full/partial batch, plus GPT and Hybrid static generation (control and #8863 case).
+Production shapes (``test_flash_decode_at_production_shapes``): Qwen2.5-1.5B as the offline
+inference example runs it (12 query and 2 KV heads of 128, rotary base 1e6, a batch of 64) over
+a 4096-token cache (the inference server's ``--inference-max-seq-length``), and Llama-3.1-8B (32
+query and 8 KV heads of 128, rotary base 5e5) over an 8192-token cache with a batch of 8;
+positions around the tiles and powers of two up to the last cache row, the rest of the batch at
+random positions.
 
 Open PRs (written against main):
 * #8878 (t3-flashdecode): main passes no ``window_size`` to the decode kernel (R11-F3) and
@@ -95,6 +101,7 @@ def _config(
     *,
     kv_heads: int,
     head_dim: int,
+    heads: int = HEADS,
     rotary_interleaved: bool = False,
     window: Optional[int] = None,
     softcap: Optional[float] = None,
@@ -106,8 +113,8 @@ def _config(
 
     return TransformerConfig(
         num_layers=1,
-        hidden_size=HEADS * head_dim,
-        num_attention_heads=HEADS,
+        hidden_size=heads * head_dim,
+        num_attention_heads=heads,
         num_query_groups=kv_heads,
         kv_channels=head_dim,
         bf16=True,
@@ -143,10 +150,10 @@ def _attention(config):
     return module
 
 
-def _tables(rot_dim: int, dtype: torch.dtype):
-    """cos/sin [S_MAX, rot_dim / 2] of the exact fp64 angles, rounded to ``dtype`` (the call site
+def _tables(rot_dim: int, dtype: torch.dtype, s_max: int = S_MAX, base: float = ROPE_BASE):
+    """cos/sin [s_max, rot_dim / 2] of the exact fp64 angles, rounded to ``dtype`` (the call site
     rounds the model's tables to the query dtype before the kernel)."""
-    theta = ar.rope_angles(torch.arange(S_MAX, device="cuda"), rot_dim, ROPE_BASE)
+    theta = ar.rope_angles(torch.arange(s_max, device="cuda"), rot_dim, base)
     return torch.cos(theta).to(dtype), torch.sin(theta).to(dtype)
 
 
@@ -176,25 +183,28 @@ def _kernel_cases():
     ]
 
 
-def _flash_decode_step(module, case, positions: List[int], g):
+def _flash_decode_step(
+    module, case, positions: List[int], g, s_max: int = S_MAX, base: float = ROPE_BASE
+):
     """One ``flash_decode`` call on a poisoned static cache. Returns everything the checks need."""
     head_dim, kv_heads = case["head_dim"], case["kv_heads"]
+    heads = module.config.num_attention_heads
     dtype = torch.bfloat16
     batch, batch_max = len(positions), len(positions) + 2
     pos = torch.tensor(positions, dtype=torch.int32, device="cuda")
     # The cache: earlier keys/values random (already RoPE'd), every other element NaN.
-    k_mem = ou.poisoned_empty((S_MAX, batch_max, kv_heads, head_dim), dtype)
-    v_mem = ou.poisoned_empty((S_MAX, batch_max, kv_heads, head_dim), dtype)
+    k_mem = ou.poisoned_empty((s_max, batch_max, kv_heads, head_dim), dtype)
+    v_mem = ou.poisoned_empty((s_max, batch_max, kv_heads, head_dim), dtype)
     for b, p in enumerate(positions):
         k_mem[:p, b] = torch.randn(p, kv_heads, head_dim, device="cuda", generator=g).to(dtype)
         v_mem[:p, b] = torch.randn(p, kv_heads, head_dim, device="cuda", generator=g).to(dtype)
     k_before, v_before = k_mem.clone(), v_mem.clone()
     q_scale = 4.0 if case["softcap"] is not None else 1.0
-    q = (torch.randn(1, batch, HEADS, head_dim, device="cuda", generator=g) * q_scale).to(dtype)
+    q = (torch.randn(1, batch, heads, head_dim, device="cuda", generator=g) * q_scale).to(dtype)
     k = torch.randn(1, batch, kv_heads, head_dim, device="cuda", generator=g).to(dtype)
     v = torch.randn(1, batch, kv_heads, head_dim, device="cuda", generator=g).to(dtype)
     rot_dim = {"full": head_dim, "half": head_dim // 2, "none": 0}[case["rotary"]]
-    cos, sin = _tables(rot_dim, dtype) if rot_dim else (None, None)
+    cos, sin = _tables(rot_dim, dtype, s_max, base) if rot_dim else (None, None)
     with torch.no_grad():
         out = module.flash_decode(
             sequence_len_offset=pos,
@@ -258,7 +268,7 @@ def _check_flash_decode(module, step, case, window):
     # Attention of the RoPE'd query over keys 0..pos_b, with k' (exact rotation) at pos_b.
     q_ref = _rotate(q, cos, sin, positions, interleaved, lowp=False)
     q_trusted = _rotate(q, cos, sin, positions, interleaved, lowp=True)
-    scale = module.get_softmax_scale(q)
+    scale = case["head_dim"] ** -0.5  # the layers set no softmax_scale: 1 / sqrt(kv_channels)
     sink = module._get_inference_softmax_offset()
     refs, trusted = [], []
     for b, p in enumerate(positions):
@@ -286,7 +296,8 @@ def _check_flash_decode(module, step, case, window):
                 sink=sink,
             )
         )
-    assert out.shape == (batch, 1, HEADS, q.shape[-1]), f"output shape {tuple(out.shape)}"
+    heads = module.config.num_attention_heads
+    assert out.shape == (batch, 1, heads, q.shape[-1]), f"output shape {tuple(out.shape)}"
     flat = lambda t: t.reshape(t.shape[0], -1)  # noqa: E731
     ou.assert_close_to_reference(
         flat(out[:, 0]),
@@ -333,6 +344,68 @@ def test_flash_decode_small_case_for_sanitizer():
     )
     module = _attention(_config(kv_heads=2, head_dim=64))
     step = _flash_decode_step(module, case, [0, 3, 129], ou.make_generator(device="cuda"))
+    _check_flash_decode(module, step, case, None)
+
+
+# Production shapes from the inference examples (see the module docstring). Positions: FA2's
+# 128-key tiles, powers of two and the last rows of the cache; a batch of 64 fills up at random.
+PRODUCTION_SHAPES = {
+    "qwen2.5_1.5b": dict(
+        heads=12,
+        kv_heads=2,
+        head_dim=128,
+        base=1e6,
+        s_max=4096,
+        positions=[0, 1, 127, 128, 129, 1023, 1024, 1025, 2047, 2048, 2049, 4094, 4095],
+        batch=64,
+    ),
+    "llama3.1_8b": dict(
+        heads=32,
+        kv_heads=8,
+        head_dim=128,
+        base=5e5,
+        s_max=8192,
+        positions=[0, 129, 1025, 4095, 4096, 4097, 8190, 8191],
+        batch=8,
+    ),
+}
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize(
+    "model", [pytest.param(m, marks=ou.requires_sm(ou.HOPPER)) for m in PRODUCTION_SHAPES]
+)
+def test_flash_decode_at_production_shapes(model):
+    """One decode call at a production model's head geometry, cache length and batch: RoPE at
+    each row's position (up to the last cache row), the cache append and attention over up to 8192
+    keys match the fp64 reference (FA2 splits the long rows over its split-KV heuristic, which
+    depends on the batch and head counts)."""
+    _require_fa2()
+    shape = PRODUCTION_SHAPES[model]
+    positions = list(shape["positions"])
+    extra = shape["batch"] - len(positions)
+    if extra > 0:
+        g_cpu = ou.make_generator(seed=ou.DEFAULT_SEED + 5)
+        positions += torch.randint(0, shape["s_max"], (extra,), generator=g_cpu).tolist()
+    case = dict(
+        kv_heads=shape["kv_heads"],
+        head_dim=shape["head_dim"],
+        interleaved=False,
+        rotary="full",
+        window=None,
+        softcap=None,
+        sink=False,
+    )
+    config = _config(kv_heads=shape["kv_heads"], head_dim=shape["head_dim"], heads=shape["heads"])
+    module = _attention(config)
+    step = _flash_decode_step(
+        module,
+        case,
+        positions,
+        ou.make_generator(device="cuda"),
+        s_max=shape["s_max"],
+        base=shape["base"],
+    )
     _check_flash_decode(module, step, case, None)
 
 

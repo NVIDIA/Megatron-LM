@@ -31,7 +31,14 @@ input bit for bit (exact, metamorphic; tensorwise and MXFP8 current scaling).
 Variants covered: TELinear (duplicated), TEColumnParallelLinear, TERowParallelLinear and
 TELayerNormColumnParallelLinear; TP 1, 2, 4 (sequence parallel when TP > 1); full sequence
 ``TP, 16 - TP, 16, 16 + TP, 32 + TP`` around the 16-row alignment (32-row for MXFP8); batch 1
-and 2; tensorwise and delayed scaling on H100, MXFP8 on GB200.
+and 2; tensorwise and delayed scaling on H100, MXFP8 on GB200 (256 x 128 features). Production
+widths (``test_wrapped_linear_at_production_widths``, tensorwise on H100 and MXFP8 on GB200):
+Llama-3.1-8B's projections (QKV 4096 -> 6144 with the fused norm, attention output 4096 -> 4096,
+the gated FFN 4096 -> 28672 and 14336 -> 4096) and DeepSeek-V3's MLA KV down-projection (7168 ->
+576, duplicated), at TP 1, 2, 4 (pairwise) with 132 tokens (a decode batch) and 2044 tokens (a
+prefill chunk of the inference server's 2048-token step budget), both off the alignment and
+divisible by TP; batch 1, the dynamic engine's token layout. Delayed scaling is not repeated at
+these widths.
 
 Open PRs (written against main):
 * #8567 (s7): with sequence parallelism the wrapper clears ``module.sequence_parallel``, so TE's
@@ -63,12 +70,12 @@ def fresh_wrapper_registry():
     fp8_utils._fp8_inference_wrapped_modules.clear()
 
 
-def _config(tp: int, recipe):
+def _config(tp: int, recipe, hidden: int = IN_FEATURES):
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     return TransformerConfig(
         num_layers=1,
-        hidden_size=IN_FEATURES,
+        hidden_size=hidden,
         num_attention_heads=4,
         tensor_model_parallel_size=tp,
         sequence_parallel=tp > 1,
@@ -80,7 +87,9 @@ def _config(tp: int, recipe):
     )
 
 
-def _module(mode: str, config, tp_group):
+def _module(
+    mode: str, config, tp_group, in_features: int = IN_FEATURES, out_features: int = OUT_FEATURES
+):
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
@@ -97,8 +106,8 @@ def _module(mode: str, config, tp_group):
     )
     if mode == "duplicated":
         return TELinear(
-            IN_FEATURES,
-            OUT_FEATURES,
+            in_features,
+            out_features,
             parallel_mode="duplicated",
             tp_comm_buffer_name=None,
             skip_weight_param_allocation=False,
@@ -107,10 +116,10 @@ def _module(mode: str, config, tp_group):
         )
     if mode == "row":
         return TERowParallelLinear(
-            IN_FEATURES, OUT_FEATURES, input_is_parallel=True, tp_group=tp_group, **kwargs
+            in_features, out_features, input_is_parallel=True, tp_group=tp_group, **kwargs
         )
     cls = TELayerNormColumnParallelLinear if mode == "layernorm_column" else TEColumnParallelLinear
-    return cls(IN_FEATURES, OUT_FEATURES, gather_output=False, tp_group=tp_group, **kwargs)
+    return cls(in_features, out_features, gather_output=False, tp_group=tp_group, **kwargs)
 
 
 def _full_weight(module, mode: str, tp_group) -> torch.Tensor:
@@ -153,7 +162,7 @@ def _trusted(mode: str, weight: torch.Tensor, module, config, x_full: torch.Tens
 
     if mode == "layernorm_column":
         ref = te.LayerNormLinear(
-            IN_FEATURES,
+            weight.shape[1],
             weight.shape[0],
             eps=config.layernorm_epsilon,
             bias=False,
@@ -165,7 +174,7 @@ def _trusted(mode: str, weight: torch.Tensor, module, config, x_full: torch.Tens
             if getattr(module, "layer_norm_bias", None) is not None:
                 ref.layer_norm_bias.copy_(module.layer_norm_bias)
     else:
-        ref = te.Linear(IN_FEATURES, weight.shape[0], bias=False, params_dtype=torch.bfloat16)
+        ref = te.Linear(weight.shape[1], weight.shape[0], bias=False, params_dtype=torch.bfloat16)
         ref = ref.cuda()
     with torch.no_grad():
         ref.weight.copy_(weight)
@@ -189,7 +198,16 @@ def _reference(mode, module, weight, x_full, config):
     return ou.fp64_reference(fn, x_full, weight, gamma, beta)
 
 
-def _run(mode: str, tp: int, recipe_name: str, seq: int, batch: int, align: int):
+def _run(
+    mode: str,
+    tp: int,
+    recipe_name: str,
+    seq: int,
+    batch: int,
+    align: int,
+    in_features: int = IN_FEATURES,
+    out_features: int = OUT_FEATURES,
+):
     from megatron.core import parallel_state
     from megatron.core.enums import Fp8Recipe
     from megatron.core.fp8_utils import get_fp8_context, prepare_model_for_fp8_inference
@@ -203,8 +221,8 @@ def _run(mode: str, tp: int, recipe_name: str, seq: int, batch: int, align: int)
     try:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         rank = tp_group.rank()
-        config = _config(tp, recipe)
-        module = _module(mode, config, tp_group).cuda().eval()
+        config = _config(tp, recipe, hidden=in_features)
+        module = _module(mode, config, tp_group, in_features, out_features).cuda().eval()
         # Each rank draws its own weight shard; every rank draws the same full input and feeds
         # its own part of it.
         g_rank = ou.make_generator(seed=ou.DEFAULT_SEED + 1000 * (rank + 1) + seq, device="cuda")
@@ -214,7 +232,7 @@ def _run(mode: str, tp: int, recipe_name: str, seq: int, batch: int, align: int)
             )
         weight = _full_weight(module, mode, tp_group)
         g = ou.make_generator(seed=ou.DEFAULT_SEED + seq, device="cuda")
-        x_full = torch.randn(seq, batch, IN_FEATURES, device="cuda", generator=g).to(torch.bfloat16)
+        x_full = torch.randn(seq, batch, in_features, device="cuda", generator=g).to(torch.bfloat16)
         x = _rank_input(x_full, mode, tp, rank)
         original_forward = module.forward
         container = torch.nn.ModuleList([module])
@@ -235,7 +253,7 @@ def _run(mode: str, tp: int, recipe_name: str, seq: int, batch: int, align: int)
             out.reshape(-1, out.shape[-1]),
             reference.reshape(-1, reference.shape[-1]),
             trusted.reshape(-1, trusted.shape[-1]),
-            what=f"{mode} TP={tp} S={seq} B={batch} ({recipe})",
+            what=f"{mode} {in_features}->{out_features} TP={tp} S={seq} B={batch} ({recipe})",
         )
         if tp == 1 and recipe_name in ("tensorwise", "mxfp8"):
             # Current scaling: zero rows change no amax, so padding by hand is the same GEMM.
@@ -282,6 +300,61 @@ def test_wrapped_linear_matches_reference(recipe_name, align, tp, mode, seq, bat
     """Each rank's wrapped FP8 output is its part of the full ``x @ W^T`` (bounded by TE's own
     unsharded linear), and at TP=1 it equals the unwrapped module on the padded input."""
     _run(mode, tp, recipe_name, seq, batch, align)
+
+
+# Production widths (mode, in, out) of real models' projections, and production token counts; see
+# the module docstring.
+PRODUCTION_WIDTHS = {
+    "llama3.1_8b-qkv": ("layernorm_column", 4096, 6144),
+    "llama3.1_8b-proj": ("row", 4096, 4096),
+    "llama3.1_8b-fc1": ("column", 4096, 28672),
+    "llama3.1_8b-fc2": ("row", 14336, 4096),
+    "deepseek_v3-kv_down": ("duplicated", 7168, 576),
+}
+PRODUCTION_TOKENS = [132, 2044]
+
+
+def _production_cases(recipe_name: str, align: int, marks):
+    params = []
+    sharded = [name for name, (mode, _, _) in PRODUCTION_WIDTHS.items() if mode != "duplicated"]
+    cases = ou.pairwise_cases({"shape": sharded, "tp": [1, 2, 4], "seq": PRODUCTION_TOKENS})
+    cases += [
+        dict(shape=name, tp=1, seq=seq)
+        for name, (mode, _, _) in PRODUCTION_WIDTHS.items()
+        if mode == "duplicated"
+        for seq in PRODUCTION_TOKENS
+    ]
+    for case in cases:
+        mode, in_features, out_features = PRODUCTION_WIDTHS[case["shape"]]
+        params.append(
+            pytest.param(
+                recipe_name,
+                align,
+                case["tp"],
+                mode,
+                in_features,
+                out_features,
+                case["seq"],
+                id=f"{recipe_name}-tp{case['tp']}-{mode}-{case['shape']}-S{case['seq']}",
+                marks=marks,
+            )
+        )
+    return params
+
+
+@pytest.mark.usefixtures("fresh_wrapper_registry")
+@pytest.mark.parametrize(
+    "recipe_name, align, tp, mode, in_features, out_features, seq",
+    _production_cases("tensorwise", 16, HOPPER) + _production_cases("mxfp8", 32, BLACKWELL),
+)
+def test_wrapped_linear_at_production_widths(
+    recipe_name, align, tp, mode, in_features, out_features, seq
+):
+    """The contract of ``test_wrapped_linear_matches_reference`` at production model widths and
+    token counts: each rank's wrapped FP8 output is its part of the full ``x @ W^T`` (bounded by
+    TE's own unsharded linear), and at TP=1 it equals the unwrapped module on the padded input
+    bit for bit. Row-parallel cases with TP > 1 fail on main (s7, #8567)."""
+    _run(mode, tp, recipe_name, seq, 1, align, in_features, out_features)
 
 
 @pytest.mark.usefixtures("fresh_wrapper_registry")
