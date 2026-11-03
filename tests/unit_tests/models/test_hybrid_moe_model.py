@@ -456,6 +456,11 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_hybridep_pad_variable_tokens": False,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
     "attention_output_gate_fusion": False,
+    "enable_attention_residuals": False,
+    "attn_res_impl": "fla",
+    "attn_res_block_layers": None,
+    "attn_res_norm_fusion": False,
+    "hybrid_layer_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

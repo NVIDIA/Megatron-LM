@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -103,6 +103,26 @@ class HybridModelConfig(ModelConfig):
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
+        # Own dataclass fields always live on this object: proxying them only to
+        # the embedded TransformerConfig would leave the class-level default
+        # visible through normal attribute lookup on self whenever
+        # TransformerConfig declares a same-named field (e.g.
+        # ``hybrid_layer_pattern``), silently dropping the configured value.
+        # The value is still mirrored into the transformer config when it
+        # declares the same attribute (``hybrid_layer_pattern`` itself, which
+        # the AttnRes validation reads from TransformerConfig, and
+        # ``rotary_base`` / ``rotary_percent`` on MLATransformerConfig).
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+            if name == "transformer":
+                return
+            try:
+                transformer = object.__getattribute__(self, "transformer")
+            except AttributeError:
+                return
+            if hasattr(transformer, name):
+                setattr(transformer, name, value)
+            return
         # Use object.__getattribute__ to avoid triggering __getattr__ while
         # `transformer` may not yet exist (e.g. during dataclass __init__).
         try:

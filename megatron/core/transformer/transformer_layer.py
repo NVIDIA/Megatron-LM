@@ -7,7 +7,7 @@ import warnings
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Tuple, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import (
@@ -31,6 +31,12 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention_residual import (
+    AttentionResidual,
+    attn_res_final_num_sources,
+    attn_res_num_sources,
+    is_attn_res_block_start,
+)
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import (
     AttnMaskType,
@@ -697,14 +703,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        input_is_normalized: bool = False,
         *,
         inference_params: Optional[Any] = None,
     ):
-        """Run input norm and self-attention, returning the raw output before BDA."""
+        """Run input norm and self-attention, returning the raw output before BDA.
+
+        ``input_is_normalized`` (AttnRes norm fusion): ``hidden_states`` is already the
+        input_layernorm output (the depth aggregation applied the norm with this layer's
+        weight inside the fused kernel), so the norm module and its checkpoint are bypassed.
+        """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        norm_kwargs = {"mhc_recompute_manager": mhc_recompute_manager}
+        if input_is_normalized:
+            norm_kwargs["input_is_normalized"] = True
         input_layernorm_output, residual, attn_state = self._run_input_layernorm(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, **norm_kwargs
         )
         if attn_state:
             raise RuntimeError(
@@ -953,6 +968,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         hidden_states,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        input_is_normalized: bool = False,
     ):
         """Run input layernorm with optional output-discarding checkpoint and
         fine-grained activation offloading.
@@ -960,6 +976,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Sets ``self._input_layernorm_checkpoint_active`` so the caller can gate
         the post-attention discard-and-register hook on the same condition. The
         flag is consumed by the next ``self._apply_self_attn_bda_step`` step.
+
+        ``input_is_normalized`` (AttnRes norm fusion): ``hidden_states`` is already
+        the input_layernorm output, so the norm module and its checkpoint are
+        bypassed and the norm input doubles as the returned residual.
 
         Returns:
             Tuple ``(input_layernorm_output, residual, attn_state)`` where
@@ -992,6 +1012,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.attn_norm_manager = self.off_interface(
             self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
         )
+        if input_is_normalized:
+            # AttnRes norm fusion: the depth aggregation already applied input_layernorm
+            # (with this layer's weight) inside the fused kernel; bypass the module and
+            # leave no norm checkpoint for the post-attention discard hook.
+            self._input_layernorm_checkpoint_active = False
+            return hidden_states, hidden_states, connection_state
         replay_input_layernorm = recompute_context is not None and not isinstance(
             self.input_layernorm, IdentityOp
         )
@@ -1150,6 +1176,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             raise RuntimeError(
                 "Use the mHC TransformerLayer/Hybrid wrapper when hyper connections are enabled."
             )
+        called_from_hybrid_attn_res_wrapper = kwargs.pop(
+            "_called_from_hybrid_attn_res_wrapper", False
+        )
+        return_layer_delta = kwargs.pop("_return_layer_delta", False)
+        input_is_normalized = kwargs.pop("_input_is_normalized", False)
+        if self.config.enable_attention_residuals and not called_from_hybrid_attn_res_wrapper:
+            raise RuntimeError(
+                "TransformerLayer.forward() must not be called directly when "
+                "enable_attention_residuals=True. Use AttnResTransformerLayer (selected "
+                "automatically by the GPT layer specs); AttnResHybridLayer drives the "
+                "wrapped layer through this path automatically for hybrid stacks."
+            )
+        if return_layer_delta:
+            if not called_from_hybrid_attn_res_wrapper:
+                raise RuntimeError(
+                    "Layer deltas are only supported for the hybrid AttnRes wrapper."
+                )
+            return self._forward_hybrid_attn_res_delta(
+                *args, input_is_normalized=input_is_normalized, **kwargs
+            )
+        if input_is_normalized:
+            raise RuntimeError(
+                "Pre-normalized inputs are only supported for the hybrid AttnRes wrapper."
+            )
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
@@ -1173,17 +1223,76 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
             return output, context
 
+    def _forward_hybrid_attn_res_delta(
+        self, hidden_states: Tensor, *, input_is_normalized: bool = False, **kwargs
+    ):
+        """Return a split hybrid entry's contribution without rounding a local residual.
+
+        This is dispatched from ``forward``, not called by the wrapper directly:
+        normal module hooks (in particular parameter all-gather hooks) must run.
+        Adding a scalar zero through the entry's BDA preserves its bias/dropout
+        implementation without the lossy BF16 ``(input + branch) - input`` round trip.
+        With ``input_is_normalized`` (AttnRes norm fusion) ``hidden_states`` is already
+        the output of this entry's pre-norm, which is bypassed.
+        """
+        has_attention = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
+        if has_attention == has_mlp or not isinstance(self.cross_attention, IdentityOp):
+            raise ValueError(
+                "Hybrid AttnRes requires exactly one attention or MLP branch per entry."
+            )
+        if kwargs.get("inference_context") is not None:
+            raise NotImplementedError("Attention residuals do not support inference yet.")
+
+        if has_attention:
+            output_with_bias, norm_manager, norm_input = (
+                self._forward_self_attention_output_with_bias(
+                    hidden_states,
+                    attention_mask=kwargs.get("attention_mask"),
+                    rotary_pos_emb=kwargs.get("rotary_pos_emb"),
+                    sequence_len_offset=kwargs.get("sequence_len_offset"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
+                    input_is_normalized=input_is_normalized,
+                )
+            )
+            with self.bias_dropout_add_exec_handler():
+                delta = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    output_with_bias, output_with_bias[0].new_zeros(()), self.hidden_dropout
+                )
+            # Same post-step as _apply_self_attn_bda_step: commit the attention-norm offload
+            # group now that the BDA no longer needs the norm input, then release the manager.
+            delta = norm_manager.group_offload(delta, forced_released_tensors=[norm_input])
+            self.attn_norm_manager = None
+            return delta, kwargs.get("context")
+
+        output_with_bias, residual = self._forward_mlp_output_with_bias(
+            hidden_states,
+            padding_mask=kwargs.get("padding_mask"),
+            input_ids=kwargs.get("input_ids"),
+            packed_seq_params=kwargs.get("packed_seq_params"),
+            input_is_normalized=input_is_normalized,
+        )
+        delta = self._apply_mlp_bda_step(output_with_bias, residual, _return_layer_delta=True)
+        return delta, kwargs.get("context")
+
     def _forward_pre_mlp_layernorm(
         self,
         hidden_states: Tensor,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        input_is_normalized: bool = False,
     ):
         self.mlp_norm_manager = self.off_interface(
             self.offload_mlp_norm and residual_stream_recompute_context is None,
             hidden_states,
             "mlp_norm",
         )
+        if input_is_normalized:
+            # AttnRes norm fusion: the depth aggregation already applied pre_mlp_layernorm
+            # (with this layer's weight) inside the fused kernel; bypass the module and
+            # leave no norm checkpoint for _apply_mlp_bda_step to discard.
+            self.pre_mlp_norm_checkpoint = None
+            return hidden_states
         replay_pre_mlp_layernorm = residual_stream_recompute_context is not None and not isinstance(
             self.pre_mlp_layernorm, IdentityOp
         )
@@ -1268,9 +1377,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         hidden_states,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        input_is_normalized: bool = False,
     ):
         """Run pre-MLP layernorm (with optional recompute and offload), unpack a
         tuple-output layernorm, and apply the fp32-residual cast.
+
+        ``input_is_normalized`` (AttnRes norm fusion) bypasses the norm module; see
+        ``_forward_pre_mlp_layernorm``.
 
         Returns:
             Tuple ``(pre_mlp_layernorm_output, residual, mlp_state)`` where
@@ -1304,6 +1417,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             hidden_states,
             mhc_recompute_manager=mhc_recompute_manager,
             residual_stream_recompute_context=recompute_context,
+            input_is_normalized=input_is_normalized,
         )
 
         if self._pre_mlp_layernorm_returns_residual:
@@ -1328,10 +1442,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        input_is_normalized: bool = False,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
-        """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
+        """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA.
+
+        ``input_is_normalized`` (AttnRes norm fusion): ``hidden_states`` is already the
+        pre_mlp_layernorm output, so the norm module and its checkpoint are bypassed.
+        """
+        norm_kwargs = {"mhc_recompute_manager": mhc_recompute_manager}
+        if input_is_normalized:
+            norm_kwargs["input_is_normalized"] = True
         pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, **norm_kwargs
         )
         if mlp_state:
             raise RuntimeError(
@@ -1430,7 +1552,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         ):
-            if self.recompute_pre_mlp_layernorm:
+            if self.recompute_pre_mlp_layernorm and self.pre_mlp_norm_checkpoint is not None:
                 # Register the recompute hooks to all the cudagraph output tensors, because some
                 # tensors are in parallel execution paths and they all need pre_mlp_layernorm to be
                 # recomputed in backward pass. For example, the router path and the shared expert
@@ -1584,6 +1706,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual: Tensor,
         mlp_state: tuple = (),
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        _return_layer_delta: bool = False,
+        mlp_norm_input: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform operations after the MLP computation: bias-dropout-add for
@@ -1597,6 +1722,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
             mlp_state: Opaque payload from ``_pre_mlp_layernorm_and_residual``. Default ``()``.
+            _return_layer_delta (bool): Internal split-hybrid AttnRes mode: omit the residual
+                addition while retaining norm ownership and recompute hooks.
+            mlp_norm_input (Tensor, optional): Input owned by the pre-MLP norm offload group.
+                Defaults to ``residual``. AttnRes supplies this separately because its BDA
+                residual is the running partial sum, not the aggregated norm input.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1626,9 +1756,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
-        if self.recompute_pre_mlp_layernorm:
+        if self.recompute_pre_mlp_layernorm and self.pre_mlp_norm_checkpoint is not None:
             # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of mlp_output_with_bias[0]
+            # as a gradient hook of mlp_output_with_bias[0] (no checkpoint exists when the
+            # AttnRes norm fusion bypassed the norm)
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
             )
@@ -1664,13 +1795,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
+                    mlp_output_with_bias,
+                    residual.new_zeros(()) if _return_layer_delta else residual,
+                    self.hidden_dropout,
                 )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.mlp_norm_manager is not None:
-            forced_released_tensors = [residual] if residual_connection is None else []
+            norm_input = residual if mlp_norm_input is None else mlp_norm_input
+            forced_released_tensors = [norm_input] if residual_connection is None else []
             hidden_states = self.mlp_norm_manager.group_offload(
                 hidden_states, forced_released_tensors=forced_released_tensors
             )
@@ -2614,6 +2748,269 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             List[Tensor]: A list of layernorm weight tensors.
         """
         return
+
+
+class AttnResTransformerLayer(TransformerLayer):
+    """A transformer layer with Attention Residuals (AttnRes, arXiv:2603.15031).
+
+    Extends TransformerLayer by replacing the residual capture of both sublayers
+    with a per-token softmax attention over depth sources. The hidden state
+    carried between layers is the intra-block partial sum; the depth-source
+    list is owned by the enclosing TransformerBlock (or MTP layer) and passed
+    per call as the ``attn_res_sources`` keyword (a tuple whose arity is a
+    static per-layer constant).
+
+    For each sublayer::
+
+        h = AttentionResidual(sources [+ partial])   # softmax over depth, fp32
+        out = sublayer(norm(h))
+        partial = partial + dropout(out)             # BDA; plain dropout at block starts
+
+    Cross-attention is not supported. Training-only for now: inference contexts
+    are rejected at the top of ``forward``.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+        )
+
+        assert isinstance(
+            self.cross_attention, IdentityOp
+        ), "AttnResTransformerLayer does not support cross-attention."
+
+        block_layers = self.config.attn_res_block_layers
+        if is_mtp_layer:
+            # MTP layers attend over the completed trunk history (all sources
+            # plus the trailing partial block) and never open a new block; their
+            # own input (eh_proj output) is the fresh partial sum.
+            self.attn_res_is_block_start = False
+            self.attn_res_num_sources = attn_res_final_num_sources(
+                self.config.num_layers, block_layers
+            )
+        else:
+            self.attn_res_is_block_start = is_attn_res_block_start(self.layer_number, block_layers)
+            self.attn_res_num_sources = attn_res_num_sources(self.layer_number, block_layers)
+
+        # Norm fusion: the aggregation emits norm(h) with the norm module's own weight, so it
+        # applies per sublayer wherever the norm exists as a standalone module. Specs that fold
+        # the norm into the first linear (TE LayerNormLinear) leave an IdentityOp here; those
+        # sublayers keep the unfused aggregation.
+        self.attn_res_norm_fusion = self.config.attn_res_norm_fusion
+
+        def has_standalone_norm(norm):
+            return not isinstance(norm, IdentityOp) and isinstance(
+                getattr(norm, "weight", None), torch.Tensor
+            )
+
+        self._fuse_input_norm = self.attn_res_norm_fusion and has_standalone_norm(
+            self.input_layernorm
+        )
+        self._fuse_pre_mlp_norm = self.attn_res_norm_fusion and has_standalone_norm(
+            self.pre_mlp_layernorm
+        )
+        attn_res_recompute = self.config.recompute_granularity == 'selective' and 'attn_res' in (
+            self.config.recompute_modules or []
+        )
+        self.self_attention_attn_res = AttentionResidual(
+            self.config, self.layer_number, recompute=attn_res_recompute
+        )
+        self.mlp_attn_res = AttentionResidual(
+            self.config, self.layer_number, recompute=attn_res_recompute
+        )
+
+    def forward(self, *args, **kwargs):
+        """Forward pass threading the depth-source tuple into both sublayers."""
+        kwargs.pop("dynamic_inference_decode_only", None)
+        attn_res_sources = kwargs.pop("attn_res_sources", None)
+        if attn_res_sources is None:
+            raise RuntimeError(
+                "AttnResTransformerLayer requires the attn_res_sources keyword; it is "
+                "provided by TransformerBlock / MultiTokenPredictionLayer. An execution "
+                "path that does not thread it (e.g. full recompute, the fine-grained "
+                "EP-overlap schedule, or inference) cannot run attention residuals."
+            )
+        if (
+            kwargs.get("inference_context") is not None
+            or kwargs.get("inference_params") is not None
+        ):
+            raise NotImplementedError("Attention residuals do not support inference yet.")
+        assert len(attn_res_sources) == self.attn_res_num_sources, (
+            f"layer {self.layer_number}: expected {self.attn_res_num_sources} depth "
+            f"sources, got {len(attn_res_sources)}; block-boundary bookkeeping is broken"
+        )
+
+        hidden_states, context = self._forward_attention(
+            *args, attn_res_sources=attn_res_sources, **kwargs
+        )
+        output = self._forward_mlp(
+            hidden_states,
+            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+            input_ids=kwargs.get("input_ids", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
+            attn_res_sources=attn_res_sources,
+        )
+        return output, context
+
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        attn_res_sources: Tuple[Tensor, ...] = (),
+        inference_params: Optional[Any] = None,
+    ):
+        """Attention sublayer with AttnRes residual handling.
+
+        At block-start layers the incoming hidden state was just appended to the
+        depth sources by the caller, so there is no partial sum: the sublayer
+        output starts a new one (plain bias + dropout, no residual add).
+        """
+        if residual_stream_recompute_context is not None:
+            raise TypeError(
+                "'residual_stream' recomputation (wide residuals) cannot be combined with "
+                "attention residuals."
+            )
+        # At non-block-start layers the incoming hidden state IS the partial sum.
+        partial = None if self.attn_res_is_block_start else hidden_states
+        values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
+
+        nvtx_range_push(suffix="self_attention_attn_res")
+        aggregated = self.self_attention_attn_res(
+            values,
+            output_norm_weight=self.input_layernorm.weight if self._fuse_input_norm else None,
+        )
+        nvtx_range_pop(suffix="self_attention_attn_res")
+
+        attention_output_with_bias, attn_norm_manager, attn_norm_input = (
+            self._forward_self_attention_output_with_bias(
+                aggregated,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=None,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                input_is_normalized=self._fuse_input_norm,
+            )
+        )
+
+        nvtx_range_push(suffix="self_attn_bda")
+        with self.bias_dropout_add_exec_handler():
+            if partial is None:
+                # First sublayer of a depth block: no residual add. Keep the
+                # partial sum in the residual-stream dtype so the payload cat /
+                # downstream BDAs never get silently promoted.
+                attention_output, attention_bias_out = attention_output_with_bias
+                if attention_bias_out is not None:
+                    attention_output = attention_output + attention_bias_out
+                hidden_states = torch.nn.functional.dropout(
+                    attention_output, p=self.hidden_dropout, training=self.training
+                ).to(values[0].dtype)
+            else:
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, partial, self.hidden_dropout
+                )
+        nvtx_range_pop(suffix="self_attn_bda")
+
+        # Same post-step as _apply_self_attn_bda_step: commit the attention-norm offload
+        # group now that the BDA no longer needs the norm input, then release the manager.
+        hidden_states = attn_norm_manager.group_offload(
+            hidden_states, forced_released_tensors=[attn_norm_input]
+        )
+        self.attn_norm_manager = None
+        # The forward is done with the aggregation output; under 'attn_res' recompute release
+        # it now and rebuild it when the gradient of this sublayer's output arrives, which is
+        # before the input-norm checkpoint's own hook (on the attention output) and backward.
+        self.self_attention_attn_res.discard_output_and_register_recompute(hidden_states)
+
+        return hidden_states, context
+
+    def _forward_mlp(
+        self,
+        hidden_states: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        attn_res_sources: Tuple[Tensor, ...] = (),
+    ):
+        """MLP sublayer with AttnRes residual handling.
+
+        The incoming hidden state is always the (non-empty) partial sum here:
+        block boundaries only fall on attention sublayers.
+        """
+        if residual_stream_recompute_context is not None:
+            raise TypeError(
+                "'residual_stream' recomputation (wide residuals) cannot be combined with "
+                "attention residuals."
+            )
+        partial = hidden_states
+        values = [*attn_res_sources, partial]
+
+        nvtx_range_push(suffix="mlp_attn_res")
+        aggregated = self.mlp_attn_res(
+            values,
+            output_norm_weight=self.pre_mlp_layernorm.weight if self._fuse_pre_mlp_norm else None,
+        )
+        nvtx_range_pop(suffix="mlp_attn_res")
+
+        # The aggregated input belongs to the norm offload group, while the BDA
+        # residual is the independently owned partial sum.
+        mlp_output_with_bias, mlp_norm_input = self._forward_mlp_output_with_bias(
+            aggregated,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+            input_is_normalized=self._fuse_pre_mlp_norm,
+        )
+
+        output = self._apply_mlp_bda_step(
+            mlp_output_with_bias, partial, mlp_norm_input=mlp_norm_input
+        )
+        # See _forward_attention: the sublayer output's gradient precedes the pre-MLP norm
+        # checkpoint's hook (on the MLP output), so the aggregation is rebuilt first.
+        self.mlp_attn_res.discard_output_and_register_recompute(output)
+        return output
 
 
 class MoETransformerLayer(TransformerLayer):

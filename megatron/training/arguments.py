@@ -3022,6 +3022,9 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
+        # defined manually in _add_experimental_args; the config field is filled
+        # by the generic field copy in core_transformer_config_from_args
+        "hybrid_layer_pattern",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
