@@ -133,10 +133,10 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
 
 
 @pytest.mark.parametrize(
-    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+    "overlap_allgather_reduction", [True, False], ids=["separate_streams", "unified_stream"]
 )
 def test_training_step_peak_memory_bounds_full_size_buffers(
-    distributed_setup, unify_communication_stream
+    distributed_setup, overlap_allgather_reduction
 ):
     """A training step should stay within its full-size-buffer bound."""
     rank = distributed_setup.rank
@@ -154,7 +154,7 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     with fully_shard_context(
         FsdpContext(
             device=device,
-            runtime_policy=RuntimePolicy(unify_communication_stream=unify_communication_stream),
+            runtime_policy=RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction),
         )
     ):
         for layer in model.layers:
@@ -186,7 +186,7 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     # allocation on that stream, reducing the peak to three. The slack on top covers
     # allocator granularity and small temporaries, measured at ~169 KiB.
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    full_buffer_bound = 3 if unify_communication_stream else 4
+    full_buffer_bound = 4 if overlap_allgather_reduction else 3
     bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
