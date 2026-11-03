@@ -371,6 +371,10 @@ class ProcessGroupCollection:
             Keep this shim at bootstrap boundaries or in explicitly commented migration
             fallbacks for existing callers. See ``docs/developer/parallel-state-deprecation.md``.
 
+        These are the groups registered with parallel_state.register_process_groups(), which
+        initialize_model_parallel() calls. Each call returns a new collection; dp_cp_ag and
+        expt_dp_ag are None.
+
         Args:
             required_pgs (List[str], optional): List of process group names to initialize.
                 If None, pull all default process groups. Each string should correspond to
