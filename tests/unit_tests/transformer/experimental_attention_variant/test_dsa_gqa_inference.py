@@ -12,6 +12,10 @@ import torch
 
 from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.dsa_metadata import (
+    SCORE_ROW_BLOCK,
+    build_row_metadata,
+)
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference as dsa_gqa
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
@@ -21,8 +25,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference 
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
     HAVE_TRITON,
-    SCORE_ROW_BLOCK,
-    build_row_metadata,
     dsa_gqa_indexer_scores,
     dsa_gqa_sparse_attention,
 )
@@ -457,10 +459,13 @@ def test_native_decode_workspace_suspend_resume(
     def fill_metadata():
         context.padded_active_token_count = context.padded_active_request_count = rows
         context.num_prefill_requests = 0
-        context._fill_dsa_row_metadata(
-            3, rows, torch.tensor([1, 1, 1]), torch.tensor([bound, 2048, 33])
+        context.dsa_metadata.update(
+            torch.tensor([1, 1, 1]),
+            torch.tensor([bound, 2048, 33]),
+            padded_request_count=rows,
+            padded_token_count=rows,
         )
-        context._gpu_dsa_row_buf.copy_(context._cpu_dsa_row_buf)
+        context.dsa_metadata.transfer_to_gpu()
 
     def attend():
         return dsa_gqa._native_sparse_attention(
@@ -471,7 +476,7 @@ def test_native_decode_workspace_suspend_resume(
             index_key_cache=context.dsa_memory_buffer[0],
             block_table=table,
             inference_context=context,
-            row_metadata=context.dsa_row_metadata(),
+            row_metadata=context.dsa_metadata.row_metadata(),
             max_context_length=bound,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
@@ -496,7 +501,7 @@ def test_native_decode_workspace_suspend_resume(
         index_query=index_query,
         index_key_cache=context.dsa_memory_buffer[0],
         block_table=table,
-        row_metadata=context.dsa_row_metadata(),
+        row_metadata=context.dsa_metadata.row_metadata(),
         max_context_length=bound,
         index_topk=TOPK,
         softmax_scale=HEAD_DIM**-0.5,
@@ -510,8 +515,10 @@ def test_native_decode_workspace_suspend_resume(
         fill_metadata()
         graph.replay()
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-        assert len(context._dsa_decode_workspaces) == 1
-        workspace_ref = weakref.ref(next(iter(context._dsa_decode_workspaces.values()))[0])
+        assert len(context.dsa_metadata.decode_workspaces) == 1
+        metadata_ref = weakref.ref(context.dsa_metadata)
+        metadata_buffer_ref = weakref.ref(context.dsa_metadata._gpu_buffer)
+        workspace_ref = weakref.ref(next(iter(context.dsa_metadata.decode_workspaces.values()))[0])
         descriptor_base_ref = weakref.ref(workspace_ref()._key_descriptor.base)
         torch.cuda.synchronize()
         allocated_before = torch.cuda.memory_allocated()
@@ -526,12 +533,17 @@ def test_native_decode_workspace_suspend_resume(
         if releases_storage:
             assert workspace_ref() is None
             assert descriptor_base_ref() is None
+            if cache_mode == KVCacheManagementMode.RECOMPUTE:
+                assert metadata_ref() is None
+                assert metadata_buffer_ref() is None
             allocated_after = torch.cuda.memory_allocated()
             assert allocated_before - allocated_after >= cache_bytes
             suspended_allocations.append(allocated_after)
             assert allocated_after <= suspended_allocations[0] + 1024**2
         else:
-            assert workspace_ref() is next(iter(context._dsa_decode_workspaces.values()))[0]
+            assert metadata_ref() is context.dsa_metadata
+            assert metadata_buffer_ref() is context.dsa_metadata._gpu_buffer
+            assert workspace_ref() is next(iter(context.dsa_metadata.decode_workspaces.values()))[0]
 
         context.reinitialize_inference_state_buffers()
         if cache_mode == KVCacheManagementMode.RECOMPUTE:
@@ -542,7 +554,7 @@ def test_native_decode_workspace_suspend_resume(
             graph, output = capture()
         graph.replay()
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-        assert len(context._dsa_decode_workspaces) == 1
+        assert len(context.dsa_metadata.decode_workspaces) == 1
 
 
 @pytest.mark.parametrize("decode_only", [True, False])
@@ -559,7 +571,13 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
         batches = [([1, 1, 1], [700, 9000, 2600]), ([1, 1, 1, 1], [9000, 513, 4000, 1])]
     else:
         padded_rows, padded_requests = 640, 4
-        batches = [([1, 1, 300, 37], [700, 9000, 3000, 37]), ([1, 520], [8000, 9000])]
+        batches = [
+            ([1, 1, 300, 37], [700, 9000, 3000, 37]),
+            ([400, 37], [4000, 1000]),
+            ([1, 520], [8000, 9000]),
+        ]
+    batches.append(([], []))
+    batches.append(batches[0])
     max_pages = bound // page_size
     num_pages = padded_requests * max_pages
     keys = torch.randn(num_pages, page_size, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
@@ -584,13 +602,13 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
         keys.copy_(torch.randn_like(keys))
         index_keys.copy_(torch.randn_like(index_keys))
         table.copy_(torch.randperm(num_pages, device=device).view(padded_requests, max_pages))
-        native_context._fill_dsa_row_metadata(
-            len(query_lengths),
-            padded_requests,
+        native_context.dsa_metadata.update(
             torch.tensor(query_lengths),
             torch.tensor(kv_lengths),
+            padded_request_count=padded_requests,
+            padded_token_count=padded_rows,
         )
-        native_context._gpu_dsa_row_buf.copy_(native_context._cpu_dsa_row_buf)
+        native_context.dsa_metadata.transfer_to_gpu()
         return real
 
     def attend():
@@ -602,7 +620,7 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(decode_only, nativ
             index_key_cache=index_keys,
             block_table=table,
             inference_context=native_context,
-            row_metadata=native_context.dsa_row_metadata(),
+            row_metadata=native_context.dsa_metadata.row_metadata(),
             max_context_length=bound,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,

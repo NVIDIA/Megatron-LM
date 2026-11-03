@@ -111,7 +111,7 @@ def dynamic_sparse_attention(
     """Simplified-DSA attention over paged caches for a decode, prefill, or mixed batch.
 
     Every token is a row that routes to the top-k of its causal prefix
-    (``DynamicInferenceContext.dsa_row_metadata``), so all step types share one path with
+    (``DSAMetadata.row_metadata``), so all step types share one path with
     launch sizes fixed by the padded batch and can run as CUDA graphs. The caches already
     hold this step's keys, values, and indexer keys.
 
@@ -137,7 +137,7 @@ def dynamic_sparse_attention(
     if query.dim() == 3:
         query = query.unsqueeze(1)
     num_tokens, _, num_query_heads, _ = query.shape
-    row_metadata = inference_context.dsa_row_metadata()
+    row_metadata = inference_context.dsa_metadata.row_metadata()
     if row_metadata[0].numel() != num_tokens:
         raise RuntimeError(
             f"DSA row metadata covers {row_metadata[0].numel()} tokens, but the step has "
@@ -188,7 +188,7 @@ def _native_sparse_attention(
         index_topk,
         key_cache.shape[1],
     )
-    cache = inference_context._dsa_decode_workspaces
+    cache = inference_context.dsa_metadata.decode_workspaces
     if cache_key not in cache:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the native DSA workspace before CUDA graph capture")
@@ -207,7 +207,7 @@ def _native_sparse_attention(
         cache[cache_key] = workspace, stable_query
     workspace, stable_query = cache[cache_key]
     stable_query.copy_(index_query[:rows])
-    lengths = inference_context.dsa_decode_lengths[:rows]
+    lengths = inference_context.dsa_metadata.decode_lengths[:rows]
     native = workspace(
         query=query[:rows],
         index_query=stable_query,
@@ -282,7 +282,7 @@ class TritonDSADecodeWorkspace:
         from triton.experimental.gluon import language as gl
         from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-        from . import dsa_gqa_decode_kernels as decode_kernels
+        from . import dsa_gqa_inference_kernels as kernels
         from .dsa_gqa_topk import CuteTopKWorkspace
 
         self._topk_workspace_type = CuteTopKWorkspace
@@ -324,7 +324,7 @@ class TritonDSADecodeWorkspace:
             batch_size, num_query_heads, head_dim, dtype=torch.bfloat16, device=device
         )
         self.request_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-        self._score = decode_kernels.score_tcgen
+        self._score = kernels.score_tcgen
         self._descriptor_type = TensorDescriptor
         self._descriptor_layout = gl.NVMMASharedLayout(
             swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
@@ -335,7 +335,7 @@ class TritonDSADecodeWorkspace:
         self._score_workers = 8
         self._score_stages = 3
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        self._slices = decode_kernels._num_slices(batch_size, 1, index_topk, sms)
+        self._slices = kernels._num_slices(batch_size, 1, index_topk, sms)
         self._slice_len = triton.cdiv(index_topk, self._slices)
         partial_rows = batch_size * self._slices * num_query_heads
         self._partial = torch.empty(partial_rows, head_dim, dtype=torch.float32, device=device)
@@ -358,7 +358,7 @@ class TritonDSADecodeWorkspace:
         """Score, select exact top-k, and attend into preallocated output storage."""
         import triton
 
-        from . import dsa_gqa_decode_kernels as decode_kernels
+        from . import dsa_gqa_inference_kernels as kernels
 
         requests = self.request_indices if request_indices is None else request_indices
         tensors = (
@@ -456,7 +456,7 @@ class TritonDSADecodeWorkspace:
                     self.scores, context_lengths, self.indices
                 )
             self._topk_selectors[selector_key]()
-            decode_kernels._partial_kernel[(self.batch_size, 1, self._slices)](
+            kernels._partial_kernel[(self.batch_size, 1, self._slices)](
                 query,
                 key_cache,
                 value_cache,
@@ -482,7 +482,7 @@ class TritonDSADecodeWorkspace:
                 self.index_topk,
                 self._slice_len,
                 self._slices,
-                softmax_scale * decode_kernels.LOG2E,
+                softmax_scale * kernels.LOG2E,
                 HEADS_PER_GROUP=self.num_query_heads,
                 HEAD_TILE=max(16, triton.next_power_of_2(self.num_query_heads)),
                 HEAD_DIM=self.head_dim,
@@ -490,11 +490,11 @@ class TritonDSADecodeWorkspace:
                 VALUE_DIM=self.head_dim,
                 VALUE_DIM_TILE=triton.next_power_of_2(self.head_dim),
                 PAGE_SIZE=self.page_size,
-                BLOCK=decode_kernels.BLOCK_N,
+                BLOCK=kernels.BLOCK_N,
                 num_warps=4,
                 num_stages=2,
             )
-            decode_kernels._combine_kernel[(self.batch_size, self.num_query_heads)](
+            kernels._combine_kernel[(self.batch_size, self.num_query_heads)](
                 self._partial,
                 self._maxima,
                 self._sums,

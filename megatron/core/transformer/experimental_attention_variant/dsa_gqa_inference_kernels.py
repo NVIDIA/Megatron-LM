@@ -8,7 +8,8 @@ causal prefix, itself included), routed to the indexer's top-k of them. The same
 serve decode-only, prefill, and mixed steps, with launch sizes fixed by the padded batch, so
 every step type can run as a CUDA graph.
 
-Indexer scores: programs take blocks of consecutive rows of one request (``build_row_metadata``)
+Decode indexer scores use staged Gluon TMA loads and Blackwell tcgen05 MMA.
+Prefill indexer scores take blocks of consecutive rows of one request (``DSAMetadata``)
 and stride over the request's paged keys up to the block's longest row, loading each key tile
 once for the whole block and scoring it on tensor cores.
 
@@ -21,9 +22,11 @@ sums (flash decoding).
 from __future__ import annotations
 
 import functools
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
+
+from megatron.core.inference.contexts.attention_context.dsa_metadata import SCORE_ROW_BLOCK
 
 try:
     import triton
@@ -35,6 +38,20 @@ except ImportError:
     tl = None
     HAVE_TRITON = False
 
+try:
+    from triton.experimental import gluon as g
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        TensorMemoryLayout,
+        allocate_tensor_memory,
+        tcgen05_mma,
+    )
+    from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
+
+    HAVE_GLUON = True
+except ImportError:
+    HAVE_GLUON = False
+
 LOG2E = 1.4426950408889634
 # Attention: selected slots per inner tile, and the smallest query-head tile tensor cores accept.
 BLOCK_N = 128
@@ -43,9 +60,99 @@ MIN_HEAD_TILE = 16
 ATTENTION_PROGRAMS_PER_SM = 1
 # Indexer scores: rows per block (tensor cores need at least 16), keys per tile, and score
 # programs to aim for per SM across a step.
-SCORE_ROW_BLOCK = 32
 SCORE_BLOCK_T = 128
 SCORE_PROGRAMS_PER_SM = 8
+
+
+if HAVE_GLUON:
+
+    @g.jit
+    def score_tcgen(
+        Qdesc,
+        Kdesc,
+        Table,
+        Lengths,
+        Requests,
+        Out,
+        stride_table: gl.constexpr,
+        WIDTH: gl.constexpr,
+        PAGE: gl.constexpr,
+        WORKERS: gl.constexpr,
+        STAGES: gl.constexpr,
+    ):
+        """Score a paged indexer row with staged TMA loads and tcgen05 MMA."""
+        row = gl.program_id(0)
+        worker = gl.program_id(1)
+        request = gl.load(Requests + row)
+        n = gl.minimum(gl.load(Lengths + row), WIDTH)
+        tiles = gl.cdiv(gl.cdiv(n, 128), WORKERS)
+        first = worker * tiles
+        count = gl.maximum(gl.minimum(tiles, gl.cdiv(n, 128) - first), 0)
+        qbuf = gl.allocate_shared_memory(Qdesc.dtype, Qdesc.block_type.shape, Qdesc.layout)
+        keys = gl.allocate_shared_memory(
+            Kdesc.dtype, [STAGES] + Kdesc.block_type.shape, Kdesc.layout
+        )
+        qbar = mbarrier.allocate_mbarrier()
+        done = mbarrier.allocate_mbarrier()
+        mbarrier.init(done, count=1)
+        bars = gl.allocate_shared_memory(gl.int64, [STAGES, 1], mbarrier.MBarrierLayout())
+        mbarrier.init(qbar, count=1)
+        for init_slot in gl.static_range(STAGES):
+            mbarrier.init(bars.index(init_slot), count=1)
+        mbarrier.expect(qbar, Qdesc.block_type.nbytes)
+        tma.async_load(Qdesc, [row, 0], qbar, qbuf)
+        for prefetch_slot in gl.static_range(STAGES):
+            start = (first + prefetch_slot) * 128
+            page = gl.load(
+                Table + request * stride_table + start // PAGE, mask=prefetch_slot < count, other=0
+            )
+            mbarrier.expect(
+                bars.index(prefetch_slot), Kdesc.block_type.nbytes, pred=prefetch_slot < count
+            )
+            tma.async_load(
+                Kdesc,
+                [page * PAGE + start % PAGE, 0],
+                bars.index(prefetch_slot),
+                keys.index(prefetch_slot),
+                pred=prefetch_slot < count,
+            )
+        mbarrier.wait(qbar, 0)
+        acc = allocate_tensor_memory(
+            gl.float32, [128, 8], TensorMemoryLayout([128, 8], col_stride=1)
+        )
+        for step in range(count):
+            i = step % STAGES
+            phase = step // STAGES % 2
+            mbarrier.wait(bars.index(i), phase)
+            tcgen05_mma(keys.index(i), qbuf.permute((1, 0)), acc, use_acc=False, mbarriers=[done])
+            mbarrier.wait(done, step % 2)
+            # Explicit completion protects both the TMEM read and reuse of the key slot.
+            values = acc.load()
+            layout: gl.constexpr = values.type.layout
+            rows = (first + step) * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, layout))
+            cols = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
+            gl.store(
+                Out + row * WIDTH + rows[:, None] + cols[None, :] * 0,
+                values,
+                mask=(rows[:, None] < n) & (cols[None, :] == 0),
+            )
+            next_step = step + STAGES
+            start = (first + next_step) * 128
+            page = gl.load(
+                Table + request * stride_table + start // PAGE, mask=next_step < count, other=0
+            )
+            mbarrier.expect(bars.index(i), Kdesc.block_type.nbytes, pred=next_step < count)
+            tma.async_load(
+                Kdesc,
+                [page * PAGE + start % PAGE, 0],
+                bars.index(i),
+                keys.index(i),
+                pred=next_step < count,
+            )
+        mbarrier.invalidate(done)
+        mbarrier.invalidate(qbar)
+        for free_slot in gl.static_range(STAGES):
+            mbarrier.invalidate(bars.index(free_slot))
 
 
 if HAVE_TRITON:
@@ -319,47 +426,6 @@ def _num_slices(num_rows: int, num_groups: int, topk: int, num_sms: int) -> int:
     return slices
 
 
-def build_row_metadata(
-    query_lengths: torch.Tensor, kv_lengths: torch.Tensor, row_block: int = SCORE_ROW_BLOCK
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rows and score blocks for requests that each add ``query_lengths[r]`` query tokens.
-
-    Request ``r``'s tokens are rows ``cu[r] .. cu[r+1]-1`` (``cu`` the cumulative query
-    lengths) and the last of them sits at position ``kv_lengths[r] - 1``. Each request's rows
-    are split into blocks of at most ``row_block`` rows.
-
-    Args:
-        query_lengths: Int CPU tensor ``[requests]`` of new query tokens per request.
-        kv_lengths: Int CPU tensor ``[requests]`` of keys per request, the new ones included.
-        row_block: Rows per score block.
-
-    Returns:
-        ``(row_requests, row_lengths, block_starts, block_rows, block_requests)``, int32 CPU
-        tensors over ``sum(query_lengths)`` rows and the blocks.
-    """
-    query_lengths = query_lengths.to(torch.int64)
-    kv_lengths = kv_lengths.to(torch.int64)
-    num_requests = query_lengths.numel()
-    num_rows = int(query_lengths.sum())
-    request_ids = torch.arange(num_requests)
-    first_row = torch.cumsum(query_lengths, 0) - query_lengths
-    row_requests = torch.repeat_interleave(request_ids, query_lengths)
-    within = torch.arange(num_rows) - first_row[row_requests]
-    row_lengths = (kv_lengths - query_lengths)[row_requests] + within + 1
-    blocks_per_request = (query_lengths + row_block - 1) // row_block
-    block_requests = torch.repeat_interleave(request_ids, blocks_per_request)
-    first_block = torch.cumsum(blocks_per_request, 0) - blocks_per_request
-    block_in_request = torch.arange(int(blocks_per_request.sum())) - first_block[block_requests]
-    block_starts = first_row[block_requests] + block_in_request * row_block
-    block_rows = torch.clamp(
-        query_lengths[block_requests] - block_in_request * row_block, max=row_block
-    )
-    return tuple(
-        tensor.to(torch.int32)
-        for tensor in (row_requests, row_lengths, block_starts, block_rows, block_requests)
-    )
-
-
 def _require_cuda_on(device: torch.device, tensors) -> None:
     if any(not tensor.is_cuda or tensor.device != device for tensor in tensors):
         raise ValueError("All DSA inference kernel tensors must be on the same CUDA device.")
@@ -398,7 +464,7 @@ def dsa_gqa_indexer_scores(
         key_cache: Paged BF16 indexer keys ``[num_pages,page_size,index_dim]``.
         block_table: Int32 physical-page table ``[requests,max_pages]``.
         row_lengths: Int32 ``[rows]``; row ``t`` scores keys ``[0, row_lengths[t])``.
-        block_starts, block_rows, block_requests: Int32 score blocks (``build_row_metadata``);
+        block_starts, block_rows, block_requests: Int32 score blocks from ``DSAMetadata``;
             a block with 0 rows is skipped.
         out: Caller-owned FP32 scores ``[out_rows,width]`` for rows ``row_offset`` to
             ``row_offset + out_rows - 1``: ``out[t - row_offset, j]`` is the dot product of query
@@ -613,10 +679,4 @@ def dsa_gqa_sparse_attention(
     )
 
 
-__all__ = [
-    "HAVE_TRITON",
-    "SCORE_ROW_BLOCK",
-    "build_row_metadata",
-    "dsa_gqa_indexer_scores",
-    "dsa_gqa_sparse_attention",
-]
+__all__ = ["HAVE_TRITON", "SCORE_ROW_BLOCK", "dsa_gqa_indexer_scores", "dsa_gqa_sparse_attention"]
