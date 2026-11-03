@@ -1405,7 +1405,8 @@ def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
         training=True,
         recompute_up_proj=False,
         o_local_groups=1,
-        linear_o_group_proj=torch.eye(4),
+        # Identity grouped output projection, so the output is the core's sentinel.
+        _apply_linear_o_group_proj=lambda x: x,
         linear_proj=lambda x: (x, None),
     )
     output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
