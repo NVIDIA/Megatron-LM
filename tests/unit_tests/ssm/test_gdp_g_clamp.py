@@ -105,6 +105,66 @@ def test_decode_forwards_bounded_g_to_recurrence(clamp_value, dynamic_slots):
 
 
 @pytest.mark.parametrize("clamp_value", [None, 50.0])
+def test_prefill_forwards_bounded_g_to_chunked_scan(clamp_value):
+    mixer = _mixer(clamp_value)
+    mixer.ngroups_local_cp = 1
+    mixer.headdim = 4
+    mixer.d_state = 4
+    # Two prefill tokens with the Householder copies folded into the sequence; only the
+    # first copy of each token carries the decay.
+    raw_g = torch.tensor(
+        [[[-10000.0, -1.0], [0.0, 0.0], [0.0, 0.0], [-100.0, -0.25], [0.0, 0.0], [0.0, 0.0]]]
+    )
+    original_g = raw_g.clone()
+    qkv = torch.zeros(1, 6, 2, 4)
+    beta = torch.full((1, 6, 2), 0.5)
+    batch_indices = torch.tensor([2, 0], dtype=torch.int32)
+    context = SimpleNamespace(
+        mamba_slot_allocator=None,
+        mamba_metadata=SimpleNamespace(
+            cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+            batch_indices_prefill=batch_indices,
+            conv_seq_idx=None,
+            conv_seq_start=None,
+            gdp_chunk_indices=None,
+            gdp_chunk_indices_dp=None,
+            gdp_chunk_offsets=None,
+            gdp_intermediate_chunk_indices=None,
+        ),
+    )
+    ssm_state = torch.zeros(3, 2, 4, 4)
+    scan_output = torch.zeros(1, 2, 2, 4)
+
+    with (
+        patch.object(
+            mixer,
+            "_preprocess",
+            return_value=(torch.zeros(1, 2, 8), torch.zeros(1, 2, 24), torch.zeros(1, 2, 8)),
+        ),
+        patch.object(gdp, "causal_conv1d_varlen_carry_states", return_value=torch.zeros(2, 24, 4)),
+        patch.object(gdp, "tensor_masked_update"),
+        patch.object(mixer, "_prefill_conv", return_value=torch.zeros(1, 2, 24)),
+        patch.object(gdp, "gdp_prefill_prepare", return_value=(qkv, qkv, qkv, beta, raw_g)),
+        patch.object(
+            gdp, "chunk_gated_delta_product_varlen", return_value=(scan_output, ssm_state)
+        ) as scan,
+        patch.object(mixer, "_postprocess", return_value=torch.zeros(2, 1, 8)),
+    ):
+        mixer.ssm_prefill(torch.zeros(2, 1, 40), torch.zeros(3, 24, 4), ssm_state, context)
+
+    scan.assert_called_once()
+    forwarded = scan.call_args.kwargs
+    expected = original_g if clamp_value is None else original_g.clamp_min(-clamp_value)
+    torch.testing.assert_close(forwarded["g"], expected, rtol=0, atol=0)
+    # Out of place: the prepare kernel's output is left untouched.
+    torch.testing.assert_close(raw_g, original_g, rtol=0, atol=0)
+    # The zero-decay Householder copies stay zero.
+    assert torch.count_nonzero(forwarded["g"]) == torch.count_nonzero(original_g)
+    assert forwarded["beta"] is beta
+    assert forwarded["state_indices"] is batch_indices
+
+
+@pytest.mark.parametrize("clamp_value", [None, 50.0])
 @pytest.mark.parametrize("cutedsl", [False, True])
 @pytest.mark.parametrize("chunkwise_cp", [False, True])
 def test_gating_clamps_decay_with_correct_gradients(clamp_value, cutedsl, chunkwise_cp):
