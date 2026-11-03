@@ -133,13 +133,15 @@ def group_layers_into_shortcut_blocks(
         )
         physical_index += 2
 
-    if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False) and not any(
+    if config.moe_shortcut_wide_residual_norm_fusion and not any(
         getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
         for layer in grouped_layers
     ):
         if not all(getattr(layer, "is_mtp_layer", False) for layer in layers):
-            raise ValueError("shortcut kernel fusion requires an adjacent Mamba/GDN and MoE pair")
-    if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False):
+            raise ValueError(
+                "shortcut kernel fusion requires an adjacent Mamba/GDN/attention and MoE pair"
+            )
+    if config.moe_shortcut_wide_residual_norm_fusion:
         _link_residual_seams(grouped_layers)
     return grouped_layers
 
@@ -287,8 +289,7 @@ class ShortcutMoEBlock(MegatronModule):
         # wide_residual_write_read_rmsnorm_quant writes the compute update with the MoE pre-MLP
         # norm.
         self.using_shortcut_moe_fused_residual_kernel = bool(
-            getattr(self.config, "moe_shortcut_wide_residual_norm_fusion", False)
-            and not self.is_mtp_layer
+            self.config.moe_shortcut_wide_residual_norm_fusion and not self.is_mtp_layer
         )
         if self.using_shortcut_moe_fused_residual_kernel:
             self._validate_fused_residual_kernel()
@@ -734,7 +735,8 @@ class ShortcutMoEBlock(MegatronModule):
             if unsupported:
                 # Fused residuals use checkpoint replay, not residual-stream recompute.
                 raise ValueError(
-                    "shortcut kernel fusion requires eager, unpacked execution; got "
+                    "shortcut kernel fusion does not support packed sequences, padding masks, "
+                    "context parallelism or residual-stream recompute contexts; got "
                     + ", ".join(unsupported)
                 )
         # Fused inference never builds an autograd graph.

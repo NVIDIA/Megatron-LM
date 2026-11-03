@@ -209,6 +209,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="te_fused_cross_entropy",
         sources=("megatron/core/extensions/transformer_engine.py",),
+        # The shortcut-fusion tests are listed because they cover this source's TELinear MXFP8
+        # handoff hooks, not cross entropy.
         tests=(
             K + "test_te_wrappers.py",
             "tests/unit_tests/fusions/test_wide_residual_shortcut.py",

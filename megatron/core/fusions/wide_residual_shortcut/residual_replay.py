@@ -289,6 +289,15 @@ class ResidualReplayManager:
         self.last = new
         return ResidualLink(old, new, self.active, index)
 
+    def interrupt(self):
+        """End the chain before a write that cannot be replayed (saved normally by autograd).
+
+        The open interval is sealed, and the next registered write starts a new interval
+        anchored at its own input.
+        """
+        self.seal()
+        self.last = None
+
     def seal(self):
         """Publish the last write as the next interval's checkpoint."""
         if self.active is not None:

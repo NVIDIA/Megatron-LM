@@ -279,7 +279,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         vp_stage: Optional[int] = None,
         name: str | None = None,
     ):
-        if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False):
+        if config.moe_shortcut_wide_residual_norm_fusion:
             raise ValueError(
                 "wide-residual shortcut kernel fusion requires HybridStack, not TransformerBlock"
             )

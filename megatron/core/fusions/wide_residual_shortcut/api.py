@@ -12,13 +12,13 @@ from functools import lru_cache
 import torch
 from torch.autograd.function import once_differentiable
 
+from .kernel_utils import validate_num_streams
 from .residual_replay import ResidualSlot, current_manager, retained_slot
 
 
 def validate_input(residual, hidden_size, num_streams, *, inference=False):
     """Validate the local flattened token layout before launching fused work."""
-    if type(num_streams) is not int or not 1 <= num_streams <= 6:
-        raise ValueError("shortcut fusion requires an integer stream count in [1, 6]")
+    validate_num_streams(num_streams)
     if type(hidden_size) is not int or not 32 <= hidden_size <= 16384 or hidden_size % 32:
         raise ValueError("shortcut fusion requires H in [32, 16384], divisible by 32")
     if residual.ndim < 2 or residual.shape[-1] != num_streams * hidden_size:

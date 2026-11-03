@@ -970,10 +970,9 @@ def streamwise_sigmoid_writeback(
     )
     replay_owner = current_manager()
     if replay_owner is not None and (not supports_triton or not update_supports_triton):
-        raise ValueError(
-            "residual replay handoff requires a qualified native streamwise writer; "
-            "use residual_stream_recompute_num_layers=1 for this shape"
-        )
+        # Only the native writer can be replayed; autograd saves this write's inputs instead.
+        replay_owner.interrupt()
+        replay_owner = None
     if supports_triton and update_supports_triton:
         if needs_backward or replay_owner is not None:
             return _StreamwiseSigmoidWriteback.apply(

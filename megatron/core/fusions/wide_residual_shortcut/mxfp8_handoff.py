@@ -151,7 +151,7 @@ def install_linear_hooks(tensor, output, linear):
     args.wgrad_store = SimpleNamespace(delay_wgrad_compute=lambda: True, put=enqueue)
 
 
-def eligible(linear, shape, streams):
+def eligible(linear, tensor, streams):
     """Limit automatic selection to supported shapes on the qualified device and TE consumers."""
     from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
@@ -164,14 +164,14 @@ def eligible(linear, shape, streams):
     return (
         streams == 3
         and (
-            (shape.numel() // shape.shape[-1], shape.shape[-1]) in SHAPES
+            (tensor.numel() // tensor.shape[-1], tensor.shape[-1]) in SHAPES
             or (
                 not torch.is_grad_enabled()
-                and shape.shape[-1] in WIDTHS
-                and (shape.numel() // shape.shape[-1]) % 32 == 0
+                and tensor.shape[-1] in WIDTHS
+                and (tensor.numel() // tensor.shape[-1]) % 32 == 0
             )
         )
-        and qualified_device(torch.cuda.get_device_properties(shape.device))
+        and qualified_device(torch.cuda.get_device_properties(tensor.device))
         and isinstance(linear, TELinear)
         and linear.fuse_wgrad_accumulation
         and getattr(linear, "te_quant_params", None) is None

@@ -2,8 +2,9 @@
 
 For wide-residual hybrid models with shortcut-connected MoE (`--moe-shortcut-wide-residual-norm-fusion`;
 needs BF16 parameters, RMSNorm, 2-6 wide streams, a shared expert, no dropout/bias, no CP/PP, no
-layernorm recompute, at most 65536 local tokens per call (16384 above hidden 4096), and a GB300
-for training; the residual stream is FP32 with `--fp32-residual-connection`, otherwise BF16, and the
+layernorm recompute, at most 65536 local tokens per call (16384 above hidden 4096), the fusion
+stack specs, and a GB300 for training — the full list is in the
+`moe_shortcut_wide_residual_norm_fusion` docstring; the residual stream is FP32 with `--fp32-residual-connection`, otherwise BF16, and the
 connection logits may be FP32 or BF16 — all arithmetic is FP32 either way), `ShortcutMoEBlock` replaces
 each residual seam with one Gluon kernel that mixes the wide-residual streams with the branch update,
 writes the new residual, and emits the RMSNorm readers that consume it — directly as MXFP8 for an

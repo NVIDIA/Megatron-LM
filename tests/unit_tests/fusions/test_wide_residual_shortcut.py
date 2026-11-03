@@ -2184,3 +2184,34 @@ def test_generic_norm_matches_unfused_oracle(hidden):
     expected = quantizer((x * actual_rs[:, None]) * gamma.float())
     assert torch.equal(actual._rowwise_data, expected._rowwise_data)
     assert torch.equal(actual._rowwise_scale_inv, expected._rowwise_scale_inv)
+
+
+@GPU
+def test_replay_interrupts_at_an_unqualified_native_write():
+    """A residual write the native Triton writer cannot take (here a 32-column stream) ends the
+    replay chain instead of failing: autograd saves it, and the result matches no replay."""
+    from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
+
+    config = SimpleNamespace(
+        moe_shortcut_wide_residual_norm_fusion=True, residual_stream_recompute_num_layers=2
+    )
+    torch.manual_seed(5)
+    leaves = (
+        torch.randn(1024, 3 * 32, device="cuda", requires_grad=True),
+        torch.randn(1024, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+        torch.randn(3, device="cuda", requires_grad=True),
+    )
+
+    def write(replay):
+        args = tuple(t.detach().clone().requires_grad_(True) for t in leaves)
+        with residual_replay_scope(config, training=replay) as manager:
+            out = streamwise_sigmoid_writeback(args[0], args[1], args[2], 3)
+            if replay:
+                assert manager is not None and manager.last is None and manager.active is None
+        out.backward(torch.ones_like(out))
+        return out.detach(), [t.grad for t in args]
+
+    expected, expected_grads = write(replay=False)
+    actual, actual_grads = write(replay=True)
+    assert torch.equal(actual, expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
