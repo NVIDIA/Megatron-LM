@@ -1095,13 +1095,14 @@ def _forbid_te_dense_gemm(monkeypatch):
     monkeypatch.setattr(tex, "generic_gemm", raise_)
 
 
-def _build_te_fused_mlp(backend, **overrides):
-    """A TEFusedMLP (the op fuser's RMSNorm, BasicLinear, bias, SwiGLU, BasicLinear)."""
+def _build_te_fused_mlp(backend, op_fuser=True, **overrides):
+    """A TEFusedMLP (the op fuser's norm, BasicLinear, bias, SwiGLU, BasicLinear), or with
+    op_fuser=False the MLP of a TELayerNormColumnParallelLinear and a TERowParallelLinear."""
     from megatron.core.extensions.transformer_engine import TEFusedMLP
     from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.transformer.mlp import MLPSubmodules
+    from megatron.core.transformer.mlp import MLP, MLPSubmodules
 
-    cfg = TransformerConfig(
+    options = dict(
         num_layers=1,
         hidden_size=256,
         ffn_hidden_size=512,
@@ -1119,17 +1120,22 @@ def _build_te_fused_mlp(backend, **overrides):
         gated_linear_unit=True,
         activation_func=F.silu,
         attention_backend=AttnBackend.flash,
-        use_transformer_engine_op_fuser=True,
-        **overrides,
+        use_transformer_engine_op_fuser=op_fuser,
     )
-    mlp = TEFusedMLP.as_mlp_submodule(
-        submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
-        ),
-        config=cfg,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
-        is_mtp_layer=False,
-    ).cuda()
+    options.update(overrides)
+    cfg = TransformerConfig(**options)
+    mlp = (
+        (TEFusedMLP if op_fuser else MLP)
+        .as_mlp_submodule(
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            config=cfg,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            is_mtp_layer=False,
+        )
+        .cuda()
+    )
     return cfg, mlp
 
 
@@ -1165,28 +1171,36 @@ def test_te_op_fuser_mlp_batch_invariant(monkeypatch):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("normalization", ["RMSNorm", "LayerNorm"])
+@pytest.mark.parametrize("mlp_type", ["op-fuser", "layernorm-linear"])
 @pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
-def test_te_op_fuser_mlp_two_microbatch_training(monkeypatch, backend):
-    """Two training microbatches through TEFusedMLP with gradient_accumulation_fusion:
-    forward, backward, dgrad and wgrad accumulated into main_grad by the op fuser's
-    BasicLinear (which passes alpha=None). The target rows' forward bits match across the
-    two batch compositions (triton; the deepgemm dense kernel's invariance is
-    fix/deepgemm-bi-dense's), main_grad is bit-identical across repeats, and every
-    gradient matches the run without batch-invariant mode within tolerance. TE's cuBLASLt
-    GEMM never runs under the mode."""
+def test_te_op_fuser_mlp_two_microbatch_training(monkeypatch, backend, mlp_type, normalization):
+    """Two training microbatches of [s, b, h] input (b = 2) through an MLP with
+    gradient_accumulation_fusion: TEFusedMLP (the op fuser's norm op and BasicLinear, which
+    passes alpha=None), or the MLP of TE's LayerNormLinear and Linear modules. Forward,
+    backward through the norm, dgrad, and wgrad accumulated into main_grad. The target rows'
+    forward bits match across the two batch compositions (triton; the deepgemm dense
+    kernel's invariance is fix/deepgemm-bi-dense's), main_grad is bit-identical across
+    repeats, and every gradient matches the run without batch-invariant mode within
+    tolerance. TE's cuBLASLt GEMM never runs under the mode."""
     assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
     try:
-        cfg, mlp = _build_te_fused_mlp(backend, gradient_accumulation_fusion=True)
+        cfg, mlp = _build_te_fused_mlp(
+            backend,
+            op_fuser=mlp_type == "op-fuser",
+            normalization=normalization,
+            gradient_accumulation_fusion=True,
+        )
         weights = [mlp.linear_fc1.weight, mlp.linear_fc2.weight]
         torch.manual_seed(13)
-        hidden = cfg.hidden_size
-        target = torch.randn(8, 1, hidden, device="cuda", dtype=torch.bfloat16)
-        target_dy = torch.randn(8, 1, hidden, device="cuda", dtype=torch.bfloat16)
+        hidden, b = cfg.hidden_size, 2
+        target = torch.randn(8, b, hidden, device="cuda", dtype=torch.bfloat16)
+        target_dy = torch.randn(8, b, hidden, device="cuda", dtype=torch.bfloat16)
         microbatches = []
         for left, right in ((3, 29), (61, 7)):
-            x = torch.randn(left + 8 + right, 1, hidden, device="cuda", dtype=torch.bfloat16)
+            x = torch.randn(left + 8 + right, b, hidden, device="cuda", dtype=torch.bfloat16)
             dy = torch.randn_like(x)
             x[left : left + 8], dy[left : left + 8] = target, target_dy
             microbatches.append((left, x, dy))
@@ -1223,6 +1237,51 @@ def test_te_op_fuser_mlp_two_microbatch_training(monkeypatch, backend):
             torch.testing.assert_close(actual, reference, rtol=2e-2, atol=5e-2)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("shape", [(6, 64), (3, 2, 64)], ids=["2d", "3d"])
+def test_bik_norm_statistics_are_rows(monkeypatch, shape):
+    """The batch-invariant norms return mu and rsigma of shape [rows] for any input rank, as
+    TE's norm backward expects. TE 2.21 and later pass LayerNormLinear's [s, b, h] input to
+    apply_normalization unflattened. Runs on CPU: torch's mean stands in for mean_dim, and
+    preallocated outputs avoid TE's dtype map."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    monkeypatch.setattr(
+        bik, "mean_dim", lambda t, dim, keepdim=False: t.mean(dim=dim, keepdim=keepdim)
+    )
+    monkeypatch.setattr(bik, "is_batch_invariant_mode_enabled", lambda: True)
+    eps, rows = 1e-5, 6
+    torch.manual_seed(5)
+    x = torch.randn(shape, dtype=torch.bfloat16)
+    w = torch.randn(shape[-1], dtype=torch.bfloat16)
+    b = torch.randn(shape[-1], dtype=torch.bfloat16)
+    x_rows = x.float().reshape(rows, shape[-1])
+    ln_mu = x_rows.mean(-1)
+    ln_rsigma = torch.rsqrt(x_rows.var(-1, unbiased=False) + eps)
+    rms_rsigma = torch.rsqrt(x_rows.pow(2).mean(-1) + eps)
+
+    _, mu, rsigma = bik._te_layernorm_fwd_patched(
+        x, w, b, eps, torch.empty_like(x), None, None, 0, False
+    )
+    torch.testing.assert_close(mu, ln_mu)
+    torch.testing.assert_close(rsigma, ln_rsigma, rtol=1e-4, atol=1e-4)
+    _, mu, rsigma = bik._te_rmsnorm_fwd_patched(
+        x, w, eps, torch.empty_like(x), None, None, 0, False
+    )
+    assert mu is None
+    torch.testing.assert_close(rsigma, rms_rsigma, rtol=1e-4, atol=1e-4)
+    for normalization, bias in (("LayerNorm", b), ("RMSNorm", None)):
+        out, mu, rsigma = bik._te_apply_normalization_patched(
+            x, None, w, bias, eps, None, torch.bfloat16, normalization, 0, False
+        )
+        assert out.shape == x.shape
+        if normalization == "LayerNorm":
+            torch.testing.assert_close(mu, ln_mu)
+            torch.testing.assert_close(rsigma, ln_rsigma, rtol=1e-4, atol=1e-4)
+        else:
+            assert mu is None
+            torch.testing.assert_close(rsigma, rms_rsigma, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("module", ["ops-rmsnorm", "fused-residual-rmsnorm"])

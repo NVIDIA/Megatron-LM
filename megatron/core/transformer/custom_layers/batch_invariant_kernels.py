@@ -1389,7 +1389,8 @@ def _te_rmsnorm_fwd_patched(
 
     Bound where TE imports the function by name (the op fuser's RMSNorm). Computes the
     same RMSNorm as the patched fused-module normalization and returns ``(out, None,
-    rsigma)`` with fp32 rsigma of shape [rows], which TE's rmsnorm_bwd consumes.
+    rsigma)`` with fp32 rsigma of shape [rows], which TE's rmsnorm_bwd consumes, whatever
+    the input's rank.
     """
     del sm_margin  # The batch-invariant kernel does not reserve SMs.
     if quantizer is not None:
@@ -1399,7 +1400,7 @@ def _te_rmsnorm_fwd_patched(
         ln_out.copy_(out_fp32)
     else:
         ln_out = out_fp32.to(_te_dtype_to_torch()[otype])
-    return ln_out, None, rsigma.squeeze(-1)
+    return ln_out, None, rsigma.reshape(-1)
 
 
 def _layernorm_batch_invariant_fp32(x, weight, bias, eps, zero_centered_gamma) -> tuple:
@@ -1424,7 +1425,7 @@ def _te_layernorm_fwd_patched(
 
     Bound where TE imports the function by name (te.ops.LayerNorm, which TE's LayerNorm
     module subclasses). Returns ``(out, mu, rsigma)`` with fp32 ``mu`` and ``rsigma`` of
-    shape [rows], which TE's layernorm_bwd consumes.
+    shape [rows], which TE's layernorm_bwd consumes, whatever the input's rank.
     """
     del sm_margin  # The batch-invariant kernel does not reserve SMs.
     if quantizer is not None:
@@ -1436,7 +1437,7 @@ def _te_layernorm_fwd_patched(
         ln_out.copy_(out_fp32)
     else:
         ln_out = out_fp32.to(_te_dtype_to_torch()[otype])
-    return ln_out, mu.squeeze(-1), rsigma.squeeze(-1)
+    return ln_out, mu.reshape(-1), rsigma.reshape(-1)
 
 
 def _te_apply_normalization_patched(
@@ -1459,7 +1460,9 @@ def _te_apply_normalization_patched(
     does not cover (fp8 quantized output).
 
     Returns `(ln_out, mu, rsigma)` like TE: `mu` is None for RMSNorm, and `mu` and
-    `rsigma` are fp32 with shape [rows], which TE's norm backward consumes.
+    `rsigma` are fp32 with shape [rows], which TE's norm backward consumes. TE 2.21 and
+    later pass LayerNormLinear's input unflattened ([s, b, h]), so the statistics are
+    flattened rather than squeezed.
     """
     orig = _TE_APPLY_NORM_ORIGS.get("module._common.apply_normalization")
     if (
@@ -1486,7 +1489,7 @@ def _te_apply_normalization_patched(
         out_fp32, mu, rsigma = _layernorm_batch_invariant_fp32(
             inputmat, ln_weight, ln_bias, eps, zero_centered_gamma
         )
-        mu = mu.squeeze(-1)
+        mu = mu.reshape(-1)
     else:
         out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(
             inputmat, ln_weight, eps, zero_centered_gamma
@@ -1505,7 +1508,7 @@ def _te_apply_normalization_patched(
         ln_out.copy_(out_fp32)
     else:
         ln_out = out_fp32.to(output_dtype)
-    return ln_out, mu, rsigma.squeeze(-1)
+    return ln_out, mu, rsigma.reshape(-1)
 
 
 @lru_cache(maxsize=None)
