@@ -277,85 +277,93 @@ def _deterministic_sparse_indexer_grads_wk(
     if total_keys == 0 or batch * sq == 0 or topk == 0:
         grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
         return grad_w, torch.zeros_like(k_idx_bsd)
-    rows = batch * sq
-    device = k_idx_bsd.device
-    q_flat = q_idx_bshd.reshape(rows, indexer_heads, indexer_dim)
-    w_flat = w_bsh.reshape(rows, indexer_heads)
-    k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
-    attn_flat = attn_score.reshape(rows, topk)
-    index_flat = index_score.reshape(rows, topk)
-    topk_flat = topk_indices.reshape(rows, topk)
-    grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / rows) * sm_scale
-    use_index_add = torch.are_deterministic_algorithms_enabled()
-    chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
-    # Dummy rows that absorb the (zero) contributions of padding slots.
-    pad_rows = min(4096, chunk_rows * topk)
-    grad_k_ext = torch.zeros(
-        (total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32
-    )
-    grad_w_flat = (
-        torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
-        if compute_grad_w
-        else None
-    )
-    pad_ids = (
-        total_keys + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
-    )
-    key_ids = None
-    for row_start in range(0, rows, chunk_rows):
-        row_end = min(row_start + chunk_rows, rows)
-        n_rows = row_end - row_start
-        q_chunk = q_flat[row_start:row_end].float()
-        w_chunk = w_flat[row_start:row_end].float()
-        indices_chunk = topk_flat[row_start:row_end].long()
-        valid = (indices_chunk >= 0) & (indices_chunk < keys_per_batch)
-        if batch > 1:
-            # SBHD Top-K ids are local to each sample, whereas k_flat and grad_k_ext
-            # concatenate samples. Chunk boundaries need not align with sample boundaries.
-            batch_offsets = (
-                torch.arange(row_start, row_end, device=device, dtype=torch.int64) // sq
-            ) * keys_per_batch
-            indices_chunk = indices_chunk + batch_offsets.unsqueeze(-1)
-        flat_idx = torch.where(
-            valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
+    # Training runs this under BF16 autocast, which would still run the bmm calls below in BF16
+    # despite their FP32 inputs; index_add_ then rejects BF16 contributions for the FP32 buffer.
+    with torch.autocast(device_type=k_idx_bsd.device.type, enabled=False):
+        rows = batch * sq
+        device = k_idx_bsd.device
+        q_flat = q_idx_bshd.reshape(rows, indexer_heads, indexer_dim)
+        w_flat = w_bsh.reshape(rows, indexer_heads)
+        k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
+        attn_flat = attn_score.reshape(rows, topk)
+        index_flat = index_score.reshape(rows, topk)
+        topk_flat = topk_indices.reshape(rows, topk)
+        grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / rows) * sm_scale
+        use_index_add = torch.are_deterministic_algorithms_enabled()
+        chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
+        # Dummy rows that absorb the (zero) contributions of padding slots.
+        pad_rows = min(4096, chunk_rows * topk)
+        grad_k_ext = torch.zeros(
+            (total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32
         )
-        gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
-        selected_k = k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
-        dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
-        predict = index_flat[row_start:row_end].float()
-        kept = valid & (predict >= _CUDNN_INDEXER_CLIP_PROB_MIN)
-        kept_target = torch.where(
-            kept, attn_flat[row_start:row_end].float().clamp_min(_CUDNN_INDEXER_CLIP_PROB_MIN), 0.0
+        grad_w_flat = (
+            torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
+            if compute_grad_w
+            else None
         )
-        score_grad = predict * kept_target.sum(dim=-1, keepdim=True) - kept_target
-        score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
-        head_coeff = (dot > 0).to(dtype=torch.float32)
-        if grad_w_flat is not None:
-            dot.relu_()
-            dot.mul_(score_grad.unsqueeze(1))
-            grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
-        head_coeff.mul_(w_chunk.unsqueeze(-1))
-        head_coeff.mul_(score_grad.unsqueeze(1))
-        contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)  # (rows, topk, dim)
-        flat_contrib = contributions.reshape(-1, indexer_dim)
-        if use_index_add:
-            grad_k_ext.index_add_(0, flat_idx, flat_contrib)
-        else:
-            if key_ids is None:
-                key_ids = torch.arange(grad_k_ext.size(0), device=device, dtype=torch.int64)
-            sorted_keys, order = torch.sort(flat_idx, stable=True)
-            sorted_contributions = flat_contrib.index_select(0, order)
-            prefix = torch.nn.functional.pad(
-                torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0)
+        pad_ids = (
+            total_keys
+            + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
+        )
+        key_ids = None
+        for row_start in range(0, rows, chunk_rows):
+            row_end = min(row_start + chunk_rows, rows)
+            n_rows = row_end - row_start
+            q_chunk = q_flat[row_start:row_end].float()
+            w_chunk = w_flat[row_start:row_end].float()
+            indices_chunk = topk_flat[row_start:row_end].long()
+            valid = (indices_chunk >= 0) & (indices_chunk < keys_per_batch)
+            if batch > 1:
+                # SBHD Top-K ids are local to each sample, whereas k_flat and grad_k_ext
+                # concatenate samples. Chunk boundaries need not align with sample boundaries.
+                batch_offsets = (
+                    torch.arange(row_start, row_end, device=device, dtype=torch.int64) // sq
+                ) * keys_per_batch
+                indices_chunk = indices_chunk + batch_offsets.unsqueeze(-1)
+            flat_idx = torch.where(
+                valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
             )
-            left = torch.searchsorted(sorted_keys, key_ids, right=False)
-            right = torch.searchsorted(sorted_keys, key_ids, right=True)
-            grad_k_ext.add_(prefix.index_select(0, right) - prefix.index_select(0, left))
-    grad_k = grad_k_ext[:total_keys].reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
-    grad_w = (
-        grad_w_flat.reshape_as(w_bsh).to(dtype=w_bsh.dtype) if grad_w_flat is not None else None
-    )
-    return grad_w, grad_k
+            gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
+            selected_k = (
+                k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
+            )
+            dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
+            predict = index_flat[row_start:row_end].float()
+            kept = valid & (predict >= _CUDNN_INDEXER_CLIP_PROB_MIN)
+            kept_target = torch.where(
+                kept,
+                attn_flat[row_start:row_end].float().clamp_min(_CUDNN_INDEXER_CLIP_PROB_MIN),
+                0.0,
+            )
+            score_grad = predict * kept_target.sum(dim=-1, keepdim=True) - kept_target
+            score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
+            head_coeff = (dot > 0).to(dtype=torch.float32)
+            if grad_w_flat is not None:
+                dot.relu_()
+                dot.mul_(score_grad.unsqueeze(1))
+                grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
+            head_coeff.mul_(w_chunk.unsqueeze(-1))
+            head_coeff.mul_(score_grad.unsqueeze(1))
+            contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)  # (rows, topk, dim)
+            flat_contrib = contributions.reshape(-1, indexer_dim)
+            if use_index_add:
+                grad_k_ext.index_add_(0, flat_idx, flat_contrib)
+            else:
+                if key_ids is None:
+                    key_ids = torch.arange(grad_k_ext.size(0), device=device, dtype=torch.int64)
+                sorted_keys, order = torch.sort(flat_idx, stable=True)
+                sorted_contributions = flat_contrib.index_select(0, order)
+                prefix = torch.nn.functional.pad(
+                    torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0)
+                )
+                left = torch.searchsorted(sorted_keys, key_ids, right=False)
+                right = torch.searchsorted(sorted_keys, key_ids, right=True)
+                grad_k_ext.add_(prefix.index_select(0, right) - prefix.index_select(0, left))
+        grad_k = grad_k_ext[:total_keys].reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
+        grad_w = (
+            grad_w_flat.reshape_as(w_bsh).to(dtype=w_bsh.dtype) if grad_w_flat is not None else None
+        )
+        return grad_w, grad_k
 
 
 def _override_indexer_grads(ig: dict, det_w: Optional[Tensor], det_k: Optional[Tensor]) -> dict:

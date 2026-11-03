@@ -118,6 +118,46 @@ def test_deterministic_indexer_grads_match_reference_and_replay(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("torch_deterministic", [True, False])
+def test_deterministic_indexer_grads_ignore_bf16_autocast(torch_deterministic, monkeypatch):
+    # Training calls the helper under enable_autocast. Autocast would run its bmm calls in BF16,
+    # which index_add_ rejects for the FP32 buffer and which would round the prefix-sum path.
+    monkeypatch.setattr(dk, "_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES", 4096)
+    device = torch.device("cuda", torch.cuda.current_device())
+    q, w, k, indices, target = _indexer_case(2, torch.bfloat16, device)
+    predict, _, _ = _reference_indexer_grads(q, w, k, indices, target, 0.7, 1.3, 0.5)
+
+    def run():
+        return dk._deterministic_sparse_indexer_grads_wk(
+            q,
+            w,
+            k,
+            target.clone(),
+            predict.clone(),
+            indices,
+            loss_coeff=0.7,
+            grad_loss=torch.tensor(1.3, device=device),
+            sm_scale=0.5,
+            compute_grad_w=True,
+        )
+
+    prior_deterministic = torch.are_deterministic_algorithms_enabled()
+    prior_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(torch_deterministic)
+        plain = run()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            autocast = run()
+    finally:
+        torch.use_deterministic_algorithms(prior_deterministic, warn_only=prior_warn_only)
+    for first, second in zip(plain, autocast):
+        assert first.dtype == second.dtype
+        assert torch.equal(
+            first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.launch_on_gb200
 def test_deterministic_indexer_grads_match_cudnn_kernel():
     """The replacement must follow cuDNN's clipped-log KL, not only well-normalized targets."""
