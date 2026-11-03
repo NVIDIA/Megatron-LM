@@ -274,10 +274,11 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
     """A real engine, context and controller under the per-step MoE phase agreement.
 
     The model forward returns zero logits; what is checked is the scheduling. The agreement is
-    forced on (DynamicInferenceContext.moe_step_phase_is_agreed) and the tp_ep group made to span
-    two replicas, so a step that admits no prefill and has nothing left to run issues the idle
-    dummy base step. With the agreement on, each step must admit and launch exactly what it does
-    with the agreement off.
+    turned on in the context with a single-rank communicator (each vote decides), and the tp_ep
+    group is made to span two replicas, so a step that has nothing left to run issues a dummy
+    step. Every launch is checked against the step's vote (the context also raises if a step
+    voted decode-only launches prefill), and each step must admit and launch exactly what it
+    does with the agreement off.
     """
 
     @classmethod
@@ -292,14 +293,15 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
         Utils.destroy_model_parallel()
 
     @classmethod
-    def _run(cls, agreed, prompt_lengths, **config):
-        """Run the prompts to completion and return the context's state before every step and
-        the hidden-chunk state seen by every idle dummy base step."""
+    def _run(cls, agreed, prompt_lengths, num_tokens_to_generate=4, **config):
+        """Run the prompts to completion. Returns the context's state before every step, the
+        hidden-chunk state seen by every idle dummy base step, and every launch as (its step,
+        the step's vote, whether the launch is decode-only)."""
         env = cls._build_test_env(
             _DynamicEngineTestConfig(
                 num_requests=0,
-                num_tokens_to_generate=4,
-                max_sequence_length=max(prompt_lengths) + 8,
+                num_tokens_to_generate=num_tokens_to_generate,
+                max_sequence_length=max(prompt_lengths) + num_tokens_to_generate + 4,
                 context_max_requests=4,
                 context_max_tokens=64,
                 num_gap_steps=0,
@@ -324,28 +326,48 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
             dummy_base_step()
 
         controller._run_dummy_async_sched_base_step = record_dummy_base_step
-        sampling_params = SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1)
+
+        trace, votes, launches = [], [], []
+        if agreed:
+            context._moe_decode_only_needs_agreement = True
+            context.set_ep_zmq_communicator(SimpleNamespace(sync_all_reduce_max=lambda vote: vote))
+            agree = context.agree_on_moe_decode_only
+            initialize = context.initialize_attention_state
+
+            def record_vote(decode_only):
+                votes.append(decode_only)
+                agree(decode_only)
+
+            def record_launch(**kwargs):
+                result = initialize(**kwargs)
+                if kwargs.get("construct_graph_dimensions") is None:
+                    decode_only = context.batch_dimensions.prefill_req_count == 0
+                    launches.append((len(trace) - 1, votes[-1] if votes else None, decode_only))
+                return result
+
+            context.agree_on_moe_decode_only = record_vote
+            context.initialize_attention_state = record_launch
+        assert context.moe_step_phase_is_agreed == agreed
+
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
+        )
         for request_id, length in enumerate(prompt_lengths):
             engine.add_request(
                 request_id, (torch.arange(length) % 64 + 1).tolist(), sampling_params
             )
 
-        trace = []
-        with (
-            mock.patch.object(
-                type(context), "moe_step_phase_is_agreed", property(lambda self: agreed)
-            ),
-            mock.patch(
-                "megatron.core.inference.text_generation_controllers."
-                "text_generation_controller.get_moe_dp_replica_count",
-                return_value=2,
-            ),
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers."
+            "text_generation_controller.get_moe_dp_replica_count",
+            return_value=2,
         ):
             while engine.has_unfinished_requests():
                 trace.append(
                     (
                         context.chunked_prefill_request_id,
                         context.total_request_count,
+                        context.paused_request_count,
                         context.active_token_count,
                         context.num_prefill_requests,
                         len(engine.waiting_request_ids),
@@ -353,7 +375,14 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
                 )
                 engine.step_modern()
                 assert len(trace) < 64, "the requests did not finish"
-        return trace, dummy_base_steps
+        return trace, dummy_base_steps, launches
+
+    @staticmethod
+    def _assert_votes_bind(launches):
+        """Each launch follows its step's vote, and a step that voted decode-only launched a
+        decode-only forward."""
+        assert launches and all(vote is not None for _, vote, _ in launches)
+        assert all(decode_only for _, vote, decode_only in launches if vote)
 
     @torch.inference_mode()
     def test_long_prompt_chunks_in_consecutive_steps(self):
@@ -361,21 +390,42 @@ class TestAsyncSchedulePhaseAgreement(_DynamicInferenceEngineTestBase):
         the agreement. Each step after a chunk admits the next one; none admits nothing and
         lets the idle dummy base step overwrite and reset the context holding the hidden chunk,
         whose next chunk would then run on a block table of -1."""
-        expected, _ = self._run(False, [256], enable_chunked_prefill=True)
-        trace, dummy_base_steps = self._run(True, [256], enable_chunked_prefill=True)
+        expected, _, _ = self._run(False, [256], enable_chunked_prefill=True)
+        trace, dummy_base_steps, launches = self._run(True, [256], enable_chunked_prefill=True)
         assert trace == expected
         assert [chunk for chunk, *_ in trace[:4]] == [-1, 0, 0, 0]
         assert all(chunk == -1 for chunk in dummy_base_steps)
+        self._assert_votes_bind(launches)
+        # Four chunk steps voted prefill; every later step voted decode-only.
+        assert [vote for _, vote, _ in launches[:5]] == [False] * 4 + [True]
 
     @torch.inference_mode()
     def test_prompt_fitting_after_a_full_prefill_is_admitted_next_step(self):
         """A prompt that fits once the previous step's prefill turns into decode rows is admitted
         in the next step, as without the agreement, not one step later."""
-        expected, _ = self._run(False, [64, 32])
-        trace, _ = self._run(True, [64, 32])
+        expected, _, _ = self._run(False, [64, 32])
+        trace, _, launches = self._run(True, [64, 32])
         assert trace == expected
         # The 32-token prompt waits only while the 64-token one fills the token budget.
         assert [waiting for *_, waiting in trace[:3]] == [2, 1, 0]
+        self._assert_votes_bind(launches)
+
+    @torch.inference_mode()
+    def test_steps_with_a_paused_request_vote_decode_only(self):
+        """With the KV cache too small for every request's next block, a request pauses. The
+        no-overlap steps that follow admit nothing, so they announce and launch decode-only
+        forwards, and the run matches the one without the agreement."""
+        config = dict(
+            num_tokens_to_generate=8, context_buffer_size_gb=0.0002, context_block_size_tokens=64
+        )
+        expected, _, _ = self._run(False, [60, 60, 60], **config)
+        trace, _, launches = self._run(True, [60, 60, 60], **config)
+        assert trace == expected
+        assert any(paused for _, _, paused, *_ in trace)
+        self._assert_votes_bind(launches)
+        paused_steps = {step for step, (_, _, paused, *_) in enumerate(trace) if paused}
+        paused_votes = [vote for step, vote, _ in launches if step in paused_steps]
+        assert paused_votes and all(paused_votes)
 
 
 @pytest.mark.parametrize(

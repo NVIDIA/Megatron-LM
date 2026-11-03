@@ -6,7 +6,7 @@ import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -114,6 +114,17 @@ class InferenceMode:
         return cls._use_bounded_mxfp8_rows
 
     @classmethod
+    @contextlib.contextmanager
+    def bounded_mxfp8_rows(cls, enabled: bool):
+        """Select bounded rows for the forwards in the `with` block, then restore the setting."""
+        previous = cls._use_bounded_mxfp8_rows
+        cls._use_bounded_mxfp8_rows = enabled
+        try:
+            yield
+        finally:
+            cls._use_bounded_mxfp8_rows = previous
+
+    @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
@@ -130,17 +141,17 @@ class InferenceMode:
             cls.unset_active()
 
 
-def mtp_cuda_graph_key(prefix: str, padded_count: int, depth: Optional[int]) -> tuple:
+def mtp_cuda_graph_key(prefix: str, padded_count: int, depth: int | None) -> tuple:
     """Return the CUDA graph key of an MTP draft forward.
 
-    A captured graph fixes whether its FlashInfer MoE kernels process only the bounded rows.
-    An MTP forward runs with the setting of the base forward before it (InferenceMode), so the
-    key includes it; see DynamicInferenceContext.bounded_moe_row_mtp_graph_variants().
+    A captured graph fixes whether its FlashInfer MoE kernels process only the bounded rows, so
+    the key includes the setting in effect (InferenceMode); draft forwards always run with
+    DynamicInferenceContext.mtp_draft_moe_rows_bounded.
 
     Args:
         prefix (str): "mtp" for the cache-free graphs, "mtp_kv" for the KV-aware ones.
         padded_count (int): Requests the forward is padded to.
-        depth (Optional[int]): MTP depth, or None for a repeated MTP layer.
+        depth (int | None): MTP depth, or None for a repeated MTP layer.
     """
     return (prefix, padded_count, depth, InferenceMode.use_bounded_mxfp8_rows())
 

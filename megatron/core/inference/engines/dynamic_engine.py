@@ -1393,31 +1393,23 @@ class DynamicInferenceEngine(AbstractEngine):
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
             mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
-            # A draft graph runs with the bounded-row setting of the base forward before it, so
-            # each size is captured once per setting that steps can use.
-            mtp_bounds = [
-                bounded
-                for bounded in context.bounded_moe_row_mtp_graph_variants()
-                if bounded or not bounded_moe_rows_only
-            ]
-            mtp_seen_graphs = set()
+            mtp_seen_batch_sizes = set()
 
             def mtp_graph_size(graph):
                 n = graph.req_count
                 return round_up_to_nearest_multiple(n, tp_size) if sp_enabled else n
 
             def capture_mtp_graphs(n):
-                """Capture the MTP draft graphs of `n` requests for each bounded-row setting."""
+                """Capture the MTP draft graphs of `n` requests, with the bound drafts use."""
+                if n == 0 or n in mtp_seen_batch_sizes:
+                    return
+                mtp_seen_batch_sizes.add(n)
                 device = torch.cuda.current_device()
                 batch_dim = n // tp_size if sp_enabled else n
-                for bounded in mtp_bounds:
-                    if n == 0 or (n, bounded) in mtp_seen_graphs:
-                        continue
-                    mtp_seen_graphs.add((n, bounded))
-                    InferenceMode.set_bounded_mxfp8_rows(bounded)
-                    # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
-                    # it on, real and EP dummy forwards both replay the KV-aware graph below.
-                    if not context.enable_mtp_kv_cache:
+                # Cache-free MTP graph, replayed only when the MTP KV cache is off; with
+                # it on, real and EP dummy forwards both replay the KV-aware graph below.
+                if not context.enable_mtp_kv_cache:
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
                         # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
                         for depth in mtp_warmup_depths:
                             unwrapped.compute_mtp_single_step(
@@ -1432,14 +1424,15 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=mtp_cuda_graph_key("mtp", n, depth),
                             )
 
-                    # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
-                    # that includes the draft-attention KV append+attend under a distinct
-                    # ("mtp_kv", n, depth, bounded) key, replayed by the real spec-decode path and
-                    # the EP dummy path (which stages the same dummy-block metadata).
-                    # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
-                    # replay overwrites it from gpu_view each step, so only shapes/bounds count.
-                    if context.enable_mtp_kv_cache:
-                        context.mtp_metadata.begin_decode_for_capture(n)
+                # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
+                # that includes the draft-attention KV append+attend under a distinct
+                # ("mtp_kv", n, depth, bounded) key, replayed by the real spec-decode path and
+                # the EP dummy path (which stages the same dummy-block metadata).
+                # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
+                # replay overwrites it from gpu_view each step, so only shapes/bounds count.
+                if context.enable_mtp_kv_cache:
+                    context.mtp_metadata.begin_decode_for_capture(n)
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
                         for depth in mtp_warmup_depths:
                             context._mtp_setup_decode_step()
                             unwrapped.compute_mtp_single_step(
@@ -1455,7 +1448,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=mtp_cuda_graph_key("mtp_kv", n, depth),
                             )
                             context.mtp_metadata.advance_decode_step()
-                        context.mtp_metadata.end_forward()
+                    context.mtp_metadata.end_forward()
 
         tbar = enumerate(cuda_graphs)
         if HAVE_TQDM:
@@ -1489,11 +1482,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         controller._dynamic_step_sample_logits()
 
-                # MTP CUDA graph warmup for this batch dimension's request count.
-                if mtp_warmup_enabled:
+                # MTP CUDA graph warmup for this batch dimension's request count. Drafts use one
+                # bound in every step, so the graphs that add bounded base graphs add none.
+                if mtp_warmup_enabled and not bounded_moe_rows_only:
                     # pylint: disable-next=possibly-used-before-assignment
                     capture_mtp_graphs(mtp_graph_size(cuda_graph_batch_dimension))
-                    InferenceMode.set_bounded_mxfp8_rows(bounded_moe_rows)
 
                 context.reset()
 
@@ -1513,18 +1506,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
 
-        if mtp_warmup_enabled:
-            # A dummy or primer step's MTP forwards take their size from the step's own graph
-            # and their bound from the forward before it, so every size needs every bound,
-            # including sizes this pass captured no base graph for.
-            with torch.inference_mode():
-                for graph in context.cuda_graph_batch_dimensions_list:
-                    # pylint: disable-next=possibly-used-before-assignment
-                    capture_mtp_graphs(mtp_graph_size(graph))
-            InferenceMode.set_bounded_mxfp8_rows(False)
-            # pylint: disable-next=possibly-used-before-assignment
-            if mtp_seen_graphs:
-                logger.info("> MTP CUDA graph warmup: %d graph size(s)", len(mtp_seen_graphs))
+        # pylint: disable-next=possibly-used-before-assignment
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            logger.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()

@@ -1767,6 +1767,23 @@ class TextGenerationController(MTPControllerMixin):
         """Run the mode-specific dummy step used by idle expert-parallel ranks."""
         context = self.inference_wrapped_model.inference_context
         context.agree_on_moe_decode_only(True)
+        self._run_dummy_step()
+
+    def _match_peers_without_forward(self) -> None:
+        """Issue a step's MoE collectives when the step launches no forward.
+
+        With more than one replica in the tp_ep group, every peer launches a forward or a
+        dummy step in each step, so a step with work but nothing to launch (nothing admitted,
+        or a kept chunk that cannot continue yet) runs a dummy step instead of returning; its
+        vote stands, and a dummy step is decode-only.
+        """
+        if get_moe_dp_replica_count(self.model_config) > 1:
+            self._run_dummy_step()
+
+    @torch.inference_mode()
+    def _run_dummy_step(self) -> None:
+        """Run the mode-specific dummy MTP and base forwards of one step, after its vote."""
+        context = self.inference_wrapped_model.inference_context
         # The engine does not wait for dummy forwards, so stay at most one ahead of the GPU:
         # the context init below restages the host buffers the previous one's copies read.
         # Waiting after the vote lets the active peers launch their next forward meanwhile.
@@ -3211,6 +3228,7 @@ class TextGenerationController(MTPControllerMixin):
             if active_request_count == 0:
                 # An admission callback may resolve queued work without adding
                 # anything that requires a model forward.
+                self._match_peers_without_forward()
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
@@ -3442,6 +3460,7 @@ class TextGenerationController(MTPControllerMixin):
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
+            self._match_peers_without_forward()
             return DynamicBatchControllerStepResult(
                 decode_only=DecodeOnly(consumed=None, launched=None)
             )
@@ -3657,6 +3676,7 @@ class TextGenerationController(MTPControllerMixin):
             # before the no-overlap path admits and primes the restored requests.
             self._async_sched_forward.clear()
             if run_async_overlap:
+                self._match_peers_without_forward()
                 return DynamicBatchControllerStepResult(
                     decode_only=DecodeOnly(consumed=None, launched=None)
                 )

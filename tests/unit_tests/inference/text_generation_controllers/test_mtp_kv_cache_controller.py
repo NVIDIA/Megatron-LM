@@ -30,6 +30,7 @@ from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 DEVICE = "cuda"
@@ -117,6 +118,7 @@ def _make_context(
         request_to_kv_block_ids=request_to_kv_block_ids,
         gpu_view=gpu_view,
         _nvls_dispatcher=None,
+        mtp_draft_moe_rows_bounded=False,
         inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         mtp_decoder_hidden_states=None,
         setup_prefill_calls=[],
@@ -1458,6 +1460,56 @@ class TestExpertParallelForwardParity:
         dummy_modes = [kw["eager"] for tag, kw in dummy_forwards if tag == "mtp_step"]
         assert real_modes == [not graphed] * num_mtp_depths
         assert dummy_modes == real_modes
+
+    @pytest.mark.parametrize("dummy", [False, True])
+    def test_drafts_run_bounded_and_the_commit_pass_keeps_the_step_bound(self, dummy):
+        """Drafts fit the bounded MoE rows in every step, so they run bounded and replay one graph
+        per size; the commit pass, whose rows can be a prompt's, keeps the base forward's bound,
+        which is restored afterwards."""
+        if dummy:
+            context = _make_context(num_decode_requests=0)
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                model.all_forwards.append(("mtp_step", kwargs))
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model)
+            controller._mtp_resolved_padded_count = 2
+        else:
+            controller, model, context, _ = _build_step(
+                num_decode_requests=2, accepted=(2, 1), graphed=True
+            )
+        context.mtp_draft_moe_rows_bounded = True
+        bounds = []
+        draft_step, layer = model.compute_mtp_single_step, model.mtp.layers[0]
+        commit_step = layer.forward_single_position
+        model.compute_mtp_single_step = lambda **kwargs: (
+            bounds.append(("draft", InferenceMode.use_bounded_mxfp8_rows(), kwargs["cache_key"])),
+            draft_step(**kwargs),
+        )[1]
+        layer.forward_single_position = lambda **kwargs: (
+            bounds.append(("commit", InferenceMode.use_bounded_mxfp8_rows(), None)),
+            commit_step(**kwargs),
+        )[1]
+
+        with InferenceMode.active():
+            InferenceMode.set_bounded_mxfp8_rows(False)
+            if dummy:
+                controller.model_config.expert_model_parallel_size = 2
+                controller._run_dummy_serial_mtp_forward()
+            else:
+                controller._compute_serial_mtp_and_sample(
+                    base_position=torch.tensor([10, 12], device=DEVICE)
+                )
+            assert not InferenceMode.use_bounded_mxfp8_rows()
+
+        assert bounds[0][:2] == ("commit", False)
+        drafts = bounds[1:]
+        assert drafts and all(kind == "draft" and bounded for kind, bounded, _ in drafts)
+        assert all(key[-1] is True for _, _, key in drafts)
 
     def test_dummy_rank_matches_a_real_rank_whose_commit_pass_was_empty(self):
         """All drafts rejected: the real rank runs a dummy slot, so the count still matches."""

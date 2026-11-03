@@ -238,21 +238,23 @@ class TestBoundedMoeRows:
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "tp, etp, ep, communicator, variants",
+        "tp, etp, ep, communicator, bounded",
         [
-            (2, 1, 2, False, (False, True)),
-            (1, 1, 2, False, (False,)),
-            (1, 1, 2, True, (False, True)),
-            (1, 2, 2, True, (False,)),
+            (2, 1, 2, False, True),
+            (1, 1, 2, False, True),
+            (1, 1, 2, True, True),
+            (1, 2, 2, True, False),
         ],
     )
-    def test_mtp_graphs_are_captured_for_every_bound(self, tp, etp, ep, communicator, variants):
-        """An MTP draft forward runs with the bound of the base forward before it, so its graphs
-        exist for each bound a base step can use."""
+    def test_mtp_drafts_are_bounded_whenever_decode_rows_fit(
+        self, tp, etp, ep, communicator, bounded
+    ):
+        """A draft forward's rows, at most one per request on each rank, fit whenever decode
+        rows do: drafts are bounded in every step, agreed or not, on every layout."""
         ctx = self._context(
             tp=tp,
             etp=etp,
             ep=ep,
             communicator=_ScriptedCommunicator(False) if communicator else None,
         )
-        assert ctx.bounded_moe_row_mtp_graph_variants() == variants
+        assert ctx.mtp_draft_moe_rows_bounded is bounded

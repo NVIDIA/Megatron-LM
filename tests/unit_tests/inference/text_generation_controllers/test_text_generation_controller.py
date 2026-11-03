@@ -1122,6 +1122,38 @@ def test_step_agrees_on_the_phase_it_launches_before_its_forwards(
     assert order == [("agree", decode_only), "step"]
 
 
+@pytest.mark.parametrize("replicas", [1, 2])
+@pytest.mark.parametrize("path", ["async-overlap", "async-primer", "legacy"])
+def test_step_that_launches_no_forward_still_runs_its_peers_dummy_step(path, replicas):
+    """A step with work that launches nothing (nothing admitted, or a kept chunk that cannot
+    continue yet) still issues the MoE collectives of its tp_ep peers, which each launch a
+    forward or a dummy step: it runs a dummy step after its vote."""
+    context = _make_async_sched_context(total_request_count=0)
+    context.active_token_count = 0
+    if path == "legacy":
+        context.config.async_sched_mode = AsyncScheduleMode.LEGACY
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_forward.is_valid = path == "async-overlap"
+    controller._validate_async_sched_support_for_step = mock.Mock()
+    order = []
+    context.agree_on_moe_decode_only.side_effect = lambda value: order.append("agree")
+    controller._run_dummy_step = mock.Mock(side_effect=lambda: order.append("dummy"))
+
+    with mock.patch(
+        "megatron.core.inference.text_generation_controllers.text_generation_controller."
+        "get_moe_dp_replica_count",
+        return_value=replicas,
+    ):
+        asyncio.run(
+            controller.async_generate_output_tokens_dynamic_batch(
+                run_async_overlap=path == "async-overlap",
+                schedule_waiting_requests=mock.Mock() if path == "async-primer" else None,
+            )
+        )
+
+    assert order == ["agree"] + ["dummy"] * (replicas > 1)
+
+
 def test_dummy_forward_agrees_on_moe_decode_only_before_its_forwards():
     """An idle rank's dummy step counts as decode-only and agrees before its collectives. Only
     then does it wait for its previous dummy forward, before restaging the context's host

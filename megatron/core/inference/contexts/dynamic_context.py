@@ -2421,21 +2421,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return (False,)
         return (False, True)
 
-    def bounded_moe_row_mtp_graph_variants(self) -> Tuple[bool, ...]:
-        """Return the bounded-MoE-row settings that MTP draft CUDA graphs can be replayed with.
+    @property
+    def mtp_draft_moe_rows_bounded(self) -> bool:
+        """Whether MTP draft forwards process only the bounded FlashInfer MoE rows.
 
-        An MTP draft forward runs with the setting of the base forward before it. Its rows, at
-        most one per request on each rank, fit the bound whenever decode-only steps' rows do,
-        so a draft graph of any size may be bounded once any base step can be.
-
-        Returns:
-            Tuple[bool, ...]: The settings, unbounded first.
+        A draft forward's rows, at most one per request on each rank, fit the bound whenever
+        decode-only steps' rows do. So drafts are bounded in every step, whether or not the
+        replicas agreed that the base forward was decode-only, and each draft size needs a
+        single CUDA graph.
         """
-        if not self._moe_decode_rows_fit_capacity:
-            return (False,)
-        if self._moe_decode_only_needs_agreement and self._ep_zmq_communicator is None:
-            return (False,)
-        return (False, True)
+        return self._moe_decode_rows_fit_capacity
 
     @property
     def cuda_graph_key(self) -> Tuple[InferenceBatchDimensions, bool]:

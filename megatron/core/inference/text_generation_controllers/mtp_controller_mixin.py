@@ -24,7 +24,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.utils import get_moe_dp_replica_count, mtp_cuda_graph_key
+from megatron.core.inference.utils import (
+    InferenceMode,
+    get_moe_dp_replica_count,
+    mtp_cuda_graph_key,
+)
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -611,19 +615,21 @@ class MTPControllerMixin:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 if mtp_kv_cache_on:
                     context._mtp_setup_decode_step()
-                current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                    hidden_states=current_hidden,
-                    next_token_ids=token_ids_buf,
-                    position_ids=position_ids_buf,
-                    depth=mtp_depth,
-                    eager=not context.using_cuda_graph_this_step(),
-                    cache_key=(
-                        mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    ),
-                    **mtp_context_kwarg,
-                )
+                # Drafts fit the bounded MoE rows in every step (mtp_draft_moe_rows_bounded).
+                with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                    current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                        hidden_states=current_hidden,
+                        next_token_ids=token_ids_buf,
+                        position_ids=position_ids_buf,
+                        depth=mtp_depth,
+                        eager=not context.using_cuda_graph_this_step(),
+                        cache_key=(
+                            mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
+                            if context.using_cuda_graph_this_step()
+                            else None
+                        ),
+                        **mtp_context_kwarg,
+                    )
                 if mtp_kv_cache_on:
                     context.mtp_metadata.advance_decode_step()
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
@@ -756,19 +762,20 @@ class MTPControllerMixin:
                     mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                     if mtp_context_kwarg:
                         context._mtp_setup_decode_step()
-                    dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
-                        hidden_states=dummy_hidden,
-                        next_token_ids=dummy_token_ids,
-                        position_ids=dummy_position_ids,
-                        depth=mtp_depth,
-                        eager=mtp_forward_eager,
-                        cache_key=(
-                            mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
-                            if not mtp_forward_eager
-                            else None
-                        ),
-                        **mtp_context_kwarg,
-                    )
+                    with InferenceMode.bounded_mxfp8_rows(context.mtp_draft_moe_rows_bounded):
+                        dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
+                            hidden_states=dummy_hidden,
+                            next_token_ids=dummy_token_ids,
+                            position_ids=dummy_position_ids,
+                            depth=mtp_depth,
+                            eager=mtp_forward_eager,
+                            cache_key=(
+                                mtp_cuda_graph_key(mtp_graph_key_prefix, padded_count, mtp_depth)
+                                if not mtp_forward_eager
+                                else None
+                            ),
+                            **mtp_context_kwarg,
+                        )
                     if mtp_context_kwarg:
                         context.mtp_metadata.advance_decode_step()
                     mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]

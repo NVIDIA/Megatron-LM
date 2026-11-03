@@ -22,7 +22,7 @@ DECODE = InferenceBatchDimensions(token_count=8, prefill_req_count=0, decode_req
 MIXED = InferenceBatchDimensions(token_count=64, prefill_req_count=1, decode_req_count=7)
 
 
-def _engine(variants, mtp_variants=(False,)):
+def _engine(variants, draft_bounded=False):
     """An engine whose context reports `variants` per CUDA graph and one MTP depth, recording
     each base capture and each MTP graph key."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -32,7 +32,7 @@ def _engine(variants, mtp_variants=(False,)):
     engine.context = SimpleNamespace(
         cuda_graph_batch_dimensions_list=list(variants),
         bounded_moe_row_graph_variants=variants.__getitem__,
-        bounded_moe_row_mtp_graph_variants=lambda: mtp_variants,
+        mtp_draft_moe_rows_bounded=draft_bounded,
         enable_mtp_kv_cache=False,
         reset=mock.Mock(),
     )
@@ -76,32 +76,30 @@ def _engine(variants, mtp_variants=(False,)):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="graph capture reads CUDA memory stats")
-def test_create_cuda_graphs_captures_each_bounded_moe_row_variant():
-    """Every variant a step can replay is captured: at construction the unbounded ones, and once
-    the communicator makes the agreement possible the bounded ones, for the base graphs and for
-    the MTP draft graphs of every size. MTP graph keys carry the bound, and the capture
-    statistics cover both passes."""
+@pytest.mark.parametrize("draft_bounded", [False, True])
+def test_create_cuda_graphs_captures_each_bounded_moe_row_variant(draft_bounded):
+    """Every base variant a step can replay is captured: at construction the unbounded ones,
+    and once the communicator makes the agreement possible the bounded ones. MTP drafts run with
+    one bound in every step, so each draft size is captured once, at construction, under a key
+    that carries that bound. The capture statistics cover both passes."""
     mixed = InferenceBatchDimensions(token_count=64, prefill_req_count=2, decode_req_count=2)
     variants = {mixed: (False,), DECODE: (False,)}
-    engine = _engine(variants, mtp_variants=(False,))
+    engine = _engine(variants, draft_bounded=draft_bounded)
 
     with InferenceMode.active():
         engine.create_cuda_graphs()
         first_pass = dict(engine.capture_stats)
         assert engine.captured == [(mixed, False), (DECODE, False)]
-        assert engine.mtp_keys == [("mtp", 4, None, False), ("mtp", 8, None, False)]
+        assert engine.mtp_keys == [("mtp", 4, None, draft_bounded), ("mtp", 8, None, draft_bounded)]
 
         # The tp_ep communicator is attached.
         variants[DECODE] = (False, True)
-        engine.context.bounded_moe_row_mtp_graph_variants = lambda: (False, True)
         engine.captured.clear()
         engine.mtp_keys.clear()
         engine.create_cuda_graphs(bounded_moe_rows_only=True)
 
     assert engine.captured == [(DECODE, True)]
-    # A primer's dummy MTP forwards take their size from its own graph, which may be mixed, and
-    # their bound from the forward before it, so every size gets a bounded MTP graph.
-    assert engine.mtp_keys == [("mtp", 8, None, True), ("mtp", 4, None, True)]
+    assert engine.mtp_keys == []
     assert engine.capture_stats["time"] >= first_pass["time"]
 
 
