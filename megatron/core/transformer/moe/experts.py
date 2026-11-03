@@ -305,6 +305,11 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        self.tp_ep_group = pg_collection.tp_ep
+        self.dp_group = pg_collection.expt_dp
+        # Full expert data-distribution group (expt_dp x EGTP_remat): replicated extra states
+        # need distinct replica ids across EGTP_remat peers (see TEGroupedLinear).
+        self.dp_group_gtp_remat = pg_collection.expt_dp_gtp_remat
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -1458,11 +1463,23 @@ class TEGroupedMLP(MegatronModule):
         """
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
+        activation_metadata = dict(metadata)
+        activation_metadata['dp_cp_group'] = self.dp_group_gtp_remat
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            # The grouped activation module has one shared TE extra-state object. Unlike the
+            # expert-indexed linears, it is replicated across ETP x EP, expert-DP and
+            # EGTP_remat. Use the joint ETP-EP group as its TP replica coordinate and the full
+            # expt_dp x EGTP_remat group as its DP coordinate so exactly one rank is selected
+            # without changing the checkpoint object's global shape or key.
+            is_activation_module = name == 'activation_func'
             sub_sd = sharded_state_dict_default(
-                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                module,
+                f'{name}.',
+                sharded_offsets,
+                activation_metadata if is_activation_module else metadata,
+                tp_group=self.tp_ep_group if is_activation_module else self.tp_group,
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
