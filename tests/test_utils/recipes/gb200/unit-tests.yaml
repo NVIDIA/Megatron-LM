@@ -123,6 +123,23 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The FlashInfer MoE oracles JIT-compile FlashInfer's MoE kernels on first use in a fresh
+  # container: about 23 minutes on GB200 (CUTLASS fused MoE, CuTe DSL, TRT-LLM FP8, mm_mxfp8), so
+  # they run apart from the other oracles, the CUTLASS fused MoE file in a bucket of its own.
+  - test_case: [tests/unit_tests/inference/oracles/flashinfer_moe/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/oracles/flashinfer_moe/test_cutlass_fused_moe.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
     products:
       - environment: [dev]
