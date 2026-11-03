@@ -869,11 +869,16 @@ def _get_megatron_emerging_optimizer(
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
             "is hardcoded to 0 in this path."
         )
-        if not any(
-            hasattr(param, 'is_managed_by_layer_wise_optimizer')
+        trainable_params = [
+            param
             for model_chunk in model_chunks
             for param in model_chunk.parameters()
             if param.requires_grad
+        ]
+        # A pipeline stage whose params are all frozen has nothing to route; it still builds an
+        # (empty) optimizer so the cross-rank param-group alignment below sees every rank.
+        if trainable_params and not any(
+            hasattr(param, 'is_managed_by_layer_wise_optimizer') for param in trainable_params
         ):
             raise ValueError(
                 f"optimizer={config.optimizer!r} resolves to the layer-wise distributed "
