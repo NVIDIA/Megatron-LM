@@ -28,6 +28,7 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     padding_mask = torch.zeros(1, 4, dtype=torch.bool)
     input_ids = torch.arange(4).view(1, 4)
     packed = PackedSeqParams(qkv_format="thd")
+    replay_topk_idx = torch.zeros(4, 2, dtype=torch.long)
     probs = torch.ones(4, 2)
     routes = torch.ones(4, 2, dtype=torch.bool)
     layer.route = Mock(return_value=(probs, routes))
@@ -37,11 +38,21 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     monkeypatch.setattr(moe_layer, "precision_aware_checkpoint", checkpoint)
 
     output, bias = layer(
-        hidden, padding_mask=padding_mask, input_ids=input_ids, packed_seq_params=packed
+        hidden,
+        padding_mask=padding_mask,
+        input_ids=input_ids,
+        packed_seq_params=packed,
+        replay_topk_idx=replay_topk_idx,
     )
 
     assert output is hidden and bias is None
-    layer.route.assert_called_once_with(hidden, padding_mask, input_ids, packed_seq_params=packed)
+    layer.route.assert_called_once_with(
+        hidden,
+        padding_mask,
+        input_ids,
+        packed_seq_params=packed,
+        replay_topk_idx=replay_topk_idx,
+    )
     layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes)
     assert checkpoint.call_count == int(recompute)
 
