@@ -33,7 +33,9 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import (
     Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
     MegatronOptimizer,
+    MixedPrecisionOptimizer,
     copy_optimizer_param_metadata,
     get_param_group_identifier_tuple,
 )
@@ -110,6 +112,22 @@ def test_copy_optimizer_param_metadata_preserves_allreduce():
     copy_optimizer_param_metadata(destination, source)
 
     assert destination.allreduce is False
+
+
+@pytest.mark.parametrize("wrapper_class", [FP32Optimizer, MixedPrecisionOptimizer])
+def test_model_only_reload_invalidates_derived_optimizer_parameter_cache(mocker, wrapper_class):
+    """Reloading weights without optimizer state must invalidate cached sampled radii."""
+    raw_optimizer = mocker.Mock()
+    copy_weights = mocker.Mock()
+    wrapper = SimpleNamespace(
+        optimizer=raw_optimizer,
+        param_groups=[{"params": []}],
+        _copy_model_params_to_main_params=copy_weights,
+    )
+    wrapper_class.reload_model_params(wrapper)
+    raw_optimizer.reset_parameter_cache.assert_called_once_with()
+    if wrapper_class is MixedPrecisionOptimizer:
+        copy_weights.assert_called_once_with(state_dict=None)
 
 
 def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):

@@ -954,6 +954,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         if self.param_groups:
             self._copy_model_params_to_main_params(state_dict=state_dict)
+        if hasattr(self.optimizer, "reset_parameter_cache"):
+            self.optimizer.reset_parameter_cache()
 
     @override
     def _stage_model_params_from_main_params(self) -> None:
@@ -1705,7 +1707,8 @@ class FP32Optimizer(MegatronOptimizer):
         return success, grad_norm, num_zeros_in_grad
 
     def reload_model_params(self, state_dict=None):
-        pass
+        if hasattr(self.optimizer, "reset_parameter_cache"):
+            self.optimizer.reset_parameter_cache()
 
     def state_dict(self):
         return self.optimizer.state_dict()

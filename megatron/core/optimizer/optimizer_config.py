@@ -336,6 +336,14 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_ht_eps: float = 1e-15
+    """Minimum norm used for numerical stability by TensorParallelMuonH and MuonHT."""
+
+    muon_ht_radius: float | None = None
+    """Optional common Frobenius radius for TensorParallelMuonH and MuonHT. None preserves
+    each matrix's initial logical norm after Megatron's fan-in initialization. Derived
+    radii are not checkpoint state; they are reconstructed from restored weights."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

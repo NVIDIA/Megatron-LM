@@ -543,6 +543,20 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    muon_ht_init: bool = False
+    """Enable MuonH/HT model initialization before mixed-precision/distributed wrapping.
+    Training selects this automatically for muon_h/muon_ht. With no radius override,
+    managed matrices are sampled from N(0, 1/d_in), using the logical fan-in.
+    perform_initialization=False always disables initialization, including this path."""
+
+    muon_ht_radius: Optional[float] = None
+    """Optional common Frobenius radius override. When set, rescale existing managed
+    matrices to this radius. Otherwise muon_ht_init enables fan-in Gaussian initialization
+    and each matrix retains its own sampled radius."""
+
+    muon_ht_eps: float = 1e-15
+    """Numerical-zero threshold used while applying the Muon Hyperball initialization."""
+
     embedding_init_method: Optional[Callable] = None
     """
     Method to initialize weights of the embedding layer. If None, will be set as described 

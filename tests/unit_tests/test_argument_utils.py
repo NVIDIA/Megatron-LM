@@ -100,6 +100,18 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+@pytest.mark.parametrize("optimizer", ["muon_h", "muon_ht", "muon", "adam"])
+def test_hyperball_optimizer_enables_model_initialization_without_radius(optimizer):
+    """Only constrained Muon selects fan-in initialization when no radius is supplied."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args(["--optimizer", optimizer])
+    args.params_dtype = torch.float32
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+    assert config.muon_ht_init is (optimizer in ("muon_h", "muon_ht"))
+    assert args.muon_ht_radius is None
+
+
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
     from megatron.training.training import get_megatron_ddp_config

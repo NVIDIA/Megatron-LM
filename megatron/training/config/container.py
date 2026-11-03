@@ -566,6 +566,10 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         super()._finalize()
         self.optimizer.finalize_optimizer_config()
+        if transformer is not None and self.optimizer.optimizer in ("muon_h", "muon_ht"):
+            transformer.muon_ht_init = True
+            transformer.muon_ht_radius = self.optimizer.muon_ht_radius
+            transformer.muon_ht_eps = self.optimizer.muon_ht_eps
         if self.optimizer.use_layer_wise_distributed_optimizer:
             self.ddp.use_distributed_optimizer = False
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)

@@ -415,6 +415,9 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+    kw_args["muon_ht_init"] = kw_args.get("muon_ht_init", False) or getattr(
+        args, "optimizer", None
+    ) in ("muon_h", "muon_ht")
     # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
     # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
     kw_args['max_seq_length_per_sample'] = args.seq_length
