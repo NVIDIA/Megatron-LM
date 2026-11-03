@@ -15,6 +15,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
+from functools import wraps
 from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
@@ -33,6 +34,9 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -1162,7 +1166,9 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                )
 
                 run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -2622,6 +2628,22 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def _release_metadata_after_load(load_fn):
+    """Release transient metadata on every exit from a training checkpoint load."""
+
+    @wraps(load_fn)
+    def wrapped(*args, **kwargs):
+        retain_metadata = getattr(get_args(), "ckpt_assume_constant_structure", False)
+        try:
+            return load_fn(*args, **kwargs)
+        finally:
+            if not retain_metadata:
+                CachedMetadataFileSystemReader.clear_metadata_cache()
+
+    return wrapped
+
+
+@_release_metadata_after_load
 def load_checkpoint(
     ddp_model,
     optimizer,

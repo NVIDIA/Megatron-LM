@@ -51,6 +51,7 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
+from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .nvrx import has_nvrx_async_support, make_nvrx_async_request
 
@@ -911,14 +912,9 @@ def _get_filesystem_reader(
             )
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
-    if cache_metadata:
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
-            CachedMetadataFileSystemReader,
-        )
-
-        return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
-
-    return FileSystemReader(checkpoint_dir)
+    # All local load phases share the same deserialization. cache_metadata controls whether
+    # the load strategy retains metadata for subsequent save-plan reuse, not this reader cache.
+    return CachedMetadataFileSystemReader(checkpoint_dir)
 
 
 class TorchDistLoadShardedStrategy:
@@ -984,9 +980,9 @@ class TorchDistLoadShardedStrategy:
         )
 
         if self.cache_metadata:
-            self.cached_global_metadata = (
-                fsr.read_metadata()
-            )  # no storage interaction thanks to caching
+            # The reader returns a detached shallow copy; save-side attribute assignments must
+            # not change the metadata used by later readers of the original checkpoint.
+            self.cached_global_metadata = fsr.read_metadata()
 
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict
@@ -1116,3 +1112,4 @@ class TorchDistLoadShardedStrategy:
             raise e
         else:
             fs_writer.fs.rm_file(old_path)
+            CachedMetadataFileSystemReader.clear_metadata_cache(checkpoint_dir)

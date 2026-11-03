@@ -10,12 +10,13 @@ import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any
 
-from megatron.core.dist_checkpointing.strategies.nvrx import (
-    make_nvrx_async_request,
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
 )
+from megatron.core.dist_checkpointing.strategies.nvrx import make_nvrx_async_request
 from megatron.training import get_args
-from megatron.training.utils import print_rank_0
 from megatron.training.global_vars import get_run_config
+from megatron.training.utils import print_rank_0
 
 
 def _tag_current_span_call_idx(call_idx):
@@ -30,8 +31,8 @@ def _tag_current_span_call_idx(call_idx):
     if call_idx is None or call_idx == []:
         return
     try:
-        from opentelemetry import trace as _ot
         from nemo.lens.helpers import safe_set_span_attributes as _set
+        from opentelemetry import trace as _ot
 
         _set(_ot.get_current_span(), {'nvrx.call_idx': call_idx})
     except Exception:  # noqa: BLE001 -- telemetry must never break checkpointing
@@ -111,6 +112,7 @@ def build_otel_worker_bootstrap(args):
     if worker_span_groups:
         try:
             from nemo.lens.groups import SpanGroup as _BaseSpanGroup
+
             from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
             resolved = MegatronSpanGroup.resolve(worker_span_groups)
@@ -140,7 +142,9 @@ def build_otel_worker_bootstrap(args):
 
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import get_write_results_queue
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+        get_write_results_queue,
+    )
 
     global _async_calls_queue
     args = get_args()
@@ -236,8 +240,8 @@ def is_empty_async_queue() -> bool:
 
 
 def reset_persistent_async_worker():
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import ( # pylint: disable=line-too-long
-        CachedMetadataFileSystemReader,
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader as NVRxCachedMetadataFileSystemReader,  # pylint: disable=line-too-long
     )
 
     global _async_calls_queue, _results_queue
@@ -250,13 +254,16 @@ def reset_persistent_async_worker():
         del _results_queue
     _results_queue = None
     _async_calls_queue = None
+    NVRxCachedMetadataFileSystemReader.clear_metadata_cache()
     CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
     """Creates an async save request for fsdp_dtensor & torch_dcp with a finalize function."""
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_finalize # pylint: disable=line-too-long
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_finalize,  # pylint: disable=line-too-long
+    )
 
     save_fn, preload_fn, save_args = writer.get_save_function_and_args()
 
