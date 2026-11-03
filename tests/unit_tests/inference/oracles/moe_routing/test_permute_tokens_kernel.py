@@ -450,13 +450,23 @@ def test_zero_padding_kernel_leaves_the_unused_suffix(dtype, output_size, n_used
     ou.assert_exact(buf.tensor, expected, what=f"zeroed padding, untouched rest ({dtype})")
 
 
-@pytest.mark.parametrize("rows", ou.int32_overflow_params(7168))
-def test_int32_row_offsets(rows):
-    """Hidden and permuted rows whose element offsets ``row * H`` cross 2^31 (``H = 7168``,
-    one local expert, top-1, so the permuted buffer has ``rows + 1`` rows). Opt-in ``large``;
-    about 20 GiB. Hidden rows are random bit patterns (compared bitwise)."""
+@pytest.mark.parametrize("live", ou.int32_overflow_params(7168))
+def test_int32_row_offsets(live):
+    """Hidden rows read and permuted rows written whose element offsets ``row * H`` reach 2^31
+    (``H = 7168``). Opt-in ``large``; about 20 GiB. Hidden rows are random bit patterns
+    (compared bitwise).
+
+    One local expert, top-1: every one of the ``live`` real tokens is claimed, so the permuted
+    rows written are exactly ``[0, live)``. The highest hidden row read and the highest permuted
+    row written, ``live - 1``, therefore both sit at the size's label: below 2^31 (``fits``),
+    straddling it (``crosses``) or starting past it (``row-starts-past``). After the real tokens,
+    1024 CUDA-graph padding rows routed to ``-1`` follow, and ``valid`` covers them, as the
+    routing-padding mask leaves them. Padding interleaved with the real rows would lower the
+    highest claimed row below the boundary.
+    """
     dev = rr.require_cuda()
-    hidden_dim = 7168
+    hidden_dim, padding = 7168, 1024
+    rows = live + padding
     ou.require_free_memory(5 * rows * hidden_dim * 2 + (2 << 30))
     g = ou.make_generator(device=dev)
     hidden = torch.randint(
@@ -465,7 +475,7 @@ def test_int32_row_offsets(rows):
     hidden = hidden.view(torch.bfloat16)
     probs = torch.rand(rows, 1, device=dev, generator=g)
     routing_map = torch.zeros(rows, 1, dtype=torch.int64, device=dev)
-    routing_map[rows // 3 :: 7] = -1
+    routing_map[live:] = -1
     with rr.poisoned_outputs():
         out = permute.permute_tokens(
             hidden, probs, routing_map, 0, 1, rr.valid_tensor(rows, dev), alignment=16
@@ -482,8 +492,10 @@ def test_int32_row_offsets(rows):
         row_alignment=1,
         zero_padding=False,
         inverse=False,
-        what=f"int32 offsets rows={rows}",
+        what=f"int32 offsets, {live} live rows",
     )
+    claimed = int((out[2][:live] >= 0).sum())
+    assert claimed == live, f"{claimed} of the first {live} permuted rows claimed, expected all"
 
 
 @pytest.mark.large
