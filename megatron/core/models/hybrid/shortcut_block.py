@@ -36,6 +36,7 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualRead,
+    fused_norm_weight,
     is_fusable_rmsnorm,
     pending_write,
 )
@@ -139,23 +140,19 @@ def group_layers_into_shortcut_blocks(
         if not all(getattr(layer, "is_mtp_layer", False) for layer in layers):
             raise ValueError("shortcut kernel fusion requires an adjacent Mamba/GDN and MoE pair")
     if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False):
-        _link_residual_seams(grouped_layers, config.wide_residual.num_streams)
+        _link_residual_seams(grouped_layers)
     return grouped_layers
 
 
-def _link_residual_seams(grouped_layers, num_streams: int) -> None:
+def _link_residual_seams(grouped_layers) -> None:
     """Fuse each residual write into the seam kernel of the layer that reads it next.
 
     A layer defers its write (``defers_residual_write``) when its successor applies it: a fused
-    ShortcutMoEBlock (two-reader kernel) or a lone layer whose ``pending_write_reader`` the
-    one-reader kernel can apply. A fused block defers its MoE write (routed + shared); a lone
-    layer defers a ``pending_write_writer`` write. The deferred write travels to the successor
-    as its ``hidden_states`` (a PendingShortcutAdd).
+    ShortcutMoEBlock (two-reader kernel) or a lone layer with a ``pending_write_reader`` (one-reader
+    kernel). A fused block defers its MoE write (routed + shared); a lone layer defers its
+    ``pending_write_writer`` write. The deferred write travels to the successor as its
+    ``hidden_states`` (a PendingShortcutAdd).
     """
-    from megatron.core.transformer.wide_residual import (
-        StreamwiseSigmoidWideResidualConnection,
-        can_read_pending_write,
-    )
 
     def fused_block(layer):
         return (
@@ -163,18 +160,13 @@ def _link_residual_seams(grouped_layers, num_streams: int) -> None:
         )
 
     def applies_pending_write(layer):
-        if fused_block(layer):
-            return True
-        reader = getattr(layer, "pending_write_reader", lambda: None)()
-        return reader is not None and can_read_pending_write(*reader, num_streams)
+        return (
+            fused_block(layer) or getattr(layer, "pending_write_reader", lambda: None)() is not None
+        )
 
     def can_defer_write(layer):
-        if fused_block(layer):
-            return True
-        writer = getattr(layer, "pending_write_writer", lambda: None)()
         return (
-            isinstance(writer, StreamwiseSigmoidWideResidualConnection)
-            and writer.num_streams == num_streams
+            fused_block(layer) or getattr(layer, "pending_write_writer", lambda: None)() is not None
         )
 
     for layer, successor in zip(grouped_layers, grouped_layers[1:]):
@@ -312,7 +304,8 @@ class ShortcutMoEBlock(MegatronModule):
                 "shortcut kernel fusion requires a wide-residual Mamba/GDN/attention compute-only "
                 "predecessor"
             )
-        compute_read, compute_write, compute_norm, _, _ = self._compute_parts()
+        parts = self.compute_layer.shortcut_compute_parts()
+        compute_read, compute_write, compute_norm = parts.read, parts.write, parts.input_norm
         connections = (
             compute_read,
             compute_write,
@@ -331,9 +324,9 @@ class ShortcutMoEBlock(MegatronModule):
             if not is_fusable_rmsnorm(norm):
                 raise ValueError(
                     f"shortcut kernel fusion requires {name} to be a standalone RMSNorm, got "
-                    f"{type(norm).__name__}. Custom stack specs must split input norms from "
-                    "their projections, as in "
-                    "hybrid_layer_specs.wide_residual_shortcut_fusion_stack_spec."
+                    f"{type(norm).__name__}. Build the model with "
+                    "hybrid_layer_specs.shortcut_fusion_stack_spec(<wide-residual stack spec>), "
+                    "or split input norms from their projections in a custom spec."
                 )
         if compute_norm.eps != self.shortcut_pre_mlp_layernorm.eps:
             # One two-reader kernel normalizes both inputs with a single epsilon.
@@ -343,10 +336,6 @@ class ShortcutMoEBlock(MegatronModule):
             )
         if not self.moe_layer.mlp.use_shared_expert:
             raise ValueError("shortcut kernel fusion requires a shared expert")
-
-    def _compute_parts(self):
-        """``(read, write, input_norm, branch, input_projection)`` of the fused compute layer."""
-        return self.compute_layer.shortcut_compute_parts()
 
     def _shortcut_add(self, pending, quant_context_factory):
         """Apply the pending write and norm this block's two inputs.
@@ -361,7 +350,9 @@ class ShortcutMoEBlock(MegatronModule):
         from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
         streams = self.config.wide_residual.num_streams
-        compute_read, _, compute_norm, mixer, linear = self._compute_parts()
+        parts = self.compute_layer.shortcut_compute_parts()
+        compute_read, compute_norm = parts.read, parts.input_norm
+        mixer, linear = parts.branch, parts.input_projection
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
             # A GDP input-projection checkpoint keeps its weight hooks in an inner autograd
             # graph that the boundary's weight edge cannot order; only GTP's explicit
@@ -391,7 +382,10 @@ class ShortcutMoEBlock(MegatronModule):
             return kernels.shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
                 pending,
                 (compute_read.read_logits(), self.shortcut_residual_read.read_logits()),
-                (compute_norm.weight, self.shortcut_pre_mlp_layernorm.weight),
+                (
+                    fused_norm_weight(compute_norm),
+                    fused_norm_weight(self.shortcut_pre_mlp_layernorm),
+                ),
                 mxfp8_handoff=direct is not None,
                 mxfp8_consumer=direct,
                 num_streams=streams,
@@ -404,7 +398,7 @@ class ShortcutMoEBlock(MegatronModule):
         from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
         streams = self.config.wide_residual.num_streams
-        _, compute_write, _, _, _ = self._compute_parts()
+        compute_write = self.compute_layer.shortcut_compute_parts().write
         shared_expert = getattr(self.moe_layer.mlp, "shared_experts", None)
         consumer = None if shared_expert is None else shared_expert.direct_input_consumer()
         return kernels.wide_residual_write_read_rmsnorm_quant(
@@ -412,7 +406,7 @@ class ShortcutMoEBlock(MegatronModule):
             update,
             *compute_write.write_logits(),
             self.moe_layer._get_mlp_residual_connection("read").read_logits(),
-            self.moe_layer.pre_mlp_layernorm.weight,
+            fused_norm_weight(self.moe_layer.pre_mlp_layernorm),
             mxfp8_consumer=(
                 consumer
                 if consumer is not None and mxfp8_handoff.eligible(consumer, update, streams)
@@ -424,13 +418,13 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _fused_compute_input(self, residual):
         """Read and norm the compute layer's input when no pending shortcut add precedes it."""
-        compute_read, _, compute_norm, _, _ = self._compute_parts()
-        compute_input, _ = apply_module(compute_read)(
+        parts = self.compute_layer.shortcut_compute_parts()
+        compute_input, _ = apply_module(parts.read)(
             residual,
             fp32_residual_connection=self.config.fp32_residual_connection,
             branch_input_dtype=self.config.params_dtype,
         )
-        return apply_module(compute_norm)(compute_input.to(dtype=self.config.params_dtype))
+        return apply_module(parts.input_norm)(compute_input.to(dtype=self.config.params_dtype))
 
     def _read_shortcut_hidden(
         self,

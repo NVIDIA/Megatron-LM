@@ -92,22 +92,15 @@ class HybridStackSubmodules:
     mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
 
 
-_FUSED_RESIDUAL_OBSERVATION_WARNED = False
-
-
 def _warn_fused_residuals_unobserved() -> None:
-    """Warn once that residuals written inside fused seam kernels are not observed."""
-    global _FUSED_RESIDUAL_OBSERVATION_WARNED
-    if _FUSED_RESIDUAL_OBSERVATION_WARNED or not (
-        is_observing_tensor("residual_accumulator") or is_observing_tensor("residual_contribution")
-    ):
-        return
-    _FUSED_RESIDUAL_OBSERVATION_WARNED = True
-    warnings.warn(
-        "Residual observation skips layers whose residual write is fused into the next layer's "
-        "seam kernel (moe_shortcut_wide_residual_norm_fusion).",
-        stacklevel=2,
-    )
+    """Warn (once per call site, Python's default filter) that fused seams are not observed."""
+    if is_observing_tensor("residual_accumulator") or is_observing_tensor("residual_contribution"):
+        warnings.warn(
+            "Residual observation covers only lone layers that write their residual; it skips "
+            "layers whose write is fused into the next layer's seam kernel "
+            "(moe_shortcut_wide_residual_norm_fusion).",
+            stacklevel=2,
+        )
 
 
 class HybridStack(MegatronModule):

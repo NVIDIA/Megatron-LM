@@ -15,9 +15,11 @@ from megatron.core.transformer.residual_connection import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
+    ShortcutComputeParts,
     StreamwiseSigmoidWideResidualConnection,
-    is_fusable_rmsnorm,
     load_residual_state,
+    lone_seam_reader,
+    lone_seam_writer,
     pending_write,
     write_pending_and_read_norm,
 )
@@ -177,22 +179,20 @@ class WideResidualTransformerLayer(TransformerLayer):
             attention_output_with_bias, *args, **kwargs
         )
 
-    def shortcut_compute_parts(self):
-        """Parts a fused ShortcutMoEBlock applies around this compute-only layer's attention.
+    def shortcut_compute_parts(self) -> ShortcutComputeParts | None:
+        """The read, write, input norm, attention and input projection a fused block applies.
 
-        Returns ``(read, write, input_norm, branch, input_projection)`` (see
-        WideResidualMambaLayer), or None when the layer also has an MLP or cross-attention branch.
+        None when the layer also has an MLP or cross-attention branch.
         """
         if not isinstance(self.mlp, IdentityOp) or not isinstance(self.cross_attention, IdentityOp):
             return None
         attention = self.self_attention
-        projection = getattr(attention, "in_proj", getattr(attention, "linear_qkv", None))
-        return (
+        return ShortcutComputeParts(
             self.residual_read_self_attn,
             self.residual_write_self_attn,
             self.input_layernorm,
             attention,
-            projection,
+            getattr(attention, "in_proj", getattr(attention, "linear_qkv", None)),
         )
 
     def _is_lone_mlp(self) -> bool:
@@ -209,13 +209,13 @@ class WideResidualTransformerLayer(TransformerLayer):
         Only MLP-only layers qualify; with a reader the layer accepts a PendingShortcutAdd as
         ``hidden_states``.
         """
-        if not self._is_lone_mlp() or not is_fusable_rmsnorm(self.pre_mlp_layernorm):
+        if not self._is_lone_mlp():
             return None
-        return self.residual_read_mlp, self.pre_mlp_layernorm
+        return lone_seam_reader(self, self.residual_read_mlp, self.pre_mlp_layernorm)
 
     def pending_write_writer(self):
-        """The MLP residual write an MLP-only layer can defer to the next seam, or None."""
-        return self.residual_write_mlp if self._is_lone_mlp() else None
+        """The MLP residual write an MLP-only layer can defer to the next seam's kernel, or None."""
+        return lone_seam_writer(self, self.residual_write_mlp) if self._is_lone_mlp() else None
 
     def _forward_attention(self, hidden_states, *args, **kwargs):
         """An MLP-only layer passes a deferred write straight to its MLP read."""

@@ -11,9 +11,9 @@ exclusive TE Linear consumer under an MXFP8 recipe, otherwise BF16. `wide_residu
 writes the Mamba/GDN/attention output and produces the shared expert's normalized input; `shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`
 adds the routed and shared MoE outputs (the shortcut add, passed between blocks as a `PendingShortcutAdd`) and
 produces the next block's compute-layer and shortcut-routing inputs. The shortcut add is optional: a
-`PendingShortcutAdd` without a shared update is a single write read twice, which a lone wide-residual Mamba
-layer directly before a fused block uses (M → [* E]) so that block's two-reader kernel writes its update and
-emits both inputs. The matching backward is one fused kernel per seam; with
+`PendingShortcutAdd` without a shared update is a single write read twice, which a lone wide-residual
+Mamba or MLP-only layer directly before a fused block uses (M → [* E], - → [* E]) so that block's
+two-reader kernel writes its update and emits both inputs. The matching backward is one fused kernel per seam; with
 `--residual-stream-recompute-num-layers N` the residuals are rebuilt by bit-exact checkpoint replay instead
 of being saved. Residual writes are bit-identical to replay and across kernel
 schedules, reader outputs differ by at most one BF16 ulp between schedules, and the tests check every
@@ -33,7 +33,13 @@ next layer applies a layer's write in its seam kernel, `group_layers_into_shortc
 `defers_residual_write` and the layer returns its write as a `PendingShortcutAdd`, which the next
 layer receives as `hidden_states`. In a stack of such layers every seam after the first layer's
 read is one kernel, including under checkpoint replay intervals. MLP-only layers use a standalone
-pre-MLP RMSNorm in the fusion stack specs; lone attention/GDN layers are not chained.
+pre-MLP RMSNorm in the fusion stack specs; lone attention/GDN layers, and lone layers whose calls run
+through a per-layer CUDA graph, are not chained.
+
+The fused seams need the static fusion stack specs (`wide_residual_shortcut_fusion_{,gdp_}{,inference_}stack_spec`
+in `hybrid_layer_specs`), which split every input norm the kernels apply out of its projection; checkpoints
+keep the unsplit keys. Model builders select them with `shortcut_fusion_stack_spec(<wide-residual spec>)`
+(the training builder and `hybrid_builders.py` do so when the flag is set).
 
 ## Performance
 

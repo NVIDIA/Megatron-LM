@@ -18,9 +18,11 @@ from megatron.core.transformer.residual_recompute import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
+    ShortcutComputeParts,
     StreamwiseSigmoidWideResidualConnection,
-    is_fusable_rmsnorm,
     load_residual_state,
+    lone_seam_reader,
+    lone_seam_writer,
     pending_write,
     write_pending_and_read_norm,
 )
@@ -95,15 +97,10 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
-    def shortcut_compute_parts(self):
-        """Parts a fused ShortcutMoEBlock applies around this compute layer's mixer.
-
-        Returns ``(read, write, input_norm, branch, input_projection)``: the residual read and
-        write the block's seam kernels own, the RMSNorm they apply, the mixer, and the projection
-        that consumes the normalized input (a direct MXFP8 handoff candidate).
-        """
+    def shortcut_compute_parts(self) -> ShortcutComputeParts:
+        """The read, write, input norm, mixer and input projection a fused block applies."""
         mixer = self.mixer
-        return (
+        return ShortcutComputeParts(
             self.residual_read,
             self.residual_write,
             self.norm,
@@ -116,13 +113,15 @@ class WideResidualMambaLayer(MambaLayer):
 
         A layer with a reader accepts a PendingShortcutAdd as ``hidden_states``.
         """
-        if self.using_shortcut_moe_fused_residual_kernel or not is_fusable_rmsnorm(self.norm):
+        if self.using_shortcut_moe_fused_residual_kernel:
             return None
-        return self.residual_read, self.norm
+        return lone_seam_reader(self, self.residual_read, self.norm)
 
     def pending_write_writer(self):
-        """The residual write this lone layer can defer to the next seam, or None."""
-        return None if self.using_shortcut_moe_fused_residual_kernel else self.residual_write
+        """The residual write this lone layer can defer to the next seam's kernel, or None."""
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return None
+        return lone_seam_writer(self, self.residual_write)
 
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""

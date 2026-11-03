@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -465,6 +465,20 @@ def _is_rmsnorm(norm: nn.Module) -> bool:
     return isinstance(norm, te.RMSNorm)
 
 
+def fused_norm_weight(norm: nn.Module) -> Tensor:
+    """``norm.weight`` for a fused kernel that applies ``norm`` without calling the module.
+
+    Runs the module's forward pre-hooks first, as calling it would. Distributed data parallel's
+    overlapped parameter all-gather waits for a module's parameters in such a hook.
+    """
+    for hook_id, hook in tuple(norm._forward_pre_hooks.items()):
+        if hook_id in norm._forward_pre_hooks_with_kwargs:
+            hook(norm, (), {})
+        else:
+            hook(norm, ())
+    return norm.weight
+
+
 def is_fusable_rmsnorm(norm: nn.Module) -> bool:
     """Whether ``norm`` is a standalone, bias-free RMSNorm the fused seam kernels can apply."""
     return (
@@ -511,15 +525,66 @@ def write_pending_and_read_norm(
     )
 
     residual, branch_input = shortcut_add_wide_residual_write_read_rmsnorm_quant(
-        pending, read.read_logits(), norm.weight, num_streams=read.num_streams, epsilon=norm.eps
+        pending,
+        read.read_logits(),
+        fused_norm_weight(norm),
+        num_streams=read.num_streams,
+        epsilon=norm.eps,
     )
     return residual, branch_input
 
 
-def can_read_pending_write(read, norm, num_streams: int) -> bool:
-    """Whether a layer's input read and norm can consume a deferred write (fused kernel)."""
+class ShortcutComputeParts(NamedTuple):
+    """What a fused ShortcutMoEBlock applies around its compute layer's branch.
+
+    Attributes:
+        read: Residual read of the branch input (owned by the block's seam kernels).
+        write: Residual write of the branch output (owned by the block's seam kernels).
+        input_norm: Standalone RMSNorm the seam kernels apply to the read.
+        branch: The mixer or self-attention module.
+        input_projection: The Linear that consumes the normalized input (a direct MXFP8 handoff
+            candidate), or None.
+    """
+
+    read: StreamwiseSigmoidWideResidualConnection
+    write: StreamwiseSigmoidWideResidualConnection
+    input_norm: nn.Module
+    branch: nn.Module
+    input_projection: nn.Module | None
+
+
+def _seam_connection(connection, num_streams: int):
+    """``connection`` if the fused seam kernels implement it, else None."""
+    if (
+        isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+        and connection.num_streams == num_streams
+    ):
+        return connection
+    return None
+
+
+def lone_seam_reader(layer, read, norm):
+    """``(read, norm)`` when a fused seam kernel can apply a lone layer's input read, else None.
+
+    A layer whose calls run through a CUDA-graph runner keeps its unfused seams: the runner
+    cannot take a PendingShortcutAdd.
+    """
+    if _runs_through_cuda_graph(layer) or not is_fusable_rmsnorm(norm):
+        return None
+    if _seam_connection(read, layer.config.wide_residual.num_streams) is None:
+        return None
+    return read, norm
+
+
+def lone_seam_writer(layer, write):
+    """``write`` when a fused seam kernel can apply a lone layer's residual write, else None."""
+    if _runs_through_cuda_graph(layer):
+        return None
+    return _seam_connection(write, layer.config.wide_residual.num_streams)
+
+
+def _runs_through_cuda_graph(layer) -> bool:
     return (
-        isinstance(read, StreamwiseSigmoidWideResidualConnection)
-        and read.num_streams == num_streams
-        and is_fusable_rmsnorm(norm)
+        getattr(layer, "cudagraph_manager", None) is not None
+        or layer.config.cuda_graph_impl == "transformer_engine"
     )

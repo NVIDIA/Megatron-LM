@@ -32,11 +32,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
+from megatron.core.transformer.wide_residual import (
+    StreamwiseSigmoidWideResidualConnection,
+    is_fusable_rmsnorm,
+)
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
 from tests.unit_tests.test_utilities import Utils
@@ -1306,7 +1310,7 @@ def test_lone_layer_write_fuses_into_next_block(streams, retention, interval):
 
 @GPU
 def test_lone_write_deferral_scope():
-    """Only a lone wide-residual Mamba layer directly before a fused block defers its write."""
+    """A lone layer defers its write only into a fused successor, and never as the last layer."""
     layers = _lone_then_blocks(pairs=1)
     assert isinstance(layers[1], ShortcutMoEBlock)
     assert layers[0].defers_residual_write
@@ -1444,9 +1448,13 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual=True):
+def _hybrid_model(
+    mixer, optimized, hidden, dynamic, pattern=None, fp32_residual=True, fused=True, **overrides
+):
+    """A small HybridModel; ``fused`` builds it with the fusion flag and stack spec."""
     pattern = pattern or ("GEGE" if mixer == "gdn" else "MEME") + ("*" if dynamic else "")
     config = _fused_config(
+        moe_shortcut_wide_residual_norm_fusion=fused,
         fp32_residual_connection=fp32_residual,
         num_layers=len(pattern),
         hidden_size=hidden,
@@ -1472,6 +1480,7 @@ def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual
         moe_shortcut_parallel=True,
         wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
         transformer_impl="inference_optimized" if optimized else "transformer_engine",
+        **overrides,
     )
     if mixer == "gdp":
         spec = specs.wide_residual_gated_delta_product_inference_stack_spec
@@ -1479,7 +1488,8 @@ def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual
     else:
         spec = specs.wide_residual_hybrid_inference_stack_spec
         spec = spec if optimized else specs.wide_residual_hybrid_stack_spec
-    spec = specs.shortcut_fusion_stack_spec(spec)
+    if fused:
+        spec = specs.shortcut_fusion_stack_spec(spec)
     model = HybridModel(
         config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
     )
@@ -1487,7 +1497,7 @@ def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual
     assert sum(
         isinstance(b, ShortcutMoEBlock) and b.using_shortcut_moe_fused_residual_kernel
         for b in model.decoder.layers
-    ) == pattern.count("E")
+    ) == (pattern.count("E") if fused else 0)
     return model
 
 
@@ -1596,7 +1606,7 @@ def test_hybrid_inference_prefill_decode(monkeypatch, dynamic, mixer, optimized,
         raise AssertionError("inference used the training-only mixer split")
 
     for block in model.decoder.layers[:2]:
-        compute_mixer = block._compute_parts()[3]
+        compute_mixer = block.compute_layer.shortcut_compute_parts().branch
         monkeypatch.setattr(compute_mixer, "forward_pre_attn_and_core_attn", forbidden)
         monkeypatch.setattr(compute_mixer, "forward_post_core_attn", forbidden)
     execute = (_dynamic_prefill_decode if dynamic else _static_prefill_decode)(model)
@@ -1810,3 +1820,214 @@ def test_fusion_rejects_norm_and_residual_stream_recompute(module):
             recompute_granularity="selective",
             recompute_modules=[module],
         )
+
+
+# --------------------------------------------------------------- fusion specs and seam linking
+
+
+FUSION_SPEC_PAIRS = [
+    (specs.wide_residual_hybrid_stack_spec, specs.wide_residual_shortcut_fusion_stack_spec),
+    (
+        specs.wide_residual_gated_delta_product_stack_spec,
+        specs.wide_residual_shortcut_fusion_gdp_stack_spec,
+    ),
+    (
+        specs.wide_residual_hybrid_inference_stack_spec,
+        specs.wide_residual_shortcut_fusion_inference_stack_spec,
+    ),
+    (
+        specs.wide_residual_gated_delta_product_inference_stack_spec,
+        specs.wide_residual_shortcut_fusion_gdp_inference_stack_spec,
+    ),
+]
+
+
+@pytest.mark.parametrize("wide,fused", FUSION_SPEC_PAIRS)
+def test_shortcut_fusion_stack_spec_mapping(wide, fused):
+    """Each built-in wide-residual stack maps to its fusion stack; others pass through."""
+    assert specs.shortcut_fusion_stack_spec(wide) is fused
+    assert specs.shortcut_fusion_stack_spec(fused) is fused
+    assert specs.shortcut_fusion_stack_spec(specs.hybrid_stack_spec) is specs.hybrid_stack_spec
+    # The split-norm MLP-only layer differs from the wide one only in its split pre-MLP norm.
+    base, split = wide.submodules.mlp_layer, fused.submodules.mlp_layer
+    assert split.module is base.module
+    assert split.submodules.mlp_bda is base.submodules.mlp_bda
+    assert split.submodules.pre_mlp_layernorm is not IdentityOp
+    assert base.submodules.mlp.keywords["submodules"].linear_fc2 is (
+        split.submodules.mlp.keywords["submodules"].linear_fc2
+    )
+    assert split.submodules.sharded_state_dict_keys_map == {
+        "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"
+    }
+
+
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("fusion", [False, True])
+def test_resolve_hybrid_stack_spec_selects_fusion_stack(optimized, fusion):
+    from megatron.training.models.hybrid import resolve_hybrid_stack_spec
+
+    transformer = SimpleNamespace(
+        wide_residual=WideResidualConfig(num_streams=3),
+        transformer_impl="inference_optimized" if optimized else "transformer_engine",
+        moe_shortcut_wide_residual_norm_fusion=fusion,
+    )
+    config = SimpleNamespace(
+        transformer=transformer, hybrid_stack_spec=None, restore_modelopt_state=False
+    )
+    wide = (
+        specs.wide_residual_hybrid_inference_stack_spec
+        if optimized
+        else specs.wide_residual_hybrid_stack_spec
+    )
+    expected = specs.shortcut_fusion_stack_spec(wide) if fusion else wide
+    assert resolve_hybrid_stack_spec(config) is expected
+    # An explicit (e.g. --spec) GDP stack maps the same way.
+    config.hybrid_stack_spec = specs.wide_residual_gated_delta_product_stack_spec
+    expected = (
+        specs.wide_residual_shortcut_fusion_gdp_stack_spec
+        if fusion
+        else specs.wide_residual_gated_delta_product_stack_spec
+    )
+    assert resolve_hybrid_stack_spec(config) is expected
+
+
+def test_fusion_spec_names_resolve_to_their_inference_siblings():
+    from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+    module = "megatron.core.models.hybrid.hybrid_layer_specs"
+    for training, inference in (
+        (
+            "wide_residual_shortcut_fusion_stack_spec",
+            "wide_residual_shortcut_fusion_inference_stack_spec",
+        ),
+        (
+            "wide_residual_shortcut_fusion_gdp_stack_spec",
+            "wide_residual_shortcut_fusion_gdp_inference_stack_spec",
+        ),
+    ):
+        assert _hybrid_inference_stack_spec([module, training], wide_residual=True) is getattr(
+            specs, inference
+        )
+
+
+class _SeamLayer(torch.nn.Module):
+    """A lone layer for _link_residual_seams: ``reads``/``writes`` say whether it has a fusable
+    input read and residual write."""
+
+    def __init__(self, reads, writes):
+        super().__init__()
+        self.reads, self.writes = reads, writes
+        self.defers_residual_write = False
+
+    def pending_write_reader(self):
+        return ("read", "norm") if self.reads else None
+
+    def pending_write_writer(self):
+        return "write" if self.writes else None
+
+
+def _seam_block(fused=True):
+    block = ShortcutMoEBlock.__new__(ShortcutMoEBlock)
+    torch.nn.Module.__init__(block)
+    block.using_shortcut_moe_fused_residual_kernel = fused
+    return block
+
+
+def test_link_residual_seams_decisions():
+    """A layer defers exactly when it can write into its successor's seam kernel."""
+    from megatron.core.models.hybrid.shortcut_block import _link_residual_seams
+
+    lone = lambda reads=True, writes=True: _SeamLayer(reads, writes)  # noqa: E731
+    layers = [
+        lone(),  # -> lone: both fusable
+        lone(),  # -> fused block
+        _seam_block(),  # -> lone that cannot apply a write (e.g. attention, unsplit norm)
+        lone(reads=False),  # -> fused block (it can still write into one)
+        _seam_block(),  # -> fused block
+        _seam_block(),  # -> unfused block
+        _seam_block(fused=False),  # unfused blocks never defer
+        lone(writes=False),  # -> lone: no fusable write
+        lone(),  # last layer
+    ]
+    _link_residual_seams(layers)
+    assert [l.defers_residual_write for l in layers] == [
+        True,
+        True,
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+def test_fusion_spec_keeps_sharded_checkpoint_keys():
+    """The fusion stack's split norms keep the unsplit stack's sharded checkpoint keys."""
+
+    def keys(fused):
+        model = _hybrid_model("mamba", False, 256, False, "M-MMEMEM-M-", fused=fused)
+        # A ShardedTensor's key is the name stored in the checkpoint (after the spec's keys map).
+        return {
+            value.key: tuple(value.local_shape)
+            for value in model.sharded_state_dict().values()
+            if hasattr(value, "local_shape")
+        }
+
+    unfused, fused = keys(False), keys(True)
+    assert fused == unfused
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+def test_fused_seams_run_norm_forward_pre_hooks():
+    """Norms applied inside fused kernels still run their forward pre-hooks (e.g. DDP's
+    overlapped parameter all-gather wait) before the kernel reads their weights."""
+    model = _hybrid_model("mamba", False, 3072, False, "M-MMEMEM-M-").train()
+    called = set()
+    norms = {
+        name: module
+        for name, module in model.decoder.named_modules()
+        if is_fusable_rmsnorm(module) and name != "final_norm"
+    }
+    for name, module in norms.items():
+        module.register_forward_pre_hook(lambda m, args, name=name: called.add(name))
+    ids = torch.randint(0, 128, (1, 1024), device="cuda")
+    model(ids, torch.arange(1024, device="cuda")[None], None).float().mean().backward()
+    assert norms and set(norms) == called, sorted(set(norms) - called)
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+def test_layers_without_fused_seams_reject_pending_writes():
+    model = _hybrid_model("mamba", False, 256, False, "M-MMEMEM-M-")
+    lone = model.decoder.layers[0]
+    pending = PendingShortcutAdd(torch.zeros(4, 1, 768, device="cuda"), None, None, None, None)
+    lone.pending_write_reader = lambda: None
+    with pytest.raises(RuntimeError, match="cannot apply a deferred residual write"):
+        lone(pending)
+    unfused = _hybrid_model("mamba", False, 256, False, "MEME", fused=False).decoder.layers[0]
+    with pytest.raises(ValueError, match="require the fused residual kernels"):
+        _run_block(unfused, pending)
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+def test_fused_seams_use_the_norms_epsilon(monkeypatch):
+    """Every fused seam normalizes with its RMSNorm's own epsilon, not the 1e-5 default."""
+    model = _hybrid_model(
+        "mamba", False, 3072, False, "M-MMEMEM-M-", layernorm_epsilon=1e-6
+    ).train()
+    launch, epsilons = forward_kernel.forward, []
+
+    def record(*args, **kwargs):
+        epsilons.append(kwargs["epsilon"])
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(forward_kernel, "forward", record)
+    ids = torch.randint(0, 128, (1, 1024), device="cuda")
+    model(ids, torch.arange(1024, device="cuda")[None], None)
+    assert len(epsilons) == 10 and set(epsilons) == {1e-6}
