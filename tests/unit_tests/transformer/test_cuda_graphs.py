@@ -97,6 +97,82 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert assigned[:pool_size] == assigned[pool_size:]
 
 
+class TestCudaGraphSavedTensorObserver:
+    @pytest.fixture
+    def record(self):
+        # Exercise the real observer without sharing the process-global graph records.
+        class Record(_CudagraphGlobalRecord):
+            cudagraph_created = False
+            cudagraph_record = []
+            _saved_tensors_observer = None
+
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        try:
+            yield Record
+        finally:
+            Record._disable_saved_tensors_observer()
+            assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+    @pytest.mark.parametrize("save_view", [False, True])
+    def test_empty_create_preserves_observer_for_later_training(self, record, save_view):
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+
+        # GRPO computes old/reference logprobs with forward-only schedules before
+        # its first training forward records any CUDA graphs.
+        for _ in range(2):
+            assert record.create_cudagraphs() is None
+            assert record._saved_tensors_observer is not None
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+
+        class SaveInput(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, value):
+                # TE 2.20 saves an input view; TE 2.21 saves the input directly.
+                ctx.save_for_backward(value.view(-1, 3) if save_view else value)
+                return value * 2
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output * 2
+
+        value = torch.ones(2, 3, requires_grad=True)
+        output = SaveInput.apply(value)
+        assert value.cg_buffer_metadata.is_saved_for_backward
+        assert (output.grad_fn.saved_tensors[0] is value) is not save_view
+
+    @pytest.mark.parametrize("capture_fails", [False, True])
+    def test_capture_restores_observer_on_success_or_failure(
+        self, record, monkeypatch, capture_fails
+    ):
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record.cudagraph_record = [object()]
+        capture_stats = {"time": 1.0}
+
+        def capture(cls):
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+            value = torch.ones(2, 3)
+            torch.autograd.function.FunctionCtx().save_for_backward(value)
+            assert value.cg_buffer_metadata.is_saved_for_backward
+            if capture_fails:
+                raise RuntimeError("capture failed")
+            cls.cudagraph_created = True
+            cls.cudagraph_record = []
+            return capture_stats
+
+        monkeypatch.setattr(record, "_create_cudagraphs", classmethod(capture))
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                record.create_cudagraphs()
+        else:
+            assert record.create_cudagraphs() is capture_stats
+
+        assert record._saved_tensors_observer is None
+        assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
 
@@ -617,6 +693,9 @@ class TestPackedSeqCudagraphs:
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
         block.train()
+        # GRPO's forward-only logprob schedules request graph creation before the
+        # first training forward. This must preserve saved-tensor lifetime tracking.
+        create_cudagraphs()
         # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
         for param in block.parameters():
             param.main_grad = torch.zeros_like(param)
