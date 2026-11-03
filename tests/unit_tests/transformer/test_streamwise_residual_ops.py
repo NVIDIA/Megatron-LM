@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Tests for native full-width stream read and write operations."""
 
+import math
+
 import pytest
 import torch
 
@@ -8,6 +10,8 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.streamwise_residual_ops import (
     HAVE_STREAMWISE_TRITON,
     _can_use_streamwise_triton,
+    _streamwise_backward_block_config,
+    _streamwise_block_config,
     streamwise_read,
     streamwise_sigmoid_read,
     streamwise_sigmoid_writeback,
@@ -472,6 +476,28 @@ def test_streamwise_triton_fp32_selector_respects_geometry_and_layout():
 
     fp64 = eligible.to(dtype=torch.float64)
     assert not _can_use_streamwise_triton(fp64, logits, num_streams, stream_width)
+
+
+@pytest.mark.parametrize("stream_width", [64, 512, 768, 3072, 5120])
+@pytest.mark.parametrize("batch", [256, 4095, 4096, 24_576, 24_600])
+def test_backward_tile_writes_no_more_partials_than_forward_tile(batch, stream_width):
+    """The backward tile must not push a shape past the partial reduction limit."""
+
+    def partials(config):
+        block_batch, block_width, _ = config
+        return math.ceil(batch / block_batch) * math.ceil(stream_width / block_width)
+
+    forward_config = _streamwise_block_config(batch, stream_width)
+    backward_config = _streamwise_backward_block_config(batch, stream_width)
+    assert partials(backward_config) <= partials(forward_config)
+    if stream_width % 512 != 0:
+        assert backward_config == forward_config
+
+
+def test_backward_tile_halves_rows_at_production_width():
+    """At width 3,072 the backward tile is 16 x 512, where FP32 streams barely spill."""
+
+    assert _streamwise_backward_block_config(24_576, 3072) == (16, 512, 4)
 
 
 @pytest.mark.skipif(

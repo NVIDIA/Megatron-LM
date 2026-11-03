@@ -12,7 +12,11 @@ import torch
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
-from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    require_flashinfer_cutlass_mxfp8,
+    require_flashinfer_routed_mxfp8,
+)
+from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_routed_nvfp4
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -483,15 +487,22 @@ class MoELayer(BaseMoELayer):
                 )
                 fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
                 if config.fp8 and fp8_recipe == "mxfp8":
-                    require_flashinfer_routed_mxfp8()
+                    if config.activation_func_tanh_clamp_scale is not None:
+                        require_flashinfer_cutlass_mxfp8()
+                    else:
+                        require_flashinfer_routed_mxfp8()
+                if config.inference_moe_nvfp4_recipe is not None:
+                    # Per-token NVFP4 runs CuTe DSL JIT kernels, not the pre-compiled
+                    # CUTLASS kernels shipped in flashinfer-jit-cache.
+                    require_flashinfer_routed_nvfp4()
+                else:
+                    # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                    # when using the FlashInfer backend. The flashinfer-jit-cache package
+                    # must be installed ahead of time to avoid a multi-minute JIT
+                    # compilation step at runtime.
+                    from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
-                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
-                # when using the FlashInfer backend. The flashinfer-jit-cache package
-                # must be installed ahead of time to avoid a multi-minute JIT
-                # compilation step at runtime.
-                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
-
-                check_flashinfer_jit_cache_installed()
+                    check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
@@ -615,7 +626,8 @@ class MoELayer(BaseMoELayer):
         input_ids = self._align_batch_first_to_sequence_parallel(input_ids, hidden_states)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        if self.token_dispatcher is not None:
+            hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
         )
@@ -628,13 +640,15 @@ class MoELayer(BaseMoELayer):
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
         aligned with the local sequence-parallel activations before the dispatcher decides
-        whether its backend excludes padded rows.
+        whether its backend excludes padded rows. ``packed_seq_params`` tells the dispatcher
+        whether the input is packed (THD).
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -665,10 +679,15 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
+            # padded rows) and the packed-sequence metadata.
             padding_mask = self._align_batch_first_to_sequence_parallel(padding_mask, hidden_states)
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, padding_mask=padding_mask
+                hidden_states,
+                routing_map,
+                probs,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
             )
         else:
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -887,7 +906,7 @@ class MoELayer(BaseMoELayer):
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params
+                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
@@ -918,7 +937,11 @@ class MoELayer(BaseMoELayer):
                         layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
                     )
                     hidden_states, probs = self.preprocess(
-                        layer_input, probs, routing_map, padding_mask
+                        layer_input,
+                        probs,
+                        routing_map,
+                        padding_mask,
+                        packed_seq_params=packed_seq_params,
                     )
 
                     if self.run_shared_experts_after_router:

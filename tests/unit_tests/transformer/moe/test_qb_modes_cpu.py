@@ -51,7 +51,7 @@ def test_hash_routing_has_no_learned_qb_state_to_finalize(scope, monkeypatch):
     model.router = router
     all_reduce = mock.Mock(side_effect=AssertionError("hash routing must not reduce QB state"))
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    _update_router_expert_bias_with_quantile([model], config, _groups().tp)
+    _update_router_expert_bias_with_quantile([model], config, (_groups().tp,))
     _update_router_qb_beta([model], config, _groups().tp)
     all_reduce.assert_not_called()
     assert router.tid2eid.shape == (16, config.moe_router_topk)

@@ -173,6 +173,25 @@ def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
     assert config.attention_latent_norm_epsilon == pytest.approx(3e-6)
 
 
+def test_config_rejects_dynamic_context_parallel():
+    """DSv4 has no dynamic context parallelism path without the balanced indexer."""
+    # NOTE(nightly-sync 26_10_2026): dev rejects dsv4_hybrid under
+    # cp_partition_mode='zigzag' (the default) earlier in __post_init__ than main's
+    # dynamic-CP guard, so without an explicit contiguous layout this test never reached
+    # the rejection it was written to pin and failed on the layout message instead. Dev
+    # implements DSv4 dynamic CP for the balanced zigzag indexer, so main's guard is scoped
+    # to the unbalanced path; satisfying the layout prerequisite here keeps this test
+    # asserting main's limitation for the configurations main wrote it for. The supported
+    # path is covered by test_cp_balanced_indexer_layout.py::
+    # test_balanced_config_accepts_dynamic_context_parallelism.
+    with pytest.raises(ValueError, match="DSv4 dynamic context parallelism is not supported"):
+        _make_config(
+            dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=4096,
+            cp_partition_mode="contiguous",
+        )
+
+
 def test_attention_latent_norm_epsilon_accepts_override():
     """DSv4 latent norms can use the model recipe's dedicated epsilon."""
     config = _make_config(layernorm_epsilon=3e-6, attention_latent_norm_epsilon=1e-5)
@@ -1327,3 +1346,74 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
+    """The core owns output rotation; the outer projection must not rotate twice.
+
+    The core attention builds and applies the output inverse RoPE itself, so
+    the hybrid wrapper must call it exactly once, must not hand it a second
+    rotation, and must not rotate or rebuild RoPE tables after it returns.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as hybrid,
+    )
+
+    batch = 1 if packed else 2
+    hidden = torch.randn(4, batch, 4, requires_grad=True)
+    cu = torch.tensor([0, 1, 4], dtype=torch.int32) if packed else None
+    params = (
+        PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=3, max_seqlen_kv=3
+        )
+        if packed
+        else None
+    )
+    cache = Mock(side_effect=AssertionError("output RoPE tables built outside the core"))
+    observed = []
+
+    def core(query, *_args, **kwargs):
+        observed.append(kwargs)
+        # Sentinel output stands for a core that has already applied inverse RoPE.
+        return query.reshape(4, batch, 4) * 3
+
+    core.use_fused_kernels = True
+    outer_rope = Mock(side_effect=AssertionError("output RoPE applied twice"))
+    for name in ("fused_mla_rope_out_of_place", "fused_mla_rope_inplace"):
+        monkeypatch.setattr(hybrid, name, outer_rope, raising=False)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            apply_rope_fusion=True,
+            v_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            o_lora_rank=4,
+            dsa_kernel_backend="cudnn",
+            deterministic_mode=False,
+            attention_cp_layout="contiguous",
+        ),
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)),
+        rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
+        get_query_key_value_tensors=lambda *_args, **_kwargs: (hidden, hidden, hidden, None, None),
+        core_attention=core,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        training=True,
+        recompute_up_proj=False,
+        o_local_groups=1,
+        linear_o_group_proj=torch.eye(4),
+        linear_proj=lambda x: (x, None),
+    )
+    output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
+    torch.testing.assert_close(output, hidden * 3)
+    output.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 3))
+    assert len(observed) == 1
+    assert "out_rope" not in observed[0]
+    assert observed[0]["packed_seq_params"] is params
+    cache.assert_not_called()
+    outer_rope.assert_not_called()

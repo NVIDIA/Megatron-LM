@@ -7,6 +7,7 @@ import types
 
 import torch
 import transformers
+from packaging.version import Version
 from tqdm import tqdm
 
 from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
@@ -71,8 +72,9 @@ def load_args_from_checkpoint(args):
 
 
 def verify_transformers_version():
-    major, minor, patch = map(int, transformers.__version__.split('.'))
-    assert major >= 4 and minor >= 36
+    assert Version(transformers.__version__) >= Version("4.36.0"), (
+        f"Mixtral HF loader requires transformers>=4.36.0, found {transformers.__version__}"
+    )
 
 
 def set_preprocess_state(args, model, hf_model):
@@ -120,15 +122,30 @@ def set_attn_state(args, layer, hf_layer):
 def set_mlp_state(args, layer, hf_layer):
     '''Set MLP params.'''
 
-    layer.mlp.router.weight.data.copy_(hf_layer.block_sparse_moe.gate.weight)
+    # Transformers 4 uses block_sparse_moe; Transformers 5 uses mlp.
+    hf_moe = hf_layer.block_sparse_moe if hasattr(hf_layer, "block_sparse_moe") else hf_layer.mlp
+    hf_experts = hf_moe.experts
+    fused_experts = hasattr(hf_experts, "gate_up_proj")
+    if fused_experts:
+        assert not getattr(hf_experts, "is_transposed", False), (
+            "Transposed HF expert weight layout is not supported."
+        )
+
+    layer.mlp.router.weight.data.copy_(hf_moe.gate.weight)
 
     mcore_experts = layer.mlp.experts.local_experts
-    hf_experts = hf_layer.block_sparse_moe.experts
     for expert_idx in range(args.num_experts):
-        mcore_experts[expert_idx].linear_fc1.weight.data.copy_(
-            torch.cat([hf_experts[expert_idx].w1.weight, hf_experts[expert_idx].w3.weight], dim=0)
-        )
-        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(hf_experts[expert_idx].w2.weight)
+        if fused_experts:
+            # gate_up_proj already concatenates w1 (gate) and w3 (up) along dim 0.
+            fc1_weight = hf_experts.gate_up_proj[expert_idx]
+            fc2_weight = hf_experts.down_proj[expert_idx]
+        else:
+            fc1_weight = torch.cat(
+                [hf_experts[expert_idx].w1.weight, hf_experts[expert_idx].w3.weight], dim=0
+            )
+            fc2_weight = hf_experts[expert_idx].w2.weight
+        mcore_experts[expert_idx].linear_fc1.weight.data.copy_(fc1_weight)
+        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(fc2_weight)
 
 
 def set_layer_state(args, model, hf_model, layer_idx):
@@ -169,7 +186,7 @@ def load_checkpoint_to_model(args):
 
 def _load_checkpoint(queue, args):
 
-    # Llama-2 requires HF transformers >=4.31.0.
+    # Mixtral requires HF transformers >=4.36.0.
     verify_transformers_version()
 
     # Search in directory above this.

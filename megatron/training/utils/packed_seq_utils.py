@@ -12,6 +12,7 @@ def prepare_packed_seq_params(
     config: TransformerConfig,
     *,
     capacity: int | None = None,
+    cp_group=None,
 ) -> PackedSeqParams | None:
     """Finalize CP routes and prepare enabled attention layouts outside graph capture.
 
@@ -21,10 +22,20 @@ def prepare_packed_seq_params(
         capacity: Global physical token capacity when it differs from the supplied
             sequence boundaries (for example, raw metadata on a middle PP stage).
             Dynamic packed graphs otherwise use the configured fixed capacity.
+        cp_group: Caller-owned static CP group (for example ``pg_collection.cp``). It is
+            used when the metadata carries no runtime group, so finalization never
+            substitutes MPU's global CP group for the caller's group.
 
     Returns:
         The supplied metadata with its CP group and per-microbatch routes prepared.
     """
+    if (
+        packed_seq_params is not None
+        and cp_group is not None
+        and packed_seq_params.local_cp_size is None
+        and packed_seq_params.cp_group is None
+    ):
+        packed_seq_params.cp_group = cp_group
     packed_seq_params = finalize_packed_seq_params(packed_seq_params)
     if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params

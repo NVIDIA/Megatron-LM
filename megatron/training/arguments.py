@@ -525,7 +525,7 @@ def validate_args(args, defaults={}):
             getattr(args, "gtp_weight_remat_size", 1),
         )
     )
-    (args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards) = (
+    args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards = (
         resolve_tensor_parallel_sequence_shards(
             args.tensor_model_parallel_size,
             args.tensor_parallel_num_sequence_shards,
@@ -1376,31 +1376,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-    # Iteration-based training.
-    # Skip these checks when skip_train is set: LR config is irrelevant.
-    if args.train_iters and not args.skip_train:
-        # If we use iteration-based training, make sure the
-        # sample-based options are off.
-        assert args.train_samples is None, 'expected iteration-based training'
-        assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert (
-                args.lr_warmup_iters == 0
-            ), 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
-
-    # Sample-based training.
-    if args.train_samples and not args.skip_train:
-        # If we use sample-based training, make sure the
-        # iteration-based options are off.
-        assert args.train_iters is None, 'expected sample-based training'
-        assert args.lr_decay_iters is None, 'expected sample-based learning rate decay'
-        assert args.lr_warmup_iters == 0, 'expected sample-based learnig rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, (
-                'can only specify one of lr-warmup-fraction ' 'and lr-warmup-samples'
-            )
-
     if args.num_layers is not None:
         assert (
             args.encoder_num_layers is None
@@ -1490,26 +1465,6 @@ def validate_args(args, defaults={}):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
-    if args.no_weight_decay_cond_type is not None:
-        print_rank_0(
-            'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
-            args.rank,
-        )
-        if args.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
-            args.apply_wd_to_qk_layernorm = True
-        else:
-            raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
-        args.no_weight_decay_cond_type = None
-
-    if args.weight_decay_incr_style == 'constant':
-        assert args.start_weight_decay is None
-        assert args.end_weight_decay is None
-        args.start_weight_decay = args.weight_decay
-        args.end_weight_decay = args.weight_decay
-    else:
-        assert args.start_weight_decay is not None
-        assert args.end_weight_decay is not None
-
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
         args.no_persist_layer_norm = True
@@ -1581,10 +1536,17 @@ def validate_args(args, defaults={}):
             )
 
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        assert args.min_dynamic_context_parallel_size <= dp_cp_size, (
-            f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
-            f'must be <= dp_size * cp_size ({dp_cp_size})'
-        )
+        # main (ea99fdfce) tightened this from `min <= dp_cp_size` to exact membership in
+        # the creatable dynamic CP group sizes, matching create_dynamic_dp_cp_groups().
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
+
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
+        if args.min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "--min-dynamic-context-parallel-size="
+                f"{args.min_dynamic_context_parallel_size} is invalid for DPxCP size "
+                f"{dp_cp_size}; expected one of {valid_group_sizes}"
+            )
 
         import warnings
 
@@ -1915,7 +1877,9 @@ def validate_args(args, defaults={}):
             #     earlier in ``validate_args``).
             #   * Otherwise fall back to ``dp_balanced`` (static packing).
             if args.sequence_packing_scheduler is None:
-                args.sequence_packing_scheduler = 'dp_balanced'
+                args.sequence_packing_scheduler = (
+                    'default_dynamic_cp' if args.dynamic_context_parallel else 'dp_balanced'
+                )
 
     # Packed-sequence buffer-size check. Placed after all scheduler auto-select
     # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
@@ -2217,9 +2181,6 @@ def validate_args(args, defaults={}):
             args.async_save = False
 
     if args.logits_save_dir is not None:
-        assert (
-            args.logits_save_top_k is not None
-        ), '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
@@ -2231,6 +2192,10 @@ def validate_args(args, defaults={}):
                 'when dumping logits during active training; for a frozen-teacher dump pass '
                 '--freeze-all-layers.'
             )
+        assert args.rampup_batch_size is None, (
+            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
+            'mapping assumes a fixed global batch size.'
+        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -2271,19 +2236,22 @@ def validate_args(args, defaults={}):
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
-    # In RL inference-only mode, --no-load-optim is user-controlled: it determines whether the
-    # optimizer is created (needed for --rl-offload-optimizer-during-inference) or skipped entirely.
-    if args.skip_train and not args.perform_rl_step and not args.no_load_optim:
+    if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
     rl_cfg.validate_run(
         cuda_graph_impl=args.cuda_graph_impl,
         micro_batch_size=args.micro_batch_size,
         global_batch_size=args.global_batch_size,
+        train_iters=args.train_iters,
+        train_samples=args.train_samples,
         skip_train=args.skip_train,
         load_optim=not args.no_load_optim,
         save_interval=args.save_interval,
         exit_interval=args.exit_interval,
+        separate_inference_model=rl_cfg.uses_separate_inference_model(
+            context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
+        ),
     )
 
     # Optimizer CPU offload check
@@ -2971,15 +2939,6 @@ def _add_inference_args(parser):
         help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.',
     )
     group.add_argument(
-        '--inference-disable-ep-consensus',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
-        'Pause/unpause take effect as soon as the signal is delivered to a rank. '
-        'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
-    )
-    group.add_argument(
         '--inference-shards',
         type=str,
         default=None,
@@ -3088,6 +3047,8 @@ def _add_network_size_args(parser):
         "fp4_param",
         # already generated by data args
         "create_attention_mask_in_dataloader",
+        # filled from the explicit --seq-length argument below
+        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -3102,7 +3063,10 @@ def _add_network_size_args(parser):
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
         "max_seqlen_per_dp_cp_rank",
+        "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
         "hybrid_context_parallel",
+        "dynamic_context_parallel",
+        "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
@@ -3110,9 +3074,6 @@ def _add_network_size_args(parser):
         "expert_gtp_weight_remat_size",
         # Constructed from the dedicated flat CLI arguments below.
         "wide_residual",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3738,17 +3699,6 @@ def _add_regularization_args(parser):
         help='Second beta coefficient for Lion optimizer '
         '(used in momentum EMA update). Default: 0.98.',
     )
-
-    group.add_argument(
-        '--no-weight-decay-cond-type',
-        type=str,
-        choices=['apply_wd_to_qk_layernorm'],
-        help='Type of no weight decay condition. Choices: '
-        'None (default): apply weight decay to 1D weights and biases.'
-        '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
-        'qk layernorm as a special case.'
-        'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ',
-    )
     return parser
 
 
@@ -4023,7 +3973,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     from megatron.training.config import SchedulerConfig
 
-    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
+    sched_factory = ArgumentGroupFactory(SchedulerConfig)
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument(
@@ -4573,10 +4523,28 @@ def _add_distributed_args(parser):
         help='Deprecated alias for --dynamic-context-parallel.',
     )
     group.add_argument(
+        '--dynamic-context-parallel',
+        action='store_true',
+        default=False,
+        help='Enable variable-sized CP groups selected per packed microbatch.',
+    )
+    group.add_argument(
+        '--min-dynamic-context-parallel-size',
+        type=int,
+        default=1,
+        help='Minimum runtime CP group size used by dynamic CP.',
+    )
+    group.add_argument(
         '--sequence-packing-scheduler',
         type=str,
         default=None,
         choices=['dp_balanced', 'default_dynamic_cp'],
+    )
+    group.add_argument(
+        '--pad-packed-seq-alignment',
+        default=None,
+        help="Pad packed THD inputs to a CP-local multiple or 'max'. "
+        "MXFP8 additionally aligns to 32 tokens after SP sharding.",
     )
     group.add_argument(
         '--use-layer-wise-param-layout',
@@ -5342,6 +5310,15 @@ def _add_experimental_args(parser):
 
     # Megatron-FSDP Arguments
     group.add_argument(
+        "--no-megatron-fsdp-padded-shards",
+        action="store_false",
+        dest="megatron_fsdp_padded_shards",
+        help="Megatron-FSDP v2 only. If not set, pad every parameter group so each "
+        "rank gets an equal shard. If set, pack each group without padding and split "
+        "it into generally unequal per-rank shards at row boundaries (32-row block "
+        "boundaries for MXFP8).",
+    )
+    group.add_argument(
         '--megatron-fsdp-main-params-dtype',
         default='fp32',
         choices=['fp32', 'bf16', 'fp16', 'auto'],
@@ -5479,12 +5456,6 @@ def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument(
-        '--sft-tokenizer-prompt-format',
-        type=str,
-        default="nemotron-h-aligned",
-        help='SFT prompt format.',
-    )
-    group.add_argument(
         '--sft-loss-log-mode',
         type=str,
         default='token-weighted',
@@ -5561,9 +5532,12 @@ def _add_varlen_dataset_args(parser):
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
-
+    # -- Teacher saving --
     group.add_argument(
-        '--logits-save-top-k', type=int, default=None, help='Number of top logits to save.'
+        '--logits-save-dir', type=str, default=None, help='Directory to save logits.'
+    )
+    group.add_argument(
+        '--logits-save-top-k', type=int, default=128, help='Number of top logits to save.'
     )
     group.add_argument(
         '--logits-save-top-p',
@@ -5583,15 +5557,13 @@ def _add_logits_distillation_args(parser):
         'cumulative mass. Default: 1.',
     )
     group.add_argument(
-        '--logits-save-dir', type=str, default=None, help='Directory to save logits.'
-    )
-    group.add_argument(
         '--logits-save-dtype',
         type=str,
         default='fp16',
         choices=['fp16', 'bf16', 'fp32'],
         help='Dtype for on-disk top-K log-probabilities.',
     )
+    # -- Student loading --
     group.add_argument(
         '--logits-load-dir', type=str, default=None, help='Directory to load logits.'
     )
@@ -5601,13 +5573,6 @@ def _add_logits_distillation_args(parser):
         default=4,
         help='Number of decode threads for cached-logits zstd '
         'decompression and torch.load processing.',
-    )
-    group.add_argument(
-        '--logits-load-prefetch-factor',
-        type=int,
-        default=3,
-        help='PyTorch DataLoader prefetch factor for decoded '
-        'cached-logits iterations. (Non-MSC only)',
     )
     group.add_argument(
         '--logits-load-msc-prefetch-depth',
@@ -5630,6 +5595,14 @@ def _add_logits_distillation_args(parser):
         default=False,
         help='When set, KD loss errors are logged as warnings and '
         'training falls back to LM-only loss instead of crashing.',
+    )
+    group.add_argument(
+        '--logits-load-ignore-hash',
+        action='store_true',
+        default=False,
+        help='When set, skip cached-logits tar metadata hash validation. '
+        'Use only when intentionally loading logits saved with an '
+        'older or otherwise incompatible dataset hash.',
     )
     return parser
 

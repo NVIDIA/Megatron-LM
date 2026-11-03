@@ -138,7 +138,7 @@ def test_repository_gb200_mapping_respects_recipe_and_marker_filtering(monkeypat
     )
     assert mandatory.mandatory_files(patterns, bucket, ignored) == [
         "tests/unit_tests/distributed/mfsdp_v2/test_grad_comm_dtype.py",
-        "tests/unit_tests/distributed/mfsdp_v2/test_mcore_adapter.py",
+        "tests/unit_tests/distributed/mfsdp_v2/test_mcore_dense.py",
         "tests/unit_tests/distributed/mfsdp_v2/test_quantization.py",
         "tests/unit_tests/distributed/mfsdp_v2/test_quantized_dbuffer.py",
     ]

@@ -470,7 +470,7 @@ def _update_router_qb_beta(
 def _update_router_expert_bias_with_quantile(
     model: List[torch.nn.Module],
     config: TransformerConfig,
-    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    reduction_groups: tuple[Optional[torch.distributed.ProcessGroup], ...] = (),
 ):
     """Pool K3 histograms and update every local router once per global batch."""
     expert_bias_list = []
@@ -493,8 +493,9 @@ def _update_router_expert_bias_with_quantile(
     stacked_bias = torch.stack(expert_bias_list, dim=0)
     stacked_histogram = torch.stack(qb_histogram_list, dim=0)
     stacked_bin_bounds = torch.stack(qb_bin_bounds_list, dim=0)
-    if get_pg_size(tp_dp_cp_group) > 1:
-        torch.distributed.all_reduce(stacked_histogram, group=tp_dp_cp_group)
+    for group in reduction_groups:
+        if get_pg_size(group) > 1:
+            torch.distributed.all_reduce(stacked_histogram, group=group)
     updated_bias, updated_bin_bounds = get_updated_expert_bias_with_quantile(
         stacked_histogram, stacked_bin_bounds, stacked_bias, config.moe_router_topk
     )
@@ -686,10 +687,11 @@ def finalize_model_grads(
         if config.moe_router_enable_expert_bias or (
             config.moe_router_load_balancing_type == "quantile_balancing"
             and config.moe_router_quantile_balancing_estimation_scope == "global_batch"
+            and config.gtp_weight_remat_size <= 1
         ):
             assert (
                 hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None
-            ), "pg_collection must have tp_dp_cp when router bias updates are enabled."
+            ), "pg_collection must have tp_dp_cp when global router bias updates are enabled."
             tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
@@ -787,12 +789,18 @@ def finalize_model_grads(
         if config.moe_router_quantile_balancing_estimation_scope == "micro_batch":
             _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
         else:
-            if pg_collection is None:
-                # Legacy compatibility; modern callers provide pg_collection.tp_dp_cp above.
-                tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
-                    with_context_parallel=True
-                )
-            _update_router_expert_bias_with_quantile(model, config, tp_dp_cp_group=tp_dp_cp_group)
+            if config.gtp_weight_remat_size > 1:
+                qb_reduction_groups = (tp_group, dp_cp_group)
+            else:
+                if pg_collection is None:
+                    # Legacy compatibility; modern callers provide pg_collection.tp_dp_cp above.
+                    tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                qb_reduction_groups = (tp_dp_cp_group,)
+            _update_router_expert_bias_with_quantile(
+                model, config, reduction_groups=qb_reduction_groups
+            )
 
     reset_model_temporary_tensors(config, model)
 

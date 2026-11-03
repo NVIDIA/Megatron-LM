@@ -297,7 +297,7 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
 | **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
-| **quantile_balancing** | Kimi K3 aux-loss-free global-batch histogram quantile bias updates | `--moe-router-load-balancing-type quantile_balancing --moe-router-score-function sigmoid --moe-aux-loss-coeff 0` |
+| **quantile_balancing** | Exact micro-batch or Kimi K3 global-batch histogram quantile bias updates | `--moe-router-load-balancing-type quantile_balancing --moe-router-score-function sigmoid --moe-aux-loss-coeff 0` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
 
@@ -526,7 +526,7 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.
 
-> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment. For decoder layers, `uniform` groups layers by `--recompute-num-layers`, while `block` recomputes the first `--recompute-num-layers` layers. Two overlap-specific exceptions apply: MTP layers are recomputed one segment per depth under both methods (non-overlap leaves MTP eager under `block`), and FP8/FP4 `block` does not shift the recompute window past inputs that do not require gradients as non-overlap checkpointing may do. Both flags are required. Earlier releases accepted them being unset (the whole model chunk was recomputed as one unit); such configs now fail validation and must set the two flags explicitly.
+> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment. For decoder layers, `uniform` groups layers by `--recompute-num-layers`, while `block` recomputes the first `--recompute-num-layers` layers. Two overlap-specific exceptions apply: MTP layers are recomputed one segment per depth under both methods (non-overlap leaves MTP eager under `block`), and FP8/FP4 `block` does not shift the recompute window past inputs that do not require gradients as non-overlap checkpointing may do. Both flags are required. Earlier releases accepted them being unset (the whole model chunk was recomputed as one unit); such configs now fail validation and must set the two flags explicitly. This overlap recompute path requires `--cuda-graph-impl none`; CUDA Graph execution, including `full_iteration`, is not supported.
 
 ### Compute Optimization
 
@@ -594,10 +594,11 @@ FP8 training provides benefits across all three performance walls:
 #### MOK
 
 A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.
-Select MOK with the following YAML configuration:
+Select MOK for a SwiGLU model with the following YAML configuration:
 
 ```yaml
 bf16: true
+add_bias_linear: false
 moe_grouped_gemm: true
 moe_ffn_hidden_size: 3072
 gradient_accumulation_fusion: true
@@ -614,25 +615,50 @@ The equivalent backend-specific CLI value is a JSON object:
 --moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
 ```
 
-This integration targets the
-[MCore integration branch of Mixture-of-Kittens](https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration),
-which is an optional dependency and is imported only when the backend is selected.
+MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
+image already installs the supported
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
+supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
+target is unsupported.
 
 | Area | Current MOK support |
 |------|---------------------|
-| GPU architecture | NVIDIA Blackwell; validated on GB300 |
-| Routed precision | BF16, or MXFP8 with FP8 parameter gather (Transformer Engine 2.10 or later) |
-| Shared experts | Required; BF16; same intermediate size as routed experts |
-| Activation | SwiGLU |
-| Routed weight layout | Single-grouped and per-expert non-single weights |
-| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64} |
+| GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
+| Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
+| Router precision | `moe_router_dtype=None` or `"fp32"`; FP64 routing/weighted averaging is unsupported |
+| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
+| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
+| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
+Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
+precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
+to the BF16 gradient buffer. This is independent of the BF16 shared-expert weight dtype.
+The pinned MOK entrypoint requires shared and routed expert main-grad buffers to use the same dtype.
+The optional shared output gate aliases the native shared-expert parameter and accumulates into
+its FP32 or BF16 `main_grad`. It supports Qwen3.5's gated shared-expert MoE without changing native
+parameter ownership or checkpoint keys; the GDN and attention layers retain their existing paths.
+
+With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
+native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
+require this mode in the current MCore buffer implementation. MOK aliases the native payloads
+and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
+both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
+
+Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
+per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
+static input token counts alone do not establish that lifecycle.
+
 The current backend requires grouped experts and fused gradient accumulation. It does not support
-MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap/gating, shared-expert-only
-recompute, latent MoE, overload-factor logging, partial MoE CUDA Graph replay, MCore expert-input
+linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
+wgrad, native shared-expert overlap, shared-expert-only
+recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
 
@@ -701,7 +727,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | Argument | Description | Default |
 |----------|-------------|---------|
 | --moe-router-load-balancing-type | Load balancing: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, quantile_balancing, none | aux_loss |
-| --moe-router-quantile-balancing-estimation-scope | Quantile population; dev supports global_batch | global_batch |
+| --moe-router-quantile-balancing-estimation-scope | Quantile population: micro_batch or global_batch | global_batch |
 | --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |

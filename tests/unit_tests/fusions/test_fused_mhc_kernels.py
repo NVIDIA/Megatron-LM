@@ -656,6 +656,7 @@ class TestTritonHPostBDABwdE2EDebug:
         h_pre = h[..., :n].sigmoid()
         h_post_val = h[..., n : 2 * n].sigmoid() * 2
         h_res = fused_sinkhorn(h[..., 2 * n :].view(s, b, n, n), sinkhorn_iters, eps)
+        h_pre, h_post_val, h_res = h_pre.to(DTYPE), h_post_val.to(DTYPE), h_res.to(DTYPE)
         _ = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
         output = fused_h_post_bda(
             h_res, hs.view(s, b, n, C), h_post_val, layer_out_data, layer_bias_data
@@ -763,9 +764,10 @@ class TestNativeProjRms:
 
         xr = x_data.clone().requires_grad_(True)
         wr = w_data.clone().requires_grad_(True)
-        proj_r, r_r = _ref_proj_rms(xr, wr, eps)
+        proj_r, r_r = _ref_proj_rms(xr.float(), wr.float(), eps)
         (proj_r * grad_proj + r_r * grad_r).sum().backward()
 
+        assert proj_f.dtype == r_f.dtype == torch.float32
         torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
@@ -930,6 +932,7 @@ class TestEndToEndNative:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -990,6 +993,8 @@ class TestEndToEndFused:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            # Match HyperConnectionModule's activation-dtype mappings for fused mixing.
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -1015,6 +1020,7 @@ class TestEndToEndFused:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -1029,8 +1035,11 @@ class TestEndToEndFused:
         proj_f, r_f, out_f, agg_f, grad_f = _run_fused()
         proj_r, r_r, out_r, agg_r, grad_r = _run_ref()
 
-        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        proj_32, r_32 = _ref_proj_rms(hs_data.reshape(s * b, n * C).float(), w_data.float(), eps)
+        assert proj_f.dtype == r_f.dtype == torch.float32
+        assert out_f.dtype == agg_f.dtype == DTYPE
+        torch.testing.assert_close(proj_f, proj_32.view(s, b, -1), atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(r_f, r_32.view(s, b, 1), atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
             out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
@@ -1326,6 +1335,7 @@ class TestEndToEndFusedBroadcast:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = fused_h_aggregate(hs_agg.view(s, b, n, C), h_pre)
 
@@ -1365,6 +1375,7 @@ class TestEndToEndFusedBroadcast:
         out_f, agg_f, grad_f = _run_fused_broadcast()
         out_r, agg_r, grad_r = _run_ref()
 
+        assert out_f.dtype == agg_f.dtype == DTYPE
         torch.testing.assert_close(
             agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated mismatch (fused broadcast)"
         )

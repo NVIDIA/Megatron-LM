@@ -108,6 +108,20 @@ def test_qb_micro_batch_rejects_unsupported_paths(overrides, error_match):
         _config(moe_router_quantile_balancing_estimation_scope="micro_batch", **overrides)
 
 
+def test_qb_defaults_to_global_batch_scope():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=1,
+        moe_router_score_function="sigmoid",
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+    )
+    assert config.moe_router_quantile_balancing_estimation_scope == "global_batch"
+
+
 def test_qb_rejects_nonzero_aux_loss():
     with pytest.raises(ValueError, match="moe_aux_loss_coeff=0"):
         _config(moe_aux_loss_coeff=0.01)
@@ -116,6 +130,28 @@ def test_qb_rejects_nonzero_aux_loss():
 def test_qb_rejects_pre_softmax_routing():
     with pytest.raises(ValueError, match="does not use pre-softmax"):
         _config(moe_router_pre_softmax=True)
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(8, 8), (1, 1), (8, 9), (8, 0), (8, -1)])
+def test_qb_rejects_invalid_topk(scope, num_experts, topk):
+    with pytest.raises(ValueError, match="0 < moe_router_topk < num_moe_experts"):
+        _config(
+            moe_router_quantile_balancing_estimation_scope=scope,
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+        )
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(2, 1), (8, 1), (8, 7)])
+def test_qb_accepts_valid_topk(scope, num_experts, topk):
+    config = _config(
+        moe_router_quantile_balancing_estimation_scope=scope,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
+    )
+    assert config.moe_router_topk == topk
 
 
 def test_qb_treats_negative_capacity_as_disabled():
@@ -317,7 +353,7 @@ def test_qb_finalize_updates_once_and_reset_preserves_buffers():
     histogram_ptr = router.qb_histogram.data_ptr()
     bounds_ptr = router.qb_bin_bounds.data_ptr()
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
     torch.testing.assert_close(router.expert_bias, torch.tensor([0.25, -0.25]))
     reset_model_temporary_tensors(config, [model])
@@ -330,7 +366,7 @@ def test_qb_finalize_without_active_router_is_a_noop():
     model = torch.nn.Module()
     config = SimpleNamespace(moe_router_topk=1)
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
 
 def test_qb_router_maintains_float32_bias_and_bounds():
@@ -430,7 +466,7 @@ def test_qb_mcore_router_accumulates_microbatches_and_finalizes(fused, monkeypat
         marked_bounds.append,
     )
     _update_router_expert_bias_with_quantile(
-        [layer], config, tp_dp_cp_group=torch.distributed.group.WORLD
+        [layer], config, reduction_groups=(torch.distributed.group.WORLD,)
     )
 
     assert len(marked_bounds) == 1

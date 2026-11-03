@@ -441,9 +441,11 @@ class TestTransformerBlockMHCRecompute:
             get_gpt_layer_with_transformer_engine_spec,
         )
         from megatron.core.transformer.hyper_connection import HyperConnectionModule
+        from megatron.core.transformer.hyper_connection_transformer_layer import (
+            HyperConnectionTransformerLayer,
+        )
         from megatron.core.transformer.transformer_block import TransformerBlock
         from megatron.core.transformer.transformer_config import TransformerConfig
-        from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
 
         config = TransformerConfig(
             num_layers=num_layers,

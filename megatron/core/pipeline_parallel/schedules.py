@@ -276,6 +276,17 @@ def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
     return _compute_loss_scale(config, device)
 
 
+def _set_mtp_loss_scale(config, device: torch.device, num_microbatches: int) -> None:
+    """Publish the MTP loss scale so MTP backward (deferred or early) matches the main loss."""
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    loss_scale = _get_mtp_loss_scale(config, device)
+    if config.calculate_per_token_loss:
+        MTPLossAutoScaler.set_loss_scale(loss_scale)
+    else:
+        MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+
 def _get_experimental_attention_variant_loss_scale_func(config):
     """Get the loss scale hook for experimental attention variants."""
     loss_scale_func = getattr(config, 'experimental_attention_variant_loss_scale_func', None)
@@ -305,8 +316,6 @@ def forward_step_calc_loss(
     is_last_stage=None,
 ):
     """Calculate the loss and number of tokens for forward_step()"""
-
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -355,7 +364,9 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    if (hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None) or getattr(
+        config, '_hybrid_has_moe_layers', False
+    ):
         device = get_tensor_device(output_tensor)
         loss_scale = _get_moe_loss_scale(config, device)
         # Set the loss scale
@@ -371,13 +382,7 @@ def forward_step_calc_loss(
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on mtp_grad_scale_func if available,
         # else fall back to grad_scale_func, else default to 1.
-        device = get_tensor_device(output_tensor)
-        loss_scale = _get_mtp_loss_scale(config, device)
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        _set_mtp_loss_scale(config, get_tensor_device(output_tensor), num_microbatches)
 
     # Set the loss scale for any experimental attention-variant auxiliary loss.
     experimental_attention_variant_loss_scale_func = (
@@ -389,10 +394,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            # TODO: This path assumes static CP across outstanding pipeline microbatches.
-            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
-            # changes, carry the scale per autograd context instead of via a
-            # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches
@@ -490,7 +491,6 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -507,6 +507,18 @@ def forward_step(
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
+
+    # With mtp_loss_early_backward the MTP heads run their backward inside the forward pass,
+    # so the MTP loss scale must already be current before the model is called. The scale is
+    # refreshed again after the forward (below) for the deferred path.
+    if (
+        getattr(config, 'mtp_num_layers', None) is not None
+        and getattr(config, 'mtp_loss_early_backward', False)
+        and torch.cuda.is_available()
+    ):
+        _set_mtp_loss_scale(
+            config, torch.device('cuda', torch.cuda.current_device()), num_microbatches
+        )
 
     if config.enable_autocast:
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
