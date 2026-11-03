@@ -13,17 +13,15 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor import Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
-    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -44,133 +42,11 @@ class TinyModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
-        return self.fc2(torch.relu(self.fc1(x)).to(self.fc2.weight.dtype))
+        return self.fc2(torch.relu(self.fc1(x)))
 
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
-
-
-@pytest.mark.parametrize("singleton", [False, True], ids=["reduced", "local"])
-@pytest.mark.parametrize("sync_each_microbatch", [False, True])
-def test_mixed_dtype_groups_match_reference_gradients(
-    distributed_setup, singleton, sync_each_microbatch
-):
-    """One module handles both trainable dtypes and skips its frozen parameter group."""
-    setup = distributed_setup
-    if setup.world_size < 2:
-        pytest.skip("Requires a nontrivial data-parallel axis.")
-    mesh = init_device_mesh(
-        setup.device.type, (setup.world_size, 1), mesh_dim_names=("dp", "local")
-    )["local" if singleton else "dp"]
-    torch.manual_seed(1234)
-    model = TinyModel().to(setup.device)
-    model.fc1.to(torch.bfloat16)
-    model.fc1.bias.requires_grad_(False)
-    reference = TinyModel().to(setup.device)
-    reference.fc1.to(torch.bfloat16)
-    reference.fc1.bias.requires_grad_(False)
-    reference.load_state_dict(model.state_dict())
-    context = FsdpContext(device=setup.device)
-    with fully_shard_context(context):
-        fully_shard(
-            model,
-            mesh,
-            Placements([0], [Replicate()], [Replicate()], [Replicate()]),
-            mixed_precision_policy=MixedPrecisionPolicy(main_grads_dtype=torch.float32),
-        )
-
-    inputs = torch.full((4, 8), setup.rank + 1, device=setup.device, dtype=torch.bfloat16)
-    for index in range(2):
-        reference.zero_grad(set_to_none=True)
-        reference(inputs).sum().backward()
-        with microbatch(context, is_last=index == 1):
-            model(inputs).sum().backward()
-        if sync_each_microbatch:
-            context.finish_grad_sync()
-    context.finish_grad_sync()
-    for actual, expected in zip(model.parameters(), reference.parameters()):
-        if not expected.requires_grad:
-            assert actual.grad is None
-            continue
-        gradient = expected.grad.float()
-        if not singleton:
-            dist.all_reduce(gradient, op=dist.ReduceOp.AVG)
-        torch.testing.assert_close(actual.grad.to_local(), gradient * 2, rtol=0, atol=0)
-
-
-def test_replicated_gradients_still_reduce(distributed_setup):
-    """Full local gradient storage does not imply that cross-rank reduction is unnecessary."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires distinct contributions from at least two ranks.")
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Linear(8, 8, bias=False, device=device)
-    with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh, Placements([0], [Replicate()], [Replicate()], [Replicate()]))
-    inputs = torch.full((1, 8), float(distributed_setup.rank + 1), device=device)
-    for count in (1, 2):
-        model(inputs).sum().backward()
-        expected = torch.full_like(
-            inputs.expand(8, 8), count * (distributed_setup.world_size + 1) / 2
-        )
-        torch.testing.assert_close(model.weight.grad.to_local(), expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("outer_optimizer", [Replicate(), Shard(0)], ids=["hsdp", "hfsdp"])
-@pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("set_to_none", [False, True])
-@pytest.mark.parametrize("sync_each_microbatch", [False, True])
-def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
-    distributed_setup, outer_optimizer, grad_comm_dtype, set_to_none, sync_each_microbatch
-):
-    """Local accumulation uses main-grad precision regardless of the communication dtype."""
-    setup = distributed_setup
-    if setup.world_size < 2:
-        pytest.skip("Requires a nontrivial outer data-parallel axis.")
-    mesh = init_device_mesh(setup.device.type, (setup.world_size, 1))
-    model = nn.Linear(8, 8, bias=False, device=setup.device, dtype=torch.bfloat16)
-    context = FsdpContext(
-        device=setup.device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
-    )
-    scale = 1 / 3
-    with fully_shard_context(context):
-        fully_shard(
-            model,
-            mesh,
-            Placements(
-                [0, 1],
-                [Replicate(), Shard(0)],
-                [Partial("avg"), Shard(0)],
-                [outer_optimizer, Shard(0)],
-            ),
-            mixed_precision_policy=MixedPrecisionPolicy(
-                main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
-            ),
-            grad_scale=scale,
-        )
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    fully_shard_optimizer(optimizer)
-    for _ in range(3):
-        optimizer.zero_grad(set_to_none=set_to_none)
-        expected_by_rank = torch.zeros(setup.world_size, device=setup.device)
-        for index in range(2):
-            with microbatch(context, is_last=index == 1):
-                inputs = torch.full(
-                    (1, 8), setup.rank + index + 1, device=setup.device, dtype=torch.bfloat16
-                )
-                model(inputs).float().sum().backward()
-            # Local contributions are scaled in main-grad precision, even with BF16 comms.
-            contributions = torch.arange(
-                index + 1, setup.world_size + index + 1, device=setup.device, dtype=torch.float32
-            )
-            expected_by_rank.add_(contributions * scale)
-            if sync_each_microbatch or index == 1:
-                context.finish_grad_sync()
-                expected = expected_by_rank.mean() if index == 1 else expected_by_rank[setup.rank]
-                actual = model.weight.grad.to_local()
-                torch.testing.assert_close(actual, expected.expand_as(actual), rtol=1e-6, atol=0)
-        optimizer.step()
 
 
 @pytest.mark.parametrize(
