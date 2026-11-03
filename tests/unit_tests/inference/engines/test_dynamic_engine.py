@@ -4085,7 +4085,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     assert client.request_submission_times == {}
 
                 class CurrentLoopBridge:
-                    def __init__(self, loop):
+                    def __init__(self, loop) -> None:
                         self.loop = loop
 
                     async def run_async(self, coroutine):
