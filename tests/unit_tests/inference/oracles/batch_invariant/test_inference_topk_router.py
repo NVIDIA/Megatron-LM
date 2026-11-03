@@ -545,6 +545,25 @@ def test_cuda_graph_replay(path):
             check_routing(probs_buf, experts_buf, new, topk, kind, bias, None, f"replay {seed}")
 
 
+@pytest.mark.sanitizer
+@pytest.mark.parametrize("path", ["triton", "compiled"])
+def test_sanitizer_case(path, monkeypatch):
+    """Small case for compute-sanitizer: 160 experts (not a power of two, so the sigmoid kernel
+    masks 96 of its 256 columns), top-6 with scaling and an expert bias, and 7 tokens, so the
+    kernel's 4-row blocks end in a partial block; the compiled routing on the same shape. The
+    spy checks which implementation ran."""
+    num_experts, topk, tokens, kind, scaling = 160, 6, 7, "sigmoid_bias", 2.5
+    backend = "torch" if path == "compiled" else "triton"
+    router, bias, logits, x = _setup(
+        num_experts, topk, kind, tokens, seed=3, backend=backend, scaling=scaling
+    )
+    spy = _PathSpy(monkeypatch)
+    probs, experts = run_router(router, x, path)
+    want = "triton_kernel" if path == "triton" else "compiled"
+    assert spy.calls == [want], f"ran {spy.calls}, expected {want}"
+    check_routing(probs, experts, logits, topk, kind, bias, scaling, f"sanitizer {path}")
+
+
 def _gemm_reference(x, w):
     return x @ w.t()
 
