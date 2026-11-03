@@ -5088,7 +5088,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.context.mtp_prefix_backoff_stats.items()
                         )
                     )
-                    output_str += ", unregistered %d" % self.context.mtp_prefix_unregistered_blocks
+                    output_str += ", unregistered %d, replaced %d" % (
+                        self.context.mtp_prefix_unregistered_blocks,
+                        self.context.mtp_prefix_replaced_blocks,
+                    )
             output_str += self._staging_log_suffix()
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"

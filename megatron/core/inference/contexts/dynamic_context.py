@@ -276,6 +276,7 @@ class PrefixMatch:
     backed_off_blocks: int = 0
     speculative_reserve_blocks: int = 0
     mtp_backoff_reason: Optional[str] = None
+    mtp_declined_block_id: Optional[int] = None
 
 
 @dataclass
@@ -3412,8 +3413,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             req, already_allocated_blocks, overall_required_blocks
         )
 
-        matched_block_ids, mtp_backed_off_blocks, mtp_backoff_reason = self._mtp_trim_prefix_match(
-            req, matched_block_ids, already_allocated_blocks
+        matched_block_ids, mtp_backed_off_blocks, mtp_backoff_reason, mtp_declined_block_id = (
+            self._mtp_trim_prefix_match(req, matched_block_ids, already_allocated_blocks)
         )
 
         num_matched = len(matched_block_ids)
@@ -3476,6 +3477,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
+        # A continuation chunk holding the MTP boundary carry must start at `finished`, where
+        # the carry is consumable, so it inherits its matched blocks without skipping them.
+        if self.enable_mtp_kv_cache and self.mtp_metadata.chunk_boundary_req_id == req.request_id:
+            prefix_skip_tokens = 0
+
         # A one-token chunk is fine: `initialize_attention_state` keeps max_seqlen_q >= 2
         # for any batch containing prefill.
 
@@ -3498,6 +3504,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             backed_off_blocks=mtp_backed_off_blocks,
             speculative_reserve_blocks=speculative_reserve_blocks,
             mtp_backoff_reason=mtp_backoff_reason,
+            mtp_declined_block_id=mtp_declined_block_id,
         )
 
     def check_availability(
@@ -3657,6 +3664,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
+
+        # Before drawing from the pool, so an evicted declined block is reusable right away.
+        mtp_replaced_declined_block = self._mtp_try_replace_declined_block(match)
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
@@ -3852,7 +3862,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             total_tokens_after = req.finished_chunk_token_count + prefill_chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
-            if match.backed_off_blocks and req.mtp_private_suffix_start is None:
+            if (
+                match.backed_off_blocks
+                and not mtp_replaced_declined_block
+                and req.mtp_private_suffix_start is None
+            ):
                 req.mtp_private_suffix_start = already_allocated_blocks + num_matched_blocks
 
             def _register_range(start: int, end: int):

@@ -4344,46 +4344,99 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
             "token it was computed against."
         )
 
+    @staticmethod
+    def _carry(meta, r):
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
+            req_id=r.request_id,
+            position=r.finished_chunk_token_count - 1,
+        )
+
     @pytest.mark.internal
-    def test_continuation_chunk_with_a_pending_carry_gives_up_its_whole_match(self):
+    def test_continuation_chunk_with_a_pending_carry_inherits_without_skipping(self):
         """A carry pending for this request means its next chunk takes NO prefix skip.
 
         The carry can only be consumed at `finished - 1`. Any skip moves the chunk's start past
         that position, and nothing can then write it -- the hidden for the skipped region was
         never computed by anyone able to pair it with the following token. The skip is block
-        granular, so the only way to keep the carry usable is to take none of the match.
+        granular, so the chunk must start at `finished`. It still inherits the matched blocks
+        that extend its run of inherited blocks: the commit pass keeps its writes out of them,
+        and giving them up would make the rest of the prompt private, so later turns of the
+        same session could never reuse it.
         """
         ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
         meta = ctx.mtp_metadata
         prompt = self._prompt(bs * 5)
 
-        # Publish the canonical chain first. A later request that declines an ancestor
-        # keeps its suffix private, so it cannot publish these descendants for us.
+        # Publish the canonical chain first.
         ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
         r = self._req(ctx, prompt.clone(), request_id=1)
         ctx.add_request(r, prefill_chunk_length=bs * 2)
+        assert r.num_matched_prefix_blocks == 2
         r.finished_chunk_token_count += bs * 2
         r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs * 2 :]
 
-        # Without a carry the continuation chunk would take the match (minus the last block).
+        # Without a carry the continuation chunk would take the match and skip it.
         assert not meta.chunk_boundary_valid
         with_skip = ctx._compute_prefix_match(r, bs * 3)
         assert with_skip.prefix_skip_tokens > 0
         assert with_skip.matched_block_ids
 
-        # With a carry pending for THIS request, the whole match is given up so the chunk starts
-        # at `finished` and the seam stays writable.
-        meta.carry_chunk_boundary(
-            hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
-            req_id=r.request_id,
-            position=bs * 2 - 1,
-        )
+        # With a carry pending for THIS request, the same blocks are inherited but not skipped,
+        # so the chunk starts at `finished` and the seam stays writable.
+        self._carry(meta, r)
         match = ctx._compute_prefix_match(r, bs * 3)
-        assert match.matched_block_ids == []
+        assert match.matched_block_ids == with_skip.matched_block_ids
+        assert match.backed_off_blocks == with_skip.backed_off_blocks
         assert match.prefix_skip_tokens == 0
-        assert match.backed_off_blocks == len(with_skip.matched_block_ids) + 1
 
-        # The seam now lands exactly where the carry describes.
+        # The seam lands exactly where the carry describes.
         off = r.finished_chunk_token_count + match.prefix_skip_tokens
         assert meta.take_chunk_boundary(req_id=r.request_id, seam_position=off - 1) is not None
+
+        # Admitting the chunk extends the inherited run (which the commit pass keeps its draft
+        # writes out of) and keeps the rest of the prompt registrable.
+        self._carry(meta, r)
+        ctx.total_request_count -= 1
+        ctx.active_token_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.add_request(r)
+        inherited = 2 + len(match.matched_block_ids)
+        assert r.num_matched_prefix_blocks == inherited
+        assert ctx.mtp_metadata.request_matched_prefix_blocks[ctx.total_request_count - 1] == (
+            inherited
+        )
+        self._assert_hash_registry_is_injective(alloc)
+        self._assert_chained_ancestry(alloc, r)
+
+    @pytest.mark.internal
+    def test_continuation_chunk_with_a_carry_after_a_gap_gives_up_its_whole_match(self):
+        """Matches that do not extend the inherited run are shared blocks the commit pass would
+        write into (it only protects the leading run), so they are all given up."""
+        ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        bs = ctx.block_size_tokens
+        meta = ctx.mtp_metadata
+        prompt = self._prompt(bs * 5)
+        r = self._req(ctx, prompt.clone(), request_id=1)
+        # Nothing is cached yet, so the first chunk computes its blocks itself.
+        ctx.add_request(r, prefill_chunk_length=bs * 2)
+        assert r.num_matched_prefix_blocks == 0
+        r.finished_chunk_token_count += bs * 2
+        r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs * 2 :]
+        # Model a later block that some other request cached meanwhile.
+        alloc = ctx.kv_block_allocator
+        [block] = alloc.allocate_memory_blocks(1).tolist()
+        alloc.register_kv_block_hashes(
+            [block], [r.precomputed_block_hashes[2]], [r.precomputed_block_hashes[1]]
+        )
+        alloc.block_mtp_next_token[block] = int(prompt[3 * bs])
+
+        assert ctx._compute_prefix_match(r, bs * 3).matched_block_ids == [block]
+        self._carry(meta, r)
+        match = ctx._compute_prefix_match(r, bs * 3)
+        assert match.matched_block_ids == []
+        assert match.backed_off_blocks == 1
+        assert match.mtp_backoff_reason == "carry"
+        assert match.prefix_skip_tokens == 0
