@@ -126,6 +126,7 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
 
     return args
 
+
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
