@@ -90,7 +90,7 @@ def test_padding_rejects_capacity_overflow_without_truncation():
 def test_padding_disabled_preserves_batch():
     batch = _batch()
     original = dict(batch)
-    pad_packed_batch_before_cp_slice(batch, SimpleNamespace(), 2, 1)
+    assert pad_packed_batch_before_cp_slice(batch, SimpleNamespace(), 2, 1) is None
     assert all(batch[key] is value for key, value in original.items())
 
 
@@ -221,6 +221,33 @@ def test_cuda_graph_packs_share_static_thd_metadata(tail_padding_policy):
             )
         )
     assert signatures == {((10,), (10,), 32)}
+
+
+@pytest.mark.parametrize(
+    'lengths,expected_boundaries', [([4, 4], [0, 4, 8]), ([4, 8], [0, 4, 12, 16]), ([3, 5], None)]
+)
+def test_padding_returns_host_boundaries_and_keeps_valid_rows(lengths, expected_boundaries):
+    # [4, 4] is aligned for CP2 and fills the target; [4, 8] only gains the tail; [3, 5] is
+    # regathered.
+    batch = _compact_batch(lengths)
+    tokens = batch['tokens'].clone()
+    cu_seqlens = batch['cu_seqlens']
+    config = SimpleNamespace(pad_packed_seq_alignment=4, max_seqlen_per_dp_cp_rank=16)
+    host_boundaries = pad_packed_batch_before_cp_slice(batch, config, 2, 1)
+    assert host_boundaries == batch['cu_seqlens_padded'].tolist()
+    assert host_boundaries[-1] == batch['tokens'].numel()
+    if expected_boundaries is not None:
+        assert host_boundaries == expected_boundaries
+        assert (batch['cu_seqlens'] is cu_seqlens) == (expected_boundaries[-1] == sum(lengths))
+    torch.testing.assert_close(batch['tokens'][~batch['padding_mask']], tokens)
+
+
+def test_aligned_padding_rejects_short_token_tensors():
+    batch = _compact_batch([4, 4])
+    batch['tokens'] = batch['tokens'][:6]
+    config = SimpleNamespace(pad_packed_seq_alignment=4, max_seqlen_per_dp_cp_rank=16)
+    with pytest.raises(IndexError, match='tokens'):
+        pad_packed_batch_before_cp_slice(batch, config, 2, 1)
 
 
 def test_static_thd_capacity_rejects_extra_sequences():

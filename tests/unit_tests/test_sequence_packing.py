@@ -108,12 +108,16 @@ def test_build_packed_microbatches_certifies_zigzag_chunk_size(
         (2, [0, 8, 14], 0),
     ],
 )
-def test_pre_slice_padding_refreshes_zigzag_certificate(certificate, cu_seqlens_padded, expected):
+@pytest.mark.parametrize("use_host_boundaries", [False, True])
+def test_pre_slice_padding_refreshes_zigzag_certificate(
+    certificate, cu_seqlens_padded, expected, use_host_boundaries
+):
     """Pre-CP-slice padding never leaves a certificate that overstates the layout."""
     refreshed = _refresh_zigzag_cp_certificate(
         torch.tensor(certificate, dtype=torch.int32),
         torch.tensor(cu_seqlens_padded, dtype=torch.int32),
         cp_size=2,
+        cu_seqlens_padded_host=cu_seqlens_padded if use_host_boundaries else None,
     )
 
     assert refreshed.dtype == torch.int32
