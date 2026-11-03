@@ -30,7 +30,9 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -134,7 +136,12 @@ _MOE = dict(
 
 
 def _build_model(kind: str, config: TransformerConfig) -> torch.nn.Module:
-    """Build a model of ``kind`` ("gpt", "mla", "moe", or "hybrid") on CUDA."""
+    """Build a model of ``kind`` on CUDA.
+
+    ``kind`` is "gpt", "mla", "moe", "hybrid" (attention layers with an MTP layer), or
+    "hybrid_layer_configs" (an attention layer and an MLP layer whose own config, unlike
+    the root config, selectively recomputes the MLP).
+    """
     if kind == "hybrid":
         # "/" separates the decoder pattern from the MTP layer pattern.
         model = HybridModel(
@@ -143,6 +150,17 @@ def _build_model(kind: str, config: TransformerConfig) -> torch.nn.Module:
             vocab_size=128,
             max_sequence_length=32,
             hybrid_layer_pattern="*/*",
+        )
+    elif kind == "hybrid_layer_configs":
+        mlp_layer_config = MLPLayerConfig.from_config(config)
+        mlp_layer_config.recompute_granularity = "selective"
+        mlp_layer_config.recompute_modules = ["mlp"]
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+            hybrid_layer_config_list=[AttentionLayerConfig.from_config(config), mlp_layer_config],
         )
     else:
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -182,13 +200,13 @@ _GPT_MTP_LAYERS = {"decoder.layers.0", "decoder.layers.1", "mtp.layers.0.mtp_mod
 
 
 @pytest.mark.parametrize(
-    "kind, config_kwargs, extra_fsdp_unit_modules, expected_units",
+    "kind, config_kwargs, fsdp_unit_modules, expected_units",
     [
-        pytest.param("gpt", _MTP, (), set(), id="no_recompute"),
+        pytest.param("gpt", _MTP, None, set(), id="no_recompute"),
         pytest.param(
             "gpt",
             dict(**_MTP, **_SELECTIVE, recompute_modules=["core_attn"]),
-            (),
+            None,
             set(),
             id="selective_core_attn",
         ),
@@ -196,33 +214,40 @@ _GPT_MTP_LAYERS = {"decoder.layers.0", "decoder.layers.1", "mtp.layers.0.mtp_mod
         pytest.param(
             "gpt",
             dict(**_MTP, **_SELECTIVE, recompute_modules=["mlp"]),
-            (),
+            None,
             _GPT_MTP_LAYERS,
             id="selective_mlp",
         ),
         pytest.param(
             "mla",
             dict(**_MLA, **_SELECTIVE, recompute_modules=["mla_up_proj"]),
-            (),
+            None,
             {"decoder.layers.0", "decoder.layers.1"},
             id="selective_mla_up_proj",
         ),
+        # The MLP layer's own config recomputes, although the root config does not.
+        pytest.param(
+            "hybrid_layer_configs", {}, None, {"decoder.layers.1"}, id="selective_layer_config"
+        ),
         # Only the root owns eh_proj, which the MTP checkpoint reruns.
-        pytest.param("gpt", dict(**_MTP, **_FULL), (), {""}, id="full"),
+        pytest.param("gpt", dict(**_MTP, **_FULL), None, {""}, id="full"),
+        # Without layer units, the block's checkpoint reruns layers owned by the root or block.
+        pytest.param("gpt", _FULL, [], {""}, id="full_no_layer_units"),
+        pytest.param("gpt", _FULL, [TransformerBlock], {"decoder"}, id="full_block_unit"),
         # The MTP layer checkpoints inside its own forward, so it needs the opt-in as a unit too.
         pytest.param(
             "gpt",
             dict(**_MTP, **_FULL),
-            (MultiTokenPredictionLayer,),
+            [TransformerLayer, MultiTokenPredictionLayer],
             {"mtp.layers.0"},
             id="full_mtp_layer_unit",
         ),
         # Hybrid MTP layers do not checkpoint eh_proj; their inner layers are units.
-        pytest.param("hybrid", dict(**_MTP, **_FULL), (), set(), id="full_hybrid_mtp"),
+        pytest.param("hybrid", dict(**_MTP, **_FULL), None, set(), id="full_hybrid_mtp"),
     ],
 )
 def test_unshard_all_planes_in_backward_follows_recompute(
-    process_group_collection, kind, config_kwargs, extra_fsdp_unit_modules, expected_units
+    process_group_collection, kind, config_kwargs, fsdp_unit_modules, expected_units
 ):
     """The adapter opts in exactly the units whose weights recomputation uses without re-entry."""
     config = _build_config(kind, **config_kwargs)
@@ -230,9 +255,7 @@ def test_unshard_all_planes_in_backward_follows_recompute(
         _build_model(kind, config),
         config,
         process_group_collection,
-        fsdp_unit_modules=(
-            [TransformerLayer, *extra_fsdp_unit_modules] if extra_fsdp_unit_modules else None
-        ),
+        fsdp_unit_modules=fsdp_unit_modules,
     )
     assert units_unsharding_all_planes_in_backward(model) == expected_units
 
@@ -243,23 +266,28 @@ def test_unshard_all_planes_in_backward_follows_recompute(
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
 )
 @pytest.mark.parametrize(
-    "kind, model_kwargs, recompute_kwargs",
+    "kind, model_kwargs, recompute_kwargs, fsdp_unit_modules",
     [
-        pytest.param("gpt", {}, dict(**_SELECTIVE, recompute_modules=["mlp"]), id="selective_mlp"),
-        pytest.param("gpt", {}, _FULL, id="full"),
+        pytest.param(
+            "gpt", {}, dict(**_SELECTIVE, recompute_modules=["mlp"]), None, id="selective_mlp"
+        ),
+        pytest.param("gpt", {}, _FULL, None, id="full"),
+        pytest.param("gpt", {}, _FULL, [], id="full_no_layer_units"),
+        pytest.param("gpt", {}, _FULL, [TransformerBlock], id="full_block_unit"),
         pytest.param(
             "moe",
             _MOE,
             dict(**_SELECTIVE, recompute_modules=["shared_experts"]),
+            None,
             id="selective_shared_experts",
         ),
         pytest.param(
-            "moe", _MOE, dict(**_SELECTIVE, recompute_modules=["moe"]), id="selective_moe"
+            "moe", _MOE, dict(**_SELECTIVE, recompute_modules=["moe"]), None, id="selective_moe"
         ),
     ],
 )
 def test_mxfp8_recompute_matches_no_recompute(
-    process_group_collection, kind, model_kwargs, recompute_kwargs
+    process_group_collection, kind, model_kwargs, recompute_kwargs, fsdp_unit_modules
 ):
     """MXFP8 recomputation using weights of a unit it does not re-enter matches no recompute."""
     batch_size, sequence_length = 2, 32
@@ -286,7 +314,12 @@ def test_mxfp8_recompute_matches_no_recompute(
             **model_kwargs,
             **recompute_kwargs,
         )
-        model = wrap_with_fsdp_v2(_build_model(kind, config), config, process_group_collection)
+        model = wrap_with_fsdp_v2(
+            _build_model(kind, config),
+            config,
+            process_group_collection,
+            fsdp_unit_modules=fsdp_unit_modules,
+        )
 
         def forward():
             loss = model(

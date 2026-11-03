@@ -14,6 +14,8 @@
 
 """Select MCore modules for MFSDP v2 sharding."""
 
+from typing import NamedTuple, Sequence
+
 from torch import nn
 
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
@@ -21,11 +23,49 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
+class _SelectiveRecompute(NamedTuple):
+    """A module's selective recompute, which reruns part of its forward in backward.
+
+    The rerun recomputes activations with the rerun part's weights but does not call the
+    forward hooks of the FSDP unit owning those weights.
+    """
+
+    # Attribute a module sets to True at construction when it recomputes.
+    flag: str
+    # Attribute naming the rerun submodule, or None when the module reruns itself.
+    rerun_submodule: str | None
+
+
+_SELECTIVE_RECOMPUTES = (
+    _SelectiveRecompute("recompute_mlp", "mlp"),  # TransformerLayer, "mlp"
+    _SelectiveRecompute("moe_layer_recompute", None),  # MoELayer or MoETransformerLayer, "moe"
+    _SelectiveRecompute("shared_experts_recompute", "shared_experts"),  # MoELayer
+    _SelectiveRecompute("recompute_up_proj", None),  # MLA variants, "mla_up_proj"
+    _SelectiveRecompute("recompute_gdn", None),  # Gated delta net variants, "gdn"
+    _SelectiveRecompute("recompute_in_proj", "in_proj"),  # GatedDeltaProductMixer, "gdp_in_proj"
+)
+
+
 class FsdpUnitCollector:
     """Collect selected FSDP units in wrapping order, children before parents."""
 
-    def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
-        self._fsdp_unit_module_types = fsdp_unit_module_types
+    def __init__(self, fsdp_unit_module_types: Sequence[type[nn.Module]] | None = None) -> None:
+        """Initialize the collector.
+
+        Args:
+            fsdp_unit_module_types: Module types to shard as child FSDP units.
+        """
+        if fsdp_unit_module_types is None:
+            from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+
+            fsdp_unit_module_types = (
+                TransformerLayer,
+                MambaLayer,
+                ShortcutMoEBlock,
+                TEGroupedMLP,
+                SequentialMLP,
+            )
+        self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._collected_units_in_preorder: dict[nn.Module, None] = {}
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
@@ -33,6 +73,36 @@ class FsdpUnitCollector:
         self._collected_units_in_preorder = {module: None}
         self._visit(module, under_shortcut=False)
         return list(reversed(self._collected_units_in_preorder))
+
+    def is_used_by_recomputation(self, unit: nn.Module) -> bool:
+        """Whether activation recomputation uses this unit's weights without calling the unit.
+
+        Such a unit needs SchedulePolicy.unshard_all_planes_in_backward. Weights of a nested
+        unit belong to that unit, whose own hooks run during recomputation. Call collect()
+        first.
+        """
+        owned = self._owned_modules(unit)
+        for module in owned:
+            for rerun in _rerun_submodules(module):
+                for submodule in rerun.modules():
+                    # Skip modules of nested units, which own their weights.
+                    if submodule not in owned:
+                        continue
+                    # Skip parameterless modules, e.g. an IdentityOp MLP.
+                    if next(submodule.parameters(recurse=False), None) is not None:
+                        return True
+        return False
+
+    def _owned_modules(self, unit: nn.Module) -> dict[nn.Module, None]:
+        """Return the unit and its descendants that are not inside a nested unit."""
+        owned = {unit: None}
+        pending = list(unit.children())
+        while pending:
+            submodule = pending.pop()
+            if submodule not in self._collected_units_in_preorder:
+                owned[submodule] = None
+                pending.extend(submodule.children())
+        return owned
 
     def _visit(self, module: nn.Module, under_shortcut: bool) -> None:
         if self._should_shard(module, under_shortcut):
@@ -58,3 +128,39 @@ class FsdpUnitCollector:
         if under_shortcut and isinstance(module, (TransformerLayer, MambaLayer)):
             return False
         return True
+
+
+def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
+    """Return the parts of this module's forward that its own checkpoints rerun in backward."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    # Read the module's own config: hybrid layers may each have one.
+    config = getattr(module, "config", None)
+    if config is not None and config.recompute_granularity == "full":
+        if isinstance(module, (TransformerBlock, HybridStack)):
+            # Block recompute may checkpoint a prefix of the layers; FP8 can shift it at
+            # runtime, so conservatively take all layers.
+            if config.recompute_method == "block" and not config.recompute_num_layers:
+                return []
+            return list(module.layers)
+        # GPT MTP layers checkpoint eh_proj together with their inner layer. Hybrid MTP
+        # layers delegate full recompute to their inner stack.
+        if isinstance(module, MultiTokenPredictionLayer) and not module.is_hybrid_mtp:
+            return [module]
+        return []
+
+    # Selective recompute flags are set from each module's own config.
+    rerun = []
+    for recompute in _SELECTIVE_RECOMPUTES:
+        if getattr(module, recompute.flag, False) is not True:
+            continue
+        if recompute.rerun_submodule is None:
+            rerun.append(module)
+            continue
+        # The submodule may be absent, e.g. shared_experts is None without shared experts.
+        submodule = getattr(module, recompute.rerun_submodule, None)
+        if submodule is not None:
+            rerun.append(submodule)
+    return rerun

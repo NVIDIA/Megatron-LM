@@ -121,77 +121,6 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
-# Under selective recompute, these modules checkpoint part of their forward and rerun it in
-# backward to recompute activations. Each entry is (flag the module sets when it recomputes,
-# attribute of the rerun submodule or None if the module reruns itself). The rerun uses
-# the submodule's weights without calling the forward hooks of the FSDP unit owning them.
-_SELECTIVE_RECOMPUTE_FLAGS = (
-    ("recompute_mlp", "mlp"),  # TransformerLayer, "mlp"
-    ("moe_layer_recompute", None),  # MoELayer or MoETransformerLayer, "moe"
-    ("shared_experts_recompute", "shared_experts"),  # MoELayer, "shared_experts"
-    ("recompute_up_proj", None),  # MLA variants, "mla_up_proj"
-    ("recompute_gdn", None),  # Gated delta net variants, "gdn"
-    ("recompute_in_proj", "in_proj"),  # GatedDeltaProductMixer, "gdp_in_proj"
-)
-
-
-def _units_used_by_recomputation(
-    config: TransformerConfig, units: list[nn.Module]
-) -> set[nn.Module]:
-    """Return FSDP units whose weights activation recomputation uses without calling the unit."""
-    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-    unit_set = set(units)
-
-    def owned_modules(unit: nn.Module) -> list[nn.Module]:
-        owned = [unit]
-        pending = list(unit.children())
-        while pending:
-            submodule = pending.pop()
-            if submodule not in unit_set:
-                owned.append(submodule)
-                pending.extend(submodule.children())
-        return owned
-
-    def recomputed_submodules(module: nn.Module) -> list[nn.Module]:
-        if config.recompute_granularity == "full":
-            # GPT MTP layers checkpoint eh_proj together with their inner layer. Hybrid MTP
-            # layers delegate full recompute to their inner stack, whose layers are units.
-            if isinstance(module, MultiTokenPredictionLayer) and not module.is_hybrid_mtp:
-                return [module]
-            return []
-        if config.recompute_granularity != "selective":
-            return []
-        recomputed = []
-        for flag, attribute in _SELECTIVE_RECOMPUTE_FLAGS:
-            if getattr(module, flag, False) is not True:
-                continue
-            if attribute is None:
-                recomputed.append(module)
-                continue
-            # The submodule may be absent, e.g. shared_experts is None without shared experts.
-            submodule = getattr(module, attribute, None)
-            if submodule is not None:
-                recomputed.append(submodule)
-        return recomputed
-
-    def is_used_by_recomputation(unit: nn.Module) -> bool:
-        owned = owned_modules(unit)
-        owned_set = set(owned)
-        for module in owned:
-            for recomputed in recomputed_submodules(module):
-                for submodule in recomputed.modules():
-                    # Skip modules of nested units, which own their weights.
-                    if submodule not in owned_set:
-                        continue
-                    # Skip parameterless modules, e.g. an IdentityOp MLP.
-                    if next(submodule.parameters(recurse=False), None) is not None:
-                        return True
-        return False
-
-    return {unit for unit in units if is_used_by_recomputation(unit)}
-
-
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
@@ -254,15 +183,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Importing experts at module load creates a cycle through pipeline schedules
         # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
         from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-
-        if fsdp_unit_modules is None:
-            fsdp_unit_modules = [
-                TransformerLayer,
-                MambaLayer,
-                ShortcutMoEBlock,
-                TEGroupedMLP,
-                SequentialMLP,
-            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -352,9 +272,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            units = FsdpUnitCollector(tuple(fsdp_unit_modules)).collect(module)
-            units_used_by_recomputation = _units_used_by_recomputation(config, units)
-            for submodule in units:
+            collector = FsdpUnitCollector(fsdp_unit_modules)
+            for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
@@ -365,7 +284,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
                     schedule_policy=replace(
                         schedule_policy,
-                        unshard_all_planes_in_backward=(submodule in units_used_by_recomputation),
+                        unshard_all_planes_in_backward=collector.is_used_by_recomputation(
+                            submodule
+                        ),
                     ),
                     **common_fully_shard_kwargs,
                 )
