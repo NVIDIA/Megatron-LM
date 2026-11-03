@@ -198,3 +198,92 @@ def test_grad_buffer_release_orders_reuse_on_allocation_stream(distributed_setup
     torch.cuda.current_stream(device).wait_stream(allocation_stream)
     torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
     torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
+
+
+def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monkeypatch):
+    """Repeated hooks replay the first schedule's retirement without querying events."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity()
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ) as context:
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+            ),
+        )
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        result = torch.empty(4096, device=device)
+        context.finish_grad_sync()
+    assert context.is_recording_execution_order
+
+    def submit():
+        with torch.cuda.stream(stream):
+            source = torch.full_like(result, 7.0)
+        context.inner_reduction_stream.wait_stream(stream)
+        with torch.cuda.stream(context.inner_reduction_stream):
+            torch.cuda._sleep(100_000)
+            result.copy_(source)
+        context._retain_grad_buffers([source], stream)
+        return ref(source)
+
+    with torch.cuda.stream(stream):
+        model(result)
+        context.post_backward()
+    assert context.is_recording_execution_order
+    source_ref = submit()
+    context._pending_grad_buffers[0].done.synchronize()
+    with torch.cuda.stream(stream):
+        model(result)
+        context.finish_grad_sync()
+    assert source_ref() is None
+    assert not context.is_recording_execution_order
+    assert len(context.execution_order) == 2
+    assert context._grad_buffer_release_plan == {1: 1}
+
+    def unexpected_query(event):
+        raise AssertionError("Replay must use the recorded plan, not query events")
+
+    monkeypatch.setattr(torch.cuda.Event, "query", unexpected_query)
+    # Eager replay must obey the same fixed plan as CUDA-graph capture.
+    source_ref = submit()
+    with torch.cuda.stream(stream):
+        model(result)
+        assert source_ref() is not None
+        model(result)
+        assert source_ref() is None
+        assert not context._pending_grad_buffers
+        replacement = torch.empty_like(result)
+        replacement.fill_(-9.0)
+    torch.cuda.current_stream(device).wait_stream(stream)
+    torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
+    torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
+    stream.wait_stream(torch.cuda.current_stream(device))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        source_ref = submit()
+        model(result)
+        assert source_ref() is not None
+        model(result)
+        assert source_ref() is None
+        assert not context._pending_grad_buffers
+        replacement = torch.empty_like(result)
+        replacement.fill_(-9.0)
+    for _ in range(3):
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
+        torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    assert context._grad_buffer_release_plan == {1: 1}

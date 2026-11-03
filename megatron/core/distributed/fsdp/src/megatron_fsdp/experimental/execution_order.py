@@ -49,6 +49,10 @@ class ExecutionOrder:
         """Append an event without consuming it."""
         self._items.append((ref(item.module), item.phase))
 
+    def __len__(self) -> int:
+        """Number of recorded occurrences, including repeated module calls."""
+        return len(self._items)
+
     def __iter__(self) -> Iterator[ExecutionEvent]:
         """Iterate over live occurrences without retaining their modules."""
         for module_ref, phase in self._items:

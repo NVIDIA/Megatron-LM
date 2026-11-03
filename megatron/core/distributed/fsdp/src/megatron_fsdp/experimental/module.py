@@ -282,6 +282,9 @@ class FsdpModule:
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         if context.is_recording_execution_order and not is_recomputing:
+            if cast(nn.Module, self).training:
+                # Main records here before unshard; replay consumes its cursor below.
+                context._release_grad_buffers_in_forward()
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
@@ -304,6 +307,8 @@ class FsdpModule:
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
+            if prefetch and phase is Phase.FORWARD and cast(nn.Module, self).training:
+                self.context._release_grad_buffers_in_forward()
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
