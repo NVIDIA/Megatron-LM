@@ -2602,6 +2602,7 @@ class TestMultiTokenPrediction:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         return model
@@ -4341,6 +4342,7 @@ class TestMultiTokenPredictionHybrid:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return model
 
