@@ -13,9 +13,14 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
+from megatron.core.transformer.residual_recompute import (
+    build_residual_stream_recompute_plan,
+    checkpoint_residual_read,
+    checkpoint_residual_write,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -24,21 +29,71 @@ class _WideResidualHarness(nn.Module):
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
-        self.connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=None
+        self.reader = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", operation="read"
+        )
+        self.writer = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", operation="write"
         )
 
     def forward(self, residual_stream: torch.Tensor) -> torch.Tensor:
-        branch_input, state = self.connection(residual_stream, operation="read")
+        branch_input, state = self.reader(residual_stream)
         branch_update = torch.tanh(branch_input) + 0.125 * branch_input
-        return self.connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
+        return self.writer(branch_update, state=state, dropout_probability=0.0, training=False)
+
+
+class _WideResidualReplayHarness(nn.Module):
+    """Exercise one complete two-layer residual-stream replay block."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.connections = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        StreamwiseSigmoidWideResidualConnection(
+                            config=config,
+                            layer_number=layer_number,
+                            branch_name="test",
+                            operation=operation,
+                        )
+                        for operation in ("read", "write")
+                    ]
+                )
+                for layer_number in range(1, 3)
+            ]
         )
 
+    def forward(self, residual_stream: torch.Tensor, *, replay: bool) -> torch.Tensor:
+        contexts = build_residual_stream_recompute_plan(2, 2) if replay else [None, None]
+        for (reader, writer), context in zip(self.connections, contexts):
+            if context is None:
+                branch_input, state = reader(residual_stream)
+            else:
+                branch_input, state = checkpoint_residual_read(
+                    reader, residual_stream, context, fp32_residual_connection=False
+                )
 
-def _config(*, tp_size: int, cp_size: int, sequence_parallel: bool) -> TransformerConfig:
+            branch_update = torch.tanh(branch_input) + 0.125 * branch_input
+            if context is not None and not context.is_block_end:
+                residual_stream = checkpoint_residual_write(
+                    writer, branch_update, state, context, dropout_probability=0.0, training=False
+                )
+            else:
+                residual_stream = writer(
+                    branch_update, state=state, dropout_probability=0.0, training=False
+                )
+            if context is not None:
+                context.finalize(residual_stream)
+
+        return residual_stream
+
+
+def _config(
+    *, tp_size: int, cp_size: int, sequence_parallel: bool, num_layers: int = 1
+) -> TransformerConfig:
     return TransformerConfig(
-        num_layers=1,
+        num_layers=num_layers,
         hidden_size=8,
         num_attention_heads=2,
         hidden_dropout=0.0,
@@ -140,6 +195,68 @@ def _run_parallel_parity(*, tp_size: int, cp_size: int, sequence_parallel: bool)
         Utils.destroy_model_parallel()
 
 
+def _run_replay_parallel_parity(*, sequence_parallel: bool) -> None:
+    """Compare eager and replayed execution under real TP and CP reductions."""
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=2
+    )
+    try:
+        config = _config(tp_size=2, cp_size=2, sequence_parallel=sequence_parallel, num_layers=2)
+        module = _WideResidualReplayHarness(config).cuda()
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(
+                overlap_grad_reduce=False, use_distributed_optimizer=False
+            ),
+            module,
+        )
+        local_residual = _local_residual(config)
+
+        def run_backward(*, replay: bool):
+            ddp_model.zero_grad_buffer()
+            residual = local_residual.detach().clone().requires_grad_(True)
+            output = ddp_model(residual, replay=replay)
+            output.float().square().mean().backward()
+            ddp_model.finish_grad_sync()
+            pre_tp_gradients = {
+                name: parameter.main_grad.detach().clone()
+                for name, parameter in ddp_model.module.named_parameters()
+            }
+            _allreduce_non_tensor_model_parallel_grads(
+                [ddp_model], config, tp_group=ddp_model.tp_group
+            )
+            post_tp_gradients = {
+                name: parameter.main_grad.detach().clone()
+                for name, parameter in ddp_model.module.named_parameters()
+            }
+            return output, residual.grad, pre_tp_gradients, post_tp_gradients
+
+        eager_output, eager_input_grad, eager_pre_tp_gradients, eager_post_tp_gradients = (
+            run_backward(replay=False)
+        )
+        replay_output, replay_input_grad, replay_pre_tp_gradients, replay_post_tp_gradients = (
+            run_backward(replay=True)
+        )
+
+        torch.testing.assert_close(replay_output, eager_output)
+        torch.testing.assert_close(replay_input_grad, eager_input_grad)
+        for name in eager_pre_tp_gradients:
+            torch.testing.assert_close(
+                replay_pre_tp_gradients[name],
+                eager_pre_tp_gradients[name],
+                msg=lambda details, name=name: f"{name} before TP reduction: {details}",
+            )
+            assert name in replay_post_tp_gradients
+            torch.testing.assert_close(
+                replay_post_tp_gradients[name],
+                eager_post_tp_gradients[name],
+                msg=lambda details, name=name: f"{name} after TP reduction: {details}",
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(
@@ -159,3 +276,14 @@ def test_streamwise_controller_gradients_match_cp_reference():
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_streamwise_controller_gradients_match_tp_cp_reference(sequence_parallel):
     _run_parallel_parity(tp_size=2, cp_size=2, sequence_parallel=sequence_parallel)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 4,
+    reason="Run this test with torchrun --nproc-per-node=4.",
+)
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_residual_stream_replay_matches_eager_with_tp_cp(sequence_parallel):
+    _run_replay_parallel_parity(sequence_parallel=sequence_parallel)

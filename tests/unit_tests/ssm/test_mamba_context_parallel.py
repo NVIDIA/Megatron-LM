@@ -22,6 +22,8 @@ class TestMambaContextParallel:
         ],
     )
     def test_forward(self, ngroups_local_tp, cp_size, D_has_hdim):
+        if Utils.world_size < cp_size:
+            pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
 
         dtype = torch.bfloat16

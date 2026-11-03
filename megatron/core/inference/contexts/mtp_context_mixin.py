@@ -229,6 +229,7 @@ class MTPContextMixin:
             return
         block_ids = self.kv_block_allocator.allocate_memory_blocks(total)
         assert block_ids is not None and block_ids.numel() == total
+        self._initialize_mha_value_pages(block_ids)
         rows = torch.repeat_interleave(
             torch.arange(request_slice.start, request_slice.stop), counts
         )
@@ -271,7 +272,7 @@ class MTPContextMixin:
     # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
     # ------------------------------------------------------------------
     @contextlib.contextmanager
-    def _mtp_forward_phase(self):
+    def _mtp_forward_phase(self, preserve_step_bookkeeping: bool = False):
         """Scope one step's MTP forwards and undo their effects on the context on the way out.
 
         Every MTP forward republishes the active attention metadata, token counts and CUDA-graph
@@ -280,6 +281,13 @@ class MTPContextMixin:
         values, and a `forward_mode` left set would keep `is_decode_only` False and KV routing on
         the draft plane for the rest of the run. Both are undone on exit, including when a draft
         forward raises.
+
+        Args:
+            preserve_step_bookkeeping (bool): Also restore the step's attention bookkeeping: the
+                GPU bookkeeping buffer and the MHA metadata bounds. MTP forwards stage their draft
+                metadata in that shared buffer, which is only safe once the step's main forward
+                has run. The EP dummy MTP forwards run before it (the async-scheduling primer and
+                the idle-rank step), so they restore it.
         """
         saved = (
             self.active_attn_metadata,
@@ -287,6 +295,15 @@ class MTPContextMixin:
             self.padded_active_token_count,
             self._using_cuda_graph_this_step,
         )
+        if preserve_step_bookkeeping:
+            saved_bookkeeping = self.gpu_view._buf.clone()
+            saved_mha_state = [
+                (mha, mha.state_data, mha._max_seqlen_q, mha._max_seqlen_k)
+                for mha in (
+                    self.graph_attn_metadata["mha_metadata"],
+                    self.non_graph_attn_metadata["mha_metadata"],
+                )
+            ]
         try:
             yield
         finally:
@@ -302,6 +319,12 @@ class MTPContextMixin:
                 self.padded_active_token_count,
                 self._using_cuda_graph_this_step,
             ) = saved
+            if preserve_step_bookkeeping:
+                self.gpu_view._buf.copy_(saved_bookkeeping)
+                for mha, state_data, max_seqlen_q, max_seqlen_k in saved_mha_state:
+                    mha.state_data = state_data
+                    mha._max_seqlen_q = max_seqlen_q
+                    mha._max_seqlen_k = max_seqlen_k
 
     def _mtp_activate_attn_metadata(
         self,
@@ -449,7 +472,7 @@ class MTPContextMixin:
 
         # Keep writes out of blocks this request inherited. The two spans overlap whenever the
         # prefix skip covers fewer tokens than the matched blocks span -- a short chunk, a
-        # non-block-aligned resume, the `>= 2` clamp, a short Mamba match, or memory-only mode.
+        # non-block-aligned resume, a short Mamba match, or memory-only mode.
         active_slice = slice(self.paused_request_count, self.total_request_count)
         inherited = (
             self.mtp_metadata.request_matched_prefix_blocks[active_slice][
@@ -487,10 +510,13 @@ class MTPContextMixin:
         # Read the bound back off `seq_lengths` rather than off `append_counts`: either branch
         # above may have introduced a run longer than any single `append_counts` entry.
         max_seqlen = int(seq_lengths.max().item()) if p > 0 else 1
+        # Never publish max_seqlen_q == 1 for this varlen pass: FlashAttention-2 would read it as
+        # one query token per sequence and, under GQA, reshape q assuming total_q == num_seqs,
+        # which requests contributing zero rows break. Raising the bound is safe.
         self._mtp_activate_attn_metadata(
             graphed=False,
             padded_request_count=padded_p,
-            max_seqlen_q=max_seqlen,
+            max_seqlen_q=max(2, max_seqlen),
             max_seqlen_k=max_seqlen,
             token_count=total,
             padded_token_count=padded_total,

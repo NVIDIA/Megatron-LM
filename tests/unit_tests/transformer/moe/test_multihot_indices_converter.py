@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import config
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 
 
 class PytorchIndicesToMultihot:
@@ -85,3 +86,42 @@ class TestIndicesToMultihot:
         ).sum() / 2
         loss_pytorch.backward()
         assert torch.allclose(probs_indices.grad, probs_indices_pytorch.grad)
+
+
+class TestRoutingMapToIndices:
+
+    @pytest.mark.experimental
+    @pytest.mark.parametrize(
+        ("num_tokens", "num_experts", "topk"), [(1, 7, 3), (17, 8, 4), (33, 31, 6), (4096, 384, 6)]
+    )
+    def test_routing_map_to_indices(self, num_tokens, num_experts, topk):
+        generator = torch.Generator(device="cpu").manual_seed(1234)
+        routing_map_cpu = torch.zeros((num_tokens, num_experts), dtype=torch.bool)
+        expected_indices_cpu = torch.full((num_tokens, topk), -1, dtype=torch.int32)
+        for token_idx in range(num_tokens):
+            num_routes = token_idx % (topk + 1)
+            selected = torch.randperm(num_experts, generator=generator)[:num_routes]
+            selected = selected.sort().values
+            routing_map_cpu[token_idx, selected] = True
+            expected_indices_cpu[token_idx, :num_routes] = selected
+
+        routing_map = routing_map_cpu.cuda()
+        expected_indices = expected_indices_cpu.cuda()
+        probs = torch.rand(
+            (num_tokens, num_experts), device="cuda", dtype=torch.float32, requires_grad=True
+        )
+        probs_reference = probs.detach().clone().requires_grad_(True)
+
+        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk)
+
+        gather_indices = expected_indices.clamp_min(0).to(torch.int64)
+        expected_weights = torch.gather(probs_reference, dim=1, index=gather_indices)
+        expected_weights = expected_weights.masked_fill(expected_indices < 0, 0.0)
+
+        torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+        torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+        grad = torch.randn_like(weights)
+        (weights * grad).sum().backward()
+        (expected_weights * grad).sum().backward()
+        torch.testing.assert_close(probs.grad, probs_reference.grad, rtol=0, atol=0)

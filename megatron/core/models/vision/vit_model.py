@@ -94,9 +94,9 @@ class Pixtral2DRotaryEmbedding(nn.Module):
         self.max_patches_per_side = max_patches_per_side
 
         # freq_dim = head_dim // 4 (half for h, half for w in the head_dim//2 space).
-        freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-
-        self.register_buffer("freqs", freqs, persistent=False)
+        # Like LLM RoPE, keep frequencies outside module buffers so Float16Module
+        # cannot cast them to BF16/FP16 before FP32 angle and sin/cos computation.
+        self.freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
 
     def forward(self, h_patches: int, w_patches: int, device: torch.device) -> torch.Tensor:
         """
@@ -104,7 +104,10 @@ class Pixtral2DRotaryEmbedding(nn.Module):
         This is the format mcore's apply_rotary_pos_emb expects for rotary_pos_emb.
         mcore handles cos/sin internally.
         """
-        base_freqs = self.freqs.to(device=device)
+        # Cache the device copy; module.to() does not move this constant tensor.
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device=device)
+        base_freqs = self.freqs
         h = torch.arange(h_patches, device=device, dtype=base_freqs.dtype)
         w = torch.arange(w_patches, device=device, dtype=base_freqs.dtype)
 

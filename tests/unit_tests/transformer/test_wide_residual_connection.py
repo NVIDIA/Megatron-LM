@@ -14,15 +14,16 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     LearnedWideResidualRetention,
     StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
-    WideResidualTransformerLayer,
+    StreamwiseSigmoidWideResidualRead,
     expand_wide_residual_stream,
 )
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 
 
 def _wide_config(
@@ -153,8 +154,6 @@ def test_wide_residual_config_rejects_negative_map_init_scale():
     ("override", "expected_error"),
     [
         ({"enable_mhc_connections": True}, "mutually exclusive"),
-        ({"moe_shortcut_connection": True}, "moe_shortcut_connection"),
-        ({"mtp_num_layers": 1}, "Multi-Token Prediction"),
         ({"inference_fuse_tp_communication": True}, "fuse_tp_communication"),
         ({"heterogeneous_block_specs": True}, "heterogeneous_block_specs"),
         ({"overlap_moe_expert_parallel_comm": True}, "overlap_moe_expert_parallel_comm"),
@@ -181,7 +180,89 @@ def test_transformer_config_accepts_fp32_wide_residual_stream():
     assert config.pipeline_dtype == torch.float32
 
 
+def test_transformer_config_accepts_mtp_with_wide_residual_replay():
+    config = _wide_config(
+        mtp_num_layers=2,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.mtp_num_layers == 2
+    assert config.residual_stream_recompute_num_layers == 1
+
+
+def test_transformer_config_accepts_shortcut_moe_with_wide_residual_replay():
+    config = _wide_config(
+        num_layers=2,
+        num_moe_experts=1,
+        moe_shortcut_connection=True,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.moe_shortcut_connection
+    assert config.residual_stream_recompute_num_layers == 1
+
+
+class TestStreamwiseSigmoidWideResidualRead:
+    def test_initial_read_preserves_replicated_base_stream(self):
+        config = _wide_config()
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        base = torch.randn(2, 3, config.hidden_size)
+
+        shortcut_hidden = residual_read(expand_wide_residual_stream(base, 3))
+
+        assert shortcut_hidden.shape == base.shape
+        assert torch.allclose(shortcut_hidden, base)
+
+    def test_read_owns_independent_trainable_controller(self):
+        config = _wide_config(init_scale=0.01)
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        hidden_states = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
+
+        residual_read(hidden_states).square().mean().backward()
+
+        gradient = residual_read.read_map.logit.grad
+        assert gradient is not None
+        assert torch.count_nonzero(gradient[: residual_read.num_streams]) > 0
+        assert torch.count_nonzero(gradient[residual_read.num_streams :]) == 0
+        assert hidden_states.grad is not None
+
+    def test_read_converts_fp32_residual_to_parameter_dtype(self):
+        config = _wide_config(bf16=True, params_dtype=torch.bfloat16, fp32_residual_connection=True)
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+        hidden_states = torch.randn(
+            4, 3 * config.hidden_size, dtype=torch.float32, requires_grad=True
+        )
+
+        branch_input = residual_read(hidden_states)
+        branch_input.float().square().mean().backward()
+
+        assert branch_input.dtype == torch.bfloat16
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.dtype == torch.float32
+        assert residual_read.read_map.logit.grad is not None
+
+    def test_rejects_wrong_residual_stream_width(self):
+        config = _wide_config()
+        residual_read = StreamwiseSigmoidWideResidualRead(
+            config=config, layer_number=2, branch_name="shortcut_routed"
+        )
+
+        with pytest.raises(ValueError, match="expected residual-stream hidden size"):
+            residual_read(torch.randn(2, config.hidden_size))
+
+
 class TestStreamwiseSigmoidWideResidualConnection:
+
     def test_maps_materialize_expected_initial_factors(self):
         config = _wide_config(num_streams=3, init_scale=0.2)
         read_map = StreamwiseSigmoidMap(config, map_kind="read")
@@ -214,6 +295,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
                 layer_number=1,
                 branch_name="test",
                 pg_collection=_process_groups(),
+                operation="read",
             )
         with pytest.raises(ValueError, match="StreamwiseSigmoidResidualReadout requires"):
             StreamwiseSigmoidResidualReadout(base_config)
@@ -233,16 +315,21 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_fp32_state_promotion_aliases_an_already_fp32_stream(self):
         """The defensive FP32 promotion must not allocate for normal FP32 model ingress."""
 
-        config = _wide_config(fp32_residual_connection=True)
+        config = _wide_config(bf16=True, params_dtype=torch.bfloat16, fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            operation="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
         )
 
-        _, state = connection(residual_stream, operation="read", fp32_residual_connection=True)
+        branch_input, state = connection(residual_stream, fp32_residual_connection=True)
 
+        assert branch_input.dtype == torch.float32
         assert connection.residual_stream(state).dtype == torch.float32
         assert connection.residual_stream(state) is residual_stream
         assert connection.residual_stream(state).data_ptr() == residual_stream.data_ptr()
@@ -250,17 +337,18 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_read_output_dtype_does_not_change_fp32_connection_state(self):
         config = _wide_config(fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            operation="read",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
         )
 
         branch_input, state = connection(
-            residual_stream,
-            operation="read",
-            fp32_residual_connection=True,
-            branch_input_dtype=torch.bfloat16,
+            residual_stream, fp32_residual_connection=True, branch_input_dtype=torch.bfloat16
         )
 
         assert branch_input.dtype == torch.bfloat16
@@ -288,7 +376,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
     ):
         config = _wide_config(fp32_residual_connection=True)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            operation="write",
         )
         residual_stream = torch.randn(
             2, connection.residual_stream_hidden_size, dtype=torch.float32
@@ -311,15 +403,13 @@ class TestStreamwiseSigmoidWideResidualConnection:
             return update
 
         monkeypatch.setattr(
-            "megatron.core.transformer.wide_residual_layer.streamwise_sigmoid_writeback",
-            record_writeback,
+            "megatron.core.transformer.wide_residual.streamwise_sigmoid_writeback", record_writeback
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.wide_residual_layer.F.dropout", preserve_dropout_input
+            "megatron.core.transformer.wide_residual.F.dropout", preserve_dropout_input
         )
         connection(
             (branch_update, bias),
-            operation="write",
             state=(residual_stream,),
             dropout_probability=dropout_probability,
             training=training,
@@ -341,7 +431,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
         torch.manual_seed(8765)
         config = _wide_config(fp32_residual_connection=True, init_scale=0.01)
         connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+            config=config,
+            layer_number=1,
+            branch_name="test",
+            pg_collection=_process_groups(),
+            operation="write",
         )
         residual = torch.randn(
             4, connection.residual_stream_hidden_size, dtype=torch.float32, requires_grad=True
@@ -358,11 +452,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
         torch.manual_seed(4321)
         output = connection(
-            (update, bias),
-            operation="write",
-            state=(residual,),
-            dropout_probability=0.25,
-            training=True,
+            (update, bias), state=(residual,), dropout_probability=0.25, training=True
         )
         torch.manual_seed(4321)
         reference_preprocessed = torch.nn.functional.dropout(
@@ -387,18 +477,19 @@ class TestStreamwiseSigmoidWideResidualConnection:
 
     def test_initial_read_write_and_readout_preserve_base_stream(self):
         config = _wide_config(init_scale=0.0)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", operation=operation
+            )
+            for operation in ("read", "write")
         )
         readout = StreamwiseSigmoidResidualReadout(config)
         base = torch.randn(2, config.hidden_size)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        branch_input, state = connection(residual_stream, operation="read")
+        branch_input, state = reader(residual_stream)
         branch_update = torch.randn_like(base)
-        output = connection(
-            branch_update, operation="write", state=state, dropout_probability=0.0, training=False
-        )
+        output = writer(branch_update, state=state, dropout_probability=0.0, training=False)
 
         assert torch.allclose(branch_input, base)
         assert torch.allclose(output, expand_wide_residual_stream(base + branch_update, 3))
@@ -408,84 +499,88 @@ class TestStreamwiseSigmoidWideResidualConnection:
     def test_controllers_have_replicated_tp_gradient_metadata(self, sequence_parallel):
         config = _wide_config(learned_retention=True)
         config.sequence_parallel = sequence_parallel
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", operation=operation
+            )
+            for operation in ("read", "write")
         )
 
         parameters = (
-            connection.read_map.logit,
-            connection.write_map.logit,
-            connection.retention.retention_logit,
+            reader.read_map.logit,
+            writer.write_map.logit,
+            writer.retention.retention_logit,
         )
         for parameter in parameters:
             assert parameter.allreduce
             assert not parameter.tensor_model_parallel
             assert parameter.sequence_parallel == sequence_parallel
             assert parameter.average_gradients_across_tp_domain is not sequence_parallel
-        assert connection.retention.retention_logit.is_wide_residual_retention_parameter
+        assert writer.retention.retention_logit.is_wide_residual_retention_parameter
 
     def test_nested_module_hooks_run_before_controller_access(self):
         config = _wide_config(learned_retention=True)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", operation=operation
+            )
+            for operation in ("read", "write")
         )
         operations = []
-        connection.read_map.register_forward_pre_hook(lambda *_: operations.append("read"))
-        connection.write_map.register_forward_pre_hook(lambda *_: operations.append("write"))
-        connection.retention.register_forward_pre_hook(lambda *_: operations.append("retention"))
+        reader.read_map.register_forward_pre_hook(lambda *_: operations.append("read"))
+        writer.write_map.register_forward_pre_hook(lambda *_: operations.append("write"))
+        writer.retention.register_forward_pre_hook(lambda *_: operations.append("retention"))
 
         residual_stream = torch.randn(2, 3 * config.hidden_size)
-        branch_input, state = connection(residual_stream, operation="read")
-        connection(
-            branch_input, operation="write", state=state, dropout_probability=0.0, training=False
-        )
+        branch_input, state = reader(residual_stream)
+        writer(branch_input, state=state, dropout_probability=0.0, training=False)
 
         assert operations == ["read", "retention", "write"]
 
     def test_gradients_reach_active_controllers_but_not_padding(self):
         config = _wide_config(init_scale=0.01, learned_retention=True)
-        connection = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        reader, writer = (
+            StreamwiseSigmoidWideResidualConnection(
+                config=config, layer_number=1, branch_name="test", operation=operation
+            )
+            for operation in ("read", "write")
         )
         residual_stream = torch.randn(4, 3 * config.hidden_size, requires_grad=True)
-        branch_input, state = connection(residual_stream, operation="read")
-        output = connection(
-            branch_input.square(),
-            operation="write",
-            state=state,
-            dropout_probability=0.0,
-            training=True,
-        )
+        branch_input, state = reader(residual_stream)
+        output = writer(branch_input.square(), state=state, dropout_probability=0.0, training=True)
         output.square().mean().backward()
 
         parameters = (
-            connection.read_map.logit,
-            connection.write_map.logit,
-            connection.retention.retention_logit,
+            reader.read_map.logit,
+            writer.write_map.logit,
+            writer.retention.retention_logit,
         )
         for parameter in parameters:
             assert parameter.grad is not None
-            assert torch.count_nonzero(parameter.grad[: connection.num_streams]) > 0
-            assert torch.count_nonzero(parameter.grad[connection.num_streams :]) == 0
+            assert torch.count_nonzero(parameter.grad[: reader.num_streams]) > 0
+            assert torch.count_nonzero(parameter.grad[reader.num_streams :]) == 0
 
     def test_checkpoint_round_trip_is_strict(self):
         config = _wide_config(learned_retention=True)
-        source = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
-        )
-        destination = StreamwiseSigmoidWideResidualConnection(
-            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
-        )
-        with torch.no_grad():
-            source.read_map.logit[0].add_(0.25)
-            source.write_map.logit[1].sub_(0.125)
-            source.retention.retention_logit[2].add_(0.5)
+        for operation in ("read", "write"):
+            source = StreamwiseSigmoidWideResidualConnection(config, 1, "test", operation=operation)
+            destination = StreamwiseSigmoidWideResidualConnection(
+                config, 1, "test", operation=operation
+            )
+            with torch.no_grad():
+                for parameter in source.parameters():
+                    parameter[0].add_(0.25)
 
-        state = source.state_dict()
-        destination.load_state_dict(state, strict=True)
-        assert set(state) == {"read_map.logit", "write_map.logit", "retention.retention_logit"}
-        for name, value in state.items():
-            assert torch.equal(destination.state_dict()[name], value)
+            state = source.state_dict()
+            destination.load_state_dict(state, strict=True)
+            expected_keys = (
+                {"read_map.logit"}
+                if operation == "read"
+                else {"write_map.logit", "retention.retention_logit"}
+            )
+            assert set(state) == expected_keys
+            for name, value in state.items():
+                assert torch.equal(destination.state_dict()[name], value)
 
     def test_retention_initializes_to_requested_factor(self):
         config = _wide_config(learned_retention=True)
@@ -540,17 +635,21 @@ class TestWideResidualStaticConstruction:
 
         assert layer_spec.module is WideResidualTransformerLayer
         assert type(layer) is WideResidualTransformerLayer
-        connections = {
-            "self_attention": layer.residual_connection_self_attn,
-            "mlp": layer.residual_connection_mlp,
-        }
-        for branch_name, connection in connections.items():
-            if branch_name in expected_connections:
-                assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
-            else:
-                assert connection is None
+        for operation in ("read", "write"):
+            connections = {
+                "self_attention": layer._get_self_attention_residual_connection(
+                    operation=operation
+                ),
+                "mlp": layer._get_mlp_residual_connection(operation=operation),
+            }
+            for branch_name, connection in connections.items():
+                if branch_name in expected_connections:
+                    assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+                    assert connection.operation == operation
+                else:
+                    assert connection is None
         if len(expected_connections) == 2:
-            assert layer.residual_connection_self_attn is not layer.residual_connection_mlp
+            assert layer.residual_read_self_attn is not layer.residual_read_mlp
 
     def test_cross_attention_is_rejected_explicitly(self):
         layer_spec = ModuleSpec(
@@ -610,6 +709,22 @@ class TestWideResidualStaticConstruction:
                 pg_collection=_process_groups(),
             )
 
+    def test_static_subclass_is_rejected_for_mtp_auxiliary_stacks(self):
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
+            submodules=TransformerLayerSubmodules(self_attention=_ActiveBranch),
+        )
+
+        with pytest.raises(ValueError, match="MTP auxiliary stacks"):
+            build_module(
+                layer_spec,
+                config=_wide_config(),
+                layer_number=1,
+                is_mtp_layer=True,
+                add_layer_offset=False,
+                pg_collection=_process_groups(),
+            )
+
     @pytest.mark.parametrize(
         "config_overrides",
         [
@@ -622,8 +737,12 @@ class TestWideResidualStaticConstruction:
         ids=("local", "transformer_engine", "full_iteration", "legacy_local", "legacy_te"),
     )
     def test_wide_residual_rejects_cuda_graphs(self, config_overrides):
-        with pytest.raises(NotImplementedError, match="does not yet support CUDA graphs"):
+        with pytest.raises(NotImplementedError, match="supports CUDA graphs only"):
             _wide_config(**config_overrides)
+
+    def test_wide_residual_accepts_local_block_cuda_graphs(self):
+        config = _wide_config(cuda_graph_impl="local", inference_cuda_graph_scope="block")
+        assert config.inference_cuda_graph_scope.name == "block"
 
 
 class TestWideResidualLayerIntegration:
@@ -757,7 +876,7 @@ class TestWideResidualLayerIntegration:
         connection_parameters = {
             name: parameter
             for name, parameter in layer.named_parameters()
-            if "residual_connection" in name
+            if "residual_read" in name or "residual_write" in name
         }
         assert connection_parameters
         assert all(parameter.grad is not None for parameter in connection_parameters.values())
@@ -779,19 +898,30 @@ class TestWideResidualLayerIntegration:
             pg_collection=_process_groups(),
         )
         with torch.no_grad():
-            source.residual_connection_self_attn.read_map.logit[0].add_(0.25)
-            source.residual_connection_mlp.write_map.logit[1].sub_(0.125)
+            source.residual_read_self_attn.read_map.logit[0].add_(0.25)
+            source.residual_write_mlp.write_map.logit[1].sub_(0.125)
 
         state = source.state_dict()
         expected_connection_keys = {
-            f"residual_connection_{branch}.{parameter}"
+            f"residual_{operation}_{branch}.{parameter}"
             for branch in ("self_attn", "mlp")
-            for parameter in ("read_map.logit", "write_map.logit", "retention.retention_logit")
+            for operation, parameter in (
+                ("read", "read_map.logit"),
+                ("write", "write_map.logit"),
+                ("write", "retention.retention_logit"),
+            )
         }
-        connection_keys = {key for key in state if key.startswith("residual_connection_")}
-
+        connection_keys = {
+            key for key in state if key.startswith(("residual_read_", "residual_write_"))
+        }
         assert connection_keys == expected_connection_keys
-        destination.load_state_dict(state, strict=True)
+        legacy = {
+            key.replace("residual_read_", "residual_connection_").replace(
+                "residual_write_", "residual_connection_"
+            ): value
+            for key, value in state.items()
+        }
+        destination.load_state_dict(legacy, strict=True)
         for key in state:
             assert torch.equal(destination.state_dict()[key], state[key])
 
@@ -806,14 +936,13 @@ class TestWideResidualLayerIntegration:
         )
         operations = []
 
-        def record_operation(module, args, kwargs):
-            del args
-            operations.append((module.branch_name, kwargs["operation"]))
-
-        layer.residual_connection_self_attn.register_forward_pre_hook(
-            record_operation, with_kwargs=True
-        )
-        layer.residual_connection_mlp.register_forward_pre_hook(record_operation, with_kwargs=True)
+        for branch, suffix in (("self_attention", "self_attn"), ("mlp", "mlp")):
+            for operation in ("read", "write"):
+                getattr(layer, f"residual_{operation}_{suffix}").register_forward_pre_hook(
+                    lambda module, args, branch=branch, operation=operation: operations.append(
+                        (branch, operation)
+                    )
+                )
         base = torch.randn(2, 3, config.hidden_size)
 
         layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)

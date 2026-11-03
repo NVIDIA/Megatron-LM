@@ -82,7 +82,9 @@ def _make_stack(config, pg_collection):
     )
 
 
-def _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=False):
+def _make_wide_config(
+    gtp_remat_size=1, calculate_per_token_loss=False, residual_stream_recompute=False
+):
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
@@ -101,6 +103,9 @@ def _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=False):
         pipeline_model_parallel_size=1,
         fp32_residual_connection=True,
         calculate_per_token_loss=calculate_per_token_loss,
+        recompute_granularity="selective" if residual_stream_recompute else None,
+        recompute_modules=["residual_stream"] if residual_stream_recompute else None,
+        residual_stream_recompute_num_layers=1 if residual_stream_recompute else None,
         wide_residual=WideResidualConfig(
             num_streams=NUM_WIDE_STREAMS,
             streamwise_sigmoid_init_scale=0.01,
@@ -113,7 +118,9 @@ def _make_wide_config(gtp_remat_size=1, calculate_per_token_loss=False):
 
 def _make_wide_stack(config, pg_collection):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+    from megatron.core.transformer.wide_residual_transformer_layer import (
+        WideResidualTransformerLayer,
+    )
 
     spec = get_gpt_layer_with_transformer_engine_spec()
     return torch.nn.ModuleList(
@@ -183,7 +190,9 @@ def _build_wide_ddp(stack):
     )
 
 
-def _run_wide_backward(ddp_model, rank, calculate_per_token_loss=False):
+def _run_wide_backward(
+    ddp_model, rank, calculate_per_token_loss=False, residual_stream_recompute=False
+):
     """Run one wide layer and complete both DP and replicated-GTP grad reductions."""
 
     ddp_model.zero_grad_buffer()
@@ -196,9 +205,21 @@ def _run_wide_backward(ddp_model, rank, calculate_per_token_loss=False):
         device='cuda',
         requires_grad=True,
     )
+    layers = list(ddp_model.module.children())
+    if residual_stream_recompute:
+        from megatron.core.transformer.residual_recompute import (
+            build_residual_stream_recompute_plan,
+        )
+
+        replay_contexts = build_residual_stream_recompute_plan(len(layers), len(layers))
+    else:
+        replay_contexts = [None] * len(layers)
+
     out = x
-    for layer in ddp_model.module.children():
-        out, _ = layer(out, attention_mask=None)
+    for layer, replay_context in zip(layers, replay_contexts):
+        out, _ = layer(out, attention_mask=None, residual_stream_recompute_context=replay_context)
+        if replay_context is not None:
+            replay_context.finalize(out)
     out.float().square().mean().backward()
     ddp_model.finish_grad_sync()
 
@@ -344,7 +365,9 @@ def _worker(rank, world_size, port, calculate_per_token_loss=False):
         )
 
 
-def _worker_wide_residual(rank, world_size, port, calculate_per_token_loss=False):
+def _worker_wide_residual(
+    rank, world_size, port, calculate_per_token_loss=False, residual_stream_recompute=False
+):
     """Compare one wide layer under DP4 and GTP2 x DP2 with identical weights and data."""
 
     from megatron.core import parallel_state as ps
@@ -383,7 +406,12 @@ def _worker_wide_residual(rank, world_size, port, calculate_per_token_loss=False
     model_parallel_cuda_manual_seed(42)
     pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
     gtp_stack = _make_wide_stack(
-        _make_wide_config(gtp_remat_size=2, calculate_per_token_loss=calculate_per_token_loss), pgc
+        _make_wide_config(
+            gtp_remat_size=2,
+            calculate_per_token_loss=calculate_per_token_loss,
+            residual_stream_recompute=residual_stream_recompute,
+        ),
+        pgc,
     ).cuda()
 
     gtp_group = ps.get_gtp_weight_remat_group()
@@ -399,7 +427,7 @@ def _worker_wide_residual(rank, world_size, port, calculate_per_token_loss=False
             sharded_names.append(name)
         else:
             param.data.copy_(full)
-        if 'residual_connection_' in name:
+        if 'residual_read_' in name or 'residual_write_' in name:
             controller_names.append(name.removeprefix('0.'))
             assert not isinstance(param, GTPShardedParam), f"controller was GTP-sharded: {name}"
 
@@ -407,7 +435,10 @@ def _worker_wide_residual(rank, world_size, port, calculate_per_token_loss=False
     assert controller_names, "no wide-residual controller parameter was found"
 
     gtp_output, gtp_input_grad = _run_wide_backward(
-        _build_wide_ddp(gtp_stack), rank, calculate_per_token_loss
+        _build_wide_ddp(gtp_stack),
+        rank,
+        calculate_per_token_loss,
+        residual_stream_recompute=residual_stream_recompute,
     )
     gtp_grads = _full_main_grads(gtp_stack)
 
@@ -1236,6 +1267,13 @@ class TestGTPGradCorrectness:
             _run_distributed(_worker_wide_residual, 4, per_token_loss)
         finally:
             update_gtp_config(calculate_per_token_loss=False)
+
+    def test_wide_residual_replay_gtp2_dp2_matches_dp4_baseline(self):
+        """Selective residual replay must preserve GTP-sharded branch gradients."""
+
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_wide_residual, 4, False, True)
 
     @pytest.mark.parametrize("moe", [False, True])
     def test_gtp_remat_rs_fp32_accumulation_preserves_grads(self, moe):

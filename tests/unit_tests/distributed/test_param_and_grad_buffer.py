@@ -428,7 +428,7 @@ def test_start_param_sync_dp_size_1():
     """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
     param_gather_dispatched=True and return immediately without launching any
     all-gather collective."""
-    world_size = torch.distributed.get_world_size()
+    world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     ddp_config = DistributedDataParallelConfig(
@@ -677,7 +677,7 @@ class TestFP32LocalGradAccumulation:
         for grad in buf.extra_main_grads:
             grad.fill_(4.0)
 
-        buf.scale_gradients(0.5)
+        buf.scale_gradients(torch.tensor(0.5, device=buf.grad_data.device, dtype=torch.float32))
 
         assert torch.allclose(
             buf.grad_data, torch.tensor(1.0, dtype=buf.grad_data.dtype)

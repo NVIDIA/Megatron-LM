@@ -10,11 +10,12 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Shard
-from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
 )
@@ -65,7 +66,12 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         torch.manual_seed(1234)
         model = TinyModel().to(device=device, dtype=torch.bfloat16)
         mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
-        with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
+        with fully_shard_context(
+            FsdpContext(
+                device=device,
+                runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory),
+            )
+        ):
             fully_shard(
                 model.fc1,
                 mesh=mesh,
@@ -100,11 +106,11 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
 
         return losses
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_without_symm_mem:
+    with torch.profiler.profile() as prof_without_symm_mem:
         losses_without_symm_mem = train(use_symmetric_memory=False)
         torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_with_symm_mem:
+    with torch.profiler.profile() as prof_with_symm_mem:
         losses_with_symm_mem = train(use_symmetric_memory=True)
         torch.cuda.synchronize()
 
@@ -195,7 +201,9 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     num_training_steps = 5
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
-    with fully_shard_context(device=device, use_symmetric_memory=True):
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=True))
+    ):
         fully_shard(
             model.fc1,
             mesh=mesh,
@@ -212,7 +220,7 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     x = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
     target = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile() as prof:
         for _ in range(num_training_steps):
             optimizer.zero_grad()
             torch.nn.functional.mse_loss(model(x), target).backward()
@@ -238,6 +246,3 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
         "Expected all zero-CTA reduce-scatter events to be ncclSymk kernels. "
         f"Observed reduce-scatter events: {reduce_scatter_groups[:20]}"
     )
-
-    # Release the dedicated communicator (leaks only on a test failure above, which is fine).
-    dist.destroy_process_group(dp_group)

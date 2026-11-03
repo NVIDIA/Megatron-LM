@@ -52,6 +52,7 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
@@ -65,7 +66,10 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
     actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs)
     expected_unweighted = squared_relu(x)
-    expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
+    # The kernel reproduces the fused training op (use_fused_weighted_squared_relu=True),
+    # which keeps the square in FP32 and rounds to BF16 once. Eager ops would round the
+    # square to BF16 first and land one ULP away for some elements.
+    expected = weighted_squared_relu(x, probs.unsqueeze(1))
 
     assert torch.equal(unweighted, expected_unweighted)
     assert torch.equal(actual, expected)
@@ -200,6 +204,35 @@ class TestComputeLocalTokensPerExpert:
         )
         local_mask = (routing_map >= local_start) & (routing_map < local_start + num_local)
         assert result.sum().item() == local_mask.sum().item()
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_counts_into_caller_zeroed_buffer(self, persistent):
+        """A caller-zeroed counter buffer is filled in place and returned."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        routing_map = torch.randint(0, 32, (64, 6), device="cuda")
+        counts = torch.zeros(8, dtype=torch.int32, device="cuda")
+        result = compute_local_tokens_per_expert(
+            routing_map, 8, 8, _vt(64), persistent=persistent, pre_initialized_output_buffer=counts
+        )
+        assert result is counts
+        expected = _ref_tokens_per_expert(routing_map, 8, 8)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
+    def test_rejects_invalid_counter_buffer(self, invalid):
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        counts = {
+            "shape": torch.zeros(7, dtype=torch.int32, device="cuda"),
+            "dtype": torch.zeros(8, dtype=torch.int64, device="cuda"),
+            "stride": torch.zeros(16, dtype=torch.int32, device="cuda")[::2],
+        }[invalid]
+        routing_map = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
+        with pytest.raises(AssertionError):
+            compute_local_tokens_per_expert(
+                routing_map, 0, 8, _vt(4), pre_initialized_output_buffer=counts
+            )
 
 
 @pytest.mark.internal

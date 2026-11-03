@@ -7,6 +7,7 @@ from megatron.core.models.common.fine_grained_callables import build_layer_calla
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -191,11 +192,23 @@ class TestTransformerLayerSubmoduleCallables:
         pass
 
     def teardown_method(self, method):
-        pass
+        reset_hybrid_ep_buffer()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
-    @pytest.mark.parametrize("grouped_gemm", [True, False])
+    @pytest.mark.parametrize(
+        "grouped_gemm, dispatcher_type",
+        [
+            pytest.param(
+                grouped_gemm,
+                dispatcher_type,
+                # All-to-all crashes (#7744) and grouped-GEMM hangs in dev:
+                # https://github.com/NVIDIA/Megatron-LM/actions/runs/38128757991/job/114439165065
+                marks=pytest.mark.flaky_in_dev if dispatcher_type == "alltoall" else (),
+            )
+            for grouped_gemm in [True, False]
+            for dispatcher_type in get_valid_token_dispatcher_types()
+        ],
+    )
     @pytest.mark.parametrize("permute_fusion", [True, False])
     def test_1f1b_overlap(self, dispatcher_type, grouped_gemm, permute_fusion):
         """
