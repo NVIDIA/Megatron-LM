@@ -22,10 +22,8 @@ kernel):
   per element the single bf16 rounding of an fp32 evaluation, and the harness policy per row
   against torch's fp32 ops rounded once.
 
-PR #8566 (d2) adds ``glu_options`` and ``squared_relu_gate``: the clamp must stay bitwise equal
-to training's fused ``clamped_weighted_swiglu``, the gated squared ReLU to training's unfused
-bf16 GLU times the fp32 probability (``_glu.gated_squared_relu_training``). Those cases run only
-where the arguments exist.
+PR #8566's GLU options and gated squared ReLU are covered by ``test_glu_options.py`` (on a
+branch stacked on that PR).
 
 Structure: ``BLOCK_SIZE = min(next_pow2(N), 1024)``; ``NUM_BLOCKS = min(M, 512)`` persistent
 programs over ``min(n_used, M)`` rows; ``ZERO_PADDING`` compile-time variant.
@@ -161,84 +159,3 @@ def test_matches_training_bitwise(width, zero_padding):
     live, _, _ = row_masks(perm, n_used)
     expected = weighted_swiglu(x[live], probs[live][:, None])
     ou.assert_exact(out[live], expected, what="swiglu_with_probs vs training weighted_swiglu")
-
-
-# ---------------------------------------------------------------------------------------------
-# PR #8566 (d2): GLU options and the gated squared ReLU
-# ---------------------------------------------------------------------------------------------
-
-D2_OPTIONS = {
-    "clamp": dict(clamp=7.0),
-    "clamp-not-bf16": dict(clamp=7.3),
-    "offset": dict(offset=1.0),
-    "interleave-32": dict(interleave=32),
-    "all": dict(clamp=7.0, offset=1.0, interleave=64),
-}
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", list(D2_OPTIONS))
-@pytest.mark.parametrize("zero_padding", [False, True])
-def test_d2_swiglu_options(name, zero_padding):
-    """SwiGLU with training's clamp, linear offset and interleaved layout, times the
-    probability: fp32 compute, one rounding."""
-    options = D2_OPTIONS[name]
-    g = ou.make_generator(device=DEVICE)
-    x, perm, probs = make_inputs(PROGRAMS_CAP + 1, 1856, g, "runs", scale=4.0)
-    out = run_swiglu_with_probs(
-        x, perm, _common.device_scalar(400), probs, zero_padding, **_glu.glu_kwargs(**options)
-    )
-    check_rows(out, x, perm, probs, 400, zero_padding, what=name, **options)
-
-
-@_common.needs_cuda
-@_glu.requires_glu_options
-@pytest.mark.parametrize("clamp", [7.0, 7.3])
-@pytest.mark.parametrize("interleave", [None, 32])
-def test_d2_clamp_matches_training_bitwise(clamp, interleave):
-    """The clamp is bitwise training's fused ``clamped_weighted_swiglu`` (which batch-invariant
-    training runs for ``activation_func_clamp_value``), on the de-interleaved halves."""
-    from megatron.core.fusions.fused_bias_swiglu import clamped_weighted_swiglu
-
-    g = ou.make_generator(device=DEVICE)
-    halves, probs = parity_inputs(1856, g)
-    halves = (halves.float() * 4).to(torch.bfloat16)
-    rows = halves.shape[0]
-    perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-    x = halves if interleave is None else _glu.interleave_halves(halves, interleave)
-    out = run_swiglu_with_probs(
-        x,
-        perm,
-        _common.device_scalar(rows),
-        probs,
-        **_glu.glu_kwargs(clamp=clamp, interleave=interleave),
-    )
-    expected = clamped_weighted_swiglu(halves, probs[:, None], clamp)
-    ou.assert_exact(out, expected, what=f"clamp {clamp} vs training clamped_weighted_swiglu")
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", ["none"] + list(D2_OPTIONS))
-def test_d2_gated_squared_relu_matches_training(name):
-    """``squared_relu_gate``: bitwise training's gated squared ReLU (bf16 ops) times the fp32
-    probability rounded to bf16, NaN and infinities included."""
-    options = D2_OPTIONS.get(name, {})
-    g = ou.make_generator(device=DEVICE)
-    x, perm, probs = make_inputs(PROGRAMS_CAP + 1, 1856, g, "runs", scale=4.0)
-    x[7, 3] = float("nan")
-    x[9, 11] = float("inf")
-    x[10, 1856 + 12] = float("-inf")
-    n_used = 450
-    out = run_swiglu_with_probs(
-        x,
-        perm,
-        _common.device_scalar(n_used),
-        probs,
-        zero_padding=True,
-        **_glu.glu_kwargs(squared_relu_gate=True, **options),
-    )
-    live, padding, beyond = row_masks(perm, n_used)
-    expected = _glu.gated_squared_relu_training(x[live], probs[live], **options)
-    _common.assert_exact_except_nan_payload(out[live], expected, what=f"gated sq-ReLU {name}")
-    ou.assert_exact(out[padding], torch.zeros_like(out[padding]), what="padding rows are +0")
-    ou.assert_poisoned(out[beyond], what="rows past n_used")

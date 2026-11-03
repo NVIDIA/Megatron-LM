@@ -1,17 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Self-tests of the MXFP8 spec reference (``_mx_spec``) used by the MXFP8 oracles; CPU only.
+"""Self-tests of the references the MoE activation and MXFP8 oracles use (no kernels).
 
-The reference is checked against the OCP tables it is written from (E4M3 Table 2, E8M0 Table 7),
-against torch's own ``float8_e4m3fn`` conversion (an independent round-to-nearest-even E4M3
-implementation), against the cuBLAS layout description, and for its round-up scale rule.
+* ``_mx_spec``: against the OCP tables it is written from (E4M3 Table 2, E8M0 Table 7), against
+  torch's own ``float8_e4m3fn`` conversion (an independent round-to-nearest-even E4M3
+  implementation), against the cuBLAS layout description, and for its round-up scale rule.
+* ``_common``'s exact rounding, on every device the oracles compute on: its bf16 rounding agrees
+  with torch's fp32 -> bf16 cast, and torch's own fp32 SwiGLU rounded once passes
+  ``assert_rounded_once`` (so the window admits a real fp32 evaluation).
 """
 
+import pytest
 import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.moe_activations import _common
 from tests.unit_tests.inference.oracles.moe_activations import _mx_spec as mx
+
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() and not _common.INTERPRET else [])
 
 
 def all_bf16_values():
@@ -20,29 +26,31 @@ def all_bf16_values():
     return bits[torch.isfinite(bits)]
 
 
-def test_e4m3_table():
+@pytest.mark.parametrize("device", DEVICES)
+def test_e4m3_table(device):
     """OCP FP8 Table 2 entries, and decode/encode round trips on every code."""
-    decode = mx.e4m3_decode(
-        torch.tensor([0x7E, 0xFE, 0x08, 0x07, 0x01, 0x00, 0x80], dtype=torch.uint8)
-    )
+    table = torch.tensor([0x7E, 0xFE, 0x08, 0x07, 0x01, 0x00, 0x80], dtype=torch.uint8)
+    decode = mx.e4m3_decode(table.to(device)).cpu()
     expected = [448.0, -448.0, 2.0**-6, 0.875 * 2.0**-6, 2.0**-9, 0.0, -0.0]
     ou.assert_exact(decode, torch.tensor(expected, dtype=torch.float64), what="Table 2 values")
     assert torch.signbit(decode[-1]), "0x80 is -0"
-    nan = mx.e4m3_decode(torch.tensor([0x7F, 0xFF], dtype=torch.uint8))
+    nan = mx.e4m3_decode(torch.tensor([0x7F, 0xFF], dtype=torch.uint8, device=device))
     assert bool(torch.isnan(nan).all()), "S.1111.111 is NaN"
     codes = torch.arange(256, dtype=torch.int64).to(torch.uint8)
-    finite = (codes.to(torch.int64) & 0x7F) != 0x7F
+    finite = codes[(codes.to(torch.int64) & 0x7F) != 0x7F]
+    on_device = finite.to(device)
     ou.assert_exact(
-        mx.e4m3_encode(mx.e4m3_decode(codes[finite])), codes[finite], what="encode(decode(c))"
+        mx.e4m3_encode(mx.e4m3_decode(on_device)).cpu(), finite, what="encode(decode(c))"
     )
     ou.assert_exact(
-        mx.e4m3_decode(codes[finite]),
-        codes[finite].view(torch.float8_e4m3fn).double(),
+        mx.e4m3_decode(on_device).cpu(),
+        finite.view(torch.float8_e4m3fn).double(),
         what="decode vs torch float8_e4m3fn",
     )
 
 
-def test_e4m3_rounding_matches_torch():
+@pytest.mark.parametrize("device", DEVICES)
+def test_e4m3_rounding_matches_torch(device):
     """Round-to-nearest-even onto E4M3 agrees with torch's float8_e4m3fn cast on every bf16 value
     up to 448 and on random fp32 values (ties included: bf16 values have few mantissa bits)."""
     g = ou.make_generator()
@@ -52,10 +60,10 @@ def test_e4m3_rounding_matches_torch():
         * torch.exp2(torch.randint(-12, 9, (200_000,), generator=g).float())
     ).double()
     for name, values in (("bf16", bf16), ("fp32", fp32)):
-        values = values[values.abs() <= mx.E4M3_MAX]
+        values = values[values.abs() <= mx.E4M3_MAX].to(device)
         ours = mx.e4m3_encode(mx.e4m3_round(values))
         torch_codes = values.to(torch.float32).to(torch.float8_e4m3fn).view(torch.uint8)
-        ou.assert_exact(ours, torch_codes, what=f"E4M3 RNE of {name} values vs torch")
+        ou.assert_exact(ours, torch_codes, what=f"E4M3 RNE of {name} values vs torch on {device}")
 
 
 def test_e4m3_saturates():
@@ -66,23 +74,58 @@ def test_e4m3_saturates():
     )
 
 
-def test_bf16_rounding_matches_torch_fp32_cast():
-    """``rne_bf16`` agrees with torch's (correctly rounded) fp32 -> bf16 cast."""
+@pytest.mark.parametrize("device", DEVICES)
+def test_bf16_rounding_matches_torch_fp32_cast(device):
+    """``rne_bf16`` and ``bf16_neighbours`` give bf16 values, and ``rne_bf16`` agrees with
+    torch's (correctly rounded) fp32 -> bf16 cast, on the device the oracles compute on."""
     g = ou.make_generator()
     x = torch.randn(200_000, generator=g) * torch.exp2(
         torch.randint(-130, 120, (200_000,), generator=g).float()
     )
-    x = x[torch.isfinite(x)]
+    x = x[torch.isfinite(x)].to(device)
+    nearest = _common.rne_bf16(x.double())
     ou.assert_exact(
-        _common.rne_bf16(x.double()).to(torch.float32),
-        x.to(torch.bfloat16).to(torch.float32),
-        what="rne_bf16 vs torch",
+        nearest.to(torch.float32), x.to(torch.bfloat16).to(torch.float32), what="rne_bf16 vs torch"
+    )
+    lo, hi = _common.bf16_neighbours(x.double() * (1 + 2.0**-20))
+    for name, t in (("nearest", nearest), ("lower", lo), ("upper", hi)):
+        ou.assert_exact(t, t.to(torch.bfloat16).double(), what=f"{name} values are bf16 values")
+    assert bool((lo <= hi).all()) and bool(((hi - lo) <= _common.format_quantum(hi, 7, -126)).all())
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_pow2_is_exact(device):
+    """Powers of two over the whole range the references use, bit for bit."""
+    k = torch.arange(-1022, 1024, device=device)
+    expected = torch.tensor([2.0**e for e in range(-1022, 1024)], dtype=torch.float64)
+    ou.assert_exact(_common.pow2(k).cpu(), expected, what="pow2")
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("scale", [1.0, 4.0, 30.0])
+def test_torch_fp32_swiglu_is_rounded_once(device, scale):
+    """Torch's fp32 SiLU times the linear half, rounded once to bf16 on the device, passes the
+    per-element "rounded once from fp32" check (with its subnormal clause: at scale 30 some gates
+    are below -87.34, where fp32 SiLU underflows): the window admits a real fp32 evaluation."""
+    from tests.unit_tests.inference.oracles.moe_activations import _glu
+
+    g = ou.make_generator()
+    x = (torch.randn(4096, 2 * 512, generator=g) * scale).to(torch.bfloat16).to(device)
+    x[0, :512] = torch.linspace(-87.0, 100.0, 512, dtype=torch.float64).to(x)
+    exact = ou.fp64_reference(_glu.swiglu_exact, x)
+    _common.assert_rounded_once(
+        _glu.swiglu_trusted(x),
+        exact,
+        what=f"torch fp32 SwiGLU on {device}",
+        may_flush=_glu.silu_may_flush(x, exact),
     )
 
 
-def test_e8m0_table():
+@pytest.mark.parametrize("device", DEVICES)
+def test_e8m0_table(device):
     """Table 7: bias 127, exponents -127..127, 0xFF is NaN."""
-    s = mx.e8m0_decode(torch.tensor([0, 1, 127, 254, 255], dtype=torch.uint8))
+    s = mx.e8m0_decode(torch.tensor([0, 1, 127, 254, 255], dtype=torch.uint8, device=device))
+    s = s.cpu()
     ou.assert_exact(s[:4], torch.tensor([2.0**-127, 2.0**-126, 1.0, 2.0**127], dtype=torch.float64))
     assert bool(torch.isnan(s[4]))
 

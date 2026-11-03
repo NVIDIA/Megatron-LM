@@ -29,9 +29,9 @@ launcher's documented API; written before reading the kernel):
   (``ou.assert_close_to_reference(dim=-1)``) against torch's fp32 SiLU rounded once on the same
   device. Padding zeros and untouched rows are exact (bitwise / still poisoned).
 
-Open PR #8566 (d2) adds ``glu_options`` (clamp, linear offset, interleaved FC1 layout) and
-``squared_relu_gate`` to this launcher. The ``test_d2_*`` cases state their contract (training's
-GLU semantics, ``_glu``) and run only where those arguments exist.
+Open PR #8566 adds GLU options (clamp, linear offset, interleaved FC1 layout) and the gated
+squared ReLU to this launcher; their cases are in ``test_glu_options.py``, on a branch stacked on
+that PR.
 
 Structure (read from the launcher after writing the contract): ``BLOCK_N = min(next_pow2(N),
 1024)`` column tiles; a persistent grid of ``NUM_BLOCKS = min(M, 512)`` programs strides over
@@ -211,96 +211,3 @@ def test_offsets_past_int32(rows):
     perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
     out = activations.padded_swiglu(x, perm, _common.device_scalar(rows))
     _glu.assert_swiglu_values(out[probe], x[probe], what=f"rows {probe}")
-
-
-# ---------------------------------------------------------------------------------------------
-# PR #8566 (d2): GLU options and the gated squared ReLU
-# ---------------------------------------------------------------------------------------------
-
-D2_OPTIONS = {
-    "clamp": dict(clamp=7.0),
-    "clamp-not-bf16": dict(clamp=7.3),
-    "offset": dict(offset=1.0),
-    "clamp-offset": dict(clamp=7.0, offset=1.0),
-    "interleave-1": dict(interleave=1),
-    "interleave-32": dict(interleave=32),
-    "all": dict(clamp=7.0, offset=1.0, interleave=64),
-}
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", list(D2_OPTIONS))
-@pytest.mark.parametrize("zero_padding", [False, True])
-def test_d2_swiglu_options(name, zero_padding):
-    """SwiGLU with training's clamp, linear offset and interleaved layout (``_glu``): fp32
-    compute and one rounding, as for the default options."""
-    options = D2_OPTIONS[name]
-    g = ou.make_generator(device=DEVICE)
-    rows, width, n_used = PROGRAMS_CAP + 1, 1856, 400
-    x = _glu.glu_inputs((rows, 2 * width), g, DEVICE, scale=4.0)  # some |x| > 7: clamp bites
-    perm = _glu.permutation_map(rows, "runs", torch.int32, g, DEVICE)
-    out = run_padded_swiglu(
-        x, perm, _common.device_scalar(n_used), zero_padding, **_glu.glu_kwargs(**options)
-    )
-    check_rows(out, x, perm, n_used, zero_padding, what=name, **options)
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", ["clamp", "clamp-not-bf16", "offset", "clamp-offset"])
-def test_d2_swiglu_options_special_values(name):
-    """The clamp keeps NaN NaN (as torch.clamp does) and bounds infinite inputs."""
-    options = D2_OPTIONS[name]
-    for i, x in enumerate(_glu.special_value_inputs(DEVICE)):
-        rows = x.shape[0]
-        perm = torch.arange(rows, dtype=torch.int32, device=DEVICE)
-        out = run_padded_swiglu(x, perm, _common.device_scalar(rows), **_glu.glu_kwargs(**options))
-        _glu.assert_swiglu_special_values(out, x, what=f"{name}, grid {i}", **options)
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("interleave", [1, 32, 64])
-def test_d2_interleaved_layout_is_a_relayout(interleave):
-    """The interleaved FC1 layout gives bitwise the same output as the same values laid out
-    as ``[gate | linear]`` halves."""
-    g = ou.make_generator(device=DEVICE)
-    rows, width = 300, 1856
-    halves = _glu.glu_inputs((rows, 2 * width), g, DEVICE)
-    perm = _glu.permutation_map(rows, "random", torch.int32, g, DEVICE)
-    n_used = _common.device_scalar(rows)
-    expected = run_padded_swiglu(halves, perm, n_used, zero_padding=True)
-    interleaved = _glu.interleave_halves(halves, interleave)
-    actual = run_padded_swiglu(
-        interleaved, perm, n_used, zero_padding=True, **_glu.glu_kwargs(interleave=interleave)
-    )
-    ou.assert_exact(actual, expected, what=f"interleave {interleave} vs halves")
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", ["none"] + list(D2_OPTIONS))
-def test_d2_gated_squared_relu_matches_training(name):
-    """``squared_relu_gate``: bitwise training's gated squared ReLU (``relu(gate)^2 * linear``
-    with training's per-op bf16 roundings, ``_glu.gated_squared_relu_training``), NaN and
-    infinities included."""
-    options = D2_OPTIONS.get(name, {})
-    g = ou.make_generator(device=DEVICE)
-    rows, width, n_used = PROGRAMS_CAP + 1, 1856, 500
-    x = _glu.glu_inputs((rows, 2 * width), g, DEVICE, scale=4.0)
-    x[7, 3] = float("nan")
-    x[8, width + 5] = float("nan")
-    x[9, 11] = float("inf")
-    x[10, width + 12] = float("-inf")
-    perm = _glu.permutation_map(rows, "runs", torch.int32, g, DEVICE)
-    out = run_padded_swiglu(
-        x,
-        perm,
-        _common.device_scalar(n_used),
-        zero_padding=True,
-        **_glu.glu_kwargs(squared_relu_gate=True, **options),
-    )
-    index = torch.arange(rows, device=out.device)
-    live = (index < n_used) & (perm >= 0)
-    expected = _glu.gated_squared_relu_training(x[live], **options)
-    _common.assert_exact_except_nan_payload(out[live], expected, what=f"gated sq-ReLU {name}")
-    padding = (index < n_used) & ~live
-    ou.assert_exact(out[padding], torch.zeros_like(out[padding]), what="padding rows are +0")
-    ou.assert_poisoned(out[index >= n_used], what="rows past n_used")

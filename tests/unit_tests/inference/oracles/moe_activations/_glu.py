@@ -14,46 +14,16 @@ alternating ``I``-wide gate and linear blocks that training de-interleaves first
 probability, where a kernel applies it, multiplies the activation output.
 
 On ``main`` the inference GLU kernels implement only the default (SwiGLU, no clamp, offset 0, no
-interleaving). Open PR #8566 (d2, ``fix/d2-moe-glu-options``) adds the options and the gated
-squared ReLU through ``GLUOptions`` and ``squared_relu_gate`` keyword arguments; the cases for
-them run only where those arguments exist (``requires_glu_options``).
+interleaving); the references here take the options as well. Open PR #8566 adds them to the
+kernels; ``test_glu_options.py``, on a branch stacked on that PR, checks them.
 """
 
 from typing import Any, Optional
 
-import pytest
 import torch
 
-from megatron.core.inference.moe import activations
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.moe_activations import _common
-
-HAS_GLU_OPTIONS = hasattr(activations, "GLUOptions")
-"""The kernels take ``glu_options`` / ``squared_relu_gate`` (PR #8566, d2)."""
-
-requires_glu_options = pytest.mark.skipif(
-    not HAS_GLU_OPTIONS,
-    reason="the GLU options and gated squared ReLU of the inference kernels arrive with #8566",
-)
-
-
-def glu_kwargs(
-    clamp: Optional[float] = None,
-    offset: float = 0.0,
-    interleave: Optional[int] = None,
-    squared_relu_gate: bool = False,
-) -> dict:
-    """Keyword arguments selecting the GLU options; empty for the default (main's API)."""
-    if clamp is None and offset == 0.0 and interleave is None and not squared_relu_gate:
-        return {}
-    kwargs = dict(
-        glu_options=activations.GLUOptions(
-            clamp_value=clamp, linear_offset=offset, interleave_size=interleave
-        )
-    )
-    if squared_relu_gate:
-        kwargs["squared_relu_gate"] = True
-    return kwargs
 
 
 def split_halves(x: torch.Tensor, interleave: Optional[int] = None) -> tuple:
@@ -67,15 +37,6 @@ def split_halves(x: torch.Tensor, interleave: Optional[int] = None) -> tuple:
         return x[..., :n], x[..., n:]
     blocks = x.reshape(*x.shape[:-1], n // interleave, 2, interleave)
     return blocks[..., 0, :].reshape(*x.shape[:-1], n), blocks[..., 1, :].reshape(*x.shape[:-1], n)
-
-
-def interleave_halves(x: torch.Tensor, interleave: int) -> torch.Tensor:
-    """The inverse of ``split_halves``: ``[gate | linear]`` rows rewritten in the interleaved
-    FC1 layout with blocks of ``interleave`` columns."""
-    n = x.shape[-1] // 2
-    gate = x[..., :n].reshape(*x.shape[:-1], n // interleave, 1, interleave)
-    linear = x[..., n:].reshape(*x.shape[:-1], n // interleave, 1, interleave)
-    return torch.cat([gate, linear], dim=-2).reshape(x.shape).contiguous()
 
 
 def fp32_bound(value: float) -> float:
@@ -127,33 +88,6 @@ def swiglu_trusted(
     if probs is not None:
         out = out * probs.float().reshape(-1, 1)
     return out.to(x.dtype)
-
-
-def gated_squared_relu_training(
-    x: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-    *,
-    clamp: Optional[float] = None,
-    offset: float = 0.0,
-    interleave: Optional[int] = None,
-) -> torch.Tensor:
-    """Training's gated squared ReLU in bf16, with the live training ops.
-
-    ``TEGroupedMLP``'s unfused ``glu`` is the only training path for ``activation_func =
-    squared_relu`` with ``gated_linear_unit``: each step is a bf16 torch op (clamp, the
-    compiled ``squared_relu``, ``linear + offset``, the product), and the probability multiply
-    promotes to fp32 and casts back to bf16. PR #8566 claims bitwise parity with this.
-    """
-    from megatron.core.activations import squared_relu
-
-    gate, linear = split_halves(x, interleave)
-    if clamp is not None:
-        gate = gate.clamp(min=None, max=clamp)
-        linear = linear.clamp(min=-clamp, max=clamp)
-    out = squared_relu(gate) * (linear + offset)
-    if probs is not None:
-        out = (out * probs.reshape(-1, 1)).to(x.dtype)
-    return out
 
 
 def glu_inputs(

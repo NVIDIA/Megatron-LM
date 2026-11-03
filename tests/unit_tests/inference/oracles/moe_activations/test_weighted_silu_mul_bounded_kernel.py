@@ -23,9 +23,8 @@ reading the kernel):
   against fp64: per element the single bf16 rounding of an fp32 evaluation, and the harness
   policy per row; (3) exact across grid sizes.
 
-PR #8566 (d2) adds ``glu_options``, ``squared_relu_gate`` and ``weights_flat=None`` (routing
-probabilities applied to the expert input): without weights the result must be bitwise training's
-``weighted_swiglu(y, ones)``. Those cases run only where the arguments exist.
+PR #8566's GLU options, gated squared ReLU and ``weights_flat=None`` are covered by
+``test_glu_options.py`` (on a branch stacked on that PR).
 
 Structure: elementwise persistent 1-D grid of ``num_programs`` programs, ``XBLOCK`` elements per
 step, striding while ``xoffset < bound``; ``HALF_N`` is a compile-time constant; int64 offsets.
@@ -198,80 +197,3 @@ def test_offsets_past_int32(rows):
         y, weights, _common.device_scalar(rows * half_n, torch.int64)
     )
     _glu.assert_swiglu_values(out[probe], y[probe], weights[probe], what=f"rows {probe}")
-
-
-# ---------------------------------------------------------------------------------------------
-# PR #8566 (d2): GLU options, gated squared ReLU and probabilities applied on the input
-# ---------------------------------------------------------------------------------------------
-
-D2_OPTIONS = {
-    "clamp": dict(clamp=7.0),
-    "clamp-not-bf16": dict(clamp=7.3),
-    "offset": dict(offset=1.0),
-    "interleave-32": dict(interleave=32),
-    "all": dict(clamp=7.0, offset=1.0, interleave=64),
-}
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", list(D2_OPTIONS))
-@pytest.mark.parametrize("weighted", [True, False], ids=["weights", "no-weights"])
-def test_d2_swiglu_options(name, weighted):
-    """SwiGLU with training's clamp, linear offset and interleaved layout, with or without
-    weights: fp32 compute, one rounding."""
-    options = D2_OPTIONS[name]
-    g = ou.make_generator(device=DEVICE)
-    rows, half_n = 300, 1856
-    y = _glu.glu_inputs((rows, 2 * half_n), g, DEVICE, scale=4.0)
-    weights = torch.rand(rows, generator=g, device=DEVICE, dtype=torch.float32)
-    weights = weights if weighted else None
-    bound = 211 * half_n
-    out = run_weighted(y, weights, bound, 3, 1024, **_glu.glu_kwargs(**options))
-    check_elements(out, y, weights, bound, what=name, **options)
-
-
-@_common.needs_cuda
-@_glu.requires_glu_options
-@pytest.mark.parametrize("clamp", [None, 7.0, 7.3])
-def test_d2_matches_training_bitwise(clamp):
-    """Bitwise training's fused weighted SwiGLU (``clamped_weighted_swiglu`` with a clamp),
-    with weights and without (training then weights by ones)."""
-    from megatron.core.fusions.fused_bias_swiglu import clamped_weighted_swiglu, weighted_swiglu
-
-    g = ou.make_generator(device=DEVICE)
-    rows, half_n = 513, 1856
-    y = _glu.glu_inputs((rows, 2 * half_n), g, DEVICE, scale=4.0)
-    weights = torch.rand(rows, generator=g, device=DEVICE, dtype=torch.float32)
-    for w in (weights, None):
-        out = run_weighted(y, w, rows * half_n, None, **_glu.glu_kwargs(clamp=clamp))
-        w_train = torch.ones_like(weights) if w is None else w
-        if clamp is None:
-            expected = weighted_swiglu(y, w_train[:, None])
-        else:
-            expected = clamped_weighted_swiglu(y, w_train[:, None], clamp)
-        ou.assert_exact(out, expected, what=f"clamp {clamp}, weights {w is not None}")
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", ["none"] + list(D2_OPTIONS))
-@pytest.mark.parametrize("weighted", [True, False], ids=["weights", "no-weights"])
-def test_d2_gated_squared_relu_matches_training(name, weighted):
-    """``squared_relu_gate``: bitwise training's gated squared ReLU (bf16 ops), times the fp32
-    weight rounded to bf16 when weights are given."""
-    options = D2_OPTIONS.get(name, {})
-    g = ou.make_generator(device=DEVICE)
-    rows, half_n = 300, 1856
-    y = _glu.glu_inputs((rows, 2 * half_n), g, DEVICE, scale=4.0)
-    y[7, 3] = float("nan")
-    y[9, 11] = float("inf")
-    weights = torch.rand(rows, generator=g, device=DEVICE, dtype=torch.float32)
-    weights = weights if weighted else None
-    live = 211
-    out = run_weighted(
-        y, weights, live * half_n, 3, 1024, **_glu.glu_kwargs(squared_relu_gate=True, **options)
-    )
-    expected = _glu.gated_squared_relu_training(
-        y[:live], None if weights is None else weights[:live], **options
-    )
-    _common.assert_exact_except_nan_payload(out[:live], expected, what=f"gated sq-ReLU {name}")
-    ou.assert_poisoned(out[live:], what="rows past the bound")

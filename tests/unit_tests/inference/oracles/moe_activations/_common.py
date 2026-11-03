@@ -217,13 +217,23 @@ BF16_MANTISSA_BITS, BF16_EMIN = 7, -126
 BF16_MAX = (2 - 2**-7) * 2.0**127
 
 
+def pow2(k: torch.Tensor) -> torch.Tensor:
+    """Exactly ``2.0**k`` in fp64 for integers ``k`` in [-1022, 1023], built from the bits.
+
+    ``torch.ldexp`` multiplies by ``pow(2, k)``, which CUDA computes inexactly for some ``k``
+    (e.g. 2**-128 one ulp off), so it cannot build exact rounding grids on the GPU.
+    """
+    k = k.to(torch.int64)
+    return ((k + 1023) << 52).view(torch.float64)
+
+
 def format_quantum(x: torch.Tensor, mantissa_bits: int, emin: int) -> torch.Tensor:
     """Spacing of a binary floating-point format with ``mantissa_bits`` fraction bits and
     minimum normal exponent ``emin`` at ``|x|`` (fp64 in and out; subnormal spacing below
     ``2**emin``)."""
     _, exponent = torch.frexp(x.abs())  # |x| = m * 2**exponent, m in [0.5, 1)
     binade = (exponent - 1).clamp(min=emin)  # floor(log2 |x|), at least emin
-    return torch.ldexp(torch.ones_like(x), (binade - mantissa_bits).to(torch.float64))
+    return pow2(binade - mantissa_bits)
 
 
 def round_to_format(x: torch.Tensor, mantissa_bits: int, emin: int) -> torch.Tensor:

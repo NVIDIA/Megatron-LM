@@ -20,9 +20,9 @@ topk)``, and training's GLU; written before reading the kernel):
   rounding of an fp32 evaluation (``_common.assert_rounded_once``), plus the harness policy per
   row against torch's fp32 SiLU rounded once. Untouched rows: still poisoned.
 
-PR #8566 (d2) adds ``glu_options`` and ``squared_relu_gate``; their cases (``test_d2_*``) run only
-where the arguments exist. PR #8871 (t3-r03f5, stacked on d2) fixes the grid at 512 programs and
-accepts ``n_rows=None``; the cases here hold for either grid.
+PR #8566's GLU options are covered by ``test_glu_options.py`` (on a branch stacked on that PR).
+PR #8871 (stacked on #8566) fixes the grid at 512 programs and accepts ``n_rows=None``; the cases
+here hold for either grid.
 
 Structure: ``BLOCK_N = min(next_pow2(N), 1024)``; ``NUM_BLOCKS = min(M, 512)`` persistent programs
 (512 on #8871); int64 row offsets. Covered: N around the tile cap, M and ``n_rows`` around the
@@ -134,49 +134,3 @@ def test_offsets_past_int32(rows):
     x[probe] = _glu.glu_inputs((len(probe), 2 * width), g, DEVICE)
     out = activations.bounded_silu_mul(x, _common.device_scalar(rows))
     _glu.assert_swiglu_values(out[probe], x[probe], what=f"rows {probe}")
-
-
-# ---------------------------------------------------------------------------------------------
-# PR #8566 (d2): GLU options and the gated squared ReLU
-# ---------------------------------------------------------------------------------------------
-
-D2_OPTIONS = {
-    "clamp": dict(clamp=7.0),
-    "clamp-not-bf16": dict(clamp=7.3),
-    "offset": dict(offset=1.0),
-    "interleave-32": dict(interleave=32),
-    "all": dict(clamp=7.0, offset=1.0, interleave=64),
-}
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", list(D2_OPTIONS))
-def test_d2_swiglu_options(name):
-    """SwiGLU with training's clamp, linear offset and interleaved FC1 layout."""
-    options = D2_OPTIONS[name]
-    g = ou.make_generator(device=DEVICE)
-    rows, width, n_rows = PROGRAMS_CAP + 1, 1856, 400
-    x = _glu.glu_inputs((rows, 2 * width), g, DEVICE, scale=4.0)
-    out = run_bounded_silu_mul(x, _common.device_scalar(n_rows), **_glu.glu_kwargs(**options))
-    check_rows(out, x, n_rows, what=name, **options)
-
-
-@_glu.requires_glu_options
-@pytest.mark.parametrize("name", ["none"] + list(D2_OPTIONS))
-def test_d2_gated_squared_relu_matches_training(name):
-    """``squared_relu_gate``: bitwise training's gated squared ReLU, NaN and infinities
-    included."""
-    options = D2_OPTIONS.get(name, {})
-    g = ou.make_generator(device=DEVICE)
-    rows, width, n_rows = PROGRAMS_CAP + 1, 1856, 450
-    x = _glu.glu_inputs((rows, 2 * width), g, DEVICE, scale=4.0)
-    x[7, 3] = float("nan")
-    x[8, width + 5] = float("nan")
-    x[9, 11] = float("inf")
-    x[10, width + 12] = float("-inf")
-    out = run_bounded_silu_mul(
-        x, _common.device_scalar(n_rows), **_glu.glu_kwargs(squared_relu_gate=True, **options)
-    )
-    expected = _glu.gated_squared_relu_training(x[:n_rows], **options)
-    _common.assert_exact_except_nan_payload(out[:n_rows], expected, what=f"gated sq-ReLU {name}")
-    ou.assert_poisoned(out[n_rows:], what="rows past n_rows")

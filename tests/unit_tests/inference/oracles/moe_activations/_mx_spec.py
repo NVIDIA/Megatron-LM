@@ -72,7 +72,7 @@ def e4m3_encode(v: torch.Tensor) -> torch.Tensor:
     binade = exponent - 1  # floor(log2 |v|) for v != 0
     normal = mag >= 2.0**E4M3_EMIN
     e_field = torch.where(normal, binade + E4M3_BIAS, torch.zeros_like(binade))
-    unit = torch.ldexp(torch.ones_like(mag), torch.where(normal, binade, E4M3_EMIN) - 3.0)
+    unit = _common.pow2(torch.where(normal, binade, E4M3_EMIN) - 3)
     m_field = (mag / unit).round().to(torch.int64) - torch.where(normal, 8, 0)
     code = sign | (e_field.to(torch.int64) << 3) | m_field
     code = torch.where(mag == 0, sign, code)
@@ -86,8 +86,8 @@ def e4m3_decode(codes: torch.Tensor) -> torch.Tensor:
     sign = torch.where((c >> 7) == 1, -1.0, 1.0).to(torch.float64)
     e = (c >> 3) & 0xF
     m = (c & 0x7).to(torch.float64)
-    normal = torch.ldexp(1.0 + m / 8.0, (e - E4M3_BIAS).to(torch.float64))
-    subnormal = torch.ldexp(m, torch.full_like(m, float(E4M3_EMIN - 3)))
+    normal = (1.0 + m / 8.0) * _common.pow2(e - E4M3_BIAS)
+    subnormal = m * 2.0 ** (E4M3_EMIN - 3)
     value = sign * torch.where(e == 0, subnormal, normal)
     return torch.where((c & 0x7F) == E4M3_NAN_MAGNITUDE, float("nan"), value)
 
@@ -95,7 +95,7 @@ def e4m3_decode(codes: torch.Tensor) -> torch.Tensor:
 def e8m0_decode(scales: torch.Tensor) -> torch.Tensor:
     """E8M0 bytes to fp64 scales ``2**(byte - 127)``, NaN for 0xFF (Table 7)."""
     b = scales.view(torch.uint8).to(torch.int64)
-    value = torch.ldexp(torch.ones_like(b, dtype=torch.float64), (b - E8M0_BIAS).to(torch.float64))
+    value = _common.pow2(b - E8M0_BIAS)
     return torch.where(b == E8M0_NAN, float("nan"), value)
 
 
@@ -140,7 +140,7 @@ def quantize(x: torch.Tensor) -> tuple:
     rows, k = x.shape
     blocks = x.to(torch.float64).reshape(rows, k // BLOCK, BLOCK)
     exponent = rceil_scale_exponent(blocks.abs().amax(dim=-1))
-    scale = torch.ldexp(torch.ones_like(exponent, dtype=torch.float64), exponent.double())
+    scale = _common.pow2(exponent)
     elements = e4m3_round(blocks / scale[..., None])
     codes = e4m3_encode(elements).reshape(rows, k)
     return codes, (exponent + E8M0_BIAS).to(torch.uint8)
