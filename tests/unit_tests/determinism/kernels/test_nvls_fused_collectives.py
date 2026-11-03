@@ -4,10 +4,11 @@
 
 ``fused_multimem_rs_add_norm_ag`` launches one block per token: each block processes its tokens
 one after another, so a block sized from the whole per-rank shard ran several tokens in series
-with most of its threads idle. The launch geometry is checked on the real launcher without a
-GPU. On an NVLink multicast group, the kernel replays bit-exactly and gives the bits of the
-shard-sized launch it replaced: the extra threads of a wider block only add zeros to the
-block-wide sum of squares.
+with most of its threads idle. The launch geometry, and the launcher's refusal of inputs the
+kernel would read or write out of bounds, are checked on the real launcher without a GPU. On an
+NVLink multicast group, the kernel replays bit-exactly and gives the bits of the shard-sized
+launch it replaced: the extra threads of a wider block only add zeros to the block-wide sum of
+squares.
 """
 
 import math
@@ -76,6 +77,65 @@ def test_launch_runs_one_token_per_block(monkeypatch, world_size, hidden, tokens
     assert launch["grid"] == (min(tokens_per_rank, MAX_NUM_BLOCKS), 1, 1)
     assert block_size == min(_next_power_of_2(row_threads), MAX_BLOCK_SIZE)
     assert launch["kwargs"]["num_warps"] == max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
+
+
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("valid", None),
+        ("tokens-not-a-multiple-of-world-size", "divisible by the world size"),
+        ("hidden-not-a-multiple-of-8", "multiple of 8"),
+        ("weights-not-bf16", "must be bfloat16"),
+        ("weights-not-hidden-long", "RMSNorm weights, got"),
+        ("residual-input-not-shard-sized", "residual input must hold"),
+        ("residual-output-not-shard-sized", "residual output must hold"),
+    ],
+)
+def test_launcher_refuses_inputs_outside_the_contract(monkeypatch, case, error):
+    """Inputs the kernel cannot process are refused before anything is launched: with a token
+    count not divisible by the world size the last rank would reduce and normalize rows past the
+    end and write them into every rank's buffer; with H % 8 != 0 every row after the first is
+    misaligned; weights that are not H bf16 values are misdecoded or read out of bounds; and
+    residuals that are not this rank's tokens are read and written out of bounds."""
+    pytest.importorskip("triton")
+    recorder = _LaunchRecorder()
+    monkeypatch.setattr(fused_collectives, "_multimem_reduce_scatter_residual_add_kernel", recorder)
+    world_size, tokens, hidden = 4, 8, 1024
+    weight_dtype, weight_len = torch.bfloat16, None
+    residual_in_rows = residual_out_rows = None
+    if case == "tokens-not-a-multiple-of-world-size":
+        tokens = 10
+    elif case == "hidden-not-a-multiple-of-8":
+        hidden = 12  # tokens * hidden is still a multiple of 8
+    elif case == "weights-not-bf16":
+        weight_dtype = torch.float32
+    elif case == "weights-not-hidden-long":
+        weight_len = hidden + 8
+    elif case == "residual-input-not-shard-sized":
+        residual_in_rows = tokens // world_size + 1
+    elif case == "residual-output-not-shard-sized":
+        residual_out_rows = tokens // world_size + 1
+    handle = SimpleNamespace(
+        world_size=world_size, rank=world_size - 1, multicast_ptr=0, signal_pad_ptrs_dev=0
+    )
+    shard_rows = math.ceil(tokens / world_size)
+    symm = torch.empty(tokens, 1, hidden, dtype=torch.bfloat16)
+    residual_in = torch.empty(residual_in_rows or shard_rows, 1, hidden, dtype=torch.bfloat16)
+    residual_out = torch.empty(residual_out_rows or shard_rows, 1, hidden, dtype=torch.bfloat16)
+    weight = torch.empty(weight_len or hidden, dtype=weight_dtype)
+
+    def launch():
+        fused_collectives.fused_multimem_rs_add_norm_ag(
+            residual_out, symm, handle, residual_in, weight, 1e-5
+        )
+
+    if error is None:
+        launch()
+        assert len(recorder.launches) == 1
+        return
+    with pytest.raises(AssertionError, match=error):
+        launch()
+    assert not recorder.launches, f"{case}: the kernel was launched"
 
 
 @pytest.fixture(scope="module")

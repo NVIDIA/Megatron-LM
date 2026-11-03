@@ -225,11 +225,15 @@ def fused_multimem_rs_add_norm_ag(
     The output of the full kernel is written in-place to the symmetric memory buffer.
     input_tensor must be a symmetric memory buffer.
     Args:
-        residual_output_tensor: torch.Tensor to write the output of the residual add.
-        input_tensor: torch.Tensor, symmetric memory buffer to read the input from.
+        residual_output_tensor: torch.Tensor to write the output of the residual add,
+            this rank's num_tokens // world_size tokens.
+        input_tensor: torch.Tensor, symmetric memory buffer to read the input from:
+            num_tokens tokens of hidden size H, with num_tokens divisible by the world size
+            and H by 8 (rows of whole 128-bit lanes).
         symm_mem_hdl: _SymmetricMemory handle for the symmetric memory buffer.
-        residual_input_tensor: torch.Tensor, the residual input to be added.
-        rms_norm_weights: torch.Tensor, the weights for rms norm.
+        residual_input_tensor: torch.Tensor, the residual input to be added, shaped like
+            residual_output_tensor (it may be the same tensor).
+        rms_norm_weights: torch.Tensor, the H weights for rms norm.
         eps: float, epsilon value for rms norm.
     Returns:
         residual_output_tensor: torch.Tensor, the output of the full fused operation.
@@ -245,17 +249,36 @@ def fused_multimem_rs_add_norm_ag(
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert residual_output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert residual_input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
+    assert (
+        rms_norm_weights.dtype == torch.bfloat16
+    ), f"The RMSNorm weights must be bfloat16, got {rms_norm_weights.dtype}."
 
     # this evaluates to 128 for bf16.
     # each thread will process 128 bits (8 bf16 values) at a time.
     numel_per_thread = BYTES_PER_THREAD // residual_input_tensor.element_size()
 
-    assert (
-        input_tensor.numel() % numel_per_thread == 0
-    ), "The number of elements must be 128-bit aligned."
-
     hsize = input_tensor.size(-1)
     num_tokens = input_tensor.numel() // hsize
+
+    # The kernel gives each rank cdiv(num_tokens, world_size) rows of cdiv(hsize, 8) 128-bit
+    # lanes and reads the weights as hsize bf16 values. Anything else makes it read and write
+    # past the residual, the weights or this rank's region of every rank's buffer.
+    assert (
+        hsize % numel_per_thread == 0
+    ), f"The hidden size ({hsize}) must be a multiple of {numel_per_thread} (128-bit rows)."
+    assert num_tokens % symm_mem_hdl.world_size == 0, (
+        f"The number of tokens ({num_tokens}) must be divisible by the world size "
+        f"({symm_mem_hdl.world_size})."
+    )
+    assert (
+        rms_norm_weights.numel() == hsize
+    ), f"Expected {hsize} RMSNorm weights, got {rms_norm_weights.numel()}."
+    tokens_per_rank = num_tokens // symm_mem_hdl.world_size
+    for name, residual in (("output", residual_output_tensor), ("input", residual_input_tensor)):
+        assert residual.numel() == tokens_per_rank * hsize, (
+            f"The residual {name} must hold this rank's {tokens_per_rank} tokens of hidden size "
+            f"{hsize}, got {residual.numel()} elements."
+        )
 
     # One token per block, as in the variable-count collectives: each block processes its
     # tokens one after another, so sizing blocks from the whole shard would run several
