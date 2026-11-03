@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.fusions import fused_cross_entropy
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -185,6 +185,8 @@ def test_warmup_rejects_invalid_shape(tp_group):
         pytest.param(F.silu, True, False, 16.0, id="unfused_situ_glu"),
         pytest.param(squared_relu, False, False, 16.0, id="unfused_clamped_squared_relu"),
         pytest.param(quick_gelu, True, False, None, id="unfused_quick_geglu"),
+        pytest.param(situlu, True, False, None, id="unfused_situlu"),
+        pytest.param(situlu, True, False, 16.0, id="unfused_situlu_ignores_clamp"),
     ],
 )
 def test_other_configurations_and_later_compilation(

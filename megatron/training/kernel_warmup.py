@@ -9,7 +9,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
+from megatron.core.activations import situ_glu, situlu, squared_relu, tanh_soft_clamp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_single_rank
 
@@ -97,7 +97,11 @@ def _warmup_activation(
         if kernel == "squared_relu":
             output = weighted_squared_relu_impl(x, None, clamp)
         elif kernel == "unfused":
-            if gated and clamp is not None:
+            if gated and config.activation_func is situlu:
+                # SiTU-GLU consumes the whole [gate, up] FC1 output (MLP.forward applies it
+                # before any clamp handling); chunking first would halve the width twice.
+                output = situlu(x, config.situ_glu_beta1, config.situ_glu_beta2)
+            elif gated and clamp is not None:
                 linear_clamp = config.activation_func_tanh_clamp_scale_linear
                 output = situ_glu(x, clamp, linear_clamp, config.glu_linear_offset)
             elif gated:
