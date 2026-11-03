@@ -939,7 +939,7 @@ def test_gtp_shards_execute_real_transfer_and_match_fresh_oracle(refit_backend: 
     src_pgs.gtp_remat = gtp_group
 
     class TinyWeightModel(torch.nn.Module):
-        def __init__(self, weight, pg_collection):
+        def __init__(self, weight, pg_collection) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(weight)
             self.pg_collection = pg_collection
@@ -1006,7 +1006,7 @@ def test_refit_executes_context_parallel_collectives_with_new_weights(monkeypatc
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     class TinyContextParallelModel(torch.nn.Module):
-        def __init__(self, seed, pg_collection):
+        def __init__(self, seed, pg_collection) -> None:
             super().__init__()
             torch.manual_seed(seed)
             self.pg_collection = pg_collection
@@ -1104,7 +1104,7 @@ def test_noncollocated_multi_destination_pools_receive_and_execute_same_weights(
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     class TinyModel(torch.nn.Module):
-        def __init__(self, value, pg_collection):
+        def __init__(self, value, pg_collection) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(value)
             self.pg_collection = pg_collection

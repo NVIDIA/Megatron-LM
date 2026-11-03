@@ -382,7 +382,7 @@ class TestMXFP8ReshardTransform:
         class LoopbackCopyService(CopyService):
             requires_process_group_barrier = False
 
-            def __init__(self):
+            def __init__(self) -> None:
                 self.sends, self.recvs = {}, []
 
             def submit_send(self, src_tensor, dest_rank, task_id=None):
