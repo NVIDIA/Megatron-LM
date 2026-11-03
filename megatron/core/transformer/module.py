@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     require_process_groups,
+    resolve_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -156,14 +157,30 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
-        if not hasattr(self, 'tp_group'):
-            # some model interface hasn't updated for m4, fallback needed
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-        else:
+        pg_collection = getattr(self, 'pg_collection', None)
+        if hasattr(self, 'tp_group'):
             tp_group = self.tp_group
+        elif pg_collection is not None and 'tp' in vars(pg_collection):
+            tp_group = pg_collection.tp
+        elif sharded_state_dict or any(
+            not hasattr(module, 'sharded_state_dict') for module in self.children()
+        ):
+            # The replica ids of this module's own state, and of submodules that have no
+            # sharded_state_dict of their own, depend on the tensor-parallel rank.
+            tp_group = resolve_process_groups(
+                None,
+                owner=f"{type(self).__name__}.sharded_state_dict",
+                required=('tp',),
+                argument='tp_group',
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ).tp
+        else:
+            # Every submodule builds its own sharded state dict, so no tensor-parallel group is
+            # used here.
+            tp_group = None
         # Guard for cases metadata is not provided. A module with its own collection supplies
         # its GTP-inclusive DP x CP group, the group the global default stands for.
-        pg_collection = getattr(self, 'pg_collection', None)
         dp_cp_group = None
         if pg_collection is not None:
             dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
