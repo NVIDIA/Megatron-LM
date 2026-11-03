@@ -45,6 +45,9 @@ spec:
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
     export NVTE_FLASH_ATTN_V4=0
+    # The GPU this recipe runs on. The inference kernel oracles (tests/unit_tests/inference/oracles)
+    # then fail, not skip, when the image lacks a package or kernel build they need here.
+    export MCORE_ORACLE_TARGET_SM=9
 
     # GTP scales to any world size; the test fixtures don't — most GTP cases
     # pytest.skip unless world_size==4 exactly (a few also run at 8, see
@@ -284,6 +287,16 @@ products:
   - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Inference kernel oracles (tests/unit_tests/inference/oracles/README.md), apart from the rest of
+  # inference for the time limit; a file too slow to share this bucket gets its own entry below it.
+  # Dev image only: the LTS image has no FlashInfer, FlashMLA or DeepGEMM.
+  - test_case: [tests/unit_tests/inference/oracles/**/*.py]
+    products:
+      - environment: [dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]

@@ -30,6 +30,10 @@ def pytest_configure(config):
 
 
 def pytest_runtest_setup(item):
+    # One GPU per rank when CI runs the bucket on every GPU, before anything here touches CUDA.
+    # Not in pytest_configure: pytest also loads this conftest in the buckets that ignore this
+    # directory's files, and their tests must keep their own device.
+    oracle_utils.use_local_rank_device()
     if item.get_closest_marker("large") and not oracle_utils.large_selected():
         pytest.skip("large test: opt in with -m large")
     path = Path(str(item.fspath))

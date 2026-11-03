@@ -16,7 +16,7 @@ conventions):
   ``poison_`` / ``poisoned_empty`` / ``assert_poisoned`` (NaN-poisoned unused memory), and the
   ``sanitizer`` marker;
 * hardware: ``requires_sm`` / ``require_sm`` (skip off-target, fail when the run targets the
-  hardware);
+  hardware) and ``use_local_rank_device`` (one GPU per rank under ``torch.distributed.run``);
 * samplers: ``assert_matches_distribution`` (chi-square), ``assert_counts_within_binomial_bounds``
   (exact binomial bounds), with a stated false-failure rate and a fixed seed.
 """
@@ -902,6 +902,22 @@ def device_sm_major() -> Optional[int]:
     if not torch.cuda.is_available():
         return None
     return torch.cuda.get_device_capability()[0]
+
+
+def use_local_rank_device(environ: Any = None) -> Optional[int]:
+    """Make ``LOCAL_RANK`` (modulo the visible devices) this process's CUDA device; return it.
+
+    CI runs each unit-test bucket under ``torch.distributed.run`` on every GPU of the node, and
+    every rank runs every test. Most oracles never set up process groups (which would pick the
+    rank's device), so without this every rank would run on device 0. A no-op outside
+    ``torch.distributed.run`` or without CUDA (returns None).
+    """
+    environ = os.environ if environ is None else environ
+    if "LOCAL_RANK" not in environ or not torch.cuda.is_available():
+        return None
+    index = int(environ["LOCAL_RANK"]) % torch.cuda.device_count()
+    torch.cuda.set_device(index)
+    return index
 
 
 def requires_sm(*majors: int) -> Any:
