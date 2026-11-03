@@ -1167,7 +1167,13 @@ class TEGroupedMLP(MegatronModule):
                                 x_linear + self.config.glu_linear_offset
                             )
 
-                        if self.activation_func in (F.silu, F.gelu, quick_gelu, squared_relu):
+                        # Paged stash sizes its pool from the tensors that autograd saves. The
+                        # chunked path saves the FC1 output, so an input that crosses the chunking
+                        # threshold after the capture step would need a pool that does not exist.
+                        if (
+                            self.activation_func in (F.silu, F.gelu, quick_gelu, squared_relu)
+                            and not self.config.moe_paged_stash
+                        ):
                             return apply_weighted_activation(
                                 glu, intermediate_parallel, permuted_probs
                             )

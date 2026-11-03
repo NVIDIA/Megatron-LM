@@ -2105,6 +2105,48 @@ def test_unfused_experts_bound_router_weighting(monkeypatch, gated, te_activatio
     assert 0 < products.largest <= weighted_activation._MAX_TEMP_ELEMENTS
 
 
+def test_unfused_glu_keeps_fc1_output_out_of_paged_stash(monkeypatch):
+    """Paged stash sizes its pool at capture, so a later large input must not add a saved tensor."""
+    import contextlib
+
+    from megatron.core.ops.moe import weighted_activation
+
+    def mark(*tensors):
+        for tensor in tensors:
+            tensor.grouped_tensor_scale_inv = False
+
+    monkeypatch.setattr(weighted_activation, "_MAX_TEMP_ELEMENTS", 32)
+    monkeypatch.setattr(experts_module, "_mark_te_grouped_tensor", mark)
+    module = _build_moe_act_recompute_module()
+    module.activation_recompute = False
+    module.activation_func = F.silu
+    module.config.activation_func = F.silu
+    module.config.gated_linear_unit = True
+    module.config.glu_linear_offset = 0.2
+    module.config.moe_paged_stash = True
+    # The real stash manager needs CUDA streams, and the saved tensors are what this test checks.
+    monkeypatch.setattr(
+        module, "_get_paged_stash_scope", lambda hidden, tokens: (hidden, contextlib.nullcontext())
+    )
+    monkeypatch.setattr(experts_module, "paged_stash_group_commit", lambda output, **_: output)
+    inputs = torch.randn(31, 14, dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.rand(31, dtype=torch.float32, requires_grad=True)
+
+    stashed_shapes = []
+
+    def pack(tensor):
+        if hasattr(tensor, "grouped_tensor_scale_inv"):
+            stashed_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output, _ = module(inputs, torch.tensor([31, 0]), probs)
+    output.sum().backward()
+
+    assert stashed_shapes
+    assert (31, 14) not in stashed_shapes
+
+
 def test_unfused_experts_preserve_custom_activation_parameter_gradient(monkeypatch):
     """A custom activation's trainable parameters remain in the outer autograd graph."""
     from megatron.core.ops.moe import weighted_activation
