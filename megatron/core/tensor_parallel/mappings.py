@@ -24,6 +24,24 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
+def _native_cp_transport(group, parent=None):
+    """Resolve the transport for a logical group without a subgroup communicator."""
+    if not isinstance(group, LogicalCPGroup):
+        return None
+    from transformer_engine.pytorch.attention.native_cp_transport import (
+        get_native_cp_transport,
+        set_native_cp_parent_group,
+    )
+
+    transport = get_native_cp_transport(group)
+    if transport is None and parent is not None:
+        set_native_cp_parent_group(group, parent)
+        transport = get_native_cp_transport(group)
+    if transport is None:
+        raise RuntimeError("Logical CP group has no native parent transport")
+    return transport
+
+
 def _reduce(input_, group):
     """All-reduce the input tensor across model parallel group."""
     assert group is not None, "group should not be None"
@@ -32,12 +50,8 @@ def _reduce(input_, group):
     if group.size() == 1:
         return input_
 
-    if isinstance(group, LogicalCPGroup):
-        from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
-
-        transport = get_native_cp_transport(group)
-        if transport is None:
-            raise RuntimeError("Logical CP group has no native parent transport")
+    transport = _native_cp_transport(group)
+    if transport is not None:
         return transport.all_reduce(input_, group)
 
     # All-reduce.
@@ -105,8 +119,12 @@ def _gather_along_last_dim(input_, group):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    dist_all_gather_func(output, input_.contiguous(), group=group)
+    transport = _native_cp_transport(group)
+    if transport is None:
+        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+        dist_all_gather_func(output, input_.contiguous(), group=group)
+    else:
+        output = transport.all_gather(input_, group)
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
 
@@ -148,6 +166,20 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
     if world_size == 1:
         return input_
 
+    transport = _native_cp_transport(group)
+    if transport is not None:
+        if (
+            output_split_sizes is not None
+            and list(output_split_sizes) != [input_.shape[0]] * world_size
+        ):
+            raise ValueError("Logical CP all-gather requires equal first-dimension shards")
+        output = transport.all_gather(input_, group)
+        if use_global_buffer:
+            buffer = get_global_memory_buffer().get_tensor(output.shape, input_.dtype, "mpu")
+            buffer.copy_(output)
+            return buffer
+        return output
+
     dim_size = list(input_.size())
     if output_split_sizes is None:
         dim_size[0] = dim_size[0] * world_size
@@ -183,6 +215,20 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
+
+    transport = _native_cp_transport(group)
+    if transport is not None:
+        if (
+            input_split_sizes is not None
+            and list(input_split_sizes) != [input_.shape[0] // world_size] * world_size
+        ):
+            raise ValueError("Logical CP reduce-scatter requires equal first-dimension shards")
+        output = transport.reduce_scatter(input_, group)
+        if use_global_buffer:
+            buffer = get_global_memory_buffer().get_tensor(output.shape, input_.dtype, "mpu")
+            buffer.copy_(output)
+            return buffer
+        return output
 
     if input_split_sizes is None:
         dim_size = list(input_.size())
@@ -379,7 +425,7 @@ class _AsyncCollectiveHandle:
         if self.work is not None:
             self.work.wait()
             self.work = None
-            self._input_buffer = None
+        self._input_buffer = None
         return self.tensor
 
 
@@ -392,12 +438,16 @@ class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
         ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
         ctx.group = group
 
-        dim_size = list(input_.size())
-        dim_size[0] *= group.size()
-        output = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
         input_buffer = input_.contiguous()
         handle._input_buffer = input_buffer
-        handle.work = dist_all_gather_func(output, input_buffer, group=group, async_op=True)
+        transport = _native_cp_transport(group)
+        if transport is None:
+            dim_size = list(input_.size())
+            dim_size[0] *= group.size()
+            output = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+            handle.work = dist_all_gather_func(output, input_buffer, group=group, async_op=True)
+        else:
+            output = transport.all_gather(input_buffer, group)
         return output
 
     @staticmethod
@@ -633,11 +683,15 @@ def async_reduce_scatter_along_first_dim(input_, group=None):
     ), "First dimension of the tensor should be divisible by tensor parallel size"
     dim_size[0] //= group.size()
 
-    handle.tensor = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
     handle._input_buffer = input_.contiguous()
-    handle.work = dist_reduce_scatter_func(
-        handle.tensor, handle._input_buffer, group=group, async_op=True
-    )
+    transport = _native_cp_transport(group)
+    if transport is None:
+        handle.tensor = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+        handle.work = dist_reduce_scatter_func(
+            handle.tensor, handle._input_buffer, group=group, async_op=True
+        )
+    else:
+        handle.tensor = transport.reduce_scatter(handle._input_buffer, group)
     return handle
 
 

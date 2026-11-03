@@ -28,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import _native_cp_transport
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
@@ -795,6 +796,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
         # Run decoder.
+        if self.config.use_native_cp_transport:
+            _native_cp_transport(
+                resolve_cp_group(self.pg_collection.cp, packed_seq_params), self.pg_collection.dp_cp
+            )
         backbone_context = (
             torch.no_grad()
             if self.config.freeze_base_model_for_mtp and self.training

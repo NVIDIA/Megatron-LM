@@ -13,8 +13,15 @@ from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+    exchange_cp_boundary_hidden,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     bind_native_mtp_cp_group,
@@ -168,6 +175,86 @@ def test_native_reduction_and_contiguous_roll_replays(native_parent, sizes):
     expected_grad = torch.ones_like(value)
     if group.rank() == 0:
         expected_grad[0] = 0
+    assert bytes_equal(outputs["out"], expected)
+    assert bytes_equal(gradients["in[0]"], expected_grad)
+
+
+@pytest.mark.parametrize("sizes", [(3, 5), (5, 3), (1,) * 8])
+def test_native_all_gather_reduce_scatter_replays(native_parent, sizes):
+    """Logical AG/RS and both autograd directions match integer-exact references."""
+    from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+    group = _group(native_parent, sizes)
+    transport = get_native_cp_transport(native_parent)
+    # Each FP32 shard exceeds the entire arena, forcing multiple bounded
+    # chunks even if staging later stops splitting the arena into two halves.
+    rows = transport.payload_bytes // (3 * 4) + 17
+
+    def pattern(count):
+        return torch.arange(count * 6, device="cuda", dtype=torch.float32).view(count, 6) % 17
+
+    base = pattern(rows)
+    value = (base + 32 * dist.get_rank())[:, ::2].requires_grad_()
+    assert not value.is_contiguous() and value.nbytes > transport.payload_bytes
+
+    def gather_then_scatter(tensor):
+        gathered = gather_from_sequence_parallel_region(tensor, group=group)
+        reduced = reduce_scatter_to_sequence_parallel_region(gathered, group=group)
+        return gathered.detach(), reduced
+
+    outputs, gradients = assert_replays_bit_exact(
+        gather_then_scatter,
+        (value,),
+        contention=True,
+        what=f"chunked logical CP AG then RS {sizes}",
+    )
+    expected_gather = torch.cat([(base + 32 * rank)[:, ::2] for rank in group.ranks])
+    assert bytes_equal(outputs["out[0]"], expected_gather)
+    assert bytes_equal(outputs["out[1]"], group.size() * value.detach())
+    assert bytes_equal(gradients["in[0]"], torch.full_like(value, group.size()))
+
+    # Different replicas contribute different values: a local multiply cannot
+    # accidentally satisfy this reduce-scatter oracle. Distinct upstream
+    # gradients also verify the logical ordering of its all-gather backward.
+    full_pattern = pattern(group.size() * rows)
+    full = (full_pattern + 32 * dist.get_rank())[:, ::2].requires_grad_()
+    upstream = torch.full_like(value, dist.get_rank() + 1)
+    outputs, gradients = assert_replays_bit_exact(
+        lambda tensor: reduce_scatter_to_sequence_parallel_region(tensor, group=group),
+        (full,),
+        grad_outputs={"out": upstream},
+        contention=True,
+        what=f"chunked logical CP RS and AG backward {sizes}",
+    )
+    selected = full_pattern[group.rank() * rows : (group.rank() + 1) * rows, ::2]
+    expected = group.size() * selected + 32 * sum(group.ranks)
+    expected_grad = torch.cat([torch.full_like(value, rank + 1) for rank in group.ranks])
+    assert bytes_equal(outputs["out"], expected)
+    assert bytes_equal(gradients["in[0]"], expected_grad)
+
+
+@pytest.mark.parametrize("sizes", [(3, 5), (5, 3), (1,) * 8])
+def test_native_dsv4_boundary_exchange_replays(native_parent, sizes):
+    """Native left halos and reverse gradient halos retain physical boundary zeros."""
+    from transformer_engine.pytorch.attention.native_cp_transport import set_native_cp_parent_group
+
+    group = _group(native_parent, sizes)
+    # Bind CP1 too: its no-peer exchange is an explicit native no-op.
+    set_native_cp_parent_group(group, native_parent)
+    base = torch.arange(19 * 10, device="cuda", dtype=torch.float32).view(19, 1, 10) % 17
+    value = (base + 32 * dist.get_rank())[..., ::2].requires_grad_()
+    outputs, gradients = assert_replays_bit_exact(
+        lambda tensor: exchange_cp_boundary_hidden(tensor, 4, 8, group),
+        (value,),
+        contention=True,
+        what=f"native DSv4 boundary exchange {sizes}",
+    )
+    expected = torch.zeros_like(value[-8:])
+    if group.rank() > 0:
+        expected = (base[-8:] + 32 * group.ranks[group.rank() - 1])[..., ::2]
+    expected_grad = torch.zeros_like(value)
+    if group.rank() + 1 < group.size():
+        expected_grad[-8:] = 1
     assert bytes_equal(outputs["out"], expected)
     assert bytes_equal(gradients["in[0]"], expected_grad)
 

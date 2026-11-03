@@ -310,6 +310,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_dynamic_cp.py",
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
@@ -1010,6 +1011,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
@@ -1017,7 +1019,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_csa_packed_kernels.py",
+            K + "test_native_cp_replay.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_dynamic_cp.py",
         ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "

@@ -7,7 +7,9 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields, is_dataclass
 from datetime import timedelta
+from functools import partial
 from typing import Optional
 
 import numpy as np
@@ -58,8 +60,35 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 logger = logging.getLogger(__name__)
 
 
+def _same_native_cp_spec(actual, expected):
+    """Compare a resolved spec, including partial builders, to the known factory."""
+    if actual is expected:
+        return True
+    if type(actual) is not type(expected) or isinstance(expected, type):
+        return False
+    if is_dataclass(expected):
+        return all(
+            _same_native_cp_spec(getattr(actual, f.name), getattr(expected, f.name))
+            for f in fields(expected)
+        )
+    if isinstance(expected, partial):
+        return all(
+            _same_native_cp_spec(getattr(actual, name), getattr(expected, name))
+            for name in ("func", "args", "keywords")
+        )
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_native_cp_spec(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, (tuple, list)):
+        return len(actual) == len(expected) and all(
+            _same_native_cp_spec(a, b) for a, b in zip(actual, expected)
+        )
+    return actual == expected
+
+
 def _native_cp_model_unavailable_reason(model_config, args):
-    """Recognize the default GPT builder before any dynamic CP groups are created.
+    """Recognize known full-attention GPT and DSv4 builders before CP groups exist.
 
     Unknown specs/builders are deliberately left on ProcessGroups: identifying one
     TE layer does not prove that every PP/VPP/MTP stage supports logical CP.
@@ -68,22 +97,47 @@ def _native_cp_model_unavailable_reason(model_config, args):
         return "model metadata is unavailable"
 
     from megatron.core.transformer.enums import AttnBackend
-    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
     from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 
-    if type(model_config) is not GPTModelConfig:
-        return "the model is not a known full-attention GPT configuration"
+    config = getattr(model_config, "transformer", None)
+    dsv4 = (
+        type(config) is MLATransformerConfig
+        and config.experimental_attention_variant == "dsv4_hybrid"
+        and config.multi_latent_attention
+    )
+    if type(model_config) is GPTModelConfig:
+        known_builder = (
+            model_config.builder == "megatron.training.models.gpt.GPTModelBuilder"
+            and model_config.get_builder_cls() is GPTModelBuilder
+            and model_config.transformer_layer_spec is None
+        )
+    else:
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+
+        known_builder = (
+            type(model_config) is HybridModelConfig
+            and dsv4
+            and config.transformer_impl == "transformer_engine"
+            and not config.use_kitchen
+            and model_config.builder == "megatron.training.models.hybrid.HybridModelBuilder"
+            and model_config.get_builder_cls() is HybridModelBuilder
+            and type(model_config.hybrid_stack_spec) is ModuleSpec
+            and _same_native_cp_spec(model_config.hybrid_stack_spec, hybrid_dsv4_stack_spec(config))
+            and bool(model_config.hybrid_layer_pattern)
+            and set(model_config.hybrid_layer_pattern) <= set("WCHDE/|")
+        )
+    if not known_builder:
+        return "the model is not a known full-attention GPT or DSv4 configuration"
     if (
-        model_config.builder != "megatron.training.models.gpt.GPTModelBuilder"
-        or model_config.get_builder_cls() is not GPTModelBuilder
-        or model_config.transformer_layer_spec is not None
-        or model_config.restore_modelopt_state
+        model_config.restore_modelopt_state
         or model_config.pre_wrap_hooks
         or model_config.post_wrap_hooks
     ):
         return "custom builders/specs/hooks and ModelOpt need explicit CP support"
-    config = model_config.transformer
-    if type(config) is not TransformerConfig:
+    if type(config) is not TransformerConfig and not dsv4:
         return "only the standard full-attention TransformerConfig is recognized"
     if not config.dynamic_context_parallel or not args.dynamic_context_parallel:
         return "dynamic CP is disabled"
@@ -93,15 +147,20 @@ def _native_cp_model_unavailable_reason(model_config, args):
         return "GTP weight-rematerialization axes need explicit native CP support"
     if config.transformer_impl != "transformer_engine":
         return "attention is not implemented by Transformer Engine"
-    if any(
+    if config.use_kitchen or config.use_kitchen_attention or config.fallback_to_eager_attn:
+        return "custom attention backends are not auto-enabled"
+    if dsv4:
+        if config.params_dtype != torch.bfloat16 or config.dsa_indexer_precision != "bf16":
+            return "native DSv4 DCP currently requires BF16 attention and indexer"
+        if config.dsa_kernel_backend != "cudnn" or config.cp_partition_mode != "contiguous":
+            return "native DSv4 DCP requires cuDNN attention and contiguous CP partitioning"
+        if config.dsa_cp_balance_indexer:
+            return "native DSv4 DCP does not support balanced indexer communication"
+        if config.tensor_model_parallel_size != 1:
+            return "native DSv4 DCP currently requires TP1"
+    elif any(
         getattr(config, name, None)
-        for name in (
-            "is_hybrid_model",
-            "multi_latent_attention",
-            "experimental_attention_variant",
-            "use_kitchen_attention",
-            "fallback_to_eager_attn",
-        )
+        for name in ("is_hybrid_model", "multi_latent_attention", "experimental_attention_variant")
     ):
         return "hybrid, experimental and custom attention are not auto-enabled"
     if config.attention_backend not in (AttnBackend.auto, AttnBackend.flash, AttnBackend.fused):
@@ -114,6 +173,7 @@ def _native_cp_model_unavailable_reason(model_config, args):
     if (
         config.params_dtype not in (torch.float16, torch.bfloat16)
         or config.fp8
+        or config.fp4
         or config.fp8_dot_product_attention
         or config.quant_recipe is not None
     ):
@@ -138,8 +198,19 @@ def _native_cp_transport_checker(model_config, args):
             from transformer_engine.pytorch.attention.native_cp_transport import (
                 get_native_cp_transport_unavailable_reason,
             )
+
+            if model_config.transformer.experimental_attention_variant == "dsv4_hybrid":
+                from transformer_engine.pytorch.attention.native_cp_transport import (
+                    NativeCPTransport,
+                )
+
+                if any(
+                    not callable(getattr(NativeCPTransport, name, None))
+                    for name in ("all_gather", "reduce_scatter", "exchange")
+                ):
+                    return "Transformer Engine native CP needs DSv4 AG/RS/halo support; rebuild TE"
         except ImportError:
-            return "Transformer Engine does not provide the native CP capability query"
+            return "Transformer Engine does not provide the required native CP interfaces"
         return get_native_cp_transport_unavailable_reason(parent_group)
 
     return check
@@ -610,6 +681,15 @@ def _initialize_distributed(
     config = getattr(model_config, "transformer", None)
     if config is not None:
         config.use_native_cp_transport = args.use_native_cp_transport
+        if args.use_native_cp_transport and config.experimental_attention_variant == "dsv4_hybrid":
+            from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+                initialize_native_dsv4_cp_transport,
+            )
+
+            # Every PP stage participates, including stages with no attention layer.
+            initialize_native_dsv4_cp_transport(
+                config, mpu.get_data_parallel_group(with_context_parallel=True)
+            )
     if args.dynamic_context_parallel:
         print_rank_0(
             "> dynamic CP transport: "

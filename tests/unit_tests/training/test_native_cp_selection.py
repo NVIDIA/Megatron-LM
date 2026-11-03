@@ -2,6 +2,8 @@
 
 import sys
 from argparse import ArgumentParser
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,14 +11,17 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.arguments import (
     add_megatron_arguments,
     core_transformer_config_from_args,
     parse_args,
     validate_args,
 )
-from megatron.training.initialize import _native_cp_model_unavailable_reason
+from megatron.training.initialize import (
+    _native_cp_model_unavailable_reason,
+    _native_cp_transport_checker,
+)
 from megatron.training.models.gpt import GPTModelConfig
 
 
@@ -50,6 +55,188 @@ def native_cp_args(monkeypatch):
 
 def _model(args):
     return GPTModelConfig(transformer=core_transformer_config_from_args(args), vocab_size=1024)
+
+
+def _dsv4_model(args, hybrid, config_class=MLATransformerConfig):
+    """Isolate model recognition from optional DSv4 kernel/config validation."""
+    config = core_transformer_config_from_args(args, config_class=config_class)
+    # As in the existing unsupported-attention tests, mutate after constructing
+    # the config: this tests selection, not the availability of cuDNN kernels.
+    config.experimental_attention_variant = "dsv4_hybrid"
+    config.multi_latent_attention = True
+    config.dsa_kernel_backend = "cudnn"
+    config.cp_partition_mode = "contiguous"
+    config.attention_cp_layout = "contiguous"
+    config.linear_cp_layout = "contiguous"
+    config.dsa_cp_balance_indexer = False
+    config.is_hybrid_model = hybrid
+    if not hybrid:
+        return GPTModelConfig(transformer=config, vocab_size=1024)
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+    from megatron.training.models.hybrid import HybridModelConfig
+
+    return HybridModelConfig(
+        transformer=config,
+        vocab_size=1024,
+        hybrid_stack_spec=hybrid_dsv4_stack_spec(config),
+        hybrid_layer_pattern="WECEHE|DE/WE",
+    )
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("mtp_depth", [None, 1])
+def test_native_cp_known_dsv4_builders_are_candidates(native_cp_args, hybrid, mtp_depth):
+    model = _dsv4_model(native_cp_args, hybrid)
+    model.transformer.mtp_num_layers = mtp_depth
+    assert model.transformer.params_dtype is torch.bfloat16
+    assert _native_cp_model_unavailable_reason(model, native_cp_args) is None
+
+
+def test_native_cp_dsv4_resolved_cli_spec_is_candidate(native_cp_args):
+    from megatron.training.argument_utils import hybrid_config_from_args
+
+    model = _dsv4_model(native_cp_args, hybrid=True)
+    native_cp_args.spec = [
+        "megatron.core.models.hybrid.hybrid_layer_specs",
+        "hybrid_dsv4_stack_spec",
+    ]
+    native_cp_args.hybrid_layer_pattern = model.hybrid_layer_pattern
+    native_cp_args.vocab_size = 1024
+    resolved = hybrid_config_from_args(
+        native_cp_args, config=model.transformer, vocab_size_from_tokenizer=False
+    )
+    assert _native_cp_model_unavailable_reason(resolved, native_cp_args) is None
+    # Re-created partial builders must compare by structure, not object identity.
+    assert _native_cp_model_unavailable_reason(deepcopy(resolved), native_cp_args) is None
+    resolved.hybrid_stack_spec.submodules.csa_layer.submodules.self_attention.submodules.core_attention = (
+        torch.nn.Identity
+    )
+    assert _native_cp_model_unavailable_reason(resolved, native_cp_args)
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
+@pytest.mark.parametrize("missing", [None, "all_gather", "reduce_scatter", "exchange"])
+def test_native_cp_checks_dsv4_transport_interfaces(monkeypatch, native_cp_args, dsv4, missing):
+    methods = {name: lambda: None for name in ("all_gather", "reduce_scatter", "exchange")}
+    if missing:
+        methods.pop(missing)
+    module = SimpleNamespace(
+        NativeCPTransport=type("Transport", (), methods),
+        get_native_cp_transport_unavailable_reason=lambda parent: None,
+    )
+    monkeypatch.setitem(
+        sys.modules, "transformer_engine.pytorch.attention.native_cp_transport", module
+    )
+    model = _dsv4_model(native_cp_args, hybrid=True) if dsv4 else _model(native_cp_args)
+    reason = _native_cp_transport_checker(model, native_cp_args)(object())
+    assert bool(reason) == (dsv4 and missing is not None)
+
+
+@pytest.mark.parametrize(
+    "hidden,window,expected", [(256, 128, 131072), (4096, 128, 2097152), (256, 256, 262144)]
+)
+def test_native_dsv4_staging_budget_is_independent_of_runtime_cp(
+    monkeypatch, hidden, window, expected
+):
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+        initialize_native_dsv4_cp_transport,
+    )
+
+    calls = []
+    parent = object()
+    module = SimpleNamespace(
+        initialize_native_cp_transport=lambda group, size: calls.append((group, size))
+    )
+    monkeypatch.setitem(
+        sys.modules, "transformer_engine.pytorch.attention.native_cp_transport", module
+    )
+    config = SimpleNamespace(
+        csa_window_size=window,
+        csa_compress_ratios=[0, 4, 128],
+        hidden_size=hidden,
+        params_dtype=torch.bfloat16,
+        num_moe_experts=8,
+        thd_max_packed_sequences=64,
+    )
+    for cp_size in (1, 3, 5, 32):
+        config.context_parallel_size = cp_size
+        initialize_native_dsv4_cp_transport(config, parent)
+    assert calls == [(parent, expected)] * 4
+    with pytest.raises(ValueError, match="dp_cp"):
+        initialize_native_dsv4_cp_transport(config, None)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_native_cp_dsv4_config_subclass_is_not_inferred(native_cp_args, hybrid):
+    class CustomMLATransformerConfig(MLATransformerConfig):
+        pass
+
+    model = _dsv4_model(native_cp_args, hybrid, config_class=CustomMLATransformerConfig)
+    assert _native_cp_model_unavailable_reason(model, native_cp_args)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("experimental_attention_variant", "dsa"),
+        ("multi_latent_attention", False),
+        ("dsa_kernel_backend", "none"),
+        ("dsa_kernel_backend", "tilelang"),
+        ("cp_partition_mode", "zigzag"),
+        ("dsa_cp_balance_indexer", True),
+        ("tensor_model_parallel_size", 2),
+        ("transformer_impl", "local"),
+        ("use_kitchen", True),
+        ("use_kitchen_attention", True),
+        ("fallback_to_eager_attn", True),
+        ("params_dtype", torch.float16),
+        ("params_dtype", torch.float32),
+        ("dsa_indexer_precision", "mxfp8"),
+        ("fp8", "hybrid"),
+        ("fp4", "e2m1"),
+        ("fp8_dot_product_attention", True),
+        ("quant_recipe", object()),
+        ("cuda_graph_impl", "transformer_engine"),
+        ("cp_comm_type", "a2a+p2p"),
+    ],
+)
+def test_native_cp_dsv4_unsupported_paths_are_not_inferred(native_cp_args, hybrid, field, value):
+    model = _dsv4_model(native_cp_args, hybrid)
+    setattr(model.transformer, field, value)
+    assert _native_cp_model_unavailable_reason(model, native_cp_args)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("builder", "custom.DSv4Builder"),
+        ("restore_modelopt_state", True),
+        ("pre_wrap_hooks", [lambda model: model]),
+        ("post_wrap_hooks", [lambda model: model]),
+    ],
+)
+def test_native_cp_dsv4_custom_builders_and_hooks_are_not_inferred(
+    native_cp_args, hybrid, field, value
+):
+    model = _dsv4_model(native_cp_args, hybrid)
+    setattr(model, field, value)
+    assert _native_cp_model_unavailable_reason(model, native_cp_args)
+
+
+@pytest.mark.parametrize("pattern", [None, "", "WEGE", "WECE/ME"])
+def test_native_cp_dsv4_hybrid_rejects_non_dsv4_patterns(native_cp_args, pattern):
+    model = _dsv4_model(native_cp_args, hybrid=True)
+    model.hybrid_layer_pattern = pattern
+    assert _native_cp_model_unavailable_reason(model, native_cp_args)
+
+
+@pytest.mark.parametrize("spec", [None, lambda config: None, ModuleSpec(module=torch.nn.Identity)])
+def test_native_cp_dsv4_hybrid_rejects_unknown_stack_specs(native_cp_args, spec):
+    model = _dsv4_model(native_cp_args, hybrid=True)
+    model.hybrid_stack_spec = spec
+    assert _native_cp_model_unavailable_reason(model, native_cp_args)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -113,6 +300,7 @@ def test_native_cp_custom_transformer_config_is_not_inferred(native_cp_args):
         ("attention_backend", AttnBackend.unfused),
         ("params_dtype", torch.float32),
         ("fp8", "hybrid"),
+        ("fp4", "e2m1"),
         ("fp8_dot_product_attention", True),
         ("qk_clip", True),
         ("log_max_attention_logit", True),
