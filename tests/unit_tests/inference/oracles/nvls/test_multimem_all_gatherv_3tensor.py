@@ -35,13 +35,16 @@ three regions at offsets; ws in {2, 4, 8}; combined pairwise. Memory: every outp
 poisoned before the call and rows past the total must stay poisoned; 64 KiB sentinels around
 each region; guarded inputs.
 
-`test_dispatch_then_combine_steps` runs the dispatcher's per-layer order, step after step:
-all-gather-v -> copy out -> poison the gathered buffers -> experts write the combine buffer ->
-reduce-scatter-v (multimem, or the batch-invariant ordered combine), with the token counts
-changing every step, a random rank delayed before every step, eagerly and as one CUDA graph per
-local token count replayed with the counts (device scalars) changing between replays. Stale rows
-from the previous step must never show up, and nothing may race (the combine's entry barrier is
-what keeps the next all-gather-v from overwriting rows a peer has not consumed).
+`test_dispatch_then_combine_steps` runs the dispatcher's order, step after step: the metadata
+update (`fused_metadata_update`, the first MoE layer's; it computes the offsets and the maximum
+count on device behind a barrier) -> all-gather-v -> copy out -> poison the gathered buffers ->
+experts write the combine buffer -> reduce-scatter-v (multimem, or the batch-invariant ordered
+combine). The token counts change every step, a random rank is delayed before every step, and it
+runs eagerly and as one CUDA graph per local token count, replayed in a changing order. Stale
+rows from the previous step must never show up. Within a step the combine's entry barrier keeps
+the next all-gather-v from overwriting rows a peer has not consumed; between steps the metadata
+barrier does, and it is the only barrier of a step in which no rank has tokens (the first GPU
+run, without it, let a peer's next-step rows land before a delayed rank had copied out).
 """
 
 from types import SimpleNamespace
@@ -55,6 +58,7 @@ from megatron.core.inference.communication.torch_symm_triton.variable_collective
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe.batch_invariant import ordered_reduce_scatter_v
+from megatron.core.inference.moe.metadata import fused_metadata_update
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.nvls import nvls_oracle_utils as nu
 
@@ -201,8 +205,9 @@ def test_dispatch_then_combine_steps(nvls_groups, ws, mode, combine):
     rsv_offset = _align(global_max * hidden * 2 + nu.SENTINEL_BYTES)
     rsv = g.buffer().view((global_max, hidden), torch.float32, rsv_offset)
     combine_fn = multimem_reduce_scatter_v if combine == "multimem" else ordered_reduce_scatter_v
-    rank_token_offset = torch.zeros(1, dtype=torch.int32, device="cuda")
-    ep_max_tokens = torch.zeros(1, dtype=torch.int32, device="cuda")
+    meta = g.buffer("meta")
+    step_metadata = torch.zeros(3, dtype=torch.int32, device="cuda")
+    rank_token_offset, ep_max_tokens = step_metadata[1:2], step_metadata[2:3]
     static_in = [torch.zeros(per_rank_max, w, dtype=d, device="cuda") for d, w in specs]
     static_experts = torch.zeros(global_max, hidden, dtype=torch.float32, device="cuda")
     copies = [torch.empty(global_max, w, dtype=d, device="cuda") for d, w in specs]
@@ -211,6 +216,11 @@ def test_dispatch_then_combine_steps(nvls_groups, ws, mode, combine):
     outs = {c: out_storage[:c] for c in choices}
 
     def body(count):
+        # The first MoE layer's metadata update: [total, this rank's offset, max count] from
+        # every rank's count, behind a barrier. In the dispatcher this barrier is what orders
+        # one step's reads of the gathered rows before the next step's all-gather-v (a step in
+        # which no rank has tokens runs no other barrier).
+        fused_metadata_update(count, meta.view((ws,), torch.int32), meta.hdl, step_metadata)
         multimem_all_gatherv_3tensor(
             *(v for _, _, v in agv),
             *(t[:count] for t in static_in),
@@ -233,16 +243,11 @@ def test_dispatch_then_combine_steps(nvls_groups, ws, mode, combine):
             input_byte_offset=rsv_offset,
         )
 
-    def set_counts(counts):
-        rank_token_offset.fill_(nu.offsets_from_counts(counts)[g.rank])
-        ep_max_tokens.fill_(max(counts))
-
     for _, _, view in agv:
         ou.poison_(view)
     g.sync()  # the all-gather-v has no entry barrier: poison before any peer's stores
     graphs = {}
     for count in choices:  # compile and warm up with every rank at `count` tokens
-        set_counts([count] * ws)
         body(count)
         if mode == "graph":
             torch.cuda.synchronize()
@@ -258,7 +263,7 @@ def test_dispatch_then_combine_steps(nvls_groups, ws, mode, combine):
         gen = g.rank_generator(nu.case_seed("dispatch-combine", ws, mode, combine, i))
         inputs = [nu.random_bits((per_rank_max, w), d, gen) for d, w in specs]
         experts = ou.dyadic_tensor(
-            (global_max, hidden), dtype=torch.float32, device="cuda", generator=gen, **nu.DYADIC
+            (global_max, hidden), dtype=torch.float32, device="cuda", generator=gen, **nu.EXACT
         )
         rows = slice(
             nu.offsets_from_counts(counts)[g.rank],
@@ -279,7 +284,6 @@ def test_dispatch_then_combine_steps(nvls_groups, ws, mode, combine):
         for static, value in zip(static_in, step.inputs):
             static.copy_(value)
         static_experts.copy_(step.experts)
-        set_counts(step.counts)
         g.maybe_sleep(shared)
         if mode == "graph":
             graphs[count].replay()

@@ -14,9 +14,12 @@ inference_layers.py:502-521, and the RMSNorm the next layer would otherwise appl
   on every rank. With S = sum_q P_q and S_r its rows of rank r:
 
   1. residual_out_r = bf16(bf16(S_r) + R_r): the reduce-scatter accumulates in fp32 and rounds
-     once to bf16, then the residual is added in bf16 with one rounding, as the unfused path
-     (reduce-scatter, then torch.add) does. residual_out may be residual_in (production passes
-     one tensor for both).
+     once to bf16 (the kernel's `multimem.ld_reduce ... .acc::f32 ... .bf16x2`), then the
+     residual is added in bf16 with one rounding, as the unfused path (reduce-scatter, then
+     torch.add) does. residual_out may be residual_in (production passes one tensor for both).
+     How the switch rounds is checked with designed sums in
+     test_multimem_reduce_scatter.py::test_bf16_in_switch_sum_rounding (GB200 does not round
+     to nearest even: finding O5-N4).
   2. Every rank's buffer bytes [0, T*H*2) hold Y = RMSNorm(concat_r residual_out_r), row by row:
      y = x * rsqrt(mean(x^2) + eps) * w in fp32, rounded once to bf16. Y is bit-identical on
      every rank. An all-zero row gives y = 0.
@@ -31,12 +34,11 @@ inference_layers.py:502-521, and the RMSNorm the next layer would otherwise appl
   with H elements; the residual tensors hold T/ws * H elements; ws a power of two.
 
 Tolerance classes:
-  * residual_out: bit-exact on dyadic partials and residuals (values m * 2**e, |m| < 256,
-    e in [-8, -6], plus outliers of 2**10; a sum of ws <= 8 of them is exact in fp32 in any order
-    but needs rounding to bf16, so the reference is the NCCL fp32 reduce-scatter rounded once,
-    plus R, rounded once). On N(0, 1) data: bounded (``ou.assert_close_to_reference``, per row)
-    against the fp64 S_r + R_r, calibrated by the unfused composition (NCCL fp32 reduce-scatter
-    rounded to bf16, then torch's bf16 add).
+  * residual_out: bit-exact on ``nu.EXACT`` partials and residuals, whose sums are exact in bf16
+    under any order and rounding (the reference is NCCL's fp32 reduce-scatter, exact here, plus
+    R, rounded once to nearest even). On N(0, 1) data: bounded (``ou.assert_close_to_reference``,
+    per row) against the fp64 S_r + R_r, calibrated by the unfused composition (NCCL fp32
+    reduce-scatter rounded to bf16, then torch's bf16 add), which is the contract's arithmetic.
   * Y: bounded per row against fp64 RMSNorm of the kernel's own residual_out (gathered with
     NCCL), calibrated by torch's bf16 ``rms_norm`` on the same device; bit-identical across
     ranks (exact); doubling w doubles Y bit for bit, and zero inputs give zero (exact).
@@ -55,10 +57,10 @@ sized from the whole shard (T*H/(8*ws) lanes); #8880 (t3-r09f2) sizes it from on
   * production: H=1152 (the functional-test model), 4096 with 64 tokens per rank;
   * rows narrower than a warp (H <= 128 with one or two tokens per rank);
   * ws in {2, 4, 8} (subgroups of the job), residual in place (production) and separate,
-    eps in {1e-5, 1e-6}; combined pairwise. Every third token has two 1024 outliers at lane or
-    window edges (first and last lanes, 8191/8192), which dominate the row's sum of squares; with
-    N(0, 1) data, rows scaled by 2**-10 (mean(x^2) ~ eps) and an all-zero last token. Each case
-    also checks the NCCL-gathered buffers of all ranks for bit identity.
+    eps in {1e-5, 1e-6}; combined pairwise. Every third token's residual has two 1024 outliers
+    at lane or window edges (first and last lanes, 8191/8192), which dominate the row's sum of
+    squares; with N(0, 1) data, rows scaled by 2**-10 (mean(x^2) ~ eps) and an all-zero last
+    token. Each case also checks the NCCL-gathered buffers of all ranks for bit identity.
 Memory: residual buffers and weights carry NaN guard bands (an out-of-bounds weight or residual
 read turns a row NaN; a write changes the guard), a separate residual_out starts NaN-poisoned
 (an unwritten element, or a stage-2 reload hoisted above its stage-1 store, shows up), and the
@@ -130,7 +132,7 @@ def _sweep_params():
             "shape": SHAPES,
             "ws": nu.GROUP_SIZES,
             "residual": ["inplace", "separate"],
-            "data": ["dyadic", "randn"],
+            "data": ["exact", "randn"],
             "eps": [1e-5, 1e-6],
         }
     )
@@ -168,15 +170,12 @@ def residual_reference(partials, residual):
     return partials.sum(0) + residual
 
 
-DYADIC = nu.DYADIC
-"""Partials and residuals: |x| < 4 in steps of 2**-8 with 8 significant bits, so sums need
-rounding to bf16, and a sum of ws <= 8 of them plus an OUTLIER stays exact in fp32 (below 2**11,
-a multiple of 2**-8: 19 bits)."""
-
 OUTLIER = 1024.0
-"""2**10, exact in bf16. Its square dominates its row's sum of squares (H * E[x^2] is at most a
-few 10**4 here), so a lane left out of the sum, or counted twice, moves rsqrt(mean(x^2)) by far
-more than one bf16 ulp."""
+"""2**10, exact in bf16, placed in the residual. Its square dominates its row's sum of squares
+(H * E[x^2] is at most about 1.5e5 here), so a lane left out of the sum, or counted twice, moves
+rsqrt(mean(x^2)) by far more than one bf16 ulp. It sits in the residual, not in the partials, so
+the in-switch sum stays small: its rounding is the subject of test_bf16_in_switch_sum_rounding,
+not of this sweep."""
 
 
 def structural_columns(hidden):
@@ -189,10 +188,13 @@ def structural_columns(hidden):
 def make_inputs(ws, rank, tokens, hidden, data, seed, device="cuda"):
     """Partials (distinct per rank), rank `rank`'s residual shard and the shared norm weights.
 
-    Every third token carries an OUTLIER at two of the structural columns (in one rank's
-    partial; the first such token at the last column and at the 1024-lane window edge). With
-    N(0, 1) data the token after it is scaled by 2**-10 (mean(x^2) ~ eps, so a wrong eps
-    shows), and the last token is all zero (y = 0 through rsqrt(eps)).
+    "exact": partials and residuals from ``nu.EXACT``, whose sums are exact in bf16 in any order
+    and rounding, so the reduce-scatter's result is the exact sum on every architecture; the
+    residual add then rounds once (on the SM, to nearest even). "randn": N(0, 1); the token
+    after every outlier token is scaled by 2**-10 (mean(x^2) ~ eps, so a wrong eps shows) and
+    the last token is all zero (y = 0 through rsqrt(eps)). In both, every third token's residual
+    has an OUTLIER at two of the structural columns (the first such token at the last column
+    and at the 1024-lane window edge).
     """
     tokens_per_rank = tokens // ws
     gen = ou.make_generator(nu.rank_seed(seed, rank), device=device)
@@ -201,20 +203,12 @@ def make_inputs(ws, rank, tokens, hidden, data, seed, device="cuda"):
     if data == "zeros":
         partial = torch.zeros(shape, dtype=BF16, device=device)
         residual = torch.zeros(shard_shape, dtype=BF16, device=device)
-    elif data == "dyadic":
-        partial = ou.dyadic_tensor(shape, device=device, generator=gen, **DYADIC)
-        residual = ou.dyadic_tensor(shard_shape, device=device, generator=gen, **DYADIC)
+    elif data == "exact":
+        partial = ou.dyadic_tensor(shape, device=device, generator=gen, **nu.EXACT)
+        residual = ou.dyadic_tensor(shard_shape, device=device, generator=gen, **nu.EXACT)
     else:
         partial = torch.randn(shape, device=device, generator=gen).to(BF16)
         residual = torch.randn(shard_shape, device=device, generator=gen).to(BF16)
-    if data != "zeros":
-        columns = torch.tensor(structural_columns(hidden))
-        rows = torch.arange(0, tokens, 3)
-        mine = (rows // 3) % ws == rank
-        for k in (0, 1):
-            cols = columns[(2 * (rows // 3) + k) % len(columns)]
-            partial[rows[mine].to(device), 0, cols[mine].to(device)] = OUTLIER
-    if data == "randn":
         small = torch.arange(1, tokens, 3, device=device)
         partial[small] *= 2**-10
         local_small = small[(small // tokens_per_rank) == rank] - rank * tokens_per_rank
@@ -222,6 +216,13 @@ def make_inputs(ws, rank, tokens, hidden, data, seed, device="cuda"):
         partial[-1] = 0
         if rank == ws - 1:
             residual[-1] = 0
+    if data != "zeros":
+        columns = torch.tensor(structural_columns(hidden))
+        rows = torch.arange(0, tokens, 3)
+        rows = rows[(rows // tokens_per_rank == rank) & (rows != tokens - 1)]
+        for k in (0, 1):
+            cols = columns[(2 * (rows // 3) + k) % len(columns)]
+            residual[(rows - rank * tokens_per_rank).to(device), 0, cols.to(device)] = OUTLIER
     weight = torch.randn(hidden, device=device, generator=shared).to(BF16)
     return partial, residual, weight
 
@@ -269,12 +270,12 @@ class FusedCall:
 
 
 def check_residual(out, partials_shard, residual, data, nccl_rs):
-    """residual_out of this rank against the reference (exact on dyadic data)."""
-    if data in ("dyadic", "zeros"):
-        # NCCL's fp32 sum of dyadic partials is exact; then one rounding, an exact fp32 add of
-        # two bf16 values, and one more rounding (contract item 1).
+    """residual_out of this rank against the reference (exact on ``nu.EXACT`` data)."""
+    if data in ("exact", "zeros"):
+        # The sum is exact in bf16 (nu.EXACT), so NCCL's fp32 sum is it; the residual add is an
+        # exact fp32 add of two bf16 values rounded once to nearest even (contract item 1).
         expected = (nccl_rs.to(BF16).float() + residual.float()).to(BF16)
-        ou.assert_exact(out, expected, what="residual_out (exact on dyadic data)")
+        ou.assert_exact(out, expected, what="residual_out (exact sum, one rounding)")
         return
     hidden = out.shape[-1]
     ou.assert_close_to_reference(
@@ -350,7 +351,7 @@ def test_rows_narrower_than_a_warp(nvls_groups, ws, hidden, tokens_per_rank):
     #8880 (t3-r09f2) launches at least one warp per block; these cases must pass with it.
     (128, 2) and (8, 129) pass on main."""
     g = nvls_groups.get(ws)
-    run_and_check(g, hidden, tokens_per_rank, "separate", "dyadic", 1e-5, what="narrow rows")
+    run_and_check(g, hidden, tokens_per_rank, "separate", "exact", 1e-5, what="narrow rows")
 
 
 @gpu_test
@@ -362,7 +363,7 @@ def test_metamorphic_weight_scaling_and_zero_input(nvls_groups, ws, hidden, toke
     g = nvls_groups.get(ws)
     tokens = tokens_per_rank * g.ws
     seed = nu.case_seed("metamorphic", ws, hidden, tokens_per_rank)
-    partial, residual, weight = _inputs(g, tokens, hidden, "dyadic", seed)
+    partial, residual, weight = _inputs(g, tokens, hidden, "exact", seed)
     eps = 1e-5
     first = FusedCall(g, partial, residual, weight, eps, "separate")
     y_first = first.view.clone()
@@ -400,14 +401,14 @@ def test_back_to_back_calls_reuse_the_buffer(nvls_groups, ws):
     hidden, eps, steps = 1152, 1e-5, 8
     shared = g.shared_generator(nu.case_seed("back-to-back", ws))
     tokens_per_rank = [int(t) for t in torch.randint(1, 70, (steps,), generator=shared)]
-    _, _, weight = _inputs(g, ws, hidden, "dyadic", nu.case_seed("back-to-back-weight", ws))
+    _, _, weight = _inputs(g, ws, hidden, "exact", nu.case_seed("back-to-back-weight", ws))
     plan = []
     for step, tpr in enumerate(tokens_per_rank):
         seed = nu.case_seed("back-to-back", ws, step)
-        partial, residual, _ = _inputs(g, tpr * ws, hidden, "dyadic", seed)
+        partial, residual, _ = _inputs(g, tpr * ws, hidden, "exact", seed)
         gen = g.rank_generator(seed + 1)
-        gather_in = ou.dyadic_tensor((tpr, 1, hidden), device="cuda", generator=gen, **DYADIC)
-        rs_in = ou.dyadic_tensor((tpr * ws, 1, hidden), device="cuda", generator=gen, **DYADIC)
+        gather_in = ou.dyadic_tensor((tpr, 1, hidden), device="cuda", generator=gen, **nu.EXACT)
+        rs_in = ou.dyadic_tensor((tpr * ws, 1, hidden), device="cuda", generator=gen, **nu.EXACT)
         shard = slice(g.rank * tpr, (g.rank + 1) * tpr)
         plan.append(
             SimpleNamespace(
@@ -455,7 +456,7 @@ def test_back_to_back_calls_reuse_the_buffer(nvls_groups, ws):
 
     def check():
         for i, (step, res) in enumerate(zip(plan, results)):
-            check_residual(res.residual, step.partials_shard, step.residual, "dyadic", step.nccl_rs)
+            check_residual(res.residual, step.partials_shard, step.residual, "exact", step.nccl_rs)
             check_normalized(res.y, res.gathered_y, res.gathered_residual, weight, eps)
             ou.assert_exact(
                 res.gathered,
@@ -484,7 +485,7 @@ def test_cuda_graph_replay_with_changing_token_count(nvls_groups, ws):
     hidden, eps, replays = 1152, 1e-6, 12
     sizes = [1, 3, 64, 129]
     shared = g.shared_generator(nu.case_seed("graph", ws))
-    _, _, weight = _inputs(g, ws, hidden, "dyadic", nu.case_seed("graph-weight", ws))
+    _, _, weight = _inputs(g, ws, hidden, "exact", nu.case_seed("graph-weight", ws))
     graphs = {}
     for tpr in sizes:
         static = SimpleNamespace(
@@ -514,7 +515,7 @@ def test_cuda_graph_replay_with_changing_token_count(nvls_groups, ws):
     order = [sizes[int(i)] for i in torch.randint(0, len(sizes), (replays,), generator=shared)]
     plan = []
     for i, tpr in enumerate(order):
-        partial, residual, _ = _inputs(g, tpr * ws, hidden, "dyadic", nu.case_seed("graph", ws, i))
+        partial, residual, _ = _inputs(g, tpr * ws, hidden, "exact", nu.case_seed("graph", ws, i))
         shard = slice(g.rank * tpr, (g.rank + 1) * tpr)
         plan.append(
             SimpleNamespace(
@@ -539,7 +540,7 @@ def test_cuda_graph_replay_with_changing_token_count(nvls_groups, ws):
 
     def check():
         for step, res in zip(plan, results):
-            check_residual(res.residual, step.partials_shard, step.residual, "dyadic", step.nccl_rs)
+            check_residual(res.residual, step.partials_shard, step.residual, "exact", step.nccl_rs)
             check_normalized(res.y, res.gathered_y, res.gathered_residual, weight, eps)
 
     nu.agree(check, f"CUDA-graph replays in the order {order}")

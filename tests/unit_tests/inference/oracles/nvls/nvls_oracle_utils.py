@@ -38,10 +38,11 @@ GROUP_SIZES: List[int] = [ws for ws in (2, 4, 8) if ws <= WORLD_SIZE and WORLD_S
 job. Outside a multi-rank job this is ``[2]``, and the cases fail or skip at setup (see
 ``NvlsGroups.get``) instead of disappearing from collection."""
 
-BUFFER_MB = {"main": 80, "aux1": 8, "aux2": 8}
+BUFFER_MB = {"main": 80, "aux1": 8, "aux2": 8, "meta": 1}
 """Symmetric buffers per group. ``main`` holds the largest case of any module (64 MiB of data
 plus sentinels); ``aux1`` and ``aux2`` are the second and third output buffers of the
-three-tensor all-gather-v (the dispatcher allocates one buffer per gathered tensor)."""
+three-tensor all-gather-v (the dispatcher allocates one buffer per gathered tensor); ``meta`` is
+the step-metadata buffer of ``fused_metadata_update``, which writes at its offset 0."""
 
 SENTINEL_BYTES = 64 * 1024
 """Bytes after (and, with a byte offset, before) a kernel's region that must survive it."""
@@ -317,9 +318,46 @@ blocks of one token each, with a grid-stride loop past 128 tokens per rank."""
 
 COUNTS = ["uneven", "full", "one-rank", "empty"]
 
-DYADIC = dict(mantissa_bits=8, exponents=(-8, -6))
-"""Dyadic inputs for exact sums: |x| < 4 in steps of 2**-8 with up to 8 significant bits, so a
-sum of ws <= 8 of them needs rounding to bf16 but is exact in fp32 in any order."""
+EXACT = dict(mantissa_bits=4, exponents=(-3, -2))
+"""Inputs whose sums are exact in bf16 under any order and any rounding: values m * 2**e with
+|m| < 16 and e in {-3, -2}, so every partial sum of ws <= 8 of them is a multiple of 2**-3 below
+2**5 in magnitude, at most 8 significant bits. A reduction that accumulates in bf16 or fp32, in
+whatever order, must then return the exact sum, so these inputs check addressing (peer, shard,
+row, window) bit for bit on every architecture. They do not exercise rounding:
+test_multimem_reduce_scatter.py::test_bf16_in_switch_sum_rounding does, with designed sums."""
+
+FP32_UNIT_ROUNDOFF = 2.0**-24
+
+
+def assert_fp32_sum_within_bound(out: torch.Tensor, parts: torch.Tensor, *, what: str) -> None:
+    """``out`` (fp32) is the sum over dim 0 of ``parts`` [ws, ...] in some order, one fp32
+    rounding per add.
+
+    The in-switch fp32 sum adds the ranks' values in an order the hardware picks (H100 rounds
+    after each add, in an order that differs between GPU sets; GB200 measured correctly
+    rounded). No single trusted implementation has the same order, so the bound is derived
+    instead: for any order of recursive summation, |s_hat - s| <= gamma_(ws-1) * sum_q |x_q|
+    with gamma_k = k u / (1 - k u), u = 2**-24 (Higham, Accuracy and Stability of Numerical
+    Algorithms, 2nd ed., eq. 4.4). It holds element by element; a wrong peer, row or window
+    exceeds it by orders of magnitude.
+    """
+    k = parts.shape[0] - 1
+    gamma = k * FP32_UNIT_ROUNDOFF / (1 - k * FP32_UNIT_ROUNDOFF)
+    exact = parts.double().sum(0)
+    bound = gamma * parts.double().abs().sum(0)
+    got = out.double()
+    finite = torch.isfinite(exact)
+    if bool((finite & ~torch.isfinite(got)).any()):
+        raise AssertionError(f"{what}: non-finite output where the exact sum is finite")
+    err = torch.where(finite, (got - exact).abs(), torch.zeros_like(exact))
+    bad = err > bound
+    if bool(bad.any()):
+        i = tuple(int(v) for v in bad.nonzero()[0])
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} of {bad.numel()} elements exceed the fp32 summation"
+            f" bound gamma_{k} * sum|x|; first at {i}: got {got[i].item()!r}, exact sum"
+            f" {exact[i].item()!r}, error {err[i].item():.3e} > bound {bound[i].item():.3e}"
+        )
 
 
 def token_counts(pattern: str, ws: int, per_rank_max: int, generator: torch.Generator) -> List[int]:

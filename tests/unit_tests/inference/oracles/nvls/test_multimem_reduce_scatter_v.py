@@ -15,10 +15,15 @@ Contract (from the launchers' docstrings and `NVLSAllGatherVDispatcher.token_com
   rank_token_offset holds off_r and ep_max_tokens holds max_q c_q (device int32 scalars, the
   latter the same on every rank); per_rank_max_tokens is static and fixes the grid. Rank r's
   output is out[i] = sum_q P_q[off_r + i] for i < c_r (shape [c_r, H]).
-  * multimem: fp32 (production: the dispatcher's buffer is fp32) or bf16 (fp32 accumulation,
-    one rounding). The dispatcher documents the fp32 in-switch sum as correctly rounded,
-    "bitwise-equal to an fp64 reference" (token_dispatcher_inference.py:667-671), which batch-
-    invariant mode with batch_invariant_collective="multimem" relies on.
+  * multimem: fp32 (production: the dispatcher's buffer is fp32), added in an order the switch
+    picks, or bf16 (fp32 accumulation, one rounding). Batch-invariant mode with
+    batch_invariant_collective="multimem" (token_dispatcher_inference.py:666-675) needs a
+    token's combined row to depend only on its partials: the same bits on every call, whatever
+    its row position, the other tokens and the per-rank counts. It does not need correct
+    rounding, which the dispatcher's comment claims ("correctly-rounded (exact fp32 sum,
+    bitwise-equal to an fp64 reference)", :667-671): the first GPU run measured it on GB200 and
+    refuted it on H100, where the fp32 sum rounds after each add, in an order that also differs
+    between GPU sets (finding O5-N3; the comment should say what holds).
   * ordered: fp32 only; ((P_0 + P_1) + P_2) + ... in rank order, each add rounded to nearest in
     fp32, so the result depends on nothing else in the batch.
   Only rows [off_r, off_r + c_r) of the buffers are read and nothing but the output is written.
@@ -27,10 +32,14 @@ Contract (from the launchers' docstrings and `NVLSAllGatherVDispatcher.token_com
   next layer's all-gather-v; see test_multimem_all_gatherv_3tensor.py). Blocks at or past
   ep_max_tokens skip the barrier on every rank together.
 
-Tolerance classes: exact on dyadic partials (sums exact in fp32 in any order) for both kernels;
-multimem on N(0, 1) data bounded against the fp64 sum of the NCCL-gathered partials, calibrated
-by NCCL's fp32 all-reduce rounded to the dtype, plus (fp32) the documented exactness against the
-fp64 sum rounded once; ordered on N(0, 1) data exact against the rank-order fp32 sum in torch.
+Tolerance classes:
+  * exact on ``nu.EXACT`` partials (sums exact in bf16 under any order and rounding) for both
+    kernels: addressing bit for bit on every architecture;
+  * multimem fp32 on N(0, 1) data: the derived bound of recursive fp32 summation in any order,
+    element by element (``nu.assert_fp32_sum_within_bound``); bf16: bounded against the fp64 sum
+    of the NCCL-gathered partials, calibrated by NCCL's fp32 all-reduce rounded once to bf16;
+  * multimem fp32 batch invariance: exact (bitwise) across calls, positions and co-batches;
+  * ordered on N(0, 1) data: exact against the rank-order fp32 sum in torch.
 
 Structure-derived inputs: one block per token (grid min(per_rank_max, 128), grid-stride beyond
 128 tokens per rank; per_rank_max in {1, 127, 128, 129, 300}); multimem blocks of
@@ -48,7 +57,8 @@ changing counts, and back-to-back use, are in test_multimem_all_gatherv_3tensor.
 reorder a chain of plain adds (it can turn it into a vector reduction that runs from the last
 rank); `test_ordered_sum_is_rank_ordered` is the case it must pass, and it fails on main if that
 reordering happens on the target compiler. #8879 (t3-r09f1) runs the multimem combine at EP =
-world size inside the dispatcher; this file checks the kernel against the same claim directly.
+world size inside the dispatcher and asserts the correctly-rounded claim; it passed on H100 because
+expert outputs carry few significant bits, so their fp32 sums are exact in any order.
 """
 
 import pytest
@@ -100,21 +110,8 @@ class CombineCase:
         self.rows = slice(offsets[g.rank], offsets[g.rank] + counts[g.rank])
         gen = g.rank_generator(seed)
         shape = (self.global_max, hidden)
-        if data == "dyadic":
-            partial = ou.dyadic_tensor(
-                shape, dtype=dtype, device="cuda", generator=gen, **nu.DYADIC
-            )
-        elif data == "spread":
-            # Full 24-bit significands, exponents over 2**-8 .. 2**8: the fp32 sum must round,
-            # and the fp64 sum is exact (multiples of 2**-8 below 2**35: 43 bits).
-            partial = ou.dyadic_tensor(
-                shape,
-                mantissa_bits=24,
-                exponents=(-8, 8),
-                dtype=dtype,
-                device="cuda",
-                generator=gen,
-            )
+        if data == "exact":
+            partial = ou.dyadic_tensor(shape, dtype=dtype, device="cuda", generator=gen, **nu.EXACT)
         else:
             partial = torch.randn(shape, device="cuda", generator=gen).to(dtype)
         partial[self.total :] = float("nan")  # rows nobody owns: never read
@@ -173,7 +170,7 @@ def _multimem_params():
             "per_rank_max": nu.PER_RANK_MAX,
             "counts": nu.COUNTS,
             "byte_offset": BYTE_OFFSETS,
-            "data": ["dyadic", "randn"],
+            "data": ["exact", "randn"],
             "ws": nu.GROUP_SIZES,
         }
     )
@@ -205,7 +202,7 @@ def _ordered_params():
             "per_rank_max": nu.PER_RANK_MAX,
             "counts": nu.COUNTS,
             "byte_offset": BYTE_OFFSETS,
-            "data": ["dyadic", "randn"],
+            "data": ["exact", "randn"],
             "ws": nu.GROUP_SIZES,
         }
     )
@@ -243,8 +240,10 @@ def test_multimem_combine_matches_nccl(
         assert result is case.out.tensor, "multimem_reduce_scatter_v must return output_tensor"
         case.check_memory()
         out = case.out.tensor
-        if data == "dyadic":
-            ou.assert_exact(out, case.nccl_sum.to(out.dtype), what="combine (exact, dyadic)")
+        if data == "exact":
+            ou.assert_exact(out, case.nccl_sum.to(out.dtype), what="combine (exact sum)")
+        elif out.dtype == torch.float32:
+            nu.assert_fp32_sum_within_bound(out, case.parts, what="combine")
         else:
             ou.assert_close_to_reference(
                 out,
@@ -256,32 +255,80 @@ def test_multimem_combine_matches_nccl(
     nu.agree(check, f"multimem combine, counts {counts}")
 
 
+PROBES = 3
+"""Probe tokens per rank in the batch-invariance test."""
+
+SPREAD = dict(mantissa_bits=24, exponents=(-8, 8))
+"""fp32 values with full significands and exponents over 2**+-8: their fp32 sums must round, so
+the order of the adds shows in the bits (and their fp64 sums are exact)."""
+
+
 @gpu_test
-@pytest.mark.parametrize(
-    "hidden,per_rank_max,counts_pattern",
-    [(7168, 129, "uneven"), (4100, 64, "full"), (128, 300, "uneven")],
-)
+@pytest.mark.parametrize("hidden", [7168, 128])
 @pytest.mark.parametrize("ws", nu.group_size_params())
-def test_multimem_fp32_sum_is_correctly_rounded(
-    nvls_groups, ws, hidden, per_rank_max, counts_pattern
-):
-    """The dispatcher's claim for the fp32 in-switch sum (token_dispatcher_inference.py:667-671):
-    bitwise equal to the fp64 sum rounded once, on fp32 values with full significands and
-    exponents spread over 2**+-8 (their fp32 sums must round; their fp64 sums are exact).
-    Batch-invariant mode with collective "multimem" depends on it."""
+def test_multimem_fp32_combine_is_batch_invariant(nvls_groups, ws, hidden):
+    """What batch-invariant mode with collective "multimem" needs from the fp32 in-switch sum:
+    each rank owns PROBES probe tokens with fixed partials (a request stays on its EP rank);
+    over several calls the per-rank counts, the probes' row positions, the co-batched tokens
+    and the timing (a random rank is delayed) change, and every probe's combined row must keep
+    its bits. Every call is also checked against the fp32 summation bound. Runs on every
+    architecture; correct rounding is not required (finding O5-N3)."""
     g = nvls_groups.get(ws)
-    seed = nu.case_seed("rsv-rounding", ws, hidden, per_rank_max, counts_pattern)
-    counts = nu.token_counts(counts_pattern, ws, per_rank_max, g.shared_generator(seed))
-    case = CombineCase(g, hidden, torch.float32, per_rank_max, counts, 0, "spread", seed)
-    case.launch(multimem_reduce_scatter_v)
-    case.snapshot()
+    symm = g.buffer()
+    per_rank_max, probes, calls = 129, PROBES, 6
+    global_max = per_rank_max * ws
+    seed = nu.case_seed("rsv-batch-invariance", ws, hidden)
+    shared = g.shared_generator(seed)
+    gen = g.rank_generator(seed)
+    # This rank's contribution to probe k of owner o.
+    probe_parts = ou.dyadic_tensor(
+        (ws, probes, hidden), dtype=torch.float32, device="cuda", generator=gen, **SPREAD
+    )
+    view = symm.view((global_max, hidden), torch.float32)
+    results = []
+    for _ in range(calls):
+        counts = [int(c) for c in torch.randint(probes, per_rank_max + 1, (ws,), generator=shared)]
+        offsets = nu.offsets_from_counts(counts)
+        positions = [torch.randperm(c, generator=shared)[:probes].tolist() for c in counts]
+        partial = ou.dyadic_tensor(
+            (global_max, hidden), dtype=torch.float32, device="cuda", generator=gen, **SPREAD
+        )
+        partial[sum(counts) :] = float("nan")
+        for owner in range(ws):
+            for k, position in enumerate(positions[owner]):
+                partial[offsets[owner] + position] = probe_parts[owner, k]
+        rows = slice(offsets[g.rank], offsets[g.rank] + counts[g.rank])
+        # The gather also orders every rank's previous combine (no exit barrier) before this
+        # rank rewrites its buffer, as the next all-gather-v does in the dispatcher.
+        parts = g.gather(partial)[:, rows]
+        view.copy_(partial)
+        out = torch.empty(counts[g.rank], hidden, dtype=torch.float32, device="cuda")
+        g.maybe_sleep(shared)
+        multimem_reduce_scatter_v(
+            out,
+            view,
+            symm.hdl,
+            rank_token_offset=torch.tensor([offsets[g.rank]], dtype=torch.int32, device="cuda"),
+            ep_max_tokens=torch.tensor([max(counts)], dtype=torch.int32, device="cuda"),
+            per_rank_max_tokens=per_rank_max,
+        )
+        results.append((out, parts, positions[g.rank], counts))
+    nu.sync_world()
 
     def check():
-        case.check_memory()
-        expected = ou.fp64_reference(sum_reference, case.parts).to(torch.float32)
-        ou.assert_exact(case.out.tensor, expected, what="fp32 combine vs fp64 sum rounded once")
+        first = None
+        for call, (out, parts, positions, counts) in enumerate(results):
+            nu.assert_fp32_sum_within_bound(out, parts, what=f"call {call} (counts {counts})")
+            probe_rows = out[positions]
+            if first is None:
+                first = probe_rows
+            ou.assert_exact(
+                probe_rows,
+                first,
+                what=f"call {call} (counts {counts}, rows {positions}): probe rows vs call 0",
+            )
 
-    nu.agree(check, f"correctly rounded fp32 combine, counts {counts}")
+    nu.agree(check, "batch-invariant fp32 combine")
 
 
 @gpu_test
