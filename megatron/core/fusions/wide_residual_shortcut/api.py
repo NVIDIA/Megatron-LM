@@ -238,6 +238,21 @@ def shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(pending, reads, ga
             "shortcut_add_wide_residual_write_two_reader_rmsnorm_quant requires two read "
             "controllers and two RMSNorm weights"
         )
+    return _apply_pending(pending, reads, gammas, **options)
+
+
+def shortcut_add_wide_residual_write_read_rmsnorm_quant(pending, read, gamma, **options):
+    """Fuse a pending write and one following read/RMSNorm.
+
+    This is the seam into a lone layer: a fused block's MoE write (a shortcut add of
+    ``routed + shared``) or a lone layer's single update (``pending.shared`` None) is written
+    together with the next layer's input read and RMSNorm. Options and the MXFP8 contract
+    match ``wide_residual_write_read_rmsnorm_quant``.
+    """
+    return _apply_pending(pending, (read,), (gamma,), **options)
+
+
+def _apply_pending(pending, reads, gammas, **options):
     p = pending
     updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
     return _apply_boundary(

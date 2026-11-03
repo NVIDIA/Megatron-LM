@@ -718,7 +718,12 @@ class HybridStack(MegatronModule):
                     getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
                     for layer in self.layers
                 ]
-                defer_shortcut_add = [a and b for a, b in zip(fused, fused[1:] + [False])]
+                # A lone layer flagged consumes_pending_write also takes the deferred write.
+                consumes = [
+                    f or getattr(layer, "consumes_pending_write", False)
+                    for f, layer in zip(fused, self.layers)
+                ]
+                defer_shortcut_add = [a and b for a, b in zip(fused, consumes[1:] + [False])]
                 pending_shortcut_add = None
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
@@ -774,6 +779,9 @@ class HybridStack(MegatronModule):
                             pending_shortcut_add, hidden_states = hidden_states, None
                         residual_stream_recompute_context = moe_recompute_context
                     else:
+                        if pending_shortcut_add is not None:
+                            # The layer applies the deferred write with its own read and norm.
+                            hidden_states, pending_shortcut_add = pending_shortcut_add, None
                         if cp_layout_state is not None:
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
@@ -851,12 +859,13 @@ class HybridStack(MegatronModule):
                                 )
 
                         if getattr(layer, "defers_write_to_shortcut_block", False):
-                            # Unwritten: the next fused block's two-reader kernel writes it.
+                            # Unwritten: the next fused consumer's kernel writes it.
                             pending_shortcut_add, hidden_states = hidden_states, None
                         else:
                             if isinstance(hidden_states, tuple):
                                 hidden_states = hidden_states[0]
-                            observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                            if torch.is_tensor(residual_accumulator):
+                                observe_layer_residuals(layer, residual_accumulator, hidden_states)
                             if cp_layout_state is not None:
                                 hidden_states = cp_layout_state.finalize_layer(
                                     physical_layer_idx, hidden_states

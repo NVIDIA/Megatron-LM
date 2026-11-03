@@ -137,7 +137,72 @@ def group_layers_into_shortcut_blocks(
     for layer, successor in zip(grouped_layers, grouped_layers[1:]):
         if getattr(successor, "using_shortcut_moe_fused_residual_kernel", False):
             _defer_lone_write(layer, successor)
+    if getattr(config, "moe_shortcut_wide_residual_norm_fusion", False):
+        _chain_lone_layer_writes(grouped_layers, config)
     return grouped_layers
+
+
+def _lone_residual_parts(layer):
+    """Return a lone wide-residual layer's (input read, input RMSNorm, write), or None.
+
+    Covers wide-residual Mamba/GDN layers and MLP-only wide-residual transformer layers outside
+    a fused shortcut block.
+    """
+    from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+    from megatron.core.transformer.wide_residual_transformer_layer import (
+        WideResidualTransformerLayer,
+    )
+
+    if getattr(layer, "using_shortcut_moe_fused_residual_kernel", False) or getattr(
+        layer, "is_mtp_layer", False
+    ):
+        return None
+    if isinstance(layer, WideResidualMambaLayer):
+        return layer.residual_read, layer.norm, layer.residual_write
+    if isinstance(layer, WideResidualTransformerLayer) and layer.supports_pending_write_chaining():
+        if layer.recompute_pre_mlp_layernorm:
+            return None
+        return layer.residual_read_mlp, layer.pre_mlp_layernorm, layer.residual_write_mlp
+    return None
+
+
+def _chain_lone_layer_writes(grouped_layers, config) -> None:
+    """Fuse the residual seams into lone layers.
+
+    A lone layer whose predecessor is a fused ShortcutMoEBlock (block -> lone layer) or a lone
+    layer (lone -> lone) consumes that predecessor's deferred write: one
+    ``shortcut_add_wide_residual_write_read_rmsnorm_quant`` launch replaces the predecessor's
+    residual write (and a block's routed + shared add) and this layer's read and RMSNorm.
+    Checkpoint replay intervals (residual_stream_recompute_num_layers) keep these seams unfused:
+    lone-seam chaining is validated without replay only.
+    """
+    from megatron.core.transformer.wide_residual import (
+        StreamwiseSigmoidWideResidualConnection,
+        can_read_pending_write,
+    )
+
+    # validate_shortcut_fusion_config already rejects residual_stream recompute and other norms.
+    if config.residual_stream_recompute_num_layers is not None:
+        return
+    streams = config.wide_residual.num_streams
+    for layer, successor in zip(grouped_layers, grouped_layers[1:]):
+        consumer = _lone_residual_parts(successor)
+        if consumer is None or not can_read_pending_write(consumer[0], consumer[1], streams):
+            continue
+        if getattr(layer, "using_shortcut_moe_fused_residual_kernel", False):
+            if isinstance(layer, ShortcutMoEBlock):
+                # HybridStack defers the block's MoE write to a consuming successor.
+                successor.consumes_pending_write = True
+            continue
+        producer = _lone_residual_parts(layer)
+        if (
+            producer is None
+            or not isinstance(producer[2], StreamwiseSigmoidWideResidualConnection)
+            or producer[2].num_streams != streams
+        ):
+            continue
+        layer.defers_write_to_shortcut_block = True
+        successor.consumes_pending_write = True
 
 
 def _defer_lone_write(layer, block: "ShortcutMoEBlock") -> None:

@@ -3,6 +3,7 @@
 
 from torch import Tensor
 
+from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
@@ -19,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
+    write_pending_and_read_norm,
 )
 from megatron.core.typed_torch import apply_module
 
@@ -32,9 +34,14 @@ class WideResidualMambaLayer(MambaLayer):
     # mixer output.
     using_shortcut_moe_fused_residual_kernel: bool = False
     # Set by group_layers_into_shortcut_blocks on a lone layer directly before a fused
-    # ShortcutMoEBlock: the layer returns its residual write as a PendingShortcutAdd (single
-    # update) that the block's two-reader kernel writes with its compute and shortcut reads.
+    # consumer (a fused ShortcutMoEBlock, or a lone layer with consumes_pending_write): the
+    # layer returns its residual write as a PendingShortcutAdd (single update) that the
+    # consumer's fused kernel writes together with its own read(s) and RMSNorm(s).
     defers_write_to_shortcut_block: bool = False
+    # Set by group_layers_into_shortcut_blocks on a lone layer whose predecessor defers its
+    # write: the layer receives that PendingShortcutAdd as hidden_states and applies it with its
+    # own read and RMSNorm in one kernel (shortcut_add_wide_residual_write_read_rmsnorm_quant).
+    consumes_pending_write: bool = False
 
     def __init__(
         self,
@@ -106,6 +113,13 @@ class WideResidualMambaLayer(MambaLayer):
 
         if self.using_shortcut_moe_fused_residual_kernel:
             return ResidualBranchInput(hidden_states, None), None
+        if isinstance(hidden_states, PendingShortcutAdd):
+            if not self.consumes_pending_write or residual_stream_recompute_context is not None:
+                raise RuntimeError("this layer cannot consume a deferred residual write")
+            residual, branch_input = write_pending_and_read_norm(
+                hidden_states, self.residual_read, self.norm
+            )
+            return ResidualBranchInput(branch_input, (residual,)), None
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
             hidden_states, connection_state = apply_module(self.residual_read)(
@@ -163,9 +177,7 @@ class WideResidualMambaLayer(MambaLayer):
             )
 
     def _pending_write(self, mixer_out_with_bias, state: ResidualConnectionState):
-        """Return the residual write for the following fused block instead of applying it."""
-        from megatron.core.fusions.wide_residual_shortcut import PendingShortcutAdd
-
+        """Return the residual write for the following fused consumer instead of applying it."""
         update, bias = mixer_out_with_bias
         if bias is not None:
             raise ValueError("a deferred shortcut write requires a bias-free mixer projection")

@@ -1633,3 +1633,121 @@ def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden, fp32_resi
     for a, b in zip(states, taped_states, strict=True):
         for key in a:
             assert all(torch.equal(av, bv) for av, bv in zip(a[key], b[key]))
+
+
+def _unchain(model):
+    """Turn off lone-layer write chaining (each seam writes, then reads and norms unfused)."""
+    for layer in model.decoder.layers:
+        for flag in ("defers_write_to_shortcut_block", "consumes_pending_write"):
+            if getattr(layer, flag, False):
+                setattr(layer, flag, False)
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("fp32_residual", [True, False])
+def test_hybrid_lone_seams_fuse(monkeypatch, fp32_residual):
+    """HybridModel M - M [M E] [M E] M - M -: every residual seam runs one fused kernel.
+
+    lone -> lone and fused block -> lone seams apply the predecessor's deferred write with the
+    lone layer's read and RMSNorm (one reader; a block's write is a shortcut add of two
+    updates), bit for bit with the taped forward, and match the unchained model.
+    """
+    model = _hybrid_model("mamba", False, 3072, False, "M-MMEMEM-M-", fp32_residual)
+    layers = model.decoder.layers
+    kinds = [
+        (
+            "B"
+            if isinstance(l, ShortcutMoEBlock)
+            else "M" if isinstance(l, WideResidualMambaLayer) else "T"
+        )
+        for l in layers
+    ]
+    assert kinds == ["M", "T", "M", "B", "B", "M", "T", "M", "T"]
+    assert [bool(getattr(l, "defers_write_to_shortcut_block", False)) for l in layers] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert [bool(getattr(l, "consumes_pending_write", False)) for l in layers] == [
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
+    execute = _static_prefill_decode(model, keys=(1, 3, 4, 6, 8, 10))
+    with torch.inference_mode(), InferenceMode.active():
+        (outputs, states), (taped_outputs, taped_states), calls = _inference_and_taped(
+            monkeypatch, execute
+        )
+    # Updates per launch, ten launches per step: M->-, -->M, M->[M E] (one update read twice),
+    # block 1's compute write, block->block (shortcut add), block 2's compute write,
+    # block->M (shortcut add read once), M->-, -->M, M->-.
+    assert calls == [1, 1, 1, 1, 2, 1, 2, 1, 1, 1] * 4
+    assert all(torch.equal(a, b) for a, b in zip(outputs, taped_outputs, strict=True))
+    for a, b in zip(states, taped_states, strict=True):
+        for key in a:
+            assert all(torch.equal(av, bv) for av, bv in zip(a[key], b[key]))
+    _unchain(model)
+    with torch.inference_mode(), InferenceMode.active():
+        unchained, _ = execute()
+    for a, b in zip(outputs, unchained, strict=True):
+        # The fused reader folds the unrounded residual and norms it in FP32; the unchained read
+        # rounds to BF16 first. Over eleven layers this is a few BF16 ulps of the largest logit
+        # (|logits| <= ~3.5), the same order as the shortcut-block fusion vs no fusion.
+        torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0.1)
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("fp32_residual", [True, False])
+def test_hybrid_lone_seams_fuse_training(fp32_residual):
+    """Training through the chained lone seams (forward and backward, 1024 tokens) matches the
+    unchained model: outputs and every parameter gradient within BF16 noise."""
+    model = _hybrid_model("mamba", False, 3072, False, "M-MMEMEM-M-", fp32_residual).train()
+    ids = torch.randint(0, 128, (1, 1024), device="cuda")
+    positions = torch.arange(1024, device="cuda")[None]
+
+    def step():
+        model.zero_grad(set_to_none=True)
+        logits = model(ids, positions, None)
+        logits.float().square().mean().backward()
+        grads = {
+            n: p.grad.detach().float().clone()
+            for n, p in model.named_parameters()
+            if p.grad is not None
+        }
+        return logits.detach().float(), grads
+
+    assert any(getattr(l, "consumes_pending_write", False) for l in model.decoder.layers)
+    chained, chained_grads = step()
+    _unchain(model)
+    assert not any(getattr(l, "consumes_pending_write", False) for l in model.decoder.layers)
+    unchained, unchained_grads = step()
+    torch.testing.assert_close(chained, unchained, rtol=0, atol=0.1)
+    assert chained_grads.keys() == unchained_grads.keys() and len(chained_grads) > 50
+    # Controller logit gradients nearly cancel at init (the shortcut-block fusion alone moves
+    # them several-fold); the kernel tests check them against FP64. For every other parameter
+    # the error is bounded by the model's own sensitivity: a half-ulp BF16 perturbation of the
+    # embedding output moves these gradients by a median ~4% and the Mamba dt_bias/A_log
+    # reductions by up to ~15%.
+    errors = {}
+    for name, a in chained_grads.items():
+        b = unchained_grads[name]
+        assert torch.isfinite(a).all(), name
+        if not name.endswith(("map.logit", "retention_logit")):
+            errors[name] = ((a - b).norm() / b.norm().clamp_min(1e-20)).item()
+    assert sorted(errors.values())[len(errors) // 2] < 0.05, errors
+    worst = max(errors, key=errors.get)
+    assert errors[worst] < 0.3, (worst, errors[worst])

@@ -20,9 +20,18 @@ output and gradient against independent FP64/autograd references.
 
 | boundary | updates | readers | kernel |
 |---|--:|--:|---|
-| lone layer → lone layer, compute → MoE inside a block, block → lone layer | 1 | 1 | `wide_residual_write_read_rmsnorm_quant` |
+| compute → MoE inside a block | 1 | 1 | `wide_residual_write_read_rmsnorm_quant` |
+| lone layer → lone layer (M → -, - → M) | 1 | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant`, no shared update |
+| block → lone layer ([* E] → M) | 2 (routed + shared) | 1 | `shortcut_add_wide_residual_write_read_rmsnorm_quant` |
 | block → block (shortcut add) | 2 (routed + shared) | 2 | `shortcut_add_..._two_reader_rmsnorm_quant` |
 | lone layer → block (M → [* E]) | 1 | 2 | `shortcut_add_..._two_reader_rmsnorm_quant`, no shared update |
+
+Lone wide-residual Mamba layers (Mamba or GDP mixers) and MLP-only layers defer their write to
+the next seam (`defers_write_to_shortcut_block`) and apply the previous one with their own read
+and RMSNorm (`consumes_pending_write`), so in a stack of such layers every seam after the first
+layer's read is one kernel. MLP-only layers use a standalone pre-MLP RMSNorm under the fusion
+spec. Lone attention/GDN layers are not chained, and checkpoint replay intervals
+(`residual_stream_recompute_num_layers`) keep the lone → lone and block → lone seams unfused.
 
 ## Performance
 

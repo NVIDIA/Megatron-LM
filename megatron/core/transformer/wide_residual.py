@@ -440,3 +440,44 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
         and config.recompute_modules is not None
         and "residual_stream" in config.recompute_modules
     )
+
+
+def write_pending_and_read_norm(
+    pending, read: StreamwiseSigmoidWideResidualConnection, norm: nn.Module
+) -> tuple[Tensor, Tensor]:
+    """Apply a deferred residual write and the next layer's read and RMSNorm in one kernel.
+
+    ``pending`` is a ``PendingShortcutAdd``: a fused shortcut block's MoE write (routed + shared)
+    or a lone layer's single update. The fused kernel writes it and emits ``norm(read(...))``
+    for the consuming layer.
+
+    Returns:
+        ``(residual, branch_input)``: the written wide residual and the normalized BF16 input.
+    """
+    from megatron.core.fusions.wide_residual_shortcut import (
+        shortcut_add_wide_residual_write_read_rmsnorm_quant,
+    )
+
+    residual, branch_input = shortcut_add_wide_residual_write_read_rmsnorm_quant(
+        pending,
+        read.read_map(return_logits=True),
+        norm.weight,
+        num_streams=read.num_streams,
+        epsilon=norm.eps,
+    )
+    return residual, branch_input
+
+
+def can_read_pending_write(read, norm, num_streams: int) -> bool:
+    """Whether a layer's input read and norm can consume a deferred write (fused kernel)."""
+
+    return (
+        isinstance(read, StreamwiseSigmoidWideResidualConnection)
+        and read.num_streams == num_streams
+        and getattr(norm, "eps", None) is not None
+        and getattr(norm, "weight", None) is not None
+        and not getattr(norm, "zero_centered_gamma", False)
+        and not getattr(norm, "returns_residual", False)
+        and getattr(norm, "bias", None) is None
+        and type(norm).__name__ == "RMSNorm"
+    )

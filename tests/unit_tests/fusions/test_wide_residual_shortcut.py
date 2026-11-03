@@ -31,6 +31,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
     forward_kernel,
     kernel_utils,
     replay_kernel,
+    shortcut_add_wide_residual_write_read_rmsnorm_quant,
     shortcut_add_wide_residual_write_two_reader_rmsnorm_quant,
     wide_residual_write_read_rmsnorm_quant,
 )
@@ -90,8 +91,9 @@ MX_SHAPES = [
     (8192, 13312),
 ]
 
-# Seams as (readers, updates): one reader, a shortcut add read twice, a single write read twice.
-SEAMS = [(1, 1), (2, 2), (2, 1)]
+# Seams as (readers, updates): one reader, a shortcut add read twice, a single write read twice,
+# a shortcut add read once (a fused block into a lone layer).
+SEAMS = [(1, 1), (2, 2), (2, 1), (1, 2)]
 
 # ---------------------------------------------------------------- shared inputs and runners
 
@@ -139,6 +141,13 @@ def run(raw, streams=3, epsilon=1e-5, **options):
     """Call the one-reader or two-reader public API (a shortcut add with two updates)."""
     residual, updates, controllers, gammas = raw
     options.update(num_streams=streams, epsilon=epsilon)
+    if len(gammas) == 1 and len(updates) == 2:
+        return shortcut_add_wide_residual_write_read_rmsnorm_quant(
+            PendingShortcutAdd(residual, updates[0], updates[1], *controllers[:2]),
+            controllers[2],
+            gammas[0],
+            **options,
+        )
     if len(gammas) == 1:
         return wide_residual_write_read_rmsnorm_quant(
             residual, updates[0], *controllers, gammas[0], **options

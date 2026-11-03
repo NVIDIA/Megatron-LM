@@ -123,8 +123,8 @@ def backward(
         )
     if n not in (1, 2):
         raise ValueError("backward requires one or two readers")
-    if updates not in range(1, n + 1):
-        raise ValueError("backward requires one update, or two summed for two readers")
+    if updates not in (1, 2):
+        raise ValueError("backward requires one update, or two summed by a shortcut add")
     if len(dys) != n:
         raise ValueError("backward requires one gradient slot per reader")
     if previous.dtype not in (torch.float32, torch.bfloat16):

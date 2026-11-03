@@ -468,7 +468,7 @@ def forward(
     """Write the current residual and the folded RMSNorm reader operands.
 
     One or two readers (``reads``/``gammas``) consume the write of one update, or of a
-    shortcut add of two updates (two readers only). Inference skips backward state
+    shortcut add of two updates. Inference skips backward state
     (coefficients, the shortcut add's BF16 update sum and reader statistics), returning
     saved=None. A shortcut add rounds its BF16 update sum before writing the residual.
     The residual is FP32 or BF16 (the current residual keeps its dtype) and controller logits
@@ -503,8 +503,8 @@ def forward(
     """
     validate_num_streams(num_streams)
     n = len(reads)
-    if n not in (1, 2) or len(gammas) != n or len(updates) not in range(1, n + 1):
-        raise ValueError("one or two readers write one update; two readers may add two")
+    if n not in (1, 2) or len(gammas) != n or len(updates) not in (1, 2):
+        raise ValueError("one or two readers write one update or a shortcut add of two")
     shortcut_add = len(updates) == 2
     if not residual.is_cuda or updates[0].ndim != 2:
         raise ValueError("expected CUDA [M,H] updates")

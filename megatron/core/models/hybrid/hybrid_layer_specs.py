@@ -719,6 +719,32 @@ def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
                 sharded_state_dict_keys_map=mapping,
             ),
         )
+    # An MLP-only layer's pre-MLP norm feeds linear_fc1; split it so a deferred residual write
+    # can be applied with the layer's read and RMSNorm in one kernel.
+    mlp_spec = submodules.mlp_layer
+    mlp = getattr(getattr(mlp_spec, "submodules", None), "mlp", None)
+    mlp_submodules = mlp.keywords.get("submodules") if isinstance(mlp, partial) else None
+    fc1 = {
+        TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+        InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+    }.get(getattr(mlp_submodules, "linear_fc1", None))
+    if fc1 is not None and mlp_spec.submodules.pre_mlp_layernorm is IdentityOp:
+        mlp = partial(
+            mlp.func,
+            *mlp.args,
+            **(mlp.keywords | {"submodules": replace(mlp_submodules, linear_fc1=fc1)}),
+        )
+        mapping = dict(mlp_spec.submodules.sharded_state_dict_keys_map)
+        mapping["pre_mlp_layernorm."] = "mlp.linear_fc1.layer_norm_"
+        layers["mlp_layer"] = replace(
+            mlp_spec,
+            submodules=replace(
+                mlp_spec.submodules,
+                mlp=mlp,
+                pre_mlp_layernorm=TENorm,
+                sharded_state_dict_keys_map=mapping,
+            ),
+        )
     return replace(stack_spec, submodules=replace(submodules, **layers))
 
 
