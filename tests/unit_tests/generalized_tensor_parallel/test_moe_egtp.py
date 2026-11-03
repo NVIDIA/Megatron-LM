@@ -644,7 +644,7 @@ class TestMoEEGTPCorrectness:
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("egtp_remat_size", (1, 2))
-    def test_egtp_quantized_precision_override_backward(self, monkeypatch, egtp_remat_size):
+    def test_egtp_quantized_precision_override_backward(self, request, egtp_remat_size):
         """MXFP8 override under global NVFP4 keeps experts fused and survives backward with EGTP_remat."""
         import transformer_engine.pytorch as te
 
@@ -660,15 +660,7 @@ class TestMoEEGTPCorrectness:
                 "quantizes re-gathered BF16 weights (ops/fused/grouped_mlp.py "
                 "_quantize_unquantized_weights)"
             )
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-        try:
-            from transformer_engine.pytorch.ops.fused import grouped_mlp as te_grouped_mlp
-        except ImportError:
-            pytest.skip("TE fused grouped MLP module not available")
-        # FP8/FP4 support alone does not imply that TE can fuse this SReLU MLP.
-        fused_cls = getattr(te_grouped_mlp, "GroupedMLP_CuTeGEMMUnary", None)
-        if fused_cls is None or not fused_cls.is_supported():
-            pytest.skip("TE fused unary grouped MLP unsupported here")
+        request.getfixturevalue("require_te_fused_grouped_mlp")
         _run_distributed(_worker_egtp_quantized_precision_override_backward, 4, egtp_remat_size)
 
 

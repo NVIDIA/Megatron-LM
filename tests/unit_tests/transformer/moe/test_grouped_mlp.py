@@ -1995,7 +1995,7 @@ class TestTEGroupedMLP:
         layer = Float16Module(layer.config, layer).module
         return layer.cuda()
 
-    def _skip_unless_quantized_override_testable(self, monkeypatch):
+    def _skip_unless_quantized_override_testable(self):
         try:
             import transformer_engine.pytorch as te
             from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
@@ -2005,12 +2005,13 @@ class TestTEGroupedMLP:
             available, reason = probe(return_reason=True)
             if not available:
                 pytest.skip(reason)
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(self, monkeypatch):
+    def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(
+        self, monkeypatch, request
+    ):
         """MXFP8 experts under NVFP4 autocast match a global-MXFP8 reference exactly.
 
         Check the recipe at the real TE sequence boundary, its selected fused kernel and
@@ -2021,8 +2022,8 @@ class TestTEGroupedMLP:
         from transformer_engine.pytorch import MXFP8Quantizer
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-        self._skip_unless_quantized_override_testable(monkeypatch)
-        self._skip_unless_clamped_fusion_available(tanh_clamp_scale=None)
+        self._skip_unless_quantized_override_testable()
+        request.getfixturevalue("require_te_fused_grouped_mlp")
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
         hidden, ffn = 128, 256
@@ -2092,12 +2093,12 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self, monkeypatch):
+    def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self):
         """The TE sequence rejects a quantized override matching only one of its linears."""
         import transformer_engine.pytorch as te
         from transformer_engine.common.recipe import NVFP4BlockScaling
 
-        self._skip_unless_quantized_override_testable(monkeypatch)
+        self._skip_unless_quantized_override_testable()
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
 
