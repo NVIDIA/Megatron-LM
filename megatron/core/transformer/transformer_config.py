@@ -1812,7 +1812,7 @@ class TransformerConfig(ModelParallelConfig):
         latent) dimension H is not. The CUTLASS path (ClampedRelu2 experts) packs the weights as
         they are and needs both dimensions divisible by 128. The TRT-LLM routed path (unclamped
         squared-ReLU experts) zero-pads both to multiples of 128, but FlashInfer 0.7.2's batched
-        GEMMs have no kernel config when both pad to 128 (the first forward fails with "No valid
+        GEMMs have no kernel config when H pads to 128 (the first forward fails with "No valid
         config found for the given problem shape"). __post_init__ runs this check, and the
         inference experts run it again when built, for a config whose parallel layout was
         changed after construction (such as an RL inference model's).
@@ -1844,15 +1844,14 @@ class TransformerConfig(ModelParallelConfig):
                     f"over {etp} expert tensor-parallel ranks (the FFN is moe_ffn_hidden_size, "
                     "or ffn_hidden_size when that is unset)."
                 )
-        elif expert_hidden <= 128 and expert_ffn <= 128 * etp:
-            # Seen on GB200 with FlashInfer 0.7.2.post1. test_flashinfer_mxfp8.py runs the
-            # smallest shapes accepted here and fails once FlashInfer serves this one.
+        elif expert_hidden <= 128:
+            # Seen on GB200 with FlashInfer 0.7.2.post1 (FFN 128 and 256);
+            # test_flashinfer_mxfp8.py fails once FlashInfer serves it.
             raise ValueError(
-                "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel when the expert hidden size "
-                f"and the per-rank FFN size both pad to 128; got hidden {expert_hidden} "
-                f"(moe_latent_size, or hidden_size when that is unset) and FFN {expert_ffn} split "
-                f"over {etp} expert tensor-parallel ranks. Use a larger expert hidden or per-rank "
-                "FFN size, or inference_grouped_gemm_backend 'torch' or 'vllm'."
+                "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel for an expert hidden size that "
+                f"pads to 128; got hidden {expert_hidden} (moe_latent_size, or hidden_size when "
+                "that is unset). Use an expert hidden size above 128, or "
+                "inference_grouped_gemm_backend 'torch' or 'vllm'."
             )
 
     def __post_init__(self):
