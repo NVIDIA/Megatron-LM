@@ -85,8 +85,11 @@ def test_draws_follow_the_tempered_softmax(monkeypatch):
 
 @pytest.mark.parametrize(
     "top,temperature",
-    [(4.0, 0.0), (32.0, 0.0), (4.0, 1e-4)],
-    ids=["logit4-T0", "logit32-T0", "logit4-T1e-4-control"],
+    [
+        pytest.param(4.0, 0.0, id="logit4-T0", marks=so.XFAIL_O4A_N2),
+        pytest.param(32.0, 0.0, id="logit32-T0", marks=so.XFAIL_O4A_N2),
+        pytest.param(4.0, 1e-4, id="logit4-T1e-4-control"),
+    ],
 )
 def test_near_zero_temperature_splits_exact_ties_evenly(top, temperature, monkeypatch):
     """Three exactly tied maxima at a temperature near the clamp are drawn 1/3 each.
@@ -96,7 +99,9 @@ def test_near_zero_temperature_splits_exact_ties_evenly(top, temperature, monkey
     noise to the fp32 scaled logit (``sampling.cuh:777``), whose spacing at 4e6 is 0.25, so
     tied tokens tie again in the race and ``DataAndIndex`` (``:670``) breaks those ties by
     position. The control (T = 1e-4: spacing 0.004) should pass. PR #8875 maps a request's
-    T = 0 to greedy, so the case remains for explicit temperatures near the clamp.
+    T = 0 to greedy, so the case remains for explicit temperatures near the clamp. No Megatron
+    change can fix it: the T = 0 cases are strict xfails up to the FlashInfer the CI image pins
+    (``sampling_oracle.XFAIL_O4A_N2``).
     """
     vocab, launches = 32000, 16
     g = ou.make_generator()

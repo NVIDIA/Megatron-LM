@@ -192,13 +192,21 @@ def test_radix_mask_cta_split(vocab, monkeypatch):
     so.assert_batch_distribution(counts, specs, what=f"{KERNEL} V={vocab}")
 
 
-@pytest.mark.parametrize("vocab", so.RADIX_SMEM_LIMIT_VOCABS)
+@pytest.mark.parametrize(
+    "vocab",
+    [
+        pytest.param(v, marks=so.XFAIL_O4A_N1) if v in so.RADIX_MASK_UNLAUNCHABLE_VOCABS else v
+        for v in so.RADIX_SMEM_LIMIT_VOCABS
+    ],
+)
 def test_vocabularies_at_the_shared_memory_limit(vocab, monkeypatch):
     """Mixed batches whose radix mask chunk ends at or just below the shared-memory limit.
 
     Finding O4a-N1 (see ``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``): on H100 (pdx 7849977) the
     multi-CTA ``top_k_mask_logits`` fails with ``invalid argument`` at V = 115183 and 115184
-    (chunk 57592, no headroom); the single-CTA one runs at 57592.
+    (chunk 57592, no headroom); the single-CTA one runs at 57592. No Megatron change can fix
+    it: those two cases are strict xfails up to the FlashInfer the CI image pins
+    (``sampling_oracle.XFAIL_O4A_N1``).
     """
     positions, ctas = _chunk_edges(vocab)
     logits, _ = _ramp(vocab, positions=positions)

@@ -106,8 +106,9 @@ RADIX_VOCAB_SIZES = sorted({57472, 57593, 114944, 115185, *PRODUCTION_VOCABS})
 # for the multi-CTA top_k_mask_logits the flag alone. Measured on H100 (pdx 7849977, dfw
 # 21223592): the renorm fails at 0-224 bytes of headroom (all sizes below but the edge probes),
 # runs at 480 (57472, 114944); the mask fails only at 0. Edge probes for the renorm's 328/332
-# bytes: 57509 and 57510 (332, 328 bytes: should run), 57511 (324: should fail), 115016 (336:
-# should run), 115018 (328 < 332: should fail).
+# bytes: 57509 and 57510 (332, 328 bytes), 57511 (324), 115016 (336), 115018 (328). The first,
+# 57509, already fails (pdx 7852166, dfw 21230145), so the static part exceeds 332 bytes and
+# the renorm fails at every size here; the mask at RADIX_MASK_UNLAUNCHABLE_VOCABS.
 RADIX_SMEM_LIMIT_VOCABS = (
     57509,
     57510,
@@ -123,6 +124,28 @@ RADIX_SMEM_LIMIT_VOCABS = (
     230272,
     287744,
     287872,
+)
+# The sizes whose multi-CTA top_k_mask_logits chunk is the full 57592 tokens (0 bytes of headroom).
+RADIX_MASK_UNLAUNCHABLE_VOCABS = (115183, 115184)
+
+# FlashInfer's bugs here (O4a-N1, O4a-N2) have no Megatron fix: their cases are strict xfails up
+# to the FlashInfer the CI image pins (flashinfer-python in uv.lock), with the drafted patches.
+FLASHINFER_IN_CI = "0.7.2.post1"
+XFAIL_O4A_N1 = ou.xfail_upstream(
+    "O4a-N1",
+    "flashinfer-python",
+    fixed_after=FLASHINFER_IN_CI,
+    reason="radix top-k sizes its dynamic shared memory without the kernel's static part, so the"
+    " launch fails; drafted patch audit/fixes/upstream/flashinfer-radix-topk-static-smem.diff",
+)
+XFAIL_O4A_N2 = ou.xfail_upstream(
+    "O4a-N2",
+    "flashinfer-python",
+    fixed_after=FLASHINFER_IN_CI,
+    reason="sampling_from_logits breaks exact ties by reduction position at near-zero"
+    " temperatures; drafted patch"
+    " audit/fixes/upstream/flashinfer-sampling-from-logits-exact-gumbel.diff",
+    raises=AssertionError,
 )
 
 # 128-multiple vocabularies whose processed log-probs (top_k_renorm_probs) cannot launch on H100
