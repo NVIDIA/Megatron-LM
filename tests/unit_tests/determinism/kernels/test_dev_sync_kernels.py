@@ -7,11 +7,16 @@ requirements remain explicit; skipped Blackwell kernels are not qualified on Hop
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -236,6 +241,102 @@ def test_kda_recurrence_replays():
     assert_replays_bit_exact(
         run, (q, k, v, raw_g, raw_beta, a_log, dt_bias), contention=True, what="KDA recurrence"
     )
+
+
+def test_kda_recurrence_with_fused_gated_output_norm_replays():
+    """Replay the KDA recurrence feeding its fused sigmoid output norm (PR #7609).
+
+    With ``gdn_gated_output_norm_fusion`` set, ``KimiDeltaAttention._apply_gated_norm`` routes
+    the ``chunk_kda`` output through ``fused_gated_norm(gate_activation="sigmoid")`` instead of
+    the jit-fused norm and gate. The chain gates -> chunk_kda -> fused RMSNorm/sigmoid is
+    replayed forward and backward with a projection-backed strided gate, comparing every
+    input gradient and the RMSNorm weight gradient.
+    """
+    from megatron.core.fusions import fused_gated_norm
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if kda.chunk_kda is None:
+        pytest.skip("FLA KDA kernel is unavailable")
+    te = pytest.importorskip("transformer_engine.pytorch")
+    seeded()
+    batch, length, heads, dim = 1, 128, 4, 64
+    shape = (batch, length, heads, dim)
+    q, k, v = (
+        torch.randn(shape, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        for _ in range(3)
+    )
+    raw_g = torch.randn(batch, length, heads * dim, device="cuda", requires_grad=True)
+    raw_beta = torch.randn(batch, length, heads, device="cuda", requires_grad=True)
+    a_log = torch.zeros(heads, device="cuda", requires_grad=True)
+    dt_bias = torch.zeros(heads * dim, device="cuda", requires_grad=True)
+    # The output gate is a strided slice of the in_proj output, as in pre_gated_delta_rule.
+    projection = torch.randn(
+        length, batch, heads * dim * 2 + 32, device="cuda", dtype=torch.bfloat16
+    )
+    gate = projection[..., 17 : 17 + heads * dim].view(length, batch, heads, dim)
+    gate = gate.permute(1, 0, 2, 3).detach().requires_grad_()
+    gate_layer = SimpleNamespace(key_head_dim=dim)
+
+    class KDAOutput(torch.nn.Module):
+        """The KDA attributes the fused dispatcher and ``validate_gated_norm`` read."""
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                deterministic_mode=False, gdn_gated_output_norm_fusion=True
+            )
+            self.activation = "silu"
+            self.out_norm = te.RMSNorm(dim, eps=1e-6, params_dtype=torch.bfloat16, device="cuda")
+            self.value_head_dim = dim
+
+        def forward(self, q, k, v, g, beta, a_log, dt_bias, gate):
+            decay, extra = kda.KimiDeltaAttention._compute_gates(
+                gate_layer, a_log, dt_bias, batch, length, g, beta
+            )
+            core_attn_out, _ = kda.chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=decay,
+                beta=extra["beta"],
+                A_log=a_log,
+                dt_bias=dt_bias,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                initial_state=None,
+                output_final_state=False,
+                safe_gate=False,
+            )
+            out = kda.KimiDeltaAttention._apply_gated_norm(self, core_attn_out, gate)
+            assert out.shape == (batch * length * heads, dim)
+            return out
+
+    inputs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": raw_g,
+        "beta": raw_beta,
+        "a_log": a_log,
+        "dt_bias": dt_bias,
+        "gate": gate,
+    }
+    with patch.object(
+        fused_gated_norm, "fused_gated_norm", wraps=fused_gated_norm.fused_gated_norm
+    ) as fused:
+        outputs, grads = assert_module_replays_bit_exact(
+            KDAOutput(),
+            inputs,
+            replays=3,
+            contention=True,
+            what="KDA recurrence with fused sigmoid output norm",
+        )
+        assert fused.call_count == 3
+        assert all(call.kwargs.get("gate_activation") == "sigmoid" for call in fused.call_args_list)
+    assert len(outputs) == 1
+    # A_log / dt_bias gradients are compared too whenever chunk_kda produces them.
+    compared = {"in.q", "in.k", "in.v", "in.g", "in.beta", "in.gate", "chunk0.out_norm.weight"}
+    assert compared <= set(grads)
 
 
 def test_mok_route_adapter_replays():
