@@ -144,8 +144,9 @@ def _fake_shared_expert(**config_kwargs):
     for key, value in config_kwargs.items():
         setattr(config, key, value)
     shared_expert.config = config
-    shared_expert.linear_fc1 = _FakeTELinear((8, 4))
-    shared_expert.linear_fc2 = _FakeTELinear((4, 4))
+    # Hidden size 4 and an FFN of one 32-wide interleave block per GLU half.
+    shared_expert.linear_fc1 = _FakeTELinear((64, 4))
+    shared_expert.linear_fc2 = _FakeTELinear((4, 32))
     shared_expert.tp_group = object()
     shared_expert._fused_grouped_swiglu_ops = None
     shared_expert._fused_grouped_swiglu_recipe = None
@@ -218,6 +219,8 @@ def test_validate_fused_grouped_swiglu_requires_clamped_te_support(monkeypatch, 
         ({"activation_func": F.gelu}, None, "SwiGLU activation"),
         ({"gated_linear_unit": False}, None, "SwiGLU activation"),
         ({"moe_shared_expert_glu_interleave_size": None}, None, "glu_interleave_size"),
+        ({"moe_shared_expert_glu_interleave_size": 16}, None, "multiple of 32"),
+        ({"moe_shared_expert_glu_interleave_size": 64}, None, "multiple of 32"),
         ({}, "linear_fc1", "FC1"),
         ({}, "linear_fc2", "FC2"),
     ],
@@ -246,7 +249,7 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert isinstance(fc1_op, _FakeTEGroupedLinear)
     assert fc1_op.kwargs["num_groups"] == 1
     assert fc1_op.kwargs["in_features"] == 4
-    assert fc1_op.kwargs["out_features"] == 8
+    assert fc1_op.kwargs["out_features"] == 64
     assert fc1_op.kwargs["device"] == "meta"
     assert fc1_op.kwargs["bias"] is False
     assert fc1_op.kwargs["accumulate_into_main_grad"] is True
@@ -259,7 +262,7 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
 
     assert isinstance(fc2_op, _FakeTEGroupedLinear)
     assert fc2_op.kwargs["num_groups"] == 1
-    assert fc2_op.kwargs["in_features"] == 4
+    assert fc2_op.kwargs["in_features"] == 32
     assert fc2_op.kwargs["out_features"] == 4
     assert fc2_op.kwargs["device"] == "meta"
     assert fc2_op.kwargs["bias"] is False
@@ -346,9 +349,12 @@ def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch)
     assert hidden_states_2d.shape == (256, 4)
     assert tokens_per_expert.tolist() == [256]
     assert tokens_per_expert_again is tokens_per_expert
-    torch.testing.assert_close(scales, torch.ones(1))
+    # One unit scale per row (TE's unfused scaled GLU needs it; the fused op ignores it), as a
+    # stride-0 view of one cached element.
+    torch.testing.assert_close(scales, torch.ones(256))
+    assert scales.stride() == (0,)
     assert cached_tokens_per_expert is tokens_per_expert
-    assert cached_scales is scales
+    assert cached_scales.data_ptr() == scales.data_ptr()
 
 
 def test_fused_grouped_swiglu_rejects_unaligned_input():
@@ -687,3 +693,140 @@ class TestSharedExperts:
             "Clamping had no observable effect on shared-expert output; "
             "activation_func_clamp_value may not be plumbed through."
         )
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestFusedSharedExpertTrainingPaths:
+    """Training forward and backward of the fused shared expert on either TE path.
+
+    TE's op fuser decides whether GroupedLinear + scaled GLU + GroupedLinear run as its fused
+    grouped MLP, from the TE version, NVTE_CUTEDSL_FUSED_GROUPED_MLP at TE import, the cuDNN
+    frontend and the shapes; otherwise it runs the three ops one by one. Either way the module
+    must compute what the unfused SharedExpertMLP computes on the same weights, stored as
+    checkpoints store them. The ops run only under an MXFP8 or NVFP4 recipe, so on Blackwell.
+    """
+
+    interleave = 32
+    tol = 5e-2
+    grad_tol = 1e-1
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _config(**overrides):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_shared_expert_intermediate_size=256,
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            bias_activation_fusion=False,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=False,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            **overrides,
+        )
+
+    @pytest.mark.parametrize("clamp_value", [None, 0.5])
+    @pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+    def test_training_matches_unfused_shared_expert(self, monkeypatch, fused, clamp_value):
+        """On main, the unfused path raises TE's "one scale per input row" assertion."""
+        from transformer_engine.pytorch.ops.fused.grouped_mlp import GroupedMLP_CuTeGEMMGLU
+
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.transformer.mlp import MLPSubmodules
+        from megatron.training.ckpt.glu_checkpointing import _permute_glu_rows
+
+        if torch.cuda.get_device_capability()[0] != 10:
+            pytest.skip("The shared expert's MXFP8 TE ops need Blackwell")
+        if fused and not GroupedMLP_CuTeGEMMGLU.is_supported():
+            pytest.skip(
+                "TE's fused grouped MLP is not available: TE registers it at import, when "
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 is set"
+            )
+        if not fused:
+            # TE's op fuser then runs GroupedLinear, the scaled GLU and GroupedLinear in turn.
+            monkeypatch.setattr(
+                GroupedMLP_CuTeGEMMGLU, "is_supported", classmethod(lambda cls: False)
+            )
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = self._config(
+            use_grouped_gemm_for_shared_expert=True,
+            moe_shared_expert_glu_interleave_size=self.interleave,
+            activation_func_clamp_value=clamp_value,
+        )
+        reference_config = self._config(activation_func_clamp_value=clamp_value)
+        with get_fp8_context(config, is_init=True):
+            module = FusedSharedExpertMLP(
+                config, submodules, gate=False, pg_collection=pg_collection
+            ).cuda()
+            reference = SharedExpertMLP(
+                reference_config, submodules, gate=False, pg_collection=pg_collection
+            ).cuda()
+        state = module.state_dict()
+        stored = _permute_glu_rows(state["linear_fc1.weight"], self.interleave, 0, interleave=False)
+        reference.load_state_dict({**state, "linear_fc1.weight": stored})
+
+        # 256 tokens, the fused ops' alignment; FC1 outputs of std ~1, so the clamp bites.
+        hidden_states = (
+            torch.randn(256, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16) * 4
+        )
+        grad_output = torch.randn_like(hidden_states)
+        results = []
+        for shared_expert in (module, reference):
+            inputs = hidden_states.clone().requires_grad_(True)
+            with get_fp8_context(config):
+                output = shared_expert(inputs)
+            output.backward(grad_output)
+            results.append(
+                (
+                    output.detach(),
+                    inputs.grad,
+                    shared_expert.linear_fc1.weight.grad,
+                    shared_expert.linear_fc2.weight.grad,
+                )
+            )
+        (output, input_grad, fc1_grad, fc2_grad), expected = results
+
+        (sequential,) = module._fused_grouped_swiglu_ops
+        ran_fused = any(
+            isinstance(op, GroupedMLP_CuTeGEMMGLU)
+            for fuser in sequential._module_groups
+            for op, _ in fuser._forward_ops
+        )
+        assert ran_fused is fused
+        assert _rel_err(output, expected[0]) < self.tol
+        assert _rel_err(input_grad, expected[1]) < self.grad_tol
+        fc1_grad = _permute_glu_rows(fc1_grad, self.interleave, 0, interleave=False)
+        assert _rel_err(fc1_grad, expected[2]) < self.grad_tol
+        assert _rel_err(fc2_grad, expected[3]) < self.grad_tol
+        # The comparison only discriminates if the FC1 layout matters.
+        with torch.no_grad(), get_fp8_context(config):
+            reference.linear_fc1.weight.copy_(module.linear_fc1.weight)
+            misread = reference(hidden_states)
+        assert _rel_err(misread, expected[0]) > 10 * self.tol
+
+
+def _rel_err(actual, expected):
+    actual, expected = actual.float(), expected.float()
+    return ((actual - expected).norm() / expected.norm()).item()
