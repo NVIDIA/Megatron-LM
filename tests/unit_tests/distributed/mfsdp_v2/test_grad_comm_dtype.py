@@ -52,7 +52,10 @@ def _default_placements() -> Placements:
 
 
 @pytest.mark.parametrize("singleton", [False, True], ids=["reduced", "local"])
-def test_mixed_dtype_groups_match_reference_gradients(distributed_setup, singleton):
+@pytest.mark.parametrize("sync_each_microbatch", [False, True])
+def test_mixed_dtype_groups_match_reference_gradients(
+    distributed_setup, singleton, sync_each_microbatch
+):
     """One module handles both trainable dtypes and skips its frozen parameter group."""
     setup = distributed_setup
     if setup.world_size < 2:
@@ -68,7 +71,8 @@ def test_mixed_dtype_groups_match_reference_gradients(distributed_setup, singlet
     reference.fc1.to(torch.bfloat16)
     reference.fc1.bias.requires_grad_(False)
     reference.load_state_dict(model.state_dict())
-    with fully_shard_context(FsdpContext(device=setup.device)):
+    context = FsdpContext(device=setup.device)
+    with fully_shard_context(context):
         fully_shard(
             model,
             mesh,
@@ -77,10 +81,14 @@ def test_mixed_dtype_groups_match_reference_gradients(distributed_setup, singlet
         )
 
     inputs = torch.full((4, 8), setup.rank + 1, device=setup.device, dtype=torch.bfloat16)
-    for _ in range(2):
+    for index in range(2):
         reference.zero_grad(set_to_none=True)
         reference(inputs).sum().backward()
-        model(inputs).sum().backward()
+        with microbatch(context, is_last=index == 1):
+            model(inputs).sum().backward()
+        if sync_each_microbatch:
+            context.finish_grad_sync()
+    context.finish_grad_sync()
     for actual, expected in zip(model.parameters(), reference.parameters()):
         if not expected.requires_grad:
             assert actual.grad is None

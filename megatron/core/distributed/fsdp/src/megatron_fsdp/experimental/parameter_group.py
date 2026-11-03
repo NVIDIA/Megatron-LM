@@ -635,9 +635,13 @@ class FsdpParameterGroup:
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
+        """Pack on the caller's stream, which must wait for gradient production."""
+        current_stream = torch.cuda.current_stream(partial_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            grad = fsdp_parameter.unsharded.grad
+            # Retain compute-allocated storage until this stream finishes copying it.
+            grad.record_stream(current_stream)
+            partial_grad.get_tensor_view(index).copy_(grad)
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:
