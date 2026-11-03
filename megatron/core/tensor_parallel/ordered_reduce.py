@@ -26,7 +26,8 @@ Paths:
     GEMM output). One kernel stores each peer's rows into that peer's fixed-size symmetric
     staging buffer (chunked, double-buffered, one block-level barrier per chunk) and folds
     the staged partials in rank order. No receive buffer of the input's size, no NCCL.
-    Falls back to all-to-all + fold for uneven splits or without symmetric memory.
+    Falls back to all-to-all + fold for uneven splits, inputs above 64 MiB (where the push
+    is not faster), TP above 8, or without symmetric memory.
   * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
     buffer; one kernel barriers through the signal pad, reads the owned slice from every
     peer with plain loads (not multimem, whose in-switch reduction order is unspecified)
@@ -38,6 +39,8 @@ Only forward reductions use these paths; backward keeps the stock collectives.
 With ``batch_invariant_tp_shards`` (see the last section) the partials are those of fixed
 reduction-dim shards rather than of TP ranks, so the bits do not depend on the TP size either.
 A rank that owns several shards passes one partial per shard to the paths above.
+
+The vocab-parallel cross-entropy denominator uses the same definition (last section).
 
 ``batch_invariant_collective="multimem"`` (the EP combine's exact-sum setting) switches every
 path to an fp64 accumulator with one rounding to fp32 before the final cast. All paths stay
@@ -134,6 +137,8 @@ def _ordered_fold_kernel(
     mask = offs < n
     acc_ty = tl.float64 if ACC_FP64 else tl.float32
     acc = tl.load(src_ptr + offs, mask=mask).to(acc_ty)
+    # int64: r * part_stride passes 2**31 for large messages.
+    part_stride = tl.cast(part_stride, tl.int64)
     for r in tl.static_range(1, TP):
         acc += tl.load(src_ptr + r * part_stride + offs, mask=mask).to(acc_ty)
     if ROUND_FP32:
@@ -180,6 +185,7 @@ def _ordered_pull_kernel(
     sync_threads()
 
     acc_ty = tl.float64 if ACC_FP64 else tl.float32
+    part_stride = tl.cast(part_stride, tl.int64)  # j * part_stride can pass 2**31
     step = tl.num_programs(0).to(tl.int64) * BLOCK
     start = tl.program_id(0).to(tl.int64) * BLOCK
     for block_start in range(start, n, step):
@@ -289,8 +295,9 @@ def _ordered_push_fold_kernel(
 ):
     """Reduce-scatter of a local (non-symmetric) tensor through symmetric staging buffers.
 
-    src holds this rank's partial of all WORLD_SIZE output slices (slice d at d * n). s_r is
-    rank r's staging buffer: [2 slots][num_blocks][WORLD_SIZE][BLOCK]. Block b stores the
+    src holds this rank's C partials of all WORLD_SIZE output slices (partial j of slice d at
+    j * src_part_stride + d * n). s_r is rank r's staging buffer:
+    [2 slots][num_blocks][WORLD_SIZE * C][BLOCK]. Block b stores the
     BLOCK elements of every peer's slice it handles into that peer's staging (NVLink
     stores), barriers with block b of every peer, pushes its next chunk into the other
     slot, then folds the staged partials of the current chunk (its own from src) in rank
@@ -301,6 +308,10 @@ def _ordered_push_fold_kernel(
     """
     pid = tl.program_id(0)
     nb = tl.num_programs(0)
+    # int64: the slice and partial offsets (d * n, j * src_part_stride) pass 2**31 for
+    # large messages.
+    n = tl.cast(n, tl.int64)
+    src_part_stride = tl.cast(src_part_stride, tl.int64)
     acc_ty = tl.float64 if ACC_FP64 else tl.float32
     lane = tl.arange(0, BLOCK)
     my_stage = _peer_ptr(RANK, s0, s1, s2, s3, s4, s5, s6, s7)
@@ -403,9 +414,7 @@ def _ordered_push_fold_kernel(
 def _fold_launch_config(n: int, element_size: int) -> Tuple[int, int]:
     """(BLOCK, num_warps): 16-byte vectors, two per thread, and enough CTAs to fill the GPU."""
     vec = 16 // element_size
-    if "fold" in _TUNE_OVERRIDE:
-        num_warps, per_thread = _TUNE_OVERRIDE["fold"]
-    elif n >= (1 << 20):
+    if n >= (1 << 20):
         num_warps, per_thread = 8, 2
     else:
         num_warps, per_thread = 4, 1
@@ -510,12 +519,8 @@ def _launch_push_fold(
     if n == 0:
         return output
     vec = 16 // input_.element_size()
-    if "push" in _TUNE_OVERRIDE:
-        per_thread = _TUNE_OVERRIDE["push"][1]
-    else:
-        # Small messages: more blocks with less work each; larger: fewer barriers per byte.
-        per_thread = 2 if n * input_.element_size() <= (2 << 20) else _PUSH_MAX_VECS
-    assert per_thread <= _PUSH_MAX_VECS, "the staging is sized for _PUSH_MAX_VECS"
+    # Small messages: more blocks with less work each; larger: fewer barriers per byte.
+    per_thread = 2 if n * input_.element_size() <= (2 << 20) else _PUSH_MAX_VECS
     block = _PUSH_WARPS * 32 * vec * per_thread
     num_blocks = max(1, min(triton.cdiv(n, block), SYMM_MEM_KERNEL_CONFIG.max_num_blocks))
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
@@ -621,6 +626,9 @@ def ordered_all_reduce(input_: torch.Tensor, group, exact: Optional[bool] = None
 # ── Symmetric-memory pull paths (inference) ─────────────────────────────────
 
 _PEER_VIEWS: Dict[Tuple, List[torch.Tensor]] = {}
+# The key holds id(handle): drop every view when the buffers are destroyed, before a new
+# handle can reuse the id.
+SymmetricMemoryManager.register_destroy_callback(_PEER_VIEWS.clear)
 
 
 def _peer_views(symm_mem_hdl, offset_elems: int, numel: int, dtype: torch.dtype):
@@ -647,16 +655,10 @@ def can_use_symm_pull(symm_mem_hdl, tensor: torch.Tensor) -> bool:
     )
 
 
-# Benchmark hook: {"pull": (warps, vecs_per_thread), "fold": (warps, vecs_per_thread)}.
-_TUNE_OVERRIDE: Dict[str, Tuple[int, int]] = {}
-
-
 def _pull_launch_config(n: int, element_size: int) -> Tuple[int, int, int]:
     """(BLOCK, num_warps, num_blocks) for the pull kernel; identical on every rank."""
     vec = 16 // element_size
-    if "pull" in _TUNE_OVERRIDE:
-        num_warps, per_thread = _TUNE_OVERRIDE["pull"]
-    elif n <= SYMM_MEM_KERNEL_CONFIG.max_num_blocks * 512 * vec:
+    if n <= SYMM_MEM_KERNEL_CONFIG.max_num_blocks * 512 * vec:
         # Up to one 16-byte load per thread per peer across the whole grid.
         num_warps, per_thread = 16, 1
     else:
@@ -700,13 +702,9 @@ def _launch_pull(
 
 
 def symm_ordered_reduce_scatter(
-    output: torch.Tensor,
-    input_: torch.Tensor,
-    symm_mem_hdl,
-    byte_offset: int = 0,
-    exact: Optional[bool] = None,
+    output: torch.Tensor, input_: torch.Tensor, symm_mem_hdl, exact: Optional[bool] = None
 ) -> torch.Tensor:
-    """Reduce-scatter dim 0 of ``input_`` (a view of the symmetric buffer at ``byte_offset``).
+    """Reduce-scatter dim 0 of ``input_``, a view of the symmetric buffer at its start.
 
     One kernel: every rank reads its owned rows from all peers over NVLink and folds them
     in rank order into ``output``. Same bits as :func:`ordered_reduce_scatter`.
@@ -715,11 +713,7 @@ def symm_ordered_reduce_scatter(
     n_out = output.numel()
     assert input_.numel() == n_out * ws, "input numel must be world_size * output numel"
     assert input_.dtype == output.dtype and output.is_contiguous()
-    elem = input_.element_size()
-    assert byte_offset % elem == 0
-    views = _peer_views(
-        symm_mem_hdl, byte_offset // elem + symm_mem_hdl.rank * n_out, n_out, input_.dtype
-    )
+    views = _peer_views(symm_mem_hdl, symm_mem_hdl.rank * n_out, n_out, input_.dtype)
     return _launch_pull(views, output, symm_mem_hdl, exact)
 
 
@@ -913,11 +907,11 @@ def tp_shard_row_linear(
 
 
 def symm_ordered_reduce_scatter_shards(
-    output: torch.Tensor, parts: torch.Tensor, symm_mem_hdl, byte_offset: int = 0, exact=None
+    output: torch.Tensor, parts: torch.Tensor, symm_mem_hdl, exact: Optional[bool] = None
 ) -> torch.Tensor:
     """:func:`ordered_reduce_scatter_shards` of ``parts`` [c, M, ...] in the symmetric buffer.
 
-    ``parts`` is a contiguous view of the buffer at ``byte_offset``. One pull kernel reads
+    ``parts`` is a contiguous view of the buffer at its start. One pull kernel reads
     the owned rows of every peer's c partials and folds them in global shard order.
     """
     ws = symm_mem_hdl.world_size
@@ -925,10 +919,52 @@ def symm_ordered_reduce_scatter_shards(
     n_out = output.numel()
     part_numel = parts[0].numel()
     assert part_numel == n_out * ws and parts.is_contiguous() and output.is_contiguous()
-    elem = parts.element_size()
-    assert byte_offset % elem == 0
     span = (c - 1) * part_numel + n_out
-    views = _peer_views(
-        symm_mem_hdl, byte_offset // elem + symm_mem_hdl.rank * n_out, span, parts.dtype
-    )
+    views = _peer_views(symm_mem_hdl, symm_mem_hdl.rank * n_out, span, parts.dtype)
     return _launch_pull(views, output, symm_mem_hdl, exact, num_parts=c, part_stride=part_numel)
+
+
+# ── Vocab-parallel sums (cross entropy) ─────────────────────────────────────
+#
+# The cross-entropy denominator sum_v exp(logit_v - max) is a reduction over the vocab, split
+# across TP ranks like a row-parallel K. Under batch-invariant mode it uses the same
+# definition: the vocab is cut into fixed shards (one per rank, or batch_invariant_tp_shards),
+# each shard is summed in a fixed order that does not depend on the number of rows, and the
+# shard sums are folded in shard order across TP.
+
+_ROW_SUM_BLOCK = 1024  # fixed: the in-shard summation order must not depend on any size
+
+
+@triton.jit
+def _row_shard_sum_kernel(x_ptr, out_ptr, num_rows, row_stride, shard_len, BLOCK: tl.constexpr):
+    """out[s, r] = sum of row r over shard s: BLOCK-strided fp32 lanes, then one tree sum."""
+    row = tl.program_id(0).to(tl.int64)
+    shard = tl.program_id(1).to(tl.int64)
+    base = x_ptr + row * row_stride + shard * shard_len
+    lanes = tl.zeros([BLOCK], dtype=tl.float32)
+    for start in range(0, shard_len, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        lanes += tl.load(base + offs, mask=offs < shard_len, other=0.0).to(tl.float32)
+    tl.store(out_ptr + shard * num_rows + row, tl.sum(lanes, axis=0))
+
+
+def batch_invariant_vocab_sum(x: torch.Tensor, group, num_shards: int = 1) -> torch.Tensor:
+    """fp32 ``x.sum(-1)`` over a vocab split across ``group``, with batch-invariant bits.
+
+    ``x`` [..., V/TP] holds this rank's ``num_shards`` consecutive vocab shards. Each shard is
+    summed per row in a fixed order, and the shard sums of all ranks are folded in global shard
+    order (:func:`ordered_all_reduce_shards`), so the result depends neither on the number of
+    rows nor, for a fixed total shard count, on the TP size.
+    """
+    *lead, vocab = x.shape
+    assert vocab % num_shards == 0, f"local vocab {vocab} must divide into {num_shards} shards"
+    x2 = x.reshape(-1, vocab)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    rows = x2.shape[0]
+    parts = torch.empty((num_shards, rows), dtype=torch.float32, device=x.device)
+    if rows:
+        _row_shard_sum_kernel[(rows, num_shards)](
+            x2, parts, rows, x2.stride(0), vocab // num_shards, BLOCK=_ROW_SUM_BLOCK
+        )
+    return ordered_all_reduce_shards(parts, group).view(lead)

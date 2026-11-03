@@ -545,7 +545,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         One strided batched GEMM for this rank's shards, then the reduce-scatter (or, at
         TP 1, the local fold) of the shard partials in global shard order.
         """
-        assert not use_mxfp8, "batch_invariant_tp_shards with several shards per rank is BF16 only"
+        assert (
+            not use_mxfp8
+        ), "MXFP8 with several batch_invariant_tp_shards per rank is not built yet"
         c = self._bi_tp_local_shards
         if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
             buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)

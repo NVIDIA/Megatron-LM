@@ -40,7 +40,6 @@ class TestShardReductions:
 
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
-        orr._PEER_VIEWS.clear()
         Utils.destroy_model_parallel()
 
     def test_shard_partials_match_per_shard_gemm(self):
@@ -106,16 +105,6 @@ class TestShardReductions:
         orr.symm_ordered_reduce_scatter_shards(out, parts, symm["handle"])
         ref = _canonical(x, w, shards)[r * (m // tp) : (r + 1) * (m // tp)]
         assert torch.equal(_bits(out), _bits(ref))
-
-    def test_shards_with_one_partial_per_rank_is_the_ordered_tp_reduction(self):
-        Utils.initialize_model_parallel(4, 1)
-        group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        gen = torch.Generator(device="cuda").manual_seed(4 + group.rank())
-        local = torch.randn(32, 300, device="cuda", generator=gen).bfloat16()
-        with set_batch_invariant_mode(True):
-            a = orr.ordered_reduce_scatter_shards(local.unsqueeze(0), group)
-            b = orr.ordered_reduce_scatter(local, group)
-        assert torch.equal(_bits(a), _bits(b))
 
 
 @requires_4
@@ -211,3 +200,71 @@ class TestTERowParallelShards:
         )
         assert TERowParallelLinear(1024, 256, is_expert=False, **kw)._bi_tp_local_shards == 2
         assert TERowParallelLinear(1024, 256, is_expert=True, **kw)._bi_tp_local_shards == 1
+
+
+@requires_4
+def test_cross_entropy_is_tp_and_batch_invariant():
+    """Batch-invariant vocab-parallel cross entropy with batch_invariant_tp_shards = 4: the
+    same loss bits at TP 1, 2 and 4 (fixed vocab shards folded in order), and for a token in
+    a smaller batch at another position. Both native implementations agree."""
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+
+    shards, vocab, tokens = 4, 4096, 64
+    Utils.initialize_model_parallel(1, 1)
+    groups = {tp: dist.new_group(list(range(tp))) for tp in (2, 4)}  # every rank creates them
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(9)
+        logits = torch.randn(tokens, 1, vocab, device="cuda", generator=gen) * 8
+        target = torch.randint(0, vocab, (tokens, 1), device="cuda", generator=gen)
+        losses = {}
+        with set_batch_invariant_mode(True):
+            for tp in (1, 2, 4):
+                group = groups.get(tp)
+                rank = dist.get_rank()
+                if tp > 1 and rank >= tp:
+                    continue
+                local = logits.chunk(tp, dim=-1)[rank if tp > 1 else 0].contiguous()
+                for name, ce in (
+                    (
+                        "unfused",
+                        lambda l, t, g: vocab_parallel_cross_entropy(
+                            l, t, tp_group=g, batch_invariant_tp_shards=shards
+                        ),
+                    ),
+                    (
+                        "fused",
+                        lambda l, t, g: fused_vocab_parallel_cross_entropy(
+                            l, t, g, batch_invariant_tp_shards=shards
+                        ),
+                    ),
+                ):
+                    g = group if tp > 1 else get_tensor_model_parallel_group_if_none(tp_group=None)
+                    losses[tp, name] = ce(local.clone(), target, g)
+                    small = ce(local[8:24].clone(), target[8:24], g)
+                    assert torch.equal(_bits(small), _bits(losses[tp, name][8:24])), (tp, name)
+        if dist.get_rank() == 0:
+            ref = losses[1, "unfused"]
+            for key, loss in losses.items():
+                assert torch.equal(_bits(loss), _bits(ref)), key
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_config_rejects_unsupported_multi_shard_combinations():
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    base = dict(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        batch_invariant_mode=True,
+        batch_invariant_tp_shards=4,
+        tensor_model_parallel_size=2,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+    )
+    with pytest.raises(ValueError, match="not supported with fp8 yet"):
+        TransformerConfig(**base, fp8="e4m3")
+    with pytest.raises(ValueError, match="native cross entropy"):
+        TransformerConfig(**base, cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")

@@ -166,6 +166,15 @@ class SymmetricMemoryManager:
 
     _buffers: dict[str, SymmetricMemoryBuffer] = {}
     _default_size_mb: int = 512
+    # Called on destroy(), so caches derived from the buffers (e.g. peer views keyed by
+    # handle) never outlive them.
+    _destroy_callbacks: list = []
+
+    @classmethod
+    def register_destroy_callback(cls, callback) -> None:
+        """Call ``callback()`` whenever buffers are destroyed."""
+        if callback not in cls._destroy_callbacks:
+            cls._destroy_callbacks.append(callback)
 
     @classmethod
     def get_buffer(
@@ -202,6 +211,8 @@ class SymmetricMemoryManager:
             cls._buffers.pop(key, None)
         else:
             cls._buffers.clear()
+        for callback in cls._destroy_callbacks:
+            callback()
 
     @classmethod
     def is_initialized(cls, key: str) -> bool:

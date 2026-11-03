@@ -136,17 +136,24 @@ class TestTensorParallelLayers:
         )
 
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
-    def test_vocab_parallel_cross_entropy_replays(self, label_smoothing):
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "bi"])
+    def test_vocab_parallel_cross_entropy_replays(self, label_smoothing, batch_invariant):
+        """batch_invariant: the fixed-order vocab-shard sum and the ordered TP fold."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         logits = torch.randn(4096, 32768, device="cuda", dtype=torch.float32, requires_grad=True)
         target = torch.randint(0, 32768 * tp_group.size(), (4096,), device="cuda")
-        assert_replays_bit_exact(
-            lambda l, t: vocab_parallel_cross_entropy(l, t, label_smoothing, tp_group),
-            (logits, target),
-            replays=3,
-            what="vocab_parallel_cross_entropy",
-        )
+        with set_batch_invariant_mode(batch_invariant):
+            assert_replays_bit_exact(
+                lambda l, t: vocab_parallel_cross_entropy(l, t, label_smoothing, tp_group),
+                (logits, target),
+                replays=3,
+                what="vocab_parallel_cross_entropy",
+            )
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
     def test_vocab_parallel_cross_entropy_staged_helpers_match_composite(self, dtype):

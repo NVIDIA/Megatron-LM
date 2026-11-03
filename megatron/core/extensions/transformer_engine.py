@@ -1456,6 +1456,9 @@ class TELinear(te.pytorch.Linear):
             and self.config.batch_invariant_mode
             and tp_size >= 3
         )
+        # Set by a caller that runs the TP communication itself (shared-expert overlap): the
+        # forward then returns this rank's partial and the caller reduces it.
+        self.bi_tp_reduce_by_caller = False
         if self._explicit_bi_tp_reduce:
             input_size = divide(input_size, tp_size)
             te_parallel_mode = None
@@ -1555,9 +1558,6 @@ class TELinear(te.pytorch.Linear):
 
     def _bi_tp_shards_forward(self, x):
         """Row-parallel forward with several batch_invariant_tp_shards per rank (see __init__)."""
-        assert (
-            self.config.fp8 is None and self.config.fp4 is None
-        ), "batch_invariant_tp_shards with more shards than TP ranks supports BF16 only"
         out = tp_shard_row_linear(
             x,
             self.weight,
@@ -1600,6 +1600,9 @@ class TELinear(te.pytorch.Linear):
         self.is_first_microbatch = False
 
         if self._explicit_bi_tp_reduce:
+            if self.bi_tp_reduce_by_caller:
+                assert not self.use_bias, "the caller-side TP reduction does not add the bias"
+                return out, None
             return self._bi_tp_reduce(out)
 
         # TE only returns a tuple when return_bias is True, otherwise

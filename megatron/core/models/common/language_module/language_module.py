@@ -132,14 +132,17 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         argmax = None
-        if return_argmax and (
-            "return_argmax" in inspect.signature(self.vocab_parallel_cross_entropy).parameters
-        ):
+        parameters = inspect.signature(self.vocab_parallel_cross_entropy).parameters
+        kwargs = {}
+        if "batch_invariant_tp_shards" in parameters:
+            # The batch-invariant softmax denominator uses the row-parallel shard definition.
+            kwargs["batch_invariant_tp_shards"] = self.config.batch_invariant_tp_shards
+        if return_argmax and "return_argmax" in parameters:
             loss, argmax = self.vocab_parallel_cross_entropy(
-                logits, labels, self.tp_group, return_argmax=True
+                logits, labels, self.tp_group, return_argmax=True, **kwargs
             )
         else:
-            loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
+            loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group, **kwargs)
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
         if return_argmax:

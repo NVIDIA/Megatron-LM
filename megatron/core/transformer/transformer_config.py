@@ -1480,8 +1480,10 @@ class TransformerConfig(ModelParallelConfig):
     same bits, so training and inference can use different TP sizes. At TP equal to this
     value each rank owns one shard and the reduction is the ordered TP reduction; at a
     smaller TP each rank computes its shards in one batched GEMM and sends one partial per
-    shard (BF16 only); the backward is the stock row-parallel one. None (default) keeps the
-    reduction tied to the TP size."""
+    shard (BF16; see __post_init__ for the options not supported there yet); the backward is
+    the stock row-parallel one. The native vocab-parallel cross entropy sums its softmax
+    denominator over the same number of fixed vocab shards. None (default) keeps the
+    reductions tied to the TP size."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4460,6 +4462,33 @@ class TransformerConfig(ModelParallelConfig):
                 f"batch_invariant_tp_shards ({self.batch_invariant_tp_shards}) must be a multiple "
                 f"of tensor_model_parallel_size ({self.tensor_model_parallel_size})"
             )
+            if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "te":
+                raise ValueError(
+                    "batch_invariant_tp_shards needs the native cross entropy: TE's fused "
+                    "cross entropy sums each rank's vocab slice, which depends on the TP size."
+                )
+            if self.batch_invariant_tp_shards > self.tensor_model_parallel_size:
+                # Several shards per rank: the row-parallel forward is one batched cuBLAS GEMM
+                # over the rank's shards plus the ordered reduction, outside TE's linear.
+                unsupported = {
+                    # An MXFP8 GEMM per K-shard is not built yet; per-tensor-scaled FP8/FP4
+                    # would also need one scale per shard to match a rank holding one shard.
+                    "fp8": self.fp8 is not None,
+                    "fp4": self.fp4 is not None,
+                    "quant_recipe": self.quant_recipe is not None,
+                    # The weight gradient is computed in the backward, not deferred to TE.
+                    "delay_wgrad_compute": self.delay_wgrad_compute,
+                    "tp_comm_overlap": self.tp_comm_overlap,
+                    # The caller would reduce one partial per rank, not one per shard.
+                    "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
+                }
+                names = sorted(name for name, enabled in unsupported.items() if enabled)
+                if names:
+                    raise ValueError(
+                        f"batch_invariant_tp_shards ({self.batch_invariant_tp_shards}) above "
+                        f"tensor_model_parallel_size ({self.tensor_model_parallel_size}) is not "
+                        f"supported with {', '.join(names)} yet."
+                    )
 
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (

@@ -44,7 +44,6 @@ class TestOrderedReduceKernels:
     def teardown_method(self, method):
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
-        orr._PEER_VIEWS.clear()
         if self._tp is not None:
             Utils.destroy_model_parallel()
 

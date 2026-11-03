@@ -7,6 +7,9 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
 from megatron.core.tensor_parallel.utils import VocabUtility
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 
 
 @jit_fuser
@@ -109,7 +112,7 @@ def calculate_gradients(
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group):
+    def forward(ctx, vocab_parallel_logits, target, tp_group, batch_invariant_tp_shards=None):
         """
         Forward implementation for the cross entropy loss.
         """
@@ -126,18 +129,32 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             partition_vocab_size, tp_group.rank(), tp_group.size()
         )
 
-        target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (
-            calculate_predicted_logits(
-                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+        if is_batch_invariant_mode_enabled():
+            target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
+                VocabParallelCrossEntropy.reduced_predicted_logits_batch_invariant(
+                    vocab_parallel_logits,
+                    target,
+                    logits_max,
+                    vocab_start_index,
+                    vocab_end_index,
+                    tp_group,
+                    batch_invariant_tp_shards,
+                )
             )
-        )
+            predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
+        else:
+            target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (
+                calculate_predicted_logits(
+                    vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+                )
+            )
 
-        # All reduce is needed to get the chunks from other GPUs.
-        # In the fused case, tensors are batches to invoke a single
-        # AllReduce call
-        torch.distributed.all_reduce(
-            predicted_logits_sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+            # All reduce is needed to get the chunks from other GPUs.
+            # In the fused case, tensors are batches to invoke a single
+            # AllReduce call
+            torch.distributed.all_reduce(
+                predicted_logits_sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
 
         exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
 
@@ -158,10 +175,12 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             softmax, grad_output, target_mask, masked_target_1d, ctx.logits_dtype
         )
 
-        return grad_input, None, None
+        return grad_input, None, None, None
 
 
-def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
+def fused_vocab_parallel_cross_entropy(
+    vocab_parallel_logits, target, tp_group, batch_invariant_tp_shards=None
+):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
@@ -172,5 +191,11 @@ def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
         target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
         tp_group: the tensor parallel group over which to all reduce
 
+        batch_invariant_tp_shards: under batch-invariant mode, the fixed vocab shard count
+            of the softmax denominator (TransformerConfig.batch_invariant_tp_shards), else one
+            shard per rank
+
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)
+    return _VocabParallelCrossEntropy.apply(
+        vocab_parallel_logits, target, tp_group, batch_invariant_tp_shards
+    )

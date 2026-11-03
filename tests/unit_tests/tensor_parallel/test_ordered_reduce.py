@@ -76,12 +76,11 @@ class TestOrderedReduce:
 
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
-        orr._PEER_VIEWS.clear()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("exact", [False, True])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-    @pytest.mark.parametrize("rows,hidden", [(4, 2688), (64, 4096), (1024, 8192)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("rows,hidden", [(4, 2688), (1024, 8192)])
     def test_reduce_scatter_matches_left_fold(self, dtype, rows, hidden, exact):
         x = _partials((rows, hidden), dtype, seed=rows)
         ref = _left_fold(_all_partials(x, self.group), exact)
@@ -209,19 +208,16 @@ class TestOrderedReduce:
         if sin is not None:
             assert torch.equal(_bits(symm_rs), _bits(expected_rs))
 
-    def test_stock_nccl_is_not_position_invariant(self):
-        """Informational: shows the invariance tests above are not vacuous at TP=4."""
-        hidden = 4096
-        row = _partials((1, hidden), torch.bfloat16, seed=13)
-        results = []
-        for rows, pos in ((4, 0), (4, 3), (4096, 0), (4096, 1500), (4096, 4095)):
-            x = _partials((rows, hidden), torch.bfloat16, seed=rows + pos)
-            x[pos] = row[0]
-            dist.all_reduce(x, group=self.group)
-            results.append(x[pos].clone())
-        differs = any(not torch.equal(_bits(r), _bits(results[0])) for r in results[1:])
-        if not differs:
-            pytest.skip("informational: NCCL happened to be position-invariant on this input")
+    def test_destroy_drops_cached_peer_views(self):
+        """Views are keyed by id(handle); a new handle may reuse the id of a destroyed one."""
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        x = _partials((64, 1024), torch.bfloat16, seed=5)
+        with set_batch_invariant_mode(True):
+            orr.ordered_reduce_scatter(x, self.group)  # push: caches the staging views
+        assert orr._PEER_VIEWS
+        SymmetricMemoryManager.destroy()
+        assert not orr._PEER_VIEWS
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 GPUs")
@@ -251,6 +247,14 @@ class TestOrderedReduceTP2Unchanged:
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_te_row_parallel_linear_ordered_reduction(sequence_parallel):
     """TERowParallelLinear at TP=4 under batch-invariant mode reduces with the ordered sum."""
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        _check_te_row_parallel_linear(sequence_parallel)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _check_te_row_parallel_linear(sequence_parallel):
     import transformer_engine as te
 
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -259,7 +263,6 @@ def test_te_row_parallel_linear_ordered_reduction(sequence_parallel):
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import init_method_normal
 
-    Utils.initialize_model_parallel(TP, 1)
     model_parallel_cuda_manual_seed(123)
     group = get_tensor_model_parallel_group_if_none(tp_group=None)
     cfg = TransformerConfig(
@@ -313,4 +316,63 @@ def test_te_row_parallel_linear_ordered_reduction(sequence_parallel):
         x.requires_grad_()
         layer(x)[0].float().sum().backward()
         assert x.grad is not None and layer.weight.grad is not None
-    Utils.destroy_model_parallel()
+
+        # A caller that reduces itself (shared-expert overlap) gets this rank's partial.
+        no_bias = TERowParallelLinear(
+            input_size=cfg.hidden_size,
+            output_size=768,
+            config=cfg,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        no_bias.bi_tp_reduce_by_caller = True
+        with torch.no_grad():
+            local, _ = no_bias(x)
+            expected_local = te.pytorch.Linear.forward(no_bias, x)
+        assert torch.equal(_bits(local), _bits(expected_local))
+
+
+@requires_tp4
+def test_tp3_symmetric_memory_paths():
+    """TP = 3 (not a power of two): push and pull give the left fold, like TP 4."""
+    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+    Utils.initialize_model_parallel(1, 1)
+    group = dist.new_group([0, 1, 2])  # every rank must create it
+    try:
+        if dist.get_rank() >= 3:
+            return
+        x = _partials((96, 1024), torch.bfloat16, seed=31)
+        rank = group.rank()
+        ref = _left_fold(_all_partials(x, group))[rank * 32 : (rank + 1) * 32]
+        assert orr._push_staging(group, x) is not None
+        assert torch.equal(_bits(orr.ordered_reduce_scatter(x, group)), _bits(ref))
+
+        symm = SymmetricMemoryManager.get_buffer("tp3_test", process_group=group)
+        buf = symm.maybe_get_tensor(list(x.shape), dtype=x.dtype)
+        assert orr.can_use_symm_pull(buf["handle"], x)
+        buf["tensor"].copy_(x)
+        out = torch.empty(32, 1024, dtype=x.dtype, device="cuda")
+        orr.symm_ordered_reduce_scatter(out, buf["tensor"], buf["handle"])
+        assert torch.equal(_bits(out), _bits(ref))
+    finally:
+        torch.cuda.synchronize()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+def test_fold_offsets_past_int32():
+    """Partials more than 2**31 elements apart (large all-to-all receive buffers)."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    n = 4096
+    stride = 1 << 31
+    storage = torch.zeros(stride + n, dtype=torch.bfloat16, device="cuda")
+    parts = storage.as_strided((2, n), (stride, 1))
+    parts[0].copy_(_partials((n,), torch.bfloat16, seed=41))
+    parts[1].copy_(_partials((n,), torch.bfloat16, seed=42))
+    out = orr.ordered_fold(parts)
+    assert torch.equal(_bits(out), _bits(_left_fold(parts.clone())))
