@@ -27,6 +27,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 if HAVE_TE:
     import transformer_engine as te  # type: ignore[import-untyped]
+else:
+    te = None  # type: ignore[assignment]
 
 
 def get_dsv4_o_group_proj_spec() -> type | None:
