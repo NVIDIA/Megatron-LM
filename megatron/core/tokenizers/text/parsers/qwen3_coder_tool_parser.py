@@ -276,7 +276,9 @@ class _Qwen3CoderToolParser:
                 id=self._generate_tool_call_id(),
                 function=FunctionCall(name=function_name, arguments="{}"),
             )
-        function_name = function_call_str[:end_index]
+        function_name = function_call_str[:end_index].strip()
+        if not function_name:
+            return None
         param_config = self._get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}

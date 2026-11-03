@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -85,6 +88,29 @@ def test_double_fork_cuda_rng_states_tracker(use_cudagraphable_rng):
     assert torch.equal(randn_double_fork_2[1], randn_single_fork_2[1])
     assert torch.equal(double_fork_state1, single_fork_state1)
     assert torch.equal(double_fork_state2, single_fork_state2)
+
+
+def test_cudagraph_generator_registration_matches_capture_behavior():
+    """Capturing a tracker fork must work when registration follows the detected requirement.
+
+    Regression test for PyTorch 2.14.0a0 builds without lazy generator registration, which
+    the version check alone treated as not needing registration.
+    """
+    rng_tracker = CudaRNGStatesTracker(use_cudagraphable_rng=True)
+    rng_tracker.add("state1", 1234)
+    needs_registration = cudagraph_needs_generator_registration()
+    assert cudagraph_needs_generator_registration() is needs_registration
+
+    graph = torch.cuda.CUDAGraph()
+    if needs_registration:
+        for state in rng_tracker.get_states().values():
+            graph.register_generator_state(state)
+    with torch.cuda.graph(graph):
+        with rng_tracker.fork("state1"):
+            out = torch.rand(16, device="cuda")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all((out >= 0) & (out < 1))
 
 
 def test_convert_cuda_rng_state():
@@ -374,5 +400,82 @@ def test_checkpoint_without_output_retain_input_tensors(use_manager):
         weight.grad = None
         output2.backward(grad)
         assert torch.allclose(ref_input_grad, input2.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _te_recompute_queue():
+    """Transformer Engine's queue of first-pass recompute state, or None if unavailable."""
+    try:
+        from transformer_engine.pytorch.distributed import activation_recompute_forward
+    except ImportError:
+        return None
+    return getattr(activation_recompute_forward, "_is_first_fp8_module", None)
+
+
+@pytest.mark.parametrize("mode", ["no_grad", "input_without_grad"])
+def test_checkpoint_without_output_plain_call_without_backward(mode):
+    """With grad disabled, or no input that requires grad, checkpoint() is a plain call.
+
+    Nothing is discarded, no Transformer Engine recompute state is left behind, and parameters
+    used inside the function still receive gradients.
+    """
+    Utils.initialize_model_parallel()
+    try:
+        linear = torch.nn.Linear(8, 8)
+        reference = torch.nn.Linear(8, 8)
+        reference.load_state_dict(linear.state_dict())
+        x = torch.randn(4, 8)
+        queue = _te_recompute_queue()
+        queue_len = None if queue is None else len(queue)
+
+        checkpoint = CheckpointWithoutOutput()
+        with torch.no_grad() if mode == "no_grad" else contextlib.nullcontext():
+            hidden = checkpoint.checkpoint(linear, x)
+            output = hidden * 2
+            checkpoint.discard_output_and_register_recompute(output)
+
+        assert hidden.untyped_storage().size() > 0
+        if queue is not None:
+            assert len(queue) == queue_len
+        if mode == "input_without_grad":
+            output.sum().backward()
+            (reference(x) * 2).sum().backward()
+            assert torch.equal(linear.weight.grad, reference.weight.grad)
+            assert torch.equal(linear.bias.grad, reference.bias.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output_multiple_hook_tensors():
+    """Discarding with several hook tensors on parallel consumers recomputes only once."""
+    grad_enabled_per_call = []
+
+    def gelu(x):
+        grad_enabled_per_call.append(torch.is_grad_enabled())
+        return torch.nn.functional.gelu(x)
+
+    Utils.initialize_model_parallel()
+    try:
+        input1 = torch.randn(6, 8, requires_grad=True)
+        weight_a1 = torch.randn(8, 8, requires_grad=True)
+        weight_b1 = torch.randn(8, 8, requires_grad=True)
+        input2, weight_a2, weight_b2 = (
+            t.detach().clone().requires_grad_(True) for t in (input1, weight_a1, weight_b1)
+        )
+
+        checkpoint = CheckpointWithoutOutput()
+        hidden = checkpoint.checkpoint(gelu, input1)
+        out_a, out_b = hidden @ weight_a1, hidden @ weight_b1
+        checkpoint.discard_output_and_register_recompute(out_a)
+        checkpoint.discard_output_and_register_recompute(out_b)
+        (out_a.sum() + 2 * out_b.sum()).backward()
+        assert grad_enabled_per_call == [False, True]
+
+        hidden_ref = torch.nn.functional.gelu(input2)
+        ((hidden_ref @ weight_a2).sum() + 2 * (hidden_ref @ weight_b2).sum()).backward()
+        assert torch.allclose(input1.grad, input2.grad)
+        assert torch.allclose(weight_a1.grad, weight_a2.grad)
+        assert torch.allclose(weight_b1.grad, weight_b2.grad)
     finally:
         Utils.destroy_model_parallel()

@@ -9,12 +9,18 @@ import pytest
 import torch
 
 from megatron.training import training as training_mod
+from megatron.training.state import TrainState
 
 
 @pytest.mark.parametrize("sft", [False, True])
 @pytest.mark.parametrize("scheduled", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
-def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(sft, scheduled, empty):
+def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
+    sft, scheduled, empty, run_config
+):
+    run_config.validation.eval_global_batch_size = 4
+    run_config.validation.eval_micro_batch_size = 1
+    run_config.validation.eval_iters = 2
     args = SimpleNamespace(
         eval_global_batch_size=4,
         eval_micro_batch_size=1,
@@ -32,6 +38,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(sft, 
     )
     config = SimpleNamespace(sequence_packing_scheduler="default_dynamic_cp" if scheduled else None)
     groups = SimpleNamespace(pp=object(), dp_cp=object(), dp_cp_gtp_remat=object())
+    train_state = TrainState()
     # Local token counts differ between microbatches and evaluation iterations.
     local = [[(2, 1), (36, 9)], [(8, 2), (0, 0)]]
     if scheduled:
@@ -59,6 +66,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(sft, 
     model = mock.Mock()
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_train_state", return_value=train_state),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=mock.Mock()),
         mock.patch.object(training_mod, "get_forward_backward_func", return_value=forward_backward),
@@ -83,7 +91,7 @@ def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(sft, 
     torch.testing.assert_close(result["lm loss"], tensor(0.0 if empty else 5.0))
     assert all_reduce.call_count == 2
     assert [call.kwargs["num_microbatches"] for call in forward_backward.call_args_list] == counts
-    assert args.consumed_valid_samples == 8
+    assert train_state.consumed_valid_samples == 8
     assert not exited
     model.eval.assert_called_once()
     model.train.assert_called_once()

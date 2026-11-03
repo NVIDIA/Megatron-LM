@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
@@ -8,6 +9,8 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 
 from ..utils import is_te_min_version
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,15 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    rmsnorm_weight_decay_mult: Optional[float] = None
+    """Multiplier on scheduled global weight decay for RMSNorm gamma parameters.
+
+    ``None`` preserves the default weight-decay policy. Set to 1.0 for full decay,
+    0.5 for half decay, or 0.0 to disable decay on RMSNorm gamma. Must be finite and
+    nonnegative. When set, takes precedence over ``apply_wd_to_qk_layernorm`` for
+    RMSNorm gamma only; other parameters retain their existing policy.
+    """
+
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
@@ -292,7 +304,7 @@ class OptimizerConfig:
     mode runs there with zero communication and zero redundancy, and reverse all_to_all
     stages scatter the result back to the original shards. layer_sharded requires
     optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
-    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); __post_init__
+    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); validate_run
     checks all three. Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
@@ -303,13 +315,15 @@ class OptimizerConfig:
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded'. MoE assigns hundreds of identically shaped expert weights
-    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
-    transient stack of this many matrices for far fewer launches. The value is an upper
-    bound per same-shape bucket, so oversizing it is harmless. Batches of more than one use
-    baddbmm instead of addmm and differ from the per-matrix path by kernel-level rounding,
-    so bitwise parity with duplicated mode is lost; the default of 1 keeps the bit-exact
-    path. Values > 1 require emerging-optimizers >= 0.3.0."""
+    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
+    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
+    the per-matrix loop is kernel-launch bound; batching trades transient memory for
+    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
+    value is an upper bound per same-shape bucket, so a value above the matrix count
+    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
+    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
+    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
+    emerging-optimizers >= 0.3.0."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -406,6 +420,10 @@ class OptimizerConfig:
 
     Disabled by default. Set a finite value to enable skip-on-large-grad behavior.
     """
+    dsa_indexer_clip_grad: Optional[float] = None
+    """Threshold for clipping DSA indexer gradients with an L2 norm taken separately from the
+    non-indexer gradients, which keep the ``clip_grad`` threshold. ``None`` clips every
+    parameter together under ``clip_grad``."""
 
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
@@ -422,23 +440,23 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    def __post_init__(self):
-        """Check the validity of the config."""
+    def validate(self) -> None:
+        """Check optimizer-local settings without modifying the config."""
 
-        # The following condition is used to avoid repetition in distrib_optimizer.py.
-        # This is because in distrib_optimizer.py, the process to handle parameters are
-        # different for different training precision settings. FP8 cases require different
-        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
-        # TransformerEngine supports it in the kernel computation.
-        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
-        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
-            self.use_precision_aware_optimizer
-            and (
-                self.main_params_dtype != torch.float32
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
+        if self.rmsnorm_weight_decay_mult is not None and (
+            not math.isfinite(self.rmsnorm_weight_decay_mult)
+            or self.rmsnorm_weight_decay_mult < 0.0
+        ):
+            raise ValueError("rmsnorm_weight_decay_mult must be a finite nonnegative value")
+
+        if self.optimizer == 'dist_muon':
+            logger.warning(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
             )
-        )
+
+        if self.lr is not None and self.min_lr is not None:
+            assert self.min_lr <= self.lr
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
@@ -462,6 +480,14 @@ class OptimizerConfig:
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
 
+        # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
+        # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
+        # value it will produce, not only the pre-finalize flag.
+        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+            self.optimizer not in ('sgd', 'adam')
+            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+        )
+
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
             if self.optimizer not in ('muon', 'dist_muon'):
@@ -470,7 +496,7 @@ class OptimizerConfig:
                     f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
                     "implement layer sharding."
                 )
-            if self.optimizer == 'muon' and not self.use_layer_wise_distributed_optimizer:
+            if not will_be_layer_wise:
                 raise ValueError(
                     "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
                     "optimizer path (use_layer_wise_distributed_optimizer=True)."
@@ -481,54 +507,184 @@ class OptimizerConfig:
                     "set muon_split_qkv=False."
                 )
 
+        # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
+        fp32 = (torch.float32, 'fp32')
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            if not is_te_min_version("2.1.0"):
-                self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
-            if self.optimizer_cpu_offload:
-                return
-            try:
-                import inspect
+            if not self.optimizer_cpu_offload:
+                try:
+                    import inspect
 
-                # TODO: Move this below?
-                from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+                    # TODO: Move this below?
+                    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 
-                adam_args = inspect.signature(Adam).parameters
-                arg_names = [
-                    'master_weight_dtype',
-                    'exp_avg_dtype',
-                    'exp_avg_sq_dtype',
-                    'use_decoupled_grad',
-                ]
-                for name in arg_names:
-                    assert name in adam_args, (
-                        "Current FusedAdam of TE doesn't support --use-precision-aware-optimizer, "
-                        "please update TE version."
+                    adam_args = inspect.signature(Adam).parameters
+                    arg_names = [
+                        'master_weight_dtype',
+                        'exp_avg_dtype',
+                        'exp_avg_sq_dtype',
+                        'use_decoupled_grad',
+                    ]
+                    for name in arg_names:
+                        assert name in adam_args, (
+                            "Current FusedAdam of TE doesn't support "
+                            "--use-precision-aware-optimizer, please update TE version."
+                        )
+                except ImportError:
+                    raise RuntimeError(
+                        '--use-precision-aware-optimizer requires FusedAdam from '
+                        'TransformerEngine, but not found.'
                     )
-            except ImportError:
-                raise RuntimeError(
-                    '--use-precision-aware-optimizer requires FusedAdam from TransformerEngine, '
-                    'but not found.'
-                )
         else:
             assert (
-                self.main_grads_dtype == torch.float32
+                self.main_grads_dtype in fp32
             ), "main_grads_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.main_params_dtype == torch.float32
+                self.main_params_dtype in fp32
             ), "main_params_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.exp_avg_dtype == torch.float32
+                self.exp_avg_dtype in fp32
             ), "exp_avg_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.exp_avg_sq_dtype == torch.float32
+                self.exp_avg_sq_dtype in fp32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+        # Optimizer CPU offload check
+        if self.optimizer_cpu_offload:
+            assert self.use_precision_aware_optimizer, (
+                "The optimizer cpu offload must be used in conjunction with "
+                "`--use-precision-aware-optimizer`, as the hybrid device optimizer reuses the "
+                "code path of this flag."
+            )
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert self.use_distributed_optimizer, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'distributed optimizer'
+            )
+            assert (
+                self.overlap_param_gather
+            ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+
+    def validate_run(
+        self,
+        *,
+        ddp_config: "DistributedDataParallelConfig",
+        use_torch_fsdp2: bool,
+        ckpt_format: str | None,
+    ) -> None:
+        """Check settings shared with DDP and checkpointing without modifying them."""
+        if self.optimizer_cpu_offload:
+            assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
+                "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+                "must be used in conjunction with `--fp8-recipe delayed`."
+            )
+
+        if self.overlap_param_gather:
+            # finalize_optimizer_config() may already have turned use_distributed_optimizer into
+            # use_layer_wise_distributed_optimizer (muon / dist_muon), which shares the same
+            # param-gather overlap, so accept either form.
+            assert (
+                self.use_distributed_optimizer
+                or self.use_layer_wise_distributed_optimizer
+                or ddp_config.use_megatron_fsdp
+                or self.optimizer == 'dist_muon'
+            ), (
+                '--overlap-param-gather only supported with distributed optimizer, '
+                'megatron fsdp, or dist_muon'
+            )
+            assert (
+                ddp_config.overlap_grad_reduce
+            ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
+
+        if self.use_distributed_optimizer:
+            assert (
+                not use_torch_fsdp2
+            ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert ckpt_format == "torch", (
+                '--overlap-param-gather-with-optimizer-step not supported with '
+                'distributed checkpointing yet'
+            )
+
+    def validate_model(
+        self, *, moe_single_grouped_weight: bool, virtual_pipeline_model_parallel_size: int | None
+    ) -> None:
+        """Check model-dependent constraints at the native or legacy model boundary."""
+        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+            self.optimizer not in ('sgd', 'adam')
+            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+        )
+        assert not (will_be_layer_wise and moe_single_grouped_weight), (
+            "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+            "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+            "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+        )
+
+        if self.overlap_param_gather_with_optimizer_step:
+            assert virtual_pipeline_model_parallel_size is not None, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'interleaved pipeline parallelism'
+            )
+
+    @property
+    def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
+        """Whether decoupled grads / precision-aware handling applies outside FP8 (except delayed).
+
+        The following condition is used to avoid repetition in distrib_optimizer.py.
+        This is because in distrib_optimizer.py, the process to handle parameters are
+        different for different training precision settings. FP8 cases require different
+        handling while FP8 delayed scaling is an exception because the Adam optimizer in
+        TransformerEngine supports it in the kernel computation.
+        This is also the flag to determine the usage of param.grad or param.decoupled_grad
+        Derived on access so configs built directly (without finalize_optimizer_config) work.
+        """
+        return bool(
+            self.use_precision_aware_optimizer
+            and (
+                self.main_params_dtype not in (torch.float32, 'fp32')
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
+            )
+        )
+
+    def finalize_optimizer_config(self) -> None:
+        """Resolve dtypes, derived flags and optimizer aliases once the config is validated."""
+        # Map string data-type to torch.dtype.
+        dtype_map = {
+            'fp32': torch.float32,
+            'bf16': torch.bfloat16,
+            'fp16': torch.float16,
+            'fp8': torch.uint8,
+            'auto': None,
+            None: None,
+        }
+        map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
+
+        self.main_grads_dtype = map_dtype(self.main_grads_dtype)
+        self.main_params_dtype = map_dtype(self.main_params_dtype)
+        self.exp_avg_dtype = map_dtype(self.exp_avg_dtype)
+        self.exp_avg_sq_dtype = map_dtype(self.exp_avg_sq_dtype)
+
+        if self.use_precision_aware_optimizer and not is_te_min_version("2.1.0"):
+            self.store_param_remainders = False
+
+        # emerging optimizer check
+        if self.optimizer not in ('sgd', 'adam'):
+            if self.optimizer == 'dist_muon':
+                self.optimizer = 'muon'
+                self.use_layer_wise_distributed_optimizer = True
+
+            if self.use_distributed_optimizer:
+                self.use_layer_wise_distributed_optimizer = True
+                self.use_distributed_optimizer = False
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

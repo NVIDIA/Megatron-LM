@@ -5,6 +5,12 @@ import pytest
 import megatron.core.num_microbatches_calculator as mb_calculator
 
 
+@pytest.fixture(autouse=True)
+def unset_calculator():
+    yield
+    mb_calculator.unset_num_microbatches_calculator()
+
+
 def test_init_num_microbatches_calculator():
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     mb_calculator.init_num_microbatches_calculator(

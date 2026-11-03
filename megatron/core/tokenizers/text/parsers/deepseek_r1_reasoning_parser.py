@@ -42,5 +42,6 @@ class DeepSeekR1ReasoningParser(BaseParser):
             reasoning_content = remaining[:reasoning_end]
             content = remaining[content_start:]
 
-        info = {"reasoning": reasoning_content} if reasoning_content else {}
+        # Preserve parser provenance even when reasoning is empty (e.g. immediate EOS).
+        info = {"reasoning": reasoning_content}
         return content, info

@@ -31,31 +31,73 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
     ResidualConnectionState,
-    ResidualConnectionWriteState,
 )
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
     checkpoint_residual_read,
     checkpoint_residual_write,
-    residual_stream_recompute_enabled,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.wide_residual import wide_residual_recompute_enabled
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
 
 
 class _StaticTestConnection(ResidualConnection):
-    def __init__(self, stream_width: int, branch_width: int):
-        super().__init__(stream_width, branch_width)
-        self.read_map = nn.Parameter(torch.randn(stream_width, branch_width) / stream_width**0.5)
-        self.write_map = nn.Parameter(torch.randn(branch_width, stream_width) / branch_width**0.5)
+    def __init__(self, stream_width: int, branch_width: int, *, operation):
+        super().__init__(stream_width, branch_width, operation=operation)
+        if operation == "read":
+            self.read_map = nn.Parameter(
+                torch.randn(stream_width, branch_width) / stream_width**0.5
+            )
+        else:
+            self.write_map = nn.Parameter(
+                torch.randn(branch_width, stream_width) / branch_width**0.5
+            )
 
-    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return hidden_states @ self.read_map, ()
+    def _read(
+        self,
+        hidden_states: Tensor,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        branch_input = hidden_states @ self.read_map
+        if branch_input_dtype is not None:
+            branch_input = branch_input.to(branch_input_dtype)
+        residual = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual,)
+
+    def _checkpoint_read(
+        self, hidden_states, context, *, fp32_residual_connection, branch_input_dtype
+    ):
+        def read_branch(stream):
+            branch_input, _ = apply_module(self)(
+                stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
+            )
+            return branch_input
+
+        branch_input = context.checkpoint(read_branch, hidden_states)
+        residual = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual,)
+
+    def _checkpoint_write(self, branch_output, state, context, *, dropout_probability, training):
+        is_tuple = isinstance(branch_output, tuple)
+        output, bias = branch_output if is_tuple else (branch_output, None)
+
+        def write_update(update, bias, *connection_state):
+            return apply_module(self)(
+                (update, bias) if is_tuple else update,
+                state=connection_state,
+                dropout_probability=dropout_probability,
+                training=training,
+            )
+
+        return context.checkpoint(write_update, output, bias, *state)
 
     def _write(
         self,
@@ -86,7 +128,15 @@ class _StaticResidualChain(nn.Module):
     def __init__(self, stream_width: int = 12, branch_width: int = 6):
         super().__init__()
         self.connections = nn.ModuleList(
-            [_StaticTestConnection(stream_width, branch_width) for _ in range(2)]
+            [
+                nn.ModuleList(
+                    [
+                        _StaticTestConnection(stream_width, branch_width, operation=operation)
+                        for operation in ("read", "write")
+                    ]
+                )
+                for _ in range(2)
+            ]
         )
         self.norms = nn.ModuleList([nn.LayerNorm(branch_width) for _ in range(2)])
         self.branches = nn.ModuleList([_HeavyTestBranch(branch_width) for _ in range(2)])
@@ -95,38 +145,29 @@ class _StaticResidualChain(nn.Module):
         self, hidden_states: Tensor, contexts: list[ResidualStreamRecomputeContext] | None = None
     ) -> tuple[Tensor, list[Tensor]]:
         managed_outputs = []
-        for index, (connection, norm, branch) in enumerate(
+        for index, ((reader, writer), norm, branch) in enumerate(
             zip(self.connections, self.norms, self.branches)
         ):
             context = contexts[index] if contexts is not None else None
             if context is None:
-                branch_input, state = apply_module(connection)(
-                    hidden_states, operation="read", fp32_residual_connection=False
+                branch_input, state = apply_module(reader)(
+                    hidden_states, fp32_residual_connection=False
                 )
                 branch_input = apply_module(norm)(branch_input)
             else:
                 branch_input, state = checkpoint_residual_read(
-                    connection, hidden_states, context, fp32_residual_connection=False
+                    reader, hidden_states, context, fp32_residual_connection=False
                 )
                 branch_input = context.checkpoint(apply_module(norm), branch_input)
 
             branch_output = apply_module(branch)(branch_input)
             if context is not None and not context.is_block_end:
                 hidden_states = checkpoint_residual_write(
-                    connection,
-                    branch_output,
-                    state,
-                    context,
-                    dropout_probability=0.2,
-                    training=True,
+                    writer, branch_output, state, context, dropout_probability=0.2, training=True
                 )
             else:
-                hidden_states = apply_module(connection)(
-                    branch_output,
-                    operation="write",
-                    state=state,
-                    dropout_probability=0.2,
-                    training=True,
+                hidden_states = apply_module(writer)(
+                    branch_output, state=state, dropout_probability=0.2, training=True
                 )
 
             if context is not None and context.is_block_end:
@@ -166,6 +207,12 @@ class _MambaMixer(_TransformerBranch):
 
 
 class _RecordingTransformerLayer(WideResidualTransformerLayer):
+    def forward(self, *args, **kwargs):
+        self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
+        return super().forward(*args, **kwargs)
+
+
+class _RecordingOrdinaryTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
         return super().forward(*args, **kwargs)
@@ -303,6 +350,12 @@ def _recording_layer_spec() -> ModuleSpec:
     return spec
 
 
+def _ordinary_recording_layer_spec() -> ModuleSpec:
+    spec = _layer_spec()
+    spec.module = _RecordingOrdinaryTransformerLayer
+    return spec
+
+
 def _mamba_spec() -> ModuleSpec:
     return ModuleSpec(
         module=WideResidualMambaLayer,
@@ -332,17 +385,14 @@ def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> N
         torch.testing.assert_close(recomputed_parameter.grad, reference_parameter.grad)
 
 
-def test_legacy_residual_connection_subclass_honors_requested_branch_dtype():
-    """Existing subclasses inherit the default terminal-cast compatibility hook."""
+def test_residual_connection_subclass_honors_requested_branch_dtype():
+    """Each concrete reader owns its requested branch dtype conversion."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32)
 
     branch_input, state = connection(
-        hidden_states,
-        operation="read",
-        fp32_residual_connection=True,
-        branch_input_dtype=torch.bfloat16,
+        hidden_states, fp32_residual_connection=True, branch_input_dtype=torch.bfloat16
     )
 
     expected = (hidden_states @ connection.read_map).to(torch.bfloat16)
@@ -354,7 +404,7 @@ def test_legacy_residual_connection_subclass_honors_requested_branch_dtype():
 def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
     """Replay's defensive FP32 promotion must not allocate for normal FP32 ingress."""
 
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32, requires_grad=True)
     context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
 
@@ -373,28 +423,21 @@ def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
 
 @pytest.mark.parametrize("invalid_dtype", ["bfloat16", torch.int32])
 def test_residual_connection_rejects_invalid_branch_dtype(invalid_dtype):
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12)
 
     with pytest.raises(TypeError, match="branch_input_dtype"):
-        connection(
-            hidden_states,
-            operation="read",
-            fp32_residual_connection=False,
-            branch_input_dtype=invalid_dtype,
-        )
+        connection(hidden_states, fp32_residual_connection=False, branch_input_dtype=invalid_dtype)
 
 
 def test_residual_connection_rejects_branch_dtype_on_write():
-    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="write")
     hidden_states = torch.randn(4, 12)
-    branch_input, state = connection(hidden_states, operation="read")
 
     with pytest.raises(TypeError, match="read-only"):
         connection(
-            branch_input,
-            operation="write",
-            state=state,
+            torch.randn(4, 6),
+            state=(hidden_states,),
             branch_input_dtype=torch.bfloat16,
             dropout_probability=0.0,
             training=False,
@@ -410,6 +453,35 @@ class TestResidualStreamRecomputePlan:
         assert contexts[2].manager is contexts[3].manager
         assert contexts[1].manager is not contexts[2].manager
 
+    def test_keeps_atomic_layer_pairs_in_one_replay_block(self):
+        contexts = build_residual_stream_recompute_plan(
+            num_layers=8, block_size=4, atomic_layer_pairs=[(3, 4), (5, 6)]
+        )
+
+        assert [context.is_block_end for context in contexts] == [
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert contexts[3].manager is contexts[4].manager
+        assert contexts[5].manager is contexts[6].manager
+        assert contexts[2].manager is not contexts[3].manager
+        assert contexts[6].manager is not contexts[7].manager
+
+    @pytest.mark.parametrize(
+        "atomic_layer_pairs", [[(1, 1)], [(1, 3)], [(-1, 0)], [(2, 3)], [(0, 1), (1, 2)]]
+    )
+    def test_rejects_invalid_atomic_layer_pairs(self, atomic_layer_pairs):
+        with pytest.raises(ValueError, match="adjacent in-range|must not overlap"):
+            build_residual_stream_recompute_plan(
+                num_layers=3, block_size=2, atomic_layer_pairs=atomic_layer_pairs
+            )
+
     @pytest.mark.parametrize("invalid_block_size", [False, 0, -1, 1.5])
     def test_rejects_invalid_block_size(self, invalid_block_size):
         with pytest.raises(ValueError, match="positive integer"):
@@ -417,10 +489,10 @@ class TestResidualStreamRecomputePlan:
 
     def test_training_gate(self):
         config = _wide_recompute_config()
-        assert residual_stream_recompute_enabled(config, training=True)
-        assert not residual_stream_recompute_enabled(config, training=False)
+        assert wide_residual_recompute_enabled(config, training=True)
+        assert not wide_residual_recompute_enabled(config, training=False)
         with torch.no_grad():
-            assert not residual_stream_recompute_enabled(config, training=True)
+            assert not wide_residual_recompute_enabled(config, training=True)
 
 
 class TestResidualStreamRecomputeConfig:
@@ -458,7 +530,7 @@ class TestResidualStreamRecomputeConfig:
             )
 
     def test_inherits_wide_residual_cuda_graph_guard(self):
-        with pytest.raises(NotImplementedError, match="wide_residual does not yet support"):
+        with pytest.raises(NotImplementedError, match="wide_residual supports CUDA graphs only"):
             TransformerConfig(
                 num_layers=2,
                 hidden_size=8,
@@ -534,12 +606,13 @@ class TestResidualStreamRecomputeIntegration:
         reference_output.square().mean().backward()
 
         operation_counts = {"connections": 0, "norms": 0, "branches": 0}
-        for connection in recomputed.connections:
-            connection.register_forward_pre_hook(
-                lambda *_: operation_counts.__setitem__(
-                    "connections", operation_counts["connections"] + 1
+        for pair in recomputed.connections:
+            for connection in pair:
+                connection.register_forward_pre_hook(
+                    lambda *_: operation_counts.__setitem__(
+                        "connections", operation_counts["connections"] + 1
+                    )
                 )
-            )
         for norm in recomputed.norms:
             norm.register_forward_pre_hook(
                 lambda *_: operation_counts.__setitem__("norms", operation_counts["norms"] + 1)
@@ -693,18 +766,15 @@ class TestResidualStreamRecomputeIntegration:
 
         def record_read(mode):
             def hook(_module, _args, kwargs, output):
-                if kwargs.get("operation") == "read":
-                    branch_input, state = output
-                    read_dtypes[mode].append(branch_input.dtype)
-                    state_dtypes[mode].append(state[0].dtype)
-                    read_grad_fns[mode].append(type(branch_input.grad_fn).__name__)
+                branch_input, state = output
+                read_dtypes[mode].append(branch_input.dtype)
+                state_dtypes[mode].append(state[0].dtype)
+                read_grad_fns[mode].append(type(branch_input.grad_fn).__name__)
 
             return hook
 
-        reference.residual_connection.register_forward_hook(record_read("eager"), with_kwargs=True)
-        recomputed.residual_connection.register_forward_hook(
-            record_read("replay"), with_kwargs=True
-        )
+        reference.residual_read.register_forward_hook(record_read("eager"), with_kwargs=True)
+        recomputed.residual_read.register_forward_hook(record_read("replay"), with_kwargs=True)
         reference_output = reference(hidden_states=reference_input)
         reference_output.square().mean().backward()
 
@@ -812,6 +882,11 @@ class TestResidualStreamRecomputeIntegration:
                 events.append("cp_prepare")
                 return hidden_states, layer_packed_seq_params
 
+            def get_layer_padding_mask(self, layer_index, default, masks):
+                assert layer_index == 0
+                assert masks is None
+                return default
+
             def finalize_layer(self, layer_index, hidden_states):
                 assert layer_index == 0
                 events.append("cp_finalize")
@@ -862,3 +937,31 @@ class TestResidualStreamRecomputeIntegration:
         assert len(replay_inputs) == 1
         assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
+
+    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
+        config = _wide_recompute_config(num_layers=1)
+        stack = HybridStack(
+            config,
+            HybridStackSubmodules(attention_layer=_ordinary_recording_layer_spec()),
+            layer_type_list=[Symbols.ATTENTION],
+            post_layer_norm=False,
+            is_mtp_layer=True,
+            pg_collection=_process_groups(),
+        ).cuda()
+        hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
+
+        output = stack(hidden_states=hidden_states, attention_mask=None)
+        output.square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert not stack.uses_wide_residual_stream
+        assert stack.residual_stream_readout is None
+        layer = stack.layers[0]
+        assert type(layer) is _RecordingOrdinaryTransformerLayer
+        assert layer.is_mtp_layer
+        assert not layer.supports_wide_residual_connections
+        for operation in ("read", "write"):
+            assert layer._get_self_attention_residual_connection(operation=operation) is None
+            assert layer._get_mlp_residual_connection(operation=operation) is None
+        assert not layer.received_residual_recompute_kwarg
+        assert hidden_states.grad is not None

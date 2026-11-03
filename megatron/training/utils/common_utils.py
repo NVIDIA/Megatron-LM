@@ -51,6 +51,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
+from megatron.training.global_vars import get_run_config
 
 
 def _compute_norm_2(params_list):
@@ -409,14 +410,14 @@ def report_memory(name, process_group=None):
     process_group: optional data-parallel group to gate the rank-0 print on; None falls back
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
-    args = get_args()
+    cfg = get_run_config()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
+    if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0
