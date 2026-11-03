@@ -81,6 +81,8 @@ LONG_KV = 4097  # crosses several split-KV chunks and 128-token tiles
 FA_PAGE_SIZES = {2: (256,), 3: (64, 128, 256), 4: (64, 128, 256)}
 SOFTCAP = 8.0
 SOFTCAP_Q_SCALE = 4.0  # makes |scores| reach the cap, so a dropped softcap is visible
+# FA generations the CI image ships: flash-attn 2 and its FA4 cute interface, not FA3.
+IN_CI_IMAGE = {2, 4}
 
 
 def _installed(version: int) -> bool:
@@ -95,13 +97,13 @@ def _installed(version: int) -> bool:
 
 
 def _require_flash(version: int) -> None:
-    """Skip when this FA generation is not installed, but fail on a run that targets the
-    hardware (``MCORE_ORACLE_TARGET_SM``): the manifest deselects the generations its image
-    lacks (FA3 in the CI image), so a selected case never passes by skipping."""
+    """Skip when this FA generation is not installed. A run that targets the hardware
+    (``MCORE_ORACLE_TARGET_SM``, which CI sets) fails instead for a generation the CI image
+    ships, so its cases never pass by skipping; FA3's cases skip wherever FA3 is missing."""
     if _installed(version):
         return
     reason = f"FlashAttention-{version} is not installed"
-    if ou.session_target_sm() is not None:
+    if version in IN_CI_IMAGE and ou.session_target_sm() is not None:
         pytest.fail(reason + " on a run that targets this hardware", pytrace=False)
     pytest.skip(reason)
 
