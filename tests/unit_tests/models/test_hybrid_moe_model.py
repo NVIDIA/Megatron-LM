@@ -452,6 +452,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "head_wise_attn_gate": False,
     "moe_hybridep_pad_variable_tokens": False,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
+    "attention_output_gate_fusion": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

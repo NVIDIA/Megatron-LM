@@ -74,3 +74,41 @@ def apply_attention_output_gate(
     if granularity == 'headwise':
         return output.reshape(output_shape)
     return output
+
+
+def apply_elementwise_attention_output_gate_before_cast(
+    core_attn_out: torch.Tensor, gate: torch.Tensor, *, fusion: bool = False
+) -> torch.Tensor:
+    """Elementwise ``apply_attention_output_gate(..., cast_mode='before')`` with an optional fusion.
+
+    ``fusion=False`` runs the eager composition (FP32 sigmoid, cast to the activation dtype,
+    multiply); autograd then keeps the FP32 sigmoid output and the cast scale alive until
+    backward. ``fusion=True`` (``TransformerConfig.attention_output_gate_fusion``) runs the
+    forward and the backward as one Triton kernel each
+    (``megatron.core.fusions.fused_attention_output_gate``) with the same values and gradients
+    and only the two inputs saved. Contiguous CUDA inputs then require Triton; non-contiguous
+    views and CPU inputs fall back to the eager composition.
+    """
+    validate_attention_output_gate_shapes(core_attn_out, gate, 'elementwise')
+    if fusion and core_attn_out.is_cuda:
+        from megatron.core.fusions.fused_attention_output_gate import (
+            HAVE_TRITON,
+            SUPPORTED_DTYPES,
+            can_use_fused_elementwise_attention_output_gate,
+            fused_elementwise_attention_output_gate_before_cast,
+        )
+
+        if can_use_fused_elementwise_attention_output_gate(core_attn_out, gate):
+            return fused_elementwise_attention_output_gate_before_cast(core_attn_out, gate)
+        if (
+            not HAVE_TRITON
+            or core_attn_out.dtype not in SUPPORTED_DTYPES
+            or gate.dtype not in SUPPORTED_DTYPES
+            or core_attn_out.device != gate.device
+        ):
+            raise RuntimeError(
+                "attention_output_gate_fusion requires Triton and BF16/FP16/FP32 CUDA tensors "
+                f"on one device, got {core_attn_out.dtype} / {gate.dtype} on "
+                f"{core_attn_out.device} / {gate.device}."
+            )
+    return apply_attention_output_gate(core_attn_out, gate, 'elementwise', cast_mode='before')
