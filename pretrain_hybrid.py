@@ -107,15 +107,7 @@ def get_batch(data_iterator, vp_stage=None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            padding_mask,
-        ) = get_batch_on_this_rank_for_sequence_packing(
+        return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
@@ -126,18 +118,7 @@ def get_batch(data_iterator, vp_stage=None):
             ),
             vp_stage=vp_stage,
             config=config,
-        )
-        return ContextParallelBatch.from_single_layout(
-            config.linear_cp_layout,
-            {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "padding_mask": padding_mask,
-            },
-            packed_seq_params,
+            return_context_parallel_batch=True,
         )
 
     cp_size = args.context_parallel_size
@@ -344,7 +325,8 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        # The packing scheduler already supplies global iteration statistics.
+        if cu_seqlens is not None and get_args().sequence_packing_scheduler is None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
     timers('batch-generator').stop()

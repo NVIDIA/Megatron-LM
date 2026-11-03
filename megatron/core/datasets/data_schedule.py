@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Type
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule_utils import (
     _get_global_seqlens_and_ids,
     broadcast_scalars,
@@ -779,6 +780,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     config=None,
+    return_context_parallel_batch: bool = False,
 ):
     """
     Get a batch of data for sequence packing.
@@ -786,10 +788,15 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Model config with packing and CP layout settings.
+        return_context_parallel_batch: Return layout-aware views for HybridModel.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
-        packed_seq_params, padding_mask)
+        packed_seq_params, padding_mask), or a ContextParallelBatch when requested.
     """
+
+    if return_context_parallel_batch and config is None:
+        raise ValueError("config is required when returning ContextParallelBatch")
 
     if pg_collection is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -842,7 +849,7 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Partition padding_mask for context parallel on every PP stage. Partition
     # token-like tensors only on stages that own them.
-    if is_tp_rank_0:
+    if is_tp_rank_0 and not return_context_parallel_batch:
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
         # If cp_size == 1, no need to do further processing.
@@ -933,6 +940,33 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
+
+    if return_context_parallel_batch:
+        # Broadcast global tensors first, then let the layout-aware sharder select
+        # the same CP ordering for tokens, positions, labels, and padding masks.
+        batch['cu_seqlens'] = batch['cu_seqlens'].unsqueeze(0)
+        batch['cu_seqlens_padded'] = batch['cu_seqlens_padded'].unsqueeze(0)
+        additional_layouts = {config.attention_cp_layout} - {config.linear_cp_layout}
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout=config.linear_cp_layout,
+            is_hybrid_cp=False,
+            cp_group=cp_group,
+            additional_layouts=additional_layouts,
+            sequence_parallel=config.sequence_parallel,
+            tp_group=tp_group,
+        )
+        if config.cuda_graph_thd_max_packed_sequences is not None:
+            # Keep logical document boundaries and the fixed graph bound. Ordinary
+            # release batch callers retain the sharder's existing metadata behavior.
+            for layout, params in cp_batch.packed_seq_params_by_layout.items():
+                values = cp_batch.get_batch(layout)
+                params.cu_seqlens_q = params.cu_seqlens_kv = values['cu_seqlens'].squeeze(0)
+                bound = params.cu_seqlens_q_padded[-1].to(torch.int32)
+                params.max_seqlen_q = params.max_seqlen_kv = int(bound.item())
+                params.pad_between_seqs = True
+                values['max_seqlen'] = bound
+        return cp_batch
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']
