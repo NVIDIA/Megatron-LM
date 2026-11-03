@@ -66,6 +66,9 @@ _PATTERNS = {
     "gdn": "G*-G-",
     "mla": "+-+-",
 }
+# GDN runs under InferenceMode only with a dynamic inference context, so its forwards are
+# compared in the engine test below.
+_FORWARD_PATTERNS = {name: pattern for name, pattern in _PATTERNS.items() if "G" not in pattern}
 
 # (tp, disable_nvls) for each path of the row-parallel layer: no reduce-scatter at TP=1, the
 # NCCL reduce-scatter when the Triton NVLS kernels are disabled, and the NVLS reduce-scatter,
@@ -267,7 +270,9 @@ class TestHybridFusedTPCommunication:
         _check_wiring(pattern, stack.layers, [False, True, False, False])
 
     @pytest.mark.parametrize("path", list(_PATHS))
-    @pytest.mark.parametrize("pattern", list(_PATTERNS.values()), ids=list(_PATTERNS))
+    @pytest.mark.parametrize(
+        "pattern", list(_FORWARD_PATTERNS.values()), ids=list(_FORWARD_PATTERNS)
+    )
     def test_fused_matches_unfused(self, pattern, path):
         """Flag-on output equals flag-off output on every path. With NVLS, the fused kernel
         runs exactly at the links, and only the input linears it feeds skip their own norm."""
@@ -318,9 +323,9 @@ class TestHybridFusedTPCommunication:
             assert applies_norm != fed, f"layer {i} ({symbol}) applies its own norm: {applies_norm}"
 
 
-# A Nemotron-H-style model in the dynamic engine: Mamba layers break the fused chain, and
-# attention-only and MLP-only layers link across layers.
-_ENGINE_PATTERN = "M*-M*-"
+# Hybrid models in the dynamic engine, as served: Mamba (Nemotron-H style) or GDN layers break
+# the fused chain, and attention-only and MLP-only layers link across layers.
+_ENGINE_PATTERNS = {"mamba": "M*-M*-", "gdn": "G*-G*-"}
 _ENGINE_VOCAB, _ENGINE_MAX_SEQ = 128, 1024
 # (arrival step, prompt length). Prefill and mixed steps run eagerly, decode steps from graphs.
 _ENGINE_PROMPTS = ((0, 9), (0, 37), (1, 130))
@@ -334,7 +339,7 @@ _ENGINE_RTOL = 5e-2
     not inference_layers.HAVE_TE, reason="inference_optimized requires Transformer Engine"
 )
 class TestHybridModelFusedTPEngine:
-    """A HybridModel at TP=2 in the dynamic engine with CUDA graphs: the same requests served
+    """HybridModels at TP=2 in the dynamic engine with CUDA graphs: the same requests served
     with the flag on and off decode the same tokens through the same decoder outputs."""
 
     def setup_method(self, method):
@@ -350,12 +355,12 @@ class TestHybridModelFusedTPEngine:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _build_model(scope: InferenceCudaGraphScope, *, fuse: bool) -> HybridModel:
+    def _build_model(pattern: str, scope: InferenceCudaGraphScope, *, fuse: bool) -> HybridModel:
         model_parallel_cuda_manual_seed(
             123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
         )
         config = _config(
-            _ENGINE_PATTERN,
+            pattern,
             2,
             fuse=fuse,
             # One token per rank in a fused reduce-scatter still fills a warp.
@@ -366,13 +371,16 @@ class TestHybridModelFusedTPEngine:
             inference_rng_tracker=True,
             cuda_graph_impl="local",
             inference_cuda_graph_scope=scope,
+            # GDN: 2 key and 4 value heads per rank at TP=2.
+            linear_value_head_dim=64,
+            linear_num_value_heads=8,
         )
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_inference_stack_spec,
             vocab_size=_ENGINE_VOCAB,
             max_sequence_length=_ENGINE_MAX_SEQ,
-            hybrid_layer_pattern=_ENGINE_PATTERN,
+            hybrid_layer_pattern=pattern,
             parallel_output=True,
             share_embeddings_and_output_weights=True,
         )
@@ -473,10 +481,11 @@ class TestHybridModelFusedTPEngine:
         [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block],
         ids=["layer_graphs", "block_graphs"],
     )
-    def test_engine_matches_unfused(self, scope):
+    @pytest.mark.parametrize("pattern", list(_ENGINE_PATTERNS.values()), ids=list(_ENGINE_PATTERNS))
+    def test_engine_matches_unfused(self, pattern, scope):
         _require_nvls()
-        unfused = self._build_model(scope, fuse=False)
-        fused = self._build_model(scope, fuse=True)
+        unfused = self._build_model(pattern, scope, fuse=False)
+        fused = self._build_model(pattern, scope, fuse=True)
         with torch.no_grad():
             # Tied embeddings at about the sub-layers' scale: each request decodes its last
             # prompt token again by a wide logit margin, so both engines decode the same
