@@ -45,6 +45,7 @@ from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     SinglePassMHCState,
+    get_mhc_aggregate,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
@@ -406,6 +407,10 @@ class HybridStack(MegatronModule):
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+        self._mhc_final_aggregate = (
+            get_mhc_aggregate(self.config) if self.config.enable_mhc_connections else None
+        )
 
         self.residual_stream_readout = (
             build_wide_residual_readout(self.config)
@@ -916,7 +921,9 @@ class HybridStack(MegatronModule):
                 mhc_multistream = hidden_states
             if mhc_state is not None:
                 hidden_states = mhc_state.contract(
-                    hidden_states, self.config.mhc_num_residual_streams
+                    hidden_states,
+                    self.config.mhc_num_residual_streams,
+                    aggregate=self._mhc_final_aggregate,
                 )
             else:
                 hidden_states = learned_output_contract(

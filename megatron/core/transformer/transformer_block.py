@@ -30,6 +30,7 @@ from megatron.core.transformer.hyper_connection import (
     SinglePassMHCState,
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
+    get_mhc_aggregate,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -331,6 +332,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config._cpu_offloading_context = None
 
         self.mhc_num_residual_streams = config.mhc_num_residual_streams
+        self._mhc_final_aggregate = (
+            get_mhc_aggregate(config) if config.enable_mhc_connections else None
+        )
         self.mhc_recompute_enabled = (
             config.enable_mhc_connections
             and config.recompute_granularity == 'selective'
@@ -794,7 +798,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
             hidden_states = (
-                mhc_state.contract(hidden_states, self.mhc_num_residual_streams)
+                mhc_state.contract(
+                    hidden_states,
+                    self.mhc_num_residual_streams,
+                    aggregate=self._mhc_final_aggregate,
+                )
                 if mhc_state is not None
                 else HyperConnectionModule.output_contract(
                     hidden_states, self.mhc_num_residual_streams

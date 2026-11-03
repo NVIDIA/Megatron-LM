@@ -56,6 +56,15 @@ class SinglePassMHCState:
         )
 
 
+def get_mhc_aggregate(config: TransformerConfig) -> Callable[[Tensor, Tensor], Tensor] | None:
+    """Bind the configured fused aggregation for the stack's final contraction."""
+    if not config.use_fused_mhc:
+        return None
+    from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
+    return partial(fused_h_aggregate, backend=config.mhc_fused_backend)
+
+
 def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
 ) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
@@ -200,6 +209,107 @@ def learned_output_contract(
     pre = torch.sigmoid(mixes * scale + base) + eps
     y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
     return y.to(dtype)
+
+
+@torch.compile
+def _single_pass_projection_rms_forward(
+    hidden_states: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute FP32 mapping and epsilon-inside-sqrt RMS without saving the wide cast."""
+    x = hidden_states.float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        projected = F.linear(x, weight.float())
+        inv_rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    return projected * inv_rms, projected, inv_rms
+
+
+@torch.compile
+def _single_pass_projection_rms_backward(
+    grad_output: Tensor,
+    hidden_states: Tensor,
+    weight: Optional[Tensor],
+    projected: Optional[Tensor],
+    inv_rms: Tensor,
+    need_hidden: bool,
+    need_weight: bool,
+) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    """Recast original storage only in backward; merge both dX paths before rounding."""
+    x = hidden_states.float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        grad = grad_output.float()
+        grad_projected = grad * inv_rms
+        grad_hidden = None
+        if need_hidden:
+            grad_hidden = F.linear(grad_projected, weight.float().t())
+            grad_rms = (grad * projected).sum(-1, keepdim=True)
+            grad_mean = grad_rms * -0.5 * inv_rms.pow(3)
+            grad_square = grad_mean.expand_as(x) / x.shape[-1]
+            grad_hidden = (grad_hidden + grad_square * (2 * x)).to(hidden_states.dtype)
+        grad_weight = None
+        if need_weight:
+            grad_weight = (
+                grad_projected.reshape(-1, grad_projected.shape[-1])
+                .t()
+                .matmul(x.reshape(-1, x.shape[-1]))
+            )
+    return grad_hidden, grad_weight
+
+
+class _SinglePassProjectionRMS(torch.autograd.Function):
+    """Retain original activation storage and only narrow FP32 mapping statistics.
+
+    This boundary must stay outside the coefficient activation's compiled graph:
+    jointly partitioning forward/backward can otherwise retain the wide FP32
+    cast again. Saved tensors keep their original StorageImpl so checkpoint
+    output storage can be discarded and rebound before backward reads it.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states: Tensor, weight: Tensor, eps: float) -> Tensor:
+        normalized, projected, inv_rms = _single_pass_projection_rms_forward(
+            hidden_states, weight, eps
+        )
+        ctx.need_hidden, ctx.need_weight = ctx.needs_input_grad[:2]
+        ctx.weight_dtype = weight.dtype
+        ctx.set_materialize_grads(False)
+        if ctx.need_hidden or ctx.need_weight:
+            ctx.save_for_backward(
+                hidden_states,
+                weight if ctx.need_hidden else None,
+                projected if ctx.need_hidden else None,
+                inv_rms,
+            )
+        return normalized
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: Optional[Tensor]):
+        if grad_output is None:
+            return None, None, None
+        hidden_states, weight, projected, inv_rms = ctx.saved_tensors
+        grad_hidden, grad_weight = _single_pass_projection_rms_backward(
+            grad_output, hidden_states, weight, projected, inv_rms, ctx.need_hidden, ctx.need_weight
+        )
+        if grad_weight is not None:
+            grad_weight = grad_weight.to(ctx.weight_dtype)
+        return grad_hidden, grad_weight, None
+
+
+@torch.compile
+def _single_pass_coefficient_activations(
+    projected: Tensor,
+    alpha_pre: Tensor,
+    alpha_post: Tensor,
+    alpha_res: Tensor,
+    bias: Tensor,
+    n: int,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Apply the original coefficient activations to the narrow FP32 projection."""
+    pre = (projected[..., :n] * alpha_pre + bias[:n]).sigmoid()
+    post = (projected[..., n : 2 * n] * alpha_post + bias[n : 2 * n]).sigmoid()
+    residual = (projected[..., 2 * n :] * alpha_res + bias[2 * n :]).unflatten(-1, (n, n))
+    return pre + eps, 2 * post, residual
 
 
 # ============================================================================
@@ -363,22 +473,20 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 
-    @torch.compile
     def _single_pass_coefficients(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Fuse FP32 normalization and coefficient activations around the projection."""
-        x = hidden_states.float()
-        # V4.1 requires epsilon inside sqrt, including for zero/small inputs.
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            projected = F.linear(x, self.mapping_proj.weight.float())
-        projected = projected * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        pre = (projected[..., : self.n] * self.alpha_pre + self.bias[: self.n]).sigmoid()
-        post = (
-            projected[..., self.n : 2 * self.n] * self.alpha_post + self.bias[self.n : 2 * self.n]
-        ).sigmoid()
-        residual = (
-            projected[..., 2 * self.n :] * self.alpha_res + self.bias[2 * self.n :]
-        ).unflatten(-1, (self.n, self.n))
-        return pre + self.compute_h_eps, 2 * post, residual
+        """Keep the original input for backward instead of its wide FP32 cast."""
+        projected = _SinglePassProjectionRMS.apply(
+            hidden_states, self.mapping_proj.weight, self.norm_eps
+        )
+        return _single_pass_coefficient_activations(
+            projected,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.bias,
+            self.n,
+            self.compute_h_eps,
+        )
 
     def _compute_single_pass_mappings(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Predict FP32 coefficients, then apply the configured Sinkhorn kernel."""

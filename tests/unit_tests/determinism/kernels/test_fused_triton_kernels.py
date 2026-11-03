@@ -498,12 +498,13 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
-def test_mhc_h_aggregate_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("mix_dtype", [torch.bfloat16, torch.float32])
+def test_mhc_h_aggregate_replays_fwd_bwd(backend, mix_dtype):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
         pytest.skip("Triton mHC backend unavailable")
     seeded()
     x = _mhc_rand(S, B, N, C)
-    h_pre = _mhc_rand(S, B, N)
+    h_pre = _mhc_rand(S, B, N, dtype=mix_dtype)
     assert_replays_bit_exact(
         lambda x, h: fused_mhc_kernels.fused_h_aggregate(x, h, backend=backend),
         (x, h_pre),
@@ -535,7 +536,6 @@ def test_csa2_cudnn_r2_pool_replays_fwd_bwd():
         )
     with deterministic_algorithms(True):
         assert pool(kv, gate, kv.dtype) is None
-
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
