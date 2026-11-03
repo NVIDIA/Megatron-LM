@@ -75,6 +75,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
+        # Cache for persistent pipeline receive buffers when CUDA graphs are enabled.
+        # Key: (batch_size, seq_len), Value: tensor that persists across forward passes.
+        self._cached_recv_buffers: Dict[tuple[int, int], torch.Tensor] = {}
+
         if (
             getattr(self.config, "enable_mhc_connections", False)
             and torch.distributed.get_world_size(self.pp_group) > 1
@@ -264,6 +268,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
             # except for the MoE layers which is handled separately.
             seq_len = seq_len // self.tp_size
         recv_size = (seq_len, batch_size, self.config.hidden_size)
+
+        # When CUDA graphs are enabled, reuse persistent buffers to avoid stale addresses.
+        # The graph captures the recv buffer address; allocating a new tensor each forward
+        # would cause the graph to read from stale memory after replay.
+        if getattr(self.config, 'inference_cuda_graph_scope', None) is not None:
+            cache_key = (batch_size, seq_len)
+            if cache_key not in self._cached_recv_buffers:
+                self._cached_recv_buffers[cache_key] = torch.empty(
+                    recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
+                )
+            return self._cached_recv_buffers[cache_key]
+
         return torch.empty(
             recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
         )
