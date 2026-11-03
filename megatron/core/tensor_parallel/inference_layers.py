@@ -543,7 +543,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """batch_invariant_tp_shards with several shards per rank: the same bits as training.
 
         One strided batched GEMM for this rank's shards, then the reduce-scatter (or, at
-        TP 1, the local fold) of the shard partials in global shard order.
+        TP 1, the local fold) of the shard partials in global shard order. Called from
+        forward() at TP 1 and from _matmul_reduce_scatter otherwise, whenever this rank holds
+        several shards (``_bi_tp_local_shards > 1``).
         """
         assert (
             not use_mxfp8
@@ -551,6 +553,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         c = self._bi_tp_local_shards
         if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
             buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+            # The c shard partials of all rows; maybe_get_tensor returns no handle when they
+            # do not fit, and the NCCL path below gives the same bits.
             dims = [c, *x.shape[:-1], self.weight.size(0)]
             symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
             if symm["handle"] is not None and can_use_symm_pull(symm["handle"], x):
@@ -569,7 +573,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
 
         Gives the same bits as the training forward (tensor_parallel/ordered_reduce.py).
         With a symmetric buffer, the GEMM writes into it and one kernel pulls the owned rows
-        from every peer and folds them; otherwise all-to-all + fold.
+        from every peer and folds them; otherwise all-to-all + fold. Called from
+        _matmul_reduce_scatter when ``use_ordered_tp_reduce`` holds (one shard per rank).
         """
         if (
             self.triton_nvls_kernels_allowed

@@ -1543,7 +1543,11 @@ class TELinear(te.pytorch.Linear):
             self._set_bi_row_parallel_attributes()
 
     def _bi_tp_reduce(self, out):
-        """Batch-invariant forward TP reduction of the local GEMM output (see __init__)."""
+        """Batch-invariant forward TP reduction of the local GEMM output (see __init__).
+
+        Called from forward() at TP >= 3 (``_explicit_bi_tp_reduce``): the ordered
+        reduce-scatter (SP) or all-reduce of ``mappings.py``, then the bias.
+        """
         bias = None
         if self.use_bias:
             out, bias = out
@@ -1557,7 +1561,11 @@ class TELinear(te.pytorch.Linear):
         return out, bias
 
     def _bi_tp_shards_forward(self, x):
-        """Row-parallel forward with several batch_invariant_tp_shards per rank (see __init__)."""
+        """Row-parallel forward with several batch_invariant_tp_shards per rank (see __init__).
+
+        Called from forward() instead of TE's linear when ``batch_invariant_tp_shards`` exceeds
+        the TP size: shard GEMMs and the shard-order reduction in ``tp_shard_row_linear``.
+        """
         out = tp_shard_row_linear(
             x,
             self.weight,
@@ -1569,6 +1577,7 @@ class TELinear(te.pytorch.Linear):
         bias = self.bias if self.use_bias else None
         if self.te_return_bias:
             return out, bias
+        # Added once, after the reduction, as in _bi_tp_reduce and stock row-parallel TE.
         if bias is not None:
             out = out + bias
         return out, None

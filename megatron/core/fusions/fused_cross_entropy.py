@@ -141,6 +141,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
                     batch_invariant_tp_shards,
                 )
             )
+            # The fused loss below takes the two reduced tensors stacked, as the stock path's
+            # single all-reduce produces them.
             predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
         else:
             target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (

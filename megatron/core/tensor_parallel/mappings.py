@@ -174,7 +174,9 @@ def _reduce_scatter_along_first_dim(
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
         ordered (bool): Use the batch-invariant rank-order sum when
-            `use_ordered_tp_reduce` selects it (forward reductions only).
+            `use_ordered_tp_reduce` selects it. Only the forward reductions pass True: the
+            backward of the all-gather regions calls this helper too, and gradients do not
+            need a fixed summation order.
     """
     assert group is not None, "group should not be None"
     world_size = group.size()
