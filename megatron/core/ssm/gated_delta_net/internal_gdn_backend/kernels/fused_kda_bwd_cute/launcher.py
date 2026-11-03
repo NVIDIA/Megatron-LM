@@ -1,7 +1,8 @@
 """Host launcher for the SM100 fused KDA backward.
 
 The token, chunk and sequence counts are dynamic in the compiled kernel, so one
-compilation per (heads, device) serves every packing of a training run.
+compilation per (heads, split, device) serves every packing of a training run;
+``split`` changes only when the sequence count crosses the one-wave bound.
 """
 
 import threading
@@ -24,6 +25,17 @@ def chunk_offsets_for(cu_seqlens: torch.Tensor) -> torch.Tensor:
     lengths = cu_seqlens[1:] - cu_seqlens[:-1]
     chunks = (lengths + _BT - 1) // _BT
     return torch.cat([chunks.new_zeros(1), chunks.cumsum(0)]).to(torch.int32)
+
+
+def default_split(num_sequences: int, heads: int, device: torch.device) -> int:
+    """CTAs per (sequence, head): two while both fit on the device in one wave.
+
+    Each CTA walks the whole dS recursion but runs the intra-chunk and dq/dk
+    work for every ``split``-th chunk only, so a second CTA roughly halves that
+    part of the per-chunk latency when SMs would otherwise stay idle.
+    """
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return 2 if 2 * num_sequences * heads <= sms else 1
 
 
 def _require(name, tensor, dtype, shape, device):
@@ -85,6 +97,7 @@ def fused_kda_bwd(
     scale,
     *,
     chunk_offsets=None,
+    split=None,
     debug=False,
     trace=False,
 ):
@@ -114,6 +127,8 @@ def fused_kda_bwd(
         chunk_offsets = chunk_offsets_for(cu_seqlens)
     _validate(q, k, v, gc, beta, aqk, akk, h, do, dht, cu_seqlens, chunk_offsets)
     heads = q.shape[2]
+    if split is None:
+        split = default_split(cu_seqlens.numel() - 1, heads, q.device)
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     dg = torch.empty_like(gc)
     dbeta = torch.empty_like(beta)
@@ -140,11 +155,11 @@ def fused_kda_bwd(
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    key = (heads, debug, trace, device_index)
+    key = (heads, split, debug, trace, device_index)
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
-            kernel = FusedKdaBwdKernel(heads=heads, debug=debug, trace=trace)
+            kernel = FusedKdaBwdKernel(heads=heads, split=split, debug=debug, trace=trace)
             compiled = cute.compile(kernel, *args, cutlass.Float32(scale), stream)
             _CACHE[key] = compiled
     compiled(*args, cutlass.Float32(scale), stream)

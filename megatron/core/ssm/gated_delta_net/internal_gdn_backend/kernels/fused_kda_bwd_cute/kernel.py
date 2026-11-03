@@ -1,7 +1,8 @@
 """SM100 CuTe DSL device kernel for the fused KDA backward.
 
-One CTA per (sequence, head) walks the sequence's 64-token chunks in reverse
-and keeps the state gradient dH (128 key x 128 value, FP32) in tensor memory.
+``split`` CTAs per (sequence, head) walk the sequence's 64-token chunks in
+reverse and keep the state gradient dH (128 key x 128 value, FP32) in tensor
+memory.
 A chunk reads FLA's forward residuals (q, k, v, dO, Aqk, Akk and the
 chunk-start state h in BF16; the chunk-local log2 gate cumsum and beta in
 FP32) and writes dq, dk, dv, dg (after the chunk-local reverse cumsum), dbeta
@@ -34,6 +35,13 @@ channel while that channel's log2 gate span is below ``DIAG_SPAN_LIMIT``;
 otherwise the owning thread recomputes the channel's triangle on CUDA cores.
 The anchored token operands are BF16 high/low pairs, which keeps dg at
 FP32-operand accuracy; every other MMA operand is a single BF16 tile.
+
+Split: only the dS recursion carries state across chunks, and it needs only
+phases A-D of a chunk.  With ``split=2`` both CTAs of a (sequence, head) run
+the recursion over every chunk, but each runs the intra-chunk products, the
+dq/dk/dg epilogue and the dv, dbeta and dh0 stores for every second chunk
+(phases C-E and the stores are skipped on the other CTA's chunks).  The
+launcher picks two CTAs while they fit on the device in one wave.
 
 Schedule: warps 0-3 (CH) do the channel-major element-wise work and stores,
 warps 4-7 (TK) the token-major work, warp 8 issues tcgen05 MMAs and warp 9
@@ -392,14 +400,17 @@ class _Smem:
 
 
 class FusedKdaBwdKernel:
-    """Warp-specialized SM100 fused KDA backward, one CTA per (sequence, head)."""
+    """Warp-specialized SM100 fused KDA backward, ``split`` CTAs per (sequence, head)."""
 
     threads_per_cta = _THREADS
 
-    def __init__(self, *, heads: int, debug: bool = False, trace: bool = False):
+    def __init__(self, *, heads: int, split: int = 1, debug: bool = False, trace: bool = False):
         if heads <= 0:
             raise ValueError("heads must be positive")
+        if split not in (1, 2):
+            raise ValueError("split must be 1 or 2")
         self.heads = heads
+        self.split = split
         self.debug = debug
         self.trace = trace
         self.io_dtype = cutlass.BFloat16
@@ -534,8 +545,8 @@ class FusedKdaBwdKernel:
             ops["intra_lower"].tiled_mma,
             ops["intra_upper"].tiled_mma,
         ).launch(
-            # The sequence count is dynamic: one CTA per (sequence, head).
-            grid=((cute.size(cu_seqlens, mode=[0]) - 1) * self.heads, 1, 1),
+            # The sequence count is dynamic: ``split`` CTAs per (sequence, head).
+            grid=((cute.size(cu_seqlens, mode=[0]) - 1) * self.heads * self.split, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             cluster=(1, 1, 1),
             smem=SharedStorage.size_in_bytes(),
@@ -595,8 +606,9 @@ class FusedKdaBwdKernel:
         # kernel so every device-side layout is defined inside it.
         self._plan = build_kda_layout_plan(self.io_dtype, self.acc_dtype)
         canonical = self._plan.canonical
-        sequence = block // self.heads
-        head = block % self.heads
+        part = block % self.split
+        sequence = block // self.split // self.heads
+        head = block // self.split % self.heads
         storage = cutlass.utils.SmemAllocator().allocate(SharedStorage)
 
         edges = storage.edges.data_ptr()
@@ -647,6 +659,7 @@ class FusedKdaBwdKernel:
             self.run_ch(
                 tidx,
                 warp,
+                part,
                 head,
                 sequence,
                 seq_start,
@@ -683,6 +696,7 @@ class FusedKdaBwdKernel:
             self.run_tk(
                 tidx - 128,
                 warp,
+                part,
                 head,
                 sequence,
                 seq_start,
@@ -721,6 +735,7 @@ class FusedKdaBwdKernel:
             cute.arch.setmaxregister_decrease(_OTHER_REGISTERS)
             if warp == _MMA_WARP:
                 self.run_mma(
+                    part,
                     num_chunks,
                     smem,
                     edges,
@@ -912,6 +927,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def run_mma(
         self,
+        part,
         num_chunks,
         smem,
         edges,
@@ -952,7 +968,10 @@ class FusedKdaBwdKernel:
         )
 
         for it in cutlass.range(num_chunks):
-            ring_base = it * 6
+            # Every CTA of a (sequence, head) runs the dS recursion; only the
+            # chunk's owner runs the intra-chunk and dq/dk work (phases C-E).
+            owned = it % self.split == part
+            ring_base = (it // self.split) * 6
             # Phase A: X = kG S; dvn = kgL dS + Aqk^T dO; dH += (q G scale)^T dO.
             self._wait(edges, _E_READY_A, it)
             self._stamp(trace, 2, 0, it)
@@ -1010,34 +1029,35 @@ class FusedKdaBwdKernel:
             # Phase C: dAqk, state-path token gradients, dh_k, inverse left.
             self._wait(edges, _E_READY_C, it)
             self._stamp(trace, 2, 4, it)
-            self._gemm(
-                mma_sq_kk,
-                sq_b,
-                operand("daqk", smem.do, "a"),
-                operand("daqk", smem.t21, "b"),
-                False,
-            )
-            self._gemm(
-                mma_ch128,
-                acc_dkm,
-                operand("dk_state", smem.ds, "a"),
-                operand("dk_state", smem.t21, "b"),
-                False,
-            )
-            self._gemm(
-                mma_ch128,
-                acc_dq,
-                operand("dq_state", smem.h, "a"),
-                operand("dq_state", smem.do, "b"),
-                False,
-            )
-            self._gemm(
-                mma_ch128,
-                acc_dkp,
-                operand("dk_w", smem.h, "a"),
-                operand("dk_w", smem.kb, "b"),
-                False,
-            )
+            if owned:
+                self._gemm(
+                    mma_sq_kk,
+                    sq_b,
+                    operand("daqk", smem.do, "a"),
+                    operand("daqk", smem.t21, "b"),
+                    False,
+                )
+                self._gemm(
+                    mma_ch128,
+                    acc_dkm,
+                    operand("dk_state", smem.ds, "a"),
+                    operand("dk_state", smem.t21, "b"),
+                    False,
+                )
+                self._gemm(
+                    mma_ch128,
+                    acc_dq,
+                    operand("dq_state", smem.h, "a"),
+                    operand("dq_state", smem.do, "b"),
+                    False,
+                )
+                self._gemm(
+                    mma_ch128,
+                    acc_dkp,
+                    operand("dk_w", smem.h, "a"),
+                    operand("dk_w", smem.kb, "b"),
+                    False,
+                )
             for hh in cutlass.range_constexpr(2):
                 self._gemm(
                     mma_ch64,
@@ -1046,86 +1066,94 @@ class FusedKdaBwdKernel:
                     operand("dh_k", smem.kb, "b", hh * half),
                     True,
                 )
-            self._gemm(
-                mma_sq_mnmn,
-                sq_a,
-                operand("inv_left", smem.akk, "a"),
-                operand("inv_left", smem.sq, "b"),
-                False,
-            )
+            if owned:
+                self._gemm(
+                    mma_sq_mnmn,
+                    sq_a,
+                    operand("inv_left", smem.akk, "a"),
+                    operand("inv_left", smem.sq, "b"),
+                    False,
+                )
             self._commit(edges + _E_DONE_C)
             self._stamp(trace, 2, 5, it)
             # Phase D: T Akk^T (negated and masked by TK).
             self._wait(edges, _E_READY_D, it)
             self._stamp(trace, 2, 6, it)
-            self._gemm(
-                mma_sq_kk64,
-                sq_a,
-                operand("inv_right", smem.sq, "a"),
-                operand("inv_right", smem.akk, "b"),
-                False,
-            )
+            if owned:
+                self._gemm(
+                    mma_sq_kk64,
+                    sq_a,
+                    operand("inv_right", smem.sq, "a"),
+                    operand("inv_right", smem.akk, "b"),
+                    False,
+                )
             self._commit(edges + _E_DONE_D)
             self._stamp(trace, 2, 7, it)
             # Phase E: intra ring (lower dq x4, lower k x4, upper dk x4).
             self._wait(edges, _E_READY_E, it)
             self._stamp(trace, 2, 8, it)
-            for r in cutlass.range_constexpr(12):
-                slot = r % 2
-                use = ring_base + r // 2
-                if use > 0:
-                    cute.arch.mbarrier_wait(ring_empty + slot, (use - 1) & 1)
-                block = r % 4
-                if cutlass.const_expr(r < 8):
-                    square = smem.aqk if r < 4 else smem.sq
-                    b = operand("intra_lower", square, "b")
-                    self._gemm(
-                        mma_lower, ring[slot], operand("intra_lower", smem.ds, "a"), b, False, block
-                    )
-                    self._gemm(
-                        mma_lower,
-                        ring[slot],
-                        operand("intra_lower", smem.ds, "a", token_tile),
-                        b,
-                        True,
-                        block,
-                    )
-                else:
-                    b_q = operand("intra_upper", smem.aqk, "b")
-                    b_k = operand("intra_upper", smem.sq, "b")
-                    self._gemm(
-                        mma_upper,
-                        ring[slot],
-                        operand("intra_upper", smem.ka, "a"),
-                        b_q,
-                        False,
-                        block,
-                    )
-                    self._gemm(
-                        mma_upper,
-                        ring[slot],
-                        operand("intra_upper", smem.kb, "a"),
-                        b_q,
-                        True,
-                        block,
-                    )
-                    self._gemm(
-                        mma_upper,
-                        ring[slot],
-                        operand("intra_upper", smem.qa, "a"),
-                        b_k,
-                        True,
-                        block,
-                    )
-                    self._gemm(
-                        mma_upper,
-                        ring[slot],
-                        operand("intra_upper", smem.t21, "a"),
-                        b_k,
-                        True,
-                        block,
-                    )
-                self._commit(ring_full + slot)
+            if owned:
+                for r in cutlass.range_constexpr(12):
+                    slot = r % 2
+                    use = ring_base + r // 2
+                    if use > 0:
+                        cute.arch.mbarrier_wait(ring_empty + slot, (use - 1) & 1)
+                    block = r % 4
+                    if cutlass.const_expr(r < 8):
+                        square = smem.aqk if r < 4 else smem.sq
+                        b = operand("intra_lower", square, "b")
+                        self._gemm(
+                            mma_lower,
+                            ring[slot],
+                            operand("intra_lower", smem.ds, "a"),
+                            b,
+                            False,
+                            block,
+                        )
+                        self._gemm(
+                            mma_lower,
+                            ring[slot],
+                            operand("intra_lower", smem.ds, "a", token_tile),
+                            b,
+                            True,
+                            block,
+                        )
+                    else:
+                        b_q = operand("intra_upper", smem.aqk, "b")
+                        b_k = operand("intra_upper", smem.sq, "b")
+                        self._gemm(
+                            mma_upper,
+                            ring[slot],
+                            operand("intra_upper", smem.ka, "a"),
+                            b_q,
+                            False,
+                            block,
+                        )
+                        self._gemm(
+                            mma_upper,
+                            ring[slot],
+                            operand("intra_upper", smem.kb, "a"),
+                            b_q,
+                            True,
+                            block,
+                        )
+                        self._gemm(
+                            mma_upper,
+                            ring[slot],
+                            operand("intra_upper", smem.qa, "a"),
+                            b_k,
+                            True,
+                            block,
+                        )
+                        self._gemm(
+                            mma_upper,
+                            ring[slot],
+                            operand("intra_upper", smem.t21, "a"),
+                            b_k,
+                            True,
+                            block,
+                        )
+                    self._commit(ring_full + slot)
             self._commit(edges + _E_DONE_E)
             self._stamp(trace, 2, 9, it)
 
@@ -1141,6 +1169,7 @@ class FusedKdaBwdKernel:
         self,
         ttidx,
         warp,
+        part,
         head,
         sequence,
         seq_start,
@@ -1235,6 +1264,7 @@ class FusedKdaBwdKernel:
             tok0 = seq_start + chunk * _BT
             valid = cutlass.min(_BT, seq_len - chunk * _BT)
             gchunk = chunk_base + chunk
+            owned = it % self.split == part
             # Phase A: beta, tails and triangular masks; Akk * diag(beta).
             if ttidx < _BT:
                 s_beta[ttidx] = (
@@ -1339,16 +1369,21 @@ class FusedKdaBwdKernel:
                     r_in[e, 0, sub] = (s_beta[t] * d_value).to(self.io_dtype)
                 r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
                 cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_kb[None, 0, sub, 0])
-            for sub in cutlass.range_constexpr(cute.size(sregs, mode=[2])):
-                cute.copy(sq_copy, sq_src_dakk[None, 0, sub, 0], sregs[None, 0, sub])
-                for e in cutlass.range_constexpr(cute.size(sregs, mode=[0])):
-                    i, j = sq_crd[e, 0, sub]
-                    value = sregs[e, 0, sub] * s_beta[j]
-                    keep = (j < i) and (i < valid)
-                    if cutlass.const_expr(self.debug):
-                        debug_out[gchunk, head, 5, i, j] = value if keep else cutlass.Float32(0.0)
-                    sq_out[e, 0, sub] = (value if keep else cutlass.Float32(0.0)).to(self.io_dtype)
-                cute.copy(t_sq_out[0], t_sq_out[1][None, 0, sub], w_sq[None, 0, sub])
+            if owned:
+                for sub in cutlass.range_constexpr(cute.size(sregs, mode=[2])):
+                    cute.copy(sq_copy, sq_src_dakk[None, 0, sub, 0], sregs[None, 0, sub])
+                    for e in cutlass.range_constexpr(cute.size(sregs, mode=[0])):
+                        i, j = sq_crd[e, 0, sub]
+                        value = sregs[e, 0, sub] * s_beta[j]
+                        keep = (j < i) and (i < valid)
+                        if cutlass.const_expr(self.debug):
+                            debug_out[gchunk, head, 5, i, j] = (
+                                value if keep else cutlass.Float32(0.0)
+                            )
+                        sq_out[e, 0, sub] = (value if keep else cutlass.Float32(0.0)).to(
+                            self.io_dtype
+                        )
+                    cute.copy(t_sq_out[0], t_sq_out[1][None, 0, sub], w_sq[None, 0, sub])
             cute.arch.fence_view_async_tmem_load()
             self._arrive(edges, _E_READY_C, _BAR_TK, ttidx)
             self._stamp(trace, 1, 5, it)
@@ -1364,85 +1399,109 @@ class FusedKdaBwdKernel:
                 s_dbeta[row0] = part0
                 s_dbeta[row0 + 8] = part1
             cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
-            self._store_rows(dv, smem.v, ttidx, head, tok0, valid)
+            if owned:
+                self._store_rows(dv, smem.v, ttidx, head, tok0, valid)
 
             # Phase D: T = Akk^T dAkk -> sSq (the only operand MMA D waits for).
             self._wait(edges, _E_DONE_C, it)
             self._stamp(trace, 1, 6, it)
-            self._square_to_smem(
-                0, ttidx, valid, tmem, mma_sq_kk, smem.sq, l_square, scale, debug_out, gchunk, head
-            )
+            if owned:
+                self._square_to_smem(
+                    0,
+                    ttidx,
+                    valid,
+                    tmem,
+                    mma_sq_kk,
+                    smem.sq,
+                    l_square,
+                    scale,
+                    debug_out,
+                    gchunk,
+                    head,
+                )
             self._arrive(edges, _E_READY_D, _BAR_TK, ttidx)
             self._stamp(trace, 1, 7, it)
-            # Channel-major state-path scaling and anchored tiles, tokens 32..63.
-            self._cm_phase_c(
-                1,
-                gchunk,
-                ttidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                smem,
-                gc,
-                s_beta,
-                debug_out,
-                scale,
-                l_token,
-                cm,
-            )
-            self._stamp(trace, 1, 8, it)
-            # dAqk -> sAqk (read only by the intra ring; the CH warpgroup writes dL).
-            self._square_to_smem(
-                1, ttidx, valid, tmem, mma_sq_kk, smem.aqk, l_square, scale, debug_out, gchunk, head
-            )
+            if owned:
+                # Channel-major state-path scaling and anchored tiles, tokens 32..63.
+                self._cm_phase_c(
+                    1,
+                    gchunk,
+                    ttidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    smem,
+                    gc,
+                    s_beta,
+                    debug_out,
+                    scale,
+                    l_token,
+                    cm,
+                )
+                self._stamp(trace, 1, 8, it)
+                # dAqk -> sAqk (read only by the intra ring; the CH warpgroup writes dL).
+                self._square_to_smem(
+                    1,
+                    ttidx,
+                    valid,
+                    tmem,
+                    mma_sq_kk,
+                    smem.aqk,
+                    l_square,
+                    scale,
+                    debug_out,
+                    gchunk,
+                    head,
+                )
             self._arrive(edges, _E_READY_E, _BAR_TK, ttidx)
             self._stamp(trace, 1, 9, it)
 
-            dg_part += self._cm_fold(
-                1,
-                it,
-                ttidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                smem,
-                ring_full,
-                ring_empty,
-                gc,
-                s_beta,
-                s_dbeta,
-                l_token,
-                l_square,
-                cm,
-                scale,
-                debug_out,
-                gchunk,
-            )
-            self._cm_epilogue(
-                1,
-                ttidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                dg_part,
-                s_xchg,
-                s_suffix,
-                smem,
-                q,
-                k,
-                dq,
-                dk,
-                dg,
-                l_token,
-                cm,
-                trace,
-                it,
-            )
-            if ttidx < valid:
-                dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
+            if owned:
+                dg_part += self._cm_fold(
+                    1,
+                    it,
+                    ttidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    smem,
+                    ring_full,
+                    ring_empty,
+                    gc,
+                    s_beta,
+                    s_dbeta,
+                    l_token,
+                    l_square,
+                    cm,
+                    scale,
+                    debug_out,
+                    gchunk,
+                )
+                self._cm_epilogue(
+                    1,
+                    ttidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    dg_part,
+                    s_xchg,
+                    s_suffix,
+                    smem,
+                    q,
+                    k,
+                    dq,
+                    dk,
+                    dg,
+                    l_token,
+                    cm,
+                    trace,
+                    it,
+                )
+                if ttidx < valid:
+                    dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
             self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
             self._stamp(trace, 1, 10, it)
 
@@ -1453,6 +1512,7 @@ class FusedKdaBwdKernel:
         self,
         tidx,
         warp,
+        part,
         head,
         sequence,
         seq_start,
@@ -1502,6 +1562,7 @@ class FusedKdaBwdKernel:
             tok0 = seq_start + chunk * _BT
             valid = cutlass.min(_BT, seq_len - chunk * _BT)
             gchunk = chunk_base + chunk
+            owned = it % self.split == part
             self._load_gate_column(0, gc, tok0, valid, head, tidx, cm)
             self._wait(edges, _E_LOAD_EARLY, it)
             self._stamp(trace, 0, 0, it)
@@ -1538,79 +1599,91 @@ class FusedKdaBwdKernel:
             self._stamp(trace, 0, 4, it)
             self._wait(edges, _E_DONE_C, it)
             self._stamp(trace, 0, 5, it)
-            if it == num_chunks - 1:
+            if it == num_chunks - 1 and owned:
                 buf = cm[1]
                 for part in cutlass.range_constexpr(_DV // 32):
                     _tmem_ld32(lane_base + tmem_offset("dh") + part * 32, buf)
                     for c in cutlass.range_constexpr(32):
                         dh0[sequence, head, tidx, part * 32 + c] = buf[c]
-            self._cm_phase_c(
-                0,
-                gchunk,
-                tidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                smem,
-                gc,
-                s_beta,
-                debug_out,
-                scale,
-                l_token,
-                cm,
-            )
-            # Phase E: dL = -(T Akk^T), strictly lower and valid -> sSq.
-            self._wait(edges, _E_DONE_D, it)
-            self._square_to_smem(
-                2, tidx, valid, tmem, mma_sq_kk, smem.sq, l_square, scale, debug_out, gchunk, head
-            )
+            if owned:
+                self._cm_phase_c(
+                    0,
+                    gchunk,
+                    tidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    smem,
+                    gc,
+                    s_beta,
+                    debug_out,
+                    scale,
+                    l_token,
+                    cm,
+                )
+                # Phase E: dL = -(T Akk^T), strictly lower and valid -> sSq.
+                self._wait(edges, _E_DONE_D, it)
+                self._square_to_smem(
+                    2,
+                    tidx,
+                    valid,
+                    tmem,
+                    mma_sq_kk,
+                    smem.sq,
+                    l_square,
+                    scale,
+                    debug_out,
+                    gchunk,
+                    head,
+                )
             self._arrive(edges, _E_READY_E, _BAR_CH, tidx)
             self._stamp(trace, 0, 6, it)
-            dg_part += self._cm_fold(
-                0,
-                it,
-                tidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                smem,
-                ring_full,
-                ring_empty,
-                gc,
-                s_beta,
-                s_dbeta,
-                l_token,
-                l_square,
-                cm,
-                scale,
-                debug_out,
-                gchunk,
-            )
-            self._stamp(trace, 0, 7, it)
+            if owned:
+                dg_part += self._cm_fold(
+                    0,
+                    it,
+                    tidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    smem,
+                    ring_full,
+                    ring_empty,
+                    gc,
+                    s_beta,
+                    s_dbeta,
+                    l_token,
+                    l_square,
+                    cm,
+                    scale,
+                    debug_out,
+                    gchunk,
+                )
+                self._stamp(trace, 0, 7, it)
 
-            self._cm_epilogue(
-                0,
-                tidx,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                dg_part,
-                s_xchg,
-                s_suffix,
-                smem,
-                q,
-                k,
-                dq,
-                dk,
-                dg,
-                l_token,
-                cm,
-                trace,
-                it,
-            )
+                self._cm_epilogue(
+                    0,
+                    tidx,
+                    head,
+                    tok0,
+                    valid,
+                    lane_base,
+                    dg_part,
+                    s_xchg,
+                    s_suffix,
+                    smem,
+                    q,
+                    k,
+                    dq,
+                    dk,
+                    dg,
+                    l_token,
+                    cm,
+                    trace,
+                    it,
+                )
             self._arrive(edges, _E_FREE, _BAR_CH, tidx)
             self._stamp(trace, 0, 8, it)
 
@@ -1975,7 +2048,7 @@ class FusedKdaBwdKernel:
         base_sq = cutlass.Int32(smem.sq.toint())
         for r in cutlass.range_constexpr(12):
             slot = r % 2
-            use = it * 6 + r // 2
+            use = (it // self.split) * 6 + r // 2
             block = r % 4
             lower = r < 8
             touches = ((col + 31) // _BC >= block) if lower else (col // _BC <= block)
