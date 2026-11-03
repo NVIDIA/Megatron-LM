@@ -3262,6 +3262,8 @@ def load_checkpoint(
             with load_ctx():
                 module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
+            if not strict:
+                raise
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 with load_ctx():
