@@ -1845,6 +1845,8 @@ class TransformerConfig(ModelParallelConfig):
                     "or ffn_hidden_size when that is unset)."
                 )
         elif expert_hidden <= 128 and expert_ffn <= 128 * etp:
+            # Seen on GB200 with FlashInfer 0.7.2.post1. test_flashinfer_mxfp8.py runs the
+            # smallest shapes accepted here and fails once FlashInfer serves this one.
             raise ValueError(
                 "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel when the expert hidden size "
                 f"and the per-rank FFN size both pad to 128; got hidden {expert_hidden} "

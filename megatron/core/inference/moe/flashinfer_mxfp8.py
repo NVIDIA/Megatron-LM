@@ -247,14 +247,6 @@ def prepare_routed_mxfp8_weights(
     experts, logical_rows, logical_cols = weight.data.shape
     padded_rows = _round_up(logical_rows, 128)
     padded_cols = _round_up(logical_cols, 128)
-    if (padded_rows, padded_cols) == (128, 128):
-        # FC1 is [FFN, hidden] and FC2 is [hidden, FFN]. FlashInfer's batched GEMMs have no
-        # kernel config when both pad to 128; TransformerConfig rejects such models up front.
-        raise ValueError(
-            "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel when the expert hidden size and "
-            "the per-rank FFN size both pad to 128; got an expert weight of shape "
-            f"({logical_rows}, {logical_cols})."
-        )
     scale_cols = padded_cols // 32
 
     expected_data_shape = (experts, padded_rows, padded_cols)
@@ -555,6 +547,14 @@ def flashinfer_routed_mxfp8_moe(
         raise ValueError("FC2 output size must match the model hidden size")
     if fc2_weight.logical_cols != fc1_weight.logical_rows:
         raise ValueError("FC2 K size must match the FC1 output size")
+    if (fc1_weight.padded_rows, fc1_weight.padded_cols) == (128, 128):
+        # FlashInfer 0.7.2's TRT-LLM batched GEMMs have no config for this shape;
+        # TransformerConfig.validate_flashinfer_mxfp8_expert_shapes rejects such models.
+        raise ValueError(
+            "FlashInfer routed MXFP8 MoE has no TRT-LLM kernel when the expert hidden size and "
+            f"the per-rank FFN size both pad to 128; got hidden {fc1_weight.logical_cols} and "
+            f"FFN {fc1_weight.logical_rows}."
+        )
     if probabilities.dtype != torch.float32:
         raise TypeError(
             f"FlashInfer routed MoE requires FP32 probabilities; got {probabilities.dtype}"
