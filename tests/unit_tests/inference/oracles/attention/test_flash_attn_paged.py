@@ -20,7 +20,9 @@ Contract (from the call site's arguments, the dynamic context's metadata and the
   ``pool[block_table[r, j // P], j % P]``; query ``i`` sits at position ``L_r - S_r + i`` and
   attends keys ``j <= L_r - S_r + i`` (bottom-right causal), and with the layer's window
   ``(W, 0)`` only keys ``j >= L_r - S_r + i - W``; scores ``s = scale * q.k`` with
-  ``scale = get_softmax_scale`` (``D ** -0.5`` here); softcap ``c * tanh(s / c)``; a sink adds
+  ``scale = D ** -0.5`` (the layers leave ``TransformerConfig.softmax_scale`` unset, so the scale
+  is the definition's, from the configured head dim ``kv_channels = D``; the reference takes it
+  from the configuration, never from the layer); softcap ``c * tanh(s / c)``; a sink adds
   ``exp(sink_h)`` to head ``h``'s softmax denominator; GQA head ``h`` reads KV head
   ``h // (H / Hk)``.
 * Outputs: prefill ``[T, 1, H, Dv]``, decode ``[R * S, 1, H, Dv]``, in q's row order. Rows past
@@ -46,7 +48,11 @@ on Hopper and Blackwell); prefill/mixed and decode-only; page size 256 (FA2's on
 prefill continuing across a page boundary; decode with ``S`` in 1, 2, 4 (MTP); GQA 1, 4, 8;
 head dim 64 and 128; window ``P-1``, ``P``, ``P+1``; softcap; learnable sink; zero-length padding
 requests; FA4 ``max_seqlen_k`` at the block-table capacity (as CUDA graphs pass it); FA3/FA4
-batch-invariant mode. Factors combined pairwise.
+batch-invariant mode. Factors combined pairwise. Decode whose packed query rows ``S * H / Hk``
+(FA3/FA4 pack a KV head's query heads with the request's tokens into the rows of one M tile) sit
+below, at and past the 128-row M tile and past FA4's two-stage 256-row tile on SM100, where FA4
+sizes its schedule from ``max_seqlen_q * H / Hk`` (one tile per request when that fits):
+``test_decode_query_rows_cross_the_m_tile``.
 
 Open PRs (written against main):
 * #8584 (n2): on main, FA4 on Hopper asks for split-KV (``num_splits=0``), which FA4's SM90
@@ -122,6 +128,7 @@ def _attention(
     softcap: Optional[float] = None,
     batch_invariant: bool = False,
     dtype: torch.dtype = torch.bfloat16,
+    heads: int = HEADS,
 ):
     """A ``SelfAttention`` layer (TE spec) pinned to FlashAttention ``version``."""
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -133,8 +140,8 @@ def _attention(
 
     config = TransformerConfig(
         num_layers=1,
-        hidden_size=HEADS * head_dim,
-        num_attention_heads=HEADS,
+        hidden_size=heads * head_dim,
+        num_attention_heads=heads,
         num_query_groups=kv_heads,
         kv_channels=head_dim,
         bf16=dtype == torch.bfloat16,
@@ -193,6 +200,7 @@ def _run(
     v_tail: str = "zero",
     capacity_max_seqlen_k: bool = False,
     dtype: torch.dtype = torch.bfloat16,
+    heads: int = HEADS,
 ):
     """Run the call site on a poisoned paged batch; return (out, q, batch, live_rows)."""
     g = ou.make_generator(device="cuda")
@@ -215,8 +223,8 @@ def _run(
     else:
         rows = -(-(live + 1) // 64) * 64  # padded token count, as CUDA-graph buckets pad it
         max_seqlen_q = max(q_lens)
-    q = ou.poisoned_empty((rows, 1, HEADS, head_dim), dtype)
-    q_live = torch.randn(live, 1, HEADS, head_dim, device="cuda", generator=g)
+    q = ou.poisoned_empty((rows, 1, heads, head_dim), dtype)
+    q_live = torch.randn(live, 1, heads, head_dim, device="cuda", generator=g)
     if softcap is not None:
         q_live = q_live * SOFTCAP_Q_SCALE
     q[:live] = q_live.to(dtype)
@@ -241,12 +249,14 @@ def _run(
     torch.cuda.synchronize()
     batch.check_pool_unchanged()
     ou.assert_exact(q, q_before, what="q (read-only)")
-    assert out.shape == (rows, 1, HEADS, head_dim), f"output shape {tuple(out.shape)}"
+    assert out.shape == (rows, 1, heads, head_dim), f"output shape {tuple(out.shape)}"
     return out, q, batch, live
 
 
-def _check(out, q, batch, live, module, *, softcap, sink, window, what):
-    scale = module.get_softmax_scale(q.squeeze(1))
+def _check(out, q, batch, live, *, head_dim, softcap, sink, window, what):
+    # The definition's scale for the configured head dim (``kv_channels``; no softmax_scale in the
+    # config), independent of the layer's own lookup (``get_softmax_scale``).
+    scale = head_dim**-0.5
     q_rows = q.squeeze(1)
     ref, _ = ar.paged_attention_reference(
         q_rows, batch, scale=scale, window=window, softcap=softcap, sink=sink
@@ -337,7 +347,7 @@ def _run_case(version, phase, case, dtype=torch.bfloat16):
         q,
         batch,
         live,
-        module,
+        head_dim=case["head_dim"],
         softcap=case["softcap"],
         sink=sink,
         window=window,
@@ -403,7 +413,7 @@ def test_small_batch_for_sanitizer(version):
             q,
             batch,
             live,
-            module,
+            head_dim=64,
             softcap=None,
             sink=None,
             window=None,
@@ -457,6 +467,78 @@ def test_batch_invariant_rows_do_not_depend_on_the_batch(version, phase):
         ou.assert_exact(alone[:q_len], out[rows], what=f"request {r} alone vs in the batch")
 
 
+# FA3/FA4 pack the H / Hk query heads that share a KV head with a request's S query tokens into
+# the rows of one M tile: 128 rows for FA4 on SM90 at head dim 128 and for FA4 on SM100, which
+# also runs a two-stage 256-row tile once the packed rows pass 128. FA4 sizes its schedule from
+# max_seqlen_q * H / Hk; on SM100 it gives each request a single tile while that product fits
+# (flash_attn/cute/interface.py, max_m_blocks_leq_one and q_stage, read at 4.0.0b27 and b34). With
+# MQA (Hk = 1) and 32 query heads, S = 3, 4, 5, 9 give 96, 128, 160 and 288 packed rows: below,
+# at and past the 128-row tile, and past the 256-row one.
+M_TILE_HEADS, M_TILE_KV_HEADS, M_TILE_HEAD_DIM = 32, 1, 128
+M_TILE_TOKENS = (3, 4, 5, 9)
+
+
+def _m_tile_cases():
+    params = []
+    for tag, version, batch_invariant in (
+        ("fa2", 2, False),
+        ("fa3", 3, False),
+        ("fa4", 4, False),
+        ("fa4bi", 4, True),
+    ):
+        for tokens in M_TILE_TOKENS:
+            params.append(
+                pytest.param(
+                    version,
+                    batch_invariant,
+                    tokens,
+                    id=f"{tag}-tokens={tokens}",
+                    marks=_version_marks(version),
+                )
+            )
+    return params
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("version, batch_invariant, tokens", _m_tile_cases())
+def test_decode_query_rows_cross_the_m_tile(version, batch_invariant, tokens):
+    """Multi-token decode (MTP, speculative) whose packed query rows ``S * H / Hk`` sit below, at
+    and past the 128-row M tile (and FA4's 256-row two-stage tile): every query row of every
+    request matches the fp64 reference, so the kernel must be told ``S`` query tokens per request
+    (``max_seqlen_q``) and must compute every M tile of a request."""
+    _require_flash(version)
+    page = 256 if version == 2 else 128  # FA2 reads only 256-token pages
+    module = _attention(
+        version,
+        kv_heads=M_TILE_KV_HEADS,
+        head_dim=M_TILE_HEAD_DIM,
+        batch_invariant=batch_invariant,
+        heads=M_TILE_HEADS,
+    )
+    out, q, batch, live = _run(
+        module,
+        phase="decode",
+        requests=_decode_requests(page, tokens),
+        padding=1,
+        page=page,
+        kv_heads=M_TILE_KV_HEADS,
+        head_dim=M_TILE_HEAD_DIM,
+        tokens=tokens,
+        heads=M_TILE_HEADS,
+    )
+    _check(
+        out,
+        q,
+        batch,
+        live,
+        head_dim=M_TILE_HEAD_DIM,
+        softcap=None,
+        sink=None,
+        window=None,
+        what=f"FA{version} decode, {tokens} tokens x {M_TILE_HEADS} query heads per KV head",
+    )
+
+
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.large
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -508,7 +590,7 @@ def test_pool_offsets_past_int32(version, phase):
         q,
         batch,
         live,
-        module,
+        head_dim=head_dim,
         softcap=None,
         sink=None,
         window=None,

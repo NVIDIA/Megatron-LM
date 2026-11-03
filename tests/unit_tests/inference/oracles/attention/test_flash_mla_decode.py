@@ -14,10 +14,10 @@ Contract (from the MLA math, the call site and FlashMLA's documented interface):
   ``cu_seqlens_q`` with ``S`` rows per live request and 0 for padding requests (which come last,
   with length 0 and an all-dummy block-table row).
 * Computes, for live request ``r`` with ``L_r`` cached latents: query ``i`` of ``S`` sits at
-  ``L_r - S + i`` and attends latents ``j <= L_r - S + i`` (bottom-right causal), with
-  ``scale = layer.softmax_scale`` (``(qk_head_dim + qk_pos_emb_head_dim) ** -0.5`` for plain
-  RoPE); values are the latents' first 512 channels; a sink adds ``exp(sink_h)`` to head ``h``'s
-  denominator. Output ``[R * S, 1, H, 512]``; padding rows unspecified.
+  ``L_r - S + i`` and attends latents ``j <= L_r - S + i`` (bottom-right causal), with MLA's
+  scale ``1 / sqrt(qk_head_dim + qk_pos_emb_head_dim)`` (no configured ``softmax_scale``, no YaRN
+  factor; the reference derives it from the configuration, not from the layer); values are the
+  latents' first 512 channels; a sink adds ``exp(sink_h)`` to head ``h``'s denominator. Output ``[R * S, 1, H, 512]``; padding rows unspecified.
 * FlashMLA's own output ``lse [R, H, S]`` is the natural-log sum of exponentiated scaled scores
   (the call site's sink correction relies on it).
 * Memory: the pool is read only. Rows past ``L_r`` in a request's last page and the dummy page
@@ -50,6 +50,7 @@ Hardware and open PRs (written against main):
 """
 
 import functools
+import math
 import subprocess
 import sys
 
@@ -62,6 +63,10 @@ from tests.unit_tests.inference.oracles.attention import attention_reference as 
 from tests.unit_tests.test_utilities import Utils
 
 LATENT, ROPE, BLOCK = 512, 64, 64  # FlashMLA's latent shape; dynamic MLA forces 64-token pages
+QK_HEAD_DIM = 64
+# MLA's scale from the configuration: 1 / sqrt(qk_head_dim + qk_pos_emb_head_dim) (the YaRN
+# factor mscale(rotary_scaling_factor, mscale_all_dim)**2 is 1 for the default mscale_all_dim 0).
+SOFTMAX_SCALE = 1.0 / math.sqrt(QK_HEAD_DIM + ROPE)
 LENGTHS = [1, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK - 1, 2 * BLOCK + 1, 4097]
 HEADS = [16, 32, 64, 128]
 
@@ -132,7 +137,7 @@ def _mla_attention(num_heads: int):
         num_attention_heads=num_heads,
         q_lora_rank=128,
         kv_lora_rank=LATENT,
-        qk_head_dim=64,
+        qk_head_dim=QK_HEAD_DIM,
         qk_pos_emb_head_dim=ROPE,
         v_head_dim=128,
         qk_layernorm=True,
@@ -152,6 +157,7 @@ def _mla_attention(num_heads: int):
     module = MLASelfAttention(
         config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
     )
+    assert config.softmax_scale is None and config.mscale_all_dim == 0.0, "see SOFTMAX_SCALE"
     return module.cuda().eval()
 
 
@@ -245,7 +251,7 @@ def test_decode_matches_reference(case):
     inputs, batch, live = _latent_batch(lengths, tokens, heads, case["padding"])
     out = _decode(module, inputs, sink)
     batch.check_pool_unchanged()
-    _check(out, inputs, batch, live, module.softmax_scale, sink, f"MLA decode {case}")
+    _check(out, inputs, batch, live, SOFTMAX_SCALE, sink, f"MLA decode {case}")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -263,7 +269,7 @@ def test_batch_sizes_around_the_sm_count(requests):
     inputs, batch, live = _latent_batch(lengths, 1, 16, padding=1)
     out = _decode(module, inputs)
     batch.check_pool_unchanged()
-    _check(out, inputs, batch, live, module.softmax_scale, None, f"MLA decode, {count} requests")
+    _check(out, inputs, batch, live, SOFTMAX_SCALE, None, f"MLA decode, {count} requests")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -276,7 +282,7 @@ def test_small_batch_for_sanitizer(heads):
     inputs, batch, live = _latent_batch([3, BLOCK + 1], 1, heads, padding=1)
     out = _decode(module, inputs)
     batch.check_pool_unchanged()
-    _check(out, inputs, batch, live, module.softmax_scale, None, "MLA decode sanitizer case")
+    _check(out, inputs, batch, live, SOFTMAX_SCALE, None, "MLA decode sanitizer case")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -322,7 +328,7 @@ def test_pool_offsets_past_int32(heads):
     batch.q_lens = [1] * len(lengths)
     out = _decode(module, inputs)
     batch.check_pool_unchanged()
-    _check(out, inputs, batch, len(lengths), module.softmax_scale, None, "MLA decode past 2**31")
+    _check(out, inputs, batch, len(lengths), SOFTMAX_SCALE, None, "MLA decode past 2**31")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -362,7 +368,7 @@ def test_decode_replays_in_a_cuda_graph(heads):
     )
     graph.replay()
     torch.cuda.synchronize()
-    _check(out, inputs, batch, live, module.softmax_scale, None, "MLA decode after graph replay")
+    _check(out, inputs, batch, live, SOFTMAX_SCALE, None, "MLA decode after graph replay")
 
 
 @pytest.mark.usefixtures("model_parallel")
@@ -388,17 +394,15 @@ def test_flash_mla_lse_is_natural_log(tokens):
             LATENT,
             metadata,
             num_splits,
-            softmax_scale=module.softmax_scale,
+            softmax_scale=SOFTMAX_SCALE,
             causal=True,
         )
-    _, ref_lse = ar.paged_attention_reference(
-        inputs["q"].squeeze(1), batch, scale=module.softmax_scale
-    )
+    _, ref_lse = ar.paged_attention_reference(inputs["q"].squeeze(1), batch, scale=SOFTMAX_SCALE)
     # Trusted: torch's fp32 logsumexp of the fp32 scores of the same bf16 inputs.
     trusted, start = [], 0
     for r, length in enumerate(lengths):
         k = ar.gather_request_kv(batch.k, batch.block_table, r, length)[:, 0].float()
-        scores = torch.einsum("shd,ld->shl", q[r].float(), k) * module.softmax_scale
+        scores = torch.einsum("shd,ld->shl", q[r].float(), k) * SOFTMAX_SCALE
         allowed = ar.allowed_keys(tokens, length, None, "cuda")
         trusted.append(torch.logsumexp(scores.masked_fill(~allowed[:, None], float("-inf")), -1))
     trusted = torch.cat(trusted)  # [R * S, H]

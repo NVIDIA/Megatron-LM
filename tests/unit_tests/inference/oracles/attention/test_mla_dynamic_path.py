@@ -14,8 +14,11 @@ Contract (from the MLA math; the training path is the semantic definition):
   ``linear_proj`` equals the training forward of the same weights (``cache_mla_latents=False``)
   over that request's whole prefix: ``softmax(scale * (q_nope . k_nope + q_pe . k_pe)) v`` per
   head, bottom-right causal, with ``k_nope = W_UK c``, ``v = W_UV c``, ``c = RMSNorm(kv_latent)``
-  (the layer's kv norm), ``k_pe`` RoPE'd at the key's position, the layer's ``softmax_scale``, and
-  the layer's sink (``softmax_type`` learnable: ``exp(sink_h)`` in the denominator).
+  (the layer's kv norm, applied once, with its gain), ``q = [q_nope, q_pe]`` split as
+  ``[qk_head_dim, qk_pos_emb_head_dim]``, ``k_pe`` RoPE'd at the key's position, MLA's scale
+  ``1 / sqrt(qk_head_dim + qk_pos_emb_head_dim)`` (times the YaRN ``mscale**2``, which is 1 with
+  ``mscale_all_dim = 0``; no ``softmax_scale`` in the config), and the layer's sink
+  (``softmax_type`` learnable: ``exp(sink_h)`` in the denominator).
 * Padding: rows past the live tokens are not part of the contract, but they must not move live
   rows: with an FP8 per-tensor recipe ``linear_proj`` scales its input by an amax over every row,
   so padding rows must reach it as zeros (whatever the attention kernel left there). The check
@@ -30,15 +33,20 @@ Contract (from the MLA math; the training path is the semantic definition):
 
 Reference: fp64 MLA attention built from the training path's own bf16 inputs (its RoPE'd ``q`` and
 ``k_pe`` as core attention receives them, and the latent before the kv norm), with the norm, the
-up-projection (``W_UK``/``W_UV`` from the layer's ``linear_kv_up_proj``) and attention in fp64.
-Tolerance class: floating point, bounded by the training forward in bf16 (an independent
-implementation: unpaged, unabsorbed, TE attention), per token row. Padding and unused-memory
+up-projection (``W_UK``/``W_UV`` from the layer's ``linear_kv_up_proj``) and attention in fp64, at
+the scale derived from the configuration above (not read from a layer). Tolerance class: floating
+point, bounded by the training forward in bf16 (an independent implementation: unpaged,
+unabsorbed, TE attention, given that scale explicitly as ``softmax_scale`` so that it does not
+share the layer's default-scale derivation), per token row. Padding and unused-memory
 contracts: exact (metamorphic: poisoned vs clean runs are bitwise equal). DSA/FA2: the error.
 
 Variants covered: prompts 63, 64, 65, 129 (around the 64-token page), a prefill step, a
 decode-only step (absorbed, FlashMLA), a mixed step (decodes plus a 70-token prefill, whole-pool
 up-projection), another decode-only step; vanilla and learnable sink; bf16 and FP8 tensorwise for
-the padding and unused-memory contracts; poison values 1e4 and NaN.
+the padding and unused-memory contracts; poison values 1e4 and NaN. DeepSeek-V3's head widths
+(``qk_head_dim`` 128, ``qk_pos_emb_head_dim`` 64, ``v_head_dim`` 128), so the query's content and
+RoPE parts have different widths; random RMSNorm gains (the q and kv norms), so a norm applied
+twice or skipped changes the result (with unit gains RMSNorm is idempotent).
 
 Hardware: H100 with a FlashMLA build that has its SM90 kernels (#8701; the manifest runs the SM90
 build) and FA3 or FA4 for the paged prefill (FA2 cannot read 64-token pages). The scenario also
@@ -63,6 +71,7 @@ Open PRs (written against main):
 
 import contextlib
 import functools
+import math
 import subprocess
 import sys
 from typing import Dict
@@ -75,7 +84,11 @@ from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.attention import attention_reference as ar
 from tests.unit_tests.test_utilities import Utils
 
-HEADS, HIDDEN, LATENT, ROPE, QK, V = 16, 512, 512, 64, 64, 128
+HEADS, HIDDEN, LATENT, ROPE, QK, V = 16, 512, 512, 64, 128, 128
+# MLA's softmax scale from the configuration: 1 / sqrt(qk_head_dim + qk_pos_emb_head_dim), times
+# the YaRN factor mscale(rotary_scaling_factor, mscale_all_dim)**2, which is 1 for the default
+# mscale_all_dim = 0 (DeepSeek-V2/V3's definition).
+SOFTMAX_SCALE = 1.0 / math.sqrt(QK + ROPE)
 PROMPTS = {0: 63, 1: 64, 2: 65, 3: 129}
 LATE_PROMPT = 70  # joins in the mixed step
 DEVICES = [ou.requires_sm(ou.HOPPER, ou.BLACKWELL), pytest.mark.launch_on_gb200]
@@ -185,6 +198,17 @@ def _weights(sink: bool = False, fp8: bool = False, flash_version=None):
     twin holding them too. The weights are copied before any inference forward, which deletes the
     fused KV up-projection."""
     first = _layer(_config(cache=True, sink=sink, fp8=fp8, flash_version=flash_version))
+    assert (
+        first.config.softmax_scale is None and first.config.mscale_all_dim == 0.0
+    ), "SOFTMAX_SCALE is MLA's default scale: no configured scale and no YaRN factor"
+    # Random RMSNorm gains (the q and kv norms fused into the up-projections): with unit gains a
+    # second normalization of already-normalized latents would change nothing.
+    g = ou.make_generator(seed=ou.DEFAULT_SEED + 3, device="cuda")
+    with torch.no_grad():
+        gains = [p for name, p in first.named_parameters() if name.endswith("layer_norm_weight")]
+        assert len(gains) == 2, "expected the q and kv up-projections' fused RMSNorm gains"
+        for gain in gains:
+            gain.copy_(torch.rand(gain.shape, device="cuda", generator=g) + 0.5)
     if sink:
         g = ou.make_generator(seed=ou.DEFAULT_SEED + 1, device="cuda")
         with torch.no_grad():
@@ -198,7 +222,10 @@ def _weights(sink: bool = False, fp8: bool = False, flash_version=None):
         layer.load_state_dict(state)
         return layer
 
-    twin = _layer(_config(cache=False, sink=sink, fp8=fp8))
+    # The trusted training forward gets the scale from the definition (SOFTMAX_SCALE) as an
+    # explicit config value, so it does not share the default-scale derivation under test.
+    twin = _layer(_config(cache=False, sink=sink, fp8=fp8, softmax_scale=SOFTMAX_SCALE))
+    assert twin.softmax_scale == SOFTMAX_SCALE
     twin.load_state_dict(state)
     return make_layer, twin
 
@@ -344,7 +371,7 @@ def _training_reference(twin, hidden_prefix: torch.Tensor, rows: slice):
         key64,
         value,
         allowed,
-        scale=twin.softmax_scale,
+        scale=SOFTMAX_SCALE,
         sink=None if sink is None else sink.double(),
     )
     trusted = captured["out"][rows, 0]
