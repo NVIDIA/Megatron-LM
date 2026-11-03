@@ -301,6 +301,22 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The SSM chunk-scan and KDA oracles step fp64 references token by token: 15 and 17 minutes on
+  # H100. GB200 runs only the KDA production case (3 minutes), in its directory bucket.
+  - test_case: [tests/unit_tests/inference/oracles/ssm/test_chunk_scan_varlen.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/oracles/ssm/test_kda_chunk.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/inference/**/*.py]
     products:
       - environment: [lts, dev]
