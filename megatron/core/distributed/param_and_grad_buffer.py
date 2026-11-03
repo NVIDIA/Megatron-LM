@@ -1939,14 +1939,15 @@ def partition_buckets(
     CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back communications will prevent the
     overlap of communication kernels with computation kernels.
 
-    Before applying a grouping strategy that could merge buckets, buffers are partitioned by
-    optimizer ownership so a bucket group never mixes LayerWise-managed and
-    DistributedOptimizer-managed parameters.
+    A bucket group runs one set of collectives with one DDP config, so the buffers are first
+    partitioned by optimizer ownership (LayerWise-managed or not) and DDP config, and buckets of
+    different partitions never share a group. Partitions with an fp8 buffer come first, as the
+    fp8 buckets lead the grouping below; the others keep their buffer order.
 
-    The grouping strategy within each optimizer ownership partition is:
-    1. If force_single_bucket_group is True, put all buckets across all buffers into a single
+    The grouping strategy within each partition is:
+    1. If force_single_bucket_group is True, put all buckets of the partition into a single
        bucket group.
-    2. If force_single_bucket_group is False, when there is no fp8 buffer in the input buffers,
+    2. If force_single_bucket_group is False, when there is no fp8 buffer in the partition,
        let each bucket group have only one bucket.
     3. If force_single_bucket_group is False, when using fp8 params, merge all non-fp8 buckets
        into the last fp8 bucket group.
@@ -1959,145 +1960,97 @@ def partition_buckets(
          has completed. This is because we need to wait for the non-fp8 params from the beginning
          layers to obtain their gradients.
        - Combining the non-fp8 bucket with the last fp8 bucket can help avoid this issue.
+       - reduce_scatter_with_fp32_accumulation needs one bucket per group, so with it the
+         non-fp8 buckets keep groups of their own.
 
     Args:
         buffers (list): list of input buffers.
-        force_single_bucket_group (bool, optional): force all buckets with the same optimizer
-            ownership into a single bucket group.
+        force_single_bucket_group (bool, optional): force all buckets of a partition into a
+            single bucket group.
         reduce_scatter_with_fp32_accumulation (bool, optional): keep buckets separate when the
             FP32-accumulating reduce-scatter implementation requires singleton groups.
     """
-
-    if len(buffers) == 0:
-        return []
-
-    # LayerWiseDistributedOptimizer and DistributedOptimizer classify a whole bucket group from
-    # its first bucket when synchronizing their subsets. Partition only when the policy below may
-    # merge owners (or when multiple owners each have an FP8 buffer); singleton paths retain their
-    # existing global bucket order for overlap linkage.
-    buffers_by_optimizer_owner = {}
-    num_fp8_buffers = 0
+    partitions: List[List[_ParamAndGradBuffer]] = []
     for buffer in buffers:
         assert buffer.params
-        is_layerwise_owned = getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        is_layer_wise = getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
         assert all(
-            getattr(param, 'is_managed_by_layer_wise_optimizer', False) == is_layerwise_owned
+            getattr(param, 'is_managed_by_layer_wise_optimizer', False) == is_layer_wise
             for param in buffer.params
         )
-        buffers_by_optimizer_owner.setdefault(is_layerwise_owned, []).append(buffer)
-        num_fp8_buffers += int(buffer.param_dtype == torch.uint8)
-
-    should_partition_by_owner = len(buffers_by_optimizer_owner) > 1 and (
-        force_single_bucket_group
-        or num_fp8_buffers > 1
-        or (num_fp8_buffers == 1 and not reduce_scatter_with_fp32_accumulation)
-    )
-    if should_partition_by_owner:
-        owner_buffer_partitions = list(buffers_by_optimizer_owner.values())
-        owner_buffer_partitions.sort(
-            key=lambda owner_buffers: not any(
-                buffer.param_dtype == torch.uint8 for buffer in owner_buffers
-            )
+        partition = next(
+            (
+                partition
+                for partition in partitions
+                if getattr(partition[0].params[0], 'is_managed_by_layer_wise_optimizer', False)
+                == is_layer_wise
+                and partition[0].ddp_config == buffer.ddp_config
+            ),
+            None,
         )
-        return [
-            bucket_group
-            for owner_buffers in owner_buffer_partitions
-            for bucket_group in partition_buckets(
-                owner_buffers,
-                force_single_bucket_group=force_single_bucket_group,
-                reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
-            )
-        ]
+        if partition is None:
+            partitions.append([buffer])
+        else:
+            partition.append(buffer)
+    partitions.sort(
+        key=lambda partition: not any(buffer.param_dtype == torch.uint8 for buffer in partition)
+    )
+    return [
+        bucket_group
+        for partition in partitions
+        for bucket_group in _group_buckets(
+            partition, force_single_bucket_group, reduce_scatter_with_fp32_accumulation
+        )
+    ]
+
+
+def _group_buckets(
+    buffers: List[_ParamAndGradBuffer],
+    force_single_bucket_group: bool,
+    reduce_scatter_with_fp32_accumulation: bool,
+) -> List[_ParamAndGradBucketGroup]:
+    """Group the buckets of buffers that share optimizer ownership and DDP config."""
+    ddp_config = buffers[0].ddp_config
+    data_parallel_group = buffers[0].data_parallel_group
+    data_parallel_world_size = buffers[0].data_parallel_world_size
+    for buffer in buffers:
+        assert data_parallel_group == buffer.data_parallel_group
+        assert data_parallel_world_size == buffer.data_parallel_world_size
+
+    def new_group(buckets):
+        return _ParamAndGradBucketGroup(
+            buckets, ddp_config, data_parallel_group, data_parallel_world_size
+        )
+
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
+    if force_single_bucket_group:
+        return [new_group([bucket for buffer in buffers for bucket in buffer.buckets])]
 
     # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
     # whether one is present. Non-uint8 dtypes can legitimately appear in
     # multiple buffers, so the uniqueness check is restricted to uint8.
-    fp8_buffer = None
-    for buffer in buffers:
-        if buffer.param_dtype == torch.uint8:
-            assert fp8_buffer is None
-            fp8_buffer = buffer
+    fp8_buffers = [buffer for buffer in buffers if buffer.param_dtype == torch.uint8]
+    assert len(fp8_buffers) <= 1
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
-    if force_single_bucket_group:
-        buckets = []
-        ddp_config = buffers[0].ddp_config
-        data_parallel_group = buffers[0].data_parallel_group
-        data_parallel_world_size = buffers[0].data_parallel_world_size
-        for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
-            assert data_parallel_group == buffer.data_parallel_group
-            assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
+    # Case 2: When there is no fp8 buffer, let each bucket group have only one bucket.
+    if not fp8_buffers:
+        return [new_group([bucket]) for buffer in buffers for bucket in buffer.buckets]
 
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
-
-    if fp8_buffer is None:
-        # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
-        #         only one bucket.
-        bucket_groups = []
-        for buffer in buffers:
-            for bucket in buffer.buckets:
-                bucket_groups.append(
-                    _ParamAndGradBucketGroup(
-                        [bucket],
-                        buffer.ddp_config,
-                        buffer.data_parallel_group,
-                        buffer.data_parallel_world_size,
-                    )
-                )
-        return bucket_groups
+    # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
+    fp8_buckets = fp8_buffers[0].buckets
+    non_fp8_buckets = [
+        bucket
+        for buffer in buffers
+        if buffer.param_dtype != torch.uint8
+        for bucket in buffer.buckets
+    ]
+    bucket_groups = [new_group([bucket]) for bucket in fp8_buckets[:-1]]
+    if reduce_scatter_with_fp32_accumulation:
+        # reduce_scatter_with_fp32_accumulation requires exactly one bucket per group (see the
+        # assert in _ParamAndGradBucketGroup.reduce_scatter), so the non-fp8 buckets get their
+        # own groups after the last fp8 bucket.
+        bucket_groups.append(new_group([fp8_buckets[-1]]))
+        bucket_groups.extend(new_group([bucket]) for bucket in non_fp8_buckets)
     else:
-        # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
-        for buffer in buffers:
-            if buffer.param_dtype != torch.uint8:
-                for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
-
-        bucket_groups = []
-        for bucket in fp8_buffer.buckets:
-            if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
-                # reduce_scatter_with_fp32_accumulation requires exactly one bucket
-                # per group (see assert in _ParamAndGradBucketGroup.reduce_scatter).
-                # Without this flag the non-FP8 buckets would be merged into the last
-                # FP8 group, violating that constraint. So we split them out into
-                # their own individual groups instead.
-                if reduce_scatter_with_fp32_accumulation:
-                    bucket_groups.append(
-                        _ParamAndGradBucketGroup(
-                            [bucket],
-                            buffer.ddp_config,
-                            buffer.data_parallel_group,
-                            buffer.data_parallel_world_size,
-                        )
-                    )
-                    if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
-                            bucket_groups.append(
-                                _ParamAndGradBucketGroup(
-                                    [non_fp8_bucket],
-                                    buffer.ddp_config,
-                                    buffer.data_parallel_group,
-                                    buffer.data_parallel_world_size,
-                                )
-                            )
-
-                    continue  # Skip the default bucket group creation below
-                else:
-                    group_buckets = [bucket] + non_fp8_buckets
-            else:
-                # The first N-1 bucket groups.
-                group_buckets = [bucket]
-            bucket_groups.append(
-                _ParamAndGradBucketGroup(
-                    group_buckets,
-                    buffer.ddp_config,
-                    buffer.data_parallel_group,
-                    buffer.data_parallel_world_size,
-                )
-            )
-        return bucket_groups
+        bucket_groups.append(new_group([fp8_buckets[-1]] + non_fp8_buckets))
+    return bucket_groups
