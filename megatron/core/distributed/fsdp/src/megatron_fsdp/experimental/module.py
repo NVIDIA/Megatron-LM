@@ -49,6 +49,8 @@ class FsdpModule:
 
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
+    _mesh: DeviceMesh
+    _main_grad_placements: tuple[Placement, ...]
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -79,14 +81,11 @@ class FsdpModule:
                 See ``fully_shard``.
         """
         self._context = context
+        self._mesh = mesh
+        self._main_grad_placements = main_grad_placements
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
-        # All groups share this mesh and these gradient placements. Dtype-specific
-        # sharding layouts do not change whether communication is needed.
-        if any(
-            mesh.size(axis) > 1 and placement != Partial("avg")
-            for axis, placement in enumerate(main_grad_placements)
-        ):
+        if self.requires_inner_reduction:
             self._accumulate_gradients = self._reduce_inner_gradients
         else:
             self._accumulate_gradients = self._accumulate_local_gradients
@@ -525,6 +524,18 @@ class FsdpModule:
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
+
+    @property
+    def requires_inner_reduction(self) -> bool:
+        """Whether this module's gradients need communication before accumulation.
+
+        All groups share the mesh and gradient placements. Dtype-specific sharding
+        layouts do not change whether communication is needed.
+        """
+        return any(
+            self._mesh.size(axis) > 1 and placement != Partial("avg")
+            for axis, placement in enumerate(self._main_grad_placements)
+        )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
