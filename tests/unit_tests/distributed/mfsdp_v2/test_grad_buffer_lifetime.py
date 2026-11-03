@@ -65,6 +65,7 @@ def test_grad_buffer_lifetime_matches_reference(
         FsdpContext(
             device=device,
             prefetch_order=PrefetchOrder.RECORDED,
+            prefetch_process_group=mesh.get_group(0),
             runtime_policy=RuntimePolicy(
                 caller_managed_grad_sync=True, overlap_outer_communication=overlap_outer
             ),
@@ -209,6 +210,7 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
         FsdpContext(
             device=device,
             prefetch_order=PrefetchOrder.RECORDED,
+            prefetch_process_group=mesh.get_group(0),
             runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
         )
     ) as context:
@@ -248,16 +250,21 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
     assert source_ref() is None
     assert not context.is_recording_execution_order
     assert len(context.execution_order) == 2
-    assert context._grad_buffer_release_plan == {1: 1}
+    assert context._grad_buffer_release_plan == {1: (0,)}
 
     def unexpected_query(event):
         raise AssertionError("Replay must use the recorded plan, not query events")
 
     monkeypatch.setattr(torch.cuda.Event, "query", unexpected_query)
+
+    def unexpected_collective(*args, **kwargs):
+        raise AssertionError("Replay must not compile another retirement plan")
+
+    monkeypatch.setattr(dist, "all_reduce", unexpected_collective)
     # Eager replay must obey the same fixed plan as CUDA-graph capture.
-    source_ref = submit()
     with torch.cuda.stream(stream):
         model(result)
+        source_ref = submit()
         assert source_ref() is not None
         model(result)
         assert source_ref() is None
@@ -271,8 +278,8 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        source_ref = submit()
         model(result)
+        source_ref = submit()
         assert source_ref() is not None
         model(result)
         assert source_ref() is None
@@ -286,4 +293,4 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
         torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
         torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
         stream.wait_stream(torch.cuda.current_stream(device))
-    assert context._grad_buffer_release_plan == {1: 1}
+    assert context._grad_buffer_release_plan == {1: (0,)}

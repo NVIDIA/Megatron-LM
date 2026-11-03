@@ -79,6 +79,7 @@ class FsdpModule:
         """
         self._context = context
         self._phase = Phase.RESTING
+        self._grad_buffer_position = -1
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_scale <= 0:
@@ -430,6 +431,12 @@ class FsdpModule:
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
+        # Main records pre-hooks, so nested children may advance past this producer.
+        self._grad_buffer_position = (
+            len(context.execution_order)
+            if context.is_recording_execution_order
+            else context.execution_order.position
+        )
         if context.is_recording_execution_order:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
@@ -498,7 +505,9 @@ class FsdpModule:
                     with torch.cuda.stream(context.outer_reduction_stream):
                         group.reduce_outer_gradients()
             finally:
-                context._retain_grad_buffers(buffers, current_stream)
+                context._retain_grad_buffers(
+                    buffers, current_stream, position=self._grad_buffer_position
+                )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
