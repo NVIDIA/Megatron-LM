@@ -57,9 +57,10 @@ decision changes with the step's token count. Covered:
 - TP = 1, 2 and 8 (flag off as controls; NVLS, NVLS disabled, batch-invariant mode, fp16, a
   1 KiB buffer), 3 layers (first, middle, last);
 - TP 2 x PP 2 with 3 layers per stage and the final norm on the last stage (NVLS and NCCL);
-- step token counts of decode (tp, 2 tp), mixed (64 tp, 65 tp) and prefill (1024 tp) steps in
-  dynamic batching's [T, 1, H] layout, with the default buffer and with one holding exactly
-  64 tp tokens (so consecutive steps decide differently, 65 tp is one row per rank over);
+- step token counts of decode (2 tp, 4 tp; tp alone in `narrow_decode`), mixed (64 tp, 65 tp)
+  and prefill (1024 tp) steps in dynamic batching's [T, 1, H] layout, with the default buffer and
+  with one holding exactly 64 tp tokens (so consecutive steps decide differently, 65 tp is one
+  row per rank over);
 - full-iteration graphs (the block captured at two sizes) and local graphs (each layer captured
   alone, replayed as a chain, with eager steps in between), at sizes that decide alike and that
   decide differently;
@@ -78,6 +79,9 @@ Main vs open PRs:
   fuse). #8561 (d1) fixes them; #8712 (n16) and #8704 (n8) change the same wiring and must keep
   these tests passing; #8868 (t3-r04f3) changes the batch-invariant branch to a rank-ordered
   reduce-scatter (still no residual add without d1).
+- `test_step_sizes_keep_the_residual[narrow_decode]` fails on main in the fused kernel's
+  launcher (one token per rank at H = 128 is under a warp: num_warps = 0); #8880 (t3-r09f2)
+  fixes it.
 - MLA (`test_mla_layers_keep_the_residual`) fails on main at construction: the block asks every
   layer for `linear_qkv`'s norm weights, which MLA does not have (AttributeError). #8704 (n8,
   stacked on #8561) wires MLA and must make it pass; the MLA up projections all-gather back to
@@ -233,7 +237,7 @@ def build_block(tp, case, fuse, *, pp=1, num_layers=LAYERS, **block_kwargs):
         pipeline_model_parallel_size=pp,
         pipeline_dtype=torch.bfloat16 if pp > 1 else None,
     )
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     block = TransformerBlock(
         config, get_gpt_layer_with_inference_spec(), post_layer_norm=False, **block_kwargs
     )
@@ -458,7 +462,7 @@ def test_pipeline_stages_keep_the_residual(case, parallel, monkeypatch):
         pipeline_model_parallel_size=pp,
         pipeline_dtype=torch.bfloat16,
     )
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     block = TransformerBlock(
         config,
         get_gpt_layer_with_inference_spec(),
@@ -518,10 +522,16 @@ def test_pipeline_stages_keep_the_residual(case, parallel, monkeypatch):
 
 # ---- Step sizes (decode, mixed, prefill) ------------------------------------------------------
 
-# Token counts per step, in units of tp, in dynamic batching's [T, 1, H] layout: decode (1, 2),
-# mixed prefill/decode (64, 65) and a long prefill (1024), in an order where each kind follows
-# another.
-STEP_TOKENS = (64, 1, 1024, 2, 65, 64, 1)
+# Token counts per step, in units of tp, in dynamic batching's [T, 1, H] layout: decode (2, 4
+# tokens per rank pair), mixed prefill/decode (64, 65) and a long prefill (1024), in an order
+# where each kind follows another. One token per rank (T = tp) is its own case, `narrow_decode`:
+# with this toy H (128) that shard is 16 threads of the fused kernel, under a warp, and main's
+# launcher computes num_warps = 0 there (the launcher bug #8880 fixes, s4-o5's narrow-rows task).
+STEP_TOKENS = {
+    "decode_prefill_sizes": (64, 2, 1024, 4, 65, 64, 2),
+    "sizes_across_capacity": (64, 2, 1024, 4, 65, 64, 2),
+    "narrow_decode": (1, 64, 1),
+}
 CAPACITY_TOKENS = 64  # in units of tp: the "capacity" buffers hold [64 tp, 1, H] bf16 exactly
 
 
@@ -530,12 +540,14 @@ def _capacity_bytes(tp):
 
 
 @pytest.mark.parametrize("parallel", [2], indirect=True, ids=["tp2"])
-@pytest.mark.parametrize("case", ["decode_prefill_sizes", "sizes_across_capacity"])
+@pytest.mark.parametrize("case", list(STEP_TOKENS))
 def test_step_sizes_keep_the_residual(case, parallel, monkeypatch):
     """Consecutive steps of different token counts on one model and one buffer. With the
     default buffer every step fuses; with a buffer of exactly 64 tp tokens the 65 tp and
     1024 tp steps fall back between fused steps (fails on main: the fallback drops the
-    residual, #8561)."""
+    residual, #8561). `narrow_decode` runs one token per rank, a shard narrower than a warp:
+    fails on main with "num_warps must be a power of 2" in the fused kernel's launcher, passes
+    with #8880 (t3-r09f2)."""
     tp = parallel
     capacity = _capacity_bytes(tp) if case == "sizes_across_capacity" else None
     if capacity is not None:
@@ -544,7 +556,7 @@ def test_step_sizes_keep_the_residual(case, parallel, monkeypatch):
     trace = _Trace(monkeypatch)
     eps = config.layernorm_epsilon
     problems, branches = [], []
-    for step, units in enumerate(STEP_TOKENS):
+    for step, units in enumerate(STEP_TOKENS[case]):
         tokens = tp * units
         x_full = full_input(dtype, (tokens, 1, HIDDEN), seed=step)
         x = tp_shard(x_full)
@@ -596,6 +608,11 @@ def test_cuda_graph_replay_keeps_the_residual(case, parallel, monkeypatch):
         monkeypatch.setattr(SymmetricMemoryManager, "_default_size_mb", capacity / 2**20)
     sizes = (tp * 64, tp * (128 if capacity is not None else 32))
     block, config, dtype = build_block(tp, "nvls", True)
+    # Seed before capturing, as the engine does: inference has no dropout, so the inference RNG
+    # tracker's fork is a no-op. The training tracker's fork (TransformerBlock.forward under
+    # sequence parallelism) would reseed the CUDA generator inside the capture, which CUDA
+    # graphs refuse.
+    model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
     trace = _Trace(monkeypatch)
     eps = config.layernorm_epsilon
     problems, branches = [], []
@@ -726,8 +743,17 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
         parallel_output=True,
         pre_process=True,
         post_process=True,
+        # No learned position embedding: it is a plain fp32 torch.nn.Embedding, which would make
+        # the decoder input fp32, and TE's RMSNorm has no fp32-input / bf16-weight kernel.
+        position_embedding_type="none",
     )
     model = model.cuda().eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            # As Float16Module does, but only for parameters not yet in bf16: the fused wiring
+            # holds the (bf16) norm weights by reference, so they must keep their storage.
+            if param.dtype != torch.bfloat16:
+                param.data = param.data.to(torch.bfloat16)
     zero_projections_(model.decoder.layers)
     model.decoder.final_layernorm = None
 
@@ -837,7 +863,7 @@ def test_mtp_inner_layer_keeps_the_residual(case, parallel, depth, monkeypatch):
     layers that add it only inside a fused kernel they never run (#8561)."""
     tp = parallel
     config, dtype = make_config(tp, "nvls", True, mtp_num_layers=2)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     spec = get_gpt_layer_with_inference_spec()
     mtp_spec = get_gpt_mtp_block_spec(config, spec, use_transformer_engine=True)
     mtp = build_module(
@@ -914,7 +940,7 @@ def test_hybrid_stack_keeps_the_residual(case, parallel, monkeypatch):
     linear_fc2 / linear_proj (AttributeError, O8a-N7)."""
     tp = parallel
     config, dtype = make_config(tp, "nvls", True, num_layers=len(HYBRID_PATTERN))
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     stack = HybridStack(
         config,
         hybrid_inference_stack_spec.submodules,
@@ -979,7 +1005,7 @@ def test_mla_layers_keep_the_residual(case, pattern, parallel, monkeypatch):
         qk_layernorm=True,
         rope_type="rope",
     )
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
     specs = {
         kind: get_gpt_layer_with_inference_spec(
             qk_layernorm=True, multi_latent_attention=kind == "M"

@@ -3,7 +3,8 @@
 """Oracle for DeepGEMM `m_grouped_bf16_gemm_nt_contiguous`, the batch-invariant grouped GEMM.
 
 Kernel entry points (`megatron/core/transformer/custom_layers/batch_invariant_kernels.py`):
-- `grouped_gemm_batch_invariant(a, w, offs=, m_total=)` -> `_bf16_grouped_gemm_aligned_contiguous`:
+- `grouped_gemm_batch_invariant(a, w, offs=, m_total=)` (with s4f-grouped-gemm-alignment also
+  `offs_alignment=`) -> `_bf16_grouped_gemm_aligned_contiguous`:
   inference, over expert blocks already aligned by the permute (`inference/moe/fused_moe.py`
   through `inference/moe/batch_invariant.grouped_mm`, FC1 and FC2 of every BF16 MoE layer in
   batch-invariant mode); CUDA-graph safe.
@@ -26,7 +27,12 @@ Contract (written from the callers' semantics):
 - Batch invariance: a row's bits depend only on a[r] and w[e]: not on the other experts' counts,
   the block's position, M_total, which entry point ran, or eager vs CUDA-graph replay with new
   offsets.
-- Precondition, unchecked on main: aligned block starts. A misaligned `offs` must raise or still
+- Precondition: aligned block starts. On main it is unchecked and undeclared. With
+  s4f-grouped-gemm-alignment the caller declares the alignment the offsets were built with
+  (`offs_alignment`): a declaration that is not a positive multiple of A, or an `offs` that is not
+  one entry per expert ([E]), must be rejected before the GEMM; offsets declared with a multiple
+  of A but holding misaligned values remain the documented, unchecked precondition (their values
+  are on the device). A misaligned `offs` declared with its true alignment must raise or still
   give every live row its own expert's product; it must never mix experts silently.
 
 Reference: a per-expert fp64 loop. Trusted implementation: per-expert `torch.mm` in bf16 on the
@@ -43,13 +49,18 @@ K in {64, 128, 2880, 7168}, 0 / 1 / A tail rows past offs[-1], and M_total = 0.
 
 Main vs open PRs: no open PR changes these entry points' per-row results. #8866 (t3-r04f2) and
 #8869 (t3-p4n3) add `_bf16_grouped_gemm_device_counts` (the TE grouped-tensor path) on the same
-DeepGEMM kernel; it is not on main and is not tested here. The misaligned-offsets case is
-expected to fail on main (finding O8a-N1); no open PR adds the guard.
+DeepGEMM kernel; it is not on main and is not tested here. s4f-grouped-gemm-alignment
+(fix/bi-grouped-gemm-offsets-contract) adds the required `offs_alignment` keyword, which
+`grouped_gemm` passes only where the entry point takes it, and the host-side checks: the
+misaligned-offsets case, the foreign-alignment rejections and the offs-shape rejections fail on
+main (finding O8a-N1: nothing is declared or checked there) and pass with that PR. Every other
+case passes on both.
 
 Hardware: H100 and GB200. Needs DeepGEMM with bf16 bindings; a missing DeepGEMM fails the test
 on the target hardware.
 """
 
+import inspect
 import math
 
 import pytest
@@ -75,6 +86,23 @@ def _alignment() -> int:
         " 'batch_invariant')"
     )
     return bik.grouped_gemm_batch_invariant_alignment()
+
+
+# s4f-grouped-gemm-alignment (branch fix/bi-grouped-gemm-offsets-contract) makes every caller
+# declare the alignment its offsets were built with: `offs_alignment`, keyword-only and required
+# there, absent on main. These tests are written against main and must also pass with that PR,
+# so the keyword is passed exactly when the entry point takes it.
+_DECLARES_ALIGNMENT = (
+    "offs_alignment" in inspect.signature(bik.grouped_gemm_batch_invariant).parameters
+)
+
+
+def grouped_gemm(a, w, offs, m_total, offs_alignment):
+    """`grouped_gemm_batch_invariant`, declaring ``offs_alignment`` where the API takes it."""
+    kwargs = dict(offs=offs, m_total=m_total)
+    if _DECLARES_ALIGNMENT:
+        kwargs["offs_alignment"] = offs_alignment
+    return bik.grouped_gemm_batch_invariant(a, w, **kwargs)
 
 
 def expert_counts(num_experts: int, pattern: str, align: int):
@@ -193,7 +221,7 @@ def test_aligned_grouped_gemm_matches_fp64(case, monkeypatch):
     w = _weights(case["e"], case["n"], case["k"])
     a_before, w_before = batch.a.clone(), w.clone()
     spy = _DeepGemmSpy(monkeypatch)
-    out = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+    out = grouped_gemm(batch.a, w, batch.offs, batch.m_total, align)
     assert out.shape == (batch.m_total, case["n"]) and out.dtype == torch.bfloat16
     assert spy.calls == (1 if batch.m_total else 0), f"DeepGEMM ran {spy.calls} times"
     ou.assert_exact(batch.a, a_before, what="a is read-only")
@@ -225,7 +253,7 @@ def test_padded_entry_point_matches_aligned(case):
         compact_rows.append(torch.arange(start, start + count, device=_DEVICE))
         start += count
     _check_experts(out, compact, compact_rows, w, f"padded {_id(case)}")
-    aligned = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+    aligned = grouped_gemm(batch.a, w, batch.offs, batch.m_total, align)
     ou.assert_exact(out, aligned[all_live], what="padded vs aligned entry point")
 
 
@@ -249,7 +277,7 @@ def test_rows_do_not_depend_on_other_experts():
         batch = AlignedBatch(
             counts, k, align, tail, seed=sum(counts), live_rows={probe: probe_rows}
         )
-        out = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+        out = grouped_gemm(batch.a, w, batch.offs, batch.m_total, align)
         rows = out[batch.live(probe)]
         if expected is None:
             expected = rows
@@ -271,29 +299,33 @@ def test_cuda_graph_replay_with_new_offsets():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):  # warm up (DeepGEMM JIT) outside the capture
-        bik.grouped_gemm_batch_invariant(a_buf, w, offs=offs_buf, m_total=capacity)
+        grouped_gemm(a_buf, w, offs_buf, capacity, align)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out_buf = bik.grouped_gemm_batch_invariant(a_buf, w, offs=offs_buf, m_total=capacity)
+        out_buf = grouped_gemm(a_buf, w, offs_buf, capacity, align)
     for pattern in ("cycle3", "one_expert", "all_empty", "cycle0"):
         batch = AlignedBatch(expert_counts(num_experts, pattern, align), k, align, 0, seed=7)
         ou.poison_(a_buf)
         a_buf[: batch.m_total] = batch.a
         offs_buf.copy_(batch.offs)
         graph.replay()
-        eager = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+        eager = grouped_gemm(batch.a, w, batch.offs, batch.m_total, align)
         for e in range(num_experts):
             rows = batch.live(e)
             ou.assert_exact(out_buf[rows], eager[rows], what=f"replay {pattern}, expert {e}")
 
 
 def test_misaligned_offsets_raise_or_stay_correct():
-    """A block start that is not a multiple of the alignment: raise, or keep every row right.
+    """A block start that is not a multiple of the alignment, declared with its true alignment
+    (1): raise before the GEMM, or keep every row right.
 
-    Expected to fail on main: nothing checks the alignment, and DeepGEMM takes a block's expert
-    from its first row, so expert 1's first rows are multiplied by expert 0's weights (finding
-    O8a-N1). The inference permute aligns every block, so production never builds such offsets.
+    Fails on main: nothing checks the alignment (main's entry point takes no declaration), and
+    DeepGEMM takes a block's expert from its first row, so expert 1's first rows are multiplied
+    by expert 0's weights (finding O8a-N1). Passes with s4f-grouped-gemm-alignment, which rejects
+    a declared alignment DeepGEMM cannot use. Offsets declared with DeepGEMM's alignment but
+    holding misaligned values stay a documented, unchecked precondition there (the values live on
+    the device), so they are not a case here. The inference permute aligns every block.
     """
     align = _alignment()
     k, n = 128, 256
@@ -304,7 +336,7 @@ def test_misaligned_offsets_raise_or_stay_correct():
     a = torch.randn(ends[-1], k, device=_DEVICE, generator=g).to(torch.bfloat16)
     offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
     try:
-        out = bik.grouped_gemm_batch_invariant(a, w, offs=offs, m_total=ends[-1])
+        out = grouped_gemm(a, w, offs, ends[-1], offs_alignment=1)
         torch.cuda.synchronize()
     except (AssertionError, RuntimeError, ValueError):
         return
@@ -315,13 +347,92 @@ def test_misaligned_offsets_raise_or_stay_correct():
     _check_experts(out, a, rows, w, "misaligned offsets")
 
 
+class _GemmCalls:
+    """Counts the aligned grouped GEMM's launches, to check that a rejection comes first."""
+
+    def __init__(self, monkeypatch):
+        self.calls = 0
+        real = bik._bf16_grouped_gemm_aligned_contiguous
+
+        def spy(*args, **kwargs):
+            self.calls += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bik, "_bf16_grouped_gemm_aligned_contiguous", spy)
+
+
+def _expect_rejection(monkeypatch, call, what):
+    """`call` must raise before the GEMM runs."""
+    gemm = _GemmCalls(monkeypatch)
+    with pytest.raises((AssertionError, ValueError)):
+        call()
+    torch.cuda.synchronize()
+    assert gemm.calls == 0, f"{what}: the GEMM ran before the rejection"
+
+
+# (case, declared alignment as a function of DeepGEMM's A): offsets built from raw cumulative
+# counts, with torch grouped_mm's 16, with half of A, and a non-positive declaration.
+_FOREIGN_ALIGNMENTS = [
+    ("raw_counts", lambda a: 1),
+    ("torch_grouped_mm", lambda a: 16),
+    ("half", lambda a: a // 2),
+    ("zero", lambda a: 0),
+]
+
+
+@pytest.mark.parametrize(
+    "declared", [f for _, f in _FOREIGN_ALIGNMENTS], ids=[c for c, _ in _FOREIGN_ALIGNMENTS]
+)
+def test_declared_alignment_deepgemm_cannot_use_is_rejected(declared, monkeypatch):
+    """Offsets built for counts [A + 5, A] with an alignment that is not a positive multiple of
+    DeepGEMM's A, and declared so: rejected before the GEMM.
+
+    Fails on main (no declaration: the GEMM runs and mixes experts, O8a-N1); passes with
+    s4f-grouped-gemm-alignment.
+    """
+    align = _alignment()
+    alignment = declared(align)
+    step = max(alignment, 1)
+    counts = [align + 5, align]
+    blocks = [math.ceil(c / step) * step for c in counts]
+    ends = [blocks[0], blocks[0] + blocks[1]]
+    assert ends[0] % align, "the layout must be one DeepGEMM cannot use"
+    w = _weights(2, 128, 64)
+    a = torch.zeros(ends[-1], 64, device=_DEVICE, dtype=torch.bfloat16)
+    offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
+    _expect_rejection(
+        monkeypatch,
+        lambda: grouped_gemm(a, w, offs, ends[-1], alignment),
+        f"declared alignment {alignment}",
+    )
+
+
+@pytest.mark.parametrize("num_offs", [1, 3], ids=["fewer_than_experts", "more_than_experts"])
+def test_offsets_not_one_per_expert_are_rejected(num_offs, monkeypatch):
+    """`offs` must hold one end row per expert of `w` ([E]); one or three offsets for two experts
+    are rejected before the GEMM. The layouts are aligned and every extra block is empty, so a
+    GEMM that ran anyway would stay inside `w`.
+
+    Fails on main (offs' shape is unchecked); passes with s4f-grouped-gemm-alignment.
+    """
+    align = _alignment()
+    ends = [align, 2 * align, 2 * align][:num_offs]
+    w = _weights(2, 128, 64)
+    m_total = 2 * align
+    a = torch.zeros(m_total, 64, device=_DEVICE, dtype=torch.bfloat16)
+    offs = torch.tensor(ends, device=_DEVICE, dtype=torch.int32)
+    _expect_rejection(
+        monkeypatch, lambda: grouped_gemm(a, w, offs, m_total, align), f"{num_offs} offsets"
+    )
+
+
 def test_empty_problem():
     """M_total = 0: an empty [0, N] result, on both entry points."""
     _alignment()
     w = _weights(4, 128, 64)
     a = torch.empty(0, 64, device=_DEVICE, dtype=torch.bfloat16)
     offs = torch.zeros(4, device=_DEVICE, dtype=torch.int32)
-    out = bik.grouped_gemm_batch_invariant(a, w, offs=offs, m_total=0)
+    out = grouped_gemm(a, w, offs, 0, _alignment())
     assert out.shape == (0, 128) and out.dtype == torch.bfloat16
     m_indices = torch.empty(0, device=_DEVICE, dtype=torch.int32)
     out = bik._bf16_grouped_gemm_contiguous(a, w, m_indices, [0, 0, 0, 0])
@@ -335,6 +446,6 @@ def test_sanitizer_case(monkeypatch):
     batch = AlignedBatch([3, align + 1], 64, align, 2, seed=1)
     w = _weights(2, 128, 64)
     spy = _DeepGemmSpy(monkeypatch)
-    out = bik.grouped_gemm_batch_invariant(batch.a, w, offs=batch.offs, m_total=batch.m_total)
+    out = grouped_gemm(batch.a, w, batch.offs, batch.m_total, align)
     spy.check()
     _check_experts(out, batch.a, [batch.live(e) for e in range(2)], w, "sanitizer")
