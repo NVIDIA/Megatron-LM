@@ -278,11 +278,11 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup, singleton)
     for plane in source.planes:
         plane.local_buffer.zero_()
     assert source.view([Replicate()]) is source
-    assert source.can_be_viewed_as([Replicate()])
+    assert source.can_redistribute_locally([Replicate()])
 
     view = source.view([BlockAtomic(32)])
-    assert source.can_be_viewed_as([BlockAtomic(32)])
-    assert view.can_be_viewed_as([Replicate()]) == (mesh.size() == 1)
+    assert source.can_redistribute_locally([BlockAtomic(32)])
+    assert view.can_redistribute_locally([Replicate()]) == (mesh.size() == 1)
     assert view.view([BlockAtomic(32)]) is view
     assert source.is_alias_of(view)
     assert view.is_alias_of(source)

@@ -287,7 +287,7 @@ class DBuffer:
         buffer.local_buffer = local_buffer
         return buffer
 
-    def can_be_viewed_as(self, placements: Iterable[Placement]) -> bool:
+    def can_redistribute_locally(self, placements: Iterable[Placement]) -> bool:
         """Whether a local view preserves the values required by the target placements.
 
         Singleton axes need no communication. On larger axes, only unchanged

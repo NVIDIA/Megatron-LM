@@ -350,7 +350,7 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if self.model_weight.can_be_viewed_as(unsharded_placements):
+        if self.model_weight.can_redistribute_locally(unsharded_placements):
             self._unsharded_model_weight = self.model_weight.view(unsharded_placements)
         else:
             with self._symmetric_memory_context():
