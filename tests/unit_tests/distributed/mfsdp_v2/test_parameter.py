@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
@@ -210,6 +211,30 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
 
     output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
     torch.testing.assert_close(output, torch.full_like(output, 96.0))
+
+
+def test_meta_parameters_keep_delayed_wgrad_marker(distributed_setup):
+    """Sharding meta parameters keeps Transformer Engine's delayed-wgrad marker.
+
+    FsdpModule reduces a parameter marked with skip_backward_post_hook after backward_dw()
+    rather than after autograd accumulates its gradient.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    linear = te.Linear(
+        16,
+        16,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device="meta",
+        delay_wgrad_compute=True,
+    )
+    assert linear.weight.skip_backward_post_hook
+
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(linear, mesh=mesh, placements=_default_placements())
+
+    assert getattr(linear.weight, "skip_backward_post_hook", False)
 
 
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
