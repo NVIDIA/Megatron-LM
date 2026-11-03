@@ -222,7 +222,7 @@ async def main(
         client.shutdown_coordinator()
         client.stop()
     # Reap the coordinator child on the rank that spawned it.
-    await engine.join_coordinator_process()
+    engine.join_coordinator_process()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 
 

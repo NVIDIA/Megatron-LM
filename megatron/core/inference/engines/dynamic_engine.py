@@ -1794,21 +1794,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return dp_addr
 
-    async def join_coordinator_process(self, timeout: float = 10.0) -> None:
-        """Reap the coordinator child process this engine spawned."""
+    def join_coordinator_process(self, timeout: float = 10.0) -> None:
+        """Reap the coordinator child this engine spawned; terminate it if it ignores SHUTDOWN."""
         process = self.inference_coordinator_process
         if process is None:
             return
-        await asyncio.to_thread(process.join, timeout)
+        process.join(timeout)
         if process.is_alive():
-            logger.warning(f"Inference coordinator alive {timeout}s after shutdown; terminating.")
+            logger.warning(
+                f"Inference coordinator still alive {timeout}s after shutdown; terminating."
+            )
             process.terminate()
-            await asyncio.to_thread(process.join, 5.0)
-            if process.is_alive():
-                process.kill()
-                await asyncio.to_thread(process.join)
-        elif process.exitcode:
-            logger.warning(f"Inference coordinator exited with code {process.exitcode}.")
+            process.join()
         self.inference_coordinator_process = None
 
     @contextmanager

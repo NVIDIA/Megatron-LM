@@ -214,7 +214,7 @@ class _CoordinatorRuntime:
             finally:
                 self._client = None
                 # Reap the coordinator child once it has processed SHUTDOWN.
-                await self._engine.join_coordinator_process()
+                self._engine.join_coordinator_process()
             return
 
         # Partial-setup path: client never opened. If the coordinator
