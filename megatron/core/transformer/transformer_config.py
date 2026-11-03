@@ -1499,21 +1499,18 @@ class TransformerConfig(ModelParallelConfig):
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
     (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
     deterministic by construction on any hardware. "multimem" keeps the native
-    NVLS in-switch reduce-scatter, with better scaling at large NVLink domains.
-    Batch invariance needs only that its sum is deterministic and that a
-    token's sum depends only on its partials; that was measured within one
-    process on H100 (2-8 GPUs) and GB200 (2-4 GPUs). On Hopper an NVLS result
-    can also depend on earlier multicast allocations unless the driver and
-    Fabric Manager carry the fix (docs/user-guide/deterministic-training.md).
-    Its rounding depends on the GPU and the group size. It returned the
-    correctly rounded fp32 sum (bitwise-equal to an fp64 reference) over 16.7M
-    adversarial channels on B200 and at 2 and 4 GPUs on GB200, so software
-    paths that must match it bitwise accumulate in fp64; larger NVLink domains
-    are unmeasured. On H100 it was correctly rounded at 2 GPUs only: at 4 and
-    8 it was not, and two 4-GPU groups of one node returned different bits for
-    the same partials, so no software path matches it bitwise there. Use
-    "ordered" when bitwise parity with a software path, such as training's MoE
-    combine, is needed."""
+    NVLS in-switch reduce-scatter, with better scaling at large NVLink domains;
+    batch invariance needs its sum to be deterministic and a token's sum to
+    depend only on that token's partials. "multimem" is rejected on Hopper
+    (compute capability 9), as --deterministic-mode rejects NVLS there: on an
+    H100 system a token's combined row changed bits with the tokens batched
+    alongside it, and Hopper NVLS reductions can depend on earlier multicast
+    allocations unless the driver and Fabric Manager carry the fix, which is not
+    checked (NVIDIA/nccl#2360, docs/user-guide/deterministic-training.md). On
+    GB200 it was measured batch-invariant and correctly rounded (the fp32 sum
+    rounded once, bitwise-equal to an fp64 reference) at 2 and 4 GPUs, as on
+    B200 over 16.7M adversarial channels, so software paths that must match it
+    bitwise accumulate in fp64. Larger NVLink domains are unmeasured."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4738,6 +4735,25 @@ class TransformerConfig(ModelParallelConfig):
                 f"Unknown batch_invariant_backend {self.batch_invariant_backend!r}; "
                 f"expected one of {_BATCH_INVARIANT_BACKENDS}."
             )
+            # As --deterministic-mode rejects NVLS on Hopper: the result of a Hopper NVLS
+            # reduction can depend on earlier multicast allocations unless the driver and
+            # Fabric Manager carry the fix, and their versions cannot be checked here.
+            if (
+                self.batch_invariant_collective == "multimem"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 9
+            ):
+                raise ValueError(
+                    "batch_invariant_collective='multimem' is not supported on Hopper "
+                    "(compute capability 9). The NVLS in-switch reduction it uses may not be "
+                    "batch-invariant there: on an H100 system a token's combined row changed "
+                    "bits with the tokens batched alongside it. Hopper NVLS reductions can "
+                    "depend on multicast objects allocated earlier in the process unless the "
+                    "kernel driver and Fabric Manager are 550.144.03 or later in the 550 "
+                    "branch, or 570 or later (the 560 branch has no fix); their versions are "
+                    "not checked here (NVIDIA/nccl#2360). Use "
+                    "batch_invariant_collective='ordered' (the default)."
+                )
             assert self.params_dtype == torch.bfloat16, (
                 "Batch invariant mode supports BF16 model parameters only; "
                 f"got {self.params_dtype}."

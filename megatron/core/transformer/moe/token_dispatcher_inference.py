@@ -670,18 +670,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         )
         use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
         # Under batch-invariant mode the "multimem" option keeps the native
-        # NVLS in-switch fp32 reduce. Batch invariance needs only that it is
-        # deterministic and that a token's sum depends on that token's partials
-        # alone; that was measured within one process on H100 (2-8 GPUs) and
-        # GB200 (2-4 GPUs). On Hopper an NVLS result can also depend on earlier
-        # multicast allocations unless the driver carries the fix (see
-        # docs/user-guide/deterministic-training.md). The sum is not correctly
-        # rounded everywhere: GB200 returned the exact sum rounded once at 2 and
-        # 4 GPUs (larger NVLink domains are unmeasured); H100 did at 2 GPUs but
-        # not at 4 or 8, where two 4-GPU groups of one node also returned
-        # different bits for the same partials. "ordered" (default) uses the
-        # explicit fixed rank-order fp32 kernel, deterministic by construction
-        # anywhere.
+        # NVLS in-switch fp32 reduce; batch invariance needs it to be
+        # deterministic, with a token's sum depending only on that token's
+        # partials. TransformerConfig rejects it on Hopper, where an H100 system
+        # was measured not batch-invariant (NVIDIA/nccl#2360). On GB200 it was
+        # measured batch-invariant and correctly rounded at 2 and 4 GPUs; larger
+        # NVLink domains are unmeasured. "ordered" (default) uses the explicit
+        # fixed rank-order fp32 kernel, deterministic by construction anywhere.
         reduce_scatter_v = (
             batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
         )

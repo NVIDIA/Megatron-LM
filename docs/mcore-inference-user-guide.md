@@ -144,6 +144,9 @@ workload rather than generalizing from any single comparison.
 > `batch_invariant_backend` (`te_native` by default, or `deepgemm` / `triton`)
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
+> `multimem` is rejected on Hopper GPUs, where the NVLS in-switch reduction it
+> uses may not be batch-invariant (see the Hopper note in
+> [deterministic training](user-guide/deterministic-training.md)).
 >
 > Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
 > MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under

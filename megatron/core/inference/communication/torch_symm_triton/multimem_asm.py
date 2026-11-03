@@ -39,13 +39,13 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
             GB200 (2-4 GPUs), where most inexact sums (ties included) come out rounded
             toward zero, so a result can differ from the nearest-even one by one bf16 ulp.
         -   When `reduce_f32=True`: native f32 addition
-            (128 bits = 4 x fp32, 1 per register). Measured deterministic within one
-            process on one set of GPUs, with each element's sum depending only on that
-            element's inputs (on Hopper, see the multicast caveat in
-            docs/user-guide/deterministic-training.md). Correctly rounded on GB200 at 2
-            and 4 GPUs and on H100 at 2; not on H100 at 4 or 8, where two 4-GPU groups of
-            one node also returned different bits for the same inputs. Larger groups are
-            unmeasured.
+            (128 bits = 4 x fp32, 1 per register). Correctly rounded on GB200 at 2 and 4
+            GPUs and on H100 at 2; not on H100 at 4 or 8 GPUs. On GB200 each element's sum
+            was measured to depend only on that element's inputs. On one H100 system a
+            row's sum changed bits between calls that changed its position, the other rows
+            and the timing, which is why batch-invariant mode rejects this reduction on
+            Hopper (see the multicast caveat in docs/user-guide/deterministic-training.md).
+            Larger groups are unmeasured.
 
     Args:
         ptr: Memory pointer to the source buffer.
