@@ -40,8 +40,17 @@ temperature, the fp32 top-p). Megatron and FlashInfer compute in fp32, so a toke
 membership in ``S_k`` or ``S`` is decided within fp32 rounding is ambiguous; the reference
 rejects such inputs (``ValueError``: a test design error, not a kernel failure) unless the test
 builds exact dyadic inputs and asks for ``exact_boundaries``.
+
+Renormalizations (``assert_renormalized``, ``assert_log_probs``): FlashInfer renormalizes a row
+by multiplying with the (approximate, ``rcp.approx``) reciprocal of an fp32 sum taken in its own
+order, so its output carries a common relative scale error of a few ulp per row that torch's
+pairwise sum does not (H100, pdx 7849977: up to 24x torch's error at V >= 150K). The checks
+therefore split a row into its scale (the mass, bounded by the fp32 summation error of the
+kernel's reduction tree) and its values after that scale (bounded by the harness policy against
+torch fp32 on the same GPU normalized the same way); the kept set is exact.
 """
 
+import math
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence
@@ -85,10 +94,112 @@ SAMPLING_VOCAB_SIZES = ou.boundary_sizes(
     1024, 2048, SAMPLING_TILE, minimum=1, production=PRODUCTION_VOCABS + (4094,)
 )
 
-# Around the radix top-k CTA split (one, two, three CTAs per row on H100) and production sizes.
-RADIX_VOCAB_SIZES = ou.boundary_sizes(
-    RADIX_CHUNK_H100, degenerate=False, production=PRODUCTION_VOCABS
-)
+# Around the radix top-k CTA split on H100: the largest 128-multiples served by one and by two
+# CTAs below the shared-memory limit (57472, 114944), the first two- and three-CTA sizes (57593,
+# 115185), and the production sizes. Sizes whose chunk ends within a few dozen tokens of
+# RADIX_CHUNK_H100 do not launch (finding O4a-N1): RADIX_SMEM_LIMIT_VOCABS.
+RADIX_VOCAB_SIZES = sorted({57472, 57593, 114944, 115185, *PRODUCTION_VOCABS})
+
+# O4a-N1: FlashInfer sizes a radix CTA's dynamic shared memory up to the full 227 KiB without
+# counting the kernel's static shared memory. These sizes leave 0, 4 (measured: invalid argument)
+# and 64-224 bytes (multiples of 128, as Megatron pads vocabularies) of headroom.
+RADIX_SMEM_LIMIT_VOCABS = (57591, 57592, 115072, 115183, 115184, 172672, 230272, 287744, 287872)
+
+
+UNIT_ROUNDOFF = 2.0**-24  # fp32
+
+
+def renorm_summation_depth(vocab: int) -> int:
+    """Depth of the summation tree FlashInfer 0.7.2 sums a row of V probabilities with.
+
+    Each of 1024 threads adds at most ``ceil(V / 1024) + 3`` terms in sequence (strided or
+    4-wide loads: ``sampling.cuh`` ternary top-p, ``air_top_p.cuh:436-447``,
+    ``topk.cuh:1840-1870``), the block reduction adds 10 levels, and the multi-CTA top-k one
+    partial per CTA.
+    """
+    return math.ceil(vocab / SAMPLING_BLOCK_THREADS) + 3 + 10 + math.ceil(vocab / RADIX_CHUNK_H100)
+
+
+def renorm_mass_bound(vocab: int, terms: int, renorms: int = 1) -> float:
+    """Bound on ``|sum(out) - 1|`` after ``renorms`` fp32 renormalizations of ``terms`` values.
+
+    A sum of n non-negative terms through a tree of depth d is within ``min(n - 1, d) * u`` of
+    the exact sum (each term is rounded at most d times; Higham, *Accuracy and Stability of
+    Numerical Algorithms*, ch. 4); the reciprocal (``rcp.approx``, at most 1 ulp) adds ``2u``
+    and the products ``u``.
+    """
+    depth = min(max(terms - 1, 0), renorm_summation_depth(vocab))
+    return renorms * (depth + 3) * UNIT_ROUNDOFF
+
+
+def trusted_renorm(probs: torch.Tensor, refs: torch.Tensor) -> torch.Tensor:
+    """torch fp32 on the same device: keep the reference's set, divide by torch's sum."""
+    kept = torch.where(refs.to(probs.device) > 0, probs, torch.zeros_like(probs))
+    return kept / kept.sum(-1, keepdim=True)
+
+
+def _assert_mass(mass: torch.Tensor, bound: torch.Tensor, what: str) -> None:
+    err = (mass.cpu() - 1.0).abs()
+    bad = (err > bound).nonzero().reshape(-1).tolist()
+    if bad:
+        rows = ", ".join(
+            f"row {r}: |mass - 1| {float(err[r]):.3e} > {float(bound[r]):.3e}" for r in bad[:8]
+        )
+        raise AssertionError(f"{what}: row mass off by more than fp32 summation allows: {rows}")
+
+
+def assert_renormalized(
+    out: torch.Tensor, probs: torch.Tensor, refs: torch.Tensor, *, what: str
+) -> None:
+    """A renormalization kernel's fp32 rows against the fp64 renormalized reference ``refs``.
+
+    1. Kept set exact: ``out > 0`` exactly where ``refs > 0``.
+    2. Scale: the row's mass is 1 within ``renorm_mass_bound`` (FlashInfer's summation order and
+       reciprocal).
+    3. Values after the scale: ``out / sum(out)`` against ``refs`` with
+       ``ou.assert_close_to_reference`` per row (factor 2, one ulp), the trusted implementation
+       (``trusted_renorm``) normalized the same way; only elementwise roundings remain.
+    """
+    ou.assert_exact(out > 0, refs.to(out.device) > 0, what=f"{what}: kept set")
+    mass = out.double().sum(-1)
+    vocab = out.shape[-1]
+    terms = (refs > 0).sum(-1).tolist()
+    bound = torch.tensor([renorm_mass_bound(vocab, n) for n in terms], dtype=torch.float64)
+    _assert_mass(mass, bound, what)
+    trusted = trusted_renorm(probs, refs).double()
+    trusted = (trusted / trusted.sum(-1, keepdim=True)).float()
+    shape = (out.double() / mass[:, None]).float()
+    ou.assert_close_to_reference(
+        shape, refs, trusted, dim=-1, what=f"{what}: values after the scale"
+    )
+
+
+def assert_log_probs(
+    log_probs: torch.Tensor, refs: torch.Tensor, trusted_log: torch.Tensor, *, what: str
+) -> None:
+    """Processed log-probs ``[B, V]`` (fp32) against the fp64 distributions ``refs``.
+
+    1. Finite exactly on each row's support.
+    2. Scale: ``|logsumexp(row)|`` within three renormalizations of the vocabulary (softmax,
+       top-k, top-p: ``renorm_mass_bound``) plus the rounding of the logs (``u`` times the
+       row's entropy, at most ``u * ln V``).
+    3. Values after the scale: ``row - logsumexp(row)`` against ``log(refs)`` per row (factor 2,
+       one ulp), ``trusted_log`` normalized the same way.
+    """
+    refs_dev = refs.to(log_probs.device)
+    ou.assert_exact(
+        torch.isfinite(log_probs), refs_dev > 0, what=f"{what}: finite exactly on the support"
+    )
+    vocab = log_probs.shape[-1]
+    lse = torch.logsumexp(log_probs.double(), dim=-1)
+    bound = renorm_mass_bound(vocab, vocab, renorms=3) + math.log(vocab) * UNIT_ROUNDOFF
+    _assert_mass(lse.exp(), torch.full((log_probs.shape[0],), bound, dtype=torch.float64), what)
+    shape = (log_probs.double() - lse[:, None]).float()
+    trusted = trusted_log.double()
+    trusted = (trusted - torch.logsumexp(trusted, dim=-1, keepdim=True)).float()
+    ou.assert_close_to_reference(
+        shape, torch.log(refs), trusted, dim=-1, what=f"{what}: values after the scale"
+    )
 
 
 def fp32(value: float) -> float:

@@ -26,10 +26,15 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   cut sits within rounding of a cumulative boundary can keep a different set from run to run:
   ``test_log_probs_kernel_replays_bit_exactly`` can fail on main; open PR #8572 (s12,
   ``fix/s12-processed-logprob-determinism``) makes it pass.
-* Tolerance class: floating point, bounded. Values against the fp64 reference within
-  ``ou.assert_close_to_reference``'s default (factor 2, one-ulp floor, per row); the trusted
-  implementation is plain torch fp32 on the same GPU (mask the reference's kept set,
-  renormalize, log). The kept set is exact.
+* Tolerance class: floating point, bounded (``sampling_oracle.assert_renormalized`` and
+  ``assert_log_probs``). The kept set is exact. A row's scale (its mass) within the fp32
+  summation error of FlashInfer's reduction tree plus its reciprocal; the values after that
+  scale against the fp64 reference within ``ou.assert_close_to_reference``'s default (factor 2,
+  one-ulp floor, per row), the trusted implementation being plain torch fp32 on the same GPU
+  (mask the reference's kept set, renormalize, log) normalized the same way. (FlashInfer sums
+  the kept mass per thread in sequence and multiplies by its reciprocal, ``rcp.approx`` in the
+  ternary search: on H100 a single kept token comes out as ``1 + 2**-23``, and long rows carry
+  a common scale error that a direct comparison with torch's pairwise sum flags at up to 24x.)
 
 Structure (read from FlashInfer 0.7.2 after the contract): ``V < 2048`` runs a ternary search
 (``csrc/renorm.cu:44``); ``V >= 2048`` runs AIR top-p (``air_top_p.cuh``): three radix passes of
@@ -55,16 +60,6 @@ KERNEL = "top_p_renorm_probs"
 DETERMINISTIC = pytest.mark.parametrize(
     "is_deterministic", [False, True], ids=["default-float-hist", "deterministic"]
 )
-
-
-def _trusted(probs, refs):
-    kept = torch.where(refs.to(probs.device) > 0, probs, torch.zeros_like(probs))
-    return kept / kept.sum(-1, keepdim=True)
-
-
-def _assert_renorm(out, probs, refs, what):
-    ou.assert_exact(out > 0, refs.to(out.device) > 0, what=f"{what}: kept set")
-    ou.assert_close_to_reference(out, refs, _trusted(probs, refs), dim=-1, what=what)
 
 
 def _nucleus_rows(vocab):
@@ -111,7 +106,7 @@ def test_renormalizes_the_nucleus(vocab, is_deterministic):
     out = so.flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=is_deterministic)
     ou.assert_exact(probs, before, what="probs are read-only")
     assert out.dtype == torch.float32 and out.shape == probs.shape
-    _assert_renorm(out, probs, refs, what=f"{KERNEL} V={vocab}")
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V={vocab}")
 
 
 def _dyadic_row(vocab, tied, small, g):
@@ -146,7 +141,7 @@ def test_cut_exactly_on_a_cumulative_boundary(vocab, tied, small, is_determinist
     refs = torch.stack(
         [so.filter_distribution(row, 0, p, exact_boundaries=True) for p in DYADIC_TOP_P]
     )
-    _assert_renorm(out, probs, refs, what=f"{KERNEL} exact boundaries V={vocab}")
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} exact boundaries V={vocab}")
 
 
 @pytest.mark.sanitizer
@@ -156,7 +151,7 @@ def test_sanitizer_smallest_air_vocabulary():
     guarded = ou.guarded_like(probs)
     out = so.flashinfer.sampling.top_p_renorm_probs(guarded.tensor, top_p)
     ou.check_guards(probs=guarded)
-    _assert_renorm(out, probs, refs, what=f"{KERNEL} V=2049")
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V=2049")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -185,20 +180,10 @@ def test_log_probs_kernel_scores_the_nucleus(vocab):
     batch = so.build_batch(specs, replicas=1)
     log_probs = so.make_sampler(vocab).log_probs_kernel(batch.logits, so.batch_context(batch))
     refs = torch.stack([s.reference() for s in specs])
-    ou.assert_exact(
-        torch.isfinite(log_probs),
-        refs.to(log_probs.device) > 0,
-        what="finite exactly on pi's support",
-    )
     temperature = torch.tensor([so.clamped_temperature(s.temperature) for s in specs])
     probs = torch.softmax(batch.logits / temperature.to(so.DEVICE)[:, None], dim=-1)
-    ou.assert_close_to_reference(
-        log_probs,
-        torch.log(refs),
-        torch.log(_trusted(probs, refs)),
-        dim=-1,
-        what="log_probs_kernel",
-    )
+    trusted = torch.log(so.trusted_renorm(probs, refs))
+    so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel")
 
 
 def test_log_probs_kernel_replays_bit_exactly():

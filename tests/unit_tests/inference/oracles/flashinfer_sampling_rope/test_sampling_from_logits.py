@@ -18,7 +18,9 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   nothing outside) and returned when ``output`` is given.
 * RNG: the same generator state replays the same tokens; every call advances the generator, so
   the next call draws afresh. Draws also depend on the batch row (documented, not asserted).
-* Degenerate: ``T = 0`` is clamped to 1e-6: the argmax, uniform among exact ties. A token whose
+* Degenerate: ``T = 0`` is clamped to 1e-6: the argmax, uniform among exact ties (finding
+  O4a-N2: FlashInfer skews the choice among ties at such temperatures,
+  ``test_near_zero_temperature_splits_exact_ties_evenly``). A token whose
   logit is ``-inf`` is never drawn. A row of NaN logits has no distribution: its token is
   unspecified (S11; Megatron requests no NaN check) but must be a valid id and must not disturb
   the other rows.
@@ -65,7 +67,6 @@ def _tempered_specs(vocab):
         so.RowSpec(ramp, 1.0, name="T=1"),
         so.RowSpec(ramp, 0.3, name="T=0.3"),
         so.RowSpec(ramp, 5.0, name="T=5 (tail-dominated)"),
-        so.RowSpec(tied, 0.0, name="T=0 -> 1e-6, three tied maxima"),
         so.RowSpec(tied, 1.0, name="T=1 with tied maxima"),
         so.RowSpec(masked, 0.7, name="half the vocabulary -inf"),
     ]
@@ -80,6 +81,35 @@ def test_draws_follow_the_tempered_softmax(monkeypatch):
     counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
     spy.assert_only(KERNEL, launches)
     so.assert_batch_distribution(counts, specs, what=KERNEL)
+
+
+@pytest.mark.parametrize(
+    "top,temperature",
+    [(4.0, 0.0), (32.0, 0.0), (4.0, 1e-4)],
+    ids=["logit4-T0", "logit32-T0", "logit4-T1e-4-control"],
+)
+def test_near_zero_temperature_splits_exact_ties_evenly(top, temperature, monkeypatch):
+    """Three exactly tied maxima at a temperature near the clamp are drawn 1/3 each.
+
+    Finding O4a-N2: fails on H100 (pdx 7849977, top logit 4, T = 0 -> 1e-6: counts 10061 /
+    11652 / 11055 of 32768, chi2 118 on 2 dof, p = 2e-26). FlashInfer's Gumbel race adds the
+    noise to the fp32 scaled logit (``sampling.cuh:777``), whose spacing at 4e6 is 0.25, so
+    tied tokens tie again in the race and ``DataAndIndex`` (``:670``) breaks those ties by
+    position. The control (T = 1e-4: spacing 0.004) should pass. PR #8875 maps a request's
+    T = 0 to greedy, so the case remains for explicit temperatures near the clamp.
+    """
+    vocab, launches = 32000, 16
+    g = ou.make_generator()
+    hot = so.spread_positions(vocab, 48, g)
+    tied = so.ramp_logits(vocab, hot, top=top)
+    tied[hot[1]] = tied[hot[0]]
+    tied[hot[2]] = tied[hot[0]]
+    spec = so.RowSpec(tied, temperature, name=f"three tied maxima at {top}, T={temperature}")
+    batch = so.build_batch([spec], replicas=4096)
+    spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
+    counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
+    spy.assert_only(KERNEL, launches)
+    so.assert_batch_distribution(counts, [spec], what=KERNEL)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])

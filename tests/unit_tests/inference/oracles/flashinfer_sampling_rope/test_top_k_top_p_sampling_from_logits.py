@@ -31,7 +31,10 @@ int-only fast path, so the kernel runs ``top_k_mask_logits`` (radix select, keep
 ``>=`` the k-th) -> softmax -> ``top_p_sampling_from_probs``. The radix mask splits a row over
 ``ceil(V / 57592)`` CTAs on H100 (``sampling_oracle.RADIX_CHUNK_H100``): vocabularies around one
 and two CTAs and the production sizes, with hot tokens on the chunk edges, cover the single- and
-multi-CTA kernels and the cross-CTA pivot.
+multi-CTA kernels and the cross-CTA pivot. Every vocabulary must launch; finding O4a-N1: a row
+whose CTA chunk fills the shared memory to within the kernel's static scratch fails with
+``invalid argument`` (measured at V = 115183 and 115184 for the multi-CTA mask),
+``test_vocabularies_at_the_shared_memory_limit``.
 
 Hardware: H100 (sm_90; the CTA split is derived from H100's 227 KiB opt-in shared memory).
 """
@@ -158,6 +161,28 @@ def test_radix_mask_cta_split(vocab, monkeypatch):
         specs = [specs[0], specs[2]]  # k = 1 is greedy, covered above
     batch = so.build_batch(specs, replicas=1024 if vocab <= 65536 else 256)
     launches = 16
+    spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
+    counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
+    spy.assert_only(KERNEL, launches)
+    so.assert_batch_distribution(counts, specs, what=f"{KERNEL} V={vocab}")
+
+
+@pytest.mark.parametrize("vocab", so.RADIX_SMEM_LIMIT_VOCABS)
+def test_vocabularies_at_the_shared_memory_limit(vocab, monkeypatch):
+    """Mixed batches whose radix mask chunk ends at or just below the shared-memory limit.
+
+    Finding O4a-N1 (see ``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``): on H100 (pdx 7849977) the
+    multi-CTA ``top_k_mask_logits`` fails with ``invalid argument`` at V = 115183 and 115184
+    (chunk 57592, no headroom); the single-CTA one runs at 57592.
+    """
+    positions, ctas = _chunk_edges(vocab)
+    logits, _ = _ramp(vocab, positions=positions)
+    specs = [
+        so.RowSpec(logits, 1.0, top_k=12, name=f"V={vocab} ({ctas} CTAs), k=12"),
+        so.RowSpec(logits, 1.0, top_p=0.9, name="p only"),
+    ]
+    batch = so.build_batch(specs, replicas=256)
+    launches = 8
     spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
     counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
     spy.assert_only(KERNEL, launches)

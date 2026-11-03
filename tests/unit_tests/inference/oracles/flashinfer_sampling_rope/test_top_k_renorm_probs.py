@@ -24,12 +24,19 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   with #8875.
 * Every token the sampler draws has a finite processed log-prob, and the draws follow
   ``exp(log_probs)``: sampling and scoring describe one distribution.
-* Tolerance class: floating point, bounded. Values against the fp64 reference within
-  ``ou.assert_close_to_reference``'s default (factor 2 of a trusted implementation's error plus
-  a one-ulp floor, per row): the trusted implementation is plain torch on the same GPU in fp32,
-  running the same mathematical pipeline (softmax, mask the reference's kept set, renormalize,
-  log). The kept set is exact: zero (``-inf``) exactly off it, positive (finite) on it.
-  Statistical checks as for the samplers (``alpha = 1e-6``).
+* Every vocabulary launches: a row is split over as many CTAs as its shared memory needs.
+  Finding O4a-N1: sizes whose per-CTA chunk ends within a few dozen tokens of the 57592-token
+  limit fail with ``invalid argument`` (``test_vocabularies_at_the_shared_memory_limit``).
+* Tolerance class: floating point, bounded (``sampling_oracle.assert_renormalized`` and
+  ``assert_log_probs``). The kept set is exact: zero (``-inf``) exactly off it, positive (finite)
+  on it. A row's scale (its mass) within the fp32 summation error of FlashInfer's reduction tree
+  plus its reciprocal; the values after that scale against the fp64 reference within
+  ``ou.assert_close_to_reference``'s default (factor 2, one-ulp floor, per row), the trusted
+  implementation being plain torch fp32 on the same GPU (softmax, mask the reference's kept
+  set, renormalize, log) normalized the same way. (FlashInfer multiplies by ``rcp.approx`` of
+  an fp32 sum taken per thread in sequence: on H100 its rows carry a common 1-5 ulp scale error
+  that a direct comparison with torch's pairwise sum flags at up to 21x.) Statistical checks
+  as for the samplers (``alpha = 1e-6``).
 
 Structure (read from FlashInfer 0.7.2 after the contract): radix top-k with the same CTA split as
 ``top_k_mask_logits`` (``ceil(V / 57592)`` CTAs per row on H100); ``k >= V`` short-circuits to a
@@ -63,17 +70,6 @@ def _rows(vocab, specs):
     probs = torch.softmax(logits / temperature.to(so.DEVICE)[:, None], dim=-1)
     top_k = torch.tensor([s.top_k for s in specs], dtype=torch.int32, device=so.DEVICE)
     return probs, top_k
-
-
-def _trusted_renorm(probs, refs):
-    """fp32 torch on the same device: mask the reference's kept set, renormalize."""
-    kept = torch.where(refs.to(probs.device) > 0, probs, torch.zeros_like(probs))
-    return kept / kept.sum(-1, keepdim=True)
-
-
-def _assert_renorm(out, probs, refs, what):
-    ou.assert_exact(out > 0, refs.to(out.device) > 0, what=f"{what}: kept set")
-    ou.assert_close_to_reference(out, refs, _trusted_renorm(probs, refs), dim=-1, what=what)
 
 
 def _specs(vocab, positions):
@@ -112,7 +108,26 @@ def test_renormalizes_the_top_k(vocab):
     ou.assert_exact(probs, before, what="probs are read-only")
     assert out.dtype == torch.float32 and out.shape == probs.shape
     refs = torch.stack([so.filter_distribution(p, k) for p, k in zip(probs, top_k.tolist())])
-    _assert_renorm(out, probs, refs, what=f"{KERNEL} V={vocab}")
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V={vocab}")
+
+
+@pytest.mark.parametrize("vocab", so.RADIX_SMEM_LIMIT_VOCABS)
+def test_vocabularies_at_the_shared_memory_limit(vocab):
+    """Rows whose radix CTA chunk ends at or just below the 57592-token shared-memory limit.
+
+    Finding O4a-N1: FlashInfer gives each CTA ``2080 + 4 * chunk`` bytes of dynamic shared
+    memory, up to the full 227 KiB opt-in limit, and the kernel's static shared memory (its
+    block-reduction scratch) on top. On H100 (pdx 7849977) V = 57591, 57592, 115183 and 115184
+    (0 or 4 bytes of headroom) fail with ``invalid argument``; the 128-multiples here leave 64-224
+    bytes and show which padded vocabularies Megatron can reach the failure with.
+    """
+    g = ou.make_generator()
+    specs = _specs(vocab, so.spread_positions(vocab, 48, g))
+    specs = [s for s in specs if s.top_k in (2, 32, vocab)]
+    probs, top_k = _rows(vocab, specs)
+    out = so.flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+    refs = torch.stack([so.filter_distribution(p, k) for p, k in zip(probs, top_k.tolist())])
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V={vocab}")
 
 
 @pytest.mark.sanitizer
@@ -126,7 +141,7 @@ def test_sanitizer_two_cta_rows():
     out = so.flashinfer.sampling.top_k_renorm_probs(guarded.tensor, top_k)
     ou.check_guards(probs=guarded)
     refs = torch.stack([so.filter_distribution(p, k) for p, k in zip(probs, top_k.tolist())])
-    _assert_renorm(out, probs, refs, what=f"{KERNEL} V={vocab}")
+    so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V={vocab}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -138,7 +153,7 @@ def _trusted_log_probs(logits, specs, refs):
     """fp32 torch on the GPU: scale, softmax, keep the reference's set, renormalize, log."""
     temperature = torch.tensor([so.clamped_temperature(s.temperature) for s in specs])
     probs = torch.softmax(logits.float() / temperature.to(logits.device)[:, None], dim=-1)
-    return torch.log(_trusted_renorm(probs, refs))
+    return torch.log(so.trusted_renorm(probs, refs))
 
 
 def _log_probs(specs, *, greedy=True):
@@ -159,15 +174,8 @@ def test_log_probs_kernel_scores_the_top_k_distribution(vocab):
     specs.append(plain)
     batch, log_probs, refs = _log_probs(specs)
     assert log_probs.dtype == torch.float32 and log_probs.shape == batch.logits.shape
-    ou.assert_exact(
-        torch.isfinite(log_probs),
-        refs.to(log_probs.device) > 0,
-        what="finite exactly on pi's support",
-    )
     trusted = _trusted_log_probs(batch.logits, specs, refs)
-    ou.assert_close_to_reference(
-        log_probs, torch.log(refs), trusted, dim=-1, what="log_probs_kernel (top-k)"
-    )
+    so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel (top-k)")
     # Unfiltered rows of a filtered batch are torch's log_softmax of the fp32-scaled logits.
     temperature = torch.tensor(batch.temperature, dtype=torch.float32, device=so.DEVICE)
     scaled = batch.logits / temperature.clamp(min=so.MIN_SAMPLING_TEMPERATURE)[:, None]
