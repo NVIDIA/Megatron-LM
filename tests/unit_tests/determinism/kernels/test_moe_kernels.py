@@ -885,23 +885,35 @@ def _pin_flashinfer_gemm2_tactic(monkeypatch):
 
     Set ``.tactic`` to an index into the runner's GEMM2 tactics, or ``None`` for FlashInfer's
     untuned default. ``.count`` is the number of GEMM2 tactics the runner offers and
-    ``.fused_finalize`` whether it offers fused-finalize ones. GEMM1 keeps its default.
+    ``.fused_finalize`` whether it offers fused-finalize ones. ``.valid`` lists the GEMM2
+    tactics FlashInfer's autotuner may select (its runner's ``get_valid_tactics``: the
+    CUTLASS dispatch accepts them on this GPU); it never offers the others. GEMM1 keeps its
+    default.
     """
     from flashinfer.autotuner import AutoTuner
 
     choose_one = AutoTuner.choose_one
-    pin = SimpleNamespace(tactic=None, count=None, fused_finalize=None)
+    pin = SimpleNamespace(tactic=None, count=None, fused_finalize=None, valid=None)
 
     def pinned_choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
         if custom_op not in (_FLASHINFER_MOE_GEMM1, _FLASHINFER_MOE_GEMM2):
             return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
         moe_runner = runners[0].fused_moe_runner
+        # GEMM2 tactic ids follow the GEMM1 ones.
+        gemm1_count = moe_runner.get_gemm1_tactic_count()
         pin.count = moe_runner.get_gemm2_tactic_count()
         pin.fused_finalize = runners[0].use_fused_finalize
+        if custom_op == _FLASHINFER_MOE_GEMM2:
+            # The runner is set to GEMM2 here, as for FlashInfer's own tuning; the profile
+            # only matters for W4 group scaling.
+            pin.valid = sorted(
+                tactic - gemm1_count
+                for tactic in runners[0].get_valid_tactics(inputs, None)
+                if tactic >= gemm1_count
+            )
         if custom_op == _FLASHINFER_MOE_GEMM1 or pin.tactic is None:
             return runners[0], -1
-        # GEMM2 tactic ids follow the GEMM1 ones.
-        return runners[0], moe_runner.get_gemm1_tactic_count() + pin.tactic
+        return runners[0], gemm1_count + pin.tactic
 
     monkeypatch.setattr(AutoTuner, "choose_one", pinned_choose_one)
     return pin
@@ -1487,20 +1499,25 @@ class TestMoEModules:
             return InferenceGroupedMLP._flashinfer_forward(experts, hidden, routing_map, probs)[0]
 
         batch, _ = _routed_tokens(4096, num_experts, topk, hidden_size)
-        runnable = []
+        failed = {}
         with torch.no_grad(), deterministic_algorithms(True):
             forward(*batch)
             assert (
                 flashinfer_gemm2_tactic.fused_finalize is False
             ), "FlashInfer offers fused-finalize GEMM2 tactics to CUTLASS MXFP8 experts"
-            tactics = [None, *range(flashinfer_gemm2_tactic.count)]
-            for tactic in tactics:
+            # The runner lists more GEMM2 tactics than its CUTLASS dispatch can launch with
+            # MXFP8 on this GPU; FlashInfer reports those as invalid (zero occupancy) and its
+            # autotuner never selects them. Every tactic it reports valid must run and replay.
+            valid = flashinfer_gemm2_tactic.valid
+            invalid = flashinfer_gemm2_tactic.count - len(valid)
+            assert valid, f"FlashInfer reports none of {flashinfer_gemm2_tactic.count} valid"
+            for tactic in [None, *valid]:
                 flashinfer_gemm2_tactic.tactic = tactic
                 try:
                     forward(*batch)
-                except RuntimeError:  # FlashInfer cannot run this tactic for these shapes
+                except RuntimeError as error:
+                    failed[tactic] = str(error).strip().splitlines()[0][:300]
                     continue
-                runnable.append(tactic)
                 assert_replays_bit_exact(
                     forward,
                     batch,
@@ -1508,9 +1525,11 @@ class TestMoEModules:
                     backward=False,
                     what=f"FlashInfer CUTLASS MXFP8 experts[GEMM2 tactic {tactic}]",
                 )
-        assert None in runnable and 2 * len(runnable) >= len(
-            tactics
-        ), f"only GEMM2 tactics {runnable} of {len(tactics) - 1} ran"
+        assert not failed, (
+            f"{len(failed)} of the {len(valid)} GEMM2 tactics FlashInfer reports valid (or the "
+            f"default, None) failed to run ({invalid} of {flashinfer_gemm2_tactic.count} are "
+            f"invalid): {failed}"
+        )
 
     @pytest.mark.xfail(
         strict=False,
