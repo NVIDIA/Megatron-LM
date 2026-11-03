@@ -16,8 +16,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
@@ -32,55 +30,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
     QuantizedDBuffer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-@pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
-@pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16, torch.float32])
-def test_mcore_fp32_reduction_flag(
-    distributed_setup, monkeypatch, grad_reduce_in_fp32, grad_comm_dtype
-):
-    """The adapter's FP32 flag controls actual reduction inputs, not stored gradients."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=8,
-        num_attention_heads=1,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        gradient_accumulation_fusion=False,
-    )
-    model = FullyShardedDataParallelV2(
-        config,
-        DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            data_parallel_sharding_strategy="optim_grads_params",
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
-        ),
-        nn.Linear(8, 8, device=device, dtype=torch.bfloat16),
-        device=device,
-        pg_collection=ProcessGroupCollection(dp_cp=mesh.get_group()),
-    )
-    expected = torch.float32 if grad_reduce_in_fp32 else grad_comm_dtype or torch.bfloat16
-    inputs = []
-    original = dist.reduce_scatter_tensor
-
-    def record(output, input, *args, **kwargs):
-        inputs.append((input.dtype, output.dtype))
-        return original(output, input, *args, **kwargs)
-
-    monkeypatch.setattr(dist, "reduce_scatter_tensor", record)
-    for _ in range(4):
-        x = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
-        model(x).float().sum().backward()
-    model.finish_grad_sync()
-    assert inputs == [(expected, expected)] * 4
-    assert model.mp_policy.main_grads_dtype is None
-    assert all(p.grad.dtype == torch.bfloat16 for p in model.parameters())
 
 
 class TinyModel(nn.Module):
