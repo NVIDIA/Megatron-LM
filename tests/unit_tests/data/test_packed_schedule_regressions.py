@@ -646,3 +646,68 @@ def test_tuple_path_honors_contiguous_cp_partition_mode(cpu_batch_communication,
     torch.testing.assert_close(
         params.cu_seqlens_q_padded, torch.tensor([0, 4, 16, 16, 16], dtype=torch.int32)
     )
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_context_parallel_batch_path_honors_legacy_contiguous_cp_partition_mode(
+    cpu_batch_communication, cp_rank
+):
+    """The ContextParallelBatch path (pretrain_hybrid) must shard like the tuple path when
+    the recipe only sets the legacy cp_partition_mode='contiguous' (linear_cp_layout unset):
+    the chunkwise linear layers consume contiguous rows and never convert."""
+    cp_batch = data_schedule.get_batch_on_this_rank_for_sequence_packing(
+        iter([_batch([3, 5])]),
+        dynamic_cp=False,
+        pg_collection=ProcessGroupCollection(tp=_group(1), pp=_group(1), cp=_group(2, cp_rank)),
+        config=SimpleNamespace(
+            cp_partition_mode="contiguous",
+            linear_cp_layout="zigzag",
+            attention_cp_layout="zigzag",
+            _linear_cp_layout_explicit=False,
+            sequence_parallel=False,
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=8,
+            thd_max_packed_sequences=4,
+            thd_tail_padding_policy="extend_last",
+        ),
+        return_context_parallel_batch=True,
+    )
+    assert cp_batch.boundary_layout == "contiguous"
+    assert set(cp_batch.batches_by_layout) == {"contiguous"}
+    batch, params = cp_batch.get_batch(), cp_batch.get_packed_seq_params()
+    rows = slice(8 * cp_rank, 8 * (cp_rank + 1))
+    torch.testing.assert_close(batch["tokens"].view(-1), _PADDED_TOKENS[rows])
+    torch.testing.assert_close(batch["loss_mask"].view(-1), _PADDED_LOSS_MASK[rows])
+    assert params.cp_partition_mode == "contiguous"
+    assert params.pad_between_seqs is True
+    assert params.max_seqlen_q == 16
+    torch.testing.assert_close(
+        params.cu_seqlens_q_padded, torch.tensor([0, 4, 16, 16, 16], dtype=torch.int32)
+    )
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_context_parallel_batch_path_keeps_explicit_two_knob_layouts(
+    cpu_batch_communication, cp_rank
+):
+    """An explicit linear_cp_layout keeps dev's two-knob behaviour (boundary view = linear
+    layout, extra attention view when the two differ)."""
+    cp_batch = data_schedule.get_batch_on_this_rank_for_sequence_packing(
+        iter([_batch([3, 5])]),
+        dynamic_cp=False,
+        pg_collection=ProcessGroupCollection(tp=_group(1), pp=_group(1), cp=_group(2, cp_rank)),
+        config=SimpleNamespace(
+            cp_partition_mode="zigzag",
+            linear_cp_layout="contiguous",
+            attention_cp_layout="zigzag",
+            _linear_cp_layout_explicit=True,
+            sequence_parallel=False,
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=8,
+            thd_max_packed_sequences=4,
+            thd_tail_padding_policy="extend_last",
+        ),
+        return_context_parallel_batch=True,
+    )
+    assert cp_batch.boundary_layout == "contiguous"
+    assert set(cp_batch.batches_by_layout) == {"contiguous", "zigzag"}
