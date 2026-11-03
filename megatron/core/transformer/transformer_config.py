@@ -4745,17 +4745,13 @@ class TransformerConfig(ModelParallelConfig):
                 "activation scaling depends on neighboring batch rows."
             )
             # deepgemm and triton replace TE's GEMMs with BF16 batch-invariant kernels, which
-            # take no quantized operands and no Userbuffers (GEMM + communication) overlap.
+            # take no quantized operands. (Per-module quant_recipe precisions depend on module
+            # names, so the GEMM itself rejects those.)
             if self.batch_invariant_backend in ("deepgemm", "triton"):
-                assert not (self.fp8 or self.fp4 or self.quant_recipe is not None), (
+                assert not (self.fp8 or self.fp4), (
                     f"batch_invariant_backend={self.batch_invariant_backend!r} runs TE's GEMMs "
-                    "on BF16 batch-invariant kernels and does not support FP8/FP4 "
-                    "(fp8, fp4 or quant_recipe); use batch_invariant_backend='te_native'."
-                )
-                assert not self.tp_comm_overlap, (
-                    f"batch_invariant_backend={self.batch_invariant_backend!r} does not support "
-                    "tp_comm_overlap: its batch-invariant GEMMs cannot run inside TE's "
-                    "Userbuffers overlap."
+                    "on BF16 batch-invariant kernels and does not support FP8/FP4; use "
+                    "batch_invariant_backend='te_native'."
                 )
             assert (
                 self.attention_backend == AttnBackend.flash

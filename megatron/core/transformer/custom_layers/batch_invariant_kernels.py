@@ -1114,6 +1114,11 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         assert isinstance(layout, str) and len(layout) == 2, f"Unsupported layout: {layout}"
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
+        # TE flattens both operands to 2D before applying the layout's transposes, and its
+        # output keeps B's leading dims unless B is transposed (getGemmOutputShape).
+        ctx.a_shape, ctx.b_shape = A.shape, B.shape
+        out_leading_shape = None if transb else B.shape[:-1]
+        A, B = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
 
         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
         # Triton's persistent GEMM consumes the operand strides directly. A
@@ -1134,7 +1139,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
         # Flatten all leading dims of opB except the last feature dim to match TE behavior
         if opB.dim() >= 2:
-            leading_shape = opB.shape[:-1]
+            leading_shape = opB.shape[:-1] if out_leading_shape is None else out_leading_shape
             K = opB.shape[-1]
             opB_2d = opB.reshape(-1, K)
         else:
@@ -1215,7 +1220,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         else:
             dbias = None
 
-        return dA, dB, dbias, None, None
+        return dA.reshape(ctx.a_shape), dB.reshape(ctx.b_shape), dbias, None, None
 
 
 def _te_apply_normalization_patched(
@@ -1344,7 +1349,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     ):
         raise RuntimeError(
             "Batch-invariant GEMM does not support quantized operands, output quantization "
-            "or GELU fusion."
+            "or GELU fusion; quantized modules need batch_invariant_backend='te_native'."
         )
     # Disallow GEMM-comm overlap in batch-invariant mode
     extra_output = p.get("extra_output")
@@ -1381,7 +1386,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         if accumulate:
             if beta != 1.0:
                 out.mul_(beta)
-            result = out.add_(result)
+            result = out.add_(result.reshape(out.shape))
     elif alpha == 1.0 and not accumulate:
         # Compute via autograd-aware function matching TE's layout semantics
         result = BatchInvariantTEGemmFn.apply(A, B, epilogue_bias, out_dtype, layout)
@@ -1391,7 +1396,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         if epilogue_bias is not None:
             result = result + epilogue_bias.float()
         if accumulate:
-            result = result + beta * out.float()
+            result = result + beta * out.float().reshape(result.shape)
         result = result.to(result_dtype)
 
     bias_grad = None
@@ -1402,7 +1407,7 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
 
     if out is not None:
         if result is not out:
-            out.copy_(result)
+            out.copy_(result.reshape(out.shape))
         # TE expects (gemm_out, bias_grad, gelu_input, extra_output)
         return (out, bias_grad, None, extra_output)
     return (result, bias_grad, None, extra_output)
@@ -1416,10 +1421,14 @@ def _te_gemm_product_fp32(A: torch.Tensor, B: torch.Tensor, layout: str) -> torc
     products are exact and accumulate in fp32: the result is not rounded to bf16 before it
     is added into an fp32 weight gradient.
     """
-    opA = A.transpose(0, 1) if layout[0].upper() == "T" else A
-    opB = B.transpose(0, 1) if layout[1].upper() == "T" else B
-    product = matmul_persistent(opB.reshape(-1, opB.shape[-1]).float(), opA.float())
-    return product.reshape(*opB.shape[:-1], opA.shape[-1])
+    # TE flattens both operands to 2D before applying the layout's transposes, and its output
+    # keeps B's leading dims unless B is transposed (getGemmOutputShape).
+    transb = layout[1].upper() == "T"
+    A2, B2 = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
+    opA = A2.transpose(0, 1) if layout[0].upper() == "T" else A2
+    opB = B2.transpose(0, 1) if transb else B2
+    product = matmul_persistent(opB.float(), opA.float())
+    return product if transb else product.reshape(*B.shape[:-1], opA.shape[-1])
 
 
 class BatchInvariantRMSNormFn(torch.autograd.Function):
