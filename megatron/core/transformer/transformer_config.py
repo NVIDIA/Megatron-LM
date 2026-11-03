@@ -4753,13 +4753,6 @@ class TransformerConfig(ModelParallelConfig):
                     "on BF16 batch-invariant kernels and does not support FP8/FP4; use "
                     "batch_invariant_backend='te_native'."
                 )
-                # The op fuser's RMSNorm runs the batch-invariant norm; its LayerNorm has none.
-                assert not (
-                    self.use_transformer_engine_op_fuser and self.normalization == "LayerNorm"
-                ), (
-                    "Batch invariant mode with use_transformer_engine_op_fuser supports RMSNorm "
-                    "only: TE's fused LayerNorm reduction depends on the batch's row count."
-                )
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"

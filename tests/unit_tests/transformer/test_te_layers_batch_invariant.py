@@ -1286,22 +1286,69 @@ def test_te_op_fuser_rmsnorm_batch_invariant(module, zero_centered_gamma):
     torch.testing.assert_close(x.grad.double(), x64.grad, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
-def test_batch_invariant_op_fuser_rejects_layernorm(backend):
-    """The op fuser's te.ops.LayerNorm has no batch-invariant kernel, so the config is
-    rejected at construction rather than run batch-dependent."""
-    with pytest.raises(AssertionError, match="LayerNorm"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=64,
-            num_attention_heads=4,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_backend=AttnBackend.flash,
-            flash_attention_version=_BIK_FA_VERSION,
-            attention_dropout=0.0,
-            batch_invariant_mode=True,
-            batch_invariant_backend=backend,
-            normalization="LayerNorm",
-            use_transformer_engine_op_fuser=True,
+@pytest.mark.parametrize("module", ["ops-layernorm", "te-layernorm", "layernorm-linear"])
+@pytest.mark.parametrize("zero_centered_gamma", [False, True])
+def test_te_layernorm_batch_invariant(module, zero_centered_gamma):
+    """TE's LayerNorm runs the batch-invariant LayerNorm under batch-invariant mode, whether it
+    is the op fuser's te.ops.LayerNorm, TE's LayerNorm module (TENorm), or the norm fused
+    into a LayerNormLinear, and still back-propagates through TE's layernorm_bwd."""
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.ops.basic.layer_norm as te_ops_layer_norm
+
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+
+    hidden, eps, bf16 = 256, 1e-5, torch.bfloat16
+    if module == "ops-layernorm":
+        norm = te.ops.LayerNorm(
+            hidden, eps=eps, zero_centered_gamma=zero_centered_gamma, device="cuda", dtype=bf16
         )
+        weight, bias, run = norm.weight, norm.bias, norm
+    elif module == "te-layernorm":
+        norm = te.LayerNorm(
+            hidden, eps=eps, zero_centered_gamma=zero_centered_gamma, device="cuda", dtype=bf16
+        )
+        weight, bias, run = norm.weight, norm.bias, norm
+    else:
+        norm = te.LayerNormLinear(
+            hidden,
+            128,
+            eps=eps,
+            normalization="LayerNorm",
+            zero_centered_gamma=zero_centered_gamma,
+            params_dtype=bf16,
+            device="cuda",
+            return_layernorm_output=True,
+        )
+        weight, bias = norm.layer_norm_weight, norm.layer_norm_bias
+
+        def run(x):
+            return norm(x)[1]
+
+    torch.manual_seed(17)
+    with torch.no_grad():
+        weight.copy_(torch.randn(hidden) * 0.1 + (0.0 if zero_centered_gamma else 1.0))
+        bias.copy_(torch.randn(hidden) * 0.1)
+    target = torch.randn(8, hidden, device="cuda", dtype=bf16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        assert te_ops_layer_norm.layernorm_fwd is bik._te_layernorm_fwd_patched
+        with torch.no_grad():
+            alone = run(target)
+            expected, _, _ = bik._layernorm_batch_invariant_fp32(
+                target, weight, bias, eps, zero_centered_gamma
+            )
+            assert torch.equal(alone, expected.to(bf16))
+            for left, right in ((0, 1), (5, 23), (37, 64), (120, 3)):
+                filler = torch.randn(left + right, hidden, device="cuda", dtype=bf16)
+                out = run(torch.cat([filler[:left], target, filler[left:]]))
+                assert torch.equal(out[left : left + 8], alone), (left, right)
+        if module != "layernorm-linear":
+            x = target.clone().requires_grad_(True)
+            dy = torch.randn_like(target)
+            run(x).backward(dy)
+    assert te_ops_layer_norm.layernorm_fwd is not bik._te_layernorm_fwd_patched
+    if module != "layernorm-linear":
+        x64 = target.double().requires_grad_(True)
+        w64 = weight.detach().double() + (1.0 if zero_centered_gamma else 0.0)
+        reference = torch.nn.functional.layer_norm(x64, (hidden,), w64, bias.detach().double(), eps)
+        reference.backward(dy.double())
+        torch.testing.assert_close(x.grad.double(), x64.grad, rtol=2e-2, atol=2e-2)

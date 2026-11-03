@@ -627,8 +627,9 @@ _TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
-# transformer_engine_torch.rmsnorm_fwd, captured while batch-invariant mode rebinds it.
-_TE_RMSNORM_FWD_ORIGS: Dict[str, Any] = {}
+# transformer_engine_torch's rmsnorm_fwd and layernorm_fwd by name, captured while
+# batch-invariant mode rebinds them.
+_TE_NORM_FWD_ORIGS: Dict[str, Any] = {}
 _TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
@@ -765,14 +766,17 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             _TE_APPLY_NORM_ORIGS[key] = mod.apply_normalization
             mod.apply_normalization = _te_apply_normalization_patched
 
-    # The op fuser's te.ops.RMSNorm imports transformer_engine_torch.rmsnorm_fwd by name
-    # (ops/basic/rmsnorm.py) instead of calling the module functions patched above.
+    # te.ops.RMSNorm and te.ops.LayerNorm (the op fuser's norms, and the bases of TE's
+    # LayerNorm module and Megatron's TEFusedResidualRMSNorm) import their forward kernels
+    # from transformer_engine_torch by name instead of calling the functions patched above.
     tex = _import_module_if_available("transformer_engine_torch")
-    if tex is not None and hasattr(tex, "rmsnorm_fwd"):
-        _TE_RMSNORM_FWD_ORIGS.setdefault("rmsnorm_fwd", tex.rmsnorm_fwd)
-        _te_rebind_or_raise(
-            "TE's rmsnorm_fwd", {_TE_RMSNORM_FWD_ORIGS["rmsnorm_fwd"]: _te_rmsnorm_fwd_patched}
-        )
+    for name, patched in (
+        ("rmsnorm_fwd", _te_rmsnorm_fwd_patched),
+        ("layernorm_fwd", _te_layernorm_fwd_patched),
+    ):
+        if tex is not None and hasattr(tex, name):
+            _TE_NORM_FWD_ORIGS.setdefault(name, getattr(tex, name))
+            _te_rebind_or_raise(f"TE's {name}", {_TE_NORM_FWD_ORIGS[name]: patched})
 
 
 def _loaded_te_modules() -> list:
@@ -1177,9 +1181,13 @@ def _te_unpatch_for_batch_invariant():
             {id(_te_general_gemm_patched): (_te_general_gemm_patched, _TE_GENERAL_GEMM_ORIG)}
         )
         _TE_GENERAL_GEMM_ORIG = None
-    for orig in _TE_RMSNORM_FWD_ORIGS.values():
-        _te_rebind({id(_te_rmsnorm_fwd_patched): (_te_rmsnorm_fwd_patched, orig)})
-    _TE_RMSNORM_FWD_ORIGS.clear()
+    for name, patched in (
+        ("rmsnorm_fwd", _te_rmsnorm_fwd_patched),
+        ("layernorm_fwd", _te_layernorm_fwd_patched),
+    ):
+        if name in _TE_NORM_FWD_ORIGS:
+            _te_rebind({id(patched): (patched, _TE_NORM_FWD_ORIGS[name])})
+    _TE_NORM_FWD_ORIGS.clear()
 
     rms_cls = getattr(te, "RMSNorm", None)
     if rms_cls is None:
@@ -1394,6 +1402,43 @@ def _te_rmsnorm_fwd_patched(
     return ln_out, None, rsigma.squeeze(-1)
 
 
+def _layernorm_batch_invariant_fp32(x, weight, bias, eps, zero_centered_gamma) -> tuple:
+    """Batch-invariant LayerNorm of the rows of ``x`` in fp32: (output, mean, rsigma)."""
+    x_fp32 = x.float()
+    w_fp32 = weight.float()
+    if zero_centered_gamma:
+        w_fp32 = w_fp32 + 1.0
+    mu = mean_dim(x_fp32, dim=-1, keepdim=True)
+    centered = x_fp32 - mu
+    rsigma = torch.rsqrt(mean_dim(centered * centered, dim=-1, keepdim=True) + eps)
+    out = centered * rsigma * w_fp32
+    if bias is not None:
+        out = out + bias.float()
+    return out, mu, rsigma
+
+
+def _te_layernorm_fwd_patched(
+    input, weight, bias, eps, ln_out, quantizer, otype, sm_margin, zero_centered_gamma
+):  # pylint: disable=redefined-builtin
+    """Batch-invariant replacement for transformer_engine_torch.layernorm_fwd.
+
+    Bound where TE imports the function by name (te.ops.LayerNorm, which TE's LayerNorm
+    module subclasses). Returns ``(out, mu, rsigma)`` with fp32 ``mu`` and ``rsigma`` of
+    shape [rows], which TE's layernorm_bwd consumes.
+    """
+    del sm_margin  # The batch-invariant kernel does not reserve SMs.
+    if quantizer is not None:
+        raise RuntimeError("Batch-invariant LayerNorm does not support a quantized output.")
+    out_fp32, mu, rsigma = _layernorm_batch_invariant_fp32(
+        input, weight, bias, eps, zero_centered_gamma
+    )
+    if ln_out is not None:
+        ln_out.copy_(out_fp32)
+    else:
+        ln_out = out_fp32.to(_te_dtype_to_torch()[otype])
+    return ln_out, mu.squeeze(-1), rsigma.squeeze(-1)
+
+
 def _te_apply_normalization_patched(
     inputmat,
     ln_out,
@@ -1408,20 +1453,20 @@ def _te_apply_normalization_patched(
 ):
     """Batch-invariant replacement for TE's fused-module `apply_normalization`.
 
-    Routes RMSNorm through the batch-invariant implementation (fp32 stats via
-    `mean_dim`, deterministic within-row reduction independent of row count).
-    Falls back to the original TE kernel for configurations the BI path does
-    not cover (LayerNorm, fp8 quantized output).
+    Routes RMSNorm and LayerNorm through the batch-invariant implementations (fp32
+    stats via `mean_dim`, deterministic within-row reduction independent of row
+    count). Falls back to the original TE kernel for configurations the BI path
+    does not cover (fp8 quantized output).
 
-    Returns `(ln_out, mu, rsigma)` like TE: `mu` is None for RMSNorm and
-    `rsigma` is fp32 with shape [rows], which TE's rmsnorm backward consumes.
+    Returns `(ln_out, mu, rsigma)` like TE: `mu` is None for RMSNorm, and `mu` and
+    `rsigma` are fp32 with shape [rows], which TE's norm backward consumes.
     """
     orig = _TE_APPLY_NORM_ORIGS.get("module._common.apply_normalization")
     if (
         not is_batch_invariant_mode_enabled()
-        or normalization != "RMSNorm"
+        or normalization not in ("RMSNorm", "LayerNorm")
         or output_quantizer is not None
-        or ln_bias is not None
+        or (normalization == "RMSNorm" and ln_bias is not None)
     ):
         assert orig is not None, "TE apply_normalization original not captured"
         return orig(
@@ -1437,7 +1482,16 @@ def _te_apply_normalization_patched(
             zero_centered_gamma,
         )
 
-    out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(inputmat, ln_weight, eps, zero_centered_gamma)
+    if normalization == "LayerNorm":
+        out_fp32, mu, rsigma = _layernorm_batch_invariant_fp32(
+            inputmat, ln_weight, ln_bias, eps, zero_centered_gamma
+        )
+        mu = mu.squeeze(-1)
+    else:
+        out_fp32, rsigma = _rmsnorm_batch_invariant_fp32(
+            inputmat, ln_weight, eps, zero_centered_gamma
+        )
+        mu = None
 
     # The fused-module callers (layernorm_linear / layernorm_mlp) pass a torch.dtype
     # output_dtype (inputmat.dtype); assert that so we never silently ignore a TE
@@ -1451,7 +1505,7 @@ def _te_apply_normalization_patched(
         ln_out.copy_(out_fp32)
     else:
         ln_out = out_fp32.to(output_dtype)
-    return ln_out, None, rsigma.squeeze(-1)
+    return ln_out, mu, rsigma.squeeze(-1)
 
 
 @lru_cache(maxsize=None)
