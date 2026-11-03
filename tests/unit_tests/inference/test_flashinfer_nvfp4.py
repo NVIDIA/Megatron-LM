@@ -738,7 +738,7 @@ class TestNVFP4MoELayer:
                 per_rank_worst_case_token_count=_NVLS_MAX_TOKENS,
                 topk=config.moe_router_topk,
                 hidden_size=config.hidden_size,
-                ep_group=get_expert_model_parallel_group(),
+                tp_ep_group=get_expert_model_parallel_group(),
             )
         else:
             NCCLAllGatherDispatcher.allocate_buffers()

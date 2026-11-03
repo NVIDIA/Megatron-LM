@@ -7,7 +7,8 @@ This backend is deterministic, but not batch invariant.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -57,6 +58,7 @@ class CuTeDSLGatedDeltaProductCPBackend:
 
     def __init__(self, recompute_chunk_num: int = 0) -> None:
         self.recompute_chunk_num = recompute_chunk_num
+        self._compile_pending = True
 
     def cp_forward_prepare(
         self, inputs: GDPInputs
@@ -64,6 +66,10 @@ class CuTeDSLGatedDeltaProductCPBackend:
         """Compute the trailing-boundary ``[E | M]`` summary for this rank."""
         if inputs.cu_seqlens is None:
             raise ValueError("The CuTeDSL GDP backend requires cu_seqlens")
+        if self._compile_pending:
+            # Cleared first, because _compile_boundary_variants calls this method.
+            self._compile_pending = False
+            self._compile_boundary_variants(inputs)
         packed_summary, local_context = cutedsl_cp_forward_prepare(
             inputs.q,
             inputs.k,
@@ -128,6 +134,36 @@ class CuTeDSLGatedDeltaProductCPBackend:
         return cutedsl_cp_backward_apply(
             backward_context, _backward_packed_tensor(following_summaries), dht=None
         )
+
+    def _compile_boundary_variants(self, inputs: GDPInputs) -> None:
+        """Compile the kernels of every CP boundary case on a dummy shard.
+
+        gdp_attn compiles separate kernels for a shard with and without a preceding or following
+        summary. Without this, a rank compiles a case in a later step, when a packed batch first
+        puts a sequence boundary on its shard edge, while its CP group waits for it.
+        """
+        num_tokens = 256
+        # Same dtypes, widths and row pitches as the real faces: gdp_attn keys kernels on them.
+        q, k, v, g, beta = (
+            torch.empty_strided(
+                (num_tokens, face.shape[1]), face.stride(), dtype=face.dtype, device=face.device
+            ).zero_()
+            for face in (inputs.q, inputs.k, inputs.v, inputs.g, inputs.beta)
+        )
+        cu_seqlens = inputs.cu_seqlens.new_tensor([0, num_tokens])
+        dummy_inputs = replace(inputs, q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens)
+        # Zero or one preceding (following) summaries, sliced like the gathered ones in training.
+        for num_preceding, num_following in itertools.product((0, 1), repeat=2):
+            forward_summary, local_context = self.cp_forward_prepare(dummy_inputs)
+            preceding = _forward_packed_tensor(forward_summary).unsqueeze(0)[:num_preceding]
+            output, saved_context = self.cp_forward_apply(
+                local_context, CPForwardPackedSummary(packed=preceding)
+            )
+            backward_summary, backward_context = self.cp_backward_prepare(
+                torch.zeros_like(output), saved_context
+            )
+            following = _backward_packed_tensor(backward_summary).unsqueeze(0)[:num_following]
+            self.cp_backward_apply(backward_context, CPBackwardPackedSummary(packed=following))
 
 
 def _forward_packed_tensor(summary: CPForwardSummary) -> torch.Tensor:
