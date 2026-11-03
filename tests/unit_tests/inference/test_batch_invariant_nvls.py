@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Real NVLS batch invariance at EP = world size.
 
-Both combine collectives run in one process; each test enables and disables the mode around a
-freshly built layer. The ordered combine must equal the rank-order fp32 sum bit for bit; the
-multimem in-switch fp32 sum must stay within the fp32 summation bound of the exact sum. Under
-either, a target row keeps its fp32 bits across co-batches. MCORE_BI_TEST_BACKEND selects the
-GEMM backend (default te_native). In this layer the backend changes only the router's TE GEMM:
-the dispatch, the experts and the combine run the same Triton or DeepGEMM kernels under every
-backend.
+The combine collectives valid on the device run in one process: "ordered" everywhere and
+"multimem" off Hopper. Each test enables and disables the mode around a freshly built layer. The
+ordered combine must equal the rank-order fp32 sum bit for bit; the multimem in-switch fp32 sum
+must stay within the fp32 summation bound of the exact sum. Under either, a target row keeps its
+fp32 bits across co-batches. MCORE_BI_TEST_BACKEND selects the GEMM backend (default te_native).
+In this layer the backend changes only the router's TE GEMM: the dispatch, the experts and the
+combine run the same Triton or DeepGEMM kernels under every backend.
 """
 
 import os
@@ -36,6 +36,12 @@ pytestmark = [
         reason="NVLS Triton symmetric-memory barrier requires a power-of-two EP size > 1.",
     ),
 ]
+
+# A Hopper NVLS in-switch reduction is not batch-invariant on every system: it can depend on
+# multicast objects allocated earlier unless the driver and Fabric Manager carry the fix
+# (NVIDIA/nccl#2360). The multimem combine therefore runs only off Hopper; ordered runs everywhere.
+_IS_HOPPER = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+_COLLECTIVES = ["ordered"] if _IS_HOPPER else ["ordered", "multimem"]
 
 
 @pytest.fixture
@@ -138,7 +144,7 @@ def test_nvls_empty_router_width(nvls_runtime, monkeypatch):
     assert calls == [(count, config.hidden_size) for count in counts]
 
 
-@pytest.mark.parametrize("nvls_runtime", ["ordered", "multimem"], indirect=True)
+@pytest.mark.parametrize("nvls_runtime", _COLLECTIVES, indirect=True)
 @pytest.mark.parametrize("grouped_backend", ["vllm", "torch"])
 @pytest.mark.parametrize("peers", ["idle", "uneven"])
 @torch.inference_mode()
@@ -242,8 +248,8 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
                     expected = expected + contribution
                 assert torch.equal(combined, expected), "ordered combine is not the rank-order sum"
             else:
-                # The in-switch fp32 sum adds in an order the switch picks and is not correctly
-                # rounded on H100, so it is held to the recursive-summation bound for any order,
+                # The in-switch fp32 sum adds in an order the switch picks and need not be
+                # correctly rounded, so it is held to the recursive-summation bound for any order,
                 # gamma_(ws-1) * sum|x| with u = 2**-24 (Higham, eq. 4.4); its bits are pinned
                 # across co-batches below.
                 stacked = torch.stack(partials).double()
