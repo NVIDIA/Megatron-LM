@@ -476,7 +476,7 @@ class MambaBatchInvariantDecode:
 
         cached = mixer._get_batch_invariant_decode_params()
         if cached is not None:
-            A, dt_bias = cached[0], cached[1]
+            A, dt_bias = cached.A, cached.dt_bias
         else:
             A = -torch.exp(mixer.cp.get_A_log().float())
             dt_bias = mixer.cp.get_dt_bias().float()

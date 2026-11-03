@@ -166,7 +166,7 @@ class TestMambaMixer:
             mixer.conv1d_bias.float(),
         ]
         if batch_invariant:
-            got += list(bi)
+            got += [bi.A, bi.dt_bias]
             expected += [-torch.exp(mixer.A_log.float()), mixer.dt_bias.float()]
         else:
             assert bi is None

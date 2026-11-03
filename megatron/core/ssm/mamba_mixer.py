@@ -131,6 +131,16 @@ class ExtendedRMSNorm(RMSNormGated):
         )
 
 
+@dataclass(frozen=True)
+class BatchInvariantDecodeParams:
+    """The mixer's cached FP32 decode parameters for batch-invariant decode."""
+
+    A: torch.Tensor
+    """``-exp(A_log.float())``, [nheads]."""
+    dt_bias: torch.Tensor
+    """``dt_bias.float()``, [nheads]."""
+
+
 @dataclass
 class MambaMixerSubmodules:
     """
@@ -1118,8 +1128,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             return self._conv_weight_fp32_cache, self._conv_bias_fp32_cache
         return rearrange(weight, "d 1 w -> d w").to(dtype), bias.to(dtype)
 
-    def _get_batch_invariant_decode_params(self):
-        """Cached FP32 ``(A, dt_bias)`` for batch-invariant decode, or None.
+    def _get_batch_invariant_decode_params(self) -> Optional[BatchInvariantDecodeParams]:
+        """Cached FP32 ``A`` and ``dt_bias`` for batch-invariant decode, or None.
 
         The values are exactly ``-exp(A_log.float())`` and ``dt_bias.float()``, refreshed
         with the A cache after every refit or train/eval switch. None where the per-step
@@ -1129,7 +1139,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             return None
         if self._A_neg_exp_cache_stale:
             self.refresh_cache()
-        return self._A_neg_exp_cache, self._bi_dt_bias_cache
+        return BatchInvariantDecodeParams(A=self._A_neg_exp_cache, dt_bias=self._bi_dt_bias_cache)
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
