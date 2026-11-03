@@ -53,6 +53,39 @@ def _assert_as_accurate_as_torch(actual, reference, trusted, what, factor=2.0):
         )
 
 
+def _step_with_unit_B(state, x, arg, A, tie_hdim):
+    """One decode step, in place on `state`, with B = C = 1 and dt + dt_bias = `arg` per (batch,
+    head). dt_bias is drawn as MambaMixer initializes it and dt is `arg - dt_bias`; returns the fp32
+    sum dt + dt_bias that the kernel passes to its softplus."""
+    batch, nheads, headdim, dstate = state.shape
+    dt_init = torch.empty(nheads, device=state.device)
+    dt_init = dt_init.uniform_(math.log(1e-3), math.log(1e-1)).exp()
+    dt_bias = dt_init + torch.log(-torch.expm1(-dt_init))
+    dt = arg - dt_bias
+    ones = torch.ones(batch, 1, dstate, device=state.device, dtype=torch.bfloat16)
+    dt_full = dt[..., None].expand(batch, nheads, headdim)
+    A_full = A[:, None, None].expand(nheads, headdim, dstate)
+    dt_bias_full = dt_bias[:, None].expand(nheads, headdim)
+    if not tie_hdim:
+        dt_full, A_full, dt_bias_full = (t.contiguous() for t in (dt_full, A_full, dt_bias_full))
+    selective_state_update(
+        state, x, dt_full, A_full, ones, ones, dt_bias=dt_bias_full, dt_softplus=True
+    )
+    return dt + dt_bias
+
+
+def _assert_within_eps(actual, reference, arg, bound, what):
+    """`actual` must be within `bound` fp32 epsilons (relative) of the fp64 `reference`."""
+    error = (actual.double() - reference).abs() / reference.abs() / torch.finfo(torch.float32).eps
+    worst = error.argmax()
+    b, h, *_ = torch.unravel_index(worst, error.shape)
+    assert error.max().item() <= bound, (
+        f"{what}: {error.max().item():.1f} eps from fp64 (bound {bound}) at dt + dt_bias = "
+        f"{arg[b, h].item()!r}: kernel {actual.flatten()[worst].item()!r}, "
+        f"fp64 {reference.flatten()[worst].item()!r}"
+    )
+
+
 @pytest.mark.internal
 class TestSelectiveStateUpdateAccuracy:
     """With an fp32 state, a decode step must be about as accurate as torch fp32 doing the same
@@ -122,6 +155,40 @@ class TestSelectiveStateUpdateAccuracy:
         _assert_as_accurate_as_torch(state, reference[:, -1], trusted[:, -1], "final state")
         if per_token_states is not None:
             _assert_as_accurate_as_torch(per_token_states, reference, trusted, "per-token states")
+
+    @pytest.mark.parametrize("tie_hdim", [True, False], ids=["broadcast_dt_A", "dense_dt_A"])
+    def test_softplus_within_4_eps_of_fp64(self, tie_hdim):
+        """Read the kernel's softplus out of single steps, bounded against fp64 alone (no torch
+        reference, no 2x factor):
+
+        * zero state, x = 1: the new state is dt' = softplus(dt + dt_bias) itself, exactly. For
+          dt + dt_bias around 0 and over the production range (dt' ~ 1e-3 .. 1e-1), the far tail
+          and both sides of the threshold 20, dt' must be within 4 eps: libdevice's expf and
+          log1pf are within 2 and 1 ulp. log(exp(x) + 1) is off by up to ~500 eps at dt' = 1e-3.
+        * unit state, x = 0: the new state is exp(A * dt'), with A = -16 (the steepest decay
+          MambaMixer initializes) and dt' ~ 1e-3. The kernel's exp2 is within 2 ulp and
+          A * dt' is too small for its rounding to matter, so this must be within 4 eps too;
+          log(exp(x) + 1) left up to 8 eps here.
+        """
+        torch.manual_seed(0)
+        device = "cuda"
+        batch, nheads, headdim, dstate = 64, 8, 16, 16
+        A = torch.full((nheads,), -16.0, device=device)
+
+        arg = torch.empty(batch, nheads, device=device).uniform_(-8.0, 2.0)
+        arg[0, :7] = torch.tensor([-20.0, -10.0, 0.0, 19.5, 20.0, 20.5, 40.0], device=device)
+        state = torch.zeros(batch, nheads, headdim, dstate, device=device)
+        x = torch.ones(batch, nheads, headdim, device=device, dtype=torch.bfloat16)
+        arg = _step_with_unit_B(state, x, arg, A, tie_hdim)
+        dt = F.softplus(arg.double())[..., None, None].expand_as(state)
+        _assert_within_eps(state, dt, arg, 4, "dt'")
+
+        arg = torch.empty(batch, nheads, device=device).uniform_(-7.5, -5.5)
+        state = torch.ones(batch, nheads, headdim, dstate, device=device)
+        x = torch.zeros(batch, nheads, headdim, device=device, dtype=torch.bfloat16)
+        arg = _step_with_unit_B(state, x, arg, A, tie_hdim)
+        decay = torch.exp(A.double() * F.softplus(arg.double()))
+        _assert_within_eps(state, decay[..., None, None].expand_as(state), arg, 4, "exp(A dt')")
 
 
 @pytest.mark.internal
