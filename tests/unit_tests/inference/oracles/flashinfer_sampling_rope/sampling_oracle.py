@@ -100,10 +100,42 @@ SAMPLING_VOCAB_SIZES = ou.boundary_sizes(
 # RADIX_CHUNK_H100 do not launch (finding O4a-N1): RADIX_SMEM_LIMIT_VOCABS.
 RADIX_VOCAB_SIZES = sorted({57472, 57593, 114944, 115185, *PRODUCTION_VOCABS})
 
-# O4a-N1: FlashInfer sizes a radix CTA's dynamic shared memory up to the full 227 KiB without
-# counting the kernel's static shared memory. These sizes leave 0, 4 (measured: invalid argument)
-# and 64-224 bytes (multiples of 128, as Megatron pads vocabularies) of headroom.
-RADIX_SMEM_LIMIT_VOCABS = (57591, 57592, 115072, 115183, 115184, 172672, 230272, 287744, 287872)
+# O4a-N1: FlashInfer sizes a radix CTA's dynamic shared memory (2080 + 4 * chunk bytes) up to the
+# full 227 KiB without counting the kernel's static shared memory: for top_k_renorm_probs two cub
+# BlockReduce<float, 1024> scratch buffers (2 x 164 bytes) plus a 4-byte flag on multi-CTA rows,
+# for the multi-CTA top_k_mask_logits the flag alone. Measured on H100 (pdx 7849977, dfw
+# 21223592): the renorm fails at 0-224 bytes of headroom (all sizes below but the edge probes),
+# runs at 480 (57472, 114944); the mask fails only at 0. Edge probes for the renorm's 328/332
+# bytes: 57509 and 57510 (332, 328 bytes: should run), 57511 (324: should fail), 115016 (336:
+# should run), 115018 (328 < 332: should fail).
+RADIX_SMEM_LIMIT_VOCABS = (
+    57509,
+    57510,
+    57511,
+    57591,
+    57592,
+    115016,
+    115018,
+    115072,
+    115183,
+    115184,
+    172672,
+    230272,
+    287744,
+    287872,
+)
+
+# 128-multiple vocabularies whose processed log-probs (top_k_renorm_probs) cannot launch on H100
+# by the boundary above (O4a-N1); the call-site case takes the first two.
+RENORM_UNLAUNCHABLE_PADDED_VOCABS = (115072, 172544, 172672, 230144, 230272, 287616, 287744, 287872)
+
+# Elementwise roundings of a processed log-prob before the shape comparison: FlashInfer's main
+# path multiplies by two rcp.approx reciprocals (up to 1.5 ulp each), takes the log and the shape
+# is rounded to fp32 again; torch's trusted pipeline divides once. On H100 a row whose kept logits
+# are an exact arithmetic progression (the ramp) rounds every value by the same offset, which for
+# the trusted implementation can be 0.1 ulp (dfw 21223592: 2.6e-8 at |log p| ~ 2-4 against the
+# kernel's 1 ulp), so the floor, not the factor, has to admit the kernel's rounding count.
+LOG_PROB_FLOOR_ULPS = 4.0
 
 
 UNIT_ROUNDOFF = 2.0**-24  # fp32
@@ -184,7 +216,7 @@ def assert_log_probs(
        top-k, top-p: ``renorm_mass_bound``) plus the rounding of the logs (``u`` times the
        row's entropy, at most ``u * ln V``).
     3. Values after the scale: ``row - logsumexp(row)`` against ``log(refs)`` per row (factor 2,
-       one ulp), ``trusted_log`` normalized the same way.
+       a floor of ``LOG_PROB_FLOOR_ULPS`` ulp), ``trusted_log`` normalized the same way.
     """
     refs_dev = refs.to(log_probs.device)
     ou.assert_exact(
@@ -198,7 +230,12 @@ def assert_log_probs(
     trusted = trusted_log.double()
     trusted = (trusted - torch.logsumexp(trusted, dim=-1, keepdim=True)).float()
     ou.assert_close_to_reference(
-        shape, torch.log(refs), trusted, dim=-1, what=f"{what}: values after the scale"
+        shape,
+        torch.log(refs),
+        trusted,
+        floor_ulps=LOG_PROB_FLOOR_ULPS,
+        dim=-1,
+        what=f"{what}: values after the scale",
     )
 
 

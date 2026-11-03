@@ -116,10 +116,11 @@ def test_vocabularies_at_the_shared_memory_limit(vocab):
     """Rows whose radix CTA chunk ends at or just below the 57592-token shared-memory limit.
 
     Finding O4a-N1: FlashInfer gives each CTA ``2080 + 4 * chunk`` bytes of dynamic shared
-    memory, up to the full 227 KiB opt-in limit, and the kernel's static shared memory (its
-    block-reduction scratch) on top. On H100 (pdx 7849977) V = 57591, 57592, 115183 and 115184
-    (0 or 4 bytes of headroom) fail with ``invalid argument``; the 128-multiples here leave 64-224
-    bytes and show which padded vocabularies Megatron can reach the failure with.
+    memory, up to the full 227 KiB opt-in limit, and the kernel's static shared memory (two cub
+    block-reduction scratch buffers, 328-332 bytes) on top. On H100 every size here with less
+    headroom fails with ``invalid argument`` (pdx 7849977, dfw 21223592: 57591, 57592, 115072,
+    115183, 115184, 172672, 230272, 287744, 287872); 57509, 57510 and 115016 are edge probes
+    that should run (``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``).
     """
     g = ou.make_generator()
     specs = _specs(vocab, so.spread_positions(vocab, 48, g))
@@ -167,6 +168,21 @@ def _log_probs(specs, *, greedy=True):
 @pytest.mark.parametrize("vocab", [32000, so.RADIX_CHUNK_H100 + 1, 151936])
 def test_log_probs_kernel_scores_the_top_k_distribution(vocab):
     """Processed log-probs of top-k rows (and unfiltered rows) of one batch are log pi."""
+    _check_top_k_log_probs(vocab)
+
+
+@pytest.mark.parametrize("vocab", so.RENORM_UNLAUNCHABLE_PADDED_VOCABS[:2])
+def test_log_probs_kernel_at_the_shared_memory_limit(vocab):
+    """Processed log-probs at 128-padded vocabularies where ``top_k_renorm_probs`` cannot launch.
+
+    Finding O4a-N1 at Megatron's call site: fails on main (``TopKRenormProb failed with error
+    code invalid argument``, dfw 21223592 for the kernel at these sizes); passes with PR #8572,
+    whose ``top_k_mask_logits`` + softmax launches at them (measured through the joint sampler).
+    """
+    _check_top_k_log_probs(vocab)
+
+
+def _check_top_k_log_probs(vocab):
     g = ou.make_generator()
     positions = so.spread_positions(vocab, 48, g)
     specs = [s for s in _specs(vocab, positions) if s.top_k != 1]
