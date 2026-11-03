@@ -274,6 +274,10 @@ def fused_compact_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -> 
         precision=precision,
         cand_buffer=torch.empty(q.shape[0] * max_k, dtype=torch.float32, device=q.device),
         cand_batch_offsets=_compact_candidate_offsets(cu_q, offsets, inputs.ratio),
+        # cuDNN requires explicit stage-2 outputs during capture. Allocate them
+        # in the caller's graph pool, not a module cache shared by in-flight slots.
+        out_indices=torch.empty((q.shape[0], width), dtype=torch.int32, device=q.device),
+        out_logits=torch.empty((q.shape[0], width), dtype=torch.float32, device=q.device),
         deterministic=True,
         return_softmax=False,
         topk_indices_global=False,

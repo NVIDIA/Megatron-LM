@@ -2285,6 +2285,7 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        self.stateful_graph_adapters = []
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2301,6 +2302,11 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
+                adapter = getattr(chunk_with_decoder.decoder, 'forward_adapter', None)
+                if callable(getattr(adapter, 'prepare_cuda_graphs', None)):
+                    self.stateful_graph_adapters.append((chunk_number, adapter))
+                    if callable(getattr(adapter, 'record_cuda_graphs', None)):
+                        adapter.record_cuda_graphs()
                 num_decoder_layers = len(chunk_with_decoder.decoder.layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
@@ -2369,7 +2375,94 @@ class TECudaGraphHelper:
         This returns False if create_cudagraphs() was called but no graphable layers
         were found, and True if at least one graph was successfully created.
         """
-        return self._graphs_created
+        return self._graphs_created or any(
+            adapter.has_cuda_graphs() for _, adapter in self.stateful_graph_adapters
+        )
+
+    def _prepare_stateful_graphs(self):
+        """Reserve each chunk's peak live microbatches for model-owned tensor regions."""
+        if not self.stateful_graph_adapters:
+            return
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        microbatches = get_num_microbatches() if self.pp_group.size() > 1 else 1
+        _, _, warmup, _ = get_pp_rank_microbatches(
+            microbatches,
+            self.num_model_chunks,
+            self.config.microbatch_group_size_per_vp_stage,
+            forward_only=False,
+            p2p_communicator=self.p2p_communicator,
+        )
+        order = convert_schedule_table_to_order(
+            warmup,
+            self.num_model_chunks,
+            get_schedule_table(
+                microbatches, self.num_model_chunks, self.config.microbatch_group_size_per_vp_stage
+            ),
+        )
+        live, peak = [0] * self.num_model_chunks, [0] * self.num_model_chunks
+        for operation in order:
+            chunk = abs(operation) - 1
+            live[chunk] += 1 if operation > 0 else -1
+            peak[chunk] = max(peak[chunk], live[chunk])
+        profiles, counts, destinations = [], [0] * self.num_model_chunks, []
+        for chunk, adapter in self.stateful_graph_adapters:
+            recorded = adapter.prepare_cuda_graphs(slots=peak[chunk], backend='transformer_engine')
+            if recorded:
+                counts[chunk] = len(recorded)
+                profiles.extend(sample for _, sample in recorded)
+                destinations.extend((adapter, key) for key, _ in recorded)
+        return profiles, counts, destinations, order, microbatches
+
+    def _capture_stateful_graphs(self, plan):
+        """Use TE's shared-pool schedule for explicit tensor-state consumers."""
+        from megatron.core.transformer.stateful_module import StatefulGraphs
+
+        if plan is None or not plan[0]:
+            return
+        profiles, counts, destinations, order, microbatches = plan
+        kwargs = dict(
+            num_warmup_iters=max(
+                1,
+                math.ceil(
+                    (10 - self.config.cuda_graph_warmup_steps * get_num_microbatches())
+                    / microbatches
+                ),
+            )
+        )
+        if is_te_min_version('2.19.0'):
+            kwargs['clone_param_grads_on_return'] = False
+        if self.config.fp8:
+            from megatron.core.fp8_utils import get_fp8_recipe, is_first_last_bf16_layer
+
+            kwargs.update(
+                fp8_enabled=tuple(
+                    not is_first_last_bf16_layer(self.config, key[0]) for _, key in destinations
+                ),
+                fp8_recipe=get_fp8_recipe(self.config),
+                fp8_weight_caching=True,
+                fp8_group=self.tp_group,
+            )
+        owners = StatefulGraphs.capture_many(
+            profiles,
+            order=order,
+            num_layers_per_chunk=counts,
+            capture_kwargs=kwargs,
+            preserve_gradients=False,
+            clone_inputs=False,
+        )
+        for _, adapter in self.stateful_graph_adapters:
+            captures = [
+                (key, graph)
+                for (destination, key), graph in zip(destinations, owners)
+                if destination is adapter
+            ]
+            if captures:
+                adapter.install_cuda_graphs(captures, slots=microbatches)
+        self._graphs_created = True
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
@@ -2860,15 +2953,24 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
-        start_time = self._start_capturing()
+        for chunk, adapter in self.stateful_graph_adapters:
+            model_chunk = self.model[chunk]
+            # Parameter-gather overlap belongs to DDP, not TransformerConfig.
+            ddp_config = getattr(model_chunk, 'ddp_config', None)
+            if ddp_config is not None and ddp_config.overlap_param_gather:
+                adapter.setup_cuda_graph_hooks(model_chunk._make_forward_pre_hook)
+        stateful_plan = self._prepare_stateful_graphs()
 
-        if not self.flattened_callables:
+        start_time = self._start_capturing()
+        self._capture_stateful_graphs(stateful_plan)
+
+        if not self.flattened_callables and not self.stateful_graph_adapters:
             # Check if there are any graphable layers. If not, log a warning and skip capture,
             # but still call _finish_capturing to ensure all ranks complete the capture phase.
             logger.warning(
                 'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
             )
-        else:
+        elif self.flattened_callables:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
@@ -2908,6 +3010,8 @@ class TECudaGraphHelper:
         Set CUDA Graph manual hooks for the modules that contain direct parameters and
         are covered by cudagraphs.
         """
+        for chunk_number, adapter in self.stateful_graph_adapters:
+            adapter.setup_cuda_graph_hooks(self.model[chunk_number]._make_forward_pre_hook)
         for chunk_number, layers in enumerate(self.callables_per_chunk):
             model_chunk = self.model[chunk_number]
             for layer in layers:
@@ -2917,7 +3021,9 @@ class TECudaGraphHelper:
         """
         Delete all CUDA graphs.
         """
-        assert self._graphs_created, "No CUDA Graphs were created to delete."
+        assert self.graphs_created(), "No CUDA Graphs were created to delete."
+        for _, adapter in self.stateful_graph_adapters:
+            adapter.reset_cuda_graphs()
 
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0

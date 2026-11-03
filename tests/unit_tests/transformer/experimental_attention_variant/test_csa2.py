@@ -680,3 +680,11 @@ def test_packed_selection_matches_scoring_precision(monkeypatch, ratio, heads, c
     assert_replays_bit_exact(
         select, (q, k, w), backward=False, replays=3, what=f"CSA2 {precision} packed selection"
     )
+    # Compact cuDNN selection has an allocation-free output contract during
+    # capture. The caller must supply slot-local outputs for both precisions.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fused_compact_topk(inputs, 7, precision)
+    for _ in range(3):
+        graph.replay()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)

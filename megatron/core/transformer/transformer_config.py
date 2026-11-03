@@ -2879,7 +2879,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.mhc_single_pass:
-            if self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl != "none" and not (
+                self.dsv4_version == "v4.1" and self.cuda_graph_impl == "transformer_engine"
+            ):
                 raise NotImplementedError(
                     "Single-pass mHC requires an explicit tensor-state graph adapter"
                 )
