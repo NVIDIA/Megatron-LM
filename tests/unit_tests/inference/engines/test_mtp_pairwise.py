@@ -1061,10 +1061,16 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             assert set(state["after_resume_waiting_ids"]) == set(request_ids)
             assert state["suspended_bytes"] == 0
 
+    @pytest.mark.parametrize("mtp_verification", ["exact_match", "rejection"])
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @torch.inference_mode()
-    def test_sampling_filters_are_reproducible_with_mtp(self, backend):
-        """MTP proposals use the selected sampler and its temperature/k/p filters."""
+    def test_sampling_filters_are_reproducible_with_mtp(self, backend, mtp_verification):
+        """MTP proposals use the selected sampler and its temperature/k/p filters.
+
+        Under exact-match verification drafts come from the backend's `sample_kernel`; under
+        rejection sampling they are drawn from the backend's filtered `probs_kernel` (so the
+        stored q is exactly the draft distribution) and verified by its chain sampler.
+        """
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
         active_filter = "top-k" if backend == "torch" else "top-p"
@@ -1077,6 +1083,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             output_lengths=(12, 11, 10),
             config={
                 "sampling_backend": backend,
+                "mtp_verification": mtp_verification,
                 "temperature": 0.8,
                 "top_k": 3 if backend == "torch" else 0,
                 "top_p": 0.95 if backend == "flashinfer" else 0.0,
@@ -1085,6 +1092,20 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         first_env = _build_env(case, mtp_active=True)
         repeat_env = _build_env(case, mtp_active=True)
         _same_model_weights(first_env, repeat_env)
+        rejection = mtp_verification == "rejection"
+        chain_calls = Counter()
+        for env in (first_env, repeat_env):
+            controller = env.engine.controller
+            assert (controller._mtp_draft_probs is not None) == rejection
+            real_chain = controller._sampling.chain_speculative_sampling
+
+            def counted_chain(
+                draft_probs, draft_token_ids, target_probs, _real=real_chain, _env=env
+            ):
+                chain_calls[id(_env)] += 1
+                return _real(draft_probs, draft_token_ids, target_probs)
+
+            controller._sampling.chain_speculative_sampling = counted_chain
         first = _run_session(first_env, case)
         repeat = _run_session(repeat_env, case)
         _assert_request_parity(
@@ -1097,10 +1118,14 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             assert session.runtime[f"{active_filter}-filter"] > 0
             assert session.runtime[f"{inactive_filter}-filter"] == 0
             assert session.runtime["mtp-serial-steps"] > 0
-            assert session.runtime[f"mtp-local:sampling-backend:{backend}"] > 0
-            assert session.runtime["mtp-local:temperature-filter"] > 0
-            assert session.runtime[f"mtp-local:{active_filter}-filter"] > 0
-            assert session.runtime[f"mtp-local:{inactive_filter}-filter"] == 0
+            if not rejection:
+                assert session.runtime[f"mtp-local:sampling-backend:{backend}"] > 0
+                assert session.runtime["mtp-local:temperature-filter"] > 0
+                assert session.runtime[f"mtp-local:{active_filter}-filter"] > 0
+                assert session.runtime[f"mtp-local:{inactive_filter}-filter"] == 0
+        for env in (first_env, repeat_env):
+            assert (chain_calls[id(env)] > 0) == rejection
+        for session in (first, repeat):
             assert all(
                 token in {_BASE_TOKEN, _REJECT_TOKEN, _REJECT_TOKEN + 1}
                 for request in session.requests

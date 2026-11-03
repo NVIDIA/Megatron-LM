@@ -695,6 +695,17 @@ class InferenceConfig:
     window early (`write_pos + 2W > L`) so a full window always fits. Must satisfy `B >= W`.
     Only used when `mamba_replay_ssm` is True."""
 
+    mtp_verification: Literal['exact_match', 'rejection'] = 'rejection'
+    """How MTP draft tokens are verified against the main model.
+
+    "rejection" uses standard speculative (rejection) sampling: draft x_k is accepted with
+    probability min(1, p(x_k) / q(x_k)) and the first rejected position emits a sample from
+    normalize(max(0, p - q)), so per-position acceptance is sum_x min(p, q). "exact_match" samples
+    the target independently and accepts a draft only if it equals that sample (acceptance
+    sum_x p * q). Both emit target-distributed tokens and are identical for greedy (top_k=1)
+    requests. "rejection" keeps the draft logits of every depth (num_mtp_depths x max_requests x
+    vocab in params_dtype) for use at verification."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
@@ -1003,6 +1014,12 @@ class InferenceConfig:
             raise ValueError(
                 "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
                 "(num_speculative_tokens > 0)."
+            )
+
+        if self.mtp_verification not in ("exact_match", "rejection"):
+            raise ValueError(
+                f"Unsupported mtp_verification {self.mtp_verification!r}. "
+                "Supported values: exact_match, rejection."
             )
 
         if self.sampling_backend == 'flashinfer':

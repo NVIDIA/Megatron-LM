@@ -306,6 +306,7 @@ class TextGenerationController(MTPControllerMixin):
         self.tokenizer = tokenizer
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self.mtp_verification = getattr(inference_config, "mtp_verification", "exact_match")
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -1190,20 +1191,24 @@ class TextGenerationController(MTPControllerMixin):
             sample_gather_indices = required_logit_indices
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
-        # Sample tokens from logits
-        nvtx_range_push("mtp-spec-decoding/verify/sample")
-        output_tokens = self._sampling.sample_speculative(
-            sample_logits,
-            sample_num_decode,
-            sample_num_prefill,
-            self.num_speculative_tokens,
-            context,
-            gather_indices=sample_gather_indices,
-        )
-        nvtx_range_pop("mtp-spec-decoding/verify/sample")
-
         num_prefill_requests = context.num_prefill_requests
         num_decode_requests = active_request_count - num_prefill_requests
+
+        # Decode requests verified by rejection sampling (host-side; None under exact match).
+        rejection_plan = (
+            self._mtp_rejection_plan(num_decode_requests) if self._mtp_rejection_enabled() else None
+        )
+
+        # Sample tokens from logits (all verify rows except those the rejection sampler writes).
+        nvtx_range_push("mtp-spec-decoding/verify/sample")
+        output_tokens = self._sample_speculative_verify_rows(
+            sample_logits,
+            sample_gather_indices,
+            sample_num_decode,
+            sample_num_prefill,
+            rejection_plan,
+        )
+        nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
         # Verify speculative tokens against input tokens.
         nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
@@ -1214,6 +1219,16 @@ class TextGenerationController(MTPControllerMixin):
                 required_logit_indices[:actual_required_count].long()
             ]
         input_tokens_required = input_ids[0, input_row_indices]
+        if rejection_plan is not None:
+            # Writes the planned requests' rows so the exact-match verifier below reproduces
+            # speculative (rejection) sampling acceptance; see `_apply_mtp_rejection_sampling`.
+            self._apply_mtp_rejection_sampling(
+                output_tokens,
+                sample_logits,
+                sample_gather_indices,
+                input_tokens_required.reshape(-1),
+                rejection_plan,
+            )
         last_one_indices, accepted_tokens_mask, input_tokens_required = (
             self._verify_speculative_tokens(
                 output_tokens,

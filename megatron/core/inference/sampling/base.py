@@ -1,10 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import Tensor
+
+from megatron.core.inference.sampling.speculative import (
+    chain_speculative_sampling_torch,
+    sample_from_probs_torch,
+)
 
 
 class Sampling(ABC):
@@ -137,3 +142,50 @@ class Sampling(ABC):
             `[num_rows, vocab_size]` log-probs; filtered-out tokens are `-inf`.
         """
         ...
+
+    def probs_kernel(
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
+    ) -> Tensor:
+        """Per-row probabilities of the distribution this backend samples from.
+
+        Temperature-scaled, top-k / top-p filtered and renormalized, exactly as for
+        `log_probs_kernel`; filtered-out tokens have probability 0.
+
+        Args:
+            logits: `[num_rows, vocab_size]` raw logits.
+            context: The active DynamicInferenceContext.
+            token_to_request_index: Optional per-row request mapping (see `log_probs_kernel`).
+
+        Returns:
+            `[num_rows, vocab_size]` float32 probabilities.
+        """
+        return self.log_probs_kernel(
+            logits, context, token_to_request_index=token_to_request_index
+        ).exp_()
+
+    def sample_from_probs(self, probs: Tensor) -> Tensor:
+        """Draw one token per row of `probs` (`[N, V]`, rows with positive mass).
+
+        Returns:
+            `[N]` int64 token ids.
+        """
+        return sample_from_probs_torch(probs, self._rng)
+
+    def chain_speculative_sampling(
+        self, draft_probs: Tensor, draft_token_ids: Tensor, target_probs: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Speculative (rejection) sampling verification of a chain of drafts per request.
+
+        See `chain_speculative_sampling_torch` for the semantics.
+
+        Args:
+            draft_probs: `[B, D, V]` draft distributions.
+            draft_token_ids: `[B, D]` draft tokens.
+            target_probs: `[B, D + 1, V]` target distributions.
+
+        Returns:
+            (`[B, D + 1]` int64 tokens padded with -1, `[B]` int64 accepted-draft counts).
+        """
+        return chain_speculative_sampling_torch(
+            draft_probs, draft_token_ids, target_probs, generator=self._rng
+        )

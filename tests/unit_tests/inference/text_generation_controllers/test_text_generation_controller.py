@@ -3753,6 +3753,93 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert sampled_mtp_tokens.shape == (num_spec, 2)
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("mtp_verification", ["exact_match", "rejection"])
+    def test_speculative_rejection_sampling_returns_target_logprobs(
+        self, backend: str, mtp_verification: str
+    ):
+        """Draft -> verify -> log-probs with MTP rejection sampling on the real controller.
+
+        Emitted tokens (accepted drafts, then the replacement / bonus token) must carry the
+        TARGET model's log-probs, and the rejection path must consume the recorded drafts.
+        """
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        num_spec, n = 2, 3
+        stride = num_spec + 1
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            max_requests=4,
+            mtp_num_layers=num_spec,
+            sampling_backend=backend,
+            materialize_only_last_token_logits=True,
+        )
+        ctrl = self.text_generation_controller
+        ctrl.mtp_verification = mtp_verification
+        ctrl._init_mtp_sampling_tensors()
+        assert (ctrl._mtp_draft_probs is not None) == (mtp_verification == "rejection")
+
+        ctx = ctrl.inference_wrapped_model.inference_context
+        ctx.total_request_count = n
+        ctx.paused_request_count = 0
+        ctx.request_in_prefill_status_tensor = torch.zeros(n, device='cuda')
+        ctx.request_query_lengths = torch.full((n,), stride, dtype=torch.int32, device='cuda')
+        ctx.num_prefill_requests = 0
+        ctx.pad_active_slices()
+        ctx.request_ids[:n] = torch.tensor([7, 3, 11], dtype=torch.int32)
+        for label, value in (("temperature", 1.0), ("top_k", 0), ("top_p", 0.0)):
+            ctx.active_request_metadata[label][:n] = value
+            getattr(ctx.gpu_view, label)[:n] = value
+        ctx.gpu_view.request_in_prefill_status[:n] = 0
+        ctx.gpu_view.request_query_lengths[:n] = stride
+
+        torch.manual_seed(5)
+        for depth in range(num_spec):
+            draft_logits = torch.randn(n, self.vocab_size, device='cuda') * 2
+            ctrl._sampled_mtp_tokens_cuda[depth, :n] = ctrl._sample_mtp_draft(
+                depth, draft_logits, n
+            )
+        ctrl._record_mtp_draft_rows(ctx, n)
+        drafts = ctrl._sampled_mtp_tokens_cuda[:, :n].T.clone()
+        base = torch.randint(0, self.vocab_size, (n, 1), device='cuda')
+        input_ids = torch.cat([base, drafts], dim=1).reshape(1, -1)
+        logits = torch.randn(1, n * stride, self.vocab_size, device='cuda') * 2
+        ctrl._all_logits_cuda = logits
+
+        chain_results = []
+        real_chain = ctrl._sampling.chain_speculative_sampling
+
+        def chain_spy(draft_probs, draft_token_ids, target_probs):
+            result = real_chain(draft_probs, draft_token_ids, target_probs)
+            chain_results.append(result)
+            return result
+
+        ctrl._sampling.chain_speculative_sampling = chain_spy
+        ctrl._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+        assert len(chain_results) == (1 if mtp_verification == "rejection" else 0)
+        assert ctrl._mtp_draft_row_of_request is None
+
+        accepted = ctrl._accepted_token_counts_per_request[:n].tolist()
+        sampled = ctrl._sampled_tokens_cuda[:n]
+        if mtp_verification == "rejection":
+            chain_tokens, num_accepted = chain_results[0]
+            assert num_accepted.tolist() == accepted
+            assert torch.equal(sampled, chain_tokens.gather(1, num_accepted[:, None]).squeeze(1))
+
+        log_probs_list, _ = ctrl._dynamic_step_calculate_log_probs_speculative()
+        target_log_probs = torch.log_softmax(logits[0].float(), dim=-1)
+        for i in range(n):
+            a = accepted[i]
+            emitted = drafts[i, :a].tolist() + [int(sampled[i])]
+            assert ctrl._accepted_tokens_per_request[i, :a].tolist() == emitted[:a]
+            expected = [
+                target_log_probs[i * stride + j, tok].item() for j, tok in enumerate(emitted)
+            ]
+            assert log_probs_list[i] == pytest.approx(expected, abs=1e-5)
+
+    @pytest.mark.internal
     def test_rewind_kv_cache_with_prefix_caching_ref_counts(self):
         """Test that _rewind_kv_cache correctly decrements ref counts on shared blocks
         when speculative token rejection causes a block boundary crossing."""

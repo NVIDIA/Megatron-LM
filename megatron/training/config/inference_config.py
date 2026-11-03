@@ -200,6 +200,10 @@ class InferenceSetupConfig:
     """ReplaySSM committed-history buffer length B (tokens); logical flush threshold is
     B + (1 + num_speculative_tokens). Mirrors `--mamba-replay-buffer-len`."""
 
+    inference_mtp_verification: Literal["exact_match", "rejection"] = "rejection"
+    """How MTP draft tokens are verified: "rejection" (speculative rejection sampling) or
+    "exact_match" (accept a draft only if it equals an independent target sample)."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -493,6 +497,7 @@ class InferenceSetupConfig:
             num_speculative_tokens=self.num_speculative_tokens,
             mamba_replay_ssm=self.mamba_replay_ssm,
             mamba_replay_buffer_len=self.mamba_replay_buffer_len,
+            mtp_verification=self.inference_mtp_verification,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
