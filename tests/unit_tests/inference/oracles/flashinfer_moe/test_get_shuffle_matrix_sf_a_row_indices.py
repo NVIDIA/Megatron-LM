@@ -113,13 +113,34 @@ def test_shuffle_routed_scale(rows, scale_cols):
 def test_prepare_routed_mxfp8_weights_scale_round_trip(case):
     """Routed scales equal the spec repack of the canonical scales, and undoing the repack (spec
     unswizzle, inverse shuffle, unpad) gives the canonical logical scales back exactly."""
+    _check_scale_round_trip(case["experts"], case["rows"], case["scale_cols"])
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
+@pytest.mark.sanitizer
+def test_sanitizer_small_case():
+    """Small case for compute-sanitizer, on the GPU: two experts of 97 logical rows (a partial
+    32-row shuffle block and a partial 128-row tile) by 5 scale columns (a partial 4-column tile)
+    through the routed repack and its round trip, and ``_unshuffle_cublas_scale`` of a device
+    tensor of the same shape."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import _unshuffle_cublas_scale
+
+    _check_scale_round_trip(2, 97, 5)
+    logical = _logical(97, 5, ou.make_generator())
+    swizzled = spec.swizzle_128x4(logical).cuda()
+    out = _unshuffle_cublas_scale(swizzled.view(torch.float8_e8m0fnu), 97, 32 * 5)
+    ou.assert_exact(out.cpu(), logical, what="unswizzled scales on the GPU")
+
+
+def _check_scale_round_trip(experts, rows, scale_cols):
     spec.require_flashinfer()
     from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     g = ou.make_generator()
-    experts, rows, cols = case["experts"], case["rows"], 32 * case["scale_cols"]
-    logical = torch.stack([_logical(rows, case["scale_cols"], g) for _ in range(experts)])
+    cols = 32 * scale_cols
+    logical = torch.stack([_logical(rows, scale_cols, g) for _ in range(experts)])
     scale = torch.stack([spec.swizzle_128x4(s) for s in logical])
     data = torch.zeros(experts, rows, cols, dtype=torch.uint8)
     dev = spec.device()
@@ -135,10 +156,10 @@ def test_prepare_routed_mxfp8_weights_scale_round_trip(case):
     inverse = torch.argsort(src)
     for e in range(experts):
         padded = torch.zeros(pr, pc, dtype=torch.uint8)
-        padded[:rows, : case["scale_cols"]] = logical[e]
+        padded[:rows, :scale_cols] = logical[e]
         got = routed.scale[e].cpu()
         ou.assert_exact(got, spec.swizzle_128x4(padded[src]), what=f"expert {e} routed scales")
-        back = spec.unswizzle_128x4(got, pr, pc)[inverse][:rows, : case["scale_cols"]]
+        back = spec.unswizzle_128x4(got, pr, pc)[inverse][:rows, :scale_cols]
         ou.assert_exact(back, logical[e], what=f"expert {e} round trip")
 
 

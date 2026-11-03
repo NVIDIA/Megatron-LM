@@ -403,6 +403,22 @@ def _mxfp8_clamped_inputs(local, hidden, inter, tokens, generator, limit=0.5):
     ],
 )
 def test_mxfp8_clamped_relu2_matches_fp64_moe(case, monkeypatch):
+    _run_mxfp8_clamped(case, monkeypatch)
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.sanitizer
+def test_sanitizer_mxfp8_clamped_relu2_small_case(monkeypatch):
+    """Small case for compute-sanitizer: MXFP8 ClampedRelu2 at the sweep's smallest shape with
+    65 tokens (64 + 1, as in the sweep), top-2 over 8 experts at EP rank 1 of 2 (routes to the
+    other rank's experts are skipped), fused finalize."""
+    _run_mxfp8_clamped(
+        dict(tokens=65, shape=(128, 128), top_k=2, ep=(2, 1), finalize="fused"), monkeypatch
+    )
+
+
+def _run_mxfp8_clamped(case, monkeypatch):
     _cutlass_module_ready()
     if case["finalize"] == "unfused":
         _unfused_finalize(monkeypatch)
