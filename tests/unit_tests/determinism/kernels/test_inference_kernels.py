@@ -466,6 +466,72 @@ def test_batch_invariant_mxfp8_permute_replays():
     assert not padding_data.any() and not padding_scales.any()
 
 
+def test_inference_permute_valid_pairs_past_int32_replays():
+    """``valid_tokens * topk`` past int32 (``valid_tokens`` at its int32 maximum): the count
+    kernels and both permute kernels form it in int64 and clamp it to the routing-map rows. They
+    replay bit-exactly and give the ``valid_tokens == rows`` result bit for bit."""
+    from megatron.core.inference.moe.permute import (
+        compute_local_tokens_per_expert,
+        permute_and_quantize_mxfp8,
+        permute_tokens,
+    )
+
+    seeded()
+    rows, hidden, topk, num_local = 1024, 1024, 8, 32
+    hidden_states = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, topk, device="cuda")
+    tokens = torch.arange(rows, device="cuda")[:, None]
+    routing_map = (tokens + 3 * torch.arange(topk, device="cuda")[None, :]) % num_local
+
+    def logical_rows(hidden_states, probs, valid_tokens=2**31 - 1):
+        valid = _dev_scalar(valid_tokens)
+        counts = [
+            compute_local_tokens_per_expert(routing_map, 0, num_local, valid, persistent=p)
+            for p in (False, True)
+        ]
+        perm_h, perm_p, _, offs, inverse_map = permute_tokens(
+            hidden_states,
+            probs,
+            routing_map,
+            0,
+            num_local,
+            valid,
+            alignment=16,
+            return_batch_invariant_inverse_map=True,
+        )
+        live = inverse_map[inverse_map >= 0].long()
+        quantized, q_probs, _, q_offs, q_inverse_map = permute_and_quantize_mxfp8(
+            hidden_states,
+            probs,
+            routing_map,
+            0,
+            num_local,
+            valid,
+            alignment=128,
+            return_batch_invariant_inverse_map=True,
+        )
+        q_live = q_inverse_map[q_inverse_map >= 0].long()
+        return (
+            *counts,
+            offs,
+            perm_h[live],
+            perm_p[live],
+            q_offs,
+            quantized.data[q_live].view(torch.uint8),
+            q_probs[q_live],
+        )
+
+    reference, _ = assert_replays_bit_exact(
+        logical_rows,
+        (hidden_states, probs),
+        replays=4,
+        backward=False,
+        what="permute with valid_tokens * topk past int32",
+    )
+    for name, out in zip(reference, logical_rows(hidden_states, probs, valid_tokens=rows)):
+        assert torch.equal(reference[name], out), f"{name} differs from valid_tokens == rows"
+
+
 def _unpermute_case():
     from megatron.core.inference.moe import permute
 

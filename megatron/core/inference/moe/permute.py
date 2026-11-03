@@ -72,8 +72,10 @@ def _count_local_tokens_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = tl.minimum(valid_tokens * topk, max_pairs)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: valid_tokens * topk can pass 2^31 before the clamp, and the map can hold more
+    # than 2^31 pairs.
+    valid_pairs = tl.minimum(valid_tokens.to(tl.int64) * topk, max_pairs)
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < valid_pairs
     expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
     local_ids = expert_ids - local_expert_start
@@ -100,7 +102,9 @@ def _count_local_tokens_kernel_persistent(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = tl.minimum(valid_tokens * topk, max_pairs)
+    # int64, as are the block counts, block ids and offsets derived from it: the pair count,
+    # cdiv's valid_pairs + BLOCK_SIZE - 1 and the offsets can each pass 2^31.
+    valid_pairs = tl.minimum(valid_tokens.to(tl.int64) * topk, max_pairs)
 
     total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
     blocks_per_cta = tl.cdiv(total_blocks, num_sms)
@@ -221,7 +225,8 @@ def _init_permutation_map_kernel(
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: the buffer may hold more than 2^31 entries.
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_used
     tl.store(perm_map_ptr + offsets, tl.full([BLOCK_SIZE], -1, tl.int32), mask=mask)
 
@@ -284,7 +289,9 @@ def _permute_tokens_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    # int64, as are the pair index and tok derived from it: valid_tokens * topk, the pair
+    # index and the inverse-map offset tok * num_local_experts + lid can each pass 2^31.
+    valid_pairs = valid_tokens.to(tl.int64) * topk
     if pid >= valid_pairs:
         return
     for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
@@ -642,7 +649,9 @@ def _permute_quantize_mxfp8_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    # int64, as are the pair index and tok derived from it: valid_tokens * topk, the pair
+    # index and the inverse-map offset tok * num_local_experts + lid can each pass 2^31.
+    valid_pairs = valid_tokens.to(tl.int64) * topk
     if pid >= valid_pairs:
         return
 

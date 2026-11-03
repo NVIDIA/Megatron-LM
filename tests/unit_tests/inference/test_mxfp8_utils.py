@@ -942,6 +942,52 @@ class TestPermuteAndQuantizeMxfp8:
         assert result.backend == "triton"
         assert result.data.dtype == torch.float8_e4m3fn
 
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_valid_pairs_past_int32(self, inverse):
+        """valid_tokens * topk past int32 (valid_tokens at its int32 maximum) still permutes and
+        quantizes the input rows, and fills the inverse map for each of their routed pairs."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        num_tokens, K, topk, num_experts = 6, 128, 2, 8
+        hidden, probs, _ = self._make_inputs(num_tokens, K, topk, num_experts)
+        # The rows route to two distinct experts below the last one; rows past the map (in the
+        # same buffer) route to the last expert, so reading past the map changes its count.
+        buffer = torch.full((4 * num_tokens, topk), num_experts - 1, device="cuda")
+        first = torch.arange(num_tokens, device="cuda") % (num_experts - 1)
+        buffer[:num_tokens] = torch.stack((first, (first + 1) % (num_experts - 1)), dim=1)
+        routing_map = buffer[:num_tokens]
+
+        out = permute_and_quantize_mxfp8(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(2**31 - 1),
+            alignment=128,
+            return_batch_invariant_inverse_map=inverse,
+        )
+        fused_mxfp8, _, fused_perm_map, offs = out[:4]
+
+        counts = torch.bincount(routing_map.flatten(), minlength=num_experts)
+        aligned = torch.div(counts + 127, 128, rounding_mode="floor") * 128
+        assert torch.equal(offs.long(), aligned.cumsum(0))
+        real = (fused_perm_map[: offs[-1].item()] >= 0).nonzero(as_tuple=True)[0]
+        assert real.numel() == num_tokens * topk
+        src = fused_perm_map[real].long()
+        _, ref_data = ref_to_mxfp(hidden[src])
+        assert torch.equal(fused_mxfp8.data[real].view(torch.uint8), ref_data.view(torch.uint8))
+        if inverse:
+            inverse_map = out[4]
+            routed = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+            routed[torch.arange(num_tokens, device="cuda")[:, None], routing_map] = True
+            assert torch.equal(inverse_map >= 0, routed)
+            # Each entry is the row of that token in that expert's block.
+            rows = inverse_map[routed]
+            token_expert = routed.nonzero()
+            assert torch.equal(fused_perm_map[rows.long()].long(), token_expert[:, 0])
+            assert torch.equal(torch.searchsorted(offs, rows, right=True), token_expert[:, 1])
+
     @pytest.mark.parametrize("alignment", [64, 128])
     def test_fixed_buffer_rows_match_swizzled_scale_padding(self, alignment):
         from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8

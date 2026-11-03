@@ -246,6 +246,20 @@ class TestComputeLocalTokensPerExpert:
         expected = _ref_tokens_per_expert(routing_map, start, num_local)
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
+    @pytest.mark.parametrize("persistent", [False, True])
+    @pytest.mark.parametrize("topk", [2, 8])
+    def test_valid_pairs_past_int32(self, topk, persistent):
+        """valid_tokens * topk past int32 (valid_tokens at its int32 maximum) still counts the
+        routing-map rows; computed in int32, the product wraps negative and nothing is counted."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        routing_map = _routing_map_with_tail(6, topk, num_experts=8)
+        result = compute_local_tokens_per_expert(
+            routing_map, 0, 8, _vt(2**31 - 1), persistent=persistent
+        )
+        expected = _ref_tokens_per_expert(routing_map, 0, 8)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     @pytest.mark.parametrize("invalid", ["shape", "dtype", "stride"])
     def test_rejects_invalid_counter_buffer(self, invalid):
         from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
@@ -509,6 +523,46 @@ class TestPermuteTokens:
         assert real.sum().item() == num_tokens * topk
         torch.testing.assert_close(perm_h[:n_used][real], hidden[perm_map[:n_used][real].long()])
 
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_valid_pairs_past_int32(self, inverse):
+        """valid_tokens * topk past int32 (valid_tokens at its int32 maximum) still permutes the
+        input rows, and fills the batch-invariant inverse map for each of their routed pairs."""
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        num_tokens, topk, num_experts, alignment = 6, 2, 8, 16
+        hidden, probs, _ = _make_inputs(num_tokens, 64, topk, num_experts)
+        routing_map = _routing_map_with_tail(num_tokens, topk, num_experts)
+        out = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(2**31 - 1),
+            alignment=alignment,
+            return_batch_invariant_inverse_map=inverse,
+        )
+        perm_h, perm_p, perm_map, offs = out[:4]
+
+        tokens_per_expert = _ref_tokens_per_expert(routing_map, 0, num_experts)
+        _, expected_offs = _ref_expert_offsets(tokens_per_expert, alignment)
+        torch.testing.assert_close(offs, expected_offs, atol=0, rtol=0)
+        n_used = offs[-1].item()
+        real = (perm_map[:n_used] >= 0).nonzero(as_tuple=True)[0]
+        assert real.numel() == num_tokens * topk
+        src = perm_map[real].long()
+        torch.testing.assert_close(perm_h[real], hidden[src], atol=0, rtol=0)
+        if inverse:
+            inverse_map = out[4]
+            routed = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+            routed[torch.arange(num_tokens, device="cuda")[:, None], routing_map] = True
+            assert torch.equal(inverse_map >= 0, routed)
+            # Each entry is a row of that token in that expert's block.
+            rows = inverse_map[routed]
+            token_expert = routed.nonzero()
+            assert torch.equal(perm_map[rows.long()].long(), token_expert[:, 0])
+            assert torch.equal(torch.searchsorted(offs, rows, right=True), token_expert[:, 1])
+
     @pytest.mark.parametrize("hidden_dim", [32, 64, 128, 256, 512, 1024, 2688])
     def test_various_hidden_dims(self, hidden_dim):
         """Permute works across various hidden dimensions including non-power-of-2."""
@@ -725,3 +779,139 @@ class TestPermuteUnpermuteRoundtrip:
             ref[t] = hidden[t].float() * local_prob_sum
 
         torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)
+
+
+def _require_free_memory(nbytes):
+    """Skip, with the numbers, when the device has less than ``nbytes`` free."""
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < nbytes:
+        pytest.skip(f"needs {nbytes / 2**30:.1f} GiB of device memory, {free / 2**30:.1f} free")
+
+
+@pytest.mark.large
+@pytest.mark.internal
+class TestInt32Limits:
+    """Pair counts and element offsets at and past 2^31, where int32 index arithmetic wraps.
+
+    Opt in with ``-m large`` (8-28 GiB of device memory each); run one case per process, since
+    a wrapped offset can leave a sticky illegal-address error.
+    """
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    @pytest.mark.parametrize("pairs", [2**31 - 8, 2**31], ids=["cdiv-wraps", "count-wraps"])
+    def test_count_live_pairs(self, pairs, persistent):
+        """Every live pair is counted when valid_tokens * topk is 2^31 - 8 (the persistent
+        kernel's cdiv adds 1023 to it) or 2^31."""
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        topk = 8
+        rows = pairs // topk
+        _require_free_memory(pairs * 4 + (2 << 30))
+        routing_map = torch.empty(rows, topk, dtype=torch.int32, device="cuda")
+        routing_map[:] = torch.arange(topk, dtype=torch.int32, device="cuda")
+        counts = compute_local_tokens_per_expert(
+            routing_map, 0, topk, _vt(rows), persistent=persistent
+        )
+        assert counts.tolist() == [rows] * topk
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_count_block_offsets(self, persistent):
+        """A routing map of more than 2^31 pairs counts only its live rows.
+
+        The map follows a 2^31-entry front guard in the same buffer. The guard routes to expert
+        7, which the map never does, so a block offset that wraps to -2^31 shows up as a count.
+        """
+        from megatron.core.inference.moe.permute import compute_local_tokens_per_expert
+
+        topk, valid, guard = 8, 1000, 2**31
+        rows = 2**31 // topk + 1
+        _require_free_memory((guard + rows * topk) * 4 + (2 << 30))
+        buffer = torch.full((guard + rows * topk,), 7, dtype=torch.int32, device="cuda")
+        routing_map = buffer[guard:].view(rows, topk)
+        routing_map.fill_(-1)
+        routing_map[:valid] = torch.arange(topk, dtype=torch.int32, device="cuda") % 7
+        counts = compute_local_tokens_per_expert(
+            routing_map, 0, topk, _vt(valid), persistent=persistent
+        )
+        assert counts.tolist() == [2 * valid] + [valid] * 6 + [0]
+
+    def test_init_permutation_map_block_offsets(self):
+        """A permutation map of more than 2^31 entries gets -1 on [0, n_used) and nowhere else.
+
+        The map follows a 2^31-entry front guard in the same buffer, so a block offset that
+        wraps to -2^31 writes into the guard.
+        """
+        from megatron.core.inference.moe.permute import init_permutation_map
+
+        guard, size, n_used, sentinel = 2**31, 2**31 + 1, 5, 0x5A5A5A5A
+        _require_free_memory((guard + size) * 4 + (4 << 30))
+        buffer = torch.full((guard + size,), sentinel, dtype=torch.int32, device="cuda")
+        init_permutation_map(buffer[guard:], _vt(n_used))
+        assert torch.count_nonzero(buffer[:guard] != sentinel).item() == 0, "wrote before the map"
+        assert (buffer[guard : guard + n_used] == -1).all()
+        assert torch.count_nonzero(buffer[guard + n_used :] != sentinel).item() == 0
+
+    def test_permute_live_pairs(self):
+        """permute_tokens places every local pair when valid_tokens * topk is 2^31.
+
+        Each token routes its first slot to the one local expert and the others elsewhere. Its
+        hidden row and probability carry the token index in their bits, so the check is bitwise.
+        """
+        from megatron.core.inference.moe.permute import permute_tokens
+
+        topk, hidden_dim = 8, 8
+        rows = 2**31 // topk
+        _require_free_memory(28 << 30)
+        routing_map = torch.empty(rows, topk, dtype=torch.int32, device="cuda")
+        routing_map[:] = torch.arange(topk, dtype=torch.int32, device="cuda")
+        hidden = torch.zeros(rows, hidden_dim, dtype=torch.bfloat16, device="cuda")
+        probs = torch.zeros(rows, topk, dtype=torch.float32, device="cuda")
+        tokens = torch.arange(rows, dtype=torch.int32, device="cuda")
+        hidden.view(torch.int32)[:, 0] = tokens
+        probs.view(torch.int32)[:, 0] = tokens
+        del tokens
+        perm_h, perm_p, perm_map, offs = permute_tokens(hidden, probs, routing_map, 0, 1, _vt(rows))
+        del hidden, probs, routing_map
+
+        assert offs.tolist() == [rows]
+        perm_map = perm_map[:rows]
+        assert (perm_map >= 0).all()
+        assert torch.equal(perm_h[:rows].view(torch.int32)[:, 0], perm_map)
+        assert torch.count_nonzero(perm_h[:rows].view(torch.int32)[:, 1:]).item() == 0
+        assert torch.equal(perm_p[:rows].view(torch.int32), perm_map)
+        placed = torch.zeros(rows, dtype=torch.bool, device="cuda")
+        placed[perm_map.long()] = True
+        assert placed.all(), "some token was not placed"
+
+    @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "mxfp8"])
+    def test_inverse_map_offsets(self, mxfp8):
+        """The batch-invariant inverse map gets an entry for every token when tokens x local
+        experts pass 2^31 (2^24 + 1 tokens on 128 local experts: the last row starts at 2^31)."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8, permute_tokens
+
+        num_local = 128
+        rows = 2**31 // num_local + 1
+        _require_free_memory(rows * num_local * 4 + (6 << 30))
+        hidden = torch.zeros(rows, 32, dtype=torch.bfloat16, device="cuda")
+        probs = torch.ones(rows, 1, dtype=torch.float32, device="cuda")
+        tokens = torch.arange(rows, device="cuda")
+        experts = tokens % num_local
+        permute = permute_and_quantize_mxfp8 if mxfp8 else permute_tokens
+        _, _, perm_map, _, inverse_map = permute(
+            hidden,
+            probs,
+            experts.view(rows, 1),
+            0,
+            num_local,
+            _vt(rows),
+            alignment=128,
+            return_batch_invariant_inverse_map=True,
+        )
+
+        claimed = inverse_map[tokens, experts]
+        missing = torch.count_nonzero(claimed < 0).item()
+        assert missing == 0, f"{missing} tokens have no inverse-map entry"
+        assert torch.equal(perm_map[claimed.long()].long(), tokens)
+        inverse_map[tokens, experts] = -1
+        assert torch.count_nonzero(inverse_map != -1).item() == 0, "entries off the routed pairs"
