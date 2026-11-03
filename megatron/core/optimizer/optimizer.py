@@ -1170,8 +1170,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         init_state_fn (Callable, optional): function to initialize state in the optimizer.
     """
 
-    # Set by LayerWiseDistributedOptimizer for its children on the compact and legacy
-    # layouts (see _copy_main_params_to_model_params_via_bf16).
+    # Set by LayerWiseDistributedOptimizer for its children on the compact layout (see
+    # _copy_main_params_to_model_params_via_bf16).
     quantize_from_bf16_master = False
 
     def __init__(
@@ -1339,9 +1339,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
 
     def _copy_main_params_to_model_params_via_bf16(self):
-        """Master-to-model copy of a LayerWise child on the compact or legacy layout.
+        """Master-to-model copy of a LayerWise child on the compact layout.
 
-        Those layouts publish plain MXFP8 / blockwise FP8 params by requantizing the gathered
+        That layout publishes plain MXFP8 / blockwise FP8 params by requantizing the gathered
         BF16 values on every rank, owner included. The gathered params are skipped here (the
         gather overwrites them); a param no rank gathers (a single-rank data-parallel group) gets
         the same Q(bf16(master)) here. Other params are copied as usual.
@@ -2171,9 +2171,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 ):
                     if not bucket_group.buckets:
                         continue
-                    if _bucket_is_managed_by_layer_wise_optimizer(
-                        bucket_group.buckets[0], default_for_untagged=False
-                    ):
+                    if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
                         continue
 
                     bucket_group_id = id(bucket_group)

@@ -157,7 +157,7 @@ def requantize_whole_params_from_high_precision(
     """Requantize whole high-precision values into plain MXFP8 or blockwise FP8 params.
 
     Used by parameter gathers that move whole parameters as BF16 staged from FP32 masters
-    (the compact and legacy LayerWise layouts). Every rank, owner included, requantizes the
+    (the compact LayerWise layout). Every rank, owner included, requantizes the
     same values, so all replicas hold identical quantized data. Both rowwise and columnwise
     data are rebuilt: MXFP8 columnwise data cannot be derived from rowwise data, so its
     quantizer is set to produce both, and blockwise columnwise data is recreated afterwards.

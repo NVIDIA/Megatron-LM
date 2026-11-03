@@ -2016,19 +2016,10 @@ def validate_args(args, defaults={}):
                 "Newton-Schulz yet; pass --muon-no-split-qkv."
             )
 
-    if args.use_layer_wise_distributed_optimizer and args.ckpt_format == 'torch':
-        from megatron.core.distributed.distributed_data_parallel_config import (
-            resolve_layer_wise_param_layout,
-        )
-
-        layout = resolve_layer_wise_param_layout(
-            args.layer_wise_param_layout, None if args.use_layer_wise_param_layout else False
-        )
-        assert layout == 'legacy', (
-            "--ckpt-format torch does not save the state of the DistributedOptimizer that the "
-            "padded and compact LayerWise layouts chain next to the layer-wise optimizer. Use "
-            "--ckpt-format torch_dist, or the legacy layout."
-        )
+    assert not (args.use_layer_wise_distributed_optimizer and args.ckpt_format == 'torch'), (
+        "--ckpt-format torch does not save the state of the DistributedOptimizer that the "
+        "LayerWise layouts chain next to the layer-wise optimizer. Use --ckpt-format torch_dist."
+    )
 
     assert not (args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight), (
         "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
@@ -4315,7 +4306,7 @@ def _add_distributed_args(parser):
         '--layer-wise-param-layout',
         type=str,
         default=None,
-        choices=['padded', 'compact', 'legacy'],
+        choices=['padded', 'compact'],
         help='Data-parallel layout of the Muon-managed matrices when '
         '--use-distributed-optimizer selects the layer-wise distributed '
         'optimizer. padded (default): shard-aligned padded buffers with '
@@ -4323,22 +4314,11 @@ def _add_distributed_args(parser):
         'compact: unpadded buffers with gradient all-reduce, whole-matrix '
         'owners and uneven parameter all-gather. In both, the other '
         'parameters (embeddings, biases, norms) are sharded by a separate '
-        'distributed optimizer. legacy: no distributed optimizer; the '
-        'layer-wise optimizer owns every parameter, including the ones the '
-        'scalar optimizer updates (same as --no-use-layer-wise-param-layout). '
-        'The layouts reduce gradients in different orders, so loss curves '
-        'need not match bit-for-bit across layouts.',
-    )
-    group.add_argument(
-        '--no-use-layer-wise-param-layout',
-        action='store_false',
-        dest='use_layer_wise_param_layout',
-        default=True,
-        help='Original spelling of --layer-wise-param-layout legacy: fall back to '
-        'the legacy LayerWise ping-pong path, where all params (including '
-        'non-Muon embeddings, biases, layernorm) stay in the layer-wise '
-        'optimizer and the optimizer uses the allgather_params() codepath. '
-        'Does not select the compact layout.',
+        'distributed optimizer, and torch_dist checkpoints load with either '
+        'layout. The layouts reduce gradients in different orders, so loss '
+        'curves need not match bit-for-bit across layouts. The legacy layout '
+        '(--no-use-layer-wise-param-layout) was removed; see '
+        'docs/user-guide/features/dist_optimizer.md.',
     )
     group.add_argument(
         '--use-nccl-ub',
@@ -4535,13 +4515,6 @@ def _add_distributed_args(parser):
         default=None,
         help="Pad packed THD inputs to a CP-local multiple or 'max'. "
         "MXFP8 additionally aligns to 32 tokens after SP sharding.",
-    )
-    group.add_argument(
-        '--use-layer-wise-param-layout',
-        action='store_true',
-        dest='use_layer_wise_param_layout',
-        default=True,
-        help='Deprecated spelling of --layer-wise-param-layout padded, the default.',
     )
     return parser
 

@@ -149,14 +149,18 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = torch.nn.Module()
         model.config = SimpleNamespace(num_attention_heads=1, num_query_groups=1, kv_channels=4)
+        # A model wrapped for the compact LayerWise layout: every weight is a LayerWise matrix.
         model.ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False, overlap_param_gather=False
+            use_distributed_optimizer=True,
+            layer_wise_param_layout='compact',
+            overlap_param_gather=False,
         )
         model.weights = torch.nn.ParameterList(
             [_parameter(device='cuda') for _ in range(2 * torch.distributed.get_world_size())]
         )
         for index, param in enumerate(model.weights):
             param.allreduce = not (expert and index % 2)
+            param.is_managed_by_layer_wise_optimizer = True
         config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,

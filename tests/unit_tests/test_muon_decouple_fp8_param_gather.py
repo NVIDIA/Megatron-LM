@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Bitwise ON-vs-OFF check for muon + ``--fp8-param-gather`` on the DECOUPLED
-compact LayerWise layout (the default; ``--use-layer-wise-param-layout`` opts into
-the padded layout).
+compact LayerWise layout (``--layer-wise-param-layout compact``; the padded layout is the
+default).
 
 Construction mirrors tests/unit_tests/test_muon_mxfp8_fp8_param_gather.py
 (PR #4987), but on the decouple path — the route where FP8 param-gather is

@@ -49,9 +49,6 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
 )
-from megatron.core.distributed.distributed_data_parallel_config import (
-    resolve_layer_wise_param_layout,
-)
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel,
     FullyShardedDataParallelV1,
@@ -3557,7 +3554,6 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
-    use_layer_wise_param_layout=None,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -3574,8 +3570,6 @@ def wrap_model_chunks_with_ddp(
     - ``use_layer_wise_distributed_optimizer=True`` with the ``"padded"`` or ``"compact"``
       LayerWise layout forces ``ddp_config.use_distributed_optimizer=True`` and computes
       per-chunk layouts via :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`.
-      The ``"legacy"`` layout supplies no layout and LayerWise falls back to its
-      ``allgather_params`` sync path.
     - Non-layerwise with ``ddp_config.use_distributed_optimizer=True`` computes per-chunk
       byte-level layouts via :meth:`DistributedOptimizer.compute_full_param_layout`.
     - Otherwise no layouts are computed.
@@ -3590,9 +3584,6 @@ def wrap_model_chunks_with_ddp(
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
             ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: Legacy boolean spelling of
-            ``ddp_config.layer_wise_param_layout``: ``True`` selects ``"padded"`` and ``False``
-            selects ``"legacy"``. ``None`` (default) defers to ``ddp_config``.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -3619,7 +3610,6 @@ def wrap_model_chunks_with_ddp(
             model_chunks,
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
         if compute_layout is not None:
             layout_pgs = (
@@ -4072,13 +4062,6 @@ def get_megatron_ddp_config(
             args.ddp_param_name_patterns_for_fp32_local_accumulation
         )
         kwargs["average_in_collective"] = args.ddp_average_in_collective
-        # --no-use-layer-wise-param-layout is the original spelling of the legacy layout; the
-        # flag's default (True) leaves the layout to --layer-wise-param-layout. An unset layout
-        # stays None so DDP wrapping resolves it (to "padded") only for the layer-wise optimizer.
-        if not getattr(args, "use_layer_wise_param_layout", True):
-            kwargs["layer_wise_param_layout"] = resolve_layer_wise_param_layout(
-                kwargs.get("layer_wise_param_layout"), False
-            )
         # Megatron-FSDP arguments.
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype

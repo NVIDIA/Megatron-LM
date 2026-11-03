@@ -562,9 +562,8 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
 @pytest.mark.parametrize(
     ("dsa_indexer_loss_coeff", "expect_tracker_init"), [(0.1, True), (None, False)]
 )
-@pytest.mark.parametrize("ddp_layout", [False, True])
 def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
-    dsa_indexer_loss_coeff, expect_tracker_init, ddp_layout
+    dsa_indexer_loss_coeff, expect_tracker_init
 ):
     """The config-container path must preserve Muon's layer-wise DDP routing flag."""
     args = SimpleNamespace(
@@ -595,11 +594,10 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
     cfg = SimpleNamespace(
         model=model_config,
         profiling=mock.Mock(),
-        ddp=SimpleNamespace(use_layer_wise_param_layout=ddp_layout, use_megatron_fsdp=False),
+        ddp=SimpleNamespace(use_megatron_fsdp=False),
         optimizer=SimpleNamespace(
             overlap_param_gather_with_optimizer_step=False,
             use_layer_wise_distributed_optimizer=True,
-            use_layer_wise_param_layout=False,
         ),
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
         rng=SimpleNamespace(data_parallel_random_init=False),

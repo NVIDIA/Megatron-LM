@@ -239,13 +239,19 @@ def test_gradient_copy_rebuilds_after_training_graph_reset(monkeypatch):
     torch.testing.assert_close(master.grad, source.float())
 
 
-def _ddp_linear(cuda_graph_impl, use_distributed_optimizer):
+def _ddp_linear(cuda_graph_impl, use_distributed_optimizer=False, layer_wise=False):
     """A bf16 linear layer under DDP whose model config selects the CUDA-graph implementation."""
     Utils.initialize_model_parallel()
     model = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16, device="cuda")
     config = TransformerConfig(num_attention_heads=1, num_layers=1)
     config.cuda_graph_impl = cuda_graph_impl
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    if layer_wise:
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        return wrap_model_chunks_with_ddp(
+            [model], config, ddp_config, use_layer_wise_distributed_optimizer=True
+        )[0]
     return DistributedDataParallel(config, ddp_config, model)
 
 
@@ -278,7 +284,7 @@ def test_distributed_optimizer_enables_graph_copy_from_config(
 def test_layer_wise_optimizer_selects_graph_copy_wrapper(cuda_graph_impl, enabled):
     """The layer-wise optimizer wraps its base optimizers in the graph-copy Float16 wrapper
     only when the model uses full-iteration CG."""
-    model = _ddp_linear(cuda_graph_impl, use_distributed_optimizer=False)
+    model = _ddp_linear(cuda_graph_impl, layer_wise=True)
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)

@@ -2,8 +2,8 @@
 
 """CPU tests for how the layer-wise distributed optimizer plan is resolved.
 
-Covers the LayerWise data-parallel layout (padded, compact, legacy), the optimizer intent, the
-DDP wrapping decision and the rank-independent whole-parameter owners of the compact layout.
+Covers the LayerWise data-parallel layout (padded, compact), the optimizer intent, the DDP
+wrapping decision and the rank-independent whole-parameter owners of the compact layout.
 """
 
 import random
@@ -48,30 +48,19 @@ def _model():
 
 
 @pytest.mark.parametrize(
-    ("layout", "use_bool", "expected"),
-    [
-        (None, None, "padded"),
-        ("padded", None, "padded"),
-        ("compact", None, "compact"),
-        ("legacy", None, "legacy"),
-        (None, True, "padded"),
-        (None, False, "legacy"),
-        ("padded", True, "padded"),
-        ("legacy", False, "legacy"),
-    ],
+    ("layout", "expected"), [(None, "padded"), ("padded", "padded"), ("compact", "compact")]
 )
-def test_resolve_layer_wise_param_layout(layout, use_bool, expected):
-    assert resolve_layer_wise_param_layout(layout, use_bool) == expected
+def test_resolve_layer_wise_param_layout(layout, expected):
+    assert resolve_layer_wise_param_layout(layout) == expected
 
 
-@pytest.mark.parametrize(
-    ("layout", "use_bool"),
-    [("compact", False), ("compact", True), ("padded", False), ("legacy", True), ("ragged", None)],
-)
-def test_resolve_layer_wise_param_layout_rejects_conflicts(layout, use_bool):
-    # The original boolean never means "compact"; a mismatch is an error, not a silent pick.
+@pytest.mark.parametrize("layout", ["legacy", "ragged"])
+def test_resolve_layer_wise_param_layout_rejects_unknown_layouts(layout):
+    # The legacy layout was removed; naming it is an error, not a silent fallback.
     with pytest.raises(ValueError):
-        resolve_layer_wise_param_layout(layout, use_bool)
+        resolve_layer_wise_param_layout(layout)
+    with pytest.raises(ValueError):
+        DistributedDataParallelConfig(layer_wise_param_layout=layout)
 
 
 @pytest.mark.parametrize(
@@ -125,24 +114,14 @@ def test_configure_ddp_for_sharded_layer_wise_layouts(layout):
     assert ddp_config.layer_wise_param_layout == (layout or "padded")
 
 
-@pytest.mark.parametrize(
-    ("layout", "use_bool"), [("legacy", None), (None, False), ("legacy", False)]
-)
-def test_configure_ddp_for_legacy_layout_keeps_original_opt_out(layout, use_bool):
-    model = _model()
-    ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True, layer_wise_param_layout=layout
-    )
-    fn = configure_ddp_for_layer_wise_optimizer(
-        [model],
-        ddp_config,
-        use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=use_bool,
-    )
-    assert fn is None
-    assert not ddp_config.use_distributed_optimizer
-    assert ddp_config.layer_wise_param_layout == "legacy"
-    assert not hasattr(model.fc1, "is_managed_by_layer_wise_optimizer")
+def test_layer_wise_rejects_chunks_without_a_layer_wise_layout():
+    # Chunks wrapped without a LayerWise layout (the removed legacy layout) are rejected.
+    with pytest.raises(ValueError, match="padded or compact"):
+        LayerWiseDistributedOptimizer._resolve_param_layout(
+            DistributedDataParallelConfig(use_distributed_optimizer=False), None
+        )
+    # Direct construction without DDP-wrapped chunks owns and gathers whole params.
+    assert LayerWiseDistributedOptimizer._resolve_param_layout(None, None) == "compact"
 
 
 # ---------------------------------------------------------------------------

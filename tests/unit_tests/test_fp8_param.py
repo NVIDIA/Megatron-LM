@@ -740,15 +740,15 @@ class TestFP8Param:
     )
     @pytest.mark.parametrize("tp_size", [2])
     @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
-    @pytest.mark.parametrize("layer_wise_param_layout", ["compact", "legacy", "padded"])
+    @pytest.mark.parametrize("layer_wise_param_layout", ["compact", "padded"])
     @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
     def test_muon_layer_wise_fp8_param_gather(
         self, tp_size, recipe, layer_wise_param_layout, dp_overlap
     ):
         """Muon on each LayerWise layout trains FP8 params like BF16 params.
 
-        The compact and legacy layouts gather whole params as BF16 staged from the owners'
-        FP32 masters and requantize on every rank, so the FP8-param run must follow the
+        The compact layout gathers whole params as BF16 staged from the owners' FP32
+        masters and requantizes on every rank, so the FP8-param run must follow the
         BF16-param run (FP8 compute in both). The padded layout keeps main's MXFP8 path;
         its blockwise path (native FP8 transport quantized from FP32 masters) is not compared.
 

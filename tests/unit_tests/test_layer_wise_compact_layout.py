@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Multi-GPU tests of the compact LayerWise layout next to the padded and legacy layouts.
+"""Multi-GPU tests of the compact LayerWise layout next to the padded layout.
 
 The compact layout keeps Muon-managed matrices in unpadded, replicated DDP buffers (gradient
 all-reduce, one owner rank per matrix, uneven parameter all-gather) while a sibling
@@ -231,7 +231,7 @@ class TestCompactLayerWiseLayout:
         _train_step(model, optimizer, step=0)
         _assert_replicas_equal(model)
 
-    @pytest.mark.parametrize("layout", ["padded", "compact", "legacy"])
+    @pytest.mark.parametrize("layout", ["padded", "compact"])
     @pytest.mark.parametrize("overlap", [False, True])
     def test_layouts_match_reference_updates(self, layout, overlap):
         model, optimizer = _build(layout, overlap=overlap, bucket_size=4096 if overlap else None)
@@ -262,7 +262,7 @@ class TestCompactLayerWiseExperts:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("layout", ["padded", "compact", "legacy"])
+    @pytest.mark.parametrize("layout", ["padded", "compact"])
     def test_expert_params_shard_over_expert_dp(self, layout):
         model, optimizer = _build(layout, with_experts=True)
         layer_wise = _layer_wise(optimizer)
@@ -270,25 +270,20 @@ class TestCompactLayerWiseExperts:
         if expt_dp_size > 1:
             assert layer_wise.expt_dp_params_list is not None
             expert_owned = {p for owned in layer_wise.expt_dp_params_list for p in owned}
-            expected = {expert.weight for expert in model.module.experts}
-            if layout == "legacy":
-                # The legacy layout also keeps the Adam-managed expert biases in LayerWise.
-                expected |= {expert.bias for expert in model.module.experts}
-            assert expert_owned == expected
+            assert expert_owned == {expert.weight for expert in model.module.experts}
 
-        if layout != "legacy":
-            # Expert biases are Adam params on expert-parallel buffers: an expert-DP DistOpt.
-            distopts = _distopts(optimizer)
-            assert len(distopts) == 2
-            expert_distopt = next(
-                d
-                for d in distopts
-                if any(not getattr(p, 'allreduce', True) for b in d.buffers for p in b.params)
-            )
-            assert get_pg_size(expert_distopt.data_parallel_group) == expt_dp_size
-            assert {p for b in expert_distopt.buffers for p in b.params} == {
-                expert.bias for expert in model.module.experts
-            }
+        # Expert biases are Adam params on expert-parallel buffers: an expert-DP DistOpt.
+        distopts = _distopts(optimizer)
+        assert len(distopts) == 2
+        expert_distopt = next(
+            d
+            for d in distopts
+            if any(not getattr(p, 'allreduce', True) for b in d.buffers for p in b.params)
+        )
+        assert get_pg_size(expert_distopt.data_parallel_group) == expt_dp_size
+        assert {p for b in expert_distopt.buffers for p in b.params} == {
+            expert.bias for expert in model.module.experts
+        }
 
         reference, reference_optimizer = _build("reference", with_experts=True)
         for step in range(3):
@@ -314,7 +309,7 @@ class TestSingleRankDenseGroup:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("layout", ["padded", "compact", "legacy"])
+    @pytest.mark.parametrize("layout", ["padded", "compact"])
     def test_experts_are_owned_once(self, layout):
         assert get_pg_size(parallel_state.get_data_parallel_group(with_context_parallel=True)) == 1
         expt_dp = parallel_state.get_expert_data_parallel_group()
@@ -401,10 +396,9 @@ class TestPendingGatherPublication:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("layout", ["compact", "legacy"])
     @pytest.mark.parametrize("complete", ["force_sync", "free_overlap_buffers"])
-    def test_pending_gather_is_published(self, layout, complete):
-        model, optimizer = _build(layout, overlap=True, bucket_size=4096)
+    def test_pending_gather_is_published(self, complete):
+        model, optimizer = _build("compact", overlap=True, bucket_size=4096)
         owned = [p for params in _layer_wise(optimizer).dp_cp_params_list for p in params]
         before = [p.detach().clone() for p in owned]
 

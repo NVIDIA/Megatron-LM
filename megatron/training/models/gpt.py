@@ -391,7 +391,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool | None = None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -407,10 +406,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: Legacy boolean spelling of
-                ``ddp_config.layer_wise_param_layout``: ``True`` selects the padded LayerWise
-                layout and ``False`` the legacy layout. ``None`` (default) defers to
-                ``ddp_config``.
 
         Returns:
             List of model stages.
@@ -431,7 +426,6 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

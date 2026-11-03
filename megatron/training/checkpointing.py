@@ -805,20 +805,6 @@ def save_checkpoint(
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
 
-    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if (
-        getattr(args, "use_layer_wise_distributed_optimizer", False)
-        and not args.no_save_optim
-        and args.ckpt_format == 'torch'
-    ):
-        dp_rank = mpu.get_data_parallel_rank()
-        optim_checkpoint_name = os.path.join(
-            os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
-        )
-        ensure_directory_exists(optim_checkpoint_name)
-        if not optimizer.is_stub_optimizer:
-            optimizer.save_state_dict_to_file(optim_checkpoint_name)
-
     async_save_request = None
     if args.async_save:
         if ckpt_type == CheckpointType.LEGACY:
@@ -3417,16 +3403,6 @@ def load_checkpoint(
         try:
             # Load state dict.
             if (
-                getattr(args, 'use_layer_wise_distributed_optimizer', False)
-                and args.ckpt_format == 'torch'
-            ):
-                # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = mpu.get_data_parallel_rank()
-                optim_checkpoint_name = os.path.join(
-                    os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
-                )
-                optimizer.load_state_dict_from_file(optim_checkpoint_name)
-            elif (
                 not skip_load_to_model_and_opt
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer

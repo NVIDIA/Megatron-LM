@@ -139,6 +139,17 @@ def initialize_real_model(
     return this_model
 
 
+def _layer_wise_of(optimizer):
+    """The LayerWiseDistributedOptimizer of an optimizer chain."""
+    if isinstance(optimizer, LayerWiseDistributedOptimizer):
+        return optimizer
+    return next(
+        sub_optimizer
+        for sub_optimizer in optimizer.chained_optimizers
+        if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+    )
+
+
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         return load_checkpoint(*args, restore_training_state=True, **kwargs)
@@ -341,25 +352,24 @@ class TestLayerWiseOptimizer:
             optimizer='dist_muon',
         )
 
-        # If this is a LayerWiseDistributedOptimizer, test broadcast
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            # Store original param values
-            original_params = {}
-            for name, param in model[0].named_parameters():
-                original_params[name] = param.data.clone()
+        layer_wise = _layer_wise_of(optimizer)
+        # Store original param values
+        original_params = {}
+        for name, param in model[0].named_parameters():
+            original_params[name] = param.data.clone()
 
-            # Call broadcast (should be idempotent if no updates)
-            optimizer.broadcast_params()
+        # Call broadcast (should be idempotent if no updates)
+        layer_wise.broadcast_params()
 
-            # Check params are unchanged after broadcast without step
-            for name, param in model[0].named_parameters():
-                assert torch.allclose(param.data, original_params[name])
+        # Check params are unchanged after broadcast without step
+        for name, param in model[0].named_parameters():
+            assert torch.allclose(param.data, original_params[name])
 
     # TODO(deyuf): check bf16 False case
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('bf16', [True])
-    @pytest.mark.parametrize('use_param_layout', [False, True, 'compact'])
+    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
     def test_layer_wise_optimizer_save_load(
         self, tmp_path_dist_ckpt, tp, pp, bf16, use_param_layout
     ):
@@ -457,10 +467,9 @@ class TestLayerWiseOptimizer:
                 param.grad = torch.randn_like(param.data)
 
         # Test grad norm calculation
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            grad_norm = optimizer.get_grad_norm()
-            assert grad_norm is not None
-            assert grad_norm >= 0
+        grad_norm = _layer_wise_of(optimizer).get_grad_norm()
+        assert grad_norm is not None
+        assert grad_norm >= 0
 
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
@@ -490,9 +499,8 @@ class TestLayerWiseOptimizer:
                 param.grad = grad
 
         # Test zero counting
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            num_zeros = optimizer.count_zeros()
-            assert num_zeros >= 0
+        num_zeros = _layer_wise_of(optimizer).count_zeros()
+        assert num_zeros >= 0
 
     @pytest.mark.parametrize('src_tp', [1, 2, 4])
     @pytest.mark.parametrize('src_pp', [1, 2, 4])
@@ -524,8 +532,10 @@ class TestLayerWiseOptimizer:
                 optimizer='dist_muon',
             )
 
+            # Resharding across TP/PP needs the model-space format of the sibling DistOpt.
+            metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
             model_sharded_sd = model_A[0].sharded_state_dict()
-            optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd)
+            optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd, metadata=metadata)
             save(optim_sd, ckpt_dir)
 
             Utils.destroy_model_parallel()
@@ -543,7 +553,9 @@ class TestLayerWiseOptimizer:
             )
 
             model_sharded_sd = model_B[0].sharded_state_dict()
-            load_sharded_sd = optimizer_B.sharded_state_dict(model_sharded_sd, is_loading=True)
+            load_sharded_sd = optimizer_B.sharded_state_dict(
+                model_sharded_sd, is_loading=True, metadata=metadata
+            )
 
             state_dict = load(load_sharded_sd, ckpt_dir)
             optimizer_B.load_state_dict(state_dict)
@@ -551,7 +563,7 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('ep', [1, 2, 4])
-    @pytest.mark.parametrize('use_param_layout', [False, True, 'compact'])
+    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
     def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep, use_param_layout):
         """Test LayerWiseDistributedOptimizer with MoE models."""
         if tp * pp * ep > 8:
@@ -578,10 +590,9 @@ class TestLayerWiseOptimizer:
             )
 
             # Test that optimizer handles expert parallel parameters
-            if isinstance(optimizer, LayerWiseDistributedOptimizer):
+            if ep > 1:
                 # Check that expt_dp_params_list exists if EP > 1
-                if ep > 1:
-                    assert hasattr(optimizer, 'expt_dp_params_list')
+                assert hasattr(_layer_wise_of(optimizer), 'expt_dp_params_list')
 
             # Test save/load
             model_sharded_sd = model[0].sharded_state_dict()
@@ -621,19 +632,18 @@ class TestLayerWiseOptimizer:
             optimizer='dist_muon',
         )
 
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            model_sharded_sd = model[0].sharded_state_dict()
-            optim_sd = optimizer.sharded_state_dict(model_sharded_sd)
+        model_sharded_sd = model[0].sharded_state_dict()
+        optim_sd = _layer_wise_of(optimizer).sharded_state_dict(model_sharded_sd)
 
-            # Extract ShardedTensors and check replica_id
-            from megatron.core.dist_checkpointing import ShardedTensor
+        # Extract ShardedTensors and check replica_id
+        from megatron.core.dist_checkpointing import ShardedTensor
 
-            for sh_base in nested_values(optim_sd):
-                if isinstance(sh_base, ShardedTensor):
-                    # Check that replica_id has been modified
-                    assert len(sh_base.replica_id) == 3
-                    # DP component should be 0 for layer-wise optimizer
-                    assert sh_base.replica_id[2] == 0
+        for sh_base in nested_values(optim_sd):
+            if isinstance(sh_base, ShardedTensor):
+                # Check that replica_id has been modified
+                assert len(sh_base.replica_id) == 3
+                # DP component should be 0 for layer-wise optimizer
+                assert sh_base.replica_id[2] == 0
 
     @pytest.mark.parametrize('dp_size', [1, 2, 4])
     def test_layer_wise_optimizer_dp_sizes(self, dp_size):
@@ -661,18 +671,18 @@ class TestLayerWiseOptimizer:
             optimizer='dist_muon',
         )
 
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            # Check parameter sharding based on DP size
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-            pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        layer_wise = _layer_wise_of(optimizer)
+        # Check parameter sharding based on DP size
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
-            actual_dp_size = get_pg_size(pg_collection.dp_cp)
+        actual_dp_size = get_pg_size(pg_collection.dp_cp)
 
-            if actual_dp_size > 1:
-                assert optimizer.dp_cp_params_list is not None
-                assert len(optimizer.dp_cp_params_list) == actual_dp_size
-            else:
-                assert optimizer.dp_cp_params_list is None
+        if actual_dp_size > 1:
+            assert layer_wise.dp_cp_params_list is not None
+            assert len(layer_wise.dp_cp_params_list) == actual_dp_size
+        else:
+            assert layer_wise.dp_cp_params_list is None
 
     def test_layer_wise_optimizer_step(self):
         """Test that step function works and returns expected values."""
@@ -693,11 +703,10 @@ class TestLayerWiseOptimizer:
             if param.requires_grad:
                 param.grad = torch.randn_like(param.data)
 
-        if isinstance(optimizer, LayerWiseDistributedOptimizer):
-            # Perform step
-            update_successful, grad_norm, num_zeros = optimizer.step()
+        # Perform step
+        update_successful, grad_norm, num_zeros = optimizer.step()
 
-            # Check return values
-            assert isinstance(update_successful, bool)
-            assert grad_norm is None or grad_norm >= 0
-            assert num_zeros is None or num_zeros >= 0
+        # Check return values
+        assert isinstance(update_successful, bool)
+        assert grad_norm is None or grad_norm >= 0
+        assert num_zeros is None or num_zeros >= 0

@@ -89,23 +89,18 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
 
 
 @pytest.mark.parametrize(
-    "flags, use_bool, layout",
+    "flags, layout",
     [
-        ([], True, None),
-        (["--layer-wise-param-layout", "compact"], True, "compact"),
-        (["--layer-wise-param-layout", "legacy"], True, "legacy"),
-        (["--no-use-layer-wise-param-layout"], False, None),
-        (["--use-layer-wise-param-layout"], True, None),
+        ([], None),
+        (["--layer-wise-param-layout", "padded"], "padded"),
+        (["--layer-wise-param-layout", "compact"], "compact"),
     ],
 )
-def test_layer_wise_layout_cli_defaults_to_padded(flags, use_bool, layout):
+def test_layer_wise_layout_cli_defaults_to_padded(flags, layout):
     parser = add_megatron_arguments(ArgumentParser())
     args = parser.parse_args(flags)
-    # The original boolean keeps meaning padded (True) or legacy (False); compact is named.
-    assert args.use_layer_wise_param_layout is use_bool
     kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
     assert kwargs["layer_wise_param_layout"] == layout
-    assert "use_layer_wise_param_layout" not in kwargs
 
 
 @pytest.mark.parametrize("count", [2, 3])

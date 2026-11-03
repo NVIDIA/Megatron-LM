@@ -228,7 +228,7 @@ def test_whole_param_requantize_replays(recipe):
 
 @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
 def test_bf16_master_copy_replays(recipe):
-    """LayerWise children on the compact and legacy layouts write FP8 params that no gather
+    """LayerWise children on the compact layout write FP8 params that no gather
     publishes as Q(bf16(master)); other params take the multi-tensor copy."""
     from megatron.core.fp8_utils import requantize_whole_params_from_high_precision
     from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params

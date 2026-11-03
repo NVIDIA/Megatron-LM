@@ -614,29 +614,16 @@ class TestMuonOptimizerMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
-    def create_ddp_model_for_layerwise(self, model, use_param_layout=False):
-        """Wrap model in DDP for layer-wise distributed optimizer tests.
+    def create_ddp_model_for_layerwise(self, model):
+        """Wrap model in DDP with the (padded) LayerWise layout for layer-wise optimizer tests."""
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-        Args:
-            model: Model to wrap.
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout
-                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
-                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
-        """
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
-
-            ddp_config = DistributedDataParallelConfig()
-            wrapped = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=True,
-            )
-            return wrapped[0]
-        return self.create_ddp_model(model)
+        return wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
 
     def test_get_megatron_optimizer_smoke(self):
         """Smoke test for get_megatron_optimizer function."""
@@ -767,9 +754,11 @@ class TestMuonOptimizerMultiRank:
         # Verify it's a LayerWiseDistributedOptimizer
         from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 
-        assert isinstance(
-            optimizer, LayerWiseDistributedOptimizer
-        ), "Should return LayerWiseDistributedOptimizer"
+        # The LayerWise optimizer owns the Muon matrices; a sibling DistOpt owns the rest.
+        assert any(
+            isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            for sub_optimizer in optimizer.chained_optimizers
+        ), "Should chain a LayerWiseDistributedOptimizer"
 
         # Test forward and backward pass
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -816,9 +805,11 @@ class TestMuonOptimizerMultiRank:
         # Verify it's a LayerWiseDistributedOptimizer
         from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 
-        assert isinstance(
-            optimizer, LayerWiseDistributedOptimizer
-        ), "Should return LayerWiseDistributedOptimizer"
+        # The LayerWise optimizer owns the Muon matrices; a sibling DistOpt owns the rest.
+        assert any(
+            isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            for sub_optimizer in optimizer.chained_optimizers
+        ), "Should chain a LayerWiseDistributedOptimizer"
 
         # Test forward and backward pass
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
