@@ -40,7 +40,7 @@ Contract (written from the Mamba-2 recurrence, the launcher's documented API and
 
 Variants and dispatch paths (from the kernel, read after the contract): 11 autotune configs, BLOCK_SIZE_M in
 {32, 64, 128}, BLOCK_SIZE_N in {32, 64, 128, 256}, BLOCK_SIZE_K in {32, 64} (ssd_chunk_scan.py:15-75), each
-pinned in turn by `test_every_chunk_scan_tile`; constexpr HAS_D / D_HAS_HDIM (per-head and per-channel D),
+pinned in turn by `test_every_chunk_scan_tile` (those the GPU can launch); constexpr HAS_D / D_HAS_HDIM (per-head and per-channel D),
 HAS_Z, HAS_INITSTATES (with and without initial states), the dstate <= 128 single-dot branch and the
 dstate > 128 K loop (:211-264, dstate 129 and 256); the previous-state source: the request's initial state
 when the previous chunk belongs to another request, else the previous chunk's exit state (:183-198). Sizes:
@@ -58,11 +58,13 @@ import contextlib
 import pytest
 import torch
 import torch.nn.functional as F
+from triton.runtime.errors import OutOfResources
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
 from megatron.core.ssm.ops.mamba2 import ssd_chunk_scan
 from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+from megatron.core.tuning.selection import cheapest
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 
 DEVICE = "cuda"
@@ -500,33 +502,73 @@ def chunk_scan_autotuner():
     return kernel
 
 
-def _tile_params():
-    configs = chunk_scan_autotuner().configs
-    params = []
-    for dstate in (128, 256):
-        for i, config in enumerate(configs):
-            kw = config.kwargs
-            tile = "M{}N{}K{}".format(kw["BLOCK_SIZE_M"], kw["BLOCK_SIZE_N"], kw["BLOCK_SIZE_K"])
-            params.append(pytest.param(dstate, i, id=f"n{dstate}-cfg{i}-{tile}"))
-    return params
+TILE_CASE = dict(
+    chunk_size=PRODUCTION_CHUNK,
+    headdim=64,
+    heads_groups=(8, 2),
+    pack="boundaries",
+    d_kind="per_channel",
+    with_z=True,
+)
+
+
+def _tile(config):
+    kw = config.kwargs
+    return "M{}N{}K{}s{}w{}".format(
+        kw["BLOCK_SIZE_M"],
+        kw["BLOCK_SIZE_N"],
+        kw["BLOCK_SIZE_K"],
+        config.num_stages,
+        config.num_warps,
+    )
 
 
 @ou.requires_sm(ou.HOPPER)
-@pytest.mark.parametrize("dstate,config_index", _tile_params())
-def test_every_chunk_scan_tile(dstate, config_index):
-    """Each autotune candidate of the chunk scan kernel, pinned, on the boundary pack at the production chunk
-    size (dstate 128: one dot; dstate 256: the BLOCK_SIZE_K loop over dstate)."""
-    config = chunk_scan_autotuner().configs[config_index]
-    with pinned_chunk_scan_config(config):
-        run_scan_case(
-            chunk_size=PRODUCTION_CHUNK,
-            dstate=dstate,
-            headdim=64,
-            heads_groups=(8, 2),
-            pack="boundaries",
-            d_kind="per_channel",
-            with_z=True,
-        )
+@pytest.mark.parametrize(
+    "dstate", [pytest.param(128, id="n128[one dot]"), pytest.param(256, id="n256[K loop]")]
+)
+def test_every_chunk_scan_tile(dstate):
+    """Every autotune candidate of the chunk scan kernel that this GPU can launch, pinned in turn, on the
+    boundary pack at the production chunk size (dstate 128: one dot; dstate 256: the BLOCK_SIZE_K loop over
+    dstate).
+
+    The candidates come from the kernel's own list; which of them fit is the device's verdict. A candidate
+    whose shared memory exceeds the device's limit (on H100, M128 N256 K64 with 3 stages at dstate 128 needs
+    289 KiB of 227 KiB) is not one the kernel can select there: timed autotuning times a config that raises
+    OutOfResources as infinitely slow, and the pinned policy (deterministic or batch-invariant mode) takes
+    the cheapest candidate or an architecture-table entry. Such a candidate is dropped only once the error is
+    shown to be that limit, and the test then checks that neither selection path lands on it: the cheapest
+    candidate must launch, and so must the one timed autotuning picks, whose output is checked too.
+    """
+    tuner = chunk_scan_autotuner()
+    configs = list(tuner.configs)
+    too_big, failures = [], []
+    for config in configs:
+        with pinned_chunk_scan_config(config):
+            try:
+                run_scan_case(dstate=dstate, **TILE_CASE)
+            except OutOfResources as err:
+                assert err.name == "shared memory", f"{_tile(config)}: {err}"
+                too_big.append(config)
+            except AssertionError as err:
+                failures.append(f"{_tile(config)}: {err}")
+    assert not failures, "pinned chunk-scan configs disagree with the contract:\n" + "\n".join(
+        failures
+    )
+    assert len(too_big) < len(configs), "no chunk-scan config fits this GPU"
+    if too_big:
+        print(f"chunk-scan configs beyond this GPU's shared memory: {[_tile(c) for c in too_big]}")
+    assert cheapest(configs) not in too_big, "the pinned policy's fallback cannot launch here"
+
+    # Timed autotuning from a cold cache must pick a config that launches, and it must be right.
+    saved_cache = tuner.cache
+    tuner.cache = {}
+    try:
+        run_scan_case(dstate=dstate, **TILE_CASE)
+        chosen = tuner.best_config
+    finally:
+        tuner.cache = saved_cache
+    assert chosen not in too_big, f"timed autotuning chose {_tile(chosen)}, which cannot launch"
 
 
 @ou.requires_sm(ou.HOPPER)

@@ -53,8 +53,9 @@ runs the same on main and with s10.
 Suspected finding O7-N1 (no fix PR yet): the kernel's softplus is log(exp(x) + 1) in fp32 (:34-36), whose
 absolute error of ~2**-24 is a relative error up to ~5e-5 at production arguments (dt' ~ 1e-3); exp(A dt')
 with |A| up to 16 carries it into the state. With an fp32 state or output that is ~3x torch's fp32 rms
-error, so cases of `test_decode_step_fp32_outputs_match_fp64`, its Blackwell twin and
-`test_production_shapes[fp32_state]` fail on main. bf16 outputs and states are rounding-dominated and pass.
+error, so cases of `test_decode_step_fp32_outputs_match_fp64`, its Blackwell twin,
+`test_production_shapes[fp32_state]` and `test_speculative_rollback_restores_accepted_prefix[fp32_state]`
+fail on main (confirmed on H100 and GB200). bf16 outputs and states are rounding-dominated and pass.
 """
 
 import pytest
@@ -605,11 +606,16 @@ def test_reduced_launcher_layouts(form):
 
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16_state", "fp32_state"]
+)
 def test_speculative_rollback_restores_accepted_prefix(state_dtype):
     """Speculative decoding: S = 4 tokens with snapshots, then `mamba_state_selective_copy` with each
     request's accepted index a. The live state must be snapshot[slot, a] bit for bit and the fp64 state after
-    a + 1 tokens within the bound; a prefill request's slot is left as the decode step wrote it."""
+    a + 1 tokens within the bound; a prefill request's slot is left as the decode step wrote it.
+
+    `[fp32_state]` fails on main for O7-N1 (its fp32 snapshots carry the kernel's softplus error: rms 2.1x
+    torch fp32's on H100 and GB200); `[bf16_state]` checks the same rollback and passes."""
     seq_len, heads, headdim, dstate = 4, 4, 16, 64
     result = run_decode_case(
         dstate=dstate,
