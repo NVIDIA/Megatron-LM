@@ -165,3 +165,124 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
             ), f"turn {t}: MTP left prompt blocks unregistered"
         # The last turn reuses the whole previous prompt.
         assert sum(on[-1].inherited) == sum(off[-1].inherited)
+
+
+class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
+    """Replacing a declined block must keep the prefix forest valid when several requests in the
+    same scheduling pass share that block.
+
+    `_find_kv_match_count` relies on every cached block having all of its ancestors cached (block
+    hashes are parent-chained, and a registered block whose parent hash is gone silently becomes a
+    root). `_mtp_try_replace_declined_block` deregisters a cached block at admission time, so these
+    tests admit two continuations of the same block-aligned prompt in one pass and check the
+    forest, ref counts, and block tables after every admission.
+    """
+
+    BS = TestMtpMultiTurnPrefixReuse.BS
+    # Borrow the turn-admission helpers without re-collecting that class's tests.
+    _make = TestMtpMultiTurnPrefixReuse._make
+    _tokens = staticmethod(TestMtpMultiTurnPrefixReuse._tokens)
+    _admit = TestMtpMultiTurnPrefixReuse._admit
+
+    @staticmethod
+    def _check_forest(ctx, requests):
+        """Assert the allocator's prefix forest and the in-flight block tables are consistent."""
+        alloc = ctx.kv_block_allocator
+        hashes = alloc.block_hashes
+        registered = (hashes != -1).nonzero().flatten().tolist()
+
+        for block_id in registered:
+            # The hash map and the per-block hash agree.
+            assert alloc.kv_hash_to_block_id[int(hashes[block_id])] == block_id
+            parent = int(alloc.block_parent_id[block_id])
+            if parent >= 0:
+                assert int(hashes[parent]) != -1, f"block {block_id} has a deregistered parent"
+            children = sum(int(alloc.block_parent_id[b]) == block_id for b in registered)
+            assert int(alloc.block_child_count[block_id]) == children, (
+                f"block {block_id}: child count {int(alloc.block_child_count[block_id])}, "
+                f"{children} registered children"
+            )
+
+        # Prefix-closed: a request can only match block k if blocks 0..k-1 are cached, so a
+        # cached block must never sit behind an uncached ancestor in any request's hash chain.
+        for req in requests:
+            cached = [h in alloc.kv_hash_to_block_id for h in req.precomputed_block_hashes]
+            first_gap = next((k for k, c in enumerate(cached) if not c), len(cached))
+            assert not any(
+                cached[first_gap:]
+            ), f"request {req.request_id}: cached block after uncached ancestor at {first_gap}"
+
+        # In-flight block tables reference live blocks only, with no duplicates within a row, and
+        # every block's ref count equals the number of tables holding it. A block evicted while
+        # held and handed straight back out by the allocator passes the per-row checks (same
+        # hash, nonzero ref count), so only the count comparison catches it.
+        free = set(alloc.block_bag[: alloc.pool_avail].tolist())
+        holders = {}
+        for row in range(ctx.total_request_count):
+            ids = [b for b in ctx.request_to_kv_block_ids[row].tolist() if b >= 0]
+            assert len(ids) == len(set(ids)), f"row {row} repeats a block id: {ids}"
+            for b in ids:
+                assert b not in free, f"row {row} references block {b} in the free pool"
+                holders[b] = holders.get(b, 0) + 1
+        for b, n in holders.items():
+            assert (
+                int(alloc.block_ref_counts[b]) == n
+            ), f"block {b}: ref count {int(alloc.block_ref_counts[b])}, held by {n} rows"
+
+    @pytest.mark.internal
+    # A 0-block tail leaves the first request's copy as a childless in-use leaf, the case only
+    # the ref-count guard protects; a 2-block tail gives it registered children.
+    @pytest.mark.parametrize("tail_blocks", [0, 2])
+    @pytest.mark.parametrize("same_continuation", [True, False])
+    @pytest.mark.parametrize("stale_checks", [False, True], ids=["engine-order", "stale-checks"])
+    def test_same_pass_requests_sharing_the_declined_block(
+        self, tail_blocks, same_continuation, stale_checks
+    ):
+        ctx = self._make(True)
+        alloc = ctx.kv_block_allocator
+
+        # Turn 0 ends exactly on a block boundary, so its last block's successor slot is never
+        # written and every continuation must decline that block.
+        base = self._tokens(5 * self.BS, 0)
+        self._admit(ctx, base.clone(), request_id=1)
+        declined_hash = self._req(ctx, base.clone(), request_id=99).precomputed_block_hashes[-1]
+        declined_block = alloc.kv_hash_to_block_id[declined_hash]
+        assert int(alloc.block_ref_counts[declined_block]) == 0
+
+        tail_len = tail_blocks * self.BS + 11
+        tail_a = self._tokens(tail_len, 50_000)
+        tail_b = tail_a.clone() if same_continuation else self._tokens(tail_len, 70_000)
+        reqs = [
+            self._req(ctx, torch.cat([base, tail_a]), request_id=2),
+            self._req(ctx, torch.cat([base, tail_b]), request_id=3),
+        ]
+
+        ctx.active_token_count = 0
+        ctx.num_prefill_requests = 0
+        if stale_checks:
+            # Both availability checks see the declined block cached before either is admitted.
+            assert all(all(ctx.check_availability(r)) for r in reqs)
+        for req in reqs:
+            if not stale_checks:
+                assert all(ctx.check_availability(req))
+            ctx.add_request(req)
+            self._check_forest(ctx, reqs)
+
+        # Only the first admission may replace the declined block; the second must never evict
+        # the copy the first request now holds.
+        assert ctx.mtp_prefix_replaced_blocks == 1
+        first_copy = alloc.kv_hash_to_block_id.get(declined_hash)
+        assert first_copy is not None, "the first request's copy of the block was not registered"
+        assert int(alloc.block_ref_counts[first_copy]) >= 1
+
+        # Release both and peel the whole cached forest: `evict_lru_blocks` asserts the parent
+        # graph is a forest, so a dangling or cyclic chain would fail here.
+        rows = torch.tensor(
+            [ctx.total_request_count - 2, ctx.total_request_count - 1], dtype=torch.int32
+        )
+        ctx.release_memory_blocks_from_request_indexes(rows)
+        self._check_forest(ctx, reqs)
+        evictable = int(alloc.get_evictable_block_count())
+        assert evictable > 0
+        assert alloc.evict_lru_blocks(evictable)
+        assert all(int(h) == -1 for h in alloc.block_hashes.tolist())
