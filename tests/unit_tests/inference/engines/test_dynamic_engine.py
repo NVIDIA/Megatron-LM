@@ -5906,6 +5906,88 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_prompt_log_prob_pin_keeps_ancestors_unevictable(self) -> None:
+        """Under LRU, a block whose child is pinned for prompt log-probs is not evictable.
+
+        Four usable 8-token blocks, a 12-token step budget, and async scheduling. Request 0
+        returns prompt log-probs for a 24-token prompt, prefilled in chunks of 12 and 12, and
+        finishes after one token while its second chunk's blocks 1 and 2 stay pinned until
+        their rows are stored. Request 1, with another 24-token prompt, then needs two blocks
+        with one free. Had only the rows' blocks been pinned, block 0 would count as
+        evictable although its child is in use, and the eviction would fall short.
+        """
+
+        def config(**kwargs):
+            return DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=2,
+                context_max_tokens=12,
+                enable_chunked_prefill=True,
+                enable_prefix_caching=True,
+                prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+                materialize_only_last_token_logits=False,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(4 + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=0.5 * block_size_bytes / 1024**3,
+            )
+        )
+        engine = env.engine
+        allocator = engine.context.kv_block_allocator
+        assert (allocator.pool_size, allocator.paused_limit) == (5, 0)
+
+        # Paged attention kernels need 256-token blocks; scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            return torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+
+        def add(request_id, first_token, **sampling_kwargs):
+            engine.add_request(
+                request_id,
+                torch.arange(
+                    first_token,
+                    first_token + 24,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                ),
+                SamplingParams(num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs),
+            )
+
+        add(0, 1, return_log_probs=True, skip_prompt_log_probs=False)
+        # Step until request 0's second chunk is launched.
+        for _ in range(4):
+            if 0 not in engine.waiting_request_ids:
+                break
+            engine.step_modern()
+        assert 0 not in engine.waiting_request_ids
+        assert not engine.get_request(0).generated_tokens
+        add(1, 41)
+
+        finished = {}
+        for _ in range(10):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        assert {i: len(r.generated_tokens) for i, r in finished.items()} == {0: 1, 1: 1}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
