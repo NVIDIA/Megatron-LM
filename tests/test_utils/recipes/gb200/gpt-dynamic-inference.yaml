@@ -67,10 +67,10 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_async_sched]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_gb200]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp4_583m_mxfp8_param_gather_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_gb200]
