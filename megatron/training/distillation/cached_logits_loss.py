@@ -1074,8 +1074,13 @@ def topk_kl_div(
     tp_rank: int,
     tp_group: dist.ProcessGroup,
     add_ghost_token: bool = False,
+    teacher_tail_logprobs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute the KL divergence between student and teacher's top-K log-probs."""
+    """Compute the KL divergence between student and teacher's top-K log-probs.
+
+    With ``add_ghost_token``, the teacher's ghost bucket is ``teacher_tail_logprobs``
+    (``[S, B]``) when given, else derived from the retained log-probs.
+    """
     student_logits = student_logits.float()
     teacher_topk_logprobs = teacher_topk_logprobs.float()
 
@@ -1115,9 +1120,12 @@ def topk_kl_div(
                 student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
             )
         student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
-        teacher_residual = torch.log(
-            (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
-        )
+        if teacher_tail_logprobs is not None:
+            teacher_residual = teacher_tail_logprobs.float().unsqueeze(-1)
+        else:
+            teacher_residual = torch.log(
+                (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
+            )
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
         mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank == 0))], dim=-1)

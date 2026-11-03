@@ -217,8 +217,14 @@ parallel jobs share flush boundaries and dataset order.
 Within each segment, the writer drops the trailing run of positions with zero loss
 weight. Under causal attention no kept position attends to them and they are never
 scored, so this is lossless; it removes dataset padding (per-document and pack tails) and
-trailing masked turns alike. Leading or inner zero-weight positions (prompts) are kept.
-Targets drop the same rows. Consequently every stored segment ends on a scored position.
+trailing masked turns alike. Leading or inner zero-weight positions (prompts) are kept as
+context. Consequently every stored segment ends on a scored position.
+
+Targets are stored only for positions with nonzero loss weight: target row `i` belongs
+to the `i`-th such position, in token order, and the row count must equal the number of
+nonzero weights (after filling the `loss_mask` default). Context-only positions such as
+prompts and earlier conversation turns carry tokens but no target rows, so a long
+conversation supervised only on its final answer stores rows for the answer alone.
 
 | Inputs field | Required | Encoding / default |
 | --- | --- | --- |
@@ -234,7 +240,8 @@ Writers may omit an optional field only when it equals its default; Megatron doe
 automatically (RoPE models never read `position_ids`, so most Megatron dumps omit them).
 Readers fill defaults before use. A target row with no valid entry (all sentinel)
 contributes zero KD loss; its stored loss weight still controls CE supervision.
-Student-inserted padding has zero loss weight for both losses.
+Student-inserted padding has zero loss weight for both losses. The student places target
+rows back at their positions; positions without a row get sentinel targets.
 
 ### Target contract
 
@@ -248,14 +255,25 @@ Student-inserted padding has zero loss weight for both losses.
 - Every row has exactly K entries. A logprob of `-1000` marks a masked or unavailable
   entry; its decoded index must be ignored. Rows with fewer than K available entries are
   filled with it.
-- The loss derives ghost residual mass as `1 - sum(exp(retained_logprobs))`; no residual
-  tensor is stored.
+- `tail_logprobs` (optional, but always written by Megatron) is the log of the
+  probability mass outside each row's retained entries, including entries masked by
+  top-P: `log(1 - sum(exp(retained)))`. Writers compute it from full-precision log
+  probabilities **before** casting values to `save_dtype` (`v3_format.tail_logprob`);
+  computing it afterwards from rounded values can be badly wrong for confident rows
+  (with bf16 values, a 0.1% tail can come out about half its true size). A row whose
+  distribution is fully retained stores `-1000`. Readers reject a stored tail unless
+  `sum(exp(retained)) + exp(tail)` is within 0.05 of 1 for every row. Without the field,
+  readers derive the tail from the stored values.
+- The loss uses the tail as the teacher's ghost bucket against the student's mass outside
+  the same entries. Entries a student cannot represent (indices beyond its vocabulary)
+  are moved into the tail.
 
 | Targets field | Encoding |
 | --- | --- |
-| `values` | `[tokens, K]`, `save_dtype` |
-| `indices_low` | `[tokens, K]`, uint16 lower 16 bits |
-| `indices_high` | `[tokens, K]`, uint8 bits 16–23; present exactly when `contract.targets.index_encoding` is `"u16+u8"` |
+| `values` | `[rows, K]`, `save_dtype` |
+| `indices_low` | `[rows, K]`, uint16 lower 16 bits |
+| `indices_high` | `[rows, K]`, uint8 bits 16–23; present exactly when `contract.targets.index_encoding` is `"u16+u8"` |
+| `tail_logprobs` | `[rows]`, float32, optional |
 
 `index_encoding` is `"u16"` when `logprob_vocab_size <= 65536`, else `"u16+u8"` (up to
 `2**24`).
@@ -309,7 +327,9 @@ owns tokenization and packing; vLLM only scores token IDs.
    at least one generated token; discard it.
 2. Row `t` takes `prompt_logprobs[t + 1]`, so the last content token's row is the
    distribution over EOS. Keep exactly the top K entries (vLLM may add the prompt token's
-   own logprob); fill missing entries with `-1000`.
+   own logprob); fill missing entries with `-1000`. Compute `tail_logprobs` from these
+   float32 values before casting them to `save_dtype`, and keep only the rows of
+   positions with nonzero loss weight.
 3. Give the EOS position zero loss weight (it has no next token); the stripping rule
    removes it. Omit `labels` and store `segment_final_labels` = EOS: the stored segment
    then matches what a Megatron SFT dataset produces.
@@ -319,8 +339,8 @@ owns tokenization and packing; vLLM only scores token IDs.
 
 **Teacher-generated responses.** To distill on responses the teacher writes (sequence-level
 KD), make each segment prompt plus completion: completion rows come from the generated
-tokens' `logprobs=K`, prompt rows from `prompt_logprobs` or sentinel rows with zero loss
-weight. Targets must still be raw T=1 logprobs whatever the sampling temperature or top-P;
+tokens' `logprobs=K`; prompt positions have zero loss weight and need no rows, so
+`prompt_logprobs` can be skipped. Targets must still be raw T=1 logprobs whatever the sampling temperature or top-P;
 record sampling settings under `provenance`. A completion ending in EOS gets EOS as its
 final label; one cut at `max_tokens` gets zero weight on its last position, which is
 stripped. Completions are fixed at dump time; on-policy distillation (student-generated
@@ -344,8 +364,10 @@ row, but its final label is then the sampled token rather than a data label.
 
 Inputs cost about 4 bytes per token for `tokens` plus whichever optional fields differ
 from their defaults (labels 4, positions 4, loss mask 1 or 4). FP16/BF16 targets take
-about `4·K` bytes per token with `u16` indices, or `5·K` with `u16+u8`, before zstd; the
-high byte compresses to a small fraction of a byte per entry for typical token IDs.
+about `4·K + 4` bytes per scored token with `u16` indices, or `5·K + 4` with `u16+u8`,
+before zstd; the high byte compresses to a small fraction of a byte per entry for typical
+token IDs. Unscored context costs only its input bytes: a 60K-token conversation trained
+on a 1K-token answer stores 1K target rows.
 
 ### Object storage
 

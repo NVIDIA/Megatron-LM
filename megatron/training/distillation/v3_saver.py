@@ -21,6 +21,7 @@ from .v3_format import (
     finalize_record,
     join_inputs,
     pack_targets,
+    tail_logprob,
 )
 from .v3_replay import layout_options, token_map
 from .v3_storage import KINDS, Storage, member_name, parse_tar_name, tar_name, write_tar
@@ -58,6 +59,14 @@ class PairedLogitsSaver(LogitsSaverHooks):
         inputs = capture_batch(batch)
         mapping = token_map(inputs, self.cp_rank, self.cp_size, **self._layout_options(hybrid))
         self._pending_input = (inputs, mapping)
+
+    def _process_single_microbatch(self, logits: torch.Tensor) -> tuple | None:
+        """Also return each row's fp32 tail log probability, taken before downcasting."""
+        result = self._topk_logprobs(logits)
+        if result is None:
+            return None
+        values, indices = result
+        return values.to(self._save_dtype), indices, tail_logprob(values)
 
     def _layout_options(self, hybrid: bool) -> dict:
         # The hybrid layouts come from a full TransformerConfig; build it once, not per microbatch.
@@ -98,15 +107,15 @@ class PairedLogitsSaver(LogitsSaverHooks):
             self._serialize_attempt()
 
     def _serialize_attempt(self) -> None:
-        batches, all_values, all_indices = [], [], []
-        for captured, mapping, values, indices in self._captured:
+        batches, all_values, all_indices, all_tails = [], [], [], []
+        for captured, mapping, values, indices, tail in self._captured:
             if tuple(mapping.shape) != tuple(values.shape[:2]):
                 raise ValueError(
                     "Teacher output shape does not match its captured CP token mapping"
                 )
             mapping = mapping.to(values.device)
             gathered = []
-            for tensor in (mapping, values, indices):
+            for tensor in (mapping, values, indices, tail):
                 parts = (
                     [torch.empty_like(tensor) for _ in range(self.cp_size)]
                     if self.cp_rank == 0
@@ -122,8 +131,9 @@ class PairedLogitsSaver(LogitsSaverHooks):
             k = values.shape[-1]
             full_values = torch.full((captured["tokens"].numel(), k), -1e3, dtype=values.dtype)
             full_indices = torch.zeros_like(full_values, dtype=torch.int64)
+            full_tail = torch.zeros(full_values.shape[0], dtype=torch.float32)
             seen = torch.zeros(full_values.shape[0], dtype=torch.bool)
-            for mapping_part, values_part, indices_part in zip(*gathered):
+            for mapping_part, values_part, indices_part, tail_part in zip(*gathered):
                 positions = mapping_part.cpu().reshape(-1)
                 valid = positions >= 0
                 positions = positions[valid]
@@ -132,22 +142,27 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 seen[positions] = True
                 full_values[positions] = values_part.cpu().reshape(-1, k)[valid]
                 full_indices[positions] = indices_part.cpu().reshape(-1, k)[valid]
+                full_tail[positions] = tail_part.cpu().reshape(-1)[valid]
             if ((~seen) & captured["loss_mask"].bool()).any():
                 raise ValueError("Teacher CP output is missing unmasked target positions")
             batches.append(captured)
             all_values.append(full_values)
             all_indices.append(full_indices)
+            all_tails.append(full_tail)
         if self.cp_rank == 0:
             args = get_args()
             contract = self.metadata_dict["contract"]
-            # Store the padding-free record: trailing zero-weight positions are dropped.
-            inputs, values, indices = finalize_record(
+            # Store the padding-free record, with target rows only where loss is applied.
+            inputs, values, indices, tail = finalize_record(
                 join_inputs(batches),
                 torch.cat(all_values),
                 torch.cat(all_indices),
+                torch.cat(all_tails),
                 isolated=contract["attention_mode"] == "isolated_segments",
             )
-            targets = pack_targets(values, indices, vocab_size=contract["logprob_vocab_size"])
+            targets = pack_targets(
+                values, indices, vocab_size=contract["logprob_vocab_size"], tail=tail
+            )
             start = args.consumed_train_samples
             end = start + get_num_microbatches() * self.dp_size * args.micro_batch_size
             self._iteration_records = {

@@ -82,21 +82,45 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, provenance=None, producer="me
     }
 
 
-def make_record(captured, contract):
-    """Finalize captured inputs and identity targets exactly as the saver does."""
+def scored(tokens, loss_mask):
+    """Identity targets as replayed: rows exist only where the loss weight is nonzero."""
+    return torch.where(loss_mask != 0, tokens.long(), 0)
+
+
+def make_record(captured, contract, logprobs=False):
+    """Finalize captured inputs and targets exactly as the saver does.
+
+    Targets are identity rows (value = index = token ID) by default; with ``logprobs``
+    they are genuine log probabilities with a stored fp32 tail.
+    """
     target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
-    record, values, indices = codec.finalize_record(
+    values = target_ids.float()
+    if logprobs:
+        values = (0.5 + (target_ids % 7).float() / 20).log()
+    record, values, indices, tail = codec.finalize_record(
         captured,
-        target_ids.float(),
+        values,
         target_ids,
+        codec.tail_logprob(values),
         isolated=contract["attention_mode"] == "isolated_segments",
     )
-    targets = codec.pack_targets(values, indices, vocab_size=contract["logprob_vocab_size"])
+    targets = codec.pack_targets(
+        values, indices, vocab_size=contract["logprob_vocab_size"], tail=tail if logprobs else None
+    )
     return record, targets
 
 
 def write_flush(
-    storage, metadata, rank, begin, finish, *, packed=False, generation="gen", source=None
+    storage,
+    metadata,
+    rank,
+    begin,
+    finish,
+    *,
+    packed=False,
+    generation="gen",
+    source=None,
+    logprobs=False,
 ):
     """Write one teacher DP rank's flush exactly as the saver does."""
     contract = metadata["contract"]
@@ -110,7 +134,7 @@ def write_flush(
             for j in range(mbs)
         ]
         batch = (source or inputs)(ids, packed=packed)
-        record, targets = make_record(codec.capture_batch(batch), contract)
+        record, targets = make_record(codec.capture_batch(batch), contract, logprobs)
         for kind, payload in (("inputs", record), ("targets", targets)):
             members[kind].append(
                 (storage_module.member_name(start, end, kind), codec.encode(payload))
@@ -141,6 +165,7 @@ def write_cache(
     start=0,
     generation="gen",
     source=None,
+    logprobs=False,
 ):
     storage = Storage(str(root))
     if metadata is None:
@@ -162,6 +187,7 @@ def write_cache(
                     packed=packed,
                     generation=generation,
                     source=source,
+                    logprobs=logprobs,
                 )
     return storage, metadata
 
@@ -226,6 +252,107 @@ def test_members_are_plain_safetensors_inside_zstd():
         codec.decode(zstandard.ZstdCompressor().compress(b"not safetensors"))
 
 
+def test_tail_is_the_full_precision_mass_outside_retained_entries():
+    full = torch.tensor([[3.0, 1.0, 0.5, -2.0, -4.0]]).log_softmax(-1)
+    head = full[:, :3]
+    assert torch.allclose(codec.tail_logprob(head), full[:, 3:].logsumexp(-1))
+    # Sentinel entries are not retained, so their mass stays in the tail.
+    masked = head.clone()
+    masked[0, 2] = codec.LOGPROB_SENTINEL
+    assert torch.allclose(codec.tail_logprob(masked), full[:, 2:].logsumexp(-1))
+    # A fully retained distribution has no tail; a row with nothing retained is all tail.
+    assert codec.tail_logprob(full).item() == codec.LOGPROB_SENTINEL
+    assert codec.tail_logprob(torch.full((1, 2), codec.LOGPROB_SENTINEL)).item() == 0
+    # Rounding the head to bf16 first distorts a small tail; the stored fp32 tail does not.
+    confident = torch.tensor([[9.0, 5.0, 4.5, 4.0, 3.0, 2.0, 2.0]]).log_softmax(-1)
+    exact = confident[:, 6:].logsumexp(-1)  # About 0.09% of the mass.
+    rounded = codec.tail_logprob(confident[:, :6].to(torch.bfloat16))
+    assert (rounded - exact).abs() > 0.5  # Off by about half the tail mass.
+    assert torch.allclose(codec.tail_logprob(confident[:, :6]), exact, atol=1e-4)
+
+
+@pytest.mark.parametrize("case", ["mass", "nan", "dtype", "shape"])
+def test_malformed_tail_rejected(case):
+    values = torch.tensor([[0.6, 0.3]]).log()
+    tail = torch.tensor([0.1]).log()
+    payload = codec.pack_targets(values, torch.tensor([[0, 1]]), vocab_size=4, tail=tail)
+    codec.unpack_targets(payload)
+    if case == "mass":
+        payload["tail_logprobs"] = torch.tensor([0.5]).log()
+    elif case == "nan":
+        payload["tail_logprobs"] = torch.tensor([float("nan")])
+    elif case == "dtype":
+        payload["tail_logprobs"] = payload["tail_logprobs"].double()
+    else:
+        payload["tail_logprobs"] = torch.zeros(2)
+    with pytest.raises(ValueError, match="tail"):
+        codec.unpack_targets(payload)
+
+
+def test_targets_are_stored_only_where_loss_is_applied():
+    # A conversation: prompt (0), answer (1), next prompt (0), answer, trailing padding.
+    weights = [0, 0, 1, 1, 0, 0, 1, 0]
+    source = inputs([0])
+    source["loss_mask"] = torch.tensor([weights], dtype=torch.float32)
+    captured = codec.capture_batch(source)
+    ids = captured["tokens"].long().reshape(-1, 1)
+    values = (0.5 + (ids % 7).float() / 20).log()
+    record, kept, kept_ids, kept_tail = codec.finalize_record(
+        captured, values, ids, codec.tail_logprob(values), isolated=False
+    )
+    assert record["tokens"].tolist() == [0, 1, 2, 3, 4, 5, 6]  # Only the padding is stripped.
+    assert kept_ids.reshape(-1).tolist() == [2, 3, 6]  # Context tokens carry no targets.
+    payload = codec.pack_targets(kept, kept_ids, vocab_size=1 << 17, tail=kept_tail)
+    metadata = settings()
+    live = replay.ReplayReader(Storage("."), metadata, [])
+    try:
+        sample_record = {**record, "sample_offsets": torch.tensor([0, 7])}
+        live.dp = 1
+        inputs_, targets = live.decode_record(
+            0, 0, 1, codec.encode(sample_record), codec.encode(payload)
+        )
+        with pytest.raises(ValueError, match="nonzero loss weights"):
+            short = {key: value[:2] for key, value in payload.items()}
+            live.decode_record(0, 0, 1, codec.encode(sample_record), codec.encode(short))
+    finally:
+        live.close()
+    assert inputs_["target_offsets"].tolist() == [0, 0, 0, 1, 2, 2, 2, 3]
+    sample = {field: inputs_[field] for field in codec.TOKEN_FIELDS}
+    sample.update(
+        segments=inputs_["segment_lengths"],
+        sample_id=0,
+        teacher_values=targets[0],
+        teacher_indices=targets[1],
+        teacher_tail=targets[2],
+    )
+    batch = replay.collate_samples([sample], 8)
+    replayed = batch["_kd_indices"][0].reshape(-1)
+    assert replayed.tolist() == [0, 0, 2, 3, 0, 0, 6, 0]
+    tail = batch["_kd_tail"][0].reshape(-1)
+    assert torch.equal(tail[[2, 3, 6]], kept_tail)
+    assert (tail[[0, 1, 4, 5, 7]] == 0).all()
+    assert (batch["_kd_values"][0].reshape(-1)[[0, 1, 4, 5, 7]] == codec.LOGPROB_SENTINEL).all()
+
+
+def test_entries_beyond_the_student_vocabulary_join_the_tail(tmp_path):
+    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
+    full = reader(storage, metadata)
+    small = reader(storage, metadata, student_vocab_size=104)
+    try:
+        exact, masked = full.samples([1], 2)[0], small.samples([0, 1], 2)[1]
+    finally:
+        full.close()
+        small.close()
+    # Sample 1's rows are tokens 101..107; the student cannot represent 104 and up.
+    gone = exact["teacher_indices"].reshape(-1) >= 104
+    assert (masked["teacher_values"].reshape(-1)[gone] == codec.LOGPROB_SENTINEL).all()
+    moved = exact["teacher_values"].reshape(-1)[gone]
+    assert torch.allclose(
+        masked["teacher_tail"][gone], torch.logaddexp(exact["teacher_tail"][gone], moved)
+    )
+    assert torch.equal(masked["teacher_tail"][~gone], exact["teacher_tail"][~gone])
+
+
 @pytest.mark.parametrize(
     "vocab_size,encoding",
     [(1, "u16"), (65536, "u16"), (65537, "u16+u8"), (1 << 17, "u16+u8"), (1 << 24, "u16+u8")],
@@ -239,7 +366,9 @@ def test_index_encoding_roundtrip(vocab_size, encoding):
     if "indices_high" in payload:
         assert payload["indices_high"].dtype == torch.uint8
         assert payload["indices_high"].shape == indices.shape
-    restored, ids = codec.unpack_targets(codec.decode(codec.encode(payload)), vocab_size=vocab_size)
+    restored, ids, _ = codec.unpack_targets(
+        codec.decode(codec.encode(payload)), vocab_size=vocab_size
+    )
     assert torch.equal(restored, values)
     keep = values != -1000.0
     assert torch.equal(ids[keep], indices[keep])
@@ -385,16 +514,19 @@ def packed_capture(weights, *, bounds=(0, 4, 8)):
 def test_finalize_strips_only_trailing_zero_weight_positions():
     captured = packed_capture([0, 1, 1, 0, 0, 1, 0, 0])
     targets = torch.arange(8).reshape(-1, 1)
-    record, values, indices = codec.finalize_record(
-        captured, targets.float(), targets, isolated=True
+    tail = -torch.arange(8, dtype=torch.float32)
+    record, values, indices, kept_tail = codec.finalize_record(
+        captured, targets.float(), targets, tail, isolated=True
     )
     # Leading prompts (positions 0 and 4) stay; trailing padding/masked tails go.
     assert record["tokens"].tolist() == [300, 301, 302, 304, 305]
     assert record["segment_lengths"].tolist() == [3, 2]
     assert record["segment_counts"].tolist() == [2]
     assert record["sample_offsets"].tolist() == [0, 5]
-    assert indices.reshape(-1).tolist() == [0, 1, 2, 4, 5]
+    # Prompt tokens keep their inputs but get no target rows.
+    assert indices.reshape(-1).tolist() == [1, 2, 5]
     assert torch.equal(values, indices.float())
+    assert kept_tail.tolist() == [-1, -2, -5]
     # Positions and labels equal their defaults (with per-segment final labels).
     assert "position_ids" not in record and "labels" not in record
     assert record["segment_final_labels"].tolist() == [303, 306]
@@ -407,10 +539,11 @@ def test_finalize_strips_only_trailing_zero_weight_positions():
 def test_finalize_drops_fully_masked_segments_and_samples():
     captured = packed_capture([0, 0, 0, 0, 0, 1, 1, 1])
     targets = torch.arange(8).reshape(-1, 1)
-    record, _, _ = codec.finalize_record(captured, targets.float(), targets, isolated=True)
+    tail = torch.zeros(8)
+    record, *_ = codec.finalize_record(captured, targets.float(), targets, tail, isolated=True)
     assert record["segment_lengths"].tolist() == [4]
     empty = packed_capture([0] * 8)
-    record, values, _ = codec.finalize_record(empty, targets.float(), targets, isolated=True)
+    record, values, *_ = codec.finalize_record(empty, targets.float(), targets, tail, isolated=True)
     assert record["sample_offsets"].tolist() == [0, 0]
     assert record["segment_counts"].tolist() == [0]
     assert values.shape == (0, 1)
@@ -422,7 +555,9 @@ def test_unpacked_samples_are_one_segment():
     source["loss_mask"][1, 6:] = 0
     captured = codec.capture_batch(source)
     targets = torch.arange(16).reshape(-1, 1)
-    record, _, _ = codec.finalize_record(captured, targets.float(), targets, isolated=False)
+    record, *_ = codec.finalize_record(
+        captured, targets.float(), targets, torch.zeros(16), isolated=False
+    )
     assert record["sample_offsets"].tolist() == [0, 8, 14]
     assert record["segment_lengths"].tolist() == [8, 6]
 
@@ -505,7 +640,10 @@ def test_resharding_and_prefix_shortening(
         try:
             for _ in range(2 * gbs // (student_dp * student_mbs)):
                 batch = next(iterator)
-                assert torch.equal(batch["tokens"].T, batch["_kd_indices"][0].squeeze(-1))
+                assert torch.equal(
+                    scored(batch["tokens"], batch["loss_mask"]).T,
+                    batch["_kd_indices"][0].squeeze(-1),
+                )
                 assert batch["tokens"].shape == (student_mbs, 4)
                 all_ids.extend(batch["_kd_sample_ids"])
         finally:
@@ -725,9 +863,9 @@ def test_stripped_segments_are_repadded_for_the_student(tmp_path, divisor, lengt
     padding = torch.tensor([t is None for t in tokens])
     assert (batch["loss_mask"][0][padding] == 0).all()
     values = batch["_kd_values"][0].reshape(-1)
-    assert (values[padding] == -1000).all() and (
-        values[~padding] == torch.tensor(expected)[~padding]
-    ).all()
+    target = batch["loss_mask"][0] != 0  # Padding and zero-weight positions have no rows.
+    assert (values[~target] == -1000).all()
+    assert (values[target] == torch.tensor(expected)[target]).all()
     # Positions restart per segment and continue through each segment's padding.
     starts = torch.tensor(bounds[:-1])
     for a, b in zip(bounds[:-1], bounds[1:]):
@@ -745,6 +883,7 @@ def test_missing_teacher_entries_preserve_scoring_mask():
         "sample_id": 0,
         "teacher_values": torch.tensor([[-1.0], [-1000.0], [-2.0]]),
         "teacher_indices": torch.tensor([[1], [0], [2]]),
+        "teacher_tail": torch.zeros(3),
     }
     batch = replay.collate_samples([sample], 4)
     assert batch["loss_mask"][0].tolist() == [1.0, 1.0, 1.0, 0.0]
@@ -767,7 +906,8 @@ def test_collation_maps_targets_for_every_cp_rank(tmp_path, packed):
     for rank in range(2):
         mapping = replay.token_map(captured, rank, 2)
         assert torch.equal(
-            result["_kd_indices"][rank].squeeze(-1), captured["tokens"][mapping].long()
+            result["_kd_indices"][rank].squeeze(-1),
+            scored(captured["tokens"], captured["loss_mask"])[mapping],
         )
 
 
@@ -783,8 +923,10 @@ def test_cp_token_maps_cover_every_token_and_match_targets(packed, layout):
     positions = torch.cat([m.reshape(-1) for m in maps])
     assert sorted(positions.tolist()) == list(range(32))
     for mapping in maps:
-        local_values, local_indices = replay.map_targets(values, indices, mapping)
+        tail = -captured["tokens"].float()
+        local_values, local_indices, local_tail = replay.map_targets(values, indices, tail, mapping)
         assert torch.equal(local_values.long(), local_indices)
+        assert torch.equal(local_tail, -local_values.squeeze(-1))
         assert torch.equal(local_indices.squeeze(-1), captured["tokens"][mapping].long())
 
 
@@ -1165,7 +1307,9 @@ def test_resume_can_switch_to_identically_dumped_replacement(
     try:
         batch = next(iterator)
         assert batch["_kd_sample_ids"] == expected
-        assert torch.equal(batch["tokens"].T, batch["_kd_indices"].squeeze(-1))
+        assert torch.equal(
+            scored(batch["tokens"], batch["loss_mask"]).T, batch["_kd_indices"].squeeze(-1)
+        )
     finally:
         iterator.close()
 
@@ -1240,6 +1384,7 @@ def test_targets_are_handed_from_get_batch_to_forward_step(runtime_environment, 
         "tokens": torch.zeros(1, 8, dtype=torch.long),
         "_kd_values": torch.ones(8, 1, 1),
         "_kd_indices": torch.zeros(8, 1, 1, dtype=torch.long),
+        "_kd_tail": torch.zeros(8, 1),
         "_kd_sample_ids": [3],
     }
     for attempt in range(2):  # A rerun re-reads the same cached batch.
@@ -1434,7 +1579,8 @@ def test_targets_beyond_the_student_vocabulary_are_masked(tmp_path, capsys):
     small.close()
     masked = sample["teacher_indices"].reshape(-1) >= 0
     values = sample["teacher_values"].reshape(-1)
-    assert (values[4:] == -1000).all() and (values[:4] > -1000).all()
+    # Position 0 has no row (zero loss weight); rows 101..103 survive, 104..107 are masked.
+    assert (values[3:] == -1000).all() and (values[:3] > -1000).all()
     assert small.masked_entries > 0 and masked.all()
     assert "beyond the student vocabulary" in capsys.readouterr().out
 
@@ -1602,7 +1748,11 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     }
     saver._captured = []
     saver._pending_writes = collections.OrderedDict()
-    saver._process_single_microbatch = lambda logits: (logits.half(), logits.long())
+    saver._process_single_microbatch = lambda logits: (
+        logits.half(),
+        logits.long(),
+        torch.zeros(logits.shape[:2]),
+    )
 
     def forward(ids):
         source = inputs(ids)
@@ -1621,12 +1771,18 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     saver.commit_attempt()
     record = saver._pending_writes[(0, 4)]
     restored = codec.decode(record["inputs"])
-    values, indices = codec.unpack_targets(codec.decode(record["targets"]))
+    # Identity targets are not log probabilities, so inspect the payload directly.
+    payload = codec.decode(record["targets"])
+    values = payload["values"]
+    indices = payload["indices_low"].long() | payload["indices_high"].long() << 16
     assert "sample_ids" not in record and "sample_ids" not in restored
     assert all(isinstance(value, torch.Tensor) for value in restored.values())
     assert restored["tokens"][0] == 400
-    assert torch.equal(restored["tokens"].long(), indices.squeeze(-1))
+    weights = codec.fill_input_defaults(restored)["loss_mask"]
+    assert torch.equal(restored["tokens"].long()[weights != 0], indices.squeeze(-1))
     assert torch.equal(values.long(), indices)
+    assert payload["tail_logprobs"].dtype == torch.float32
+    assert payload["tail_logprobs"].shape == values.shape[:1]
 
 
 def test_saver_writes_paired_tars_readable_by_replay(tmp_path, runtime_environment, monkeypatch):
@@ -1677,7 +1833,7 @@ def _loss_namespace(monkeypatch):
         "dist_nn": None,
         "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3,
         "parallel_state": types.SimpleNamespace(get_tensor_model_parallel_group=lambda: None),
-        **{name: getattr(typing, name) for name in ("Dict", "Tuple")},
+        **{name: getattr(typing, name) for name in ("Dict", "Optional", "Tuple")},
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     cached = types.ModuleType(f"{_namespace}.cached_logits_loss")
@@ -1700,7 +1856,11 @@ def test_paired_loss_uses_explicit_targets_and_keeps_gradients(
     monkeypatch.setattr(module, "get_args", lambda: args)
     teacher = torch.randn(8, 2, 3).log_softmax(-1)
     sidecar = runtime.bind_student_logits(
-        {"values": teacher, "indices": torch.arange(3).expand(8, 2, -1)}
+        {
+            "values": teacher,
+            "indices": torch.arange(3).expand(8, 2, -1),
+            "tail": codec.tail_logprob(teacher),
+        }
     )
     mask = torch.ones(2, 8)
     mask[0, 0] = 0
@@ -1753,6 +1913,7 @@ def test_missing_kd_targets_keep_ce_loss_and_gradients(
         "sample_id": 0,
         "teacher_values": values,
         "teacher_indices": torch.arange(3).expand(3, -1),
+        "teacher_tail": codec.tail_logprob(values),
     }
     batch = replay.collate_samples([sample], 4)
     logits = torch.tensor(
@@ -1766,7 +1927,12 @@ def test_missing_kd_targets_keep_ce_loss_and_gradients(
         batch["loss_mask"],
         ce,
         types.SimpleNamespace(training=True),
-        {"logits": logits, "values": batch["_kd_values"][0], "indices": batch["_kd_indices"][0]},
+        {
+            "logits": logits,
+            "values": batch["_kd_values"][0],
+            "indices": batch["_kd_indices"][0],
+            "tail": batch["_kd_tail"][0],
+        },
     )
     expected_kd = (teacher.exp() * (teacher - logits[:3, 0].log_softmax(-1))).sum(-1)
     expected_kd[missing_rows] = 0
@@ -1784,7 +1950,12 @@ def legacy_saver_methods():
     """Execute the inherited TP/top-P helpers without Megatron GPU imports."""
     path = Path(_package.__path__[0]) / "logits_saver.py"
     cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef))
-    names = {"_process_single_microbatch", "_compute_global_topk", "_apply_topp_truncation"}
+    names = {
+        "_process_single_microbatch",
+        "_topk_logprobs",
+        "_compute_global_topk",
+        "_apply_topp_truncation",
+    }
     nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     nodes += [
         n
@@ -1814,6 +1985,7 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
         _save_dtype=torch.float32,
         _max_vocab_size=helpers["_max_vocab_size"],
     )
+    saver._topk_logprobs = types.MethodType(helpers["_topk_logprobs"], saver)
     logits = torch.arange((1 << 17) + 1, dtype=torch.float32).reshape(1, 1, -1)
     with pytest.raises(AssertionError, match="maximum supported"):
         method(saver, logits)
@@ -1824,7 +1996,7 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
         values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
     )
     assert payload["indices_high"].dtype == torch.uint8
-    restored, ids = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
+    restored, ids, _ = codec.unpack_targets(payload, vocab_size=logits.shape[-1])
     assert torch.equal(ids, indices.reshape(1, 2))
     assert torch.equal(restored, values.reshape(1, 2))
 
@@ -1891,17 +2063,27 @@ def test_inherited_tp_top_p_survives_v3_codec(dtype, monkeypatch):
         _save_dtype=dtype,
         _topp_kept_counts=[],
     )
-    for name in ("_compute_global_topk", "_apply_topp_truncation"):
+    for name in ("_topk_logprobs", "_compute_global_topk", "_apply_topp_truncation"):
         setattr(saver, name, types.MethodType(helpers[name], saver))
     values, indices = helpers["_process_single_microbatch"](saver, chunks[0])
     assert calls == [torch.distributed.ReduceOp.MAX, torch.distributed.ReduceOp.SUM]
+    # The tail is the full-precision mass outside the kept nucleus, before downcasting.
+    fp32_values, _ = saver._topk_logprobs(chunks[0])
+    tail = codec.tail_logprob(fp32_values)
     expected, expected_ids = full.log_softmax(-1).topk(4, dim=-1)
     probs = expected.exp()
     keep = (probs.cumsum(-1) - probs < 0.7) | (torch.arange(4) < 2)
     assert torch.equal(indices, torch.where(keep, expected_ids, -1))
     assert torch.allclose(values, torch.where(keep, expected, -1e3).to(dtype), atol=1e-6)
-    encoded = codec.pack_targets(values.reshape(-1, 4), indices.reshape(-1, 4), vocab_size=6)
-    restored, restored_ids = codec.unpack_targets(codec.decode(codec.encode(encoded)))
+    kept_mass = (full.softmax(-1).topk(4, dim=-1).values * keep).sum(-1)
+    assert torch.allclose(tail, (1 - kept_mass).log(), atol=1e-6)
+    encoded = codec.pack_targets(
+        values.reshape(-1, 4), indices.reshape(-1, 4), vocab_size=6, tail=tail.reshape(-1)
+    )
+    restored, restored_ids, restored_tail = codec.unpack_targets(
+        codec.decode(codec.encode(encoded))
+    )
+    assert torch.equal(restored_tail, tail.reshape(-1))
     assert torch.equal(restored, values.reshape(-1, 4))
     assert torch.equal(
         restored_ids[keep.reshape(-1, 4)], expected_ids.reshape(-1, 4)[keep.reshape(-1, 4)]
@@ -1996,9 +2178,10 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     captured = codec.capture_batch(inputs([0, 1], packed=packed))
     maps = [replay.token_map(captured, rank, 2) for rank in range(2)]
     full_ids = captured["tokens"].long().reshape(-1, 1)
-    full_values = full_ids.float()
-    mapped = [replay.map_targets(full_values, full_ids, m) for m in maps]
-    parts = [maps, [v for v, _ in mapped], [i for _, i in mapped]]
+    full_values = -(full_ids.float() + 1) / 1000  # Distinct log probabilities per token.
+    full_tail = codec.tail_logprob(full_values)
+    mapped = [replay.map_targets(full_values, full_ids, full_tail, m) for m in maps]
+    parts = [maps, *([part[field] for part in mapped] for field in range(3))]
     calls = []
 
     def gather(tensor, buffers, dst, group):
@@ -2023,10 +2206,12 @@ def test_cp_saver_reassembles_canonical_token_targets(runtime_environment, monke
     saver._captured = [(captured, maps[0], *mapped[0])]
     saver._serialize_attempt()
     raw = saver._iteration_records["targets"]
-    values, indices = codec.unpack_targets(codec.decode(raw))
-    assert len(calls) == 3
-    assert torch.equal(values, full_values)
-    assert torch.equal(indices, full_ids)
+    values, indices, tail = codec.unpack_targets(codec.decode(raw))
+    assert len(calls) == 4
+    rows = captured["loss_mask"] != 0  # No trailing padding here, so only weights drop rows.
+    assert torch.equal(values, full_values[rows])
+    assert torch.equal(indices, full_ids[rows])
+    assert torch.equal(tail, full_tail[rows])
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -2074,6 +2259,7 @@ def test_tp_target_broadcast_preserves_shape_dtype_and_virtual_stage(
     source = {
         "values": torch.randn(4, 2, 3).to(dtype),
         "indices": torch.arange(24).reshape(4, 2, 3),
+        "tail": -torch.rand(4, 2),
         "sample_ids": [2, 3],
     }
     assert runtime.broadcast_targets(source, vp_stage=2) is None
@@ -2086,8 +2272,10 @@ def test_tp_target_broadcast_preserves_shape_dtype_and_virtual_stage(
     assert received["values"].dtype == dtype
     assert torch.equal(sent["indices"], received["indices"])
     assert received["indices"].dtype == torch.int64
+    assert torch.equal(sent["tail"], received["tail"])
+    assert received["tail"].dtype == torch.float32
     assert received["sample_ids"] == [2, 3]
-    assert len(pinned) == 2
+    assert len(pinned) == 3
 
 
 def test_hybrid_padded_cp_mapping_uses_core_metadata_and_masks_inserted_padding(monkeypatch):
@@ -2109,7 +2297,10 @@ def test_hybrid_padded_cp_mapping_uses_core_metadata_and_masks_inserted_padding(
     seen = []
     for rank in range(2):
         mapping = replay.token_map(captured, rank, 2, hybrid_padded_zigzag=True, tp_alignment=4)
-        values, indices = replay.map_targets(full.float(), full, mapping)
+        values, indices, tail = replay.map_targets(
+            full.float(), full, -full.float().squeeze(-1), mapping
+        )
+        assert (tail[mapping < 0] == 0).all()  # Inserted padding: no tail mass to match.
         assert mapping.numel() % 4 == 0
         assert (values.squeeze(-1)[mapping < 0] == -1e3).all()
         assert torch.equal(indices.squeeze(-1)[mapping >= 0], mapping[mapping >= 0])
@@ -2124,16 +2315,22 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name == "topk_kl_div"
     )
-    namespace = {"torch": torch, "dist": torch.distributed, "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3}
+    namespace = {
+        "torch": torch,
+        "dist": torch.distributed,
+        "CACHED_LOGITS_LOGPROB_SENTINEL": -1e3,
+        "Optional": typing.Optional,
+    }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     # With a u16 encoding, -1 decodes as 65535, a real vocabulary ID at the limit.
-    values, indices = codec.unpack_targets(
+    values, indices, tail = codec.unpack_targets(
         codec.pack_targets(
             torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
             torch.tensor([[0, -1]]),
             vocab_size=1 << 16,
         )
     )
+    assert torch.allclose(tail, torch.tensor([0.3]).log())
     assert indices[0, 1] == 65535
     logits = torch.linspace(-2, 2, 1 << 16).reshape(1, 1, -1).requires_grad_()
     actual = namespace["topk_kl_div"](
@@ -2147,6 +2344,18 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     assert torch.allclose(actual, expected, atol=1e-5)
     actual.sum().backward()
     assert torch.isfinite(logits.grad).all()
+    # A stored tail replaces the derived ghost bucket.
+    stored = namespace["topk_kl_div"](
+        logits.detach().clone(),
+        values.unsqueeze(0),
+        indices.unsqueeze(0),
+        1,
+        0,
+        None,
+        add_ghost_token=True,
+        teacher_tail_logprobs=tail.unsqueeze(0),
+    )
+    assert torch.allclose(stored, expected.detach(), atol=1e-5)
 
 
 def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypatch, tmp_path):
@@ -2212,7 +2421,8 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
                     expected = expected_order[start : start + student_mbs]
                     assert batch["_kd_sample_ids"] == expected
                     # Packed batches map to the flattened THD layout, others to [S, B].
-                    layout = batch["tokens"].reshape(-1, 1) if packed else batch["tokens"].T
+                    targets = scored(batch["tokens"], batch["loss_mask"])
+                    layout = targets.reshape(-1, 1) if packed else targets.T
                     assert torch.equal(layout, batch["_kd_indices"][0].squeeze(-1))
                     assert torch.equal(
                         batch["tokens"], torch.tensor(expected).unsqueeze(1) * 100 + torch.arange(8)
@@ -2259,6 +2469,7 @@ FIXTURE_VARIANTS = {
         packed=True, contract={"padding_divisor": 2}, source=tail_masked, gbs=4, mbs=1
     ),
     "u16_minimal_fields": dict(contract={"logprob_vocab_size": 4096}, source=minimal_inputs),
+    "u16_logprobs_with_tail": dict(contract={"logprob_vocab_size": 4096}, logprobs=True),
 }
 
 
@@ -2293,9 +2504,21 @@ def test_golden_fixtures_decode(tmp_path, name):
         got_reader.close()
         want_reader.close()
     for a, b in zip(got, want):
-        for key in (*codec.TOKEN_FIELDS, "segments", "teacher_values", "teacher_indices"):
+        for key in (
+            *codec.TOKEN_FIELDS,
+            "segments",
+            "teacher_values",
+            "teacher_indices",
+            "teacher_tail",
+        ):
             assert torch.equal(a[key], b[key]), (name, key)
     if name == "u16_minimal_fields":
         members = dict(storage_module.iter_tar(storage, "dp0__0-16.inputs.tar"))
         record = codec.decode(members["0-8.inputs.safetensors.zst"])
         assert not set(codec.OPTIONAL_TOKEN_FIELDS) & set(record)  # All defaults: omitted.
+    if name == "u16_logprobs_with_tail":
+        members = dict(storage_module.iter_tar(storage, "dp0__0-16.targets.tar"))
+        payload = codec.decode(members["0-8.targets.safetensors.zst"])
+        assert payload["tail_logprobs"].dtype == torch.float32
+        tail = got[0]["teacher_tail"]
+        assert torch.allclose(got[0]["teacher_values"].exp().sum(-1) + tail.exp(), torch.ones(1))

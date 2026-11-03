@@ -535,7 +535,7 @@ class _ContextParallelReplay:
     @staticmethod
     def _for_rank(batch: dict, rank: int) -> dict:
         local = dict(batch)
-        for key in ("_kd_values", "_kd_indices"):
+        for key in ("_kd_values", "_kd_indices", "_kd_tail"):
             if key in local:
                 local[key] = local[key][rank]
         return local
@@ -701,9 +701,10 @@ def prepare_replay_batch(batch: dict) -> tuple[dict, dict | None]:
         sidecar = {
             "values": batch["_kd_values"],
             "indices": batch["_kd_indices"],
+            "tail": batch["_kd_tail"],
             "sample_ids": batch["_kd_sample_ids"],
         }
-    for key in ("_kd_values", "_kd_indices", "_kd_sample_ids"):
+    for key in ("_kd_values", "_kd_indices", "_kd_tail", "_kd_sample_ids"):
         result.pop(key, None)
     if args.create_attention_mask_in_dataloader:
         from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
@@ -745,17 +746,18 @@ def broadcast_targets(sidecar: dict | None, *, vp_stage: int | None = None) -> d
         sidecar = {
             "values": torch.empty(shape, dtype=dtype, device=device),
             "indices": torch.empty(shape, dtype=torch.int64, device=device),
+            "tail": torch.empty(shape[:-1], dtype=torch.float32, device=device),
             "sample_ids": ids,
         }
     else:
         sidecar = dict(sidecar)
-        for field in ("values", "indices"):
+        for field in ("values", "indices", "tail"):
             tensor = sidecar[field]
             if torch.cuda.is_available() and tensor.device.type == "cpu" and not tensor.is_pinned():
                 tensor = tensor.pin_memory()
             sidecar[field] = tensor.to(device, non_blocking=True)
     if dist.is_initialized():
-        for field in ("values", "indices"):
+        for field in ("values", "indices", "tail"):
             dist.broadcast(sidecar[field], src=source, group=group)
     return sidecar
 

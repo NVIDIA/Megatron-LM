@@ -20,6 +20,8 @@ from safetensors.torch import save as save_tensors
 FORMAT_VERSION = 3
 MAX_VOCAB_SIZE = 1 << 24
 LOGPROB_SENTINEL = -1000.0
+# Allowed |retained + tail - 1| per row; generous enough for bf16-rounded values.
+MASS_TOLERANCE = 0.05
 PADDING_POLICY = "strip"
 ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 # Token-aligned input fields. Only ``tokens`` is required; the rest have defaults.
@@ -178,6 +180,20 @@ def int32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().to(device="cpu", dtype=torch.int32).contiguous().clone()
 
 
+def tail_logprob(values: torch.Tensor) -> torch.Tensor:
+    """Log of the probability mass outside each row's retained entries.
+
+    Writers call this on full-precision log probabilities before casting them to the
+    save dtype, so rounding of the retained values does not distort the tail. Readers
+    of records without a stored tail fall back to calling it on the stored values.
+    Sentinel entries count as not retained; an empty tail is ``LOGPROB_SENTINEL``.
+    """
+    values = values.float()
+    retained = torch.logsumexp(values.masked_fill(values == LOGPROB_SENTINEL, -torch.inf), -1)
+    tail = torch.log(-torch.expm1(retained.clamp(max=0.0)))
+    return tail.clamp(min=LOGPROB_SENTINEL)
+
+
 def capture_batch(batch: dict[str, Any]) -> dict[str, Any]:
     """Own a CPU snapshot of a fixed-length dataset microbatch before TP/CP slicing.
 
@@ -272,15 +288,22 @@ def default_inputs(
 
 
 def finalize_record(
-    inputs: dict[str, Any], values: torch.Tensor, indices: torch.Tensor, *, isolated: bool
-) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+    inputs: dict[str, Any],
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    tail: torch.Tensor,
+    *,
+    isolated: bool,
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert joined teacher captures to the stored, padding-free record.
 
     Within each segment (each saved ``cu_seqlens`` segment when ``isolated``, else
     each whole sample), drop the trailing run of zero-weight positions. Under causal
     attention no kept position attends to them and they are never scored, so this is
-    lossless; it removes dataset padding and trailing masked turns alike. Targets drop
-    the same rows. Optional fields equal to their defaults are omitted.
+    lossless; it removes dataset padding and trailing masked turns alike. Targets are
+    kept only for the remaining positions with nonzero loss weight: context-only
+    positions such as prompts need tokens but no target rows. Optional fields equal to
+    their defaults are omitted.
     """
     offsets = inputs["sample_offsets"].tolist()
     weights = inputs["loss_mask"].float()
@@ -321,13 +344,20 @@ def finalize_record(
             record[key] = kept
     if "labels" not in record:
         record["segment_final_labels"] = final_labels
-    return record, values[keep], indices[keep]
+    rows = keep & (weights != 0)
+    return record, values[rows], indices[rows], tail[rows]
 
 
 def pack_targets(
-    values: torch.Tensor, indices: torch.Tensor, *, vocab_size: int
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    vocab_size: int,
+    tail: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Encode [tokens, K] indices as uint16 low words plus, above 2**16, a uint8 high byte."""
+    """Encode [rows, K] targets: indices as uint16 low words plus, above 2**16, a uint8
+    high byte, and the optional float32 ``[rows]`` tail log probability (see
+    :func:`tail_logprob`)."""
     encoding = index_encoding_for_vocab(vocab_size)
     if values.shape != indices.shape or values.ndim != 2:
         raise ValueError("Offline KD targets must have matching [tokens, K] shapes")
@@ -344,16 +374,21 @@ def pack_targets(
     payload = {"values": values, "indices_low": (indices & 0xFFFF).to(torch.uint16)}
     if encoding == "u16+u8":
         payload["indices_high"] = ((indices >> 16) & 0xFF).to(torch.uint8)
+    if tail is not None:
+        if tail.shape != values.shape[:1]:
+            raise ValueError("Offline KD tail log probabilities must have one value per row")
+        payload["tail_logprobs"] = tail.detach().to(device="cpu", dtype=torch.float32)
     return payload
 
 
 def unpack_targets(
     payload: dict[str, torch.Tensor], *, vocab_size: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruct vocabulary indices in canonical token order.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(values, indices, tail)`` target rows.
 
-    The encoding is implied by ``indices_high``'s presence; with ``vocab_size`` it must
-    also be the one :func:`index_encoding_for_vocab` prescribes.
+    The index encoding is implied by ``indices_high``'s presence; with ``vocab_size`` it
+    must also be the one :func:`index_encoding_for_vocab` prescribes. Without a stored
+    ``tail_logprobs`` the tail is derived from the stored values.
     """
     values, low = payload.get("values"), payload.get("indices_low")
     high = payload.get("indices_high")
@@ -375,7 +410,19 @@ def unpack_targets(
         indices |= high.to(torch.int64) << 16
     if vocab_size is not None and ((indices >= vocab_size) & (values != LOGPROB_SENTINEL)).any():
         raise ValueError("Offline KD target vocabulary index is out of range")
-    return values, indices
+    tail = payload.get("tail_logprobs")
+    if tail is None:
+        return values, indices, tail_logprob(values)
+    if tail.dtype != torch.float32 or tail.shape != values.shape[:1] or tail.isnan().any():
+        raise ValueError("Malformed offline KD tail_logprobs")
+    tail = tail.clamp(min=LOGPROB_SENTINEL, max=0.0)
+    retained = values.float().masked_fill(values == LOGPROB_SENTINEL, -torch.inf).exp().sum(-1)
+    if values.numel() and ((retained + tail.exp() - 1).abs() > MASS_TOLERANCE).any():
+        raise ValueError(
+            "Offline KD retained and tail probabilities do not sum to 1; targets must be "
+            "full-vocabulary log probabilities with the tail of the retained entries"
+        )
+    return values, indices, tail
 
 
 def validate_inputs(payload: dict[str, Any]) -> None:

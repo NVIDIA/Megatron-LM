@@ -513,7 +513,17 @@ class LogitsSaverHooks:
     def _process_single_microbatch(
         self, logits: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Process a single logits tensor and return top-K log-probability data.
+        """Return top-K log-probabilities cast to ``save_dtype`` (see :meth:`_topk_logprobs`)."""
+        result = self._topk_logprobs(logits)
+        if result is None:
+            return None
+        values, indices = result
+        return values.to(self._save_dtype), indices
+
+    def _topk_logprobs(
+        self, logits: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Process a single logits tensor and return fp32 top-K log-probability data.
 
         Selects local top-K positions on raw logits first, then computes
         the global log-sum-exp denominator using ``torch.logsumexp`` for
@@ -530,7 +540,7 @@ class LogitsSaverHooks:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
 
         Returns:
-            Tuple of (log_prob_values, global_indices) on TP rank 0,
+            Tuple of (fp32 log_prob_values, global_indices) on TP rank 0,
             ``None`` on other TP ranks.
         """
         local_vocab_size = logits.shape[-1]
@@ -580,8 +590,6 @@ class LogitsSaverHooks:
             global_values, global_indices = self._apply_topp_truncation(
                 global_values, global_indices,
             )
-
-        global_values = global_values.to(self._save_dtype)
 
         return global_values, global_indices
 

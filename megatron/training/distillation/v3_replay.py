@@ -105,19 +105,21 @@ def token_map(
 
 
 def map_targets(
-    values: torch.Tensor, indices: torch.Tensor, mapping: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply precisely the input token mapping to teacher top-K targets."""
+    values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor, mapping: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply precisely the input token mapping to teacher top-K targets and tails."""
     flat = mapping.reshape(-1)
     valid = flat >= 0
     selected = flat.clamp_min(0)
     shape = (*mapping.shape, values.shape[-1])
     local_values = values.index_select(0, selected).reshape(shape)
     local_indices = indices.index_select(0, selected).reshape(shape)
+    local_tail = tail.index_select(0, selected).reshape(mapping.shape)
     if not valid.all():
         local_values = local_values.masked_fill(~valid.reshape(*mapping.shape, 1), -1e3)
         local_indices = local_indices.masked_fill(~valid.reshape(*mapping.shape, 1), 0)
-    return local_values, local_indices
+        local_tail = local_tail.masked_fill(~valid.reshape(mapping.shape), 0.0)
+    return local_values, local_indices, local_tail
 
 
 def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
@@ -424,30 +426,40 @@ class ReplayReader:
             raise ValueError(
                 f"Offline KD record dp{dp_rank} {start}-{end} has the wrong sample count"
             )
-        targets = None
-        if raw_targets is not None:
-            payload = decode(raw_targets)
-            targets = unpack_targets(payload, vocab_size=self.contract["logprob_vocab_size"])
-            if targets[0].shape[0] != inputs["tokens"].numel():
-                raise ValueError("Offline KD input/target token counts disagree")
-            targets = self._mask_unknown_indices(*targets)
         inputs = fill_input_defaults(inputs)
         inputs["segment_offsets"] = torch.cat(
             (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
         )
+        # Target rows exist only at positions with nonzero loss weight, in token order.
+        scored = inputs["loss_mask"] != 0
+        inputs["target_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(scored.long(), 0))
+        )
+        targets = None
+        if raw_targets is not None:
+            payload = decode(raw_targets)
+            targets = unpack_targets(payload, vocab_size=self.contract["logprob_vocab_size"])
+            if targets[0].shape[0] != int(inputs["target_offsets"][-1]):
+                raise ValueError(
+                    "Offline KD target rows disagree with the number of nonzero loss weights"
+                )
+            targets = self._mask_unknown_indices(*targets)
         return inputs, targets
 
     def _mask_unknown_indices(
-        self, values: torch.Tensor, indices: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         valid = values != LOGPROB_SENTINEL
         self.target_entries += int(valid.sum())
         if self.student_vocab_size is None:
-            return values, indices
+            return values, indices, tail
         unknown = valid & (indices >= self.student_vocab_size)
         count = int(unknown.sum())
         if count:
             self.masked_entries += count
+            # Entries the student cannot represent join the tail bucket.
+            masked = values.float().masked_fill(~unknown, -torch.inf).logsumexp(-1)
+            tail = torch.logaddexp(tail, masked)
             values = values.masked_fill(unknown, LOGPROB_SENTINEL)
             indices = indices.masked_fill(unknown, 0)
             fraction = self.masked_entries / max(1, self.target_entries)
@@ -459,7 +471,7 @@ class ReplayReader:
                     f"({self.student_vocab_size}); check the teacher/student vocabularies",
                     flush=True,
                 )
-        return values, indices
+        return values, indices, tail
 
     def _lane(self, dp_rank: int, group_index: int, record_index: int) -> _Lane:
         lane = self.lanes.get(dp_rank)
@@ -488,8 +500,9 @@ class ReplayReader:
             s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
             sample["segments"] = inputs["segment_lengths"][s0:s1]
             if targets is not None:
-                sample["teacher_values"], sample["teacher_indices"] = (
-                    tensor[a:b] for tensor in targets
+                ta, tb = inputs["target_offsets"][[a, b]].tolist()
+                sample["teacher_values"], sample["teacher_indices"], sample["teacher_tail"] = (
+                    tensor[ta:tb] for tensor in targets
                 )
             samples.append(sample)
         return samples
@@ -559,7 +572,7 @@ def collate_samples(
     if not samples:
         raise ValueError("Cannot collate an empty offline KD microbatch")
     fields = {field: [] for field in TOKEN_FIELDS}
-    boundary_rows, values, indices = [], [], []
+    boundary_rows, values, indices, tails = [], [], [], []
     with_targets = "teacher_values" in samples[0]
     for sample in samples:
         source, positions, boundaries = _layout_sample(
@@ -579,15 +592,24 @@ def collate_samples(
                 filled = torch.where(real, column, filled)
             fields[field].append(filled)
         if with_targets:
+            # Stored rows cover only scored tokens; other positions get no KD target.
+            scored = sample["loss_mask"] != 0
+            row_of = torch.cumsum(scored.long(), 0) - 1
+            has_row = real.clone()
+            has_row[real] = scored[source[real]]
+            rows = row_of[source[has_row]]
             k = sample["teacher_values"].shape[-1]
             row_values = torch.full(
                 (seq_length, k), LOGPROB_SENTINEL, dtype=sample["teacher_values"].dtype
             )
             row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
-            row_values[real] = sample["teacher_values"][source[real]]
-            row_indices[real] = sample["teacher_indices"][source[real]]
+            row_tail = torch.zeros(seq_length, dtype=torch.float32)
+            row_values[has_row] = sample["teacher_values"][rows]
+            row_indices[has_row] = sample["teacher_indices"][rows]
+            row_tail[has_row] = sample["teacher_tail"][rows]
             values.append(row_values)
             indices.append(row_indices)
+            tails.append(row_tail)
         boundary_rows.append(boundaries)
     result = {field: torch.stack(rows) for field, rows in fields.items()}
     result["cu_seqlens_padded"] = None
@@ -607,17 +629,14 @@ def collate_samples(
             "sample_offsets": torch.arange(len(samples) + 1, dtype=torch.int64) * seq_length,
             "cu_seqlens": boundary_rows if packed else None,
         }
-        flat_values, flat_indices = torch.cat(values), torch.cat(indices)
+        flat = (torch.cat(values), torch.cat(indices), torch.cat(tails))
         shards = [
-            map_targets(
-                flat_values,
-                flat_indices,
-                token_map(mapping_inputs, rank, cp_size, **(layout or {})),
-            )
+            map_targets(*flat, token_map(mapping_inputs, rank, cp_size, **(layout or {})))
             for rank in range(cp_size)
         ]
         result["_kd_values"] = [shard[0] for shard in shards]
         result["_kd_indices"] = [shard[1] for shard in shards]
+        result["_kd_tail"] = [shard[2] for shard in shards]
     return result
 
 
