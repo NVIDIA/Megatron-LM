@@ -2119,7 +2119,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
-    callback_manager.callback_context.train_state = get_train_state()
+    callback_manager.callback_context.train_state = train_state
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
@@ -2152,7 +2152,6 @@ def pretrain(
     callback_manager.callback_context.model = model
     callback_manager.callback_context.optimizer = optimizer
     callback_manager.callback_context.scheduler = opt_param_scheduler
-    callback_manager.callback_context.train_state = get_train_state()
     callback_manager.trigger("on_data_init_start")
 
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
