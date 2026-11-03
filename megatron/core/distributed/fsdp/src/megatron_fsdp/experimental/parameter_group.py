@@ -658,7 +658,7 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
         has_sharded_grads = self._has_sharded_grads()
-        self._clear_stale_main_grad(has_sharded_grads)
+        self._clear_stale_main_grad()
         current_stream = torch.cuda.current_stream(self.main_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
@@ -700,20 +700,22 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def _clear_stale_main_grad(self, has_sharded_grads: bool) -> None:
+    def _clear_stale_main_grad(self) -> None:
         """Clear stale values before adding a new step's first contribution."""
         assert self.main_grad is not None
-        if self._main_grad_is_stale:
-            # Final reduction left .grad pointing at the optimizer's view of main_grad.
-            # In ZeRO-1/HFSDP that view can cover only part of the buffer. For example,
-            # zero_grad(False) might leave main_grad as [0, 0, old, old]. Adding the
-            # next step's first contribution would include those old values, so clear
-            # the whole buffer first. If .grad is None, the caller instead overwrites
-            # every parameter's gradient and no clearing is needed.
-            if has_sharded_grads:
-                self.main_grad.local_buffer.zero_()
-            # Later microbatches must preserve the contributions already accumulated.
-            self._main_grad_is_stale = False
+        if not self._main_grad_is_stale:
+            return
+
+        # Final reduction left .grad pointing at the optimizer's view of main_grad.
+        # In ZeRO-1/HFSDP that view can cover only part of the buffer. For example,
+        # zero_grad(False) might leave main_grad as [0, 0, old, old]. Adding the
+        # next step's first contribution would include those old values, so clear
+        # the whole buffer first. If .grad is None, the caller instead overwrites
+        # every parameter's gradient and no clearing is needed.
+        if self._has_sharded_grads():
+            self.main_grad.local_buffer.zero_()
+        # Later microbatches must preserve the contributions already accumulated.
+        self._main_grad_is_stale = False
 
     def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
@@ -728,7 +730,7 @@ class FsdpParameterGroup:
         assert self.main_grad is not None
 
         has_sharded_grads = self._has_sharded_grads()
-        self._clear_stale_main_grad(has_sharded_grads)
+        self._clear_stale_main_grad()
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):
