@@ -376,6 +376,7 @@ def prepare_thd_static_batch_for_full_iteration_cuda_graph(
             dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
             config=config,
+            precompute_seq_idx=False,
         )
     )
 
@@ -502,7 +503,10 @@ def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tens
 
 
 def _refresh_zigzag_cp_certificate(
-    certificate: Any, cu_seqlens_padded: torch.Tensor, cp_size: int
+    certificate: Any,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    cu_seqlens_padded_host: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Re-validate the scheduler's zigzag MTP certificate after pre-slice padding.
 
@@ -512,14 +516,30 @@ def _refresh_zigzag_cp_certificate(
     layout, so it becomes unknown (-1). A positive certificate is capped by the
     padded layout's minimum non-empty half-chunk, or becomes zero if a non-empty
     physical sequence is not divisible by twice the CP size. Negative (unknown)
-    values are kept. Runs on device, without a host synchronization.
+    values are kept. Runs on device, without a host synchronization; when the
+    caller already holds ``cu_seqlens_padded`` as a host list
+    (``cu_seqlens_padded_host``), the layout checks run on the host instead.
     """
-    lengths = cu_seqlens_padded.diff()
-    certificate = torch.as_tensor(certificate, dtype=torch.int32, device=lengths.device)
+    certificate = torch.as_tensor(certificate, dtype=torch.int32, device=cu_seqlens_padded.device)
     divisor = 2 * cp_size
+    no_limit = torch.iinfo(torch.int32).max
+    if cu_seqlens_padded_host is not None:
+        nonempty_lengths = [
+            end - start
+            for start, end in zip(cu_seqlens_padded_host, cu_seqlens_padded_host[1:])
+            if end > start
+        ]
+        if all(length % divisor == 0 for length in nonempty_lengths):
+            min_chunk = min((length // divisor for length in nonempty_lengths), default=no_limit)
+            positive = certificate.clamp(max=min_chunk)
+        else:
+            positive = torch.zeros_like(certificate)
+        return torch.where(
+            certificate > 0, positive, torch.where(certificate == 0, -1, certificate)
+        ).to(torch.int32)
+    lengths = cu_seqlens_padded.diff()
     nonempty = lengths > 0
     divisible = torch.all(~nonempty | (lengths.remainder(divisor) == 0))
-    no_limit = torch.iinfo(torch.int32).max
     min_chunk = (
         torch.where(nonempty, torch.div(lengths, divisor, rounding_mode='floor'), no_limit)
         .min()
@@ -1119,6 +1139,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dynamic_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    precompute_seq_idx: bool = True,
 ):
     """
     Get a batch of data for sequence packing.
@@ -1134,6 +1155,10 @@ def get_batch_on_this_rank_for_sequence_packing(
             of ``group_size`` ranks. Overrides ``pg_collection.dynamic_tp_cp``.
         tp_cp_group (torch.distributed.ProcessGroup, optional): Static TP x CP group for
             sequence parallelism. Defaults to ``pg_collection.tp_cp``.
+        precompute_seq_idx (bool): On the tuple path from a raw batch, give the returned
+            PackedSeqParams ``total_tokens`` so that it precomputes ``seq_idx`` for Mamba-style
+            layers. The full-iteration static batch keeps neither, so its preparation passes
+            False. Static batches and ``return_context_parallel_batch`` ignore it.
         pg_collection (ProcessGroupCollection): Caller-owned parallel grid. Runtime groups
             default to its ``dynamic_cp`` and ``dynamic_tp_cp`` maps; callbacks may override them.
     Returns:
@@ -1221,16 +1246,22 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
+    cu_seqlens_padded_host = None
     if is_tp_rank_0:
         batch['padding_mask'] = _build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
         original_cu_seqlens_padded = batch['cu_seqlens_padded']
-        pad_packed_batch_before_cp_slice(batch, config, cp_group.size(), tp_group.size())
+        cu_seqlens_padded_host = pad_packed_batch_before_cp_slice(
+            batch, config, cp_group.size(), tp_group.size()
+        )
         if batch['cu_seqlens_padded'] is not original_cu_seqlens_padded:
             batch['zigzag_cp_min_chunk_size'] = _refresh_zigzag_cp_certificate(
-                batch['zigzag_cp_min_chunk_size'], batch['cu_seqlens_padded'], cp_group.size()
+                batch['zigzag_cp_min_chunk_size'],
+                batch['cu_seqlens_padded'],
+                cp_group.size(),
+                cu_seqlens_padded_host=cu_seqlens_padded_host,
             )
 
     # dsv4_hybrid can give each CP rank one contiguous row range instead of TE's zigzag split.
@@ -1247,7 +1278,11 @@ def get_batch_on_this_rank_for_sequence_packing(
             # cu_seqlens to get the correct result.
             # TODO: Revert this workaround once TE fixes the issue.
             cu_seqlens = batch["cu_seqlens_padded"]
-            total_tokens = int(cu_seqlens[-1].item())
+            total_tokens = (
+                int(cu_seqlens[-1].item())
+                if cu_seqlens_padded_host is None
+                else cu_seqlens_padded_host[-1]
+            )
             if cp_partition_mode == "contiguous":
                 # Each CP rank owns one equal row range of the padded pack.
                 assert total_tokens % cp_size == 0, (
@@ -1438,7 +1473,15 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=runtime_cp_group,
-        total_tokens=int(cu_seqlens_padded[-1].item()),
+        total_tokens=(
+            None
+            if not precompute_seq_idx
+            else (
+                int(cu_seqlens_padded[-1].item())
+                if cu_seqlens_padded_host is None
+                else cu_seqlens_padded_host[-1]
+            )
+        ),
         # CUDA graphs capture this branch once. Static THD metadata therefore always takes
         # the padded path, which is correct for every gap layout.
         pad_between_seqs=(
