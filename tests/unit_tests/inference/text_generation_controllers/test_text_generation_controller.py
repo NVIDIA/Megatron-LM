@@ -2515,13 +2515,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
 
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
-                sampling_params=SamplingParams(top_k=2, top_p=0.4),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both active'
+        # Top-k and top-p together: top-p over the renormalized top-2 set {V-1: 0.73, V-2: 0.27}.
+        arange_logits = torch.arange(self.vocab_size).repeat(self.batch_size, 1).float().cuda()
+        sampled_logits = self.text_generation_controller.sample_from_logits(
+            arange_logits, SamplingParams(top_k=2, top_p=0.4), self.vocab_size
+        )
+        assert torch.all(sampled_logits == self.vocab_size - 1)
 
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
@@ -2630,8 +2629,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context = self.text_generation_controller.inference_wrapped_model.inference_context
 
         # Prepare sampling params in human-readable format, to aid with test maintenance.
-        # The temperature=0 / top_k=1 bucket exercises the greedy path: torch short-circuits
-        # to argmax, flashinfer relies on its temperature clamp to avoid divide-by-zero.
+        # The temperature=0 / top_k=1 bucket exercises the greedy path: both backends take the
+        # lowest-index argmax.
         sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
             (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
             (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
@@ -2640,9 +2639,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
             (SamplingParams(temperature=1.2), [15, 16, 17]),
         ]
-        # For non-torch backends, test simultaneous top_k and top_p sampling.
-        if backend != "torch":
-            sampling_test_cases[3][0].top_p = 0.8
+        # Simultaneous top_k and top_p sampling.
+        sampling_test_cases[3][0].top_p = 0.8
 
         # Convert sampling params to non-readable format.
         rev_sampling_dict: List[SamplingParams] = [None] * batch_size

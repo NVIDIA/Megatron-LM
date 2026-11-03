@@ -23,7 +23,8 @@ class FlashInferSampling(Sampling):
 
     Each step selects a kernel from the batch's active filters: the logits kernel
     when nothing filters, the dedicated exact top-p or top-k kernel when only one filter is in use,
-    and the joint kernel only for genuinely mixed batches.
+    and the joint kernel only for genuinely mixed batches. Greedy rows (top_k == 1) take the
+    lowest-index argmax instead, as in `TorchSampling`.
     The dispatch flags are read from the pinned CPU sampling metadata.
 
     The sampler runs eagerly. Its kernel choice is data-dependent (it varies with
@@ -43,6 +44,16 @@ class FlashInferSampling(Sampling):
         del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
+
+    @staticmethod
+    def _greedy_requests(context) -> Tensor:
+        """CPU mask of the active requests that sample greedily (top_k == 1).
+
+        FlashInfer's top-k kernels accept every token tied at the maximum and draw among them
+        by batch row, so greedy rows bypass them. Read from the pinned CPU metadata (no sync).
+        """
+        active_request_count = context.total_request_count - context.paused_request_count
+        return context.active_request_metadata["top_k"][:active_request_count] == 1
 
     def sample_kernel(
         self,
@@ -92,15 +103,24 @@ class FlashInferSampling(Sampling):
             top_k = gv.top_k[token_to_request_index]
             top_p = gv.top_p[token_to_request_index]
 
+        logits = logits[:n] if gather_indices is None else logits[gather_indices[:n], :]
+
+        # Greedy rows (top_k == 1, which temperature 0 maps to) take the lowest-index argmax.
+        # A batch without top-k has none, so only read the metadata when top-k is in use.
+        greedy = None if no_top_k else self._greedy_requests(context)
+        if greedy is not None and bool(greedy.all()):
+            sampled_tokens = torch.argmax(logits, dim=-1)
+            if output is None:
+                return sampled_tokens
+            output.copy_(sampled_tokens)
+            return output
+
         # Temperature scale. `temperature` is a float32 tensor, so `bf16 logits /
         # temperature` promotes `scaled` to fp32 -- the softmax / nucleus math must
         # run in fp32 (a bf16 softmax over the vocab loses precision in exactly the
         # tail region top-p depends on). The assert pins that guarantee.
         temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
-        if gather_indices is None:
-            scaled = logits[:n] / temperature.unsqueeze(1)
-        else:
-            scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
+        scaled = logits / temperature.unsqueeze(1)
         assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
 
         # `no_top_k` / `no_top_p` are the caller-supplied batch-level dispatch flags:
@@ -135,6 +155,8 @@ class FlashInferSampling(Sampling):
             sampled_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
             ).long()
+        if greedy is not None and bool(greedy.any()):
+            sampled_tokens = torch.where(top_k == 1, torch.argmax(logits, dim=-1), sampled_tokens)
 
         if output is None:
             return sampled_tokens
@@ -187,8 +209,16 @@ class FlashInferSampling(Sampling):
         renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
         renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
         # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
-        return torch.where(
+        log_probs = torch.where(
             (no_top_k & no_top_p).unsqueeze(1),
             torch.log_softmax(scaled, dim=-1),
             torch.log(renormed),
         )
+        if no_top_k_batch or not bool(self._greedy_requests(context).any()):
+            return log_probs
+        # Greedy rows sample their lowest-index argmax, so their distribution is one-hot on
+        # it, not split across the tied maxima that the top-k filter keeps.
+        greedy_log_probs = torch.full_like(log_probs, float("-inf")).scatter_(
+            1, logits.argmax(dim=-1, keepdim=True), 0.0
+        )
+        return torch.where((top_k == 1).unsqueeze(1), greedy_log_probs, log_probs)
