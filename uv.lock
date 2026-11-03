@@ -1505,7 +1505,7 @@ wheels = [
 
 [[package]]
 name = "flash-attn-4"
-version = "4.0.0b37"
+version = "4.0.0b29"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -1516,9 +1516,9 @@ dependencies = [
     { name = "torch-c-dlpack-ext" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/31/17/b09861c76473c01f926f607bd533f12a6cec1bc2f0e529beaf25542ce6ef/flash_attn_4-4.0.0b37.tar.gz", hash = "sha256:4cdc8aabd219d6ec96afebf07921e8f11d407af19a8aac662271960ade89eeab", size = 512818, upload-time = "2026-10-28T08:15:10.682Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/c8/b8c59af3cc8cb90f22cb323dc79db2c19dbd6e6c0f0514bd7213f907e6a5/flash_attn_4-4.0.0b29.tar.gz", hash = "sha256:ad79d2029dbb0c7fb09b92d989caf72cfa207cedb09d58b281caab23bed077bc", size = 377738, upload-time = "2026-09-02T08:21:28.353Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/73/1dbd8f083c8f2c9849df6ebdd84ba88ec5f0a1c221d34454c5732f88258e/flash_attn_4-4.0.0b37-py3-none-any.whl", hash = "sha256:e6c5b99c8d001691a1e6e7b27d553a34cefdee01bcfded3fd945297b7c3e421c", size = 541273, upload-time = "2026-10-28T08:15:08.888Z" },
+    { url = "https://files.pythonhosted.org/packages/74/f6/83590de66aa8389adac280ad6a555b53064d74866d06c1def7e3397e1a82/flash_attn_4-4.0.0b29-py3-none-any.whl", hash = "sha256:85dd4b0e98ca38f5681a3214b2f9f230638030e3b868a50f3873336fc98d7537", size = 402723, upload-time = "2026-09-02T08:21:26.945Z" },
 ]
 
 [[package]]
@@ -2761,7 +2761,7 @@ requires-dist = [
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
-    { name = "flash-attn-4", marker = "extra == 'dev'", specifier = ">=4.0.0b27" },
+    { name = "flash-attn-4", marker = "extra == 'dev'", specifier = ">=4.0.0b27,<4.0.0b30" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
