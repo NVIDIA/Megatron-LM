@@ -722,7 +722,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
-        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
+        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode reduces "
+        "with a rank-ordered kernel instead, unless batch_invariant_collective is 'multimem', "
+        "which relies only on the in-switch fp32 sum being deterministic and batch-invariant, "
+        "not on its order or rounding.",
     ),
     KernelEntry(
         name="unified_memory_allocator",

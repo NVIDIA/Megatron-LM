@@ -1499,11 +1499,16 @@ class TransformerConfig(ModelParallelConfig):
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
     (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
     deterministic by construction on any hardware. "multimem" keeps the native
-    NVLS in-switch reduce-scatter: measured to return the correctly-rounded
-    exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
-    channels on B200), deterministic and batch-invariant, with better scaling
-    at large NVLink domains; software paths that must match it bitwise should
-    accumulate in fp64."""
+    NVLS in-switch reduce-scatter, with better scaling at large NVLink domains:
+    measured deterministic and batch-invariant (a token's sum depends only on
+    its partials) on H100 and GB200, which is all batch invariance needs. Its
+    rounding depends on the GPU. On Blackwell it returns the correctly rounded
+    fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
+    channels on B200, and on GB200), so software paths that must match it
+    bitwise accumulate in fp64. On H100 it is not correctly rounded: the switch
+    adds in its own order, and two sets of GPUs can give different bits for the
+    same partials, so no software path matches it bitwise there; use "ordered"
+    when bitwise parity with such a path is needed."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""

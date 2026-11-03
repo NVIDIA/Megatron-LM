@@ -643,9 +643,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
-        In batch-invariant mode, the symmetric RSV buffer is still used for data
-        visibility, but the rank reduction is an explicit fp32 rank-order loop
-        rather than a hardware multimem reduction.
+        In batch-invariant mode with the default "ordered" collective, the
+        symmetric RSV buffer is still used for data visibility, but the rank
+        reduction is an explicit fp32 rank-order loop rather than a hardware
+        multimem reduction.
 
         Args:
             hidden_states: [global_max, hidden_size] expert outputs (fp32
@@ -669,10 +670,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         )
         use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
         # Under batch-invariant mode the "multimem" option keeps the native
-        # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
-        # bitwise-equal to an fp64 reference), deterministic and
-        # batch-invariant; "ordered" (default) uses the explicit fixed
-        # rank-order fp32 kernel, deterministic by construction anywhere.
+        # NVLS in-switch fp32 reduce. Batch invariance needs only that it is
+        # deterministic and that a token's sum depends on that token's partials
+        # alone, which was measured on H100 and GB200. It is not correctly
+        # rounded on every GPU: GB200 returns the exact sum rounded once, but
+        # H100 adds in an order the switch picks, and two sets of GPUs can give
+        # different bits for the same partials. "ordered" (default) uses the
+        # explicit fixed rank-order fp32 kernel, deterministic by construction
+        # anywhere.
         reduce_scatter_v = (
             batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
         )
