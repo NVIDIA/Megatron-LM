@@ -314,6 +314,102 @@ class TestGatedResidualTritonModule:
         for key in a:
             assert torch.equal(a[key], b[key]), key
 
+    def test_residual_grad_link(self, monkeypatch):
+        """The write-back hands its residual gradient to the gates' backward only when it
+        writes back into the very tensor the gates read, and dh matches the unlinked path."""
+        links = []
+        orig = grt.fused_gated_residual_write_back
+        monkeypatch.setattr(
+            grt,
+            "fused_gated_residual_write_back",
+            lambda *a, **k: links.append(a[4] if len(a) > 4 else None) or orig(*a, **k),
+        )
+        mod = _module(2560, 320)
+        torch.manual_seed(7)
+        M, n, C = 4096, STREAMS, 2560
+        h0 = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+        y = torch.randn(M, 1, C, device="cuda").bfloat16()
+        dm = torch.randn(M, 1, C, device="cuda").bfloat16()
+        do = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+
+        def run(alias_residual):
+            for p in mod.parameters():
+                p.grad = None
+            h = h0.detach().clone().requires_grad_(True)
+            mixed, _, g, res = mod(h)
+            if alias_residual:
+                res = res.view_as(res)  # same values, but not the tensor the gates read
+            out = mod.fused_h_res_h_post_bda(None, res, g, (y, None), 0.0, True, True)
+            torch.autograd.backward([mixed, out], [dm, do])
+            return h.grad, [p.grad.clone() for p in mod.parameters()]
+
+        dh_linked, dp_linked = run(alias_residual=False)
+        assert isinstance(links[-1], grt.ResidualGradLink) and links[-1].grad is None
+        assert mod._pending_residual_grad_link is None
+        dh_plain, dp_plain = run(alias_residual=True)
+        assert links[-1] is None
+        # dh + go rounds once to bf16 instead of twice.
+        assert _rel(dh_linked, dh_plain) < 4e-3
+        for a, b in zip(dp_linked, dp_plain):
+            assert torch.equal(a, b)
+
+    def test_residual_grad_link_dropout_path(self):
+        """A linked forward followed by the dropout write-back keeps the residual gradient."""
+        mod = _module(1024, 64)
+        torch.manual_seed(8)
+        h = torch.randn(37, 1, STREAMS * 1024, device="cuda").bfloat16().requires_grad_(True)
+        y = torch.randn(37, 1, 1024, device="cuda").bfloat16()
+        mixed, _, g, res = mod(h)
+        assert mod._pending_residual_grad_link is not None
+        out = mod.fused_h_res_h_post_bda(None, res, g.detach(), (y, None), 0.5, True, False)
+        assert mod._pending_residual_grad_link is None
+        do = torch.randn_like(out)
+        out.backward(do)
+        # Gate detached and mixed unused: the residual gradient is exactly go.
+        assert torch.equal(h.grad, do)
+
+    @pytest.mark.parametrize("zero_out_wgrad", [False, True])
+    def test_accumulate_wgrad_into_main_grad(self, zero_out_wgrad):
+        """With gradient-accumulation fusion the backward adds into main_grad: bitwise what the
+        DDP hook adds for the fp32 norm / write-gate weights; for the low-rank weights the fp32
+        GEMM result skips the rounding to bf16. zero_out_wgrad params keep the param.grad path."""
+        mod = _module(2560, 320)
+        torch.manual_seed(9)
+        M, n, C = 4096, STREAMS, 2560
+        h0 = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+        y = torch.randn(M, 1, C, device="cuda").bfloat16()
+        dm = torch.randn(M, 1, C, device="cuda").bfloat16()
+        do = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+        ref = _run_module(mod, h0, y, dm, do, fused=True)
+
+        mod.config.gradient_accumulation_fusion = True
+        init = {}
+        for name, p in mod.named_parameters():
+            init[name] = torch.randn(p.shape, device="cuda")
+            p.main_grad = init[name].clone()
+            p.grad_added_to_main_grad = False
+            if zero_out_wgrad:
+                p.zero_out_wgrad = True
+        for p in mod.parameters():
+            p.grad = None
+        h = h0.detach().clone().requires_grad_(True)
+        mixed, _, g, res = mod(h)
+        out = mod.fused_h_res_h_post_bda(None, res, g, (y, None), 0.0, True, True)
+        torch.autograd.backward([mixed, out], [dm, do])
+        assert torch.equal(h.grad, ref["dh"])
+        for name, p in mod.named_parameters():
+            grad_ref = ref["d_" + name]
+            if zero_out_wgrad:
+                assert not p.grad_added_to_main_grad, name
+                assert torch.equal(p.grad, grad_ref), name
+                assert torch.equal(p.main_grad, init[name]), name
+                continue
+            assert p.grad_added_to_main_grad, name
+            if p.dtype == torch.float32:
+                assert torch.equal(p.main_grad, init[name] + grad_ref), name
+            else:
+                assert _rel(p.main_grad - init[name], grad_ref) < 4e-3, name
+
     def test_cuda_graph_capture_replay(self):
         mod = _module(2560, 320)
         M, n, C = 4096, STREAMS, 2560

@@ -36,6 +36,13 @@ operands to TF32, as cuBLAS does for the torch path. Every reduction is a
 fixed-order partial-sum buffer; no kernel uses atomics, so the forward is
 bitwise reproducible (the mHC recompute path relies on that).
 
+The residual ``h`` feeds both the gates and the write-back, whose residual
+gradient is the write-back's incoming gradient ``go`` unchanged. When the module
+links the two calls (:class:`ResidualGradLink`), the write-back hands ``go`` to
+the gates' backward instead of returning it, and the norm backward kernel adds
+it while writing ``dh``: autograd's separate ``dh + go`` pass over the n-stream
+tensor disappears.
+
 Selected by ``GatedResidualModule`` when ``config.deterministic_mode`` is
 False; deterministic mode keeps the torch path.
 """
@@ -61,10 +68,14 @@ except ImportError:  # pragma: no cover - triton ships with every supported cont
 # Fixed tile shapes. No autotuning: the reduction order of every kernel is a
 # function of these constants only, so results do not depend on a tuning race.
 _NORM_BM, _NORM_BC, _NORM_WARPS = 8, 128, 8
-_MIX_BM, _MIX_BC, _MIX_WARPS = 8, 128, 4
+# fwd mix: 8 warps (GB300 sweep, 8192 x 4 x 2560: 69 us vs 76 us with 4; same tiles, so the
+# result is bitwise unchanged).
+_MIX_BM, _MIX_BC, _MIX_WARPS = 8, 128, 8
 _BMIX_BM, _BMIX_BC, _BMIX_WARPS = 4, 256, 4
 # bwd norm: one program per (channel tile, stream, row split of ~_BNORM_ROWS_PER_SPLIT rows).
-_BNORM_BM, _BNORM_BC, _BNORM_ROWS_PER_SPLIT, _BNORM_WARPS, _BNORM_STAGES = 8, 64, 512, 4, 1
+# Swept on GB300 with the residual gradient fused in (8192 rows, 4 x 2560): 256-row splits
+# with two pipeline stages were fastest; wider tiles, more warps or longer splits were slower.
+_BNORM_BM, _BNORM_BC, _BNORM_ROWS_PER_SPLIT, _BNORM_WARPS, _BNORM_STAGES = 8, 64, 256, 4, 2
 _RED_BLOCK = 256
 # The write-gate / write-back kernels unroll up to four streams.
 MAX_FUSED_STREAMS = 4
@@ -80,6 +91,23 @@ def _next_pow2(x: int) -> int:
 def _round_tf32() -> bool:
     """Whether fp32 x fp32 products should be TF32-rounded, mirroring cuBLAS in torch."""
     return bool(torch.backends.cuda.matmul.allow_tf32)
+
+
+class ResidualGradLink:
+    """Carries the write-back's residual gradient to the backward of the gates on the same ``h``.
+
+    Passed to both :func:`fused_gated_residual_gates` and
+    :func:`fused_gated_residual_write_back` for one sublayer call, whose ``residual`` must be
+    the gates' input ``h`` itself. The write-back's backward stores its residual gradient here
+    and returns ``None`` for it; the gates' backward, which autograd always runs later (the
+    write-back consumes the gates' write gate), adds it to ``dh`` inside the norm backward
+    kernel. A link the write-back never filled leaves the gates' backward unchanged.
+    """
+
+    __slots__ = ("grad",)
+
+    def __init__(self):
+        self.grad: Optional[Tensor] = None
 
 
 if HAVE_TRITON:
@@ -401,6 +429,7 @@ if HAVE_TRITON:
         dmixed_ptr,
         dz_ptr,
         s_ptr,
+        go_ptr,
         dh_ptr,
         dgam_part_ptr,
         dwi_part_ptr,
@@ -411,6 +440,7 @@ if HAVE_TRITON:
         C: tl.constexpr,
         ZERO_CENTERED: tl.constexpr,
         HAS_GATE: tl.constexpr,
+        HAS_GO: tl.constexpr,
         ROUND_TF32: tl.constexpr,
         BM: tl.constexpr,
         BC: tl.constexpr,
@@ -420,6 +450,7 @@ if HAVE_TRITON:
         One program owns (channel tile, stream j, row split) and walks its rows in BM blocks,
         accumulating the dgamma / dW_inject partials elementwise; they are reduced over rows
         once at the end into the per-split partial buffers. B = ddown @ W_down (cuBLAS).
+        With HAS_GO the write-back's residual gradient is added to dh before the store.
         """
         NC: tl.constexpr = N * C
         INV_N: tl.constexpr = 1.0 / N
@@ -482,6 +513,8 @@ if HAVE_TRITON:
                     a3 += dz3[:, None] * xg
             s = tl.load(s_ptr + rows * NP + j, mask=rmask, other=0.0) * INV_C
             dh = rstd[:, None] * (dxn * gam[None, :] - xhat * s[:, None])
+            if HAS_GO:
+                dh += tl.load(go_ptr + off, mask=m2, other=0.0).to(tl.float32)
             tl.store(dh_ptr + off, dh.to(dh_ptr.dtype.element_ty), mask=m2)
             a_gam += tl.where(m2, dxn * xhat, 0.0)
         tl.store(dgam_part_ptr + sp * NC + col, tl.sum(a_gam, axis=0), mask=cmask)
@@ -512,10 +545,16 @@ if HAVE_TRITON:
         S,
         N: tl.constexpr,
         NC: tl.constexpr,
+        ACC_GAM: tl.constexpr,
+        ACC_WI: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         """Fixed-order sum over the row splits of the dgamma (output 0) / dW_inject row i
-        (output 1 + i) partials; grid = (column blocks, 1 + n or 1)."""
+        (output 1 + i) partials; grid = (column blocks, 1 + n or 1).
+
+        With ACC_GAM / ACC_WI the output is the parameter's main_grad and the finished sum is
+        added to it, the same single addition the DDP grad hook would perform.
+        """
         k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         o = tl.program_id(1)
         kmask = k < NC
@@ -523,11 +562,15 @@ if HAVE_TRITON:
         if o == 0:
             for s in range(0, S):
                 acc += tl.load(dgam_part_ptr + s * NC + k, mask=kmask, other=0.0)
+            if ACC_GAM:
+                acc += tl.load(dgam_ptr + k, mask=kmask, other=0.0).to(tl.float32)
             tl.store(dgam_ptr + k, acc.to(dgam_ptr.dtype.element_ty), mask=kmask)
         else:
             i = o - 1
             for s in range(0, S):
                 acc += tl.load(dwi_part_ptr + (s * N + i) * NC + k, mask=kmask, other=0.0)
+            if ACC_WI:
+                acc += tl.load(dwi_ptr + i * NC + k, mask=kmask, other=0.0).to(tl.float32)
             tl.store(dwi_ptr + i * NC + k, acc.to(dwi_ptr.dtype.element_ty), mask=kmask)
 
     @triton.jit
@@ -679,11 +722,61 @@ def _launch_gates_fwd(h2, gamma, wd, wi, eps, n, C, zero_centered):
     return rstd, xnb, p, z, down, u, gate
 
 
+def _accumulates_into_main_grad(param: Optional[Tensor]) -> bool:
+    """Whether the backward adds ``param``'s gradient into its ``main_grad`` itself.
+
+    The gradient-accumulation-fusion contract of Megatron's DDP (as for the linear and
+    embedding layers): a ``main_grad`` owned by DDP, not Megatron-FSDP, and not
+    ``zero_out_wgrad``, which mixes the gradients of a shared weight through ``param.grad``.
+    """
+    return (
+        param is not None
+        and param.requires_grad
+        and getattr(param, "main_grad", None) is not None
+        and hasattr(param, "grad_added_to_main_grad")
+        and not getattr(param, "zero_out_wgrad", False)
+        and not hasattr(param, "__fsdp_param__")
+        and param.main_grad.shape == param.shape
+        and param.main_grad.is_contiguous()
+    )
+
+
+_ADDMM_OUT_DTYPE = [True]  # cleared once if this torch's addmm has no out_dtype
+
+
+def _accumulate_wgrad(main_grad: Tensor, grad_output: Tensor, inp: Tensor) -> None:
+    """``main_grad += grad_output^T @ inp`` with fp32 accumulation, in one GEMM.
+
+    torch's addmm (bf16 operands, ``out_dtype`` fp32, in place via ``out=``) costs about a third
+    of the host time of the TE GEMM wrapper behind ``_wgrad_gemm``, which this module calls
+    several times per layer in eager mode; ``_wgrad_gemm`` remains the fallback.
+    """
+    if main_grad.dtype == grad_output.dtype:
+        torch.addmm(main_grad, grad_output.t(), inp, out=main_grad)
+        return
+    if main_grad.dtype == torch.float32 and _ADDMM_OUT_DTYPE[0]:
+        try:
+            torch.addmm(main_grad, grad_output.t(), inp, out_dtype=torch.float32, out=main_grad)
+            return
+        except TypeError:
+            _ADDMM_OUT_DTYPE[0] = False
+    from megatron.core.tensor_parallel.layers import _wgrad_gemm
+
+    _wgrad_gemm(main_grad, grad_output, inp, accumulate=True)
+
+
+def _main_grad_placeholder(param: Tensor) -> Tensor:
+    """Mark ``param``'s gradient as already in ``main_grad`` and return a storage-less zero
+    gradient, so the DDP grad hook still runs but adds nothing."""
+    param.grad_added_to_main_grad = True
+    return torch._efficientzerotensor(param.shape, dtype=param.dtype, device=param.device)
+
+
 class _GatedResidualGatesFn(torch.autograd.Function):
     """(h, gamma, W_down, W_up[, W_inject]) -> (mixed[, g_write]) with a fused backward."""
 
     @staticmethod
-    def forward(ctx, h, gamma, wd, wu, wi, eps, n, zero_centered):
+    def forward(ctx, h, gamma, wd, wu, wi, eps, n, zero_centered, link, accumulate_wgrad):
         """Run the fused read and write gates; save what the fused backward needs."""
         shape = h.shape
         nC = shape[-1]
@@ -714,6 +807,9 @@ class _GatedResidualGatesFn(torch.autograd.Function):
         )
         ctx.save_for_backward(h2, gamma, wd, wu, wi, rstd, xnb, p, z, down, u, logits)
         ctx.has_gate = wi is not None
+        ctx.link = link
+        # The parameters themselves (not the saved tensors) carry main_grad.
+        ctx.wgrad_params = (gamma, wd, wu, wi) if accumulate_wgrad else None
         ctx.n, ctx.C, ctx.zero_centered, ctx.shape = n, C, zero_centered, shape
         mixed = mixed.view(*shape[:-1], C)
         if wi is None:
@@ -757,7 +853,15 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             num_warps=_BMIX_WARPS,
         )
         du = torch.mm(dl, wu)  # [M, R]
-        dwu = torch.mm(dl.t(), u)  # [nC, R]
+        fuse = [False] * 4
+        if ctx.wgrad_params is not None:
+            fuse = [_accumulates_into_main_grad(p) for p in ctx.wgrad_params]
+        if fuse[2]:
+            wu_param = ctx.wgrad_params[2]
+            _accumulate_wgrad(wu_param.main_grad, dl, u)  # += dl^T @ u
+            dwu = _main_grad_placeholder(wu_param)
+        else:
+            dwu = torch.mm(dl.t(), u)  # [nC, R]
         del dl
 
         ddown = torch.empty(M, R, device=dev, dtype=wd.dtype)
@@ -791,6 +895,13 @@ class _GatedResidualGatesFn(torch.autograd.Function):
         )
         dxn_down = torch.mm(ddown, wd)  # [M, nC], as the torch path's F.linear input grad
 
+        go = None
+        if ctx.link is not None:
+            go, ctx.link.grad = ctx.link.grad, None
+        if go is not None:
+            go = go.reshape(M, nC)
+            if not go.is_contiguous():
+                go = go.contiguous()
         dh = torch.empty_like(h2)
         rows_per_split = min(_BNORM_ROWS_PER_SPLIT, triton.cdiv(M, _BNORM_BM) * _BNORM_BM)
         splits = triton.cdiv(M, rows_per_split)
@@ -808,6 +919,7 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             dmixed,
             dz,
             s,
+            go if go is not None else dh,
             dh,
             dgam_part,
             dwi_part,
@@ -818,15 +930,28 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             C=C,
             ZERO_CENTERED=zc,
             HAS_GATE=has_gate,
+            HAS_GO=go is not None,
             ROUND_TF32=_round_tf32(),
             BM=_BNORM_BM,
             BC=_BNORM_BC,
             num_warps=_BNORM_WARPS,
             num_stages=_BNORM_STAGES,
         )
-        dwd = torch.mm(ddown.t(), xnb)  # [R, nC]
-        dgamma = torch.empty(nC, device=dev, dtype=gamma.dtype)
-        dwi = torch.empty(n, nC, device=dev, dtype=wi.dtype) if has_gate else None
+        if fuse[1]:
+            wd_param = ctx.wgrad_params[1]
+            _accumulate_wgrad(wd_param.main_grad, ddown, xnb)  # += ddown^T @ x̃
+            dwd = _main_grad_placeholder(wd_param)
+        else:
+            dwd = torch.mm(ddown.t(), xnb)  # [R, nC]
+        acc_gam, acc_wi = fuse[0], fuse[3] and has_gate
+        if acc_gam:
+            dgamma = ctx.wgrad_params[0].main_grad
+        else:
+            dgamma = torch.empty(nC, device=dev, dtype=gamma.dtype)
+        if acc_wi:
+            dwi = ctx.wgrad_params[3].main_grad
+        else:
+            dwi = torch.empty(n, nC, device=dev, dtype=wi.dtype) if has_gate else None
         _gr_param_reduce_kernel[(triton.cdiv(nC, _RED_BLOCK), 1 + n if has_gate else 1)](
             dgam_part,
             dwi_part,
@@ -835,17 +960,23 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             splits,
             N=n,
             NC=nC,
+            ACC_GAM=acc_gam,
+            ACC_WI=acc_wi,
             BLOCK=_RED_BLOCK,
             num_warps=4,
         )
-        return dh.view(ctx.shape), dgamma, dwd, dwu, dwi, None, None, None
+        if acc_gam:
+            dgamma = _main_grad_placeholder(ctx.wgrad_params[0])
+        if acc_wi:
+            dwi = _main_grad_placeholder(ctx.wgrad_params[3])
+        return dh.view(ctx.shape), dgamma, dwd, dwu, dwi, None, None, None, None, None
 
 
 class _GatedResidualWriteBackFn(torch.autograd.Function):
     """out = residual + g_write ⊙ (x [+ bias]) broadcast over the n streams."""
 
     @staticmethod
-    def forward(ctx, residual, gate, x, bias):
+    def forward(ctx, residual, gate, x, bias, link):
         """Write the gated sublayer output back into the n residual streams."""
         s_shape = residual.shape
         n = gate.shape[-1]
@@ -878,6 +1009,7 @@ class _GatedResidualWriteBackFn(torch.autograd.Function):
         )
         ctx.save_for_backward(gate2, x2, bias)
         ctx.has_bias = has_bias
+        ctx.link = link
         ctx.meta = (s_shape, gate.shape, x.shape, residual.dtype, n, C)
         return out.view(s_shape)
 
@@ -909,10 +1041,13 @@ class _GatedResidualWriteBackFn(torch.autograd.Function):
             num_warps=4,
         )
         dres = go if go.dtype == res_dtype else go.to(res_dtype)
+        if ctx.link is not None:
+            # The gates' backward on the same residual adds it into dh (ResidualGradLink).
+            ctx.link.grad, dres = dres, None
         dbias = None
         if ctx.has_bias and ctx.needs_input_grad[3]:
             dbias = dx.float().sum(0).to(bias.dtype)
-        return dres, dgate.view(g_shape), dx.view(x_shape), dbias
+        return dres, dgate.view(g_shape), dx.view(x_shape), dbias, None
 
 
 def fused_gated_residual_gates(
@@ -924,11 +1059,18 @@ def fused_gated_residual_gates(
     eps: float,
     n: int,
     zero_centered_gamma: bool,
+    link: Optional[ResidualGradLink] = None,
+    accumulate_wgrad: bool = False,
 ) -> Tuple[Tensor, ...]:
     """Fused read gate (and write gate when ``inject_weight`` is given).
 
     Returns ``(mixed,)`` or ``(mixed, g_write)`` with the same dtypes as the torch path:
-    both in the gate-projection weight dtype.
+    both in the gate-projection weight dtype. ``link`` (see :class:`ResidualGradLink`) lets
+    the write-back on ``hidden_states`` hand its residual gradient to this backward. With
+    ``accumulate_wgrad`` (gradient-accumulation fusion) the backward adds each parameter's
+    gradient into its DDP ``main_grad`` directly when ``_accumulates_into_main_grad`` allows:
+    the two low-rank weight-gradient GEMMs accumulate in fp32 into it, so their gradients are
+    no longer rounded to the parameter dtype first.
     """
     out = _GatedResidualGatesFn.apply(
         hidden_states,
@@ -939,12 +1081,22 @@ def fused_gated_residual_gates(
         eps,
         n,
         zero_centered_gamma,
+        link,
+        accumulate_wgrad,
     )
     return out if isinstance(out, tuple) else (out,)
 
 
 def fused_gated_residual_write_back(
-    residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+    residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+    link: Optional[ResidualGradLink] = None,
 ) -> Tensor:
-    """``residual + h_post ⊙ (x [+ bias])``; same semantics as ``_native_gr_write_back``."""
-    return _GatedResidualWriteBackFn.apply(residual, h_post, x, bias)
+    """``residual + h_post ⊙ (x [+ bias])``; same semantics as ``_native_gr_write_back``.
+
+    With ``link`` the residual gradient goes to the gates' backward on ``residual`` instead of
+    being returned (see :class:`ResidualGradLink`).
+    """
+    return _GatedResidualWriteBackFn.apply(residual, h_post, x, bias, link)

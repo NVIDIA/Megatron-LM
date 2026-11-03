@@ -201,6 +201,9 @@ class GatedResidualModule(MegatronModule):
         self.use_fused_kernels = (
             HAVE_TRITON and not config.deterministic_mode and self.n <= MAX_FUSED_STREAMS
         )
+        # (hidden_states, ResidualGradLink) of the last forward, consumed by the write-back of
+        # the same sublayer call; see _residual_grad_link_for.
+        self._pending_residual_grad_link = None
         nC = self.n * self.hidden_size
 
         self.hc_norm = GroupedRMSNorm(
@@ -238,7 +241,21 @@ class GatedResidualModule(MegatronModule):
 
     # ==================== gate computation ====================
 
-    def _compute_mixed_and_gwrite(self, hidden_states: Tensor) -> Tuple[Tensor, ...]:
+    def _uses_fused_gates(self, hidden_states: Tensor) -> bool:
+        """Whether ``_compute_mixed_and_gwrite`` runs the fused Triton gates."""
+        # The fused gates target 16-bit gate weights. fp32-weight modules (reference / debug
+        # runs) keep the torch path so they stay numerically identical to it: with fp32
+        # operands both paths round to TF32 and a recomputed x̃ that differs in the last ulp
+        # can land on the other side of a TF32 rounding boundary.
+        return (
+            self.use_fused_kernels
+            and self.input_mix_weight_down.weight.dtype != torch.float32
+            and hidden_states.is_cuda
+        )
+
+    def _compute_mixed_and_gwrite(
+        self, hidden_states: Tensor, residual_grad_link=None
+    ) -> Tuple[Tensor, ...]:
         """Compute ``mixed`` (and the write gate when ``use_combine``) from x.
 
         Everything here is recomputable from ``hidden_states`` alone, which is
@@ -251,11 +268,7 @@ class GatedResidualModule(MegatronModule):
         # require matching dtypes. In the common case both dtypes agree and this
         # is a no-op.
         gemm_dtype = self.input_mix_weight_down.weight.dtype
-        # The fused gates target 16-bit gate weights. fp32-weight modules (reference / debug
-        # runs) keep the torch path so they stay numerically identical to it: with fp32
-        # operands both paths round to TF32 and a recomputed x̃ that differs in the last ulp
-        # can land on the other side of a TF32 rounding boundary.
-        if self.use_fused_kernels and gemm_dtype != torch.float32 and hidden_states.is_cuda:
+        if self._uses_fused_gates(hidden_states):
             from megatron.core.transformer.gated_residual_triton import fused_gated_residual_gates
 
             return fused_gated_residual_gates(
@@ -267,6 +280,8 @@ class GatedResidualModule(MegatronModule):
                 self.hc_norm.eps,
                 self.n,
                 self.hc_norm.zero_centered_gamma,
+                residual_grad_link,
+                self.config.gradient_accumulation_fusion,
             )
         x_norm_f32 = grouped_rms_norm(
             hidden_states,
@@ -320,6 +335,7 @@ class GatedResidualModule(MegatronModule):
                 "return_residual=False is not supported."
             )
 
+        self._pending_residual_grad_link = None
         if mhc_recompute_manager is not None:
             from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
@@ -327,7 +343,18 @@ class GatedResidualModule(MegatronModule):
                 self._compute_mixed_and_gwrite, hidden_states
             )
         else:
-            outputs = self._compute_mixed_and_gwrite(hidden_states)
+            link = None
+            if (
+                self.use_combine
+                and torch.is_grad_enabled()
+                and hidden_states.requires_grad
+                and self._uses_fused_gates(hidden_states)
+            ):
+                from megatron.core.transformer.gated_residual_triton import ResidualGradLink
+
+                link = ResidualGradLink()
+                self._pending_residual_grad_link = (hidden_states, link)
+            outputs = self._compute_mixed_and_gwrite(hidden_states, link)
 
         if not self.use_combine:
             return outputs[0]
@@ -359,13 +386,24 @@ class GatedResidualModule(MegatronModule):
         if h_res is not None:
             raise TypeError("GatedResidualModule write-back takes no h_res (got a tensor)")
         x, bias = layer_output_with_bias
+        # The link of this sublayer call's gates; dropped whatever path runs below.
+        pending, self._pending_residual_grad_link = self._pending_residual_grad_link, None
 
         if dropout_prob == 0.0 or not training:
             write_back = _native_gr_write_back
             if self.use_fused_kernels and original_residual.is_cuda:
                 from megatron.core.transformer.gated_residual_triton import (
-                    fused_gated_residual_write_back as write_back,
+                    fused_gated_residual_write_back,
                 )
+
+                write_back = fused_gated_residual_write_back
+                # Only for the residual the linked gates consumed (not, e.g., a CUDA-graph
+                # output standing in for it) and outside a checkpoint, whose recompute would
+                # rebuild the write-back without the gates.
+                if manager is None and pending is not None and pending[0] is original_residual:
+                    return fused_gated_residual_write_back(
+                        original_residual, h_post, x, bias, pending[1]
+                    )
             if manager is not None:
                 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
