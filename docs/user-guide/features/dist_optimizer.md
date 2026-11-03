@@ -73,6 +73,8 @@ Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer 
 
 Both layouts store the same optimizer state, so a `torch_dist` checkpoint saved with one layout loads with the other. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
 
+With `--fp8-param-gather`, the padded layout gathers the FP8 bytes of each shard and supports MXFP8 only together with `--reuse-grad-buf-for-mxfp8-param-ag`, which stages BF16 values and requantizes them on every rank. Use the compact layout for blockwise FP8 parameters; it gathers BF16 values and requantizes them on every rank.
+
 ### Checkpoints of the removed legacy layout
 
 The legacy layout, selected with `--no-use-layer-wise-param-layout`, was removed together with the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags. It was also the only layout before the layer-wise optimizer gained its sibling distributed optimizer in May 2026. It kept the Adam-managed parameters inside the layer-wise optimizer, so its checkpoints store their optimizer state in a format that the current layouts do not read. Loading the optimizer state of such a checkpoint fails with a `KeyError` naming a `chained_*.optimizer.distributed.*` key.

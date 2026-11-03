@@ -715,6 +715,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # The layout DDP was built with decides who owns which parameter and who gathers it.
         self.param_layout = self._resolve_param_layout(self.ddp_config, full_param_layouts)
         if self.param_layout == 'padded':
+            self._check_padded_param_gather_storage(optimizers, self.ddp_config)
             self.shard_params(optimizers, full_param_layouts)
         else:
             # Compact buffers carry no optimizer shards, so whole-parameter owners are chosen
@@ -970,6 +971,32 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "configure_ddp_for_layer_wise_optimizer() so both use the same layout."
             )
         return built
+
+    @staticmethod
+    def _check_padded_param_gather_storage(optimizers, ddp_config) -> None:
+        """Reject quantized params whose scales the padded layout cannot publish.
+
+        The padded layout all-gathers the parameter buffer as raw bytes, and FP8 scales live
+        outside that buffer. Only MXFP8 params staged as BF16 through the reused grad buffer
+        (``reuse_grad_buf_for_mxfp8_param_ag``) are requantized on every rank after the gather;
+        any other quantized param would keep stale scales on the ranks that do not own it.
+        """
+        reuse_grad_buf = getattr(ddp_config, 'reuse_grad_buf_for_mxfp8_param_ag', False)
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    if not _param_uses_quantized_storage(param):
+                        continue
+                    if is_mxfp8tensor(param) and reuse_grad_buf:
+                        continue
+                    raise ValueError(
+                        "The padded LayerWise layout all-gathers quantized params as raw bytes "
+                        "and keeps their scales consistent only for MXFP8 with "
+                        f"--reuse-grad-buf-for-mxfp8-param-ag; got {type(param.data).__name__}"
+                        f"{' without it' if is_mxfp8tensor(param) else ''}. Use "
+                        "--layer-wise-param-layout compact, which gathers BF16 values and "
+                        "requantizes them on every rank."
+                    )
 
     def _check_whole_param_gather_storage(self, optimizers, config) -> None:
         """Reject quantized params that the whole-parameter gather cannot publish, and mark

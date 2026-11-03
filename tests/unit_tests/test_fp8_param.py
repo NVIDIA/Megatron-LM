@@ -642,8 +642,8 @@ class TestFP8Param:
 
         The compact layout gathers whole params as BF16 staged from the owners' FP32
         masters and requantizes on every rank, so the FP8-param run must follow the
-        BF16-param run (FP8 compute in both). The padded layout keeps main's MXFP8 path;
-        its blockwise path (native FP8 transport quantized from FP32 masters) is not compared.
+        BF16-param run (FP8 compute in both). The padded layout keeps main's MXFP8 path
+        through the reused grad buffer and rejects blockwise FP8 param gather.
 
         dp_overlap: (overlap_param_gather, overlap_grad_reduce)
         """
@@ -653,7 +653,7 @@ class TestFP8Param:
         if recipe == "mxfp8" and arch < 10:
             pytest.skip("MXFP8 is supported since Blackwell architecture")
         if recipe == "blockwise" and layer_wise_param_layout == "padded":
-            pytest.skip("Padded LayerWise blockwise transport quantizes FP32 masters directly")
+            pytest.skip("The padded LayerWise layout rejects blockwise FP8 param gather")
         kwargs = {
             "optimizer": "muon",
             "muon_tp_mode": "duplicated",
