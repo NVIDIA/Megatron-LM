@@ -2022,6 +2022,7 @@ class TestTEGroupedMLP:
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         self._skip_unless_quantized_override_testable(monkeypatch)
+        self._skip_unless_clamped_fusion_available(tanh_clamp_scale=None)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
         hidden, ffn = 128, 256
