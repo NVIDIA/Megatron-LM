@@ -198,7 +198,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
             main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
-            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+            # Honor the common reduction flag without changing stored gradient precision.
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
         )
         log_single_rank(
             logger,
