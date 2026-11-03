@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import math
 import weakref
 from contextlib import contextmanager
 from typing import Optional
@@ -334,15 +335,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
-                        assert (
-                            scaling_factor / data_parallel_group.size()
-                            == target_gradient_scaling_factor
+                        assert math.isclose(
+                            scaling_factor / data_parallel_group.size(),
+                            target_gradient_scaling_factor,
+                            rel_tol=1e-9,
                         )
                     else:
                         # For non-expert parameters, gradient_scaling_factor is 1.
                         # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
-                        assert (scaling_factor == 1) or (
-                            scaling_factor == (self.expt_dp_group.size() / self.dp_cp_group.size())
+                        assert math.isclose(scaling_factor, 1, rel_tol=1e-9) or math.isclose(
+                            scaling_factor,
+                            self.expt_dp_group.size() / self.dp_cp_group.size(),
+                            rel_tol=1e-9,
                         )
                 else:
                     # Expert params carry the extra egtp/gtp correction folded into
@@ -350,7 +354,9 @@ class DistributedDataParallel(_BaseDataParallel):
                     # matching non-expert params).
                     if buffer_key.is_expert_parallel:
                         target_gradient_scaling_factor *= expert_gtp_correction
-                    assert scaling_factor == target_gradient_scaling_factor
+                    assert math.isclose(
+                        scaling_factor, target_gradient_scaling_factor, rel_tol=1e-9
+                    )
 
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
@@ -727,7 +733,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.free_overlap_buffers()
 
-    def scale_gradients(self, scaling_factor: float):
+    def scale_gradients(self, scaling_factor: torch.Tensor):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
