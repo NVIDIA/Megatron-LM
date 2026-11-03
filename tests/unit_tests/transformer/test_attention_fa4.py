@@ -333,12 +333,14 @@ def test_te_flash_attention_4_causal_matches_reference(monkeypatch, batch_invari
     if batch_invariant and not te_supports_batch_invariant_attention():
         pytest.skip("this Transformer Engine has no batch-invariant attention")
 
-    # Only TE's FlashAttention-4 backend, as Megatron configures it for flash_attention_version=4.
-    for name, value in zip(_NVTE_ATTENTION_ENV, ("1", "0", "0", "0", "0", "1")):
-        monkeypatch.setenv(name, value)
     backends = te_dpa._attention_backends
-    Utils.initialize_model_parallel(1, 1)
+    Utils.initialize_model_parallel(1, 1)  # Clears the NVTE attention environment.
     try:
+        # Only TE's FlashAttention-4 backend, as Megatron configures attention_backend=flash with
+        # flash_attention_version=4. TE reads these when it selects a backend and caches its
+        # choice, so set them first and make it select again.
+        for name, value in zip(_NVTE_ATTENTION_ENV, ("1", "0", "0", "0", "0", "1")):
+            monkeypatch.setenv(name, value)
         backends["attention_params"] = None
         backends["backend_selection_requires_update"] = True
         heads, seq, batch = 4, 24, 2
