@@ -383,7 +383,10 @@ def _build_thd_zigzag_metadata(
     # CP attention needs two equal chunks per CP rank. Pad each sequence to that granularity,
     # then add only enough padding to the last sequence to split the batch evenly over TP.
     local_target_token_count = torch.div(target_lengths.sum(), cp_size, rounding_mode="floor")
-    tp_padding = torch.remainder(-local_target_token_count, tp_size)
+    # Keep each CP rank's two chunks equal when satisfying TP divisibility.
+    # For odd TP sizes, the local length must be a multiple of 2 * TP.
+    tp_alignment = tp_size if tp_size % 2 == 0 else 2 * tp_size
+    tp_padding = torch.remainder(-local_target_token_count, tp_alignment)
     target_lengths = target_lengths.clone()
     target_lengths[-1] += tp_padding * cp_size
     target_cu_seqlens = torch.cat(

@@ -515,3 +515,24 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
         torch.testing.assert_close(contiguous.grad, torch.ones_like(contiguous))
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_zigzag_padding_preserves_cp_alignment_with_odd_tp():
+    metadata = _build_thd_zigzag_metadata(
+        torch.tensor([0, 1, 24], dtype=torch.int32),
+        cu_seqlens_padded=None,
+        cp_size=2,
+        tp_size=3,
+    )
+
+    torch.testing.assert_close(
+        metadata.cu_seqlens_padded, torch.tensor([0, 4, 36], dtype=torch.int32)
+    )
+    rank_indices = metadata.rank_order_indices.view(2, 18)
+    assert rank_indices.shape[1] % 3 == 0
+    torch.testing.assert_close(
+        rank_indices[0],
+        torch.tensor([0, -1, 1, 2, 3, 4, 5, 6, 7, 8, -1, -1, -1, -1, -1, -1, -1, -1]),
+    )
+    real_indices = rank_indices[rank_indices >= 0].sort().values
+    torch.testing.assert_close(real_indices, torch.arange(24))
