@@ -92,8 +92,9 @@ def validate_shortcut_fusion_config(config):
         "moe_shortcut_post_norm": config.moe_shortcut_post_norm,
         "moe_shared_expert_overlap": config.moe_shared_expert_overlap,
         "recompute_granularity": config.recompute_granularity not in (None, "selective"),
-        # Fused seams own the shortcut norm and residual replay.
+        # Fused seams own the shortcut norm, the input norms and residual replay.
         "shortcut_pre_mlp_layernorm recompute": "shortcut_pre_mlp_layernorm" in recompute_modules,
+        "layernorm recompute": "layernorm" in recompute_modules,
         "residual_stream recompute": "residual_stream" in recompute_modules,
         "fine_grained_activation_offloading": (
             config.fine_grained_activation_offloading and not expert_only_offload
@@ -1503,8 +1504,10 @@ class TransformerConfig(ModelParallelConfig):
     ordinary RMSNorm, bias-free/dropout-free eager execution and a shared expert; the residual
     stream may be FP32 (fp32_residual_connection) or BF16. Training requires local flattened
     tokens divisible by 1024; no-grad inference accepts any positive count (MXFP8 handoffs require
-    multiples of 32). Hidden size must be divisible by 32 and <=10240 (the validated model widths;
-    the kernels themselves accept up to 16384).
+    multiples of 32). Local flattened tokens per call are capped at 65536 for hidden <= 4096 and
+    16384 above. Hidden size must be divisible by 32 and <=10240 (the validated model widths;
+    the kernels themselves accept up to 16384). Rejects layernorm, shortcut_pre_mlp_layernorm and
+    residual_stream recompute (the fused seams own those norms and use checkpoint replay).
     """
 
     wide_residual: Optional[WideResidualConfig] = None

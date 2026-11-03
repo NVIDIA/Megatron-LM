@@ -3,7 +3,8 @@
 
 Bit-exact output/gradient replay and poisoned CUDA-graph replay of the forward, inference,
 backward, final-reduction, checkpoint-interval and deferred MXFP8 weight-gradient paths. Shared
-inputs, runners and FP64 references live in ``tests/unit_tests/fusions/test_wide_residual_shortcut.py``.
+inputs, runners and FP64 references live in
+``tests/unit_tests/fusions/test_wide_residual_shortcut.py``.
 """
 
 import pytest

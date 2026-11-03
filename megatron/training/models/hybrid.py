@@ -136,6 +136,7 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
 
 
 def _configured_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """The explicit stack spec, else the built-in default for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
     use_wide_residual = model_config.transformer.wide_residual is not None

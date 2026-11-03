@@ -597,7 +597,8 @@ def forward(
         DEPENDENT=dependent,
         enable_fp_fusion=False,
         # Inference launches as a programmatic dependent: the grid may start while the
-        # previous kernel drains, then waits for it (griddepcontrol.wait) before any access.
+        # previous kernel drains, reads only parameters (and prefetches into L2), then waits for
+        # it (griddepcontrol.wait) before touching the previous kernel's outputs.
         launch_pdl=dependent,
     )
     if config.CLUSTER > 1:

@@ -304,23 +304,15 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _validate_fused_residual_kernel(self):
         """Require the residual structure that the fused residual kernels implement."""
-        from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
         from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
-        from megatron.core.transformer.wide_residual_transformer_layer import (
-            WideResidualTransformerLayer,
-        )
 
-        compute = self.compute_layer
-        if not isinstance(compute, (WideResidualMambaLayer, WideResidualTransformerLayer)):
+        parts_of = getattr(self.compute_layer, "shortcut_compute_parts", None)
+        if parts_of is None or parts_of() is None:
             raise ValueError(
-                "shortcut kernel fusion requires a wide-residual Mamba/GDN/attention predecessor"
+                "shortcut kernel fusion requires a wide-residual Mamba/GDN/attention compute-only "
+                "predecessor"
             )
-        if isinstance(compute, WideResidualTransformerLayer) and (
-            not isinstance(compute.mlp, IdentityOp)
-            or not isinstance(compute.cross_attention, IdentityOp)
-        ):
-            raise ValueError("shortcut kernel fusion requires a compute-only predecessor")
-        compute_read, compute_write, compute_norm, _ = self._compute_parts()
+        compute_read, compute_write, compute_norm, _, _ = self._compute_parts()
         connections = (
             compute_read,
             compute_write,
@@ -353,18 +345,8 @@ class ShortcutMoEBlock(MegatronModule):
             raise ValueError("shortcut kernel fusion requires a shared expert")
 
     def _compute_parts(self):
-        """Return the compute layer's read/write connections, input norm and mixer."""
-        from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
-
-        compute = self.compute_layer
-        if isinstance(compute, WideResidualMambaLayer):
-            return compute.residual_read, compute.residual_write, compute.norm, compute.mixer
-        return (
-            compute._get_self_attention_residual_connection("read"),
-            compute._get_self_attention_residual_connection("write"),
-            compute.input_layernorm,
-            compute.self_attention,
-        )
+        """``(read, write, input_norm, branch, input_projection)`` of the fused compute layer."""
+        return self.compute_layer.shortcut_compute_parts()
 
     def _shortcut_add(self, pending, quant_context_factory):
         """Apply the pending write and norm this block's two inputs.
@@ -379,8 +361,7 @@ class ShortcutMoEBlock(MegatronModule):
         from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
 
         streams = self.config.wide_residual.num_streams
-        compute_read, _, compute_norm, mixer = self._compute_parts()
-        linear = getattr(mixer, "in_proj", getattr(mixer, "linear_qkv", None))
+        compute_read, _, compute_norm, mixer, linear = self._compute_parts()
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
             # A GDP input-projection checkpoint keeps its weight hooks in an inner autograd
             # graph that the boundary's weight edge cannot order; only GTP's explicit
@@ -421,11 +402,11 @@ class ShortcutMoEBlock(MegatronModule):
         """Write the compute update and emit the shared-expert input (one-reader kernel)."""
         from megatron.core.fusions import wide_residual_shortcut as kernels
         from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
-        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
         streams = self.config.wide_residual.num_streams
-        _, compute_write, _, _ = self._compute_parts()
+        _, compute_write, _, _, _ = self._compute_parts()
         shared_expert = getattr(self.moe_layer.mlp, "shared_experts", None)
+        consumer = None if shared_expert is None else shared_expert.direct_input_consumer()
         return kernels.wide_residual_write_read_rmsnorm_quant(
             residual,
             update,
@@ -433,11 +414,8 @@ class ShortcutMoEBlock(MegatronModule):
             self.moe_layer._get_mlp_residual_connection("read").read_logits(),
             self.moe_layer.pre_mlp_layernorm.weight,
             mxfp8_consumer=(
-                shared_expert.linear_fc1
-                if shared_expert is not None
-                and type(shared_expert).forward is SharedExpertMLP.forward
-                and not shared_expert.use_shared_expert_gate
-                and mxfp8_handoff.eligible(shared_expert.linear_fc1, update, streams)
+                consumer
+                if consumer is not None and mxfp8_handoff.eligible(consumer, update, streams)
                 else None
             ),
             num_streams=streams,
@@ -446,7 +424,7 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _fused_compute_input(self, residual):
         """Read and norm the compute layer's input when no pending shortcut add precedes it."""
-        compute_read, _, compute_norm, _ = self._compute_parts()
+        compute_read, _, compute_norm, _, _ = self._compute_parts()
         compute_input, _ = apply_module(compute_read)(
             residual,
             fp32_residual_connection=self.config.fp32_residual_connection,
@@ -681,7 +659,9 @@ class ShortcutMoEBlock(MegatronModule):
             )
         if self.using_shortcut_moe_fused_residual_kernel:
             # A compute-only attention layer ends after its attention branch; the flagged
-            # layer returns the raw (output, bias) there.
+            # layer returns the raw (output, bias) there. This bypasses the layer's __call__, so
+            # its own forward hooks and per-layer CUDA-graph manager do not run; the block (or the
+            # stack's graph) is the captured unit.
             hidden_states, _ = self.compute_layer._forward_attention(
                 hidden_states,
                 attention_mask=attention_mask,

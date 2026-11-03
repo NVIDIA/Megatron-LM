@@ -177,6 +177,24 @@ class WideResidualTransformerLayer(TransformerLayer):
             attention_output_with_bias, *args, **kwargs
         )
 
+    def shortcut_compute_parts(self):
+        """Parts a fused ShortcutMoEBlock applies around this compute-only layer's attention.
+
+        Returns ``(read, write, input_norm, branch, input_projection)`` (see
+        WideResidualMambaLayer), or None when the layer also has an MLP or cross-attention branch.
+        """
+        if not isinstance(self.mlp, IdentityOp) or not isinstance(self.cross_attention, IdentityOp):
+            return None
+        attention = self.self_attention
+        projection = getattr(attention, "in_proj", getattr(attention, "linear_qkv", None))
+        return (
+            self.residual_read_self_attn,
+            self.residual_write_self_attn,
+            self.input_layernorm,
+            attention,
+            projection,
+        )
+
     def _is_lone_mlp(self) -> bool:
         return (
             isinstance(self.self_attention, IdentityOp)

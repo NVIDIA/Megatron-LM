@@ -128,8 +128,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         notes=(
-            "Includes configurable-epsilon poisoned packet-forward replay for Nano/Super/Ultra, tree-sum RMSNorm, offset-view alignment, paired shared views, queues, "
-            "predecessor-only gradients, exact mixed one-/two-reader checkpoint replay (depths 1/3/16), "
+            "Includes configurable-epsilon poisoned packet-forward replay for Nano/Super/Ultra, "
+            "tree-sum RMSNorm, offset-view alignment, paired shared views, queues, "
+            "predecessor-only gradients, exact mixed one-/two-reader checkpoint replay "
+            "(depths 1/3/16), "
             "and independently quantized MXFP8 columns including poisoned padding."
         ),
     ),

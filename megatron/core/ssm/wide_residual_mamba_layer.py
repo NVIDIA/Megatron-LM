@@ -95,6 +95,22 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
+    def shortcut_compute_parts(self):
+        """Parts a fused ShortcutMoEBlock applies around this compute layer's mixer.
+
+        Returns ``(read, write, input_norm, branch, input_projection)``: the residual read and
+        write the block's seam kernels own, the RMSNorm they apply, the mixer, and the projection
+        that consumes the normalized input (a direct MXFP8 handoff candidate).
+        """
+        mixer = self.mixer
+        return (
+            self.residual_read,
+            self.residual_write,
+            self.norm,
+            mixer,
+            getattr(mixer, "in_proj", None),
+        )
+
     def pending_write_reader(self):
         """The input read and RMSNorm a fused seam kernel can apply for this lone layer, or None.
 

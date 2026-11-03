@@ -201,6 +201,16 @@ class SharedExpertMLP(MLP):
                 SharedExpertMLP.stream = torch.cuda.Stream()
             self.stream = SharedExpertMLP.stream
 
+    def direct_input_consumer(self):
+        """The Linear that alone consumes this module's input, or None.
+
+        A fused producer may hand that Linear a quantized (MXFP8) input directly. Subclasses with
+        their own forward and gated shared experts use the input elsewhere, so they have none.
+        """
+        if type(self).forward is not SharedExpertMLP.forward or self.use_shared_expert_gate:
+            return None
+        return self.linear_fc1
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)

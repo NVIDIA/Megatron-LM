@@ -211,9 +211,10 @@ def wide_residual_write_read_rmsnorm_quant(residual, update, write, retain, read
 class PendingShortcutAdd:
     """A branch output not yet written to the wide residual.
 
-    ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` writes it together with the
-    next pair's two read/RMSNorms. A MoE output is a shortcut add of ``routed`` and ``shared``;
-    a single branch update (for example a lone Mamba layer's output before a shortcut pair)
+    The next layer's seam kernel writes it together with that layer's read/RMSNorm(s):
+    ``shortcut_add_wide_residual_write_two_reader_rmsnorm_quant`` for a fused shortcut block,
+    ``shortcut_add_wide_residual_write_read_rmsnorm_quant`` for a lone layer. A MoE output is a
+    shortcut add of ``routed`` and ``shared``; a single branch update (a lone layer's output)
     leaves ``shared`` None. ``write``/``retain`` are the writing connection's logits
     (``retain`` is None for fixed identity retention).
     """

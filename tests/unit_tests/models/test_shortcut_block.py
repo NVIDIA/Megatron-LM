@@ -804,7 +804,7 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     assert hidden_states.grad is not None
 
 
-# ---------------------------------------------------------------- fused wide-residual shortcut blocks
+# ------------------------------------------------------------ fused wide-residual shortcut blocks
 #
 # ShortcutMoEBlock with moe_shortcut_wide_residual_norm_fusion runs the one-reader kernel
 # (wide_residual_write_read_rmsnorm_quant) between its compute write and shared-expert read, and
@@ -1794,3 +1794,19 @@ def test_hybrid_lone_seams_checkpoint_replay(monkeypatch, pattern, interval):
     assert torch.equal(actual, expected)
     for name, grad in actual_grads.items():
         assert bytes_equal(grad, expected_grads[name]), name
+
+
+@pytest.mark.parametrize("module", ["layernorm", "shortcut_pre_mlp_layernorm", "residual_stream"])
+def test_fusion_rejects_norm_and_residual_stream_recompute(module):
+    """The fused seams apply the input norms and replay the residual stream themselves."""
+    with pytest.raises(ValueError, match=f"{module} recompute"):
+        _fused_config(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_shared_expert_intermediate_size=128,
+            wide_residual=WideResidualConfig(num_streams=3),
+            recompute_granularity="selective",
+            recompute_modules=[module],
+        )
