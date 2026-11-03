@@ -57,3 +57,11 @@ def test_separate_and_zero_kernel_collectives_are_preserved():
     unrelated = _event(5, "unrelated", correlation=0, device=DeviceType.CUDA)
     kernel = _event(6, "ncclKernel", correlation=12, device=DeviceType.CUDA)
     assert _groups([empty, record, operation, launch, unrelated, kernel]) == [[], [kernel]]
+
+
+def test_uncorrelated_async_backend_annotation_is_not_an_extra_collective():
+    operation = _event(1, "c10d::allgather")
+    launch = _event(2, "cudaLaunchKernel", parent=operation, correlation=11)
+    async_annotation = _event(3, "nccl:allgather")
+    kernel = _event(4, "ncclKernel", correlation=11, device=DeviceType.CUDA)
+    assert _groups([operation, launch, async_annotation, kernel]) == [[kernel]]

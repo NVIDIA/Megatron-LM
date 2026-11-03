@@ -49,7 +49,7 @@ def collect_linked_event_groups(
     groups_by_operation: dict[int, EventGroup] = {}
     groups_by_correlation: dict[int, EventGroup] = {}
     for event in events:
-        if event.device_type != DeviceType.CPU:
+        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
             continue
         node = event
         operation = None
@@ -60,10 +60,10 @@ def collect_linked_event_groups(
         if operation is None:
             continue
         group = groups_by_operation.setdefault(operation.id, EventGroup())
-        # Id 0 is the "no device correlation" sentinel. Keep the operation's
-        # empty group: zero-CTA collectives can intentionally launch no kernels.
-        if event.linked_correlation_id:
-            groups_by_correlation[event.linked_correlation_id] = group
+        # Correlated runtime calls can have no device event (for example an
+        # event record). Preserve those groups, but ignore uncorrelated async
+        # backend annotations that would otherwise count the operation twice.
+        groups_by_correlation[event.linked_correlation_id] = group
 
     for event in events:
         if event.device_type != DeviceType.CUDA:
