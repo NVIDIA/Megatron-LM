@@ -14,6 +14,7 @@ output, per-param ``main_grad``, fp32 master, and (bf16) model param. Covers
 """
 
 import gc
+import itertools
 import os
 import sys
 
@@ -21,6 +22,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -28,8 +30,9 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_model_config, is_te_min_version
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -96,14 +99,23 @@ def _snapshot_layerwise_grad_data(ddp):
 def _restore_initial_state(model, optimizer, params0, masters0):
     # Start the ON run from the OFF run's exact init (params + fp32 masters); muon
     # momentum state is empty pre-step, so it needs no restore.
-    for n, p in model.named_parameters():
-        if n in params0:
-            p.data.copy_(params0[n].to(p.device))
+    _restore_initial_state_chunks([model], optimizer, [params0], [masters0])
+
+
+@torch.no_grad()
+def _restore_initial_state_chunks(model_chunks, optimizer, params0, masters0):
+    # Per-chunk variant of _restore_initial_state for virtual-pipeline model lists (chunk
+    # parameter names repeat across chunks, so the snapshots are kept per chunk).
+    for chunk, chunk_params0 in zip(model_chunks, params0):
+        for n, p in chunk.named_parameters():
+            if n in chunk_params0:
+                p.data.copy_(chunk_params0[n].to(p.device))
     optimizer.reload_model_params()
-    for n, p in model.named_parameters():
-        mp = getattr(p, 'main_param', None)
-        if mp is not None and n in masters0:
-            mp.data.copy_(masters0[n].to(mp.device))
+    for chunk, chunk_masters0 in zip(model_chunks, masters0):
+        for n, p in chunk.named_parameters():
+            mp = getattr(p, 'main_param', None)
+            if mp is not None and n in chunk_masters0:
+                mp.data.copy_(chunk_masters0[n].to(mp.device))
 
 
 class TestMuonDecoupleFP8ParamGather:
@@ -143,6 +155,7 @@ class TestMuonDecoupleFP8ParamGather:
             post_process=post_process,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
+            vp_stage=kw.get('vp_stage'),
         )
 
     def _create_args(
@@ -154,12 +167,19 @@ class TestMuonDecoupleFP8ParamGather:
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
         optimizer_state_offload_chunk_size_mb=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        num_microbatches=1,
+        align_param_gather=False,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         sys.argv = ['test_muon_decouple_fp8_param_gather.py']
         args = parse_args()
-        args.num_layers = 2
+        # One layer per (virtual) pipeline stage once PP > 1; two layers otherwise.
+        args.num_layers = max(
+            2, pipeline_model_parallel_size * (virtual_pipeline_model_parallel_size or 1)
+        )
         args.vocab_size = 128
         args.hidden_size = 128
         args.ffn_hidden_size = 256
@@ -167,9 +187,19 @@ class TestMuonDecoupleFP8ParamGather:
         args.max_position_embeddings = self.seq_length
         args.seq_length = self.seq_length
         args.micro_batch_size = self.micro_batch_size
+        data_parallel_size = torch.distributed.get_world_size() // pipeline_model_parallel_size
+        args.global_batch_size = self.micro_batch_size * data_parallel_size * num_microbatches
         args.create_attention_mask_in_dataloader = True
         args.tensor_model_parallel_size = 1
-        args.pipeline_model_parallel_size = 1
+        args.pipeline_model_parallel_size = pipeline_model_parallel_size
+        if virtual_pipeline_model_parallel_size is not None:
+            args.num_virtual_stages_per_pipeline_rank = virtual_pipeline_model_parallel_size
+            # The interleaved schedule at PP=2 needs overlapped p2p (validate_args).
+            args.overlap_p2p_comm = True
+        # Aligned param all-gather: the interleaved schedule calls DDP.start_param_sync for
+        # every model chunk (config.param_sync_func) instead of the forward pre-hooks
+        # dispatching bucket by bucket.
+        args.align_param_gather = align_param_gather
         args.context_parallel_size = 1
         args.expert_model_parallel_size = expert_model_parallel_size
         args.train_iters = 10
@@ -252,6 +282,10 @@ class TestMuonDecoupleFP8ParamGather:
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
         optimizer_state_offload_chunk_size_mb=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        num_microbatches=1,
+        align_param_gather=False,
     ):
         args = self._create_args(
             fp8_param_gather,
@@ -261,13 +295,17 @@ class TestMuonDecoupleFP8ParamGather:
             expert_model_parallel_size=expert_model_parallel_size,
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+            num_microbatches=num_microbatches,
+            align_param_gather=align_param_gather,
         )
         set_args(args)
         torch.manual_seed(_SEED)
         model, optimizer, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
-        assert len(model) == 1
+        assert len(model) == (virtual_pipeline_model_parallel_size or 1)
         assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer), (
             "muon + use_distributed_optimizer should route to LayerWiseDistributedOptimizer; got "
             f"{type(optimizer.chained_optimizers[0]).__name__}"
@@ -340,6 +378,115 @@ class TestMuonDecoupleFP8ParamGather:
             losses.append(loss.detach().clone())
             outs.append(out.detach().clone())
         return losses, outs, grads, masters, params
+
+    def _run_vpp_steps(self, args, model, optimizer, n, num_microbatches):
+        """Run ``n`` deterministic steps of a virtual-pipeline model list through the
+        interleaved schedule, with the aligned param all-gather wired the way the training
+        loop wires it (``config.param_sync_func = [chunk.start_param_sync, ...]``) and the
+        chunked-offload ordering of ``train_step``.
+
+        Returns per-step reduced loss (``None`` off the last pipeline stage), per-step
+        per-chunk fp32 masters and (dequantized) params, and how many aligned
+        ``start_param_sync`` calls found a LayerWise bucket group already force-synced for
+        the iteration (pinned through ``param_gather_pinned_before_master_offload``,
+        dispatched, no handle): the state a second dispatch would stage from CPU-bound
+        masters."""
+        config = get_model_config(model[0])
+        config.grad_scale_func = optimizer.scale_loss
+        config.no_sync_func = [chunk.no_sync for chunk in model]
+        config.grad_sync_func = [chunk.start_grad_sync for chunk in model]
+        completed_layerwise_hits = [0]
+
+        def _aligned_param_sync(chunk):
+            def param_sync(*unused):
+                groups = chunk.bucket_groups + chunk.expert_parallel_bucket_groups
+                if any(
+                    chunk._bucket_group_is_layer_wise(g)
+                    and g.param_gather_pinned_before_master_offload
+                    and g.param_gather_dispatched
+                    and g.param_gather_handle is None
+                    for g in groups
+                ):
+                    completed_layerwise_hits[0] += 1
+                chunk.start_param_sync(*unused)
+
+            return param_sync
+
+        config.param_sync_func = [_aligned_param_sync(chunk) for chunk in model]
+
+        def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+            # train_step wraps finalize_model_grads the same way under chunked offload.
+            if args.chunked_optimizer_state_offload:
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
+            return finalize_model_grads(*fmg_args, **fmg_kwargs)
+
+        config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+        forward_backward_func = get_forward_backward_func()
+        batch = self._batch()
+
+        def forward_step_func(data_iterator, chunk):
+            ids, labels, pos, mask, loss_mask = next(data_iterator)
+            output = chunk(
+                input_ids=ids,
+                position_ids=pos,
+                attention_mask=mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+
+            def loss_func(output_tensor):
+                loss = output_tensor.mean()
+                return loss, {'lm loss': loss.detach().clone()}
+
+            return output, loss_func
+
+        losses, masters, params = [], [], []
+        for _ in range(n):
+            delay_master_offload = (
+                args.chunked_optimizer_state_offload
+                and args.reuse_grad_buf_for_mxfp8_param_ag
+                and args.overlap_param_gather
+            )
+            pre_forward_sync = (
+                args.chunked_optimizer_state_offload
+                and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+            )
+            if args.chunked_optimizer_state_offload and not pre_forward_sync:
+                optimizer.offload_optimizer_state_for_forward(
+                    offload_master=not delay_master_offload
+                )
+            for chunk in model:
+                chunk.zero_grad_buffer()
+            optimizer.zero_grad()
+            if pre_forward_sync:
+                optimizer.ensure_master_weights_for_pre_forward_param_sync()
+                optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+                optimizer.offload_optimizer_state_for_forward(
+                    offload_master=not delay_master_offload
+                )
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                for opt in optimizer.chained_optimizers:
+                    if isinstance(opt, DistributedOptimizer):
+                        opt._copy_main_params_to_param_buffer()
+            if delay_master_offload:
+                optimizer.offload_optimizer_state_for_forward()
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=[itertools.repeat(batch) for _ in model],
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                forward_only=False,
+            )
+            ok, _, _ = optimizer.step()
+            assert ok
+            losses.append(
+                torch.stack([d['lm loss'] for d in losses_reduced]) if losses_reduced else None
+            )
+            masters.append([_snapshot_masters(chunk) for chunk in model])
+            params.append([_snapshot_params(chunk, include_quantized=True) for chunk in model])
+        return losses, masters, params, completed_layerwise_hits[0]
 
     def _check_on_vs_off(self, fp8_recipe, overlap, n, num_experts=0, expert_model_parallel_size=1):
         """fp8_param_gather ON must match OFF bitwise for ``n`` deterministic steps on
@@ -743,3 +890,95 @@ class TestMuonDecoupleFP8ParamGather:
                 if g.param_gather_handle is not None:
                     g.param_gather_handle.wait()
                     g.param_gather_handle = None
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_aligned_vpp_param_gather_skips_force_synced_layerwise_buckets(self, fp8_recipe):
+        """Aligned VPP param gather must not re-dispatch LayerWise buckets that train_step
+        already force-synced for the iteration.
+
+        With ``--align-param-gather`` the interleaved schedule calls ``DDP.start_param_sync``
+        for every model chunk (``config.param_sync_func``) before any forward pre-hook runs.
+        Under chunked optimizer-state offload, train_step has by then force-synced the
+        LayerWise (Muon) bucket groups and moved their fp32 masters to CPU, so a second
+        dispatch would stage the fp8 weights from CPU-bound masters (rejected by
+        ``fp8_utils._stage_param_to_bf16``) or gather stale weights. The PP=1 tests above
+        never reach this entry point; this one runs PP=2, VP=2, DP=world/2: the offload run
+        must match the plain aligned-VPP run bitwise, and the aligned entry point must
+        actually have met force-synced LayerWise groups.
+        """
+        world = torch.distributed.get_world_size()
+        if world < 4:
+            pytest.skip(
+                "PP=2 with data-parallel size >= 2 needs >= 4 ranks; run with --nproc_per_node>=4"
+            )
+        arch = get_device_arch_version()
+        if fp8_recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise FP8 is Hopper-only")
+        if fp8_recipe == "mxfp8" and arch < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        pp, vpp, num_microbatches, n = 2, 2, 4, 4
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp,
+            virtual_pipeline_model_parallel_size=vpp,
+        )
+        vpp_kwargs = dict(
+            pipeline_model_parallel_size=pp,
+            virtual_pipeline_model_parallel_size=vpp,
+            num_microbatches=num_microbatches,
+            align_param_gather=True,
+        )
+        with deterministic_mode():
+            ref_args, ref_model, ref_opt = self._build(True, fp8_recipe, True, **vpp_kwargs)
+            assert ref_args.align_param_gather, "validate_args dropped align_param_gather"
+            assert ref_args.virtual_pipeline_model_parallel_size == vpp
+            params0 = [_snapshot_params(chunk) for chunk in ref_model]
+            masters0 = [_snapshot_masters(chunk) for chunk in ref_model]
+            off_args, off_model, off_opt = self._build(
+                True, fp8_recipe, True, chunked_optimizer_state_offload=True, **vpp_kwargs
+            )
+            assert off_opt.optimizer_state_offload_requires_pre_forward_param_sync()
+            _restore_initial_state_chunks(off_model, off_opt, params0, masters0)
+            reference = self._run_vpp_steps(ref_args, ref_model, ref_opt, n, num_microbatches)
+            offloaded = self._run_vpp_steps(off_args, off_model, off_opt, n, num_microbatches)
+
+        ref_losses, ref_masters, ref_params, _ = reference
+        off_losses, off_masters, off_params, completed_layerwise_hits = offloaded
+        # Every iteration force-syncs the LayerWise groups before the schedule's aligned
+        # dispatch, and the interleaved schedule calls start_param_sync once per chunk, so
+        # the entry point under test must have met them in that state exactly that often.
+        # All checks feed one reduced flag so a failing rank never leaves its peers waiting
+        # in the collective.
+        expected_hits = len(off_model) * n
+        problem = None
+        if completed_layerwise_hits != expected_hits:
+            problem = (
+                f"aligned start_param_sync met force-synced LayerWise bucket groups "
+                f"{completed_layerwise_hits} times, expected {expected_hits}; the test no "
+                "longer covers the aligned VPP re-dispatch path"
+            )
+        # Compare every rank's result so a single-rank divergence cannot pass unnoticed.
+        for step in range(n):
+            if ref_losses[step] is not None and not torch.equal(off_losses[step], ref_losses[step]):
+                problem = problem or f"mismatch: loss step {step}"
+            for kind, actual_chunks, expected_chunks in (
+                ("master", off_masters[step], ref_masters[step]),
+                ("param", off_params[step], ref_params[step]),
+            ):
+                for chunk_id, (actual, expected) in enumerate(zip(actual_chunks, expected_chunks)):
+                    for name in actual:
+                        if not torch.equal(actual[name], expected[name]):
+                            problem = problem or (
+                                f"mismatch: {kind} step {step} chunk {chunk_id} {name}"
+                            )
+        flag = torch.tensor([0 if problem is None else 1], device="cuda")
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        assert flag.item() == 0, (
+            "aligned VPP chunked offload did not reproduce the plain aligned VPP step "
+            f"(rank-local first problem: {problem}; fp8_recipe={fp8_recipe})"
+        )
