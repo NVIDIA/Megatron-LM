@@ -36,8 +36,8 @@ two task-specific functions in this example; this is not a built-in data recipe.
 `create_task_encoder(*, split)` returns a fresh native TaskEncoder for every
 language sample lane. The same encoder configuration runs on matching language
 and encoder replicas. It owns cooking, media processing, tokenization, packing
-callbacks, labels and loss masks. Do not use physical rank/role to change sample
-selection. Follow Energon's restorable/stateless callback rules for randomness.
+callbacks, labels and loss masks. Do not use training rank or model role to change
+sample selection. Follow Energon's restorable/stateless callback rules for randomness.
 Native errors fail fast rather than dropping a sample on only one replica.
 
 Native dataset/loader options are forwarded unchanged. The bridge reserves
