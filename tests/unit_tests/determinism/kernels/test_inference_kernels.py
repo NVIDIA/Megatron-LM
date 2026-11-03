@@ -831,22 +831,38 @@ def test_vllm_fused_moe_and_moe_sum_replay(monkeypatch, use_tma_weights):
         )
 
 
-def test_vllm_moe_align_block_size_replays():
-    """The counters are zeroed inside the init kernel, so a fresh ``torch.empty`` buffer that
-    reuses the previous replay's memory must still count from zero on every replay."""
+@pytest.mark.parametrize("fused", [False, True], ids=["multi_kernel", "fused_single_cta"])
+def test_vllm_moe_align_block_size_replays(fused):
+    """The counters are (re)initialized inside the kernels, so a fresh ``torch.empty`` buffer
+    that reuses the previous replay's memory must still count from zero on every replay.
+    Covers both table builders: the multi-kernel one and the single-CTA one used for small
+    token counts."""
     from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
 
     seeded()
-    max_tokens, topk, experts, num_local, local_start = 4096, 8, 64, 16, 16
+    block_size = 64
+    # The single-CTA builder is selected for small token counts (num_pairs_hint).
+    max_tokens, topk, experts, num_local, local_start = (256 if fused else 4096), 8, 64, 16, 16
     routing_map = torch.randint(0, experts, (max_tokens, topk), device="cuda")
     valid = _dev_scalar(max_tokens - 100)
+    num_pairs_hint = max_tokens * topk if fused else None
 
     def fn(routing_map):
         sorted_token_ids, expert_ids, num_tokens_post_padded = _moe_align_block_size_cuda_graphable(
-            routing_map, 64, num_local, local_start, valid
+            routing_map, block_size, num_local, local_start, valid, num_pairs_hint=num_pairs_hint
+        )
+        # Only rows below num_tokens_post_padded (and their blocks) are read by the GEMM;
+        # the single-CTA builder leaves the rest untouched.
+        used = torch.arange(sorted_token_ids.numel(), device="cuda") < num_tokens_post_padded
+        used_blocks = (
+            torch.arange(expert_ids.numel(), device="cuda") * block_size < num_tokens_post_padded
         )
         # Atomic slot order within an expert may differ between replays; the multiset may not.
-        return torch.sort(sorted_token_ids).values, expert_ids, num_tokens_post_padded
+        return (
+            torch.sort(torch.where(used, sorted_token_ids, -1)).values,
+            torch.where(used_blocks, expert_ids, -1),
+            num_tokens_post_padded,
+        )
 
     assert_replays_bit_exact(
         fn,

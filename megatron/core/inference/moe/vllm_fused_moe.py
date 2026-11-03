@@ -429,12 +429,91 @@ def _fill_expert_block_ids_kernel(
         tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
 
 
+@triton.jit
+def _moe_align_fused_kernel(
+    routing_map_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    counters_ptr,
+    valid_tokens_ptr,
+    local_expert_start,
+    topk: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    SENTINEL: tl.constexpr,
+    E_PAD: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_CHUNK: tl.constexpr,
+):
+    """Single-CTA build of the indirection tables, for small token counts.
+
+    Replaces the init / count / prefix-sum / fill / scatter launches with one,
+    which matters at decode where each of those is a near-empty launch. Produces
+    the same expert segments (atomic slot order can vary), initializing only
+    the region the GEMM reads: entries
+    [0, num_tokens_post_padded) of sorted_token_ids and the expert of every block
+    below it.  Correct for any token count; just slow when it is large.
+    """
+    valid_pairs = tl.load(valid_tokens_ptr) * topk
+    e = tl.arange(0, E_PAD)
+
+    # 1) Tokens per local expert.
+    counts = tl.zeros([E_PAD], dtype=tl.int32)
+    for start in tl.range(0, valid_pairs, CHUNK):
+        offs = start + tl.arange(0, CHUNK)
+        in_range = offs < valid_pairs
+        lids = (tl.load(routing_map_ptr + offs, mask=in_range, other=-1) - local_expert_start).to(
+            tl.int32
+        )
+        is_local = in_range & (lids >= 0) & (lids < num_local_experts)
+        counts += tl.histogram(lids, E_PAD, mask=is_local)
+
+    # 2) Per-expert counts padded to BLOCK_SIZE_M (empty experts stay 0), prefix sums.
+    padded = (counts + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * BLOCK_SIZE_M
+    inclusive = tl.cumsum(padded, axis=0)
+    total = tl.sum(padded, axis=0)
+    tl.store(num_tokens_post_padded_ptr, total)
+    tl.store(counters_ptr + e, inclusive - padded, mask=e < num_local_experts)
+
+    # 3) Expert of each block: the number of experts whose padded range ends at or
+    #    before the block's first row.  Fill the used rows with the sentinel.
+    num_blocks = total // BLOCK_SIZE_M
+    for b0 in tl.range(0, num_blocks, BLOCK_CHUNK):
+        b = b0 + tl.arange(0, BLOCK_CHUNK)
+        eid = tl.sum((inclusive[None, :] <= b[:, None] * BLOCK_SIZE_M).to(tl.int32), axis=1)
+        tl.store(expert_ids_ptr + b, eid, mask=b < num_blocks)
+    for s0 in tl.range(0, total, CHUNK):
+        s = s0 + tl.arange(0, CHUNK)
+        tl.store(sorted_token_ids_ptr + s, SENTINEL, mask=s < total)
+
+    # The counters and sentinel stores above must land before the scatter below.
+    tl.debug_barrier()
+
+    # 4) Scatter each local pair into its expert's rows.
+    for start in tl.range(0, valid_pairs, CHUNK):
+        offs = start + tl.arange(0, CHUNK)
+        in_range = offs < valid_pairs
+        lids = (tl.load(routing_map_ptr + offs, mask=in_range, other=-1) - local_expert_start).to(
+            tl.int32
+        )
+        is_local = in_range & (lids >= 0) & (lids < num_local_experts)
+        pos = tl.atomic_add(counters_ptr + lids, 1, mask=is_local)
+        tl.store(sorted_token_ids_ptr + pos, offs, mask=is_local)
+
+
+# Token-pair counts up to which the single-CTA table build beats the multi-kernel one
+# (GB300: 2-3x faster at up to 768 pairs, break-even near 3k).
+_FUSED_ALIGN_MAX_PAIRS = 2048
+
+
 def _moe_align_block_size_cuda_graphable(
     routing_map: torch.Tensor,
     block_size: int,
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
+    num_pairs_hint: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
@@ -448,6 +527,8 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts: experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor.
+        num_pairs_hint: expected tokens * topk (host-side). Up to
+            _FUSED_ALIGN_MAX_PAIRS, one single-CTA kernel builds the tables.
 
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
@@ -465,8 +546,29 @@ def _moe_align_block_size_cuda_graphable(
         "sorted_token_ids", (max_sorted,), torch.int32, device
     )
     expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
+    counters = torch.empty(num_local_experts, dtype=torch.int32, device=device)
 
-    pre_initialized_output_buffer = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+    if num_pairs_hint is not None and num_pairs_hint <= _FUSED_ALIGN_MAX_PAIRS:
+        num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=device)
+        _moe_align_fused_kernel[(1,)](
+            routing_map,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            counters,
+            valid_tokens,
+            local_expert_start,
+            topk=topk,
+            num_local_experts=num_local_experts,
+            BLOCK_SIZE_M=block_size,
+            SENTINEL=sentinel,
+            E_PAD=triton.next_power_of_2(num_local_experts),
+            CHUNK=1024,
+            BLOCK_CHUNK=32,
+            num_warps=8,
+        )
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
+
     INIT_BLOCK = 1024
     # max_sorted exceeds num_local_experts, so this grid also covers the counters.
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
@@ -475,7 +577,7 @@ def _moe_align_block_size_cuda_graphable(
         expert_ids,
         max_sorted,
         max_blocks,
-        pre_initialized_output_buffer,
+        counters,
         num_local_experts,
         SENTINEL=sentinel,
         BLOCK=INIT_BLOCK,
@@ -488,7 +590,7 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts,
         valid_tokens,
         persistent=True,
-        pre_initialized_output_buffer=pre_initialized_output_buffer,
+        pre_initialized_output_buffer=counters,
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size
@@ -814,7 +916,12 @@ def vllm_fused_moe(
         config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
+        routing_map,
+        config['BLOCK_SIZE_M'],
+        num_local_experts,
+        local_expert_start,
+        valid_tokens,
+        num_pairs_hint=effective_tokens * topk,
     )
     num_valid = max_tokens * topk
 

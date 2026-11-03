@@ -320,18 +320,30 @@ class TestMoeAlignBlockSize:
         assert (active_eids < num_experts).all(), "Found expert_id >= num_experts"
 
     @pytest.mark.parametrize("num_local", [1, 7, 128])
-    def test_graph_replay_starts_counting_from_zero(self, num_local):
-        """The table initializer re-zeroes the expert counters on every replay."""
+    @pytest.mark.parametrize("fused", [False, True], ids=["multi_kernel", "fused_single_cta"])
+    @pytest.mark.parametrize("max_tokens", [35, 769])
+    def test_graph_replay_starts_counting_from_zero(self, num_local, fused, max_tokens):
+        """The table builder re-initializes the expert counters on every replay. Covers the
+        multi-kernel builder and the single-CTA one that num_pairs_hint selects for small
+        batches (which only writes the region below num_tokens_post_padded)."""
         from megatron.core.inference.moe.vllm_fused_moe import _moe_align_block_size_cuda_graphable
 
-        max_tokens, topk, block_size, local_start = 35, 4, 16, 3
+        topk, block_size, local_start = 4, 16, 3
         torch.manual_seed(42)
         routing_map = torch.randint(0, num_local + 6, (max_tokens, topk), device="cuda")
         valid_tokens = _vt(max_tokens)
+        # A decode graph can replay with more tokens than its hint, including
+        # more than one CHUNK and more than the fused dispatch threshold.
+        num_pairs_hint = topk if fused else None
 
         def align():
             return _moe_align_block_size_cuda_graphable(
-                routing_map, block_size, num_local, local_start, valid_tokens
+                routing_map,
+                block_size,
+                num_local,
+                local_start,
+                valid_tokens,
+                num_pairs_hint=num_pairs_hint,
             )
 
         def routed_pairs(sorted_ids, expert_ids, num_post_padded):
@@ -364,6 +376,8 @@ class TestMoeAlignBlockSize:
                 routing_map.zero_()
             else:
                 routing_map.random_(0, num_local + 6)
+            graph_outputs[0].fill_(-777)
+            graph_outputs[1].fill_(-777)
             graph.replay()
             replayed = [t.clone() for t in graph_outputs]
             eager = align()
@@ -374,13 +388,34 @@ class TestMoeAlignBlockSize:
             aligned = (counts + block_size - 1) // block_size * block_size
             num_post_padded = replayed[2].item()
             assert num_post_padded == aligned.sum().item()
-            assert torch.equal(replayed[1], eager[1])
+            # Check each expert segment against an independent routing-map oracle;
+            # comparing replay with eager alone would miss a shared kernel bug.
+            routes_cpu = routing_map[:n].flatten().cpu()
+            sorted_cpu = replayed[0][:num_post_padded].cpu()
+            experts_cpu = replayed[1][: num_post_padded // block_size].cpu()
+            offset = 0
+            for expert, padded_count in enumerate(aligned.tolist()):
+                segment = sorted_cpu[offset : offset + padded_count]
+                expected_pairs = torch.where(routes_cpu == local_start + expert)[0]
+                actual_pairs = segment[segment < max_tokens * topk].sort().values
+                assert torch.equal(actual_pairs, expected_pairs)
+                assert (segment[segment >= max_tokens * topk] == max_tokens * topk).all()
+                assert (
+                    experts_cpu[offset // block_size : (offset + padded_count) // block_size]
+                    == expert
+                ).all()
+                offset += padded_count
             assert torch.equal(replayed[2], eager[2])
+            used_blocks = num_post_padded // block_size
+            assert torch.equal(replayed[1][:used_blocks], eager[1][:used_blocks])
             assert torch.equal(
                 routed_pairs(*replayed[:2], num_post_padded),
                 routed_pairs(*eager[:2], num_post_padded),
             )
-            assert torch.equal(replayed[0][num_post_padded:], eager[0][num_post_padded:])
+            if not fused:
+                # The multi-kernel builder also initializes the unused tail.
+                assert torch.equal(replayed[1], eager[1])
+                assert torch.equal(replayed[0][num_post_padded:], eager[0][num_post_padded:])
 
 
 # ──────────────────────────────────────────────────────────────────────
