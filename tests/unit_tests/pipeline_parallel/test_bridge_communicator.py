@@ -17,8 +17,13 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.pipeline_parallel import schedules
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator, CommRole
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -354,6 +359,180 @@ class TestBridgeCommunicatorSplitMetadata:
 
         with pytest.raises(ValueError, match="one payload tensor per peer"):
             bridge._run_batched_payload_p2p([torch.empty(1)], [4, 5], op="send")
+
+
+class TestBridgeCommunicatorVariableFanIn:
+    """Exercise fan-in with two source owners and a TP destination on four GPUs."""
+
+    @classmethod
+    def setup_class(cls):
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if dist.get_world_size() < 4:
+            pytest.skip("Fan-in tests require at least four GPUs")
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    @pytest.mark.parametrize("tensor_ndim", [2, 3])
+    @pytest.mark.parametrize(
+        "lengths",
+        [((2, 5), (6, 1), (3, 4)), ((0, 7), (7, 0), (0, 0)), ((3, 3), (5, 5), (2, 2))],
+        ids=["unequal", "empty", "equal"],
+    )
+    @pytest.mark.parametrize("combined", [False, True], ids=["separate", "combined"])
+    def test_variable_fan_in_backward(self, tensor_ndim, lengths, combined):
+        """Return exact gradients to owners in FIFO order across outstanding microbatches."""
+        src_grid = create_hypercomm_grid(offset=0, dp=2)
+        dest_grid = create_hypercomm_grid(offset=2, tp=2)
+        bridge = BridgeCommunicator(
+            src_grid,
+            dest_grid,
+            dim_mapping={'s': 0, 'b': 1, 'h': 2},
+            comm_dtype=torch.float32,
+            tensor_ndim=tensor_ndim,
+        )
+        rank = dist.get_rank()
+        if rank >= 4:
+            return
+        batch_dim = 0 if tensor_ndim == 2 else 1
+
+        def source_tensor(microbatch, owner):
+            rows = lengths[microbatch][owner]
+            shape = (rows, 8) if tensor_ndim == 2 else (2, rows, 8)
+            return torch.arange(torch.Size(shape).numel(), device="cuda").reshape(shape).float() + (
+                1000 * microbatch + 100 * owner
+            )
+
+        def expected_activation(microbatch):
+            return torch.cat(
+                [source_tensor(microbatch, owner) for owner in range(2)], dim=batch_dim
+            )
+
+        def gradient(microbatch):
+            # Distinct values catch misrouting even when a received shape happens to match.
+            return 2 * expected_activation(microbatch) + 1
+
+        received_gradients = []
+
+        def check_gradient(actual, microbatch):
+            # Finish P2P before asserting, so a regression cannot strand the other ranks.
+            received_gradients.append((actual, microbatch))
+
+        # Two warmup forwards make FIFO versus LIFO observable (including equal total lengths).
+        for microbatch in range(2):
+            if rank < 2:
+                bridge.send_forward(source_tensor(microbatch, rank))
+            else:
+                torch.testing.assert_close(bridge.recv_forward(), expected_activation(microbatch))
+
+        if combined:
+            if rank < 2:
+                check_gradient(bridge.send_forward_recv_backward(source_tensor(2, rank)), 0)
+            else:
+                torch.testing.assert_close(
+                    bridge.send_backward_recv_forward(gradient(0)), expected_activation(2)
+                )
+        else:
+            if rank < 2:
+                check_gradient(bridge.recv_backward(), 0)
+                bridge.send_forward(source_tensor(2, rank))
+            else:
+                bridge.send_backward(gradient(0))
+                torch.testing.assert_close(bridge.recv_forward(), expected_activation(2))
+
+        for microbatch in (1, 2):
+            if rank < 2:
+                check_gradient(bridge.recv_backward(), microbatch)
+            else:
+                bridge.send_backward(gradient(microbatch))
+        for actual, microbatch in received_gradients:
+            torch.testing.assert_close(actual, 2 * source_tensor(microbatch, rank) + 1)
+        assert not bridge._forward_fanin_split_sizes
+
+    def test_fan_in_schedule_evaluation_then_training(self):
+        """Evaluation metadata must not shift the next training iteration's gradients."""
+        src_grid = create_hypercomm_grid(offset=0, dp=2)
+        dest_grid = create_hypercomm_grid(offset=2, tp=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            pipeline_dtype=torch.float32,
+            variable_seq_lengths=True,
+        )
+        communicator = MultiModulePipelineCommunicator(
+            {"encoder": src_grid, "llm": dest_grid},
+            {"encoder": ["llm"], "llm": []},
+            config,
+            module_output_ndim={"encoder": 2},
+        )
+        rank = dist.get_rank()
+        if rank >= 4:
+            return
+        is_source = rank < 2
+        module_name = "encoder" if is_source else "llm"
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={
+                module_name: _get_pg_collection_from_grid(src_grid if is_source else dest_grid)
+            },
+            language_model_module_name=None if is_source else "llm",
+        )
+
+        class Model(torch.nn.Module):
+            def set_input_tensor(self, tensors):
+                self.inputs = tensors[0]
+
+        model = Model()
+        model.config = config
+        model.model_type = "unit-test"
+
+        def step_func(data_iterator, model):
+            def loss_func(outputs):
+                loss = outputs["llm"].square().sum()
+                return loss, {"loss": loss.detach()}
+
+            if is_source:
+                output = next(data_iterator) * 1.0
+            else:
+                output = model.inputs["encoder"] * 1.0
+            return {module_name: output}, loss_func
+
+        for forward_only, lengths in (
+            (True, ((1, 6), (4, 3))),
+            (False, ((2, 5), (6, 1), (3, 4))),
+            (False, ((0, 7), (7, 0), (3, 4))),
+        ):
+            inputs = (
+                [
+                    torch.full(
+                        (sizes[rank], 8), float(i + rank + 1), device="cuda", requires_grad=True
+                    )
+                    for i, sizes in enumerate(lengths)
+                ]
+                if is_source
+                else []
+            )
+            schedules.forward_backward_pipelining_without_interleaving(
+                forward_step_func=step_func,
+                data_iterator=iter(inputs),
+                model=model,
+                num_microbatches=len(lengths),
+                seq_length=1,
+                micro_batch_size=1,
+                forward_only=forward_only,
+                p2p_communicator=communicator,
+                pg_collection=pg_collection,
+            )
+            if is_source:
+                for tensor in inputs:
+                    if forward_only:
+                        assert tensor.grad is None
+                    else:
+                        torch.testing.assert_close(tensor.grad, 2 * tensor / len(lengths))
+            if not forward_only:
+                assert not communicator.bridge_comms[0]._forward_fanin_split_sizes
 
 
 class TestBridgeCommunicator:
