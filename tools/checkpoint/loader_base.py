@@ -241,6 +241,9 @@ class MegatronCheckpointLoaderBase:
         # Load shards for each pipeline rank
         mpu.set_virtual_pipeline_model_parallel_rank(0)
         for pp_rank in range(pp_size):
+            # load_checkpoint names the shard of this stage by the rank of the model's pipeline
+            # group, which is this stand-in group.
+            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             all_models.append(get_models_for_pipeline_stage(tp_size, dtype))
 
