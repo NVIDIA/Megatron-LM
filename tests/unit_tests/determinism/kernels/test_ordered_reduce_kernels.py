@@ -160,8 +160,6 @@ class TestOrderedReduceKernels:
 
         def pull(x, w):
             parts = orr.row_parallel_shard_partials(x, w, c, out=symm["tensor"])
-            if c == 1:
-                return orr.symm_ordered_reduce_scatter(parts[0], symm["handle"], out)
             return orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"], out)
 
         assert_replays_bit_exact(

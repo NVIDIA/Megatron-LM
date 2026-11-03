@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -139,10 +140,6 @@ class TestTensorParallelLayers:
     @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "bi"])
     def test_vocab_parallel_cross_entropy_replays(self, label_smoothing, batch_invariant):
         """batch_invariant: the fixed-order vocab-shard sum and the ordered TP fold."""
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            set_batch_invariant_mode,
-        )
-
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         logits = torch.randn(4096, 32768, device="cuda", dtype=torch.float32, requires_grad=True)

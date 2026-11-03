@@ -26,8 +26,8 @@ Paths:
     GEMM output). One kernel stores each peer's rows into that peer's fixed-size symmetric
     staging buffer (chunked, double-buffered, one block-level barrier per chunk) and folds
     the staged partials in rank order. No receive buffer of the input's size, no NCCL.
-    Falls back to all-to-all + fold for uneven splits, inputs above 64 MiB (where the push
-    is not faster), or without symmetric memory (e.g. a TP group spanning nodes).
+    Falls back to all-to-all + fold for inputs above 64 MiB (where the push is not
+    faster) or without symmetric memory (e.g. a TP group spanning NVLink domains).
   * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
     buffer; one kernel barriers through the signal pad, reads the owned slice from every
     peer with plain loads (not multimem, whose in-switch reduction order is unspecified)
@@ -145,10 +145,9 @@ def _ordered_fold_kernel(
     """dst[i] = cast(((src[0, i] + src[1, i]) + ...) + src[TP-1, i]); src[r] at r * part_stride.
 
     One program per BLOCK of output elements; elements never interact, so the bits do not
-    depend on the grid. Launched by :func:`ordered_fold`, the shared last step of every
-    path that gathers the partials first: the all-to-all reduce-scatter fallback, the NCCL
-    send/recv shard fallback, and the local (TP 1) shard folds of the linear layers and of
-    the cross-entropy vocab sum.
+    depend on the grid. Launched by :func:`ordered_fold`: the last step of the all-to-all
+    fallback and the local (TP 1) shard folds of the linear layers and of the cross-entropy
+    vocab sum.
     """
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -319,8 +318,8 @@ def _ordered_push_fold_kernel(
     makes the staging safe to reuse.
 
     Used by the training forward (learner), whose input is an ordinary tensor (the TE GEMM
-    output): :func:`ordered_reduce_scatter` and, with several shards per rank,
-    :func:`ordered_reduce_scatter_shards`, through ``_launch_push_fold``.
+    output): :func:`ordered_reduce_scatter_shards` (and its one-partial case
+    :func:`ordered_reduce_scatter`), through ``_launch_push_fold``.
     """
     pid = tl.program_id(0)
     nb = tl.num_programs(0)
@@ -504,13 +503,10 @@ def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
     NVLink domains, or a message above PUSH_MAX_INPUT_BYTES) makes
     :func:`ordered_reduce_scatter_shards` take the all-to-all path instead.
     """
-    if not (
-        group.size() >= 2
-        # The input-size cap only affects speed (PUSH_MAX_INPUT_BYTES). With several shard
-        # partials per rank the push beat the all-to-all at every measured size (GB200,
-        # TP2/TP4, up to 16k x 8192), so the cap applies only to one partial per rank.
-        and (num_parts > 1 or tensor.numel() * tensor.element_size() <= PUSH_MAX_INPUT_BYTES)
-    ):
+    # The input-size cap only affects speed (PUSH_MAX_INPUT_BYTES). With several shard
+    # partials per rank the push beat the all-to-all at every measured size (GB200,
+    # TP2/TP4, up to 16k x 8192), so the cap applies only to one partial per rank.
+    if num_parts == 1 and tensor.numel() * tensor.element_size() > PUSH_MAX_INPUT_BYTES:
         return None
     hdl = SymmetricMemoryManager.get_buffer(_allocate_push_staging(group, num_parts)).symm_mem_hdl
     if hdl is None or hdl.world_size != group.size():
@@ -522,8 +518,7 @@ def _launch_push_fold(
     input_: torch.Tensor, output: torch.Tensor, hdl, exact: Optional[bool], num_parts: int = 1
 ) -> torch.Tensor:
     """Launch the push kernel: ``input_`` holds num_parts partials of all world_size output
-    slices ([num_parts, ws * n]). Called by :func:`ordered_reduce_scatter` (one partial)
-    and :func:`ordered_reduce_scatter_shards` (one partial per local shard)."""
+    slices ([num_parts, ws * n]). Called by :func:`ordered_reduce_scatter_shards`."""
     ws = hdl.world_size
     n = output.numel()
     assert input_.numel() == n * ws * num_parts and output.is_contiguous()
@@ -557,7 +552,7 @@ def _launch_push_fold(
     return output
 
 
-# ── All-to-all paths (any process group) ────────────────────────────────────
+# ── Ordered reduce-scatter / all-reduce (learner) ───────────────────────────
 
 
 def ordered_reduce_scatter(
@@ -570,7 +565,9 @@ def ordered_reduce_scatter(
     Otherwise, per rank: one all-to-all of the partials ((TP-1)/TP of the input over the
     wire, the same as a ring reduce-scatter), one transient receive buffer of the input's
     size, and one fold pass that reads TP x (output size) and writes the output. Both are
-    CUDA-graph capturable (the staging is allocated on the first, uncaptured call).
+    CUDA-graph capturable (the staging is allocated before capture, see
+    :func:`prepare_ordered_reduce`). This is the c = 1 case of
+    :func:`ordered_reduce_scatter_shards`.
 
     Used by the training forward: the sequence-parallel and tensor-parallel reduce-scatters
     in ``mappings.py`` (TERowParallelLinear's batch-invariant reduction goes through them).

@@ -6,10 +6,15 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.extensions.transformer_engine import TERowParallelLinear
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel import ordered_reduce as orr
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_tensor_model_parallel_group_if_none, init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
 TP = 4
@@ -49,20 +54,13 @@ def _partials(shape, dtype, seed):
 
 
 def _symm_buffer(group, nbytes):
-    """A symmetric-memory buffer for group, or None when unsupported here."""
-    try:
-        import torch.distributed._symmetric_memory as symm_mem
-
-        from megatron.core.inference.symmetric_memory import _ensure_signal_pad_size
-
-        if torch.cuda.get_device_properties(0).major < 9:
-            return None, None
-        symm_mem.enable_symm_mem_for_group(group.group_name)
-        _ensure_signal_pad_size(group.size())
-        buf = symm_mem.empty(nbytes, dtype=torch.uint8, device="cuda")
-        return buf, symm_mem.rendezvous(buf, group)
-    except Exception:  # pragma: no cover - platform without symmetric memory
-        return None, None
+    """A raw symmetric-memory byte buffer and its handle for group, or (None, None) where
+    symmetric memory is unavailable. Owned by SymmetricMemoryManager, so teardown frees it
+    on every rank at the same point."""
+    buf = SymmetricMemoryManager.get_buffer(
+        f"ordered_reduce_test:{nbytes}", process_group=group, size_mb=nbytes >> 20
+    )
+    return buf.symm_buffer, buf.symm_mem_hdl
 
 
 @requires_tp4
@@ -72,8 +70,6 @@ class TestOrderedReduce:
         self.group = get_tensor_model_parallel_group_if_none(tp_group=None)
 
     def teardown_method(self, method):
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
@@ -154,7 +150,6 @@ class TestOrderedReduce:
         view and copies it into the symmetric buffer itself: same bits as contiguous input."""
         from types import SimpleNamespace
 
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
         from megatron.core.tensor_parallel.inference_layers import (
             inference_reduce_scatter_to_sequence_parallel_region,
         )
@@ -260,12 +255,6 @@ def test_te_row_parallel_linear_ordered_reduction(sequence_parallel):
 def _check_te_row_parallel_linear(sequence_parallel):
     import transformer_engine as te
 
-    from megatron.core.extensions.transformer_engine import TERowParallelLinear
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from megatron.core.transformer.enums import AttnBackend
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.utils import init_method_normal
-
     model_parallel_cuda_manual_seed(123)
     group = get_tensor_model_parallel_group_if_none(tp_group=None)
     cfg = TransformerConfig(
@@ -294,7 +283,7 @@ def _check_te_row_parallel_linear(sequence_parallel):
     ).cuda()
     assert layer._bi_tp_forward.value == "ordered_reduce"
     # The push staging is allocated at construction, outside any forward or graph capture.
-    assert orr.SymmetricMemoryManager.is_initialized(orr._push_staging_key(layer._tp_group))
+    assert SymmetricMemoryManager.is_initialized(orr._push_staging_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
@@ -343,7 +332,6 @@ def _check_te_row_parallel_linear(sequence_parallel):
 @requires_tp4
 def test_tp3_symmetric_memory_paths():
     """TP = 3 (not a power of two): push and pull give the left fold, like TP 4."""
-    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
     Utils.initialize_model_parallel(1, 1)
     group = dist.new_group([0, 1, 2])  # every rank must create it

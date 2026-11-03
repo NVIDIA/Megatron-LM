@@ -27,6 +27,7 @@ from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
@@ -271,10 +272,6 @@ class TestFusedCrossEntropy:
 
     def test_fused_vocab_parallel_cross_entropy_batch_invariant_replays(self):
         """Batch-invariant mode: fixed-order vocab-shard sum and the ordered TP fold."""
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            set_batch_invariant_mode,
-        )
-
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
         logits = _act((TOKENS, 32768), dtype=torch.float32)

@@ -6,8 +6,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.extensions.transformer_engine import TERowParallelLinear
+from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.tensor_parallel import ordered_reduce as orr
+from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.test_utilities import Utils
 
@@ -36,7 +42,6 @@ def _inputs(m, k, n, seed):
 @requires_4
 class TestShardReductions:
     def teardown_method(self, method):
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
@@ -86,7 +91,6 @@ class TestShardReductions:
     def test_symm_pull_shards_is_the_canonical_value(self, tp, shards):
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
         if torch.cuda.get_device_properties(0).major < 9:
             pytest.skip("symmetric memory needs sm90+")
@@ -116,9 +120,6 @@ class TestTERowParallelShards:
     @pytest.mark.parametrize("tp", [1, 2, 4])
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     def test_te_row_parallel_tp_invariant(self, tp, sequence_parallel):
-        from megatron.core.extensions.transformer_engine import TERowParallelLinear
-        from megatron.core.transformer.enums import AttnBackend
-        from megatron.core.transformer.transformer_config import TransformerConfig
 
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
@@ -169,9 +170,6 @@ class TestTERowParallelShards:
 
     def test_expert_row_parallel_keeps_its_reduction(self):
         """Routed-expert linears are not split into shards (their reduction is not covered)."""
-        from megatron.core.extensions.transformer_engine import TERowParallelLinear
-        from megatron.core.transformer.enums import AttnBackend
-        from megatron.core.transformer.transformer_config import TransformerConfig
 
         Utils.initialize_model_parallel(2, 1, expert_tensor_parallel_size=1)
         cfg = TransformerConfig(
@@ -206,8 +204,6 @@ def test_cross_entropy_is_tp_and_batch_invariant():
     """Batch-invariant vocab-parallel cross entropy with batch_invariant_tp_shards = 4: the
     same loss bits at TP 1, 2 and 4 (fixed vocab shards folded in order), and for a token in
     a smaller batch at another position. Both native implementations agree."""
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-    from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 
     shards, vocab, tokens = 4, 4096, 64
     Utils.initialize_model_parallel(1, 1)
@@ -251,7 +247,6 @@ def test_cross_entropy_is_tp_and_batch_invariant():
 
 
 def test_config_rejects_unsupported_multi_shard_combinations():
-    from megatron.core.transformer.transformer_config import TransformerConfig
 
     base = dict(
         num_layers=1,
