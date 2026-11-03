@@ -14,7 +14,12 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig
+from megatron.training.config import (
+    FaultInjectorConfig,
+    FaultToleranceConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+)
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
@@ -82,6 +87,13 @@ def test_save_checkpoint_writes_run_config(
 
     args = create_args
     model, optimizer, opt_param_scheduler = _model_and_states("torch_dist")
+    run_config.fault_tolerance = FaultToleranceConfig(
+        enable_ft_package=True,
+        calc_ft_timeouts=True,
+        ft_num_warmup_iters=9,
+        fault_injector=FaultInjectorConfig(fault_injector_seed=42),
+    )
+    args.enable_ft_package = False
 
     with TempNamedDir(
         tmp_path_dist_ckpt / "test_save_checkpoint_run_config", sync=True
@@ -91,6 +103,8 @@ def test_save_checkpoint_writes_run_config(
         loaded = _assert_saved_config(save_dir / "iter_0000123", run_config, checkpoint)
         assert loaded["checkpoint"]["ckpt_format"] == "torch_dist"
         assert loaded["checkpoint"]["save"] == str(save_dir)
+        assert loaded["fault_tolerance"] == run_config.to_dict()["fault_tolerance"]
+        assert args.enable_ft_package is False
 
 
 def test_save_checkpoint_without_optimizer(

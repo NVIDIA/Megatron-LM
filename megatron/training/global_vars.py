@@ -236,7 +236,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
-    _set_adlr_autoresume(args)
+    _set_adlr_autoresume()
     _set_timers(args)
     _set_energy_monitor(args)
     _set_train_state()
@@ -462,12 +462,13 @@ def _set_one_logger(args):
                   'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
                   ' for details to install it')
 
-def _set_adlr_autoresume(args):
+def _set_adlr_autoresume():
     """Initialize ADLR autoresume."""
     global _GLOBAL_ADLR_AUTORESUME
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
-    if args.adlr_autoresume:
+    cfg = get_run_config()
+    if cfg.fault_tolerance.adlr_autoresume:
         from megatron.training.utils import print_rank_0
         print_rank_0('enabling autoresume ...')
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))

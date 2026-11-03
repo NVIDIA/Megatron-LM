@@ -158,7 +158,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig, TrainingConfig
+from megatron.training.config import TrainingConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -4671,7 +4671,9 @@ def post_training_step_callbacks(
             enable_forward_pre_hook(model)
 
     # Autoresume.
-    if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
+    if cfg.fault_tolerance.adlr_autoresume and (
+        iteration % cfg.fault_tolerance.adlr_autoresume_interval == 0
+    ):
         check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
     # Profiling.
@@ -4898,14 +4900,10 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
 
-    fault_injector_kwargs = {}
-    for f in dataclasses.fields(FaultInjectorConfig):
-        if hasattr(args, f.name):
-            fault_injector_kwargs[f.name] = getattr(args, f.name)
-    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
+    fault_injector_config = cfg.fault_tolerance.fault_injector
 
     _maybe_raise_workload_exception = None
-    if (
+    if fault_injector_config is not None and (
         fault_injector_config.fault_injector_ranks is not None
         or fault_injector_config.fault_injector_num_ranks is not None
     ):
