@@ -72,8 +72,9 @@ def test_replicated_gradients_still_reduce(distributed_setup):
 @pytest.mark.parametrize("outer_optimizer", [Replicate(), Shard(0)], ids=["hsdp", "hfsdp"])
 @pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("set_to_none", [False, True])
+@pytest.mark.parametrize("sync_each_microbatch", [False, True])
 def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
-    distributed_setup, outer_optimizer, grad_comm_dtype, set_to_none
+    distributed_setup, outer_optimizer, grad_comm_dtype, set_to_none, sync_each_microbatch
 ):
     """Local accumulation preserves cast-before-scale precision and deferred outer reduction."""
     setup = distributed_setup
@@ -111,7 +112,6 @@ def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
                     (1, 8), setup.rank + index + 1, device=setup.device, dtype=torch.bfloat16
                 )
                 model(inputs).float().sum().backward()
-            context.finish_grad_sync()
             # Independently form each rank's contribution in the configured reduction dtype.
             contributions = torch.arange(
                 index + 1, setup.world_size + index + 1, device=setup.device, dtype=torch.bfloat16
@@ -119,9 +119,11 @@ def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
             expected_by_rank.add_(
                 (contributions.to(grad_comm_dtype or torch.float32) * scale).float()
             )
-            expected = expected_by_rank.mean() if index == 1 else expected_by_rank[setup.rank]
-            actual = model.weight.grad.to_local()
-            torch.testing.assert_close(actual, expected.expand_as(actual), rtol=1e-6, atol=0)
+            if sync_each_microbatch or index == 1:
+                context.finish_grad_sync()
+                expected = expected_by_rank.mean() if index == 1 else expected_by_rank[setup.rank]
+                actual = model.weight.grad.to_local()
+                torch.testing.assert_close(actual, expected.expand_as(actual), rtol=1e-6, atol=0)
         optimizer.step()
 
 

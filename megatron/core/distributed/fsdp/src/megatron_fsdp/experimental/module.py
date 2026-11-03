@@ -498,16 +498,16 @@ class FsdpModule:
                     group.reduce_outer_gradients()
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
-        """Accumulate on compute and join that work into the inner reduction stream.
+        """Enqueue local accumulation on the inner reduction stream.
 
-        On return, the inner stream waits for the queued accumulation, so outer
+        On return, the inner stream contains the queued accumulation, so outer
         reduction and finish_grad_sync() can use their existing stream dependencies.
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
-        current_stream.wait_stream(inner_reduction_stream)
-        group.accumulate_local_gradients()
         inner_reduction_stream.wait_stream(current_stream)
+        with torch.cuda.stream(inner_reduction_stream):
+            group.accumulate_local_gradients()
 
     def _reduce_packed_gradients(self, group: FsdpParameterGroup, partial_grad: DBuffer) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.

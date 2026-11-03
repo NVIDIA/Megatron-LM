@@ -649,7 +649,7 @@ class FsdpParameterGroup:
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:
-        """Accumulate gradients requiring no inner reduction, without a packing buffer."""
+        """Accumulate locally on the caller's stream, which must wait for gradient production."""
         assert self.main_grad is not None
         assert not self.requires_inner_reduction
         for fsdp_parameter in self.fsdp_parameters:
@@ -657,8 +657,12 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
         has_sharded_grads = self._prepare_main_grad()
+        current_stream = torch.cuda.current_stream(self.main_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
+            # Autograd produced this storage on compute; retain it until this stream
+            # finishes reading it, even after casting or clearing the original .grad.
+            grad.record_stream(current_stream)
             destination = self.main_grad.get_tensor_view(index)
             if not has_sharded_grads and self.grad_comm_dtype == self.main_grad.dtype:
                 # Convert before scaling: mul(bf16_grad, scale, out=fp32) rounds in bf16.
