@@ -374,6 +374,8 @@ class TestHybridModelFusedTPEngine:
             # GDN: 2 key and 4 value heads per rank at TP=2.
             linear_value_head_dim=64,
             linear_num_value_heads=8,
+            # GDN's convolution supports only SiLU in dynamic inference, as in served GDN models.
+            activation_func=torch.nn.functional.silu,
         )
         model = HybridModel(
             config=config,
