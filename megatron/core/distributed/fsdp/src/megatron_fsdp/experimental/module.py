@@ -25,7 +25,7 @@ from weakref import ref
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Shard
+from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
@@ -469,13 +469,12 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
-            requires_inner_reduction = self.requires_inner_reduction
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
-                if requires_inner_reduction:
+                if group.requires_inner_reduction:
                     self._reduce_inner_gradients(group)
                 else:
                     self._accumulate_local_gradients(group)
@@ -520,24 +519,6 @@ class FsdpModule:
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
-
-    @property
-    def requires_inner_reduction(self) -> bool:
-        """Whether this module's gradients need communication before accumulation.
-
-        All groups share the mesh and gradient placements. Dtype-specific sharding
-        layouts do not change whether communication is needed, so the first
-        trainable group determines the result.
-        """
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
-            assert group.main_grad is not None
-            return any(
-                group.mesh.size(axis) > 1 and placement != Partial("avg")
-                for axis, placement in enumerate(group.main_grad.placements)
-            )
-        return False
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

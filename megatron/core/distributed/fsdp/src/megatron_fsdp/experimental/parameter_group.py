@@ -616,6 +616,15 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
+    @property
+    def requires_inner_reduction(self) -> bool:
+        """Whether unreduced gradients need communication to reach main_grad's placements."""
+        assert self.main_grad is not None
+        return any(
+            self.mesh.size(axis) > 1 and placement != Partial("avg")
+            for axis, placement in enumerate(self.main_grad.placements)
+        )
+
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
