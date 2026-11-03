@@ -67,12 +67,12 @@ products:
   - test_case: [gpt_dynamic_inference_tp2_pp2_ep2_gptoss_20b_swa]
     products:
       - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_inference_optimized_swiglu_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github-broken]
+        scope: [mr, mr-github]
         platforms: [dgx_gb200]
   # Regression guard for the MTP + sequence-parallel NVLS all-gather fixes in
   # https://github.com/NVIDIA/Megatron-LM/pull/5748 (the barrier_before /
@@ -82,5 +82,5 @@ products:
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_mtp_sp_block_cudagraphs]
     products:
       - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr]
         platforms: [dgx_gb200]
