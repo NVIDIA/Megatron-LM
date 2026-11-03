@@ -21,6 +21,11 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope
 from .attention_context.mha_metadata import MHAMetadata
 from .mtp_metadata import MTPForwardMode, MTPMetadata
 
+# Why `_mtp_trim_prefix_match` declined matched blocks: a continuation chunk holding the
+# boundary carry, a request whose suffix is already private, a producer whose successor slot was
+# never written (-1), or a producer that continued with a different token.
+MTP_BACKOFF_REASONS = ("carry", "private", "unwritten", "mismatch")
+
 
 class MTPContextMixin:
     """MTP draft-KV bookkeeping for `DynamicInferenceContext`."""
@@ -71,6 +76,7 @@ class MTPContextMixin:
         # repeated MTP draft attention. Draft position i is aligned with main position i;
         # lookahead blocks cover the positions beyond the main forward. `append_key_value_cache` and
         # `key_value_cache` route to this slot on `mtp_metadata.forward_active`.
+        self.mtp_layer_type_list = mtp_layer_type_list
         self.enable_mtp_kv_cache = self.should_enable_mtp_kv_cache(
             model_config=model_config,
             mtp_layer_type_list=mtp_layer_type_list,
@@ -81,6 +87,11 @@ class MTPContextMixin:
             self.num_attention_layers += 1
         else:
             self.mtp_kv_layer_slot = None
+        # Cumulative prefix-match back-off telemetry, by reason (see `_mtp_trim_prefix_match`).
+        # Each entry is [chunks affected, blocks declined]; only executed chunks are counted.
+        self.mtp_prefix_backoff_stats = {reason: [0, 0] for reason in MTP_BACKOFF_REASONS}
+        # Complete prompt blocks left unregistered because they follow a declined block.
+        self.mtp_prefix_unregistered_blocks = 0
 
     def _mtp_initialize_metadata(self) -> None:
         """Create MTP metadata after the context's request and block limits are known."""
@@ -152,8 +163,11 @@ class MTPContextMixin:
         req: DynamicInferenceRequest,
         matched_block_ids: List[int],
         already_allocated_blocks: int,
-    ) -> Tuple[List[int], int]:
-        """Return the inheritable prefix and the number of blocks declined for MTP."""
+    ) -> Tuple[List[int], int, Optional[str]]:
+        """Return the inheritable prefix, the blocks declined for MTP, and why they were.
+
+        The reason is one of `MTP_BACKOFF_REASONS`, or None when nothing was declined.
+        """
         # MTP draft KV: give up matched blocks we cannot inherit correctly. A block's FINAL draft
         # slot consumes one token past the block, so it is not determined by the block's hash and
         # the block is ref-counted, meaning it cannot be corrected in place. Keep a block only
@@ -168,11 +182,13 @@ class MTPContextMixin:
         # inherit descendants without owning their canonical ancestors. Trim the list rather
         # than the skip so the two stay consistent.
         backed_off_blocks = 0
+        reason = None
         if self.enable_mtp_kv_cache and matched_block_ids:
             if (
                 self.mtp_metadata.chunk_boundary_req_id == req.request_id
                 or req.mtp_private_suffix_start is not None
             ):
+                reason = "private" if req.mtp_private_suffix_start is not None else "carry"
                 backed_off_blocks = len(matched_block_ids)
                 matched_block_ids = []
             else:
@@ -194,10 +210,18 @@ class MTPContextMixin:
                     # against, so equality there is not agreement -- neither is inheritable.
                     if producer_next < 0 or producer_next != our_next:
                         keep = k
+                        reason = "unwritten" if producer_next < 0 else "mismatch"
                         break
                 backed_off_blocks = len(matched_block_ids) - keep
                 matched_block_ids = matched_block_ids[:keep]
-        return matched_block_ids, backed_off_blocks
+        return matched_block_ids, backed_off_blocks, reason
+
+    def _mtp_record_backoff(self, match) -> None:
+        """Accumulate one executed chunk's back-off into `mtp_prefix_backoff_stats`."""
+        if match.backed_off_blocks and match.mtp_backoff_reason is not None:
+            stats = self.mtp_prefix_backoff_stats[match.mtp_backoff_reason]
+            stats[0] += 1
+            stats[1] += match.backed_off_blocks
 
     @property
     def _decode_kv_lookahead_tokens(self) -> int:
