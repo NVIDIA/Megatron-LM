@@ -1445,8 +1445,8 @@ def _offs_to_m_indices(offs: torch.Tensor, m_total: int) -> torch.Tensor:
           row of expert i in the contiguous M dimension. Equivalently, offs[i] is
           the start of expert i+1.
     Returns: int32 [m_total] m_indices[r] = expert id for row r. Rows past offs[-1]
-             (post-padding tail when m_total > offs[-1]) get -1; DeepGEMM skips
-             those rows.
+             (post-padding tail when m_total > offs[-1]) get -1; DeepGEMM computes
+             and stores them with expert 0's weights, and callers ignore them.
     """
     rows = torch.arange(m_total, device=offs.device, dtype=torch.int32)
     # For row r, expert id = bisect_right(offs, r). torch.searchsorted is deterministic.
@@ -1476,8 +1476,8 @@ def _m_splits_to_m_indices(m_splits: List[int], device: torch.device, m_total: i
 # per-expert block on the grouped axis to be a multiple of this alignment
 # (typically 128 on SM90/SM100). We pad inputs to satisfy this, then strip the
 # padding from the output. Padding rows are zeros (correct identity for the
-# reduction sum) and tagged with m_indices=-1 for the M-grouped case so the
-# kernel can skip them in store.
+# reduction sum) and tagged with m_indices=-1 for the M-grouped case; DeepGEMM
+# still computes and stores them (with expert 0's weights), and they are dropped.
 _DEEPGEMM_M_ALIGNMENT: Optional[int] = None
 
 
@@ -1492,7 +1492,7 @@ def _deepgemm_m_alignment() -> int:
 def grouped_gemm_batch_invariant_alignment() -> int:
     """Return the M alignment required by the DeepGEMM grouped-GEMM backend.
 
-    Every expert block passed to grouped_gemm_batch_invariant must start at a multiple of it.
+    Expert offsets passed to grouped_gemm_batch_invariant must be built with a multiple of it.
     """
     _require_deepgemm_bf16("get_m_alignment_for_contiguous_layout")
     return _deepgemm_m_alignment()
@@ -1660,7 +1660,7 @@ def _bf16_grouped_gemm_wgrad_contiguous(
 
 
 def grouped_gemm_batch_invariant(
-    a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, m_total: int
+    a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, offs_alignment: int, m_total: int
 ) -> torch.Tensor:
     """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks.
 
@@ -1668,23 +1668,32 @@ def grouped_gemm_batch_invariant(
         a: [m_total, K] bf16 rows, grouped by expert.
         b: [E, N, K] bf16 per-expert weights.
         offs: [E] int32 on a's device. offs[e] is the end row of expert e's block, which
-            starts at offs[e - 1] (row 0 for expert 0). Every block must start at a multiple
-            of grouped_gemm_batch_invariant_alignment(), as the inference permute lays them
-            out (permute_tokens with alignment=grouped_gemm_batch_invariant_alignment()).
-            Rows from offs[-1] to m_total belong to no expert; their output is unspecified.
+            starts at offs[e - 1] (row 0 for expert 0). Rows from offs[-1] to m_total belong
+            to no expert; their output is unspecified.
+        offs_alignment: the alignment offs were built with: every block starts at a
+            multiple of it, as permute_tokens(alignment=offs_alignment) lays them out. It
+            must be a multiple of grouped_gemm_batch_invariant_alignment().
         m_total: number of rows of a.
 
     Returns:
         [m_total, N] bf16, where row r of expert e's block is a[r] @ b[e].T.
 
-    The block alignment is a precondition and is not checked. DeepGEMM computes each M tile
-    with the expert of the tile's first row, so the rows of a block that starts inside a tile
-    are silently multiplied by the weights of the expert owning that tile's first row. The
-    offsets are on the device and change between replays of a captured CUDA graph, so
-    checking them would take a host sync, or a device-side assert that adds kernels to every
-    MoE GEMM and kills the process on a violation. Per-expert counts known on the host need
-    not be aligned: _bf16_grouped_gemm_contiguous pads them.
+    DeepGEMM computes each M tile with the expert of the tile's first row, so the rows of a
+    block that started inside a tile would silently take the weights of the expert owning
+    that tile's first row. offs_alignment and the shape of offs are checked on the host (no
+    sync, safe under CUDA-graph capture), which rejects offsets built from raw cumulative
+    counts or with another backend's alignment. The offset values are not checked: they live
+    on the device and change between graph replays, so a check would need a host sync, a
+    device-side assert (which kills the process), or a sticky device flag read at a later
+    sync, as training reads the MoE dispatcher's over_budget; nothing on the inference decode
+    path would read such a flag. Per-expert counts known on the host need not be aligned:
+    _bf16_grouped_gemm_contiguous pads them.
     """
+    required_alignment = grouped_gemm_batch_invariant_alignment()
+    assert offs_alignment > 0 and offs_alignment % required_alignment == 0, (
+        f"offs were built with alignment {offs_alignment}, but every expert block of the "
+        f"DeepGEMM grouped GEMM must start at a multiple of {required_alignment}"
+    )
     assert offs.shape == (b.shape[0],), (
         f"offs must hold one end row per expert: got shape {tuple(offs.shape)} for "
         f"{b.shape[0]} experts"

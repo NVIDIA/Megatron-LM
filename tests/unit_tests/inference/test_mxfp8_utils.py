@@ -1143,7 +1143,7 @@ class TestPermuteAndQuantizeMxfp8:
             fused_calls += 1
             return real_fused_permute(*args, **kwargs)
 
-        def fake_grouped_mm(act, weight, _offs):
+        def fake_grouped_mm(act, weight, _offs, _offs_alignment):
             return torch.zeros(
                 act.data.shape[0], weight.data.shape[1], device="cuda", dtype=torch.bfloat16
             )
@@ -1165,6 +1165,15 @@ class TestPermuteAndQuantizeMxfp8:
 
         assert fused_calls == 1
         assert output.shape == hidden.shape
+
+    @pytest.mark.parametrize("offs_alignment", [1, 16, 32, 64])
+    def test_grouped_mm_rejects_offsets_built_with_another_alignment(self, offs_alignment):
+        """MXFP8 expert blocks declared below the 128-row scale block fail before the GEMM."""
+        from megatron.core.inference.moe import fused_moe
+
+        offs = torch.tensor([offs_alignment], device="cuda", dtype=torch.int32)
+        with pytest.raises(AssertionError, match="must start at a multiple of 128"):
+            fused_moe._mxfp8_grouped_mm(None, None, offs, offs_alignment)
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("activation_type", ["squared_relu", "swiglu"])

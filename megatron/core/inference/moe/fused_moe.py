@@ -54,15 +54,29 @@ class ActivationType(Enum):
 
 
 def _bf16_grouped_mm(
-    x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
+    x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor, offs_alignment: int
 ) -> torch.Tensor:
-    """BF16 grouped GEMM using torch.nn.functional.grouped_mm."""
+    """BF16 grouped GEMM using torch.nn.functional.grouped_mm.
+
+    grouped_mm takes expert blocks at any row, so ``offs_alignment`` needs no check.
+    """
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
-def _mxfp8_grouped_mm(act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """MXFP8 scaled_grouped_mm with pre-quantized activations and weights."""
+def _mxfp8_grouped_mm(
+    act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor, offs_alignment: int
+) -> torch.Tensor:
+    """MXFP8 scaled_grouped_mm with pre-quantized activations and weights.
+
+    ``offs_alignment`` is the alignment ``offs`` were built with. scaled_grouped_mm needs each
+    expert block to start at a multiple of 32 rows and the swizzled scale layout at a multiple
+    of 128 (MXFP8_SCALE_ROW_BLOCK).
+    """
+    assert offs_alignment > 0 and offs_alignment % MXFP8_SCALE_ROW_BLOCK == 0, (
+        f"offs were built with alignment {offs_alignment}, but every MXFP8 expert block must "
+        f"start at a multiple of {MXFP8_SCALE_ROW_BLOCK}"
+    )
     return scaled_grouped_mm(
         act.data,
         weight.data.transpose(1, 2),
@@ -191,7 +205,9 @@ def mcore_fused_moe(
     use_fused_permute_quant = use_fused_activation_quant or (
         use_mxfp8 and batch_invariant_mode and not disable_fused_quant_kernels
     )
-    mm_fn: Callable[[Any, Any, torch.Tensor], torch.Tensor]
+    # Each grouped GEMM takes the alignment its offsets were built with and checks it against
+    # its own requirement on the host.
+    mm_fn: Callable[[Any, Any, torch.Tensor, int], torch.Tensor]
 
     if use_mxfp8:
         assert (
@@ -258,7 +274,7 @@ def mcore_fused_moe(
         hidden_states = _quantize_mxfp8_used_rows(
             hidden_states, offs[-1:] if batch_invariant_mode else None
         )
-    fc1_output = mm_fn(hidden_states, fc1_weight, offs)
+    fc1_output = mm_fn(hidden_states, fc1_weight, offs, expert_alignment)
 
     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
     # number of rows actually used by experts this iteration (valid tokens + alignment
@@ -290,7 +306,7 @@ def mcore_fused_moe(
         activation_out = _quantize_mxfp8_used_rows(
             activation_out, n_used if batch_invariant_mode else None
         )
-    fc2_output = mm_fn(activation_out, fc2_weight, offs)
+    fc2_output = mm_fn(activation_out, fc2_weight, offs, expert_alignment)
 
     # --- Post-processing: unpermute ---
     return unpermute_tokens(
