@@ -21,6 +21,11 @@ Triton kernels use the barrier the way the collectives do and pass messages thro
   * entry/exit: each rank writes its token with a torch kernel; the probe enters with the
     relaxed barrier the reduce-scatter kernels use, reads every peer's token over P2P, and
     leaves with the acq_rel barrier, as the fused kernel does.
+  * blocks meet their own block id: publish/read with every block of every rank delayed by its
+    own random time before publishing, so a peer's other blocks signal long before the matching
+    block has published. A barrier that matched blocks by count instead of by block id (any
+    block's signal releasing a waiter) would let a block read a slot its peer block has not
+    written yet. Delaying whole ranks cannot show this: all blocks of a rank arrive together.
   Every read must return this round's token: a barrier that lets a block through early returns
   the previous round's. Many rounds back to back, a random rank delayed before each, eager and
   replayed from a CUDA graph; grids of 1, 2, 127 and 128 blocks (the slot range), ws in
@@ -50,6 +55,9 @@ except ImportError:  # collected without Triton; the GPU tests skip before runni
 MAX_NUM_BLOCKS = SYMM_MEM_KERNEL_CONFIG.max_num_blocks
 GRIDS = [1, 2, MAX_NUM_BLOCKS - 1, MAX_NUM_BLOCKS]
 ROUNDS = 40
+BLOCK_DELAY_MAX_NS = 20_000
+"""Upper bound of the random per-block delay before a block publishes: well above the NVLink
+signal round trip and the launch skew between the blocks of one grid (a few microseconds)."""
 
 
 def gpu_test(fn):
@@ -60,18 +68,38 @@ def gpu_test(fn):
 if triton is not None:
 
     @triton.jit
+    def _global_timer_ns():
+        """The GPU's global nanosecond timer."""
+        return tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
+
+    @triton.jit
+    def _spin_ns(ns):
+        """Busy-wait at least ``ns`` nanoseconds."""
+        start = _global_timer_ns()
+        now = start
+        while now - start < ns:
+            now = _global_timer_ns()
+
+    @triton.jit
     def _publish_then_read_kernel(
         buffer_ptrs,
         signal_pad_ptrs,
         out_ptr,
         token_ptr,
+        delay_ptr,
         parity,
         RANK: tl.constexpr,
         WORLD_SIZE: tl.constexpr,
+        BLOCK_DELAYS: tl.constexpr,
     ):
         """Store this rank's token in every peer's slot [parity, block, RANK], barrier, then
-        read slots [parity, block, :] of this rank's buffer."""
+        read slots [parity, block, :] of this rank's buffer. With BLOCK_DELAYS, block ``b``
+        first waits ``delay_ptr[b]`` ns."""
         pid = tl.program_id(0)
+        if BLOCK_DELAYS:
+            _spin_ns(tl.load(delay_ptr + pid).to(tl.int64))
         peers = tl.arange(0, WORLD_SIZE)
         token = tl.load(token_ptr)
         ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
@@ -171,9 +199,11 @@ def test_publish_then_read_sees_this_round(nvls_groups, ws, mode, grid):
             hdl.signal_pad_ptrs_dev,
             out,
             tok,
+            tok,  # no per-block delays
             parity,
             RANK=hdl.rank,
             WORLD_SIZE=ws,
+            BLOCK_DELAYS=False,
             num_warps=1,
         )
 
@@ -206,6 +236,51 @@ def test_publish_then_read_sees_this_round(nvls_groups, ws, mode, grid):
         check_signal_pad(g, pad)
 
     nu.agree(check, f"publish/read barrier ({mode}, {grid} blocks)")
+
+
+@gpu_test
+@pytest.mark.parametrize("grid", [g for g in GRIDS if g > 1])
+@pytest.mark.parametrize("ws", nu.group_size_params())
+def test_blocks_meet_their_own_block_id(nvls_groups, ws, grid):
+    """Release/acquire barrier with every block delayed by its own random time (different on
+    every rank, block and round) before it publishes: block ``b`` must still wait for block
+    ``b`` of every peer, so it reads every peer's token of this round."""
+    g = nvls_groups.get(ws)
+    symm = g.buffer()
+    hdl = symm.hdl
+    slots = symm.view((2 * grid * ws,), torch.int32)
+    slots.fill_(-1)
+    tok = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.zeros(grid, ws, dtype=torch.int32, device="cuda")
+    delays = torch.zeros(grid, dtype=torch.int64, device="cuda")
+    own = g.rank_generator(nu.case_seed("block-delays", ws, grid))
+    g.sync()
+    results = []
+    for r in range(ROUNDS):
+        tok.fill_(token(r, g.rank))
+        delays.random_(0, BLOCK_DELAY_MAX_NS, generator=own)
+        _publish_then_read_kernel[(grid,)](
+            hdl.buffer_ptrs_dev,
+            hdl.signal_pad_ptrs_dev,
+            out,
+            tok,
+            delays,
+            r % 2,
+            RANK=hdl.rank,
+            WORLD_SIZE=ws,
+            BLOCK_DELAYS=True,
+            num_warps=1,
+        )
+        results.append(out.clone())
+    nu.sync_world()
+    pad = _signal_pad_slots(hdl, ws).clone()
+
+    def check():
+        for r, got in enumerate(results):
+            ou.assert_exact(got, expected_tokens(r, grid, ws), what=f"round {r}: tokens read")
+        check_signal_pad(g, pad)
+
+    nu.agree(check, f"publish/read barrier with per-block delays ({grid} blocks)")
 
 
 @gpu_test
