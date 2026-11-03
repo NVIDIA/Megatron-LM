@@ -31,6 +31,9 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
+    # Physical sample lengths in the CP-local zigzag stream, before TP/SP slicing.
+    # Unlike tokens_per_sample, these include per-document padding and may differ.
+    moe_sample_lengths: tuple[int, ...] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

@@ -1727,8 +1727,10 @@ def test_packed_sequence_dataset_built_on_rank(
 @pytest.mark.parametrize("metadata_only", [False, True], ids=["token-stage", "middle-stage"])
 @pytest.mark.parametrize(
     "cp_rank, expected_padding",
-    [(0, [False, True, False, False, True, True]),
-     (1, [False, False, False, False, False, True])],
+    [
+        (0, [False, True, False, False, True, True]),
+        (1, [False, False, False, False, False, True]),
+    ],
 )
 def test_padded_zigzag_constructs_padding_mask(metadata_only, cp_rank, expected_padding):
     batch = {
@@ -1745,11 +1747,58 @@ def test_padded_zigzag_constructs_padding_mask(metadata_only, cp_rank, expected_
         patch("torch.distributed.get_rank", return_value=cp_rank),
     ):
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", dynamic_cp=False,
-            cp_group=MagicMock(), use_per_sequence_balancing=True,
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
         )
 
     torch.testing.assert_close(
         cp_batch.get_batch()["padding_mask"], torch.tensor([expected_padding])
     )
     assert cp_batch.get_batch()["padding_mask"].dtype == torch.bool
+
+
+def test_padded_zigzag_keeps_original_sample_boundaries():
+    # Three length-8 samples, each containing length-3 and length-5 documents.
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 3, 8, 11, 16, 19, 24]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([5], dtype=torch.int32),
+    }
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
+            tokens_per_sample=8,
+        )
+
+    assert cp_batch.get_packed_seq_params().moe_sample_lengths == (6, 6, 6)
+
+
+def test_padded_zigzag_keeps_unequal_sample_lengths():
+    # The first length-8 sample has two documents; the second has one.
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 3, 8, 16]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+    }
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
+            tokens_per_sample=8,
+        )
+
+    assert cp_batch.get_packed_seq_params().moe_sample_lengths == (6, 4)

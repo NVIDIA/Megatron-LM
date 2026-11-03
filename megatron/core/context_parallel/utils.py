@@ -177,6 +177,25 @@ def _build_packed_seq_params(
         else physical_cu_seqlens
     )
 
+    moe_sample_lengths = None
+    if use_logical_qkv_seqlens and tokens_per_sample is not None:
+        # Each original fixed-length sample ends on a document boundary. Map those
+        # boundaries into the padded stream before converting to CP-local lengths.
+        sample_ends = torch.arange(
+            0, cu_seqlens[-1], tokens_per_sample, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        )[1:]
+        document_ends = torch.searchsorted(cu_seqlens, sample_ends)
+        if not torch.equal(cu_seqlens.index_select(0, document_ends), sample_ends):
+            raise ValueError("A packed sample boundary must also be a document boundary")
+        physical_sample_ends = torch.cat(
+            (
+                physical_cu_seqlens[:1],
+                physical_cu_seqlens.index_select(0, document_ends),
+                physical_cu_seqlens[-1:],
+            )
+        )
+        moe_sample_lengths = tuple((physical_sample_ends.diff() // cp_size).tolist())
+
     max_seqlen = int(batch['max_seqlen'].item())
     local_cp_size = batch.get('local_cp_size')
     return PackedSeqParams(
@@ -191,6 +210,7 @@ def _build_packed_seq_params(
         cp_group=batch.get('hybrid_cp_group'),
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
+        moe_sample_lengths=moe_sample_lengths,
         pad_between_seqs=pad_between_seqs,
     )
 

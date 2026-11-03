@@ -1213,7 +1213,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         Returns:
             (hidden_states, padding_mask, input_ids, mbs) where mbs is None if no
-            un-flattening was applied.
+            un-flattening was applied. For padded samples the final value is a
+            tuple of local sample lengths used to remove router-view padding.
         """
         if (
             not self.is_moe_layer
@@ -1221,6 +1222,61 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             or getattr(packed_seq_params, 'tokens_per_sample', None) is None
         ):
             return hidden_states, padding_mask, input_ids, None
+
+        sample_lengths = getattr(packed_seq_params, 'moe_sample_lengths', None)
+        if sample_lengths is not None:
+            if len(sample_lengths) == 1:
+                return hidden_states, padding_mask, input_ids, None
+            # Preserve every sample as a router batch entry, even when TP/SP owns
+            # only part of it. Use the same padded shape on every TP rank so the
+            # token dispatcher's collectives still have matching sizes.
+            max_length = max(sample_lengths)
+            local_start = (
+                self.tp_group.rank() * hidden_states.size(0) if self.config.sequence_parallel else 0
+            )
+            local_end = local_start + hidden_states.size(0)
+            sample_start = 0
+            local_lengths = []
+            for length in sample_lengths:
+                sample_end = sample_start + length
+                local_lengths.append(
+                    max(0, min(sample_end, local_end) - max(sample_start, local_start))
+                )
+                sample_start = sample_end
+            local_lengths = tuple(local_lengths)
+            if sum(local_lengths) != hidden_states.size(0):
+                raise ValueError("Packed sample lengths do not cover the MoE input")
+
+            def pad_samples(tensor, fill_value):
+                samples = tensor.split(local_lengths, dim=0)
+                return torch.stack(
+                    [
+                        torch.cat(
+                            (
+                                sample,
+                                sample.new_full(
+                                    (max_length - sample.size(0), *sample.shape[1:]), fill_value
+                                ),
+                            )
+                        )
+                        for sample in samples
+                    ]
+                )
+
+            # Padding for this rectangular router view is distinct from attention
+            # padding. Both must be excluded from auxiliary losses and bias updates.
+            if padding_mask is None:
+                padding_mask = torch.zeros(
+                    hidden_states.size(0), dtype=torch.bool, device=hidden_states.device
+                )
+            hidden_states = pad_samples(hidden_states.squeeze(1), 0).transpose(0, 1).contiguous()
+            padding_mask = pad_samples(padding_mask.reshape(-1), True)
+            if input_ids is not None:
+                input_ids = input_ids.reshape(-1)
+                if input_ids.numel() == sum(sample_lengths):
+                    input_ids = input_ids[local_start:local_end]
+                input_ids = pad_samples(input_ids, 0)
+            return hidden_states, padding_mask, input_ids, local_lengths
 
         tokens_per_sample = packed_seq_params.tokens_per_sample
         mbs = hidden_states.shape[0] // tokens_per_sample
@@ -1231,7 +1287,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # from sample 1, etc. A plain reshape would keep that ordering, but we
         # need dim 0 to be the token position and dim 1 to be the sample index,
         # so view + transpose is required.
-        hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
+        hidden_states = (
+            hidden_states.view(mbs, tokens_per_sample, hidden_states.size(-1))
+            .transpose(0, 1)
+            .contiguous()
+        )
         if padding_mask is not None:
             padding_mask = padding_mask.view(mbs, tokens_per_sample)
         if input_ids is not None:
@@ -1242,6 +1302,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
         if mbs is None:
             return output
+        if isinstance(mbs, tuple):
+            return torch.cat(
+                [output[:length, sample] for sample, length in enumerate(mbs)]
+            ).unsqueeze(1)
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
     def _pre_mlp_layernorm_and_residual(
