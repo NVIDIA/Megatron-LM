@@ -461,12 +461,10 @@ class MultimodalRotaryEmbedding(nn.Module):
         if self.seq_len_interpolation_factor is not None:
             seq *= 1 / self.seq_len_interpolation_factor
 
-        # shape (3, bs, dim, 1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].expand(3, seq.shape[1], -1, 1)
-        # shape (3, bs, 1, seq_length)
-        seq_expanded = seq[:, :, None, :].float()
         # shape (3, bs, seq_length, dim)
-        freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
+        # Element-wise multiply avoids cuBLAS, which may use TF32 for fp32
+        # matmuls and corrupt angles at large positions (see #8842).
+        freqs = seq[:, :, :, None].float() * self.inv_freq
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if not self.rotary_interleaved:

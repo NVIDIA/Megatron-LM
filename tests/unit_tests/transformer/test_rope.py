@@ -48,6 +48,32 @@ class TestMultimodalRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_precision_under_tf32(self):
+        """Regression test for #8842: angles must stay accurate when TF32 is
+        allowed for fp32 matmuls."""
+        dim = 64
+        rotary_base = 1e7
+        rope = MultimodalRotaryEmbedding(dim, rotary_percent=1.0, rotary_base=int(rotary_base))
+        inv_freq = rope.inv_freq
+
+        seq_len = 4096
+        position_ids = torch.arange(seq_len, device="cuda", dtype=torch.long).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
+        mrope_section = [dim // 8, dim // 4 - dim // 8, dim // 4 - dim // 8]
+
+        ref = position_ids[0, 0].double()[:, None] * inv_freq.double()
+
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            output = rope(position_ids, mrope_section=mrope_section)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+        freqs = output[:, 0, 0, : dim // 2].double()
+        max_err = (freqs - ref).abs().max().item()
+        assert max_err < 1e-3, f"RoPE angle error {max_err:.4f} rad exceeds tolerance under TF32"
+
 
 class TestRotaryEmbedding:
     def setup_method(self):
