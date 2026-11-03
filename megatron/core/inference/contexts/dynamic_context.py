@@ -288,6 +288,8 @@ class PromptLogprobsWrite:
         block_ids (Tensor): Block holding each row's source token.
         slots (Tensor): Position of each row's source token within its block.
         next_token_ids (Tensor): Token each row scores.
+        pinned_block_ids (Tensor): Blocks pinned until the rows are stored: the request's
+            blocks from its first through the last row's block.
     """
 
     request_index: int
@@ -296,6 +298,7 @@ class PromptLogprobsWrite:
     block_ids: Tensor
     slots: Tensor
     next_token_ids: Tensor
+    pinned_block_ids: Tensor
 
 
 class DynamoHelper:
@@ -5316,6 +5319,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         the forward that produced the rows. The pin keeps a finished request's
         blocks from being evicted and reused before `commit_prompt_logprob_writes`
         stores the rows, which under async scheduling happens after admission.
+        It covers each request's earlier blocks too: block hashes are parent-chained,
+        and prefix matching assumes that a cached block's ancestors are cached.
 
         Returns:
             List[PromptLogprobsWrite]: One entry per prefill request with prompt rows.
@@ -5354,21 +5359,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 next_token_ids = torch.cat(
                     (next_token_ids, torch.tensor([self.chunked_prefill_next_prompt_token_id]))
                 )
+            block_table = self.request_to_kv_block_ids[self.paused_request_count + request_index]
+            row_blocks = positions // self.block_size_tokens
             writes.append(
                 PromptLogprobsWrite(
                     request_index=request_index,
                     num_rows=num_prompt_rows,
                     top_n=int(top_n[request_index]),
-                    block_ids=self.request_to_kv_block_ids[
-                        self.paused_request_count + request_index
-                    ][positions // self.block_size_tokens].clone(),
+                    block_ids=block_table[row_blocks].clone(),
                     slots=positions % self.block_size_tokens,
                     next_token_ids=next_token_ids,
+                    pinned_block_ids=block_table[: int(row_blocks.max()) + 1].clone(),
                 )
             )
         if writes:
+            # Pinning only the rows' blocks would let a request that finishes before the
+            # commit release its earlier blocks, and REF_ZERO would deregister those
+            # ancestors while their pinned descendants stay cached.
             self.kv_block_allocator.retain_memory_blocks(
-                torch.cat([write.block_ids for write in writes]).unique().tolist()
+                torch.cat([write.pinned_block_ids for write in writes]).unique().tolist()
             )
         return writes
 
@@ -5408,7 +5417,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
         finally:
             allocator.release_memory_blocks(
-                torch.cat([write.block_ids for write in writes]).unique()
+                torch.cat([write.pinned_block_ids for write in writes]).unique()
             )
 
     def get_kvcache_utilization_stats(self) -> dict:

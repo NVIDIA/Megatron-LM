@@ -5834,6 +5834,81 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_prompt_log_prob_pin_keeps_prefix_chain_cached(self) -> None:
+        """Blocks pinned for prompt log-probs must keep their ancestors cached.
+
+        8-token blocks, a 12-token step budget, prefix caching with REF_ZERO, and async
+        scheduling. Request 0 returns prompt log-probs for a 24-token prompt, prefilled in
+        chunks of 12 and 12, and finishes after one token. Its second chunk's rows lie in
+        blocks 1 and 2, which stay pinned until their rows are stored, after the next
+        admission. Request 1 shares the prompt and waits for that admission. Had only the
+        rows' blocks been pinned, block 0 would leave the cache when request 0 finished,
+        and request 1's prefix match would find block 1 cached without its parent.
+        """
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=2,
+                context_max_tokens=12,
+                enable_chunked_prefill=True,
+                enable_prefix_caching=True,
+                prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+                materialize_only_last_token_logits=False,
+                model_provider="gpt",
+            )
+        )
+        engine = env.engine
+
+        # Paged attention kernels need 256-token blocks; scheduling needs no real logits.
+        def mock_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            return torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+
+        engine.controller.inference_wrapped_model.model.forward = mock_forward
+        prompt = torch.arange(1, 25, dtype=torch.int64, device=torch.cuda.current_device())
+
+        def add(request_id, **sampling_kwargs):
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt.clone(),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs
+                    ),
+                )
+            )
+
+        add(0, return_log_probs=True, skip_prompt_log_probs=False)
+        # Step until request 0's second chunk is launched.
+        for _ in range(4):
+            if 0 not in engine.waiting_request_ids:
+                break
+            engine.step_modern()
+        assert 0 not in engine.waiting_request_ids
+        assert not engine.get_request(0).generated_tokens
+        add(1)
+
+        finished = {}
+        for _ in range(10):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        assert {i: len(r.generated_tokens) for i, r in finished.items()} == {0: 1, 1: 1}
+        assert len(finished[0].prompt_log_probs) == len(prompt) - 1
+        # Request 1 reused the prefix that request 0 cached; request 0 found nothing to reuse.
+        assert engine._prefill_tokens_skipped > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
