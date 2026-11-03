@@ -1292,8 +1292,9 @@ class TransformerConfig(ModelParallelConfig):
 
     Enable this when local token counts can differ across ranks. When disabled, the caller must
     guarantee equal token counts across the HybridEP communication group, for example by padding
-    THD inputs to a fixed maximum before dispatch. CUDA Graph inputs should be statically padded
-    upstream and leave this option disabled.
+    THD inputs to a fixed maximum before dispatch (``pad_packed_seq_alignment='max'`` does this
+    for sequence packing). CUDA Graph inputs should be statically padded upstream and leave this
+    option disabled.
     """
 
     moe_hybridep_pad_uneven_dispatch_inputs: bool = False
@@ -6109,16 +6110,21 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # With pad_packed_seq_alignment='max' every DP x CP rank already holds
+                # exactly max_seqlen_per_dp_cp_rank tokens, so the dispatcher ranks see
+                # equal counts without the runtime equalization.
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    and self.pad_packed_seq_alignment != "max"
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
                         "moe_hybridep_pad_variable_tokens=True because packed token "
-                        "counts can differ across dispatcher ranks"
+                        "counts can differ across dispatcher ranks "
+                        "(or pad_packed_seq_alignment='max', which equalizes them)"
                     )
 
         if self.cuda_graph_impl != "none" and (
