@@ -303,6 +303,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_use_repeated_layer": False,
     "multi_latent_attention": False,
     "muon_ht_eps": 1e-15,
+    "muon_ht_init": False,
     "muon_ht_radius": None,
     "nccl_all_reduce_for_prefill": False,
     "no_rope_freq": None,

@@ -127,6 +127,26 @@ def test_finalization_resolves_layer_wise_ddp_flag(
     assert run_config.ddp.use_distributed_optimizer is (not layer_wise)
 
 
+@pytest.mark.parametrize("optimizer", ["muon_h", "muon_ht", "adam"])
+@pytest.mark.parametrize("radius", [None, 2.5])
+def test_finalization_selects_hyperball_model_initialization(
+    monkeypatch, run_config, optimizer, radius
+):
+    """Native config-based builds share the optimizer's initialization policy."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
+    run_config.train.micro_batch_size = 1
+    run_config.optimizer.optimizer = optimizer
+    run_config.optimizer.muon_ht_radius = radius
+    run_config.optimizer.muon_ht_eps = 1e-12
+    run_config.finalize()
+    assert transformer.muon_ht_init is (optimizer != "adam")
+    assert transformer.muon_ht_radius == (radius if optimizer != "adam" else None)
+    if optimizer != "adam":
+        assert transformer.muon_ht_eps == 1e-12
+
+
 def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     run_config.train.micro_batch_size = 1

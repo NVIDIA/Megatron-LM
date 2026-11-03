@@ -2752,7 +2752,8 @@ def _add_regularization_args(parser):
         "--muon-ht-radius",
         type=float,
         default=None,
-        help="Fixed global Frobenius norm required to initialize all muon_h/muon_ht parameters",
+        help="Optional common Frobenius radius for muon_h/muon_ht; by default use fan-in "
+        "Gaussian initialization and preserve each matrix's sampled norm",
     )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '

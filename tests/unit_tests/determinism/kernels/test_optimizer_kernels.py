@@ -188,7 +188,8 @@ def test_fused_adam_step_replays(monkeypatch, rmsnorm_weight_decay_mult):
     not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
 )
 @pytest.mark.parametrize("optimizer_cls", [TensorParallelMuonH, TensorParallelMuonHT])
-def test_hyperball_muon_update_replays(optimizer_cls):
+@pytest.mark.parametrize("configured_radius", [None, 2.5])
+def test_hyperball_muon_update_replays(optimizer_cls, configured_radius):
     """MuonH/HT projection, normalization, update, and retraction are bit-exact."""
     seeded()
     radius = 2.5
@@ -204,12 +205,14 @@ def test_hyperball_muon_update_replays(optimizer_cls):
         momentum=0.0,
         nesterov=False,
         weight_decay=0.0,
-        hyperball_radius=radius,
+        hyperball_radius=configured_radius,
         pg_collection=pg_collection,
         tp_mode="duplicated",
     )
 
     def hyperball_update(weight, raw_update):
+        # Replay starts with fresh weights; exercise lazy radius discovery each time.
+        optimizer.reset_parameter_cache()
         if optimizer_cls is TensorParallelMuonHT:
             raw_update = optimizer._project_gradient_to_tangent(weight, raw_update)
         optimizer.pre_weight_update_fn_inplace(weight, raw_update)

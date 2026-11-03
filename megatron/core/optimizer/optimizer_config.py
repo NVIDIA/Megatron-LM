@@ -340,9 +340,9 @@ class OptimizerConfig:
     """Minimum norm used for numerical stability by TensorParallelMuonH and MuonHT."""
 
     muon_ht_radius: float | None = None
-    """Fixed global Frobenius norm required by TensorParallelMuonH and MuonHT. Megatron model
-    initialization places every Muon-managed matrix at this radius before constructing
-    mixed-precision and distributed wrappers."""
+    """Optional common Frobenius radius for TensorParallelMuonH and MuonHT. None preserves
+    each matrix's initial logical norm after Megatron's fan-in initialization. Derived
+    radii are not checkpoint state; they are reconstructed from restored weights."""
 
     # Lion.
     lion_beta1: float = 0.95

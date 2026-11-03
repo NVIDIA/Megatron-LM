@@ -177,9 +177,17 @@ def prepare_existing_model_chunks_for_distributed_training(
         raise ValueError("ddp_config is required when wrap_with_ddp is True")
 
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
-    muon_ht_radius = (
-        transformer_config.muon_ht_radius if transformer_config.perform_initialization else None
+    muon_ht_radius = transformer_config.muon_ht_radius
+    initialize_hyperball = transformer_config.perform_initialization and (
+        transformer_config.muon_ht_init or muon_ht_radius is not None
     )
+    if initialize_hyperball and init_model_with_meta_device and (
+        use_torch_fsdp2 or use_megatron_fsdp
+    ):
+        raise ValueError(
+            "Muon Hyperball initialization requires materialized parameters before FSDP "
+            "wrapping; disable init_model_with_meta_device or perform_initialization"
+        )
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -199,7 +207,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
-    if not init_model_with_meta_device and muon_ht_radius is not None:
+    if not init_model_with_meta_device and initialize_hyperball:
         initialize_muon_ht_parameters(
             model_list,
             radius=muon_ht_radius,
@@ -215,7 +223,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             to_empty_if_meta_device(model_module, device=torch.device("cuda"))
             for model_module in model_list
         ]
-        if muon_ht_radius is not None:
+        if initialize_hyperball:
             initialize_muon_ht_parameters(
                 model_list,
                 radius=muon_ht_radius,

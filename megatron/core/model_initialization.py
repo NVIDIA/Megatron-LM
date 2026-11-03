@@ -8,15 +8,15 @@ from collections.abc import Iterable
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 
 def validate_hyperball_config(eps: float, radius: float | None) -> None:
-    """Validate fixed-radius Hyperball configuration."""
+    """Validate Hyperball configuration; None selects the sampled initial radius."""
     if not math.isfinite(eps) or eps <= 0.0:
         raise ValueError(f"hyperball_eps must be finite and positive, got {eps}")
     if radius is None:
-        raise ValueError("Muon Hyperball requires hyperball_radius to be configured")
+        return
     if not math.isfinite(radius) or radius < eps:
         raise ValueError(
             f"hyperball_radius must be finite and at least hyperball_eps={eps}, got {radius}"
@@ -67,6 +67,86 @@ def _parameter_shard_groups(
     return tuple(groups)
 
 
+def logical_matrix_rows(param: torch.Tensor, pg_collection: ProcessGroupCollection) -> int:
+    """Return the number of non-padding rows in this rank's matrix shard."""
+    if not getattr(param, "is_gtp_weight_remat", False):
+        return param.shape[0]
+    group = pg_collection.expt_gtp_remat if _is_expert_parameter(param) else pg_collection.gtp_remat
+    if group is None:
+        raise RuntimeError("Muon Hyperball is missing the parameter's GTP-remat group")
+    rows = param.shape[0]
+    logical_rows = rows * get_pg_size(group) - getattr(param, "pad_length", 0)
+    return max(0, min(rows, logical_rows - get_pg_rank(group) * rows))
+
+
+def _initialize_fan_in_normal(param: torch.Tensor, pg_collection: ProcessGroupCollection) -> None:
+    """Sample a logical matrix with variance 1/fan_in using Megatron's RNG streams."""
+    from megatron.core.tensor_parallel.layers import _initialize_affine_weight_cpu
+    from megatron.core.tensor_parallel.random import (
+        get_cuda_rng_tracker,
+        get_data_parallel_rng_tracker_name,
+        get_expert_parallel_rng_tracker_name,
+        get_gtp_remat_rng_tracker_name,
+    )
+
+    is_expert = _is_expert_parameter(param)
+    tp_group = pg_collection.expt_tp if is_expert else pg_collection.tp
+    tp_size = get_pg_size(tp_group) if _is_tensor_parallel_shard(param) else 1
+    partition_dim = getattr(param, "partition_dim", -1)
+    fan_in = param.shape[1] * (tp_size if partition_dim == 1 else 1)
+    std = fan_in**-0.5
+    gtp_group = None
+    if getattr(param, "is_gtp_weight_remat", False):
+        gtp_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+    gtp_size = get_pg_size(gtp_group)
+
+    if param.device.type == "cpu":
+        # Reuse master-matrix sampling and strided TP slicing, so CPU initialization is
+        # invariant to TP/GTP partitioning. Slice GTP using the existing parameter's
+        # padding metadata, not the current global GTP alignment configuration.
+        tp_rows = param.shape[0] * gtp_size - getattr(param, "pad_length", 0)
+        output_size = tp_rows * (tp_size if partition_dim == 0 else 1)
+        dim = partition_dim if partition_dim in (0, 1) else 0
+        tp_weight = torch.empty(tp_rows, param.shape[1], dtype=param.dtype, device="cpu")
+        _initialize_affine_weight_cpu(
+            tp_weight,
+            output_size,
+            fan_in,
+            tp_rows if dim == 0 else param.shape[1],
+            dim,
+            lambda weight: torch.nn.init.normal_(weight, mean=0.0, std=std),
+            stride=getattr(param, "partition_stride", 1),
+            params_dtype=param.dtype,
+            rank=get_pg_rank(tp_group) if tp_size > 1 else 0,
+            world_size=tp_size,
+            skip_set_tensor_parallel_attributes=True,
+        )
+        row_start = get_pg_rank(gtp_group) * param.shape[0]
+        rows = logical_matrix_rows(param, pg_collection)
+        param.zero_()
+        param[:rows].copy_(tp_weight[row_start : row_start + rows])
+    else:
+        if gtp_size > 1:
+            rng_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
+        elif is_expert:
+            rng_name = get_expert_parallel_rng_tracker_name()
+        elif _is_tensor_parallel_shard(param):
+            rng_name = None
+        else:
+            rng_name = get_data_parallel_rng_tracker_name()
+        tracker = get_cuda_rng_tracker()
+        rng_context = tracker.fork() if rng_name is None else tracker.fork(rng_name)
+        with rng_context:
+            torch.nn.init.normal_(param, mean=0.0, std=std)
+
+    param[logical_matrix_rows(param, pg_collection) :].zero_()
+    # Quantized primary weights can carry an initialization snapshot used to seed
+    # master weights. Keep it consistent with the new initialization.
+    high_precision_init_val = getattr(param, "_high_precision_init_val", None)
+    if high_precision_init_val is not None:
+        high_precision_init_val.copy_(param)
+
+
 def logical_frobenius_norm(
     tensor: torch.Tensor, param: torch.Tensor, pg_collection: ProcessGroupCollection
 ) -> torch.Tensor:
@@ -83,7 +163,8 @@ def logical_frobenius_inner_product(
     """Compute an FP32 Frobenius inner product over all unique shards of a parameter."""
     if pg_collection is None:
         raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
-    inner_product = (lhs.float() * rhs.float()).sum()
+    rows = logical_matrix_rows(param, pg_collection)
+    inner_product = (lhs[:rows].float() * rhs[:rows].float()).sum()
     for group in _parameter_shard_groups(param, pg_collection):
         reduction_input = inner_product
         if inner_product.device.type == "cpu" and torch.distributed.get_backend(group) == "nccl":
@@ -100,11 +181,17 @@ def logical_frobenius_inner_product(
 @torch.no_grad()  # type: ignore[misc]
 def initialize_muon_ht_parameters(
     model_chunks: Iterable[torch.nn.Module],
-    radius: float,
+    radius: float | None,
     eps: float,
     pg_collection: ProcessGroupCollection,
 ) -> None:
-    """Place every MuonH- or MuonHT-managed parameter on the configured sphere."""
+    """Initialize managed matrices with fan-in Gaussian draws or an explicit radius.
+
+    With radius=None, sample N(0, 1/d_in) using the logical (unsharded) fan-in.
+    The optimizer discovers each sampled radius lazily from the initialized/restored
+    weights, after mixed-precision copies; no radius tensor is attached to parameters.
+    An explicit radius instead rescales the existing initialization, as before.
+    """
     if pg_collection is None:
         raise ValueError("Muon Hyperball requires an explicit ProcessGroupCollection")
     validate_hyperball_config(eps, radius)
@@ -116,6 +203,10 @@ def initialize_muon_ht_parameters(
             if id(param) in seen_params or not is_muon_parameter(param):
                 continue
             seen_params.add(id(param))
+            # Validate topology before drawing random numbers or reducing any shard.
+            _parameter_shard_groups(param, pg_collection)
+            if radius is None:
+                _initialize_fan_in_normal(param, pg_collection)
             norm = logical_frobenius_norm(param, param, pg_collection)
             if bool((~torch.isfinite(norm) | (norm < eps)).item()):
                 raise ValueError(
@@ -123,5 +214,7 @@ def initialize_muon_ht_parameters(
                 )
             params_and_norms.append((param, norm))
 
-    for param, norm in params_and_norms:
-        param.mul_(radius / norm)
+    if radius is not None:
+        for param, norm in params_and_norms:
+            param.mul_(radius / norm)
+            param[logical_matrix_rows(param, pg_collection) :].zero_()

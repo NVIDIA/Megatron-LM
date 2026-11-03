@@ -6,6 +6,7 @@ import torch.nn as nn
 
 import megatron.core.parallel_state as ps
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.model_initialization import initialize_muon_ht_parameters
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
@@ -41,6 +42,84 @@ class Test:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "enabled,perform_initialization", [(True, True), (False, True), (True, False)]
+    )
+    def test_default_hyperball_initialization_uses_fan_in_only_when_enabled(
+        self, enabled, perform_initialization
+    ):
+        """The model lifecycle uses Gaussian draws, not projection to sqrt(d_out)."""
+        Utils.initialize_model_parallel(1, 1)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            muon_ht_init=enabled,
+            perform_initialization=perform_initialization,
+        )
+        model = nn.Linear(12, 8, bias=True)
+        before = model.weight.detach().clone()
+        bias_before = model.bias.detach().clone()
+        torch.manual_seed(123)
+        expected = torch.empty_like(model.weight).normal_(std=12**-0.5)
+        torch.manual_seed(123)
+        result = prepare_existing_model_chunks_for_distributed_training(
+            [model],
+            config,
+            _model_process_groups(),
+            wrap_with_ddp=False,
+            mixed_precision_wrapper=None,
+        )
+        torch.testing.assert_close(
+            result[0].weight,
+            expected if enabled and perform_initialization else before,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(result[0].bias, bias_before, rtol=0, atol=0)
+
+    def test_fan_in_initialization_skips_excluded_and_shared_parameters(self):
+        """Only managed matrices are sampled, and tied parameters consume one RNG draw."""
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.empty(8, 16))
+        model.tied = model.weight
+        model.excluded = nn.Parameter(torch.ones(5, 4))
+        model.excluded.use_muon = False
+        model.embedding = nn.Parameter(torch.ones(5, 4))
+        model.embedding.is_embedding_or_output_parameter = True
+        model.frozen = nn.Parameter(torch.ones(5, 4), requires_grad=False)
+        groups = ProcessGroupCollection(tp=None, expt_tp=None, gtp_remat=None, expt_gtp_remat=None)
+        torch.manual_seed(111)
+        expected = torch.empty(8, 16).normal_(std=16**-0.5)
+        next_draw = torch.randn(3)
+        torch.manual_seed(111)
+        initialize_muon_ht_parameters([model, model], None, 1e-15, groups)
+        torch.testing.assert_close(model.weight, expected, rtol=0, atol=0)
+        torch.testing.assert_close(torch.randn(3), next_draw, rtol=0, atol=0)
+        for param in (model.excluded, model.embedding, model.frozen):
+            torch.testing.assert_close(param, torch.ones_like(param), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("fsdp_flag", ["use_torch_fsdp2", "use_megatron_fsdp"])
+    def test_hyperball_meta_fsdp_init_is_rejected_instead_of_silently_skipped(self, fsdp_flag):
+        """A deferred FSDP materializer cannot bypass the model initialization contract."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            muon_ht_init=True,
+            init_model_with_meta_device=True,
+        )
+        groups = ProcessGroupCollection(tp=None, expt_tp=None, gtp_remat=None, expt_gtp_remat=None)
+        with pytest.raises(ValueError, match="materialized parameters before FSDP"):
+            prepare_existing_model_chunks_for_distributed_training(
+                [nn.Linear(12, 8, device="meta")],
+                config,
+                groups,
+                wrap_with_ddp=False,
+                **{fsdp_flag: True},
+            )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_muon_ht_init_runs_before_distributed_wrapping(self):

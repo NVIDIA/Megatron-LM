@@ -20,6 +20,7 @@ from megatron.core.model_initialization import (
     is_muon_parameter,
     logical_frobenius_inner_product,
     logical_frobenius_norm,
+    logical_matrix_rows,
     validate_hyperball_config,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -653,10 +654,12 @@ class TensorParallelMuonH(TensorParallelMuon):
 
     Applies ``W_next = R * normalize(W - lr * R * normalize(update))`` through
     Emerging Optimizers' pre- and post-weight-update extension points. Megatron model
-    initialization places every Muon-managed matrix at the configured radius ``R`` before
-    creating mixed-precision copies. FP32 norm sums are reduced only across applicable TP,
-    expert-TP, and GTP-remat shard groups. The fixed radius remains configuration rather
-    than per-parameter optimizer state, avoiding scalar distributed-checkpoint entries.
+    initialization samples N(0, 1/d_in) by default, and each matrix retains its own sampled
+    radius. An explicit radius instead rescales the existing initialization. Norms exclude
+    padding and replicas, reducing across TP, expert-TP, and GTP-remat shard groups. Radii
+    are cached outside optimizer state, discovered on the first update, and invalidated
+    on checkpoint load. Restored weights reconstruct radii within checkpoint precision;
+    no scalar distributed-checkpoint entries are introduced.
 
     This matches Emerging Optimizers' ``MuonHyperball``, often called MuonH. Unlike
     :class:`TensorParallelMuonHT`, it does not project the raw gradient onto the sphere's
@@ -665,8 +668,8 @@ class TensorParallelMuonH(TensorParallelMuon):
     Args:
         params: Iterable of parameters to optimize or dicts defining parameter groups.
         hyperball_eps: Minimum norm used for numerical stability.
-        hyperball_radius: Fixed global Frobenius norm for every parameter. Megatron model
-            initialization places Muon-managed parameters at this radius.
+        hyperball_radius: Optional common Frobenius radius. None preserves each matrix's
+            initial/restored logical norm, following https://arxiv.org/abs/2606.16899.
         pg_collection: Explicit model-parallel process groups used for sharded norms.
         **kwargs: Arguments passed to :class:`TensorParallelMuon`.
     """
@@ -675,7 +678,7 @@ class TensorParallelMuonH(TensorParallelMuon):
         self,
         params: ParamsT,
         *,
-        hyperball_radius: float,
+        hyperball_radius: float | None = None,
         pg_collection: ProcessGroupCollection,
         hyperball_eps: float = 1e-15,
         **kwargs: Any,
@@ -686,6 +689,7 @@ class TensorParallelMuonH(TensorParallelMuon):
 
         self.hyperball_eps = hyperball_eps
         self.hyperball_radius = hyperball_radius
+        self._hyperball_radii: dict[torch.Tensor, torch.Tensor] = {}
         super().__init__(params, pg_collection=pg_collection, **kwargs)
 
         for group in self.param_groups:
@@ -699,9 +703,28 @@ class TensorParallelMuonH(TensorParallelMuon):
         """Compute the FP32 Frobenius norm over all unique shards of ``p``."""
         return logical_frobenius_norm(tensor, p, self.pg_collection)
 
+    def reset_parameter_cache(self) -> None:
+        """Discard derived radii after restoring model weights or optimizer state."""
+        self._hyperball_radii.clear()
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore momentum while leaving radii to be discovered from restored weights."""
+        super().load_state_dict(state_dict)
+        self.reset_parameter_cache()
+
+    @torch.no_grad()
+    def _radius_for_parameter(self, p: torch.Tensor) -> torch.Tensor:
+        """Resolve a fixed radius only after model/master-weight restoration has finished."""
+        if self.hyperball_radius is not None:
+            return p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        if p not in self._hyperball_radii:
+            self._hyperball_radii[p] = self._global_frobenius_norm(p, p)
+        return self._hyperball_radii[p]
+
     def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
-        """Scale the global update norm to the configured radius."""
-        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        """Scale the logical update norm to the parameter's fixed radius."""
+        radius = self._radius_for_parameter(p)
+        update[logical_matrix_rows(p, self.pg_collection) :].zero_()
         update_norm = self._global_frobenius_norm(update, p)
         is_numerical_zero = update_norm < self.hyperball_eps
         scale = torch.where(
@@ -712,8 +735,11 @@ class TensorParallelMuonH(TensorParallelMuon):
         update.mul_(scale.to(dtype=update.dtype))
 
     def post_weight_update_fn_inplace(self, p: torch.Tensor) -> None:
-        """Project the global updated parameter norm back to the configured radius."""
-        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        """Retract to the radius captured before the first update, excluding padding."""
+        if self.hyperball_radius is None and p not in self._hyperball_radii:
+            raise RuntimeError("Muon Hyperball post-update requires a preceding pre-update call")
+        radius = self._radius_for_parameter(p)
+        p[logical_matrix_rows(p, self.pg_collection) :].zero_()
         p_norm = self._global_frobenius_norm(p, p)
         is_numerical_zero = p_norm < self.hyperball_eps
         scale = torch.where(
@@ -733,8 +759,8 @@ class TensorParallelMuonHT(TensorParallelMuonH):
     orthogonalization, as proposed in https://github.com/marin-community/marin/issues/2434.
     Inner products and norms use FP32 accumulation and reduce across the applicable TP,
     expert-TP, and GTP-remat shard groups. Both variants use Megatron initialization to
-    place weights at the configured radius and keep that radius as configuration rather
-    than per-parameter checkpoint state.
+    sample fan-in-scaled weights (or apply an explicit radius override). Derived radii
+    are cached outside checkpoint state and reconstructed from restored weights.
     """
 
     def _project_gradient_to_tangent(self, p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:

@@ -11,7 +11,11 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.model_initialization import initialize_muon_ht_parameters
+from megatron.core.model_initialization import (
+    initialize_muon_ht_parameters,
+    logical_frobenius_norm,
+    logical_matrix_rows,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer import emerging_optimizers as eo_mod
 from megatron.core.optimizer import get_megatron_optimizer
@@ -29,6 +33,7 @@ from megatron.core.optimizer.emerging_optimizers import (
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
@@ -857,6 +862,53 @@ def test_muon_ht_optimizer_step_preserves_configured_radius_without_state():
     torch.testing.assert_close(model.weight.norm(), restored_radius, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("optimizer_class", [TensorParallelMuonH, TensorParallelMuonHT])
+def test_hyperball_sampled_radii_survive_steps_and_are_rebuilt_after_load(optimizer_class):
+    """Distinct sampled radii stay fixed, never enter state, and follow restored weights."""
+    parameters = [
+        nn.Parameter(torch.randn(8, 16, device="cuda") / 4),
+        nn.Parameter(torch.randn(12, 4, device="cuda") / 2),
+    ]
+    optimizer = optimizer_class(
+        parameters, weight_decay=0.0, pg_collection=_muon_ht_process_groups()
+    )
+    assert not optimizer._hyperball_radii  # construction/checkpoint allocation is not discovery
+    # Mimic copying loaded/master weights after optimizer construction.
+    with torch.no_grad():
+        parameters[0].mul_(2)
+    radii = [p.norm().clone() for p in parameters]
+    for _ in range(3):
+        for p in parameters:
+            p.grad = torch.randn_like(p)
+        optimizer.step()
+        for p, radius in zip(parameters, radii):
+            torch.testing.assert_close(p.norm(), radius)
+            torch.testing.assert_close(optimizer._hyperball_radii[p], radius)
+
+    checkpoint = optimizer.state_dict()
+    assert set(checkpoint) == {"state", "param_groups"}
+    for state in checkpoint["state"].values():
+        assert not any("radius" in key or "hyperball" in key for key in state)
+        assert all(
+            not isinstance(value, torch.Tensor) or value.ndim != 0 for value in state.values()
+        )
+
+    optimizer.load_state_dict(checkpoint)
+    assert not optimizer._hyperball_radii
+    # The checkpoint weight copy can occur AFTER load_state_dict.
+    with torch.no_grad():
+        for p in parameters:
+            p.mul_(0.5)
+    restored_radii = [p.norm().clone() for p in parameters]
+    for p in parameters:
+        p.grad = torch.randn_like(p)
+    optimizer.step()
+    for p, radius in zip(parameters, restored_radii):
+        torch.testing.assert_close(p.norm(), radius)
+    optimizer.reset_parameter_cache()
+    assert not optimizer._hyperball_radii
+
+
 def test_muon_ht_fixed_radius_and_validation():
     """A fixed radius should be applied by the hooks and weight decay should be rejected."""
     parameter = torch.nn.Parameter(torch.ones(3, 4, dtype=torch.float32, device="cuda"))
@@ -885,8 +937,11 @@ def test_muon_ht_fixed_radius_and_validation():
             hyperball_radius=2.0,
             pg_collection=pg_collection,
         )
-    with pytest.raises(TypeError, match="hyperball_radius"):
-        TensorParallelMuonHT(params=[parameter], weight_decay=0.0, pg_collection=pg_collection)
+    inferred = TensorParallelMuonHT(
+        params=[parameter], weight_decay=0.0, pg_collection=pg_collection
+    )
+    assert inferred.hyperball_radius is None
+    assert not inferred._hyperball_radii
     with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
         TensorParallelMuonHT(
             params=[parameter], weight_decay=0.0, hyperball_radius=2.5, pg_collection=None
@@ -907,6 +962,92 @@ def test_muon_ht_fixed_radius_and_validation():
             hyperball_radius=1e-4,
             pg_collection=pg_collection,
         )
+
+
+@pytest.mark.skipif(
+    int(os.getenv("WORLD_SIZE", "1")) < 4, reason="Combined TP/GTP test requires at least 4 ranks"
+)
+@pytest.mark.parametrize("is_expert", [False, True])
+@pytest.mark.parametrize("partition_dim", [0, 1])
+def test_sampled_radius_uses_logical_tp_gtp_matrix_excluding_padding(is_expert, partition_dim):
+    """TP/ETP and GTP/EGTP shards reproduce a logical CPU Gaussian draw and its radius."""
+    world = int(os.environ["WORLD_SIZE"])
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+        gtp_remat_size=world // 2,
+        expert_gtp_remat_size=world // 2,
+    )
+    try:
+        groups = _muon_ht_process_groups()
+        tp = groups.expt_tp if is_expert else groups.tp
+        gtp = groups.expt_gtp_remat if is_expert else groups.gtp_remat
+        local_rows, local_cols = 3, 8
+        pad_length = gtp.size() + 1  # Padding can occupy more than one shard.
+        tp_rows = local_rows * gtp.size() - pad_length
+        logical_rows = tp_rows * (tp.size() if partition_dim == 0 else 1)
+        fan_in = local_cols * (tp.size() if partition_dim == 1 else 1)
+        parameter = nn.Parameter(torch.empty(local_rows, local_cols))
+        parameter.tensor_model_parallel = True
+        parameter.partition_dim = partition_dim
+        parameter.partition_stride = 1
+        parameter.expert_tp = is_expert
+        parameter.allreduce = not is_expert
+        parameter.is_gtp_weight_remat = True
+        parameter.pad_length = pad_length
+        model = nn.Module()
+        model.register_parameter("weight", parameter)
+        torch.manual_seed(314)
+        reference = torch.empty(logical_rows, fan_in).normal_(std=fan_in**-0.5)
+        expected_tp = reference.chunk(tp.size(), dim=partition_dim)[tp.rank()]
+        valid_rows = logical_matrix_rows(parameter, groups)
+        start = gtp.rank() * local_rows
+        torch.manual_seed(314)
+        initialize_muon_ht_parameters([model], None, 1e-15, groups)
+        torch.testing.assert_close(
+            parameter[:valid_rows], expected_tp[start : start + valid_rows], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            parameter[valid_rows:], torch.zeros_like(parameter[valid_rows:]), rtol=0, atol=0
+        )
+        expected_radius = reference.norm()
+        torch.testing.assert_close(
+            logical_frobenius_norm(parameter, parameter, groups), expected_radius
+        )
+        # Poison padding to ensure neither radius discovery nor update normalization counts it.
+        with torch.no_grad():
+            parameter[valid_rows:].fill_(float("nan"))
+        optimizer = TensorParallelMuonH([parameter], weight_decay=0.0, pg_collection=groups)
+        update = torch.ones_like(parameter)
+        with torch.no_grad():
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+            torch.testing.assert_close(
+                logical_frobenius_norm(update, parameter, groups), expected_radius
+            )
+            parameter.add_(update, alpha=-0.01)
+            optimizer.post_weight_update_fn_inplace(parameter)
+        torch.testing.assert_close(
+            logical_frobenius_norm(parameter, parameter, groups), expected_radius
+        )
+        torch.testing.assert_close(
+            parameter[valid_rows:], torch.zeros_like(parameter[valid_rows:]), rtol=0, atol=0
+        )
+        optimizer.load_state_dict(optimizer.state_dict())
+        assert not optimizer._hyperball_radii
+        with torch.no_grad():
+            parameter.mul_(0.5)  # Model restore can follow optimizer-state restore.
+            update = torch.ones_like(parameter)
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+            torch.testing.assert_close(
+                logical_frobenius_norm(update, parameter, groups), expected_radius * 0.5
+            )
+            parameter.add_(update, alpha=-0.01)
+            optimizer.post_weight_update_fn_inplace(parameter)
+        torch.testing.assert_close(
+            logical_frobenius_norm(parameter, parameter, groups), expected_radius * 0.5
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(
@@ -1065,12 +1206,15 @@ class TestMuonOptimizerMultiRank:
         ("optimizer_name", "optimizer_class"),
         [("muon_h", TensorParallelMuonH), ("muon_ht", TensorParallelMuonHT)],
     )
-    def test_get_megatron_optimizer_hyperball_muon(self, optimizer_name, optimizer_class):
+    @pytest.mark.parametrize("radius", [None, 2.5])
+    def test_get_megatron_optimizer_hyperball_muon(self, optimizer_name, optimizer_class, radius):
         """The public optimizer factory should construct and run both Hyperball variants."""
         model = self.create_ddp_model(Net().bfloat16().cuda().requires_grad_(True))
+        model_parallel_cuda_manual_seed(123)
         initialize_muon_ht_parameters(
-            [model], radius=2.5, eps=1e-15, pg_collection=_muon_ht_process_groups()
+            [model], radius=radius, eps=1e-15, pg_collection=_muon_ht_process_groups()
         )
+        initial_radii = {p: p.float().norm().clone() for p in model.parameters() if p.ndim == 2}
         optimizer_config = OptimizerConfig(
             optimizer=optimizer_name,
             lr=0.01,
@@ -1081,7 +1225,7 @@ class TestMuonOptimizerMultiRank:
             muon_num_ns_steps=5,
             muon_tp_mode="duplicated",
             muon_ht_eps=1e-15,
-            muon_ht_radius=2.5,
+            muon_ht_radius=radius,
         )
 
         with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
@@ -1103,7 +1247,7 @@ class TestMuonOptimizerMultiRank:
         ]
         assert any(type(raw) is optimizer_class for raw in raw_optimizers)
         for parameter in model.parameters():
-            if parameter.ndim == 2:
+            if parameter.ndim == 2 and radius is not None:
                 torch.testing.assert_close(
                     parameter.float().norm(),
                     torch.tensor(2.5, device=parameter.device),
@@ -1116,6 +1260,8 @@ class TestMuonOptimizerMultiRank:
         update_successful, _, _ = optimizer.step()
 
         assert update_successful
+        for p, initial_radius in initial_radii.items():
+            torch.testing.assert_close(p.float().norm(), initial_radius, rtol=1e-2, atol=1e-2)
 
     def test_get_megatron_optimizer_layer_wise(self):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""

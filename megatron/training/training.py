@@ -2630,7 +2630,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [model]
 
     config = get_model_config(model[0])
-    muon_ht_radius = config.muon_ht_radius if config.perform_initialization else None
+    hyperball_optimizer = cfg.optimizer.optimizer in ("muon_h", "muon_ht")
+    muon_ht_radius = cfg.optimizer.muon_ht_radius if hyperball_optimizer else config.muon_ht_radius
+    muon_ht_eps = cfg.optimizer.muon_ht_eps if hyperball_optimizer else config.muon_ht_eps
+    initialize_hyperball = config.perform_initialization and (
+        hyperball_optimizer or config.muon_ht_init or muon_ht_radius is not None
+    )
+    if initialize_hyperball and args.init_model_with_meta_device and (
+        cfg.dist.use_torch_fsdp2 or args.use_megatron_fsdp
+    ):
+        raise ValueError(
+            "Muon Hyperball initialization requires materialized parameters before FSDP "
+            "wrapping; disable init_model_with_meta_device or perform_initialization"
+        )
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
@@ -2672,9 +2684,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
-    if not args.init_model_with_meta_device and muon_ht_radius is not None:
+    if not args.init_model_with_meta_device and initialize_hyperball:
         initialize_muon_ht_parameters(
-            model, radius=muon_ht_radius, eps=config.muon_ht_eps, pg_collection=pg_collection
+            model, radius=muon_ht_radius, eps=muon_ht_eps, pg_collection=pg_collection
         )
 
     # Fp16 conversion.
@@ -2684,9 +2696,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not cfg.dist.use_torch_fsdp2 and not args.use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
-        if muon_ht_radius is not None:
+        if initialize_hyperball:
             initialize_muon_ht_parameters(
-                model, radius=muon_ht_radius, eps=config.muon_ht_eps, pg_collection=pg_collection
+                model, radius=muon_ht_radius, eps=muon_ht_eps, pg_collection=pg_collection
             )
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
