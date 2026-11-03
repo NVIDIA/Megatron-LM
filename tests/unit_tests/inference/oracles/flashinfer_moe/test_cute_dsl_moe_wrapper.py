@@ -18,12 +18,19 @@ Contract (from the call site, MCore's MoE math and FlashInfer's documented API):
   and a separate per-token NVFP4 quantizer requantizes it (``fc2_input_scale = 1 / 2688``).
   Quantization and that BF16 storage are the only approximations the contract allows.
 * Output: BF16 ``[rows, H]``. ``out``, ``token_capacity`` and ``use_bounded_rows`` behave as for
-  routed MXFP8 (only ``out[:rows]`` is written; the bounded prefix is ``min(capacity, T)``).
+  routed MXFP8 (only ``out[:rows]`` is written; the bounded prefix is ``min(capacity, T)``), and
+  only those rows are quantized and processed: every per-token input Megatron hands FlashInfer
+  (the per-token quantizer's input, and ``x``, ``x_sf``, ``token_selected_experts``,
+  ``token_final_scales`` and ``per_token_scale`` of ``CuteDslMoEWrapper.run``) has ``rows``
+  rows. FlashInfer sizes its work by ``token_selected_experts``, so extra rows of the other
+  inputs would not change the output: the test records the inputs at that boundary.
   The activation enum must match the weights' gating, else ValueError; non-FP32 probabilities
   raise TypeError; a wrong hidden size raises ValueError.
 * The fused finalize (default) sums a token's routes with BF16 atomics; under deterministic
   algorithms or batch-invariant mode Megatron selects the two-stage finalize, which must then be
-  bitwise reproducible and independent of the other tokens in the batch.
+  bitwise reproducible and independent of the other tokens in the batch. An unordered
+  reduction can only show with three or more local routes per token (BF16 addition of two
+  terms commutes), so the batch-invariance test also routes every token to six local experts.
 * Graph capture replays the eager result; refreshing the weights in place
   (``prepare_routed_nvfp4_weights(..., out=weights)``) reaches a captured graph. Inputs are read
   only.
@@ -42,13 +49,15 @@ magnitudes span 2**-13..2**13 (2**4..2**12 gated), so a per-token scale error sh
 check would not see it for Relu2: ``relu(s z)**2 = s**2 relu(z)**2``). Tolerance class: floating
 point, per row, bounded by a trusted fp32 torch implementation whose weighted route outputs are
 summed in BF16, as the fused finalize does. Two-stage finalize: bitwise replay and batch
-invariance (metamorphic).
+invariance (metamorphic), with up to 2 and with 6 local routes per token.
 
 Variants: {Relu2, SwiGLU} x {fused, two-stage finalize}; tactics are chosen per token count, so
 tokens cover 1, 127/128/129 (the 128-row ``moe_sort`` tile), 256, 512; top-k 1, 2, 8; H and I
 256-aligned, padded (320, 384 -> 512) and production (2688, 1856); EP offsets 0, interior and
 last. ``FLASHINFER_NVFP4_4OVER6*`` are unset. Hardware: Blackwell (SM100/103).
 """
+
+import inspect
 
 import pytest
 import torch
@@ -59,6 +68,41 @@ from tests.unit_tests.inference.oracles.flashinfer_moe import spec
 RELU2, SWIGLU = 6, 3  # FlashInfer ActivationType values Megatron passes
 GATE_MIN = 64.0  # |gate| beyond this: sigmoid is exactly 1 (or 0) in FP32 and its silu exact
 BF16 = spec.round_to(torch.bfloat16)
+
+
+RUN_TOKEN_ARGS = ("x", "x_sf", "token_selected_experts", "token_final_scales", "per_token_scale")
+"""``CuteDslMoEWrapper.run``'s per-token arguments (FlashInfer's names), one row per token."""
+
+
+def _record_token_rows(monkeypatch):
+    """Record the row count of every per-token input Megatron hands FlashInfer: the per-token
+    NVFP4 quantizer's input and ``RUN_TOKEN_ARGS`` of ``CuteDslMoEWrapper.run``. Returns the
+    list the calls append ``(argument, rows)`` to; FlashInfer itself runs unchanged."""
+    from megatron.core.inference.moe import flashinfer_nvfp4
+
+    seen = []
+    quantize = flashinfer_nvfp4.nvfp4_quantize
+    run = flashinfer_nvfp4.CuteDslMoEWrapper.run
+    quantize_signature, run_signature = inspect.signature(quantize), inspect.signature(run)
+
+    def quantize_spy(*args, **kwargs):
+        bound = quantize_signature.bind(*args, **kwargs).arguments
+        if bound.get("per_token_activation"):
+            seen.append(("per-token nvfp4_quantize input", bound["a"].shape[0]))
+        return quantize(*args, **kwargs)
+
+    def run_spy(self, *args, **kwargs):
+        bound = run_signature.bind(self, *args, **kwargs).arguments
+        seen.extend(
+            (f"run({name})", bound[name].shape[0])
+            for name in RUN_TOKEN_ARGS
+            if bound.get(name) is not None
+        )
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(flashinfer_nvfp4, "nvfp4_quantize", quantize_spy)
+    monkeypatch.setattr(flashinfer_nvfp4.CuteDslMoEWrapper, "run", run_spy)
+    return seen
 
 
 def _two_stage(monkeypatch):
@@ -352,11 +396,16 @@ def test_bounded_rows_write_only_the_prefix(bounded, monkeypatch):
     )
     problem.ids[40:64] = -1
     weights = problem.weights()
+    seen = _record_token_rows(monkeypatch)
     out = ou.guarded_empty((512, 256), torch.float32)
     result = problem.run(weights, out=out.tensor, token_capacity=64, use_bounded_rows=bounded)
     assert result is out.tensor
     ou.check_guards(out=out)
     rows = 64 if bounded else 512
+    required = {"per-token nvfp4_quantize input", "run(x)", "run(token_selected_experts)"}
+    assert required <= {name for name, _ in seen}, seen
+    wrong = [(name, n) for name, n in seen if n != rows]
+    assert not wrong, f"FlashInfer got {wrong}; only the {rows} leading rows may be processed"
     head = out.tensor[:rows]
     ou.assert_exact(head, head.bfloat16().float(), what="out holds the BF16 kernel output")
     _check(problem, head.bfloat16(), what="bounded prefix" if bounded else "all rows", rows=rows)
@@ -406,13 +455,23 @@ def test_cuda_graph_replay_and_weight_refresh(gated, monkeypatch):
     _check(second, replay(third), what="graph replay after refresh", inputs=third)
 
 
+ROUTINGS = {
+    # (experts, local experts, local offset, top-k)
+    "k2-local4of8": (8, 4, 4, 2),  # at most 2 local routes per token
+    "k6-local8of8": (8, 8, 0, 6),  # 6 local routes per token (top-6 as in production)
+}
+
+
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
+@pytest.mark.parametrize("routing", list(ROUTINGS))
 @pytest.mark.parametrize("gated", [False, True], ids=["relu2", "swiglu"])
-def test_two_stage_finalize_is_batch_invariant(gated, monkeypatch):
+def test_two_stage_finalize_is_batch_invariant(gated, routing, monkeypatch):
     """Metamorphic: with the two-stage finalize (batch-invariant mode), a token's output is
-    bitwise the same alone and at the last row of batches crossing the 128-row tile; random
-    BF16 inputs, so quantization and reduction order would show."""
+    bitwise the same alone and at the last row of batches crossing the 128-row tile, and every
+    token's output is unchanged when the batch is permuted; random BF16 inputs, so quantization
+    and reduction order would show. With 6 local routes per token an unordered (atomic) route
+    sum would round differently from launch to launch; with at most 2 it commutes."""
     spec.require_flashinfer()
     spec.clear_nvfp4_recipe_env(monkeypatch)
     _two_stage(monkeypatch)
@@ -422,29 +481,38 @@ def test_two_stage_finalize_is_batch_invariant(gated, monkeypatch):
     )
 
     g = ou.make_generator()
-    local, hidden, inter = 4, 512, 256
+    experts, local, offset, top_k = ROUTINGS[routing]
+    hidden, inter = 512, 256
     rows1 = 2 * inter if gated else inter
     w1 = (torch.randn(local, rows1, hidden, generator=g) / hidden**0.5).bfloat16().cuda()
     w2 = (torch.randn(local, hidden, inter, generator=g) / inter**0.5).bfloat16().cuda()
     weights = prepare_routed_nvfp4_weights(w1, w2)
     batch = 512
     x = torch.randn(batch, hidden, generator=g).bfloat16().cuda()
-    ids, probs = spec.make_routing(batch, 2, 8, generator=g, device_="cuda")
+    ids, probs = spec.make_routing(batch, top_k, experts, generator=g, device_="cuda")
+    is_local = (ids >= offset) & (ids < offset + local)
+    assert int(is_local.sum(-1).max()) == min(top_k, local), "routing gives the wrong local count"
 
-    def run(rows):
-        order = torch.arange(rows, device="cuda")
-        order[[0, rows - 1]] = order[[rows - 1, 0]]
-        out = flashinfer_routed_nvfp4_moe(
+    def moe(order):
+        return flashinfer_routed_nvfp4_moe(
             x[order],
             ids[order],
             probs[order],
             weights,
-            num_experts=8,
-            local_expert_offset=4,
+            num_experts=experts,
+            local_expert_offset=offset,
             activation_type=SWIGLU if gated else RELU2,
         )
-        return out[rows - 1]
+
+    def run(rows):
+        order = torch.arange(rows, device="cuda")
+        order[[0, rows - 1]] = order[[rows - 1, 0]]
+        return moe(order)[rows - 1]
 
     alone = run(1)
     for rows in (2, 127, 128, 129, 512):
         ou.assert_exact(run(rows), alone, what=f"token at the last of {rows} rows")
+    shuffle = torch.randperm(batch, generator=g).cuda()
+    ou.assert_exact(
+        moe(shuffle), moe(torch.arange(batch, device="cuda"))[shuffle], what="permuted batch"
+    )
