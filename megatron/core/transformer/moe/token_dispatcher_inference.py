@@ -672,9 +672,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Under batch-invariant mode the "multimem" option keeps the native
         # NVLS in-switch fp32 reduce. Batch invariance needs only that it is
         # deterministic and that a token's sum depends on that token's partials
-        # alone, which was measured on H100 and GB200. It is not correctly
-        # rounded on every GPU: GB200 returns the exact sum rounded once, but
-        # H100 adds in an order the switch picks, and two sets of GPUs can give
+        # alone; that was measured within one process on H100 (2-8 GPUs) and
+        # GB200 (2-4 GPUs). On Hopper an NVLS result can also depend on earlier
+        # multicast allocations unless the driver carries the fix (see
+        # docs/user-guide/deterministic-training.md). The sum is not correctly
+        # rounded everywhere: GB200 returned the exact sum rounded once at 2 and
+        # 4 GPUs (larger NVLink domains are unmeasured); H100 did at 2 GPUs but
+        # not at 4 or 8, where two 4-GPU groups of one node also returned
         # different bits for the same partials. "ordered" (default) uses the
         # explicit fixed rank-order fp32 kernel, deterministic by construction
         # anywhere.

@@ -35,15 +35,17 @@ def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = Fal
         -   **Hardware:** Uses `multimem.ld_reduce` (Hopper+).
         -   When `reduce_f32=False` (default): bf16x2 addition with f32 accumulation
             (128 bits = 8 x bf16, 2 per register). The rounding of the sum to bf16 is
-            the switch's: measured round-to-nearest-even on H100, but not on GB200, where
-            most inexact sums (ties included) come out rounded toward zero, so a result
-            can differ from the nearest-even one by one bf16 ulp.
+            the switch's: measured round-to-nearest-even on H100 (2-8 GPUs), but not on
+            GB200 (2-4 GPUs), where most inexact sums (ties included) come out rounded
+            toward zero, so a result can differ from the nearest-even one by one bf16 ulp.
         -   When `reduce_f32=True`: native f32 addition
-            (128 bits = 4 x fp32, 1 per register). Measured deterministic, with each
-            element's sum depending only on that element's inputs, but not correctly
-            rounded on every GPU: GB200 returns the exact sum rounded once, while H100
-            adds in an order the switch picks, and two sets of GPUs can give different
-            bits for the same inputs.
+            (128 bits = 4 x fp32, 1 per register). Measured deterministic within one
+            process on one set of GPUs, with each element's sum depending only on that
+            element's inputs (on Hopper, see the multicast caveat in
+            docs/user-guide/deterministic-training.md). Correctly rounded on GB200 at 2
+            and 4 GPUs and on H100 at 2; not on H100 at 4 or 8, where two 4-GPU groups of
+            one node also returned different bits for the same inputs. Larger groups are
+            unmeasured.
 
     Args:
         ptr: Memory pointer to the source buffer.

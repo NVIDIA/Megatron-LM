@@ -1458,7 +1458,9 @@ def validate_args(args, defaults={}):
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
                     "symmetric reduce-scatters accumulate in fp32 in-switch "
-                    "(NCCL multimem.ld_reduce .acc::f32)."
+                    "(NCCL multimem.ld_reduce .acc::f32), but the switch rounds the bf16 result "
+                    "itself: on GB200 mostly toward zero (within one bf16 ulp), not to nearest "
+                    "even."
                 )
 
     # Disable bias gelu fusion if we are disabling bias altogether

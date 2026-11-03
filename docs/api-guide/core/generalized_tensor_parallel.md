@@ -429,7 +429,11 @@ it** — a different collective over a different process group, so enable either
   NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
   `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
   all-to-all applies only to axes without a pool. E.g. `--gtp-remat-nccl-ub` + §2.6 gives a
-  symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
+  symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis. The
+  in-switch result is bf16, rounded by the switch: measured with the same `.acc::f32` bf16
+  `multimem.ld_reduce` in Megatron's inference kernels, that rounding is to nearest even on H100
+  but mostly toward zero on GB200 (within one bf16 ulp), a small bias toward zero that §2.6's
+  FP32 output does not have.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
 - **Pool allocator.** The pools are backed by a VMM allocator implementing [NCCL's

@@ -723,9 +723,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
         "order is hardware defined and needs an NVLink peer group. Batch-invariant mode reduces "
-        "with a rank-ordered kernel instead, unless batch_invariant_collective is 'multimem', "
-        "which relies only on the in-switch fp32 sum being deterministic and batch-invariant, "
-        "not on its order or rounding.",
+        "with a rank-ordered kernel instead, unless batch_invariant_collective is 'multimem': "
+        "its batch invariance relies only on the in-switch fp32 sum being deterministic and "
+        "batch-invariant, while bitwise parity with training's MoE combine also relies on its "
+        "rounding, which is correct only where measured so (Blackwell; H100 at 2 GPUs).",
     ),
     KernelEntry(
         name="unified_memory_allocator",

@@ -222,9 +222,10 @@ def _unpermute_loop(
     # - The cross-rank stage matches the configured collective: "ordered" is an
     #   ascending rank-order fp32 chain; "multimem" is mirrored as the correctly
     #   rounded fp32 sum of the partials (fp64 accumulate, single final
-    #   rounding), which is what the in-switch sum returns on Blackwell. On H100
-    #   the in-switch sum is not correctly rounded and adds in an order the
-    #   switch picks, so this mirror does not match it bitwise there.
+    #   rounding). The in-switch sum returned exactly that on B200, on GB200 at
+    #   2 and 4 GPUs (larger NVLink domains are unmeasured) and on H100 at 2
+    #   GPUs, but not on H100 at 4 or 8 GPUs, where this mirror does not match
+    #   it bitwise.
     within_rank_fp64 = probs is None
     cross_rank_fp64 = get_batch_invariant_collective() == "multimem"
     acc_dtype = torch.float64 if cross_rank_fp64 else torch.float32
