@@ -603,6 +603,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_optimizer_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/test_muon_fp8_param_gather.py",
             "tests/unit_tests/test_fp8_param.py",
@@ -813,20 +814,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/fp8_utils.py",
             "megatron/core/fp4_utils.py",
+            "megatron/core/optimizer/optimizer.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
         tests=(
             C + "test_fp8_determinism.py",
             K + "test_optimizer_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/test_fp8_param.py",
             "tests/unit_tests/test_muon_fp8_param_gather.py",
+            "tests/unit_tests/models/test_v41_engram.py",
         ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
         "(kernel replayed in test_optimizer_kernels.py). Native FP8 gather and checkpoint tests "
-        "check exact quantized storage, optimizer state and resumed training trajectories.",
+        "check exact quantized storage, optimizer state and resumed training trajectories. "
+        "Rowwise MXFP8 chunking is compared byte-for-byte with TE and replayed for FP32 "
+        "master and gathered-BF16 copy-back; a full Engram shard covers initialization and load.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",
@@ -1002,11 +1008,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="v41_engram_embedding",
-        sources=("megatron/core/models/engram/distributed_embedding.py",),
-        tests=("tests/unit_tests/models/test_v41_engram.py",),
-        kind="torch-op",
-        notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
-        "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
+        sources=(
+            "megatron/core/models/engram/distributed_embedding.py",
+            "megatron/core/models/deepseek_v41/engram.py",
+        ),
+        tests=("tests/unit_tests/models/test_v41_engram.py", K + "test_te_wrappers.py"),
+        kind="triton",
+        notes="Sorted repeated-row gradients and real Gloo EP lookup parity, including "
+        "uneven shards and FP8 values/scales transport. Blackwell tests compare fused "
+        "gather/pack and reorder/columnwise quantization against native TE, and replay "
+        "payloads, scale padding, NCCL/HybridEP lookup, projection gradients and master "
+        "copy-back. HybridEP parity includes integer IDs, all BF16 bit patterns, MXFP8 "
+        "bytes/scales, interleaved nonblocking chunks, hotspots, empty ranks, independent "
+        "buffers and multiple live lookup plans through backward.",
     ),
     KernelEntry(
         name="dsa_dispatch",

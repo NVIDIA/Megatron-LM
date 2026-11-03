@@ -265,6 +265,47 @@ def get_grouped_tensor_members(
     return members
 
 
+_MXFP8_QUANTIZE_CHUNK_ROWS = 128 * 1024
+
+
+def _update_quantized(src: torch.Tensor, dst: torch.Tensor, quantizer) -> None:
+    """Bound rowwise MXFP8 launches without allocating another quantized weight."""
+    if not (
+        is_mxfp8tensor(dst)
+        and dst.ndim == 2
+        and dst.shape[0] > _MXFP8_QUANTIZE_CHUNK_ROWS
+        and dst._rowwise_data is not None
+        and dst._columnwise_data is None
+        and not dst._with_gemm_swizzled_scales
+        and quantizer.rowwise_usage
+        and not quantizer.columnwise_usage
+        and not getattr(quantizer, 'with_2d_quantization', False)
+    ):
+        quantizer.update_quantized(src, dst)
+        return
+
+    # TE uses grid.y for rows, with as few as four rows per block in its
+    # specialized cast (64 in the generic fallback). Both must fit in 65535.
+    # Align boundaries to 128 rows so each view owns complete scale-padding
+    # tiles. Rowwise 32-element quantization blocks never cross a boundary.
+    rows, width = dst.shape
+    for start in range(0, rows, _MXFP8_QUANTIZE_CHUNK_ROWS):
+        end = min(start + _MXFP8_QUANTIZE_CHUNK_ROWS, rows)
+        chunk = MXFP8Tensor(
+            shape=(end - start, width),
+            dtype=dst.dtype,
+            rowwise_data=dst._rowwise_data[start:end],
+            rowwise_scale_inv=dst._rowwise_scale_inv[start : (end + 127) // 128 * 128],
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=dst._fp8_dtype,
+            quantizer=quantizer,
+            with_gemm_swizzled_scales=False,
+        )
+        quantizer.update_quantized(src[start:end], chunk)
+    dst._fp8_dtype = quantizer.dtype
+
+
 def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:
     """Copy high-precision values into TE quantized parameter storage."""
     dst = _unwrap_parameter_data(param)
@@ -296,18 +337,21 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
             dst.quantizer.update_quantized(src_member, dst_member)
         return
 
-    # Plain TE quantized tensors override copy_ to requantize into their
-    # backing storage.
-    dst.copy_(src.view(dst.shape))
+    src = src.view(dst.shape)
+    if is_mxfp8tensor(dst) and not is_float8tensor(src):
+        _update_quantized(src, dst, dst._get_quantizer())
+    else:
+        # Retain TE's byte-copy path for already quantized sources.
+        dst.copy_(src)
 
 
 def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
 
     Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
-    resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
-    because those casts are small and issuing them is expensive, and under
-    --reuse-grad-buf-for-mxfp8-param-ag they run inside the forward pass.
+    resolved up front and called directly. This reduces the CPU overhead of small casts,
+    which run inside the forward pass under --reuse-grad-buf-for-mxfp8-param-ag. Large
+    rowwise MXFP8 weights are cast in chunks.
 
     Args:
         params: quantized model params to write into.
@@ -338,7 +382,7 @@ def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torc
     # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
     # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
     for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
-        quantizer.update_quantized(src, dst)
+        _update_quantized(src, dst, quantizer)
 
 
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
@@ -391,8 +435,9 @@ def copy_back_gathered_bf16_into_fp8_params(
     Plain BF16 destinations are also accepted for local copy-back; buffer gather keeps
     their transport separate from the reused FP8 storage.
     Quantized destinations are limited to plain MXFP8 and blockwise tensors.
-    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before the
-    batched quantized copy. Validate the entire batch before mutating any quantizer usage.
+    MXFP8 GEMM weights need both scaling directions. Lookup-only weights may declare
+    ``mxfp8_requires_columnwise=False`` to avoid storing an unused second copy.
+    Validate the entire batch before mutating any quantizer usage.
     """
     if len(model_params) != len(srcs_bf16):
         raise ValueError(
@@ -417,10 +462,15 @@ def copy_back_gathered_bf16_into_fp8_params(
                 "Float8BlockwiseQTensor destinations."
             )
         if is_mxfp8tensor(model_p):
-            mxfp8_quantizers.append(model_p.data._get_quantizer())
+            # TE's Tensor.data can return a wrapper with a copied quantizer. Configure the
+            # live parameter so the subsequent copy observes the requested storage policy.
+            tensor = model_p if hasattr(model_p, '_get_quantizer') else model_p.data
+            mxfp8_quantizers.append(
+                (tensor._get_quantizer(), getattr(model_p, 'mxfp8_requires_columnwise', True))
+            )
 
-    for quantizer in mxfp8_quantizers:
-        quantizer.set_usage(rowwise=True, columnwise=True)
+    for quantizer, columnwise in mxfp8_quantizers:
+        quantizer.set_usage(rowwise=True, columnwise=columnwise)
 
     copy_tensors_to_quantized_params(model_params, srcs_bf16)
 

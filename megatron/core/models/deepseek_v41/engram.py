@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.models.deepseek_v41.engram_hash import EngramLayout, compute_hash_multipliers
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
@@ -89,7 +91,8 @@ class EngramHasher(nn.Module):
 class EngramEmbedding(EPShardedMultiTableEmbedding):
     """V4.1's fused table, using variable-split EP lookups and exact logical row sharding."""
 
-    def __init__(self, config, rows, width, pg_collection) -> None:
+    def __init__(self, config, rows, width, pg_collection, *, fp8_storage=False) -> None:
+        options = getattr(config, "engram_config", None)
         super().__init__(
             config,
             (rows,),
@@ -98,6 +101,9 @@ class EngramEmbedding(EPShardedMultiTableEmbedding):
             ep_group=pg_collection.ep,
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
+            fp8_storage=fp8_storage,
+            communication_backend=getattr(options, "communication_backend", "nccl"),
+            hybridep_chunk_size=getattr(options, "hybridep_chunk_size", 4096),
         )
         self.tp_group = pg_collection.tp
 
@@ -115,21 +121,46 @@ class Engram(MegatronModule):
         self.hash_index = layout.layer_ids.index(layer_idx)
         self.n = config.mhc_num_residual_streams
         self.hidden_size = config.hidden_size
+        self.fp8_projection = bool(getattr(config, 'fp8', None)) and not is_first_last_bf16_layer(
+            config, 2 * layer_idx
+        )
+        self.fp8_lookup = self.fp8_projection and getattr(config, 'fp8_param', False)
+        if self.fp8_lookup and config.fp8_recipe != Fp8Recipe.mxfp8:
+            raise ValueError('Engram FP8 primary tables currently require the MXFP8 recipe')
         self.embed = EngramEmbedding(
-            config, layout.num_embeddings[self.hash_index], layout.head_dim, pg_collection
+            config,
+            layout.num_embeddings[self.hash_index],
+            layout.head_dim,
+            pg_collection,
+            fp8_storage=self.fp8_lookup,
         )
         self.embed.tables[0].weight.lr_mult = getattr(
             getattr(config, "engram_config", None), "embedding_lr_multiplier", 5.0
         )
         width = (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
         device = self.embed.tables[0].weight.device
-        self.wkv = nn.Linear(
-            width,
-            (self.n + 1) * config.hidden_size,
-            bias=False,
-            dtype=config.params_dtype,
-            device=device,
-        )
+        if self.fp8_projection:
+            from megatron.core.extensions.transformer_engine import TELinear
+
+            with get_fp8_context(config, 2 * layer_idx, is_init=True):
+                self.wkv = TELinear(
+                    width,
+                    (self.n + 1) * config.hidden_size,
+                    config=config,
+                    parallel_mode='duplicated',
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                )
+        else:
+            self.wkv = nn.Linear(
+                width,
+                (self.n + 1) * config.hidden_size,
+                bias=False,
+                dtype=config.params_dtype,
+                device=device,
+            )
         # Vector parameters follow the standard norm weight-decay/Muon policy.
         self.q_weight = nn.Parameter(
             torch.ones(self.n * config.hidden_size, dtype=config.params_dtype, device=device)
@@ -137,13 +168,27 @@ class Engram(MegatronModule):
         self.k_weight = nn.Parameter(torch.ones_like(self.q_weight))
         self.q_weight.is_norm_weight = True
         self.k_weight.is_norm_weight = True
-        if config.perform_initialization:
+        if config.perform_initialization and not self.fp8_projection:
             config.init_method(self.wkv.weight)
 
     def forward(self, hidden_states, hash_ids, token_mask=None):
         """Preserve FP32 gating arithmetic and the reference signed-square-root gate."""
         addresses = hash_ids[:, :, self.hash_index]
-        kv = self.wkv(self.embed(addresses).flatten(-2)).transpose(0, 1)
+        if self.fp8_lookup:
+            embeddings = self.embed.lookup_quantized(
+                addresses.unsqueeze(-1),
+                addresses.shape[-1] * self.embed.embedding_dim,
+                needs_wgrad=self.wkv.weight.requires_grad,
+            )
+        else:
+            embeddings = self.embed(addresses).flatten(-2)
+        kv = self.wkv(embeddings)
+        if self.fp8_projection:
+            kv = kv[0]
+        if self.fp8_lookup:
+            batch, length = addresses.shape[:2]
+            kv = kv[: batch * length].view(batch, length, (self.n + 1) * self.hidden_size)
+        kv = kv.transpose(0, 1)
         key, value = kv.split([self.n * self.hidden_size, self.hidden_size], dim=-1)
         key = key.float().unflatten(-1, (self.n, self.hidden_size))
         h = hidden_states.float().unflatten(-1, (self.n, self.hidden_size))

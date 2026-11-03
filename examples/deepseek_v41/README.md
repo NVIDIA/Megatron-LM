@@ -142,6 +142,44 @@ disables the multiplier). Projections and normalization weights keep the base
 schedule. The multiplier scales the selected parameter-group schedule, including
 nonzero warmup and minimum LR, and is retained in optimizer checkpoints.
 
+Engram follows the model's FP8 configuration. `--fp8-recipe mxfp8 --fp8-format
+e4m3` uses TE Linear for its fused key/value projection. Adding `--fp8-param-gather`
+also stores the lookup table in rowwise MXFP8; use
+`--reuse-grad-buf-for-mxfp8-param-ag` with the existing LayerWise optimizer path.
+No additional Engram precision flag is needed. Layers explicitly kept in BF16
+keep BF16 Engram storage and projections too.
+
+FP8 lookups exchange E4M3 values and their E8M0 scales together over EP and retain
+those bytes as the projection's rowwise GEMM input. The table stores only one
+scaling direction. Projection weight gradients need columnwise quantization of
+the retrieved batch. Triton kernels gather values/scales directly into the EP
+payload, then fuse receive reordering, head concatenation and columnwise
+requantization into TE's GEMM buffers without an intermediate BF16 activation.
+The rowwise values/scales are preserved exactly; columnwise quantization rounds
+through the model dtype as TE does. The single-table path skips table sorting.
+A native fallback remains available when Triton is absent, generating only the
+needed columnwise quantization. There is no persistent BF16 table or full-table
+columnwise copy. Lookup gradients
+remain high precision, with repeated rows accumulated in FP32 before casting to
+the model gradient dtype. Normalization and gate arithmetic remain FP32.
+
+FP32 master parameters and Sinkhorn momentum follow the existing optimizer path.
+Local table storage is padded to multiples of 32; padding is excluded from
+Sinkhorn statistics and the logical model/master/momentum checkpoint shapes.
+The checkpoint factory supports whole row shards, including LayerWise ownership;
+the flattened optimizer checkpoint format is unsupported. Parameter
+synchronization among replicas still uses existing BF16 staging and FP8
+requantization; the FP8 wire format described above applies to EP lookup results.
+Projection scaling follows the existing DSv4 TE MXFP8 recipe, rather than the
+inference reference's 32-by-32 weight scaling layout.
+
+CPU/Gloo tests cover FP8 byte transport, row gradients, padding, logical checkpoint
+metadata and EP/replica-DP Sinkhorn parity. Blackwell tests cover real TE storage,
+fused/native payload and activation parity, projection gradients, recompute,
+optimizer copy-back and EP1/EP2 bit-exact replay (including fused scale padding).
+The latter tests require GPU qualification; they were not run on the CPU
+development host.
+
 Sinkhorn requires TP=1 and no GTP-sharded embeddings. Engram tables carry their
 explicit EP row partition: near-zero-row masking uses the global mean row norm,
 and column normalization reduces squared norms across all row shards. Empty or

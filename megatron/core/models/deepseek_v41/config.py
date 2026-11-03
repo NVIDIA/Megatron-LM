@@ -43,9 +43,19 @@ class EngramConfig:
     embedding_lr_multiplier: float = 5.0
     """Learning-rate multiplier for the lookup tables, excluding projections and norms."""
 
+    communication_backend: str = "nccl"
+    """EP lookup transport: nccl or hybridep, independently of the MoE dispatcher."""
+
+    hybridep_chunk_size: int = 4096
+    """Maximum queries sent per rank per HybridEP dispatch; bounds communication workspace."""
+
     def __post_init__(self):
         if not math.isfinite(self.embedding_lr_multiplier) or self.embedding_lr_multiplier <= 0:
             raise ValueError("Engram embedding_lr_multiplier must be finite and positive")
+        if self.communication_backend not in ("nccl", "hybridep"):
+            raise ValueError("Engram communication_backend must be nccl or hybridep")
+        if self.hybridep_chunk_size <= 0 or self.hybridep_chunk_size % 64:
+            raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
 
 
 @dataclass

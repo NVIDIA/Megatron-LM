@@ -46,7 +46,11 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
-from ..fp8_utils import uses_grad_buffer_for_fp8_param_gather
+from ..fp8_utils import (
+    copy_tensor_to_quantized_param,
+    is_mxfp8tensor,
+    uses_grad_buffer_for_fp8_param_gather,
+)
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -182,7 +186,12 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
-    for name in ('row_shard_group', 'row_shard_global_rows', 'row_shard_start'):
+    for name in (
+        'row_shard_group',
+        'row_shard_global_rows',
+        'row_shard_start',
+        'row_shard_local_rows',
+    ):
         if hasattr(source, name):
             setattr(destination, name, getattr(source, name))
 
@@ -1169,6 +1178,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     )
                 ):
                     # DDP quantizes all ranks from the gathered BF16 master, including the owner.
+                    continue
+                if is_mxfp8tensor(model_param):
+                    copy_tensor_to_quantized_param(model_param, main_param.data)
                     continue
                 model_data.append(model_param.data)
                 main_data.append(main_param.data)
