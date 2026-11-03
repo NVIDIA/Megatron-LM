@@ -18,7 +18,10 @@ Contract (written from the aten ops it replaces and the backend's promise of bat
   empty result, K = 0 gives zeros (plus the bias). Inputs are read only.
 - Dispatch (exact): under `deepgemm`, a bf16 x bf16 mm/addmm runs DeepGEMM's `bf16_gemm_nn`
   once, and other dtypes (the fp32 router GEMM, fp16) run the Triton `matmul_persistent`; under
-  `triton` every dtype runs `matmul_persistent`; `te_native` replaces neither op.
+  `triton` every dtype runs `matmul_persistent`; `te_native` replaces neither op. Whichever GEMM
+  runs, mm and addmm keep aten's semantics (addmm adds the bias) in every dtype; the GEMMs
+  accumulate in fp32, so on inputs whose products and sums are exact in fp32 (dyadic values) a
+  GEMM that rounds once returns the exact result rounded once to the dtype.
 - Batch invariance: each output row's bits depend only on that row of a and on b: not on M, the
   row's position among the rows, the other rows, nor on a copy of the same operand placed at
   another storage offset or with a padded outer stride (same major-ness). Rows are checked for
@@ -26,7 +29,9 @@ Contract (written from the aten ops it replaces and the backend's promise of bat
 
 Reference: fp64 `a @ b` (+ bias). Trusted implementation: `torch.mm` / `torch.addmm` on the same
 device outside batch-invariant mode (cuBLAS, bf16 output). Tolerance class: floating point,
-bounded per row (default factor); bit-exact for the batch-invariance properties and dispatch.
+bounded per row (default factor); bit-exact for the batch-invariance properties and dispatch, and
+for the dyadic mm/addmm of `test_mm_and_addmm_on_every_dispatch_path` on `matmul_persistent`
+(DeepGEMM's addmm rounds twice there, so DeepGEMM stays bounded).
 
 Structure (read after the contract): `_mm_deepgemm` copies an operand whose outer stride is not
 16-byte aligned into a padded row-major buffer, allocates D with a padded stride and returns
@@ -339,7 +344,8 @@ def test_dispatch_decisions(backend, monkeypatch):
             want = [] if target is None else [(target, dtype)]
             assert calls == want, f"{backend} {op} {dtype}: ran {calls}, expected {want}"
             if target == "deepgemm":
-                # The other kernels' numerics belong to their own oracles (matmul_persistent).
+                # matmul_persistent's results, bias included, are checked exactly by
+                # test_mm_and_addmm_on_every_dispatch_path.
                 ref = (
                     ou.fp64_reference(_gemm_reference, x, wt)
                     if op == "mm"
@@ -347,6 +353,48 @@ def test_dispatch_decisions(backend, monkeypatch):
                 )
                 trusted = torch.mm(x, wt) if op == "mm" else torch.addmm(bb, x, wt)
                 ou.assert_close_to_reference(out, ref, trusted, dim=-1, what=f"{op} {dtype}")
+
+
+# Dyadic values m * 2**e with |m| < 8 and e in [-1, 1]: products are multiples of 2**-2 below
+# 196, so for K <= 256 every partial sum of x @ w^T + bias is exact in fp32 (|sum| < 2**16, 18
+# significant bits) and finite in fp16 (< 65504), whatever the accumulation order. The 3-bit
+# mantissas are also exact in TF32, which matmul_persistent uses for fp32 operands (O8a-N4).
+_DYADIC = dict(mantissa_bits=3, exponents=(-1, 1))
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+@pytest.mark.parametrize("m,k,n", [(33, 256, 128), (129, 64, 50)])
+@pytest.mark.parametrize("dtype", list(_DTYPES), ids=list(_DTYPES))
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_mm_and_addmm_on_every_dispatch_path(backend, dtype, m, k, n):
+    """mm and addmm keep aten's semantics on whichever GEMM the backend dispatches them to
+    (`test_dispatch_decisions` pins which): the product, plus the bias for addmm, in every dtype.
+
+    On dyadic inputs the result is exact in fp32, so `matmul_persistent` (fp32 accumulation, the
+    bias added in fp32, one rounding) must return the fp64 result rounded once, bit for bit.
+    DeepGEMM's bf16 path (deepgemm backend, bf16) adds the bias after rounding the product (a
+    second rounding, documented above) and is bounded against fp64 like the other DeepGEMM cases.
+    """
+    if backend == "deepgemm":
+        _require_deepgemm()
+    dtype = _DTYPES[dtype]
+    g = ou.make_generator(11, device=_DEVICE)
+    x = ou.dyadic_tensor((m, k), dtype=dtype, device=_DEVICE, generator=g, **_DYADIC)
+    w = ou.dyadic_tensor((n, k), dtype=dtype, device=_DEVICE, generator=g, **_DYADIC)
+    bias = ou.dyadic_tensor((n,), dtype=dtype, device=_DEVICE, generator=g, **_DYADIC)
+    with bik.set_batch_invariant_mode(True, backend=backend):
+        out = torch.mm(x, w.t())
+        out_bias = torch.addmm(bias, x, w.t())
+    ref = ou.fp64_reference(_gemm_reference, x, w.t())
+    ref_bias = ou.fp64_reference(_addmm_reference, bias, x, w.t())
+    if backend == "deepgemm" and dtype == torch.bfloat16:
+        _check_mm(out, x, w.t(), "mm (DeepGEMM)")
+        ou.assert_close_to_reference(
+            out_bias, ref_bias, torch.addmm(bias, x, w.t()), dim=-1, what="addmm (DeepGEMM)"
+        )
+    else:
+        ou.assert_exact(out, ref.to(dtype), what=f"mm ({backend}, {dtype})")
+        ou.assert_exact(out_bias, ref_bias.to(dtype), what=f"addmm ({backend}, {dtype})")
 
 
 _LARGE_K = 4096

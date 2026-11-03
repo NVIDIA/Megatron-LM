@@ -39,10 +39,12 @@ Structure (read after the contract): `_forward` squeezes dim 1 of the logits (ma
 precomputed indices, then chooses the Triton kernel (`_uses_sigmoid_topk_kernel`), eager
 routing (batch-invariant) or the compiled routing, which may call TE's fused router. The
 sigmoid kernel has variants by k (< 8 left-fold sum, >= 8 tree sum, `tl.topk` for k >= 8), E
-(power-of-two padding up to 512) and rows per program. Covered: E in {8, 64, 256} (and 1024 for
-the dispatch boundary), k in {1, 2, 6, 8, 32, E}, T in {0, 1, 7, 128, 129, 4096}, B in {1, 2,
-3}, every score function, expert bias, scaling, sinkhorn, hash layers, fusion, all three
-paths, CUDA-graph replay. Not covered: quantile balancing and router replay (separate features
+(power-of-two padding up to 512) and rows per program, and it orders routing scores by integer
+keys built from their bits, with a separate rule for negative scores. Covered: E in {8, 64, 256}
+(and 1024 for the dispatch boundary), k in {1, 2, 6, 8, 32, E}, T in {0, 1, 7, 128, 129, 4096},
+B in {1, 2, 3}, every score function, expert bias, scaling, sinkhorn, hash layers, fusion, all
+three paths, CUDA-graph replay, and expert biases that make the k-th selected score (and the
+order among the selected ones) negative (`test_negative_routing_scores_select_like_fp64`). Not covered: quantile balancing and router replay (separate features
 with their own config switches).
 
 Main vs open PRs (#8562, d4-d9 "Return dense [num_tokens, topk] routing from InferenceTopKRouter
@@ -239,6 +241,22 @@ def make_bias(num_experts, seed=5):
     return (torch.randint(-16, 17, (num_experts,), generator=g).double() / 64).float().to(_DEVICE)
 
 
+def make_negative_bias(num_experts, topk, seed=9):
+    """Expert biases that make the k-th largest routing score negative.
+
+    ``topk // 2`` experts keep biases in [-1/4, 1/4], so their scores sigmoid(z) + b have either
+    sign; every other expert's bias is in [-2, -1], so its score is negative (sigmoid < 1). At
+    most ``topk // 2`` scores are positive: the k-th selected score, the margin below it and the
+    order among the remaining selected experts are all decided among negative scores. Multiples
+    of 1/64 (exact in bf16 and fp32).
+    """
+    g = ou.make_generator(seed)
+    bias = torch.randint(-128, -63, (num_experts,), generator=g).double() / 64
+    keep = torch.randperm(num_experts, generator=g)[: topk // 2]
+    bias[keep] = torch.randint(-16, 17, (keep.numel(),), generator=g).double() / 64
+    return bias.float().to(_DEVICE)
+
+
 def run_router(router, x, path):
     """Route x [S, B, H] under InferenceMode on the given path."""
     with torch.no_grad(), InferenceMode.active():
@@ -303,6 +321,38 @@ def test_routing_matches_fp64(case):
     )
     probs, experts = run_router(router, x, case["path"])
     check_routing(probs, experts, logits, topk, case["kind"], bias, case["scaling"], _id(case))
+
+
+_NEGATIVE_CASES = [(64, 2), (64, 6), (64, 8), (256, 32)]  # k < 8 and k >= 8 kernel variants
+
+
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize(
+    "num_experts,topk", _NEGATIVE_CASES, ids=[f"e{e}-k{k}" for e, k in _NEGATIVE_CASES]
+)
+def test_negative_routing_scores_select_like_fp64(num_experts, topk, path):
+    """sigmoid(z) + bias selects by value when the scores are negative: an expert bias (e.g. the
+    aux-loss-free load-balancing bias) can push most scores below zero, and the k largest must
+    still be selected, with probs from sigmoid(z) of those experts."""
+    backend = "torch" if path == "compiled" else "triton"
+    router = build_router(num_experts, topk, "sigmoid_bias", backend=backend)
+    bias = make_negative_bias(num_experts, topk)
+    router.expert_bias.copy_(bias)
+    tokens = 129
+    logits = make_logits(tokens, num_experts, topk, "sigmoid_bias", bias, seed=10)
+    keys = selection_keys(logits.double(), "sigmoid_bias", bias.double())
+    assert bool((keys.topk(topk, dim=-1).values[:, -1] < 0).all()), "a k-th score is not negative"
+    probs, experts = run_router(router, logits.view(tokens, 1, num_experts), path)
+    check_routing(
+        probs,
+        experts,
+        logits,
+        topk,
+        "sigmoid_bias",
+        bias,
+        None,
+        f"negative scores E={num_experts} k={topk} {path}",
+    )
 
 
 @pytest.mark.parametrize("path", PATHS)
