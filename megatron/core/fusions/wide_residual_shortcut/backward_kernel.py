@@ -1064,7 +1064,10 @@ def _backward(
             else:
                 u = update_shared.slice(part * 16, 16).load(L).to(gl.float32)
             if CONFIG.EARLY_CARRY and part == 0:
-                incoming_zero = early_incoming_zero
+                # Assigned above under the same compile-time EARLY_CARRY guard.
+                incoming_zero = (
+                    early_incoming_zero  # pylint: disable=possibly-used-before-assignment
+                )
             elif PAIRED and m % 16 == 0 and h % 256 == 0:
                 # Every row and column of a scheduled tile is in range.
                 incoming_zero = _widen_bf16(gl.load(inputs.carry + rows * (streams * h) + cols))

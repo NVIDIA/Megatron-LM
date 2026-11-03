@@ -155,6 +155,14 @@ _FORWARD_CONFIGS = {
 
 # fmt: on
 
+
+def _bf16_config(*fields, vector):
+    """A LOADS_FIRST config from the leading ``_ForwardConfig`` fields, WIDTH through STORE_LATE:
+    (WIDTH, PIPELINE_DEPTH, OFFLOAD_SEGMENTS, PAIRED_REDUCE, REDUCE_VECTOR, NUM_WARPS, MAXNREG,
+    STORE_LATE)."""
+    return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
+
+
 # GB300 configs for a BF16 residual stream at the production widths (3 streams), which moves
 # half the residual bytes and needs more rows in flight than the FP32 schedules keep. Chosen
 # per shape from a sweep of the 16 recipes x LOADS_FIRST x VECTOR (4 or 8 BF16 columns per
@@ -163,24 +171,24 @@ _FORWARD_CONFIGS = {
 # Training/prefill from 2048 rows and inference from 512 rows use them.
 # fmt: off
 _FORWARD_CONFIGS_BF16 = {
-    (3072, 1, 1, False): _ForwardConfig(4096, 1, 0, False, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
-    (3072, 1, 1, True): _ForwardConfig(4096, 2, 0, False, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
-    (3072, 2, 1, False): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
-    (3072, 2, 1, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 168, True, LOADS_FIRST=True, VECTOR=8),
-    (3072, 2, 2, False): _ForwardConfig(4096, 4, 0, False, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
-    (3072, 2, 2, True): _ForwardConfig(4096, 1, 0, True, 0, 8, None, True, LOADS_FIRST=True, VECTOR=4),
-    (4096, 1, 1, False): _ForwardConfig(2048, 0, 0, False, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=8),
-    (4096, 1, 1, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=8),
-    (4096, 2, 1, False): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=4),
-    (4096, 2, 1, True): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False, LOADS_FIRST=True, VECTOR=8),
-    (4096, 2, 2, False): _ForwardConfig(2048, 0, 0, True, 0, 4, 128, False, LOADS_FIRST=True, VECTOR=4),
-    (4096, 2, 2, True): _ForwardConfig(2048, 0, 0, False, 0, 4, 168, True, LOADS_FIRST=True, VECTOR=8),
-    (10240, 1, 1, False): _ForwardConfig(4096, 2, 0, False, 0, 8, 128, True, LOADS_FIRST=True, VECTOR=8),
-    (10240, 1, 1, True): _ForwardConfig(4096, 2, 0, False, 0, 8, 128, True, LOADS_FIRST=True, VECTOR=8),
-    (10240, 2, 1, False): _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=4),
-    (10240, 2, 1, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=8),
-    (10240, 2, 2, False): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=8),
-    (10240, 2, 2, True): _ForwardConfig(2048, 2, 1, True, 0, 8, 128, False, LOADS_FIRST=True, VECTOR=4),
+    (3072, 1, 1, False): _bf16_config(4096, 1, 0, False, 0, 8, None, True, vector=4),
+    (3072, 1, 1, True): _bf16_config(4096, 2, 0, False, 0, 8, 80, False, vector=4),
+    (3072, 2, 1, False): _bf16_config(4096, 2, 0, True, 0, 8, 80, False, vector=4),
+    (3072, 2, 1, True): _bf16_config(2048, 0, 0, False, 0, 4, 168, True, vector=8),
+    (3072, 2, 2, False): _bf16_config(4096, 4, 0, False, 0, 8, None, True, vector=4),
+    (3072, 2, 2, True): _bf16_config(4096, 1, 0, True, 0, 8, None, True, vector=4),
+    (4096, 1, 1, False): _bf16_config(2048, 0, 0, False, 0, 4, 128, False, vector=8),
+    (4096, 1, 1, True): _bf16_config(2048, 0, 0, False, 0, 4, 128, False, vector=8),
+    (4096, 2, 1, False): _bf16_config(4096, 2, 0, True, 0, 8, 80, False, vector=4),
+    (4096, 2, 1, True): _bf16_config(4096, 2, 0, True, 0, 8, 80, False, vector=8),
+    (4096, 2, 2, False): _bf16_config(2048, 0, 0, True, 0, 4, 128, False, vector=4),
+    (4096, 2, 2, True): _bf16_config(2048, 0, 0, False, 0, 4, 168, True, vector=8),
+    (10240, 1, 1, False): _bf16_config(4096, 2, 0, False, 0, 8, 128, True, vector=8),
+    (10240, 1, 1, True): _bf16_config(4096, 2, 0, False, 0, 8, 128, True, vector=8),
+    (10240, 2, 1, False): _bf16_config(4096, 1, 1, False, 0, 8, 128, False, vector=4),
+    (10240, 2, 1, True): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=8),
+    (10240, 2, 2, False): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=8),
+    (10240, 2, 2, True): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=4),
 }
 # fmt: on
 
@@ -274,10 +282,11 @@ def _single_write_leaf(m, h, streams, mxfp8):
 def _inference_config(m, h, streams, readers, mxfp8, updates=None):
     """Return the LOADS_FIRST row config for an inference launch.
 
-    Decode rows (<= 64 with one reader, <= 32 with two) of residuals with at least 8K columns use a cluster per row
-    (per reader with two readers) with one 512-2048 column slice per CTA: fit to a GB300 sweep of cluster
-    size x slice x warps at rows 1-64, 1.24x over the tree on 480 decode points (hidden
-    3072-16384, 1-6 streams, 1/2 readers, BF16/MXFP8). Longer rows use ``_inference_leaf``.
+    Decode rows (<= 64 with one reader, <= 32 with two) of residuals with at least 8K columns
+    use a cluster per row (per reader with two readers) with one 512-2048 column slice per CTA:
+    fit to a GB300 sweep of cluster size x slice x warps at rows 1-64, 1.24x over the tree on
+    480 decode points (hidden 3072-16384, 1-6 streams, 1/2 readers, BF16/MXFP8). Longer rows
+    use ``_inference_leaf``.
 
     Args:
         m: Rows.
