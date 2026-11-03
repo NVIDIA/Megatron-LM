@@ -518,7 +518,9 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             data_iter = iter([data])
 
-        replay_driver = RouterReplayDriver.maybe_create(handle, router_replay)
+        replay_driver = RouterReplayDriver.maybe_create(
+            handle, router_replay, forward_only=forward_only
+        )
         if replay_driver is not None:
             replay_driver.begin()
             forward_step = replay_driver.wrap(forward_step)

@@ -30,13 +30,14 @@ def _protocol_fn(protocol, name: str, fallback):
 class RouterReplayDriver:
     """Own the record/replay lifecycle for one ``forward_backward`` call."""
 
-    def __init__(self, handle, action: str):
+    def __init__(self, handle, action: str, *, forward_only: bool = False):
         if action not in ("record", "replay"):
             raise ValueError(
                 f"router replay action must be 'record' or 'replay', got {action!r}."
             )
         self.handle = handle
         self.action = action
+        self.forward_only = forward_only
         self._chunks = handle._extras.get("model_chunks", [handle._model])
         self._protocol = handle._extras.get("protocol")
         self._num_routers = 0
@@ -56,13 +57,15 @@ class RouterReplayDriver:
             yield from roots
 
     @classmethod
-    def maybe_create(cls, handle, spec: Any) -> RouterReplayDriver | None:
+    def maybe_create(
+        cls, handle, spec: Any, *, forward_only: bool = False
+    ) -> RouterReplayDriver | None:
         if not spec:
             return None
         action = spec.get("action") if isinstance(spec, dict) else spec
         if action in (None, "disabled"):
             return None
-        return cls(handle, action)
+        return cls(handle, action, forward_only=forward_only)
 
     def begin(self) -> None:
         RouterReplay.clear_global_router_replay_instances()
@@ -124,13 +127,17 @@ class RouterReplayDriver:
                 return forward_step(model, batch)
             finally:
                 self._emit_replay_evidence()
-                # Pipeline schedules may recompute checkpointed router forwards
-                # after one or more newer micro-batches have run.  Those calls
-                # must consume the saved per-microbatch FIFO, not the latest
-                # forward target.
-                RouterReplay.set_global_router_replay_action(
-                    RouterReplayAction.REPLAY_BACKWARD
-                )
+                if self.forward_only:
+                    # No recompute backward will consume the per-microbatch FIFO.
+                    RouterReplay.clear_global_state()
+                else:
+                    # Pipeline schedules may recompute checkpointed router forwards
+                    # after one or more newer micro-batches have run.  Those calls
+                    # must consume the saved per-microbatch FIFO, not the latest
+                    # forward target.
+                    RouterReplay.set_global_router_replay_action(
+                        RouterReplayAction.REPLAY_BACKWARD
+                    )
 
         return stepped
 

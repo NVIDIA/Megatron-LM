@@ -347,6 +347,35 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
     )
 
 
+def test_r3_driver_forward_only_does_not_retain_backward_targets():
+    from megatron.lite.primitive.modules.router_replay import RouterReplay
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    RouterReplay.clear_global_router_replay_instances()
+    replay = RouterReplay()
+    driver = RouterReplayDriver.__new__(RouterReplayDriver)
+    driver.forward_only = True
+    driver._protocol = SimpleNamespace(
+        pack_routed_experts=lambda _model, _batch, routed: [routed],
+        pack_r3_replay_mask=lambda _model, _batch: None,
+    )
+    driver._num_routers = 1
+    driver._emitted_evidence = True
+    driver._select_local_layers = lambda routed: routed
+
+    native = torch.tensor([[0, 1]])
+    stepped = driver._wrap_replay(
+        lambda _model, _batch: replay.select_indices(native)
+    )
+    for target in (torch.tensor([[2, 3]]), torch.tensor([[4, 5]])):
+        actual = stepped(None, SimpleNamespace(routed_experts=target))
+        assert torch.equal(actual, target)
+        assert replay.replay_backward_list == []
+        assert replay.replay_backward_mask_list == []
+        assert replay.target_topk_idx is None
+        assert replay.target_replay_mask is None
+
+
 def test_r3_driver_slices_global_layer_axis_for_pipeline_stage():
     from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
