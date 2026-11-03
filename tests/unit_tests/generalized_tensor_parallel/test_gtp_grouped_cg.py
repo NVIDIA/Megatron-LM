@@ -186,10 +186,11 @@ def _native_model(group, recipe):
 
 
 @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "native-mxfp8"])
-def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
+def test_grouped_full_iteration_replay(expert_group, mxfp8):
+    # The native model's GLU is not interleaved, so TE never fuses its grouped MLP into the
+    # CuTeDSL kernel, which requires 32-wide interleaving.
     if mxfp8:
         _requires_mxfp8()
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
     recipe = MXFP8BlockScaling() if mxfp8 else None
     model = (
         _native_model(expert_group, recipe)

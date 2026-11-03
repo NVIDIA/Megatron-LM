@@ -1286,7 +1286,9 @@ def _te_apply_normalization_patched(
         ln_out.copy_(out_fp32)
     else:
         ln_out = out_fp32.to(output_dtype)
-    return ln_out, None, rsigma.squeeze(-1)
+    # TE before 2.21 passes a 2D inputmat, TE 2.21 (#3523) an nD one. Its rmsnorm_bwd takes
+    # rsigma as [rows], every leading dimension flattened, as TE's own forward returns it.
+    return ln_out, None, rsigma.reshape(-1)
 
 
 @lru_cache(maxsize=None)

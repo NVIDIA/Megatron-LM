@@ -229,6 +229,83 @@ def test_te_linear_fused_wgrad_accumulates_over_microbatches(backend, layer_type
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("layer_type", ["linear", "layernorm_linear"])
+@pytest.mark.parametrize("backend", _BI_GEMM_BACKENDS)
+def test_te_linear_backward_on_sbh_input_matches_reference(backend, layer_type):
+    """Batch-invariant forward and backward of a TE linear on an [s, b, h] input give TE's
+    output and gradients: input, weight, bias and, for LayerNormLinear, the RMSNorm weight.
+
+    TE 2.21 (#3523) no longer flattens layer inputs and gradients to 2D, so the batch-invariant
+    GEMM sees [s, b, h] operands and TE's rmsnorm backward needs the patched norm's rsigma
+    as [s * b]."""
+    assert backend != "deepgemm" or HAVE_DEEPGEMM_BF16
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            flash_attention_version=_BIK_FA_VERSION,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            attention_backend=AttnBackend.flash,
+        )
+        layer_cls = (
+            TEColumnParallelLinear if layer_type == "linear" else TELayerNormColumnParallelLinear
+        )
+        layer = layer_cls(
+            input_size=cfg.hidden_size,
+            output_size=512,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        torch.manual_seed(11)
+        x = torch.randn(24, 2, cfg.hidden_size, **_device(torch.bfloat16))
+        dy = torch.randn(24, 2, 512, **_device(torch.bfloat16))
+        params = dict(layer.named_parameters())
+
+        def forward_backward(batch_invariant):
+            layer.zero_grad(set_to_none=True)
+            inp = x.clone().requires_grad_(True)
+            mode = (
+                set_batch_invariant_mode(True, backend=backend)
+                if batch_invariant
+                else contextlib.nullcontext()
+            )
+            with mode:
+                out, _ = layer(inp)
+                out.backward(dy)
+            return {"output": out, "input": inp.grad} | {n: p.grad for n, p in params.items()}
+
+        reference = forward_backward(batch_invariant=False)
+        actual = forward_backward(batch_invariant=True)
+        assert reference.keys() == actual.keys()
+        for name, ref in reference.items():
+            assert ref is not None and actual[name] is not None, name
+            assert actual[name].shape == ref.shape, name
+            torch.testing.assert_close(
+                actual[name].float(),
+                ref.float(),
+                rtol=2e-2,
+                atol=5e-2,
+                msg=lambda m: f"{name}: {m}",
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 _FP32, _BF16 = torch.float32, torch.bfloat16
 # name: (A shape, B shape, (out shape, dtype) or None for a returned result, calls)
 _GEMM_CASES = {
@@ -332,6 +409,34 @@ def test_batch_invariant_gemm_backends_reject_fp8(backend):
             batch_invariant_backend=backend,
             fp8="hybrid",
             fp8_recipe="mxfp8",
+        )
+
+
+@pytest.mark.parametrize(
+    "fused_mlp", ["use_grouped_gemm_for_dense_mlp", "use_grouped_gemm_for_shared_expert"]
+)
+@pytest.mark.parametrize("backend", ["te_native", "deepgemm", "triton"])
+def test_batch_invariant_rejects_cutedsl_fused_grouped_mlps(backend, fused_mlp):
+    """The fused dense and shared-expert grouped MLPs run as cuDNN CuTeDSL grouped GEMMs on
+    Blackwell, which no batch-invariant backend controls, so they are rejected at construction.
+    The MXFP8 shared expert is the one te_native would otherwise accept."""
+    quantized = (
+        dict(fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True) if backend == "te_native" else {}
+    )
+    with pytest.raises(AssertionError, match=fused_mlp):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=_BIK_FA_VERSION,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend=backend,
+            **{fused_mlp: True},
+            **quantized,
         )
 
 
@@ -683,8 +788,10 @@ def test_te_flash_attention_4_causal_matches_fp32(monkeypatch, batch_invariant, 
     )
     from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils
 
-    if not FlashAttentionUtils.v4_is_installed:
-        pytest.skip("Transformer Engine finds no flash-attn-4")
+    if is_lts_ci_image():
+        pytest.skip("flash-attn-4 is not in the LTS image")
+    # The dev CI image ships flash-attn-4, so an FA4 that TE cannot load is a failure here.
+    assert FlashAttentionUtils.v4_is_installed, "Transformer Engine cannot load flash-attn-4"
     if batch_invariant and not te_supports_batch_invariant_attention():
         pytest.skip("this Transformer Engine has no batch-invariant attention")
 
