@@ -106,52 +106,11 @@ def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
 
 
 @pytest.fixture
-def grouped_mlp_fusions(monkeypatch, virtual_expert_environment):
-    """Refresh TE fusion support after setting this test's environment."""
-    from transformer_engine.pytorch.ops.fused import grouped_mlp
-    from transformer_engine.pytorch.ops.fuser import (
-        OperationFuser,
-        register_forward_backward_fusion,
-    )
-
-    # TE caches capability checks and registers these fusions at import time.
-    # Refresh the checks under this test's settings; preserve the original registry.
-    checks = (
-        grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
-        grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
-        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
-    )
-    for check in checks:
-        check.cache_clear()
-    monkeypatch.setattr(
-        OperationFuser,
-        "forward_backward_fusion_functions",
-        list(OperationFuser.forward_backward_fusion_functions),
-    )
-    try:
-        for cls, name, legacy_name in (
-            (grouped_mlp.GroupedMLP_CuTeGEMMGLU, "fuse_glu_ops", "fuse_ops"),
-            (grouped_mlp.GroupedMLP_CuTeGEMMUnary, "fuse_unary_activation_ops", "fuse_srelu_ops"),
-        ):
-            fuse = getattr(grouped_mlp, name, None)
-            if fuse is None:
-                fuse = getattr(grouped_mlp, legacy_name)
-            if cls.is_supported() and fuse not in OperationFuser.forward_backward_fusion_functions:
-                register_forward_backward_fusion(fuse, prepend=True)
-        yield grouped_mlp
-    finally:
-        for check in checks:
-            check.cache_clear()
-
-
-@pytest.fixture
-def mxfp8_grouped_mlp(grouped_mlp_fusions):
+def mxfp8_grouped_mlp(request):
     """Require real Blackwell fused kernels for MXFP8 numerical comparisons."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 requires Blackwell")
-    assert (
-        grouped_mlp_fusions.GroupedMLP_CuTeGEMMUnary.is_supported()
-    ), "MXFP8 parity requires TE's fused SReLU kernels and a compatible cuDNN frontend"
+    request.getfixturevalue("require_te_fused_srelu_mlp")
 
 
 @pytest.fixture
