@@ -1012,11 +1012,9 @@ class FusedKdaBwdKernel:
             self._wait(edges, _E_READY_B, it)
             self._stamp(trace, 2, 2, it)
             self._gemm(
-                mma_vn, slot_a, operand("vn", smem.sq, "a"), operand("vn", smem.v, "b"), False
-            )
-            self._gemm(
                 mma_d, slot_b, operand("d", smem.akk, "a"), operand("d", smem.t21, "b"), False
             )
+            # dAkk stays unconditional: mma_sq_kk is reconfigured again in phase C.
             self._gemm(
                 mma_sq_kk,
                 sq_dakk,
@@ -1024,6 +1022,10 @@ class FusedKdaBwdKernel:
                 operand("dakk", smem.v, "b"),
                 False,
             )
+            if owned:
+                self._gemm(
+                    mma_vn, slot_a, operand("vn", smem.sq, "a"), operand("vn", smem.v, "b"), False
+                )
             self._commit(edges + _E_DONE_B)
             self._stamp(trace, 2, 3, it)
             # Phase C: dAqk, state-path token gradients, dh_k, inverse left.
@@ -1265,6 +1267,9 @@ class FusedKdaBwdKernel:
             valid = cutlass.min(_BT, seq_len - chunk * _BT)
             gchunk = chunk_base + chunk
             owned = it % self.split == part
+            # Scalars assigned only on owned chunks keep one type across the dynamic branches.
+            t_o, col_o = cutlass.Int32(0), cutlass.Int32(0)
+            x_o, delta_o, d_o, contrib_o = (cutlass.Float32(0.0),) * 4
             # Phase A: beta, tails and triangular masks; Akk * diag(beta).
             if ttidx < _BT:
                 s_beta[ttidx] = (
@@ -1311,24 +1316,26 @@ class FusedKdaBwdKernel:
             # Phase B: Delta = v - X (in place), dvn -> sT21; -(k beta G) rows 32..63.
             self._wait(edges, _E_DONE_A, it)
             self._stamp(trace, 1, 2, it)
+            # Delta feeds only vn, dAkk and dbeta, which the chunk's owner computes.
             for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
-                cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
-                for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                    t, col = tok_crd[e, 0, sub]
-                    x = regs[e, 0, sub]
-                    if cutlass.const_expr(self.debug):
-                        debug_out[gchunk, head, 0, t, col] = x
-                    delta = r_in[e, 0, sub].to(self.acc_dtype) - x
-                    r_out[e, 0, sub] = (delta if t < valid else cutlass.Float32(0.0)).to(
-                        self.io_dtype
-                    )
-                cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
+                if owned:
+                    cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
+                    cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
+                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                        t_o, col_o = tok_crd[e, 0, sub]
+                        x_o = regs[e, 0, sub]
+                        if cutlass.const_expr(self.debug):
+                            debug_out[gchunk, head, 0, t_o, col_o] = x_o
+                        delta_o = r_in[e, 0, sub].to(self.acc_dtype) - x_o
+                        r_out[e, 0, sub] = (delta_o if t_o < valid else cutlass.Float32(0.0)).to(
+                            self.io_dtype
+                        )
+                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
                 cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
                 if cutlass.const_expr(self.debug):
                     for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                        t, col = tok_crd[e, 0, sub]
-                        debug_out[gchunk, head, 1, t, col] = regs[e, 0, sub]
+                        t_o, col_o = tok_crd[e, 0, sub]
+                        debug_out[gchunk, head, 1, t_o, col_o] = regs[e, 0, sub]
                 r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
                 cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
             cute.arch.fence_view_async_tmem_load()
@@ -1343,30 +1350,32 @@ class FusedKdaBwdKernel:
             part0 = cutlass.Float32(0.0)
             part1 = cutlass.Float32(0.0)
             for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
-                if cutlass.const_expr(self.debug):
-                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                        t, col = tok_crd[e, 0, sub]
-                        debug_out[gchunk, head, 2, t, col] = regs[e, 0, sub]
-                r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
-                cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
-                cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
-                cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
-                for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                    t, col = tok_crd[e, 0, sub]
-                    d_value = regs[e, 0, sub]
+                if owned:
+                    cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
                     if cutlass.const_expr(self.debug):
-                        debug_out[gchunk, head, 3, t, col] = d_value
-                    contribution = (
-                        d_value * r_in[e, 0, sub].to(self.acc_dtype)
-                        if t < valid
-                        else cutlass.Float32(0.0)
-                    )
-                    if t == row0:
-                        part0 += contribution
-                    else:
-                        part1 += contribution
-                    r_in[e, 0, sub] = (s_beta[t] * d_value).to(self.io_dtype)
+                        for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                            t_o, col_o = tok_crd[e, 0, sub]
+                            debug_out[gchunk, head, 2, t_o, col_o] = regs[e, 0, sub]
+                    r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
+                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
+                cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
+                if owned:
+                    cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
+                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                        t_o, col_o = tok_crd[e, 0, sub]
+                        d_o = regs[e, 0, sub]
+                        if cutlass.const_expr(self.debug):
+                            debug_out[gchunk, head, 3, t_o, col_o] = d_o
+                        contrib_o = (
+                            d_o * r_in[e, 0, sub].to(self.acc_dtype)
+                            if t_o < valid
+                            else cutlass.Float32(0.0)
+                        )
+                        if t_o == row0:
+                            part0 += contrib_o
+                        else:
+                            part1 += contrib_o
+                        r_in[e, 0, sub] = (s_beta[t_o] * d_o).to(self.io_dtype)
                 r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
                 cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_kb[None, 0, sub, 0])
             if owned:
@@ -1390,16 +1399,16 @@ class FusedKdaBwdKernel:
             # Off the MMA path: stage dv = beta * D in sV (Delta is consumed;
             # the next v load waits READY_D), store whole rows, and seed dbeta
             # with the row sums (each row spread over one aligned quad).
-            for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                r_out[None, 0, sub].store(r_in[None, 0, sub].load())
-                cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
-            part0 = cute.arch.warp_reduction_sum(part0, threads_in_group=4)
-            part1 = cute.arch.warp_reduction_sum(part1, threads_in_group=4)
-            if ttidx % 4 == 0:
-                s_dbeta[row0] = part0
-                s_dbeta[row0 + 8] = part1
-            cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
             if owned:
+                for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
+                    r_out[None, 0, sub].store(r_in[None, 0, sub].load())
+                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
+                part0 = cute.arch.warp_reduction_sum(part0, threads_in_group=4)
+                part1 = cute.arch.warp_reduction_sum(part1, threads_in_group=4)
+                if ttidx % 4 == 0:
+                    s_dbeta[row0] = part0
+                    s_dbeta[row0 + 8] = part1
+                cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
                 self._store_rows(dv, smem.v, ttidx, head, tok0, valid)
 
             # Phase D: T = Akk^T dAkk -> sSq (the only operand MMA D waits for).
