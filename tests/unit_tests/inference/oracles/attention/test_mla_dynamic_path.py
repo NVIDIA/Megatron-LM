@@ -18,7 +18,8 @@ Contract (from the MLA math; the training path is the semantic definition):
   the layer's sink (``softmax_type`` learnable: ``exp(sink_h)`` in the denominator).
 * Padding: rows past the live tokens are not part of the contract, but they must not move live
   rows: with an FP8 per-tensor recipe ``linear_proj`` scales its input by an amax over every row,
-  so padding rows must reach it as zeros (whatever the attention kernel left there).
+  so padding rows must reach it as zeros (whatever the attention kernel left there). The check
+  reads the layer's output, after ``linear_proj``, where the cross-row scale acts.
 * Unused memory: a request's outputs do not depend on pool pages it does not own (free pages,
   other requests' pages, the dummy page), in bf16 and under FP8 per-tensor scaling.
 * DSA cannot use the latent cache: its sparse attention needs an indexer cache the dynamic path
@@ -277,13 +278,16 @@ class _Scenario:
         try:
             fp8_context = get_fp8_context(self.config) if self.fp8 else contextlib.nullcontext()
             with torch.no_grad(), InferenceMode.active(), fp8_context:
-                self.layer(hidden, attention_mask=None, inference_context=context)
+                layer_out, _ = self.layer(hidden, attention_mask=None, inference_context=context)
         finally:
             hook.remove()
         # The token count this step ran with (set by initialize_attention_state above).
         self.padded_tokens = context.padded_active_token_count
         out = captured[0].reshape(captured[0].shape[0], -1)
         rows = {rid: (o, n, out[s : s + n]) for rid, (o, n, s) in spans.items()}
+        # The layer's output rows (after linear_proj), where cross-row FP8 scaling shows.
+        layer_out = layer_out.reshape(layer_out.shape[0], -1)
+        self.output_rows = {rid: layer_out[s : s + n].clone() for rid, (_, n, s) in spans.items()}
         decode_only = context.is_decode_only()
         return rows, decode_only
 
@@ -414,30 +418,42 @@ def _poison_padding_rows(value: float):
     "precision", [pytest.param(p, marks=ou.requires_sm(ou.HOPPER)) for p in ("bf16", "fp8")]
 )
 def test_padding_rows_do_not_reach_live_rows(precision):
-    """A padded prefill step: live rows are finite and bitwise the same whether the attention
-    kernel leaves NaN or zeros in the padding rows. ``[fp8]`` fails on main (R11-F2) and passes
-    with #8874; ``[bf16]`` is the control."""
+    """A padded prefill step: the layer's live output rows (after ``linear_proj``) are finite and
+    bitwise the same whether the attention kernel leaves zeros or garbage in the padding rows.
+
+    The garbage is what a per-tensor FP8 scale would see in stale memory: a large finite value
+    and an infinity for ``[fp8]`` (an amax reduction built on fmax skips NaN, so NaN alone may not
+    move it), NaN and a large value for the ``[bf16]`` control, whose linear_proj is row-local.
+    ``[fp8]`` fails on main (R11-F2: ``linear_proj``'s input amax covers the padding rows) and
+    passes with #8874, which zeroes them first."""
     _require_kernels()
     fp8 = precision == "fp8"
+    poisons = (1e4, float("inf")) if fp8 else (float("nan"), 1e4)
     make_layer, _ = _weights(fp8=fp8)
     results = []
-    for value in (0.0, float("nan")):
+    for value in (0.0, *poisons):
         layer = make_layer()
         scenario = _Scenario(
             layer, layer.config, fp8=fp8, kernel_wrapper=_poison_padding_rows(value)
         )
         for rid, prompt in PROMPTS.items():
             _add_request(scenario.context, rid, prompt)
-        rows, _ = scenario.step()
+        scenario.step()
         assert scenario.padded_tokens > sum(
             PROMPTS.values()
         ), f"no padding rows: {scenario.padded_tokens} tokens for {sum(PROMPTS.values())} live"
-        results.append({rid: got for rid, (_, _, got) in rows.items()})
-    for rid in PROMPTS:
-        assert torch.isfinite(results[1][rid]).all(), f"request {rid}: padding NaN reached it"
-        ou.assert_exact(
-            results[1][rid], results[0][rid], what=f"request {rid}, NaN vs zero padding"
-        )
+        results.append(scenario.output_rows)
+    clean = results[0]
+    for value, poisoned in zip(poisons, results[1:]):
+        for rid in PROMPTS:
+            assert torch.isfinite(
+                poisoned[rid]
+            ).all(), f"request {rid}: padding rows holding {value} made live outputs non-finite"
+            ou.assert_exact(
+                poisoned[rid],
+                clean[rid],
+                what=f"request {rid}: layer output with padding rows holding {value} vs zero",
+            )
 
 
 @pytest.mark.usefixtures("model_parallel")
