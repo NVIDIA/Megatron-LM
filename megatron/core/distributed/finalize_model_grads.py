@@ -23,9 +23,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 
-from .. import parallel_state
 from ..transformer.moe.moe_utils import (
     get_updated_expert_bias,
     get_updated_expert_bias_with_quantile,
@@ -640,6 +639,21 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
 
+# The groups that finalize_model_grads reads from parallel_state when its caller omits
+# pg_collection. dp_cp_gtp_remat is the GTP-inclusive DP x CP group, the one that
+# parallel_state.get_data_parallel_group(with_context_parallel=True) returns.
+_FALLBACK_PROCESS_GROUPS = (
+    'tp',
+    'pp',
+    'embd',
+    'pos_embd',
+    'dp_cp_gtp_remat',
+    'tp_dp_cp',
+    'gtp_remat',
+    'expt_gtp_remat',
+)
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -664,7 +678,8 @@ def finalize_model_grads(
             quantile balancing, or global-batch quantile balancing with gtp_remat active.
             ``tp_dp_cp`` is required with ``moe_router_enable_expert_bias`` or global-batch
             quantile balancing without gtp_remat. An unset ``gtp_remat`` or ``expt_gtp_remat``
-            means that axis is off. When omitted, the groups come from ``parallel_state``.
+            means that axis is off. When omitted, the groups come from ``parallel_state``; this
+            fallback is deprecated and emits a ``ProcessGroupFallbackWarning``.
         force_all_reduce: Passed to ``finish_grad_sync`` of each model chunk.
     """
 
@@ -718,13 +733,21 @@ def finalize_model_grads(
         gtp_remat_group = pg_collection.gtp_remat
         egtp_remat_group = pg_collection.expt_gtp_remat
     else:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+        pg_collection = resolve_process_groups(
+            None,
+            owner="finalize_model_grads",
+            required=_FALLBACK_PROCESS_GROUPS,
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group = pg_collection.tp
+        pp_group = pg_collection.pp
+        embd_group = pg_collection.embd
+        pos_emb_group = pg_collection.pos_embd
+        dp_cp_group = pg_collection.dp_cp_gtp_remat
+        tp_dp_cp_group = pg_collection.tp_dp_cp
+        gtp_remat_group = pg_collection.gtp_remat
+        egtp_remat_group = pg_collection.expt_gtp_remat
 
     # A missing group would silently skip the gtp_remat-axis reduction below and train on
     # wrong gradients, so fail loudly whenever the config says the axis is active.
@@ -794,10 +817,6 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        if pg_collection is None:
-            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
-                with_context_parallel=True
-            )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     if config.moe_router_load_balancing_type == "quantile_balancing":
@@ -807,11 +826,6 @@ def finalize_model_grads(
             if config.gtp_weight_remat_size > 1:
                 qb_reduction_groups = (tp_group, dp_cp_group)
             else:
-                if pg_collection is None:
-                    # Legacy compatibility; modern callers provide pg_collection.tp_dp_cp above.
-                    tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
-                        with_context_parallel=True
-                    )
                 qb_reduction_groups = (tp_dp_cp_group,)
             _update_router_expert_bias_with_quantile(
                 model, config, reduction_groups=qb_reduction_groups
