@@ -555,6 +555,19 @@ class TransformerConfig(ModelParallelConfig):
     instances sized for the largest future schedule entry. Other graph configurations retain the
     static-composition behavior."""
 
+    dsa_cp_pack_zigzag: bool = False
+    """Pack-level zigzag context parallelism for the DSv4 hybrid attention stack.
+    The data split stays ``cp_partition_mode='contiguous'``; the decoder input is redistributed
+    once per microbatch so that CP rank ``r`` holds pack chunks ``r`` and ``2*cp_size-1-r``
+    (``l_local/2`` rows each), and the decoder output is redistributed back before MTP / LM head /
+    loss. Inside CSA every contiguous CP mechanism (halo exchange, compressor group ownership,
+    rank-major compressed all-gather, index building, synthetic indexer layouts) runs per segment,
+    so the prefix-proportional kernels (indexer score/top-k, attend-to-all-compressed HCA layers)
+    are balanced across CP ranks. Requires THD packing, an even per-rank row count with
+    ``l_local/2 >= max(csa_window_size, d_comp)`` (``d_comp`` = 128 for ratio-128 layers, 8 for
+    ratio-4 layers), the fused DSA backend, the sparse indexer loss, and
+    is mutually exclusive with ``dsa_cp_balance_indexer`` (superseded) and dynamic CP."""
+
     @property
     def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
         """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
@@ -2577,6 +2590,63 @@ class TransformerConfig(ModelParallelConfig):
                     f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
                     "flag would only add per-microbatch prebuild work."
                 )
+        if self.dsa_cp_pack_zigzag:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                raise ValueError(
+                    "dsa_cp_pack_zigzag requires experimental_attention_variant='dsv4_hybrid'."
+                )
+            if self.attention_cp_layout != "contiguous" or self.cp_partition_mode != "contiguous":
+                raise ValueError(
+                    "dsa_cp_pack_zigzag keeps the data split contiguous: set "
+                    "attention_cp_layout='contiguous' (legacy alias cp_partition_mode='contiguous')."
+                )
+            if self.dsa_cp_balance_indexer:
+                raise ValueError(
+                    "dsa_cp_pack_zigzag balances the indexer through the layout; "
+                    "disable dsa_cp_balance_indexer."
+                )
+            if self.dynamic_context_parallel:
+                raise ValueError("dsa_cp_pack_zigzag does not support dynamic context parallelism.")
+            if self.context_parallel_size <= 1:
+                raise ValueError("dsa_cp_pack_zigzag requires context_parallel_size > 1.")
+            # Necessary (not sufficient) row-count precondition: a pack never exceeds
+            # max_seqlen_per_dp_cp_rank rows per rank, and each half-chunk must cover the
+            # boundary window the attention layer builds PackZigzagGeometry with:
+            # max(csa_window_size, d_comp), d_comp = 128 (ratio-128 layers) / 8 (ratio-4).
+            # Per-microbatch lengths are still validated at runtime by PackZigzagGeometry.
+            if self.max_seqlen_per_dp_cp_rank is not None:
+                ratios = self.csa_compress_ratios or []
+                zz_window = max(
+                    int(self.csa_window_size), 128 if 128 in ratios else (8 if 4 in ratios else 0)
+                )
+                if self.max_seqlen_per_dp_cp_rank // 2 < zz_window:
+                    raise ValueError(
+                        "dsa_cp_pack_zigzag needs each per-rank half-chunk to cover the boundary "
+                        f"window: max_seqlen_per_dp_cp_rank // 2 = "
+                        f"{self.max_seqlen_per_dp_cp_rank // 2} < {zz_window}. Increase "
+                        "max_seqlen_per_dp_cp_rank or reduce context_parallel_size."
+                    )
+            if self.cuda_graph_impl == "full_iteration":
+                raise ValueError(
+                    "dsa_cp_pack_zigzag is incompatible with full-iteration CUDA graphs."
+                )
+            from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                use_fused_dsa_kernels,
+            )
+
+            if not use_fused_dsa_kernels(self):
+                raise ValueError("dsa_cp_pack_zigzag requires the fused DSA kernel backend.")
+            if (
+                self.csa_compress_ratios
+                and 4 in self.csa_compress_ratios
+                and not self.csa_dense_mode
+                and not self.dsa_indexer_use_sparse_loss
+            ):
+                raise ValueError(
+                    "dsa_cp_pack_zigzag currently supports the sparse indexer loss only "
+                    "(set dsa_indexer_use_sparse_loss=True)."
+                )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -5040,6 +5110,30 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         graph_captures_attention = cuda_graph_captures_attention(self)
+
+        if (
+            self.dsa_cp_pack_zigzag
+            and self.max_seqlen_per_dp_cp_rank is not None
+            and (self.pad_packed_seq_alignment == "max" or self.cuda_graph_impl != "none")
+        ):
+            # Fixed-capacity THD packing pads every pack to max_seqlen_per_dp_cp_rank rows per
+            # rank, so the capacity is the per-rank row count PackZigzagGeometry will see.
+            if self.max_seqlen_per_dp_cp_rank % 2 != 0:
+                raise ValueError(
+                    "dsa_cp_pack_zigzag needs an even per-rank row count; with fixed-capacity "
+                    f"packing that is max_seqlen_per_dp_cp_rank={self.max_seqlen_per_dp_cp_rank}."
+                )
+            from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+                FUSED_INDEXER_MAX_SAFE_ROWS,
+            )
+
+            if self.max_seqlen_per_dp_cp_rank // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+                raise ValueError(
+                    "dsa_cp_pack_zigzag would issue fused indexer calls with "
+                    f"{self.max_seqlen_per_dp_cp_rank // 2} rows per segment, above the "
+                    f"verified-safe limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce "
+                    "max_seqlen_per_dp_cp_rank."
+                )
 
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:

@@ -270,6 +270,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+        if getattr(self.config, "dsa_cp_pack_zigzag", False):
+            # The decoder runs on the pack-zigzag token permutation, which only the DSv4
+            # attention layers understand; Mamba/GDN/KDA layers consume contiguous-layout
+            # sequence metadata (seq_idx / cu_seqlens shards in CP-rank order). MTP layers
+            # are unaffected: the hidden is redistributed back before the MTP block.
+            linear_symbols = {
+                layer_utils.Symbols.MAMBA,
+                layer_utils.Symbols.GDN,
+                layer_utils.Symbols.KDA,
+            }
+            offending = sorted(set(parsed.main_pattern or '') & linear_symbols)
+            if offending:
+                raise ValueError(
+                    "dsa_cp_pack_zigzag supports only DSv4 attention (W/C/H), MLP and MoE "
+                    f"decoder layers; hybrid_layer_pattern contains {offending} "
+                    "(Mamba/GDN/KDA), whose context parallelism assumes the contiguous layout."
+                )
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
@@ -810,6 +827,53 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask_by_layout[layout] = layout_mask
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
+        # Pack-level zigzag CP for the DSv4 attention stack (dsa_cp_pack_zigzag): the whole
+        # decoder runs on a token permutation in which CP rank r holds pack chunks r and
+        # 2*cp-1-r. Convert the (contiguous) decoder input and the per-token side inputs on the
+        # way in, and the decoder output back on the way out; MTP / LM head / loss and every
+        # tensor of the data step stay contiguous. Intermediate pipeline stages receive the
+        # permuted hidden through p2p and only permute their side inputs.
+        # MTP consumes the caller's precomputed embeddings in the contiguous layout; keep them
+        # before the decoder input is permuted below (only the decoder runs on pack-zigzag).
+        mtp_decoder_input = decoder_input
+        zz_cp_group = None
+        if (
+            getattr(self.config, "dsa_cp_pack_zigzag", False)
+            and not in_inference_mode
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+        ):
+            zz_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            if zz_cp_group is None or zz_cp_group.size() <= 1:
+                zz_cp_group = None
+        if zz_cp_group is not None:
+            from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+                cp_pack_zigzag,
+            )
+
+            # The whole stack runs on one pack-zigzag permutation. The per-layer CP layout
+            # manager would read padding_mask_by_layout / cp_layout_plan, which stay in data
+            # order, so it is unsupported here (DSv4 disables it today via
+            # transformer_config._linear_cp_layout_explicit = False).
+            if getattr(self.decoder, "_cp_layout_manager", None) is not None:
+                raise NotImplementedError(
+                    "dsa_cp_pack_zigzag requires the DSv4 stack to run without a per-layer "
+                    "CP layout manager (padding_mask_by_layout / cp_layout_plan are in data order)."
+                )
+            if decoder_input is not None:
+                decoder_input = cp_pack_zigzag.redistribute_pack_zigzag(
+                    decoder_input, zz_cp_group, to_zigzag=True
+                )
+            if decoder_padding_mask is not None:
+                decoder_padding_mask = cp_pack_zigzag.redistribute_tokens_no_grad(
+                    decoder_padding_mask, zz_cp_group, to_zigzag=True, token_dim=1
+                )
+            if hash_input_ids is not None:
+                # dev passes the hash-embedding token ids straight to the decoder as `input_ids`
+                hash_input_ids = cp_pack_zigzag.redistribute_tokens_no_grad(
+                    hash_input_ids, zz_cp_group, to_zigzag=True, token_dim=1
+                )
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -834,6 +898,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         else:
             hidden_states = decoder_output
             mhc_multistream = None
+        if zz_cp_group is not None and (self.post_process or self.mtp_process):
+            # Back to the contiguous layout for MTP / LM head / loss (labels, loss_mask and the
+            # MTP roll plan are contiguous). Non-final stages hand the permuted hidden to p2p.
+            from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+                cp_pack_zigzag,
+            )
+
+            hidden_states = cp_pack_zigzag.redistribute_pack_zigzag(
+                hidden_states, zz_cp_group, to_zigzag=False
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = cp_pack_zigzag.redistribute_pack_zigzag(
+                    mhc_multistream, zz_cp_group, to_zigzag=False
+                )
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -860,7 +938,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
-                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+                decoder_input=mtp_decoder_input if use_precomputed_mtp_embeddings else None,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,

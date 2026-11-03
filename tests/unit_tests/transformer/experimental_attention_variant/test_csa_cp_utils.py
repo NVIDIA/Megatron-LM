@@ -73,7 +73,7 @@ def test_apply_thd_cp_local_rope_fused_defers_position_mapping_to_kernel(monkeyp
     assert len(calls) == 1
     assert calls[0]["cu_seqlens_q"] is cu_seqlens
     assert calls[0]["thd_global_start"] == 3
-    assert "position_ids" not in calls[0]
+    assert calls[0].get("position_ids") is None
 
 
 def test_thd_cp_left_boundary_exchange_forward_backward():

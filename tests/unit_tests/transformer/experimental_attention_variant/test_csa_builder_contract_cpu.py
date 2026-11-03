@@ -51,9 +51,10 @@ def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
             qr,
             boundary_hidden=None,
             boundary_kv=None,
+            pack_zigzag_geom=None,
         ):
             assert (packed_seq_params is not None) == packed
-            assert boundary_hidden is None and boundary_kv is None
+            assert boundary_hidden is None and boundary_kv is None and pack_zigzag_geom is None
             if fused:
                 return fused_inverse(raw, inverse=True)
             return torch.cat((raw[..., :2], inverse_rotation(raw[..., 2:], inverse=True)), dim=-1)

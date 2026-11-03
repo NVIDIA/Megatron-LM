@@ -773,11 +773,14 @@ if _CUTE_AVAILABLE:
         seq_major_rows: cutlass.Int32,
         compressed_rows: cutlass.Int32,
         compressed_base: cutlass.Int32,
+        index_base: cutlass.Int32,
         total_width: cutlass.Int32,
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
         has_unpadded_seqlens: cutlass.Constexpr,
     ):
+        # index_base: physical offset of this row block's (halo, local) pair inside kv_full_thd.
+        # 0 for the contiguous layout; b * (d_window + l_local) for block b of pack-zigzag CP.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         linear = bidx * 128 + tidx
@@ -875,9 +878,9 @@ if _CUTE_AVAILABLE:
                                 if window_col < window_count:
                                     pos = window_start + window_col
                                     if pos < global_start:
-                                        topk_value = pos - (global_start - d_window)
+                                        topk_value = index_base + pos - (global_start - d_window)
                                     else:
-                                        topk_value = d_window + pos - global_start
+                                        topk_value = index_base + d_window + pos - global_start
                         else:
                             comp_count = cutlass.Int32(0)
                             if ratio > 1 and compressed_width > 0:
@@ -890,9 +893,9 @@ if _CUTE_AVAILABLE:
                             if col < window_count:
                                 pos = window_start + col
                                 if pos < global_start:
-                                    topk_value = pos - (global_start - d_window)
+                                    topk_value = index_base + pos - (global_start - d_window)
                                 else:
-                                    topk_value = d_window + pos - global_start
+                                    topk_value = index_base + d_window + pos - global_start
                             elif col < length:
                                 seq_major_id = seq_comp_start + col - window_count
                                 if seq_major_id < seq_major_rows:
@@ -928,9 +931,13 @@ if _CUTE_AVAILABLE:
                         if window_col < window_count:
                             pos = window_start + window_col
                             if pos < global_start:
-                                topk_idxs[row, write_col] = pos - (global_start - d_window)
+                                topk_idxs[row, write_col] = (
+                                    index_base + pos - (global_start - d_window)
+                                )
                             else:
-                                topk_idxs[row, write_col] = d_window + pos - global_start
+                                topk_idxs[row, write_col] = (
+                                    index_base + d_window + pos - global_start
+                                )
                             write_col = write_col + 1
 
                     if ratio > 1 and compressed_width > 0:
@@ -972,6 +979,7 @@ if _CUTE_AVAILABLE:
         seq_major_rows: cutlass.Int32,
         compressed_rows: cutlass.Int32,
         compressed_base: cutlass.Int32,
+        index_base: cutlass.Int32,
         total_width: cutlass.Int32,
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
@@ -1002,6 +1010,7 @@ if _CUTE_AVAILABLE:
                 seq_major_rows,
                 compressed_rows,
                 compressed_base,
+                index_base,
                 total_width,
                 index_mode,
                 compressed_is_sequence_major,
@@ -1452,8 +1461,17 @@ def build_attention_indices(
     compressed_is_sequence_major: bool = False,
     cu_seqlens_unpadded: Optional[torch.Tensor] = None,
     output_alignment: int = 1,
+    index_base: int = 0,
+    out_topk_idxs: Optional[torch.Tensor] = None,
+    out_topk_length: Optional[torch.Tensor] = None,
+    out_indexer_rows: Optional[torch.Tensor] = None,
+    out_q_padding_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
+
+    ``index_base`` offsets the window (halo, local) indices for a row block that does not start
+    at row 0 of ``kv_full_thd`` (pack-zigzag CP: two blocks per rank); ``out_*`` let a caller
+    lower several blocks into row slices of shared output tensors without a concat.
 
     Inputs:
         cu_seqlens: int32 CUDA tensor, shape ``(n_seq + 1,)``.
@@ -1532,15 +1550,27 @@ def build_attention_indices(
         if logical_width > 0
         else 0
     )
-    topk_idxs = torch.empty((l_local, total_width), dtype=torch.int32, device=cu_seqlens.device)
+
+    def _out(given, shape, dtype, name):
+        if given is None:
+            return torch.empty(shape, dtype=dtype, device=cu_seqlens.device)
+        if tuple(given.shape) != tuple(shape) or given.dtype != dtype or not given.is_contiguous():
+            raise ValueError(
+                f"{name}: caller-provided output must be a contiguous {dtype} tensor of shape {tuple(shape)}"
+            )
+        return given
+
+    topk_idxs = _out(out_topk_idxs, (l_local, total_width), torch.int32, "out_topk_idxs")
     index_mode = 2 if for_indexer_loss else int(compressed_topk is None)
     if compressed_topk is None:
         compressed_topk = torch.empty((1, 1), dtype=torch.int32, device=cu_seqlens.device)
     if for_indexer_loss:
         topk_length_kernel = torch.empty((1,), dtype=torch.int32, device=cu_seqlens.device)
-        indexer_physical_rows = torch.empty_like(compressed_topk)
+        indexer_physical_rows = _out(
+            out_indexer_rows, tuple(compressed_topk.shape), torch.int32, "out_indexer_rows"
+        )
     else:
-        topk_length_kernel = torch.empty((l_local,), dtype=torch.int32, device=cu_seqlens.device)
+        topk_length_kernel = _out(out_topk_length, (l_local,), torch.int32, "out_topk_length")
         indexer_physical_rows = torch.empty((1, 1), dtype=torch.int32, device=cu_seqlens.device)
     has_unpadded_seqlens = cu_seqlens_unpadded is not None
     # Store byte flags in CuTe and reinterpret them as torch.bool without a
@@ -1548,6 +1578,10 @@ def build_attention_indices(
     if cu_seqlens_unpadded is None:
         cu_seqlens_unpadded = cu_seqlens
         q_padding_mask_kernel = torch.empty((1,), dtype=torch.uint8, device=cu_seqlens.device)
+    elif out_q_padding_mask is not None:
+        q_padding_mask_kernel = _out(
+            out_q_padding_mask, (l_local,), torch.bool, "out_q_padding_mask"
+        ).view(torch.uint8)
     else:
         q_padding_mask_kernel = torch.empty((l_local,), dtype=torch.uint8, device=cu_seqlens.device)
     launch_work = l_local * 128 if index_mode else l_local
@@ -1575,13 +1609,14 @@ def build_attention_indices(
             seq_major_rows,
             compressed_rows,
             compressed_base,
+            int(index_base),
             total_width,
             index_mode,
             compressed_is_sequence_major,
             has_unpadded_seqlens,
             launch_work,
         ),
-        static_arg_indices=(11, 12, 13),
+        static_arg_indices=(12, 13, 14),
     )
     q_padding_mask = q_padding_mask_kernel.view(torch.bool) if has_unpadded_seqlens else None
     if for_indexer_loss:

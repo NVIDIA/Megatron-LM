@@ -54,6 +54,24 @@ def thd_cp_position_ids(
 _thd_cp_position_ids = thd_cp_position_ids
 
 
+def thd_cp_position_ids_from_rows(
+    cu_seqlens_padded: torch.Tensor, global_rows: torch.Tensor
+) -> torch.Tensor:
+    """Map arbitrary global pack rows to positions within their packed sequences (0 outside).
+
+    Used by non-contiguous CP layouts (pack-zigzag): ``global_rows`` holds the pack row of
+    every local row, in local order.
+    """
+    global_rows = global_rows.to(cu_seqlens_padded.dtype)
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens_padded[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens_padded.shape[0] - 2)
+    sequence_starts = cu_seqlens_padded[sequence_ids]
+    sequence_ends = cu_seqlens_padded[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    return torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+
 def apply_thd_cp_local_rope_fused(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -63,8 +81,16 @@ def apply_thd_cp_local_rope_fused(
     cu_seqlens_padded: torch.Tensor,
     global_start: int,
     inverse: bool = False,
+    global_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply fused non-interleaved RoPE to local THD CP rows."""
+    """Apply fused non-interleaved RoPE to local THD CP rows.
+
+    ``global_rows`` (int tensor, one entry per row of ``x``) overrides the consecutive
+    ``[global_start, global_start + rows)`` interval for non-contiguous CP layouts.
+    """
+    position_ids = None
+    if global_rows is not None:
+        position_ids = thd_cp_position_ids_from_rows(cu_seqlens_padded, global_rows)
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
@@ -81,7 +107,8 @@ def apply_thd_cp_local_rope_fused(
         cu_seqlens_q=cu_seqlens_padded,
         inverse=inverse,
         remove_interleaving=True,
-        thd_global_start=global_start,
+        position_ids=position_ids,
+        thd_global_start=None if position_ids is not None else global_start,
     )
     if squeezed_batch:
         return output.unsqueeze(1)
@@ -99,9 +126,13 @@ def apply_thd_cp_local_rope_unfused(
     global_start: int,
     config,
     inverse: bool = False,
+    global_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Apply unfused RoPE to a consecutive interval of packed CP rows."""
-    position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    """Apply unfused RoPE to packed CP rows (consecutive interval, or explicit ``global_rows``)."""
+    if global_rows is not None:
+        position_ids = thd_cp_position_ids_from_rows(cu_seqlens_padded, global_rows)
+    else:
+        position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
     freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1

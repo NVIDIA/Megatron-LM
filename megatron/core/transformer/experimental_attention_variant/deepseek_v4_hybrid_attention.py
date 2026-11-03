@@ -22,7 +22,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_pack_zigzag,
+    cp_utils,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -150,6 +153,7 @@ class DSv4HybridAttention(Attention):
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
         self._dsv4_compress_ratio = compress_ratio
+        self._dsv4_is_mtp_layer = bool(is_mtp_layer)
         self._dsv4_rope_base = rope_base
         self._dsv4_uses_yarn_rope = use_compressed_yarn
         if not use_compressed_yarn:
@@ -296,13 +300,28 @@ class DSv4HybridAttention(Attention):
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None
+        zz_geom = None
         if use_thd_cp:
-            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
+            # Pack-level zigzag CP (two contiguous segments per rank) for the main decoder
+            # stack; MTP layers see contiguous hidden and keep the single-segment path.
+            if getattr(self.config, "dsa_cp_pack_zigzag", False) and not self._dsv4_is_mtp_layer:
+                _ratio = self._dsv4_compress_ratio
+                _d_comp = 8 if _ratio == 4 else _ratio if _ratio > 1 else 0
+                zz_geom = cp_pack_zigzag.make_geometry(
+                    self.pg_collection.cp,
+                    hidden_states.shape[0],
+                    max(int(self.config.csa_window_size), _d_comp),
+                )
+                boundary_hidden = cp_pack_zigzag.exchange_cp_boundary_hidden_pack_zigzag(
+                    hidden_states, zz_geom, self.pg_collection.cp
+                )
+            else:
+                boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                    hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    self.pg_collection.cp,
+                )
 
         # =====================
         # Query, Key, and Value
@@ -316,6 +335,7 @@ class DSv4HybridAttention(Attention):
             packed_seq_params,
             inference_context=inference_context,
             boundary_hidden=boundary_hidden,
+            pack_zigzag_geom=zz_geom,
         )
         if use_thd_cp:
             query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
@@ -346,6 +366,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                pack_zigzag_geom=zz_geom,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -511,6 +532,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         *,
         inference_params=None,
         boundary_hidden=None,
+        pack_zigzag_geom=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -650,8 +672,22 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
-                    # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
+                    # Rank r owns global rows [r * local_rows, (r + 1) * local_rows)
+                    # (contiguous), or the two segments described by pack_zigzag_geom.
                     global_start = cp_rank * q.shape[0]
+                    zz_q_rows = zz_kv_rows = None
+                    if pack_zigzag_geom is not None:
+                        zz_q_rows = pack_zigzag_geom.global_rows(q.device, cu_seqlens_q.dtype)
+                        zz_kv_rows = (
+                            torch.cat(
+                                (
+                                    pack_zigzag_geom.halo_global_rows(q.device, cu_seqlens_q.dtype),
+                                    zz_q_rows,
+                                )
+                            )
+                            if boundary_kv_compressed is not None
+                            else zz_q_rows
+                        )
                     query = cp_utils.apply_thd_cp_local_rope_fused(
                         q,
                         rotary_pos_cos,
@@ -660,6 +696,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
                         global_start,
+                        global_rows=zz_q_rows,
                     )
                     kv = kv.unsqueeze(-2)
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
@@ -670,6 +707,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
                         global_start - boundary_rows,
+                        global_rows=zz_kv_rows,
                     )
                     if boundary_kv_compressed is not None:
                         boundary_kv = kv[:boundary_rows]
@@ -704,6 +742,19 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             else:
                 if packed_seq and cp_size > 1:
                     global_start = cp_group.rank() * q.shape[0]
+                    zz_q_rows = zz_kv_rows = None
+                    if pack_zigzag_geom is not None:
+                        zz_q_rows = pack_zigzag_geom.global_rows(q.device, cu_seqlens_q.dtype)
+                        zz_kv_rows = (
+                            torch.cat(
+                                (
+                                    pack_zigzag_geom.halo_global_rows(q.device, cu_seqlens_q.dtype),
+                                    zz_q_rows,
+                                )
+                            )
+                            if boundary_kv_compressed is not None
+                            else zz_q_rows
+                        )
                     query = cp_utils.apply_thd_cp_local_rope_unfused(
                         q,
                         rotary_pos_emb,
@@ -712,6 +763,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cu_seqlens_q,
                         global_start,
                         self.config,
+                        global_rows=zz_q_rows,
                     )
                     kv = cp_utils.apply_thd_cp_local_rope_unfused(
                         kv.unsqueeze(-2),
@@ -721,6 +773,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cu_seqlens_kv,
                         global_start - boundary_rows,
                         self.config,
+                        global_rows=zz_kv_rows,
                     )
                     if boundary_kv_compressed is not None:
                         boundary_kv = kv[:boundary_rows]
