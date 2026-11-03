@@ -6,16 +6,30 @@ Combines lm loss with the router's budget loss, optional KD distillation
 loss, and per-budget reporting (full-model vs sub-budget breakdown).
 """
 
+from typing import Optional
+
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
-from megatron.core.utils import unwrap_model
+from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.utils import get_attr_wrapped_model, get_pg_rank, get_pg_size, unwrap_model
 from megatron.training import get_args
 
 
-def _mask_loss(output_tensor, loss_mask):
-    """Apply mask to the unreduced loss tensor."""
+def _mask_loss(output_tensor, loss_mask, tp_group: Optional[torch.distributed.ProcessGroup] = None):
+    """Apply mask to the unreduced loss tensor.
+
+    Args:
+        output_tensor: The unreduced loss; a ``(loss, (param_loss, extra_reporting_dict))``
+            tuple with the router's budget loss; or a distillation tuple ``(loss, tp_reduce,
+            is_sequence_parallel)`` whose flags mark a loss split across tensor-parallel ranks.
+        loss_mask: Mask over the tokens of the loss.
+        tp_group: Tensor-parallel group of the model. A sequence-parallel loss takes its slice of
+            the mask by the rank in this group, and a split loss is all-reduced over it. None
+            falls back to the global tensor-parallel group, with a deprecation warning, when a
+            distillation loss needs the group.
+    """
     args = get_args()
     if isinstance(output_tensor, tuple) and len(output_tensor) == 2:
         (output_tensor, (param_loss, extra_reporting_dict)) = output_tensor
@@ -36,10 +50,19 @@ def _mask_loss(output_tensor, loss_mask):
         else:
             param_loss = -args.router_beta * param_loss
 
+    if (tp_reduce or is_sequence_parallel) and tp_group is None:
+        warn_global_process_group_fallback(
+            "megatron.elastification.loss_func._mask_loss",
+            "tp_group",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+
     if is_sequence_parallel:
         # Sequence-parallel tensor derived from intermediate activation - need to split loss mask.
-        idx = parallel_state.get_tensor_model_parallel_rank()
-        loss_mask = torch.tensor_split(loss_mask, args.tensor_model_parallel_size, dim=1)[idx]
+        idx = get_pg_rank(tp_group)
+        loss_mask = torch.tensor_split(loss_mask, get_pg_size(tp_group), dim=1)[idx]
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.reshape(-1).float()
@@ -55,7 +78,7 @@ def _mask_loss(output_tensor, loss_mask):
 
     if tp_reduce or is_sequence_parallel:
         # Losses on parallel tensors require extra all-reduce to sync across MP ranks.
-        torch.distributed.all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(loss, group=tp_group)
 
     if param_loss_item is not None:
         return loss, param_loss_item
@@ -74,16 +97,20 @@ def loss_func(
     Args:
         loss_mask (Tensor): Used to mask out some portions of the loss
         output_tensor (Tensor): The tensor with the losses
-        model (GPTModel): The model (can be wrapped)
+        model (GPTModel): The model (can be wrapped). Distillation losses split across
+            tensor-parallel ranks are reduced over the ``tp`` group of its ``pg_collection``, and
+            the per-budget distillation report is gathered over its ``dp_gtp_remat`` group.
         selected_budget (float): The budget value used for this forward pass
     """
     args = get_args()
 
     # Unwrap for both Distillation and LANA
     model = unwrap_model(model)
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    tp_group = pg_collection.tp
 
     # Standard lm loss
-    out_mask_loss = _mask_loss(output_tensor, loss_mask)
+    out_mask_loss = _mask_loss(output_tensor, loss_mask, tp_group=tp_group)
 
     if isinstance(out_mask_loss, tuple):
         loss_lm, param_loss_item = out_mask_loss
@@ -124,18 +151,21 @@ def loss_func(
         # The installed balancer with skip_lm_loss=True drops student_loss (param_loss) from
         # the total. Add loss_lm back manually to restore the router gradient signal.
         losses = model.compute_kd_loss(
-            student_loss=loss_lm, loss_reduction_fn=lambda x: _mask_loss(x, loss_mask)
+            student_loss=loss_lm,
+            loss_reduction_fn=lambda x: _mask_loss(x, loss_mask, tp_group=tp_group),
         )
         loss = losses["kd_loss"] + param_loss_item
-        # All-gather logits_loss across DP ranks so we can mask by selected_budget below.
+        # All-gather logits_loss across DP ranks so we can mask by selected_budget below. Every
+        # rank of the group trains on distinct samples, so the GTP-inclusive group is used.
+        dp_group = pg_collection.dp_gtp_remat
+        if dp_group is None:
+            raise ValueError(
+                "Flextron distillation loss requires pg_collection.dp_gtp_remat of the model."
+            )
         logits_loss = losses["logits_loss"].detach()
-        dp_world_size = torch.distributed.get_world_size(
-            group=parallel_state.get_data_parallel_group()
-        )
+        dp_world_size = torch.distributed.get_world_size(group=dp_group)
         logits_loss_gathered = [torch.zeros_like(logits_loss) for _ in range(dp_world_size)]
-        torch.distributed.all_gather(
-            logits_loss_gathered, logits_loss, group=parallel_state.get_data_parallel_group()
-        )
+        torch.distributed.all_gather(logits_loss_gathered, logits_loss, group=dp_group)
         logits_loss_gathered = torch.stack(logits_loss_gathered)
 
         total_loss_report = losses["kd_loss"].detach() + param_loss_item.detach()
@@ -164,9 +194,7 @@ def loss_func(
             [selected_budget], dtype=torch.float32, device=logits_loss.device
         )
         budgets_gathered = [torch.zeros_like(local_budget) for _ in range(dp_world_size)]
-        torch.distributed.all_gather(
-            budgets_gathered, local_budget, group=parallel_state.get_data_parallel_group()
-        )
+        torch.distributed.all_gather(budgets_gathered, local_budget, group=dp_group)
         budgets_gathered = torch.cat(budgets_gathered)
 
         # Create a binary mask where gathered budgets are equal to selected_budget (with 1e-6 tolerance)
