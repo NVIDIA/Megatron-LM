@@ -106,8 +106,8 @@ dev = [
     "megatron-energon[av_decode]~=7.0",
     "av",
     "Pillow>=13.0.0",
-    "flashinfer-python>=0.5.0,<0.8.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.29.1",
+    "flashinfer-python>=0.7.2,<0.8.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -134,20 +134,20 @@ inference = [
     # flashinfer-jit-cache ships pre-compiled CUTLASS MoE kernels and must match
     # flashinfer-python exactly; bump both together. The wheels are CUDA-major
     # specific and only published on flashinfer.ai (cu130 to match the dev image).
-    # Newer releases (>=0.7.1) need a newer nvidia-cudnn-frontend than the dev pin.
-    "flashinfer-python==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache==0.7.0.post1; sys_platform == 'linux'",
+    # The pin must also satisfy the dev group's flashinfer-python range.
+    "flashinfer-python==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache==0.7.2.post1; sys_platform == 'linux'",
     # flashinfer-jit-cache is split into per-arch packages that also live only on
     # flashinfer.ai. uv only applies [tool.uv.sources] to direct dependencies, so
     # each one is listed here (same pin) and routed to the flashinfer index below.
-    "flashinfer-jit-cache-sm80==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm89==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm90a==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm100a==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm103a==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm110a==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm120f==0.7.0.post1; sys_platform == 'linux'",
-    "flashinfer-jit-cache-sm121a==0.7.0.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm80==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm89==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm90a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm100a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm103a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux'",
 ]
 
 otel = [
@@ -224,7 +224,7 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 managed = true
 default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
-constraint-dependencies = ["quack-kernels>=0.6.5"]
+constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",
