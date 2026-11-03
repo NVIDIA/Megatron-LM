@@ -3,6 +3,7 @@
 """Megatron global variables."""
 
 import os
+import re
 import signal
 import sys
 from argparse import Namespace
@@ -383,6 +384,16 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
+def _wandb_run_id(exp_name: str) -> str:
+    """A wandb run id derived from the experiment name.
+
+    The id is part of the run URL, so wandb rejects the characters that would be
+    ambiguous there. Experiment names are often paths, so substitute rather than fail;
+    the unmodified name is still what gets displayed.
+    """
+    return re.sub(r"[/\\#?%:]", "-", exp_name)
+
+
 def _set_wandb_writer(args):
     cfg = get_run_config()
     global _GLOBAL_WANDB_WRITER
@@ -406,11 +417,23 @@ def _set_wandb_writer(args):
             # settings were.
             with open(wandb_config['kitchen_config_file'], "r") as f:
                 wandb_config['kitchen_config_file_contents'] = f.read()
+        # wandb.init() creates a new run unless it is given an id to resume, and this
+        # runs on every process start. A long job restarts many times -- a requeue, a
+        # node failure, an in-job restarter -- and each restart would otherwise open a
+        # fresh run, scattering one training run across many and leaving every chart
+        # covering only the stretch between two failures. Deriving a stable id from the
+        # experiment name and resuming it keeps them a single timeline. An unnamed run has
+        # nothing stable to derive an id from, so wandb assigns one as before.
+        run_id = cfg.logger.wandb_run_id or (
+            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
+        )
         wandb_kwargs = {
             'dir': save_dir,
+            "id": run_id,
             'name': cfg.logger.wandb_exp_name,
             'project': cfg.logger.wandb_project,
-            'config': wandb_config}
+            'config': wandb_config,
+            "resume": "allow"}
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
