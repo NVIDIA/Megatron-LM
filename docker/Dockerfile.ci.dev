@@ -178,14 +178,41 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     # flash-attn-4 installs into FlashAttention 2's `flash_attn` package. The base image ships
     # both in the system site-packages, where FA2's `flash_attn/__init__.py` makes `flash_attn`
     # resolve to that directory alone, so a venv copy would never be imported. Replace the base
-    # image's copy with the locked, hash-checked one instead (--no-config: the project's
-    # constraints are not pinned, which --require-hashes rejects).
+    # image's copy with the locked, hash-checked one instead. Target the interpreter the venv
+    # was created from (/usr/bin/python3.12 in the NGC images) by path: --system would pick the
+    # venv, which is first on PATH. --no-config: the project's constraints are not pinned,
+    # which --require-hashes rejects.
     uv export --frozen --no-emit-project --no-header --no-annotate \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} \
         | awk '/^flash-attn-4==/ {p = 1} p {print; if (!/\\$/) exit}' > /tmp/flash-attn-4.txt
-    if [ -s /tmp/flash-attn-4.txt ]; then
-        uv pip install --system --break-system-packages --no-config --no-deps --require-hashes \
-            -r /tmp/flash-attn-4.txt
+    FA4_VERSION=$(sed -n 's/^flash-attn-4==\([^ ;\\]*\).*/\1/p' /tmp/flash-attn-4.txt)
+    if [ -n "${FA4_VERSION}" ]; then
+        BASE_PYTHON=$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+            'import sys; print(f"{sys.base_prefix}/bin/python{sys.version_info.major}.{sys.version_info.minor}")')
+        test -x "${BASE_PYTHON}"
+        uv pip install --python "${BASE_PYTHON}" --break-system-packages --no-config --no-deps \
+            --require-hashes -r /tmp/flash-attn-4.txt
+        # Fail the build unless the venv imports the locked flash-attn-4. The import is resolved
+        # without running FA2's or FA4's __init__, so this needs no GPU.
+        "${UV_PROJECT_ENVIRONMENT}/bin/python" - "${FA4_VERSION}" <<"PY"
+import importlib.machinery, importlib.metadata, os, sys
+
+locked = sys.argv[1]
+package = importlib.machinery.PathFinder.find_spec("flash_attn")
+cute = package and importlib.machinery.PathFinder.find_spec(
+    "flash_attn.cute", package.submodule_search_locations
+)
+origin = os.path.realpath(cute.origin) if cute and cute.origin else None
+owners = {
+    dist.version
+    for dist in importlib.metadata.distributions(name="flash-attn-4")
+    if origin and os.path.realpath(dist.locate_file("flash_attn/cute/__init__.py")) == origin
+}
+if owners != {locked}:
+    sys.exit(f"flash_attn.cute imports from {origin} (flash-attn-4 {sorted(owners)}), "
+             f"not the locked flash-attn-4 {locked}")
+print(f"flash_attn.cute imports the locked flash-attn-4 {locked} from {origin}")
+PY
     fi
     rm /tmp/flash-attn-4.txt
 
