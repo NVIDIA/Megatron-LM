@@ -3225,7 +3225,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             for padded, _real, request_ids, input_ids in live_inputs:
                 inputs_by_shape_and_requests.setdefault((padded, request_ids), set()).add(input_ids)
             assert any(len(inputs) > 1 for inputs in inputs_by_shape_and_requests.values())
-            if graph_parity != "exact" or eager_logits:
+            if graph_parity != "exact" or eager_logits or not scenario.exact_top_n:
                 graph_expected = _snapshot_requests(graph_env.requests)
                 graph_requests = graph_env.requests
                 del graph_env
