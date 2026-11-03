@@ -110,11 +110,11 @@ def _multi_tensor_copy_this_to_that(
 # Source of truth for the user-overridable fields is
 # :class:`megatron.core.optimizer_param_scheduler.ParamGroupOverride` (the keys the
 # scheduler reads from each param_group via ``param_group.get(...)``):
-# ``max_lr``, ``min_lr``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
+# ``max_lr``, ``min_lr``, ``lr_mult``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
 # We pull those keys directly from that TypedDict's annotations so future
 # additions to ``ParamGroupOverride`` automatically extend the identifier.
 #
-# The remaining keys (``lr_mult``, ``is_expert_parallel``, ``is_decoupled_lr``) are
+# The remaining keys (``is_expert_parallel``, ``is_decoupled_lr``) are
 # structural flags set by ``_get_param_groups`` (in this module's ``__init__.py``)
 # on every param_group at construction time. They aren't part of ``ParamGroupOverride``
 # (users don't override them directly; they're implied by ``decoupled_lr`` config and
@@ -144,7 +144,6 @@ param_group_identifier_keys = (
     # ``optimizer`` selects per-group optimizer class.
     *_param_group_override_keys(),
     # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
-    'lr_mult',
     'is_expert_parallel',
     'is_decoupled_lr',
 )
@@ -183,6 +182,9 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    for name in ('row_shard_group', 'row_shard_global_rows', 'row_shard_start'):
+        if hasattr(source, name):
+            setattr(destination, name, getattr(source, name))
 
 
 class MegatronOptimizer(ABC):

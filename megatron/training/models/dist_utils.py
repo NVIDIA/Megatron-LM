@@ -58,6 +58,7 @@ def unimodal_build_distributed_models(
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -87,6 +88,7 @@ def unimodal_build_distributed_models(
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             selects padded (True) or compact (False) Muon parameter layouts.
             Adam parameters remain sharded by DistributedOptimizer in both layouts.
@@ -129,6 +131,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings,
     )
 
 
@@ -145,6 +148,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -164,6 +168,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             selects padded (True) or compact (False) Muon parameter layouts.
             Adam parameters remain sharded by DistributedOptimizer in both layouts.
@@ -217,6 +222,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             pg_collection=pg_collection,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings,
         )
 
     return model_list
@@ -281,6 +287,7 @@ def _ddp_wrap(
     pg_collection: ProcessGroupCollection,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    use_sinkhorn_for_embeddings: bool = False,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -294,6 +301,7 @@ def _ddp_wrap(
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
         pg_collection: Model communication process groups.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             selects padded (True) or compact (False) Muon parameter layouts.
             Adam parameters remain sharded by DistributedOptimizer in both layouts.
@@ -336,9 +344,10 @@ def _ddp_wrap(
         ddp_config.use_distributed_optimizer = True
         ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
         compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-        # Tag Muon matrices for the selected LayerWise layout, and keep scalar
-        # parameters (embeddings, biases, layernorm) in DistOpt-style buffers.
-        tag_params_for_buffer_routing(model)
+        # Matrix optimizers need whole parameters; scalar fallbacks can use byte shards.
+        tag_params_for_buffer_routing(
+            model, use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings
+        )
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
     current_stream = torch.cuda.current_stream()

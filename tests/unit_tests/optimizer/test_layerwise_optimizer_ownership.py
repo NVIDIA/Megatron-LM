@@ -2,6 +2,8 @@
 
 """Muon whole-parameter ownership and Adam sharding are independent of layout."""
 
+import copy
+
 import pytest
 import torch
 
@@ -27,7 +29,7 @@ pytestmark = [
 ]
 
 
-def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=False):
+def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=False, sinkhorn=False):
     torch.manual_seed(seed)
     pg = ProcessGroupCollection.use_mpu_process_groups()
     model = torch.nn.Module()
@@ -81,7 +83,7 @@ def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=Fals
     if direct_core:
         ddp_config.use_distributed_optimizer = True
         ddp_config.use_layer_wise_param_layout = layout
-        tag_params_for_buffer_routing([model])
+        tag_params_for_buffer_routing([model], use_sinkhorn_for_embeddings=sinkhorn)
         ddp = DistributedDataParallel(config, ddp_config, model, pg_collection=pg)
         assert ddp_config.use_distributed_optimizer, "DDP must preserve the caller's configuration"
     else:
@@ -91,6 +93,7 @@ def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=Fals
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
             use_layer_wise_param_layout=layout,
+            use_sinkhorn_for_embeddings=sinkhorn,
             pg_collection=pg,
         )[0]
     optimizer_config = OptimizerConfig(
@@ -104,6 +107,7 @@ def _build_model_and_config(layout, expert_bias, overlap, seed, direct_core=Fals
         overlap_param_gather=overlap,
         muon_split_qkv=False,
         muon_tp_mode="duplicated",
+        muon_use_sinkhorn=sinkhorn,
     )
     return ddp, optimizer_config, pg
 
@@ -115,12 +119,15 @@ def _make_optimizer(ddp, config, pg):
 @pytest.mark.parametrize("layout", [False, True])
 @pytest.mark.parametrize("direct_core", [False, True])
 @pytest.mark.parametrize("expert_bias", [False, True])
-def test_layerwise_optimizer_ownership(layout, direct_core, expert_bias):
+@pytest.mark.parametrize("sinkhorn", [False, True])
+def test_layerwise_optimizer_ownership(layout, direct_core, expert_bias, sinkhorn):
     """Both layouts shard Adam; only compact Muon uses unpadded all-reduce buffers."""
+    if sinkhorn:
+        pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
     Utils.initialize_model_parallel(expert_model_parallel_size=2, expert_tensor_parallel_size=1)
     try:
         ddp, config, pg = _build_model_and_config(
-            layout, expert_bias, True, 1234, direct_core=direct_core
+            layout, expert_bias, True, 1234, direct_core=direct_core, sinkhorn=sinkhorn
         )
         if expert_bias:
             with pytest.raises(AssertionError, match="Non-emerging expert-parallel param groups"):
@@ -133,6 +140,10 @@ def test_layerwise_optimizer_ownership(layout, direct_core, expert_bias):
         assert isinstance(adam, DistributedOptimizer)
         assert ddp.ddp_config.use_distributed_optimizer
         assert ddp.full_param_layout is not None
+        assert ddp.module.embedding.is_managed_by_layer_wise_optimizer is sinkhorn
+        assert sum(
+            type(c.optimizer).__name__ == 'Sinkhorn' for c in layerwise.chained_optimizers
+        ) == int(sinkhorn)
         local_muon_params = {
             param
             for child in layerwise.chained_optimizers
@@ -181,5 +192,56 @@ def test_layerwise_optimizer_ownership(layout, direct_core, expert_bias):
                     assert bucket.param_data is None
             else:
                 assert buffer.param_data is not None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('layout', [False, True])
+def test_sinkhorn_distributed_update_and_resume(layout):
+    """A DP-owned FP32 embedding update must agree with an unsharded optimizer."""
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    from megatron.core.optimizer.emerging_optimizers import Sinkhorn
+
+    Utils.initialize_model_parallel()
+    try:
+        ddp, config, pg = _build_model_and_config(layout, False, False, 1701, sinkhorn=True)
+        optimizer = _make_optimizer(ddp, config, pg)
+        layerwise = optimizer.chained_optimizers[0]
+        reference_param = torch.nn.Parameter(ddp.module.embedding.detach().float().clone())
+        reference = Sinkhorn([reference_param], lr=config.lr)
+        gradients = {p: torch.randn_like(p) for p in ddp.parameters()}
+        gradients[ddp.module.embedding][0].zero_()
+        gradients[ddp.module.embedding][1].mul_(1e-6)
+
+        for iteration in range(3):
+            ddp.zero_grad_buffer()
+            optimizer.zero_grad()
+            loss = sum((p.float() * gradients[p].float()).sum() for p in ddp.parameters())
+            loss.backward()
+            ddp.finish_grad_sync()
+            success, _, _ = optimizer.step()
+            assert success
+            reference_param.grad = gradients[ddp.module.embedding].float()
+            reference.step()
+            torch.testing.assert_close(
+                ddp.module.embedding, reference_param.bfloat16(), atol=0, rtol=0
+            )
+            if iteration == 0:
+                saved = copy.deepcopy(layerwise.state_dict())
+                saved_embedding = ddp.module.embedding.detach().clone()
+                saved_reference = reference_param.detach().clone()
+                saved_reference_state = copy.deepcopy(reference.state_dict())
+            elif iteration == 1:
+                expected = ddp.module.embedding.detach().clone()
+                # Restore the matrix optimizers' state and FP32 masters. Gradients in
+                # this test are parameter-independent, so Adam's other weights do not
+                # affect the embedding's continuation.
+                layerwise.load_state_dict(saved)
+                with torch.no_grad():
+                    ddp.module.embedding.copy_(saved_embedding)
+                    reference_param.copy_(saved_reference)
+                reference.load_state_dict(saved_reference_state)
+            else:
+                torch.testing.assert_close(ddp.module.embedding, expected, atol=0, rtol=0)
     finally:
         Utils.destroy_model_parallel()

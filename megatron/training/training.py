@@ -2306,6 +2306,7 @@ def wrap_model_chunks_with_ddp(
     *,
     use_layer_wise_distributed_optimizer=False,
     use_layer_wise_param_layout=True,
+    use_sinkhorn_for_embeddings=False,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -2337,6 +2338,8 @@ def wrap_model_chunks_with_ddp(
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
             ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_sinkhorn_for_embeddings: Keep embedding/output matrices whole for Sinkhorn.
+            Must match ``OptimizerConfig.muon_use_sinkhorn``.
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             selects padded (True) or compact (False) Muon parameter layouts.
             Adam parameters remain sharded by DistributedOptimizer in both layouts.
@@ -2369,7 +2372,9 @@ def wrap_model_chunks_with_ddp(
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
             # Tag Muon matrices for the selected LayerWise layout, and keep scalar
             # parameters (embeddings, biases, layernorm) in DistOpt-style buffers.
-            tag_params_for_buffer_routing(model_chunks)
+            tag_params_for_buffer_routing(
+                model_chunks, use_sinkhorn_for_embeddings=use_sinkhorn_for_embeddings
+            )
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
@@ -2709,6 +2714,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
+                use_sinkhorn_for_embeddings=getattr(args, 'muon_use_sinkhorn', False),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -2911,6 +2917,7 @@ def setup_model_and_optimizer(
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                use_sinkhorn_for_embeddings=cfg.optimizer.muon_use_sinkhorn,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."

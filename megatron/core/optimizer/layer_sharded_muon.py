@@ -393,6 +393,8 @@ class LayerShardedMuon(TensorParallelMuon):
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
     ) -> None:
+        if scale_mode == "rms":
+            raise ValueError("Muon RMS scaling is not supported by LayerShardedMuon")
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
                 "LayerShardedMuon requires the emerging-optimizers package "

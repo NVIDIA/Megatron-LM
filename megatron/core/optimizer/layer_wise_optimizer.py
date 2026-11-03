@@ -42,15 +42,17 @@ logger = logging.getLogger(__name__)
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
-    Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
-    via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
-    explicit ``use_muon=False`` exclusions, embeddings, and non-matrix parameters.
+    Returns True for Muon matrices and embeddings selected for Sinkhorn, which both
+    require whole-parameter ownership. All other parameters use the scalar fallback.
 
-    This DDP-buffer ownership rule must match Muon's parameter-group routing.
+    This DDP-buffer ownership rule must match the optimizer's parameter-group routing.
     """
-    if not getattr(param, 'use_muon', True):
-        return False
+
     if not param.dim() == 2:
+        return False
+    if getattr(param, 'use_sinkhorn', False):
+        return True
+    if not getattr(param, 'use_muon', True):
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
         return False
@@ -75,20 +77,48 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
-def tag_params_for_buffer_routing(model_chunks) -> None:
+def _assign_row_sharded_param_owners(params) -> None:
+    """Keep all row shards of a Sinkhorn matrix on the same replica coordinate.
+
+    Local shard sizes can differ, so memory/compute bin packing alone cannot choose
+    owners for an optimizer that communicates across the row-sharding group.
+    Model-order indices survive optimizer grouping and are shared by compact and
+    padded layouts. The layout takes the index modulo its replica-group size.
+    """
+    owner_index = 0
+    for param in params:
+        if (
+            getattr(param, 'use_sinkhorn', False)
+            and get_pg_size(getattr(param, 'row_shard_group', None)) > 1
+        ):
+            if not hasattr(param, 'optimizer_owner_index'):
+                param.optimizer_owner_index = owner_index
+            owner_index += 1
+
+
+def tag_params_for_buffer_routing(model_chunks, *, use_sinkhorn_for_embeddings=False) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
     Run this once on the un-DDP-wrapped model chunks before
     :class:`DistributedDataParallel` constructs its grad/param buffers — the
     grouping function ``group_params_for_buffers`` reads this attribute to
     decide which buffer each param lands in (LayerWise shard-aligned buffer vs
-    DistOpt-style byte-level buffer).
+    DistOpt-style byte-level buffer). ``use_sinkhorn_for_embeddings`` must match
+    ``OptimizerConfig.muon_use_sinkhorn`` when the optimizer is constructed.
     """
     for model_chunk in model_chunks:
         for param in model_chunk.parameters():
             if not param.requires_grad:
                 continue
+            param.use_sinkhorn = (
+                use_sinkhorn_for_embeddings
+                and param.ndim == 2
+                and getattr(param, 'is_embedding_or_output_parameter', False)
+            )
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+    _assign_row_sharded_param_owners(
+        param for chunk in model_chunks for param in chunk.parameters() if param.requires_grad
+    )
 
 
 def _all_gather_param_group_metadata(param_group, pg_collection):
@@ -337,7 +367,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         for s in range(dp_size)
                         if pad_param_start(shard_cursors[s]) + numel <= max_shard_numel
                     ]
-                    if candidates:
+                    owner_index = getattr(param, 'optimizer_owner_index', None)
+                    if owner_index is not None:
+                        min_shard = owner_index % dp_size
+                    elif candidates:
                         min_shard = min(candidates, key=lambda s: shard_compute_loads[s])
                     else:
                         min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
@@ -634,6 +667,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             for group in optimizer.param_groups
             for param in group["params"]
         ]
+        # Bare optimizer construction has no DDP tagging pass; preserve existing model-order
+        # hints when present and assign them here otherwise.
+        _assign_row_sharded_param_owners(layerwise_params)
         self.reuse_grad_buffer_for_param_ag = self.ddp_config is not None and any(
             uses_grad_buffer_for_fp8_param_gather(param, self.ddp_config)
             for param in layerwise_params
@@ -955,14 +991,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.expt_dp):
+                owner_index = getattr(p, 'optimizer_owner_index', None)
+                owner = (
+                    owner_index % expt_dp_size
+                    if owner_index is not None
+                    else expt_dp_loop[expt_dp_idx]
+                )
+                if owner == get_pg_rank(self.expt_dp):
                     param_groups_this_rank[group_index].append(p)
-                self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
+                self.expt_dp_params_list[owner].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
             else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.dp_cp):
+                owner_index = getattr(p, 'optimizer_owner_index', None)
+                owner = (
+                    owner_index % dp_cp_size if owner_index is not None else dp_cp_loop[dp_cp_idx]
+                )
+                if owner == get_pg_rank(self.dp_cp):
                     param_groups_this_rank[group_index].append(p)
-                self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
+                self.dp_cp_params_list[owner].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
 
         # Now we modify the group to only handle local params.
@@ -1224,7 +1270,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapped_state_dict = {1: state_dict}
         else:
             wrapped_state_dict = state_dict
-        for sd in wrapped_state_dict.values():
+        # torch checkpoints store a list for multiple children; torch_dist restores a dict.
+        child_states = (
+            wrapped_state_dict.values()
+            if isinstance(wrapped_state_dict, dict)
+            else wrapped_state_dict
+        )
+        for sd in child_states:
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 log_single_rank(
                     logger,

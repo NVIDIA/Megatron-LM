@@ -217,6 +217,17 @@ def test_filter_reorder_tolerates_missing_optional_keys():
     assert reordered[0]["_tag"] == "saved_match"
 
 
+def test_filter_reorder_distinguishes_learning_rate_multipliers():
+    """Lookup tables with a scaled schedule must keep their groups on resume."""
+    current = [_make_pg(lr_mult=1.0), _make_pg(lr_mult=5.0)]
+    saved = [
+        _make_pg(lr_mult=5.0, _tag="lookup_table"),
+        _make_pg(lr_mult=1.0, _tag="base_schedule"),
+    ]
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+    assert [group["_tag"] for group in reordered] == ["base_schedule", "lookup_table"]
+
+
 def test_filter_reorder_treats_missing_and_none_identifier_values_as_same():
     """A missing identifier key and an explicit ``None`` value use the same convention."""
     common = dict(

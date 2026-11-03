@@ -907,6 +907,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+            "tests/unit_tests/test_emerging_optimizers.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -918,6 +919,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
+    ),
+    KernelEntry(
+        name="emerging_optimizer_update_dispatch",
+        sources=("megatron/core/optimizer/emerging_optimizers.py",),
+        tests=(K + "test_optimizer_kernels.py",),
+        kind="dispatch",
+        notes="TensorParallelMuon dispatches batched Newton-Schulz for complete query heads "
+        "and single shared key heads. Replays cover FP32 and BF16 NS with spectral and "
+        "actual per-head RMS scaling, including zero updates, under GEMM contention; "
+        "V4.1 layout construction and update/resume parity are covered in test_csa2.py. "
+        "Sinkhorn EMA/Nesterov and row/column L2 reductions replay embedding-shaped updates "
+        "with zero and near-zero rows under contention.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

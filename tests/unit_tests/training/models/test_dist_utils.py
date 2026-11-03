@@ -767,6 +767,7 @@ class TestDdpWrapFullParamLayout:
 
     @pytest.mark.parametrize("layout", [False, True])
     @pytest.mark.parametrize("num_buckets", [None, 2])
+    @pytest.mark.parametrize("sinkhorn", [False, True])
     @patch("megatron.training.models.dist_utils.tag_params_for_buffer_routing")
     @patch("megatron.training.models.dist_utils.LayerWiseDistributedOptimizer")
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
@@ -785,6 +786,7 @@ class TestDdpWrapFullParamLayout:
         mock_tag_params,
         layout,
         num_buckets,
+        sinkhorn,
     ):
         """Both layouts retain Adam DistOpt in the model-builder and traditional entry."""
         from megatron.core.distributed import DistributedDataParallelConfig
@@ -811,9 +813,10 @@ class TestDdpWrapFullParamLayout:
             pg_collection=self.pg,
             use_layer_wise_distributed_optimizer=True,
             use_layer_wise_param_layout=layout,
+            use_sinkhorn_for_embeddings=sinkhorn,
         )
 
-        mock_tag_params.assert_called_once_with([chunk])
+        mock_tag_params.assert_called_once_with([chunk], use_sinkhorn_for_embeddings=sinkhorn)
         passed_config = mock_ddp.call_args.kwargs["ddp_config"]
         assert ddp_config.num_buckets == num_buckets
         assert ddp_config.bucket_size == passed_config.bucket_size == 8_000

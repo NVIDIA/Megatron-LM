@@ -92,10 +92,19 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
     # Select the model-family convention for zero weight decay on vector-like parameters:
-    # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
-    # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
+    # the classic rule skips all 1-D parameters and biases; optional rules keep weight decay
+    # on normalization weights or just Q/K layernorm parameters. Retention controllers intentionally
     # follow the run's ordinary weight-decay policy rather than this generic vector exemption.
-    if config.apply_wd_to_qk_layernorm:
+    if config.apply_wd_to_norm:
+        shape_1_not_norm_param = ParamWithNamePredicate(
+            name="s1_not_norm",
+            fn=lambda param, name: len(param.shape) == 1
+            and not name.endswith(("norm.weight", "layer_norm_weight"))
+            and not getattr(param, "is_norm_weight", False)
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
+        )
+        param_wd_mult_key = ParamKey(name="*.bias", with_name_predicate=shape_1_not_norm_param)
+    elif config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
@@ -332,6 +341,8 @@ def _get_param_groups(
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
             param_overrides_list: list[ParamGroupOverride] = []
+            if getattr(param, 'lr_mult', 1.0) != 1.0:
+                param_overrides_list.append(ParamGroupOverride(lr_mult=param.lr_mult))
             if config_overrides is not None:
                 for param_key, param_override in config_overrides.items():
                     if param_key.matches(param, name):
@@ -811,16 +822,52 @@ def _get_megatron_emerging_optimizer(
     if config.muon_split_qkv_per_head and not config.muon_split_qkv:
         raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
 
+    if (
+        config.muon_use_sinkhorn
+        and not use_layer_wise
+        and (
+            config.use_distributed_optimizer
+            or any(
+                getattr(getattr(chunk, 'ddp_config', None), 'use_distributed_optimizer', False)
+                for chunk in model_chunks
+            )
+        )
+    ):
+        raise ValueError('Distributed Sinkhorn requires use_layer_wise_distributed_optimizer=True')
+
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes (use_sinkhorn, expert_tp, is_qkv).
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            use_sinkhorn = (
+                config.muon_use_sinkhorn
+                and param.ndim == 2
+                and getattr(param, 'is_embedding_or_output_parameter', False)
+            )
+            ddp_config = getattr(model_chunk, 'ddp_config', None)
+            if (
+                ddp_config is not None
+                and ddp_config.use_distributed_optimizer
+                and (
+                    getattr(param, 'use_sinkhorn', False) != use_sinkhorn
+                    or (
+                        use_sinkhorn
+                        and not getattr(param, 'is_managed_by_layer_wise_optimizer', False)
+                    )
+                )
+            ):
+                raise ValueError(
+                    f'Sinkhorn buffer routing disagrees with the optimizer for {name}. '
+                    'Call tag_params_for_buffer_routing with '
+                    'use_sinkhorn_for_embeddings=config.muon_use_sinkhorn before building DDP.'
+                )
+            param.use_sinkhorn = use_sinkhorn
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             qkv_layout = getattr(param, 'qkv_layout', None)
@@ -920,6 +967,12 @@ def _get_megatron_emerging_optimizer(
         is_expert = group['is_expert_parallel'] and not use_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
+    # Sinkhorn is a companion matrix optimizer, not a scalar fallback: its row/column
+    # normalizations require the same whole-parameter ownership as Muon.
+    matrix_optimizer_names = {eopt_name}
+    if config.muon_use_sinkhorn:
+        matrix_optimizer_names.add('sinkhorn')
+
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
     # DDP keeps Adam buffers sharded in both LayerWise layouts. Only compact
@@ -939,10 +992,8 @@ def _get_megatron_emerging_optimizer(
             "is hardcoded to 0 in this path."
         )
     if use_separate_distributed_optimizer and any(
-        # A separate DistributedOptimizer with byte-level sharding handles any group
-        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
-        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
-        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
+        # Scalar fallbacks (Adam/Lion) can use byte-level sharding.
+        opt_name not in matrix_optimizer_names
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
@@ -952,9 +1003,8 @@ def _get_megatron_emerging_optimizer(
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
         )
-        # DistOpt should only manage non-LayerWise buffers (those holding
-        # embeddings, biases, layernorm, etc.). Filter out the LayerWise
-        # shard-aligned buffers that the LayerWiseDistributedOptimizer owns.
+        # DistOpt only manages scalar-fallback buffers. Muon and Sinkhorn buffers
+        # are owned by LayerWiseDistributedOptimizer.
         distopt_per_model_buffers = {}
         for model_chunk_idx, model_chunk in enumerate(model_chunks):
             if not hasattr(model_chunk, 'buffers'):
@@ -969,10 +1019,8 @@ def _get_megatron_emerging_optimizer(
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
-    # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
-    # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
-    # — that is, the LayerWise optimizer only owns Muon-managed matrix parameters,
-    # and the rest go through DistOpt's standard byte-level shard machinery.
+    # In layer-wise mode, Muon and Sinkhorn groups feed into LayerWise; scalar
+    # fallbacks use a separate DistributedOptimizer with byte-level sharding.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
     for (opt_name, is_expert), groups in grouped_param_groups.items():
@@ -981,12 +1029,11 @@ def _get_megatron_emerging_optimizer(
 
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
-        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
-        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
-        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
+        # The primary optimizer and Sinkhorn use whole matrices. Scalar optimizers that
+        # also appear in the registry (e.g. Lion) use the standard fallback path.
+        if opt_name in matrix_optimizer_names:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, groups, opt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
@@ -1076,7 +1123,7 @@ def _get_megatron_emerging_optimizer(
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
         )
-        # LayerWise owns Muon-managed params; DistOpt instances in ``results``
+        # LayerWise owns matrix-optimizer params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:
             return ChainedOptimizer([layer_wise_optimizer] + results)

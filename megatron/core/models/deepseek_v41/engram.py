@@ -118,6 +118,9 @@ class Engram(MegatronModule):
         self.embed = EngramEmbedding(
             config, layout.num_embeddings[self.hash_index], layout.head_dim, pg_collection
         )
+        self.embed.tables[0].weight.lr_mult = getattr(
+            getattr(config, "engram_config", None), "embedding_lr_multiplier", 5.0
+        )
         width = (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim
         device = self.embed.tables[0].weight.device
         self.wkv = nn.Linear(
@@ -132,6 +135,8 @@ class Engram(MegatronModule):
             torch.ones(self.n * config.hidden_size, dtype=config.params_dtype, device=device)
         )
         self.k_weight = nn.Parameter(torch.ones_like(self.q_weight))
+        self.q_weight.is_norm_weight = True
+        self.k_weight.is_norm_weight = True
         if config.perform_initialization:
             config.init_method(self.wkv.weight)
 

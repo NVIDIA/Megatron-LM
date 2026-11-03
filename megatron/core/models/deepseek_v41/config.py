@@ -2,6 +2,7 @@
 
 """Configuration for V4.1 conditional n-gram memory."""
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +39,13 @@ class EngramConfig:
 
     compressed_vocab_size: int
     """Exact number of normalized token identities used to derive hash multipliers."""
+
+    embedding_lr_multiplier: float = 5.0
+    """Learning-rate multiplier for the lookup tables, excluding projections and norms."""
+
+    def __post_init__(self):
+        if not math.isfinite(self.embedding_lr_multiplier) or self.embedding_lr_multiplier <= 0:
+            raise ValueError("Engram embedding_lr_multiplier must be finite and positive")
 
 
 @dataclass

@@ -147,6 +147,310 @@ def test_emerging_optimizer_init_and_resume(name):
     torch.testing.assert_close(restored_param, param, atol=0, rtol=0)
 
 
+def _sinkhorn_reference_step(weight, momentum, grad, *, lr, beta, steps, threshold, eps, scale):
+    """Independent transcription of DeepSeek-V4.1 Algorithm 1, without EO calls."""
+    momentum.mul_(beta).add_(grad, alpha=1 - beta)
+    update = beta * momentum + (1 - beta) * grad
+    row_norms = update.norm(dim=1, keepdim=True)
+    update[row_norms.squeeze(1) <= threshold * row_norms.mean()] = 0
+    for step in range(steps):
+        dim = 1 if step % 2 == 0 else 0
+        update = update / (update.norm(dim=dim, keepdim=True) + eps)
+    weight.add_(update, alpha=-lr * scale * weight.shape[1] ** 0.5)
+
+
+@pytest.mark.parametrize('steps', [1, 3, 11])
+def test_sinkhorn_matches_paper_and_resumes(steps):
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    torch.manual_seed(701)
+    param = nn.Parameter(torch.randn(17, 5))
+    reference = param.detach().clone()
+    initial = reference.clone()
+    momentum = torch.zeros_like(param)
+    config = OptimizerConfig(
+        optimizer='muon',
+        lr=0.03,
+        weight_decay=0.7,
+        muon_use_sinkhorn=True,
+        sinkhorn_num_normalization_steps=steps,
+    )
+    optimizer, init_fn = eo_mod._create_emerging_optimizer(config, [param], 'sinkhorn', [], None)
+    init_fn(optimizer)
+    assert set(optimizer.state[param]) == {'momentum_buffer'}
+    assert optimizer.nesterov
+    assert optimizer.param_groups[0]['weight_decay'] == 0
+
+    for iteration in range(5):
+        grad = torch.randn_like(param)
+        grad[0].zero_()
+        grad[1].mul_(1e-6)
+        saved_grad = grad.clone()
+        param.grad = grad
+        _sinkhorn_reference_step(
+            reference,
+            momentum,
+            grad,
+            lr=0.03,
+            beta=0.95,
+            steps=steps,
+            threshold=1e-3,
+            eps=1e-20,
+            scale=0.18,
+        )
+        optimizer.step()
+        torch.testing.assert_close(param, reference, atol=2e-7, rtol=2e-6)
+        torch.testing.assert_close(optimizer.state[param]['momentum_buffer'], momentum)
+        torch.testing.assert_close(param[:2], initial[:2], atol=0, rtol=0)
+        torch.testing.assert_close(grad, saved_grad, atol=0, rtol=0)
+        if iteration == 2:
+            restored_param = nn.Parameter(param.detach().clone())
+            restored = eo_mod.Sinkhorn(
+                [restored_param],
+                lr=1,
+                momentum=0.2,
+                num_normalization_steps=1,
+                extra_scale_factor=2,
+            )
+            restored.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        elif iteration > 2:
+            restored_param.grad = grad.clone()
+            restored.step()
+            torch.testing.assert_close(restored_param, param, atol=0, rtol=0)
+
+    saved = copy.deepcopy(optimizer.state_dict())
+    param.grad = None
+    optimizer.step()
+    torch.testing.assert_close(
+        optimizer.state[param]['momentum_buffer'],
+        saved['state'][0]['momentum_buffer'],
+        atol=0,
+        rtol=0,
+    )
+    param.grad = torch.zeros_like(param)
+    # Zero input is also well defined before any momentum has accumulated.
+    zero = nn.Parameter(torch.ones(17, 5))
+    empty_peer = eo_mod.Sinkhorn([{'params': []}, {'params': [zero]}])
+    zero.grad = torch.zeros_like(zero)
+    empty_peer.step()
+    torch.testing.assert_close(zero, torch.ones_like(zero), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    'kwargs,match',
+    [
+        ({'momentum': 1.0}, 'momentum'),
+        ({'momentum': float('nan')}, 'momentum'),
+        ({'eps': 0}, 'eps'),
+        ({'eps': float('inf')}, 'eps'),
+        ({'num_normalization_steps': 2}, 'positive odd'),
+        ({'num_normalization_steps': 0}, 'positive odd'),
+        ({'num_normalization_steps': 1.5}, 'positive odd'),
+        ({'zero_row_threshold': -1}, 'threshold'),
+        ({'zero_row_threshold': float('nan')}, 'threshold'),
+        ({'extra_scale_factor': 0}, 'scale_factor'),
+    ],
+)
+def test_sinkhorn_validates_hyperparameters(kwargs, match):
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    with pytest.raises(ValueError, match=match):
+        eo_mod.Sinkhorn([nn.Parameter(torch.ones(8, 4))], **kwargs)
+
+
+@pytest.mark.parametrize('shape', [(4,), (4, 8), (0, 4), (4, 4, 4)])
+def test_sinkhorn_rejects_invalid_matrix(shape):
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    with pytest.raises(ValueError, match='2D weights'):
+        eo_mod.Sinkhorn([nn.Parameter(torch.ones(shape))])
+
+
+def test_sinkhorn_missing_feature_does_not_disable_muon(monkeypatch):
+    original_import = builtins.__import__
+
+    def missing_sinkhorn(name, *args, **kwargs):
+        if name.endswith('.sinkhorn_utils'):
+            raise ModuleNotFoundError(name, name=name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', missing_sinkhorn)
+    param = nn.Parameter(torch.randn(8, 4))
+    with pytest.raises(ImportError, match='sinkhorn_balance'):
+        eo_mod.Sinkhorn([param])
+    muon = TensorParallelMuon([param], fp32_matmul_prec='highest')
+    param.grad = torch.randn_like(param)
+    muon.step()
+    assert 'momentum_buffer' in muon.state[param]
+
+
+def test_sinkhorn_rejects_sharded_matrices(monkeypatch):
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    param = nn.Parameter(torch.randn(8, 4))
+    monkeypatch.setattr(eo_mod, 'get_pg_size', lambda group: group.size())
+    with pytest.raises(ValueError, match='tensor parallel size 1'):
+        eo_mod.Sinkhorn([param], pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 2)))
+    param.is_gtp_weight_remat = True
+    with pytest.raises(ValueError, match='GTP-sharded'):
+        eo_mod.Sinkhorn([param])
+
+
+@pytest.mark.parametrize('enabled,tagged', [(True, False), (False, True)])
+def test_sinkhorn_factory_rejects_inconsistent_ddp_routing(enabled, tagged):
+    model = nn.Module()
+    model.embedding = nn.Parameter(torch.ones(8, 4))
+    model.embedding.is_embedding_or_output_parameter = True
+    model.embedding.use_sinkhorn = tagged
+    model.embedding.is_managed_by_layer_wise_optimizer = tagged
+    model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    config = OptimizerConfig(
+        optimizer='muon', muon_use_sinkhorn=enabled, use_layer_wise_distributed_optimizer=True
+    )
+    with pytest.raises(ValueError, match='Sinkhorn buffer routing disagrees'):
+        get_megatron_optimizer(config, [model], pg_collection=ProcessGroupCollection())
+
+
+def test_sinkhorn_requires_layerwise_for_distributed_optimizer():
+    model = nn.Linear(4, 8)
+    config = OptimizerConfig(
+        optimizer='muon', muon_use_sinkhorn=True, use_distributed_optimizer=True
+    )
+    with pytest.raises(ValueError, match='use_layer_wise_distributed_optimizer=True'):
+        get_megatron_optimizer(config, [model], pg_collection=ProcessGroupCollection())
+    with pytest.raises(ValueError, match='Muon-family'):
+        OptimizerConfig(optimizer='adam', muon_use_sinkhorn=True)
+
+
+@pytest.mark.parametrize('as_dict', [False, True])
+@pytest.mark.parametrize('empty_sinkhorn_owner', [False, True])
+def test_layerwise_sinkhorn_checkpoint_containers(as_dict, empty_sinkhorn_owner):
+    """Restore multi-child LayerWise checkpoints, including a rank owning no embedding."""
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    def build(params):
+        # Isolate checkpoint serialization from CUDA/DDP setup. These are the local,
+        # already-sharded optimizers; distributed ownership is tested separately.
+        children = [
+            TensorParallelMuon([params[0]], fp32_matmul_prec='highest'),
+            eo_mod.Sinkhorn([{'params': [] if empty_sinkhorn_owner else [params[1]]}]),
+        ]
+        chain = object.__new__(LayerWiseDistributedOptimizer)
+        ChainedOptimizer.__init__(chain, children)
+        return chain
+
+    torch.manual_seed(199)
+    params = [nn.Parameter(torch.randn(8, 4)) for _ in range(2)]
+    original = build(params)
+    for param in params:
+        param.grad = torch.randn_like(param)
+    for child in original.chained_optimizers:
+        child.step()
+    checkpoint = copy.deepcopy(original.state_dict())
+    assert isinstance(checkpoint, list)
+    restored_params = [nn.Parameter(p.detach().clone()) for p in params]
+    restored = build(restored_params)
+    restored.load_state_dict(dict(enumerate(checkpoint)) if as_dict else checkpoint)
+    for param, restored_param in zip(params, restored_params):
+        param.grad = torch.randn_like(param)
+        restored_param.grad = param.grad.clone()
+    for chain in (original, restored):
+        for child in chain.chained_optimizers:
+            child.step()
+    for param, restored_param in zip(params, restored_params):
+        torch.testing.assert_close(param, restored_param, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA optimizer wrappers')
+@pytest.mark.parametrize('bf16', [False, True])
+@pytest.mark.parametrize('use_sinkhorn', [False, True])
+@pytest.mark.parametrize('scalar_optimizer', ['adam', 'lion'])
+@pytest.mark.parametrize('apply_wd_to_norm', [False, True])
+def test_sinkhorn_optimizer_factory(bf16, use_sinkhorn, scalar_optimizer, apply_wd_to_norm):
+    """Test the real three-optimizer chain, FP32 masters and scheduled zero weight decay."""
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+    Utils.initialize_model_parallel()
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        model = nn.Module()
+        model.config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+        model.linear = nn.Linear(8, 8)
+        model.embedding = nn.Embedding(17, 8)
+        model.embedding.weight.is_embedding_or_output_parameter = True
+        model.output = nn.Linear(8, 17, bias=False)
+        model.output.weight.is_embedding_or_output_parameter = True
+        model.norm = nn.LayerNorm(8)
+        model.cuda()
+        if bf16:
+            model.bfloat16()
+        model.embedding.weight.lr_mult = 5.0
+        model.embedding.weight.row_shard_group = pg.ep
+        model.embedding.weight.row_shard_global_rows = 17
+        model.embedding.weight.row_shard_start = 0
+        config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            min_lr=0,
+            bf16=bf16,
+            weight_decay=0.1,
+            apply_wd_to_norm=apply_wd_to_norm,
+            muon_use_sinkhorn=use_sinkhorn,
+            muon_scalar_optimizer=scalar_optimizer,
+        )
+        chain = get_megatron_optimizer(
+            config, [model], pg_collection=pg, use_gloo_process_groups=False
+        )
+        scheduler = OptimizerParamScheduler(
+            chain,
+            init_lr=0.01,
+            max_lr=0.01,
+            min_lr=0,
+            lr_warmup_steps=0,
+            lr_decay_steps=100,
+            lr_decay_style='linear',
+            start_wd=0.1,
+            end_wd=0.3,
+            wd_incr_steps=100,
+            wd_incr_style='linear',
+        )
+        scheduler.step(10)
+        decayed_vectors = []
+        for wrapper in chain.chained_optimizers:
+            for group in wrapper.optimizer.param_groups:
+                for param in group['params']:
+                    if group['lr_mult'] == 5.0:
+                        assert param.shape == (17, 8)
+                        assert param.row_shard_group is pg.ep
+                        assert param.row_shard_global_rows == 17
+                        assert param.row_shard_start == 0
+                    assert group['lr'] == pytest.approx(0.009 * group['lr_mult'])
+                    if isinstance(wrapper.optimizer, eo_mod.Sinkhorn):
+                        assert use_sinkhorn
+                        assert param.dtype == torch.float32
+                        assert param.shape == (17, 8)
+                        assert group['wd_mult'] == group['weight_decay'] == 0
+                    elif isinstance(wrapper.optimizer, TensorParallelMuon):
+                        assert param.shape == (8, 8)
+                    else:
+                        assert param.ndim == 1 or not use_sinkhorn
+                        if param.ndim == 1 and group['wd_mult']:
+                            decayed_vectors.append(param)
+                            assert group['weight_decay'] == pytest.approx(0.12)
+        assert len(decayed_vectors) == int(apply_wd_to_norm)
+        if apply_wd_to_norm:
+            torch.testing.assert_close(decayed_vectors[0], torch.ones_like(decayed_vectors[0]))
+        sinkhorn = [
+            c.optimizer
+            for c in chain.chained_optimizers
+            if isinstance(c.optimizer, eo_mod.Sinkhorn)
+        ]
+        assert len(sinkhorn) == int(use_sinkhorn)
+        if use_sinkhorn:
+            assert sum(len(g['params']) for g in sinkhorn[0].param_groups) == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
@@ -330,6 +634,58 @@ def test_muon_qkv_split_shapes_config_without_attention_output_gate():
 
     assert _get_qkv_split_shapes(config) == ([4, 2, 2], [4, 2, 2, 4, 2, 2])
     assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == ([2] * 8, [2] * 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA optimizer wrappers")
+@pytest.mark.parametrize('bf16', [False, True])
+@pytest.mark.parametrize('per_head', [False, True])
+@pytest.mark.parametrize('scale_mode', ['spectral', 'rms'])
+def test_v41_optimizer_factory_preserves_head_layouts(monkeypatch, bf16, per_head, scale_mode):
+    """The public factory carries V4.1 layouts into FP32 masters and routes norms to Adam."""
+    from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import (
+        _muon_attention,
+    )
+
+    Utils.initialize_model_parallel()
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        model = _muon_attention(monkeypatch, layer_number=1).cuda()
+        if bf16:
+            model.bfloat16()
+        config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=bf16,
+            muon_split_qkv_per_head=per_head,
+            muon_scale_mode=scale_mode,
+        )
+        optimizer = get_megatron_optimizer(
+            config=config, model_chunks=[model], pg_collection=groups, use_gloo_process_groups=False
+        )
+        muon = next(
+            wrapper.optimizer
+            for wrapper in optimizer.chained_optimizers
+            if isinstance(wrapper.optimizer, TensorParallelMuon)
+        )
+        muon_ids = {id(p) for group in muon.param_groups for p in group['params']}
+        expected = {
+            'linear_q_up_proj.weight': (4, 8),
+            'linear_kv_proj.weight': (1, 8),
+            'core_attention.indexer.linear_wq_b.weight': (3, 8),
+            'core_attention.indexer.linear_wk.weight': (1, 8),
+        }
+        for name, param in model.named_parameters():
+            main = getattr(param, 'main_param', param)
+            assert (id(main) in muon_ids) == (param.ndim == 2)
+            assert getattr(main, 'is_qkv', False) == (name in expected)
+            if name in expected:
+                heads, width = expected[name]
+                assert main.dtype == torch.float32
+                assert main.qkv_layout == param.qkv_layout
+                assert main.qkv_split_shapes == ([width] * heads if per_head else [width])
+                assert main.qkv_split_shapes_global == [width] * heads
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("layout_kind", ["gqa", "gated_gqa", "mla"])
@@ -978,7 +1334,8 @@ class TestMuonOptimizerMultiRank:
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
             get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
 
-    def test_get_megatron_optimizer_layer_wise(self):
+    @pytest.mark.parametrize('scale_mode', ['spectral', 'rms'])
+    def test_get_megatron_optimizer_layer_wise(self, scale_mode):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
@@ -994,7 +1351,7 @@ class TestMuonOptimizerMultiRank:
             muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
             muon_num_ns_steps=5,
-            muon_scale_mode="spectral",
+            muon_scale_mode=scale_mode,
             muon_tp_mode="duplicated",
         )
 
@@ -1952,6 +2309,173 @@ def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns(monkeypatch)
     assert call_shapes == [(2, 4), (1, 4)]
     expected = torch.cat([center_rows(head) for head in torch.split(grad, [2, 1])])
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize('shape', [(7, 13), (13, 7), (3, 7, 13)])
+@pytest.mark.parametrize('target_rms', [0.18, 0.4])
+def test_muon_rms_scaling_matches_ns_direction(shape, target_rms):
+    """Actual NS directions keep their direction and reach the requested per-matrix RMS."""
+    from emerging_optimizers.utils import fp32_matmul_precision
+
+    grad = torch.randn(shape, generator=torch.Generator().manual_seed(41))
+    param = nn.Parameter(torch.zeros_like(grad))
+    optimizer = TensorParallelMuon(
+        [param],
+        scale_mode='rms',
+        extra_scale_factor=target_rms,
+        coefficient_type='deepseekv4',
+        num_ns_steps=10,
+        fp32_matmul_prec='highest',
+    )
+    with fp32_matmul_precision('highest'):
+        actual = optimizer.scaled_orthogonalize_fn(grad, tp_group=None)
+        direction = eo_mod.newton_schulz_tp(
+            grad, steps=10, coefficient_type='deepseekv4', tp_group=None
+        ).double()
+    expected = F.normalize(direction.flatten(-2), dim=-1, eps=0).view_as(direction)
+    expected *= target_rms * (shape[-2] * shape[-1]) ** 0.5
+    torch.testing.assert_close(actual.double(), expected, atol=1e-7, rtol=2e-6)
+    torch.testing.assert_close(
+        actual.double().square().mean(dim=(-2, -1)).sqrt(),
+        torch.full(shape[:-2], target_rms, dtype=torch.float64),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+
+
+def test_muon_rms_scaling_handles_zero_and_small_updates(monkeypatch):
+    """A zero head stays zero; tiny/large nonzero heads have the same normalized direction."""
+    direction = torch.arange(-7, 8, dtype=torch.float32).view(3, 5)
+    outputs = direction.unsqueeze(0) * torch.tensor([0.0, 1e-30, 1e30]).view(3, 1, 1)
+    saved = outputs.clone()
+    monkeypatch.setattr(eo_mod, 'newton_schulz_tp', lambda *args, **kwargs: outputs)
+    optimizer = TensorParallelMuon(
+        [nn.Parameter(torch.zeros(3, 5))], scale_mode='rms', extra_scale_factor=0.18
+    )
+    actual = optimizer.scaled_orthogonalize_fn(outputs, tp_group=None)
+    expected = F.normalize(direction.double().flatten(), dim=0, eps=0).view(3, 5)
+    expected *= 0.18 * direction.numel() ** 0.5
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual[0], torch.zeros_like(actual[0]), atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual[1:].double(), expected.expand(2, -1, -1), atol=1e-7, rtol=2e-6
+    )
+    torch.testing.assert_close(outputs, saved, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('splits', [[3, 3, 3], [2, 3, 4]])
+def test_muon_rms_per_head_step_and_resume(splits):
+    """Optimizer steps use RMS per head, preserve zero updates/decay, and resume exactly."""
+    generator = torch.Generator().manual_seed(42)
+    param = nn.Parameter(torch.randn(sum(splits), 7, generator=generator))
+    param.qkv_split_shapes_global = splits
+    kwargs = dict(
+        lr=0.02,
+        weight_decay=0.1,
+        momentum=0.95,
+        nesterov=True,
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: True,
+        scale_mode='rms',
+        extra_scale_factor=0.18,
+        coefficient_type='deepseekv4',
+        num_ns_steps=10,
+        fp32_matmul_prec='highest',
+    )
+    optimizer = TensorParallelMuon([param], **kwargs)
+    restored = None
+    for iteration in range(4):
+        grad = torch.randn(param.shape, generator=generator)
+        grad[: splits[0]].zero_()
+        before = param.detach().clone()
+        param.grad = grad.clone()
+        optimizer.step()
+        decayed = before.clone().add_(before, alpha=-kwargs['lr'] * kwargs['weight_decay'])
+        update = (decayed - param) / kwargs['lr']
+        heads = update.split(splits)
+        torch.testing.assert_close(heads[0], torch.zeros_like(heads[0]), atol=0, rtol=0)
+        for head in heads[1:]:
+            torch.testing.assert_close(
+                head.double().square().mean().sqrt(),
+                torch.tensor(0.18, dtype=torch.float64),
+                atol=2e-6,
+                rtol=1e-5,
+            )
+        if restored is not None:
+            restored_param.grad = grad.clone()
+            restored.step()
+            torch.testing.assert_close(restored_param, param, atol=0, rtol=0)
+            torch.testing.assert_close(
+                restored.state[restored_param]['momentum_buffer'],
+                optimizer.state[param]['momentum_buffer'],
+                atol=0,
+                rtol=0,
+            )
+        if iteration == 1:
+            restored_param = nn.Parameter(param.detach().clone())
+            restored_param.qkv_split_shapes_global = splits
+            restored = TensorParallelMuon([restored_param], **kwargs)
+            restored.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+            assert set(optimizer.state[param]) == {'momentum_buffer'}
+
+
+@pytest.mark.parametrize('scale_mode', [None, 'spectral', 'unit_rms_norm', 'shape_scaling'])
+@pytest.mark.parametrize('shape', [(7, 13), (3, 7, 13)])
+def test_muon_rms_preserves_existing_scale_modes(scale_mode, shape):
+    """The opt-in RMS mode does not change old scaling formulas or the default."""
+    from emerging_optimizers.utils import fp32_matmul_precision
+
+    grad = torch.randn(shape, generator=torch.Generator().manual_seed(43))
+    kwargs = {} if scale_mode is None else {'scale_mode': scale_mode}
+    optimizer = TensorParallelMuon(
+        [nn.Parameter(torch.zeros_like(grad))], extra_scale_factor=0.18, **kwargs
+    )
+    with fp32_matmul_precision('highest'):
+        actual = optimizer.scaled_orthogonalize_fn(grad, tp_group=None)
+        direction = eo_mod.newton_schulz_tp(
+            grad, steps=5, coefficient_type='quintic', tp_group=None
+        )
+    factor = eo_mod.get_muon_scale_factor(*shape[-2:], mode=scale_mode or 'spectral')
+    torch.testing.assert_close(actual, direction * factor * 0.18, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('name', ['tp', 'expt_tp', 'gtp_remat', 'expt_gtp_remat'])
+def test_muon_rms_rejects_sharded_groups(monkeypatch, name):
+    """A local RMS must never silently stand in for a sharded matrix's global RMS."""
+    groups = ProcessGroupCollection(**{name: SimpleNamespace(size=lambda: 2)})
+    monkeypatch.setattr(eo_mod, 'get_pg_size', lambda group: 1 if group is None else group.size())
+    with pytest.raises(ValueError, match='TP=1 and no GTP sharding'):
+        TensorParallelMuon([nn.Parameter(torch.ones(3, 5))], scale_mode='rms', pg_collection=groups)
+
+
+@pytest.mark.parametrize(
+    'kwargs', [{'tp_group': SimpleNamespace(size=lambda: 2)}, {'scale_shape': (6, 5)}]
+)
+def test_muon_rms_rejects_partial_update(monkeypatch, kwargs):
+    """Direct scaling callers also reject incomplete or padded logical matrices."""
+    param = nn.Parameter(torch.ones(3, 5))
+    monkeypatch.setattr(eo_mod, 'get_pg_size', lambda group: 1 if group is None else group.size())
+    optimizer = TensorParallelMuon([param], scale_mode='rms')
+    with pytest.raises(ValueError, match='complete, unpadded update matrix'):
+        optimizer.scaled_orthogonalize_fn(param.detach(), **{'tp_group': None, **kwargs})
+
+
+@pytest.mark.parametrize('target', [0, -1, float('inf'), float('nan')])
+def test_muon_rms_rejects_invalid_target(target):
+    with pytest.raises(ValueError, match='finite positive extra_scale_factor'):
+        TensorParallelMuon(
+            [nn.Parameter(torch.ones(3, 5))], scale_mode='rms', extra_scale_factor=target
+        )
+
+
+def test_muon_rms_rejects_other_optimizer_paths():
+    """Alternate update algorithms reject RMS before initializing any optimizer state."""
+    params = [nn.Parameter(torch.ones(3, 5))]
+    with pytest.raises(ValueError, match='not supported by AdaptiveMuon'):
+        TensorParallelAdaptiveMuon(params, scale_mode='rms')
+    with pytest.raises(ValueError, match='not supported by LayerShardedMuon'):
+        LayerShardedMuon(params, scale_mode='rms', gtp_remat_group=None)
 
 
 def test_muon_optimizer_extra_scale_factor():

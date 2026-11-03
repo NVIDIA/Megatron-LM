@@ -143,7 +143,8 @@ def test_fused_adam_step_replays():
 
 @pytest.mark.parametrize('heads,rows,cols', [(8, 512, 1024), (8, 128, 1024), (1, 128, 512)])
 @pytest.mark.parametrize('precision', ['highest', 'medium'])
-def test_muon_per_head_replays(heads, rows, cols, precision):
+@pytest.mark.parametrize('scale_mode', ['spectral', 'rms'])
+def test_muon_per_head_replays(heads, rows, cols, precision, scale_mode):
     """Replay batched Q-head and shared K-head NS under side-stream GEMM contention."""
     pytest.importorskip('emerging_optimizers')
     from emerging_optimizers.utils import fp32_matmul_precision
@@ -155,6 +156,8 @@ def test_muon_per_head_replays(heads, rows, cols, precision):
         pytest.skip('Batched per-head Muon requires emerging-optimizers >= 0.3.0')
     seeded()
     grad = torch.randn(heads * rows, cols, device='cuda', dtype=torch.float32)
+    if scale_mode == 'rms' and heads > 1:
+        grad[:rows].zero_()
     param = torch.nn.Parameter(torch.zeros_like(grad))
     param.qkv_split_shapes_global = [rows] * heads
     optimizer = TensorParallelMuon(
@@ -163,6 +166,7 @@ def test_muon_per_head_replays(heads, rows, cols, precision):
         split_qkv_per_head=True,
         is_qkv_fn=lambda p: True,
         fp32_matmul_prec=precision,
+        scale_mode=scale_mode,
         extra_scale_factor=0.18,
     )
 
@@ -177,5 +181,35 @@ def test_muon_per_head_replays(heads, rows, cols, precision):
         replays=4,
         backward=False,
         contention=True,
-        what='Muon per-head Newton-Schulz',
+        what=f'Muon per-head Newton-Schulz ({scale_mode})',
+    )
+
+
+def test_sinkhorn_step_replays():
+    """Replay EMA, row masking and row/column reductions on embedding-shaped matrices."""
+    pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    from megatron.core.optimizer.emerging_optimizers import Sinkhorn
+
+    seeded()
+    weight = torch.randn(4097, 256, device='cuda', dtype=torch.float32)
+    gradients = [torch.randn_like(weight) for _ in range(3)]
+    for grad in gradients:
+        grad[0].zero_()
+        grad[1].mul_(1e-6)
+
+    def update(initial, *grads):
+        param = torch.nn.Parameter(initial.clone())
+        optimizer = Sinkhorn([param])
+        for grad in grads:
+            param.grad = grad.clone()
+            optimizer.step()
+        return param.detach().clone(), optimizer.state[param]['momentum_buffer'].clone()
+
+    assert_replays_bit_exact(
+        update,
+        (weight, *gradients),
+        replays=4,
+        backward=False,
+        contention=True,
+        what='Sinkhorn-balanced embedding update',
     )

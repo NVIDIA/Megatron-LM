@@ -2,7 +2,7 @@
 
 This composition uses main's HybridModel, MoE, distributed optimizer and packed CP
 path. Each logical block is `VE`: CSA2 attention followed by MoE. It does not
-include vision, DSpark, FP4 QAT or a Sinkhorn optimizer. The fused attention uses
+include vision, DSpark or FP4 QAT. The fused attention uses
 main's 512-dimensional KV path, with BF16 or MXFP8 index selection, H32/H64 and D128. MXFP8 selection
 requires SM100 or later and the cuDNN backend; indexer supervision retains its
 original BF16/FP32 path.
@@ -107,6 +107,76 @@ recipe uses Muon with `--muon-coefficient-type deepseekv4`, ten Newton-Schulz
 steps, `--overlap-grad-reduce` and `--overlap-param-gather`. BF16-only runs omit
 the FP8 recipe, parameter-gather reuse and quantization-padding options and set
 `--dsa-indexer-precision bf16`.
+
+For V4.1 head-wise Muon, enable `--muon-split-qkv-per-head` with the default
+QKV splitting enabled and `--muon-tp-mode duplicated`. The attention Q projection
+and Full/Reindex indexer Q projections split by their own head counts, including
+the full content and RoPE width of each head. SWA KV and the Full owner's indexer
+K each have one shared head and remain whole matrices. Reuse layers have no
+indexer weights. Output, compressor and other linear weights retain whole-matrix
+Muon. Without the per-head flag, V4.1 retains whole-projection updates.
+
+This also applies with `--use-layer-wise-distributed-optimizer`, which distributes
+whole parameters across DP ranks. The separate `--muon-tp-mode layer_sharded`
+algorithm currently rejects split-QKV/per-head Muon. GPU validation of V4.1
+per-head updates with distributed optimizer, FP8 parameter gather and checkpoint
+resume is still required; the training results above predate per-head support.
+
+For the paper's embedding/prediction-head update, add `--muon-use-sinkhorn` to
+`--optimizer muon` (also supported with `adaptive_muon`). This requires EO's
+`emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils.sinkhorn_balance`;
+early builds with the same `0.5.0a0` version string may not include it. Linear
+weights continue to use Muon; norms, biases and other excluded parameters continue
+to use `--muon-scalar-optimizer`. Per-head Muon is independent of this flag.
+
+Sinkhorn uses EMA/Nesterov momentum 0.95, 11 alternating row/column L2
+normalizations ending on rows, a zero-row threshold of 1e-3, epsilon 1e-20 and
+update RMS 0.18 (`--sinkhorn-momentum`, `--sinkhorn-num-normalization-steps`,
+`--sinkhorn-zero-row-threshold`, `--sinkhorn-eps`, `--sinkhorn-extra-scale-factor`).
+Its groups always have zero weight decay, including under the weight-decay
+scheduler, and otherwise follow the embedding/output learning-rate schedule.
+
+V4.1 Engram lookup tables use a 5x learning-rate multiplier by default. Set
+`embedding_lr_multiplier` in the Engram JSON to change it (for example, `1.0`
+disables the multiplier). Projections and normalization weights keep the base
+schedule. The multiplier scales the selected parameter-group schedule, including
+nonzero warmup and minimum LR, and is retained in optimizer checkpoints.
+
+Sinkhorn requires TP=1 and no GTP-sharded embeddings. Engram tables carry their
+explicit EP row partition: near-zero-row masking uses the global mean row norm,
+and column normalization reduces squared norms across all row shards. Empty or
+temporarily inactive shards participate without gathering the full table. With
+`--use-distributed-optimizer`, each local table shard and its FP32 master/momentum
+belong to one replica owner through LayerWiseDistributedOptimizer. Compact and
+padded layouts choose the same replica coordinate for every EP shard of a table;
+padded layouts also pad peer shards to fit the largest local matrix. This can be
+expensive for large vocabularies. Direct MCore callers
+must pass `use_sinkhorn_for_embeddings=True` to `tag_params_for_buffer_routing`
+before constructing DDP, and set `OptimizerConfig.muon_use_sinkhorn=True` when
+constructing the optimizer. Existing LayerWise checkpoint support is reused;
+switching an existing Adam embedding checkpoint to Sinkhorn requires a fresh
+optimizer state. GPU/distributed training validation is still required.
+
+The paper's remaining optimizer recipe is not selected automatically: set Muon
+Nesterov momentum (`--muon-nesterov`), momentum 0.95, weight decay 0.1 and update
+scale explicitly. `--muon-scale-mode spectral --muon-extra-scale-factor 0.18`
+uses shape-based scaling; it does not explicitly normalize each update to RMS
+0.18. Use `--muon-scale-mode rms --muon-extra-scale-factor 0.18` to normalize each
+nonzero Newton-Schulz output to actual RMS 0.18 before applying the learning rate.
+Per-head Muon normalizes each head independently, and zero updates stay zero.
+This mode supports ordinary Muon with TP=1 and no GTP weight sharding, including
+LayerWiseDistributedOptimizer; AdaptiveMuon and `layer_sharded` are unsupported.
+The default remains `spectral`, and the existing `unit_rms_norm` mode also uses
+shape-based scaling. No optimizer state is added; resume with the same scale mode
+and factor. AdamW uses beta1=0.9, beta2=0.95 and epsilon=1e-20 in the paper. Add
+`--apply-wd-to-norm --weight-decay 0.1` to include normalization weights in weight
+decay, including standalone RMSNorm/LayerNorm and TE fused normalization weights.
+Engram's fused `q_weight` and `k_weight` carry the generic `is_norm_weight` tag,
+so this option also includes them while keeping their AdamW optimizer routing.
+This takes precedence over `--apply-wd-to-qk-layernorm`; biases and other vector
+parameters retain their standard exemptions, and Sinkhorn groups keep zero decay.
+The flag defaults to off. Without `--muon-use-sinkhorn`, embeddings/output heads
+retain the scalar-optimizer fallback.
 
 The 16K proxy keeps 24 logical blocks / 48 physical V/E layers, hidden size 5120,
 48 experts with Top-6 routing, MBS1 and GBS128. It uses selective

@@ -45,6 +45,35 @@ def test_initialization(mock_optimizer):
     assert scheduler.wd_incr_style == 'linear'
 
 
+@pytest.mark.parametrize('style', ['linear', 'cosine', 'constant', 'inverse-square-root', 'WSD'])
+def test_lr_multiplier_scales_warmup_decay_and_floor(mock_optimizer, style):
+    """A parameter multiplier scales its selected schedule, including nonzero warmup."""
+    baseline = {'max_lr': 0.2, 'min_lr': 0.02}
+    scaled = {**baseline, 'lr_mult': 5.0}
+    mock_optimizer.param_groups = [baseline, scaled]
+    scheduler = OptimizerParamScheduler(
+        mock_optimizer,
+        init_lr=0.01,
+        max_lr=0.1,
+        min_lr=0.001,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style=style,
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=1000,
+        wd_incr_style='constant',
+        wsd_decay_steps=200,
+        lr_wsd_decay_style='linear',
+    )
+    assert baseline['lr'] == pytest.approx(0.01)
+    assert scaled['lr'] == pytest.approx(0.05)
+    for step in (50, 100, 500, 900, 1000, 1100):
+        scheduler.step(step - scheduler.num_steps)
+        assert scaled['lr'] == pytest.approx(5 * baseline['lr'])
+        assert scaled['weight_decay'] == baseline['weight_decay']
+
+
 def test_get_wd_constant(mock_optimizer):
     scheduler = OptimizerParamScheduler(
         optimizer=mock_optimizer,

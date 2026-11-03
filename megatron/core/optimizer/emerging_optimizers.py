@@ -10,6 +10,7 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
@@ -165,8 +166,21 @@ def _is_nonlinear_or_embedding(param):
 
 
 def _is_muon_excluded(param):
-    """True for parameters that should use the scalar optimizer instead of Muon."""
+    """True for parameters excluded from Muon's orthogonalization."""
     return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
+
+
+def _muon_param_overrides_factory():
+    """Keep whole-matrix Sinkhorn updates separate from the scalar fallback."""
+    return {
+        ParamKey(
+            predicate=ParamPredicate(
+                name="muon_scalar",
+                fn=lambda p: _is_muon_excluded(p) and not getattr(p, 'use_sinkhorn', False),
+            )
+        ): {'optimizer': 'adam'},
+        ParamKey(attr='use_sinkhorn'): {'optimizer': 'sinkhorn', 'wd_mult': 0.0},
+    }
 
 
 def _get_qkv_split_shapes(
@@ -217,6 +231,193 @@ def _qkv_split_groups_are_complete(
 # ===========================================================================
 
 _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
+
+
+# ===========================================================================
+# Sinkhorn-balanced embedding/output updates (DeepSeek-V4.1 Algorithm 1)
+# ===========================================================================
+
+
+class Sinkhorn(OrthogonalizedOptimizer):
+    """EMA/Nesterov SGD with EO's row/column balancing and no weight decay.
+
+    Matrices may be complete or carry explicit ``row_shard_*`` metadata. Row-sharded
+    matrices use global masking/column statistics without gathering matrix contents.
+    LayerWiseDistributedOptimizer assigns each local matrix to one replica owner;
+    ordinary DistributedOptimizer's flattened shards cannot be balanced independently.
+    TP/GTP-sharded embeddings are not supported yet.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        eps: float = 1e-20,
+        num_normalization_steps: int = 11,
+        zero_row_threshold: float = 1e-3,
+        extra_scale_factor: float = 0.18,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        # Feature detection is intentional: early 0.5.0a0 builds lack this function.
+        # A missing optional Sinkhorn implementation must not disable Muon or Lion.
+        try:
+            from emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils import (
+                sinkhorn_balance,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "Sinkhorn updates require emerging-optimizers with sinkhorn_balance; "
+                "update Emerging-Optimizers to a version providing sinkhorn_utils."
+            ) from exc
+
+        if pg_collection is not None and get_pg_size(pg_collection.tp) != 1:
+            raise ValueError("Sinkhorn updates currently require tensor parallel size 1")
+        super().__init__(
+            params,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=0.0,
+            nesterov=True,
+            weight_decay_method='decoupled',
+            fp32_matmul_prec='highest',
+            scaled_orthogonalize_fn=sinkhorn_balance,
+            eps=eps,
+            num_normalization_steps=num_normalization_steps,
+            zero_row_threshold=zero_row_threshold,
+            extra_scale_factor=extra_scale_factor,
+        )
+        for group in self.param_groups:
+            if not 0 <= group['momentum'] < 1:
+                raise ValueError('sinkhorn_momentum must be in [0, 1)')
+            if not math.isfinite(group['eps']) or group['eps'] <= 0:
+                raise ValueError('sinkhorn_eps must be finite and positive')
+            steps = group['num_normalization_steps']
+            if not isinstance(steps, int) or steps <= 0 or steps % 2 != 1:
+                raise ValueError('sinkhorn_num_normalization_steps must be a positive odd integer')
+            threshold = group['zero_row_threshold']
+            if not math.isfinite(threshold) or threshold < 0:
+                raise ValueError('sinkhorn_zero_row_threshold must be finite and nonnegative')
+            scale = group['extra_scale_factor']
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError('sinkhorn_extra_scale_factor must be finite and positive')
+            if group['weight_decay'] != 0:
+                raise ValueError('Sinkhorn updates require zero weight decay')
+            for param in group['params']:
+                if getattr(param, 'is_gtp_weight_remat', False):
+                    raise ValueError('Sinkhorn does not support GTP-sharded weights')
+                row_group = getattr(param, 'row_shard_group', None)
+                if get_pg_size(row_group) > 1:
+                    self._validate_row_partition(param, row_group)
+                elif (
+                    param.ndim != 2
+                    or param.numel() == 0
+                    or getattr(param, 'row_shard_local_rows', param.shape[0]) < param.shape[1]
+                ):
+                    raise ValueError('Sinkhorn requires nonempty 2D weights with rows >= columns')
+                param.use_sinkhorn = True
+
+    @staticmethod
+    def _validate_row_partition(param, row_group):
+        """Check exact, possibly uneven row coverage before owners start collective updates."""
+        local = (
+            getattr(param, 'row_shard_global_rows', None),
+            getattr(param, 'row_shard_start', None),
+            tuple(param.shape),
+            getattr(param, 'row_shard_local_rows', param.shape[0] if param.ndim else 0),
+        )
+        shards = [None] * get_pg_size(row_group)
+        torch.distributed.all_gather_object(shards, local, group=row_group)
+        global_rows = shards[0][0]
+        columns = shards[0][2][-1] if len(shards[0][2]) == 2 else 0
+        if (
+            not isinstance(global_rows, int)
+            or columns <= 0
+            or global_rows < columns
+            or any(
+                rows != global_rows
+                or not isinstance(start, int)
+                or len(shape) != 2
+                or shape[1] != columns
+                or not isinstance(local_rows, int)
+                or not 0 <= local_rows <= shape[0]
+                for rows, start, shape, local_rows in shards
+            )
+        ):
+            raise ValueError('Sinkhorn row shards require matching tall logical matrix metadata')
+        cursor = 0
+        for _, start, _, local_rows in sorted(shards, key=lambda shard: (shard[1], shard[3])):
+            if start != cursor:
+                raise ValueError('Sinkhorn row shards must cover the logical matrix exactly once')
+            cursor += local_rows
+        if cursor != global_rows:
+            raise ValueError('Sinkhorn row shards must cover the logical matrix exactly once')
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Participate with zero gradients when another row shard has an active update.
+
+        EO skips parameters with grad=None. A shard with no local lookups must still
+        contribute its momentum and column statistics, while a globally unused matrix
+        should keep the usual no-update semantics.
+        """
+        if closure is not None:
+            raise ValueError('closure is not supported')
+        missing_grads = []
+        try:
+            for group in self.param_groups:
+                for param in group['params']:
+                    row_group = getattr(param, 'row_shard_group', None)
+                    if get_pg_size(row_group) > 1:
+                        active = torch.tensor(
+                            param.grad is not None, dtype=torch.int32, device=param.device
+                        )
+                        torch.distributed.all_reduce(
+                            active, op=torch.distributed.ReduceOp.MAX, group=row_group
+                        )
+                        if active.item() and param.grad is None:
+                            missing_grads.append(param)
+                            param.grad = torch.zeros_like(param)
+            return super().step()
+        finally:
+            for param in missing_grads:
+                param.grad = None
+
+    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Balance the Nesterov update to unit row RMS, then apply the paper's gamma."""
+        row_group = getattr(p, 'row_shard_group', None)
+        local_rows = getattr(p, 'row_shard_local_rows', grad.shape[0])
+        distributed = get_pg_size(row_group) > 1
+        if distributed or local_rows != grad.shape[0]:
+            eps = kwargs['eps']
+            update = grad[:local_rows].to(dtype=torch.float32, copy=True)
+            row_norms = torch.linalg.vector_norm(update, dim=1, keepdim=True)
+            row_norm_sum = row_norms.sum()
+            if distributed:
+                torch.distributed.all_reduce(row_norm_sum, group=row_group)
+            mean_row_norm = row_norm_sum / (p.row_shard_global_rows if distributed else local_rows)
+            update.masked_fill_(row_norms <= kwargs['zero_row_threshold'] * mean_row_norm, 0)
+            update.div_(row_norms.add_(eps))
+            for _ in range((kwargs['num_normalization_steps'] - 1) // 2):
+                column_norms = update.square().sum(dim=0, keepdim=True)
+                if distributed:
+                    torch.distributed.all_reduce(column_norms, group=row_group)
+                update.div_(column_norms.sqrt_().add_(eps))
+                row_norms = torch.linalg.vector_norm(update, dim=1, keepdim=True)
+                update.div_(row_norms.add_(eps))
+            result = torch.zeros_like(grad)
+            result[:local_rows] = (
+                update.mul_(math.sqrt(grad.shape[1]))
+                .to(grad.dtype)
+                .mul_(kwargs['extra_scale_factor'])
+            )
+            return result
+        return self.scaled_orthogonalize_fn(
+            grad,
+            eps=kwargs['eps'],
+            num_normalization_steps=kwargs['num_normalization_steps'],
+            zero_row_threshold=kwargs['zero_row_threshold'],
+        ).mul_(kwargs['extra_scale_factor'])
 
 
 # ===========================================================================
@@ -331,6 +532,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         if split_qkv_per_head and not split_qkv:
             raise ValueError("split_qkv_per_head requires split_qkv=True")
+        if scale_mode == "rms":
+            if not math.isfinite(extra_scale_factor) or extra_scale_factor <= 0:
+                raise ValueError("Muon RMS scaling requires a finite positive extra_scale_factor")
+            if any(
+                get_pg_size(getattr(pg_collection, name, None)) > 1
+                for name in ("tp", "expt_tp", "gtp_remat", "expt_gtp_remat")
+            ):
+                raise ValueError("Muon RMS scaling currently requires TP=1 and no GTP sharding")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -354,6 +563,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 # This overrides only the final Muon scalar; NS still uses grad's physical
                 # shape and partition metadata for its collectives.
                 size = scale_shape
+            if scale_mode == "rms" and (
+                get_pg_size(tp_group) > 1 or tuple(size) != tuple(grad.shape[-2:])
+            ):
+                raise ValueError("Muon RMS scaling requires a complete, unpadded update matrix")
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
@@ -366,6 +579,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 tp_mode="duplicated" if tp_mode_this_group == "blockwise" else tp_mode_this_group,
                 **ns_kwargs,
             )
+            if scale_mode == "rms":
+                # NS returns FP32. Normalize each matrix (each head for batched NS)
+                # independently. Rescale first to avoid squaring tiny nonzero updates
+                # into zero; all-zero matrices stay zero without a device-host sync.
+                maximum = orth_grad.abs().amax(dim=(-2, -1), keepdim=True)
+                normalized = orth_grad / maximum.masked_fill(maximum == 0, 1)
+                rms = normalized.square().mean(dim=(-2, -1), keepdim=True).sqrt()
+                return normalized / rms.masked_fill(rms == 0, 1) * extra_scale_factor
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
 
@@ -917,6 +1138,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         beta2: float = 0.95,
         eps: float = 1e-8,
     ) -> None:
+        if scale_mode == "rms":
+            raise ValueError("Muon RMS scaling is not supported by AdaptiveMuon")
         TensorParallelMuon.__init__(
             self,
             params,
@@ -1031,6 +1254,13 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
+def _sinkhorn_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Use Sinkhorn-specific defaults independently of Muon's update settings."""
+    kwargs = _kwargs_from_config(Sinkhorn, 'sinkhorn', config)
+    kwargs['pg_collection'] = pg_collection
+    return kwargs
+
+
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
@@ -1052,21 +1282,18 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_muon_registry_config_to_kwargs,
             config_to_cls=_muon_config_to_cls,
-            default_param_overrides={
-                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
-                    'optimizer': 'adam'
-                }
-            },
+            default_param_overrides=_muon_param_overrides_factory(),
         ),
         "adaptive_muon": EmergingOptimizerEntry(
             optimizer_cls=TensorParallelAdaptiveMuon,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_adaptive_muon_config_to_kwargs,
-            default_param_overrides={
-                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
-                    'optimizer': 'adam'
-                }
-            },
+            default_param_overrides=_muon_param_overrides_factory(),
+        ),
+        'sinkhorn': EmergingOptimizerEntry(
+            optimizer_cls=Sinkhorn,
+            config_to_kwargs=_sinkhorn_config_to_kwargs,
+            default_param_overrides={},
         ),
     }
 )

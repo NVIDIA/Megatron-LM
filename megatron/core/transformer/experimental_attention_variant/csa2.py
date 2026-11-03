@@ -31,6 +31,7 @@ from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
+from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
@@ -672,6 +673,9 @@ class CSA2Indexer(MegatronModule):
             self.n_heads * self.head_dim,
             **linear_kwargs,
         )
+        self.linear_wq_b.weight.qkv_layout = QKVLayout.from_mla_head_components(
+            self.n_heads, (self.head_dim,)
+        )
         # HF keeps head weights and the new latent-to-key projection in BF16.
         # Q remains inside the enclosing quantization context, as in V4.
         with get_fp8_disabled_context(config, is_init=True):
@@ -684,6 +688,10 @@ class CSA2Indexer(MegatronModule):
                 self.linear_wk = build_module(
                     submodules.linear_wk, config.v_head_dim, self.head_dim, **linear_kwargs
                 )
+            # Full owns the single shared key head; Reindex reuses that parameter.
+            self.linear_wk.weight.qkv_layout = QKVLayout.from_mla_head_components(
+                1, (self.head_dim,)
+            )
             self.k_norm = build_module(
                 submodules.k_norm,
                 config=config,

@@ -159,6 +159,10 @@ class EPShardedEmbeddingTable(MegatronModule):
         self.weight.allreduce = False
         self.weight.is_engram_embedding = True
         self.weight.is_embedding_or_output_parameter = True
+        # Matrix optimizers need the logical row partition, independently of DP replication.
+        self.weight.row_shard_group = ep_group
+        self.weight.row_shard_global_rows = global_num_embeddings
+        self.weight.row_shard_start = self.row_start
         if config.sequence_parallel:
             self.weight.sequence_parallel = True
 

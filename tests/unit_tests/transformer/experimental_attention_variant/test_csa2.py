@@ -2,6 +2,7 @@
 
 """CSA2 ownership, loss-gradient and packed-layout contracts on small reference inputs."""
 
+import copy
 from functools import partial
 
 import pytest
@@ -356,6 +357,123 @@ def _setup():
         for i in range(3)
     ]
     return cfg, layers
+
+
+def _muon_attention(monkeypatch, layer_number):
+    """Construct real V4.1 attention modules with CPU projection implementations."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as attention,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+        get_csa2_module_spec_for_backend,
+    )
+    from megatron.core.transformer.spec_utils import build_module
+
+    class Backend:
+        def linear(self):
+            return Linear
+
+        column_parallel_linear = linear
+        row_parallel_linear = linear
+
+        def layer_norm(self, **kwargs):
+            return Norm
+
+    cfg, _ = _setup()
+    cfg.num_layers = 4
+    cfg.csa_compress_ratios = [2, 2, 2, 0]
+    cfg.num_attention_heads = 4
+    cfg.dsa_indexer_n_heads = 3
+    cfg.output_projection_groups = 2
+    cfg.output_projection_lora_rank = 4
+    monkeypatch.setattr(attention, 'YarnRotaryEmbedding', lambda *a, **kw: CpuRoPE())
+    monkeypatch.setattr(attention, 'RotaryEmbedding', lambda *a, **kw: CpuRoPE())
+    spec = get_csa2_module_spec_for_backend(Backend())
+    spec.submodules.linear_o_group_proj = None
+    g = Group()
+    groups = ProcessGroupCollection(tp=g, cp=g, pp=g, dp=g, dp_cp=g, ep=g, expt_dp=g)
+    return build_module(spec, config=cfg, layer_number=layer_number, pg_collection=groups)
+
+
+@pytest.mark.parametrize('layer_number', [1, 2, 3, 4], ids=['full', 'reindex', 'reuse', 'swa'])
+@pytest.mark.parametrize('per_head', [False, True])
+@pytest.mark.parametrize('coefficients,steps', [('quintic', 5), ('deepseekv4', 10)])
+def test_v41_muon_head_updates_and_resume(monkeypatch, layer_number, per_head, coefficients, steps):
+    """Full Q heads (including RoPE) match separate optimizers and survive master copies."""
+    pytest.importorskip('emerging_optimizers')
+    from emerging_optimizers.orthogonalized_optimizers import Muon
+
+    from megatron.core.optimizer.emerging_optimizers import (
+        TensorParallelMuon,
+        _get_qkv_split_shapes,
+        get_supported_coefficient_types,
+    )
+    from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
+
+    if coefficients not in get_supported_coefficient_types():
+        pytest.skip(f'{coefficients} is unavailable in this emerging-optimizers release')
+    torch.manual_seed(6326)
+    model = _muon_attention(monkeypatch, layer_number)
+    expected = {'linear_q_up_proj.weight': (4, 8), 'linear_kv_proj.weight': (1, 8)}
+    if layer_number in (1, 2):
+        expected['core_attention.indexer.linear_wq_b.weight'] = (3, 8)
+    if layer_number == 1:
+        expected['core_attention.indexer.linear_wk.weight'] = (1, 8)
+    annotated = {
+        name: param
+        for name, param in model.named_parameters()
+        if getattr(param, 'qkv_layout', None) is not None
+    }
+    assert annotated.keys() == expected.keys()
+
+    for name, param in annotated.items():
+        heads, head_dim = expected[name]
+        layout = param.qkv_layout
+        assert (layout.num_groups, layout.per_head_split_shapes) == (heads, (head_dim,))
+        param.is_qkv = True
+        param.qkv_split_shapes, param.qkv_split_shapes_global = _get_qkv_split_shapes(
+            layout, split_qkv_per_head=per_head
+        )
+        # Same attribute-copy helper used by the BF16/FP8 master-weight wrapper.
+        master = nn.Parameter(param.detach().clone().float())
+        copy_tensor_model_parallel_attributes(master, param)
+        kwargs = dict(
+            lr=0.01,
+            momentum=0.95,
+            nesterov=True,
+            weight_decay=0.1,
+            fp32_matmul_prec='highest',
+            scale_mode='spectral',
+            extra_scale_factor=0.18,
+            coefficient_type=coefficients,
+            num_ns_steps=steps,
+        )
+
+        def make_optimizer(weight):
+            return TensorParallelMuon(
+                [weight],
+                split_qkv=True,
+                split_qkv_per_head=per_head,
+                is_qkv_fn=lambda p: p.is_qkv,
+                **kwargs,
+            )
+
+        optimizer = make_optimizer(master)
+        split_size = head_dim if per_head else param.shape[0]
+        references = [nn.Parameter(p.clone()) for p in master.detach().split(split_size)]
+        reference = Muon(references, **kwargs)
+        for step in range(3):
+            grad = torch.randn_like(master)
+            master.grad = grad.clone()
+            for head, head_grad in zip(references, grad.split(split_size)):
+                head.grad = head_grad.clone()
+            optimizer.step()
+            reference.step()
+            torch.testing.assert_close(master, torch.cat(references), atol=2e-6, rtol=2e-5)
+            if step == 0:
+                state = copy.deepcopy(optimizer.state_dict())
+                optimizer = make_optimizer(master)
+                optimizer.load_state_dict(state)
 
 
 def _forward(layers, state):

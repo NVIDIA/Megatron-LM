@@ -2750,6 +2750,10 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
+    group.add_argument('--apply-wd-to-norm', action='store_true',
+                       help='Apply weight decay to normalization weights, including fused '
+                       'layernorm weights. Biases and other vector parameters retain their '
+                       'standard exemptions. Takes precedence over --apply-wd-to-qk-layernorm.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2776,8 +2780,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
-                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer. With MuP, set '
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'rms'],
+                       help='Scale mode for Muon optimizer. rms normalizes each nonzero '
+                       'NS output matrix (each head with per-head Muon) to an actual RMS '
+                       'of muon-extra-scale-factor; requires ordinary Muon, TP=1 and no '
+                       'GTP weight sharding. The other modes use shape-based factors. With MuP, set '
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
@@ -2831,6 +2838,20 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-use-sinkhorn', action='store_true',
+                       help='Use Sinkhorn-balanced updates for embedding/output matrices '
+                       'alongside Muon. Requires TP=1 and EO with sinkhorn_balance. '
+                       'With distributed optimizer, each matrix belongs to one DP rank.')
+    group.add_argument('--sinkhorn-momentum', type=float, default=0.95,
+                       help='EMA momentum for Sinkhorn; Nesterov is always enabled.')
+    group.add_argument('--sinkhorn-num-normalization-steps', type=int, default=11,
+                       help='Positive odd number of row/column L2 normalizations.')
+    group.add_argument('--sinkhorn-zero-row-threshold', type=float, default=1e-3,
+                       help='Mask rows below this fraction of the mean pre-balancing norm.')
+    group.add_argument('--sinkhorn-eps', type=float, default=1e-20,
+                       help='Epsilon added to Sinkhorn row/column norms.')
+    group.add_argument('--sinkhorn-extra-scale-factor', type=float, default=0.18,
+                       help='Sinkhorn update RMS after balancing (zero weight decay).')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

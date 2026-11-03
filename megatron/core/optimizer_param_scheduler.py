@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -31,6 +32,8 @@ class ParamGroupOverride(TypedDict, total=False):
 
     max_lr: float
     min_lr: float
+    lr_mult: float
+    """Scale the entire selected LR schedule, including its nonzero warmup initial value."""
     start_wd: float
     end_wd: float
     wd_mult: float
@@ -223,13 +226,17 @@ class OptimizerParamScheduler:
             param_group (dict): parameter group from the optimizer.
         """
 
-        max_lr = param_group.get('max_lr', self.max_lr)
-        min_lr = param_group.get('min_lr', self.min_lr)
+        lr_mult = param_group.get('lr_mult', 1.0)
+        if not math.isfinite(lr_mult) or lr_mult < 0:
+            raise ValueError('lr_mult must be finite and nonnegative')
+        max_lr = param_group.get('max_lr', self.max_lr) * lr_mult
+        min_lr = param_group.get('min_lr', self.min_lr) * lr_mult
+        init_lr = self.init_lr * lr_mult
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
-            return self.init_lr + (
-                (max_lr - self.init_lr) * float(self.num_steps) / float(self.lr_warmup_steps)
+            return init_lr + (
+                (max_lr - init_lr) * float(self.num_steps) / float(self.lr_warmup_steps)
             )
 
         # If the learning rate is constant, just return the initial value.

@@ -21,7 +21,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
@@ -744,6 +744,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
+        if self.config.dsv4_version == "v4.1":
+            # Each query head includes both its content and RoPE rows. The shared
+            # KV projection is a single head, so head-wise Muon keeps it intact.
+            self.linear_q_up_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
+                self.config.num_attention_heads, (self.q_head_dim,)
+            )
+            self.linear_kv_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
+                1, (self.config.v_head_dim,)
+            )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
             config=self.config,
