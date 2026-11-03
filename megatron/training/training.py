@@ -1590,8 +1590,21 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
-    assert args.save is not None
-    progress_log_filename = os.path.join(args.save, "progress.txt")
+    return _get_start_time_from_progress_log(args.save, args.world_size)
+
+
+# The start time will not change across multiple calls, so we can cache it.
+@functools.cache
+def _get_start_time_from_progress_log(save_dir: str, world_size: int):
+    """
+    Gets start time of earliest job in the specified save directory with the
+    specified world size. Also returns the number of floating-point operations
+    completed in last saved checkpoint.
+
+    Implementation function cached on save_dir and world_size arguments.
+    """
+    assert save_dir is not None
+    progress_log_filename = os.path.join(save_dir, "progress.txt")
 
     # start_time is time when job with same world size started.
     # start_num_floating_point_operations is the number of floating-point operations
@@ -1625,7 +1638,7 @@ def get_start_time_from_progress_log():
                 if latest_num_floating_point_operations_uncommitted is not None:
                     latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != args.world_size:
+            if world_size_in_line != world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
