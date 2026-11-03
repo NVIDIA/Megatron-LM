@@ -5,6 +5,7 @@ import math
 import os
 import random
 import types
+from unittest import mock
 
 import pytest
 import torch
@@ -35,6 +36,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
@@ -43,6 +45,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_stack_spec_for,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
     reset_rounder,
     set_rounder,
@@ -187,6 +190,90 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             len(request.generated_log_probs) == len(request.generated_tokens)
             for request in env.requests
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "model",
+        [
+            pytest.param(
+                dict(model_provider="hybrid", mtp_layer_pattern="E", num_speculative_tokens=1),
+                id="moe-draft-head",
+            ),
+            pytest.param(dict(model_provider="gpt", use_moe_layer_spec=True), id="moe-decoder"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_allgather_moe_with_an_idle_ep_rank(self, model):
+        """An idle EP rank's one-request dummy forwards join a peer's larger allgather dispatches.
+
+        A dispatch whose ranks disagree on the token count blocks rather than raising, so this
+        test asserts by completing.
+        """
+        skip_if_mamba_sequence_packing_not_available(model["model_provider"])
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=6,
+                use_fixed_output_lengths=True,
+                expert_model_parallel_size=2,
+                top_k=1,
+                context_max_requests=8,
+                **model,
+            )
+        )
+        engine = env.engine
+        active = parallel_state.get_expert_model_parallel_rank() == 0
+        if active:
+            for request in env.requests:
+                engine._add_request(request)
+
+        rank_token_counts = []
+        token_dispatch = MoEAllGatherTokenDispatcher.token_dispatch
+
+        def recording_token_dispatch(dispatcher, hidden_states, probs):
+            local_count = torch.tensor([hidden_states.shape[0]], device=hidden_states.device)
+            counts = torch.empty(2, dtype=local_count.dtype, device=local_count.device)
+            torch.distributed.all_gather_into_tensor(
+                counts, local_count, group=dispatcher.tp_ep_group
+            )
+            rank_token_counts.append(counts.tolist())
+            return token_dispatch(dispatcher, hidden_states, probs)
+
+        def any_rank_has_work():
+            work = torch.tensor([int(engine.has_unfinished_requests())], device="cuda")
+            torch.distributed.all_reduce(
+                work, group=parallel_state.get_expert_model_parallel_group()
+            )
+            return bool(work.item())
+
+        finished = {}
+        with mock.patch.object(
+            MoEAllGatherTokenDispatcher, "token_dispatch", recording_token_dispatch
+        ):
+            # The production run loop keeps an idle EP rank in step with dummy forwards.
+            while any_rank_has_work():
+                if active:
+                    for request in engine.step_modern()["finished_requests"]:
+                        finished[request.request_id] = request
+                else:
+                    engine.controller.dummy_forward()
+
+        assert any(counts[0] != counts[1] for counts in rank_token_counts)
+        if active:
+            assert sorted(finished) == sorted(request.request_id for request in env.requests)
+            for request in env.requests:
+                assert finished[request.request_id].status == Status.COMPLETED
+                assert (
+                    len(finished[request.request_id].generated_tokens)
+                    == request.sampling_params.num_tokens_to_generate
+                )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

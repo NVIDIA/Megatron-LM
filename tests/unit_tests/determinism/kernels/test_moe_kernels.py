@@ -1588,6 +1588,47 @@ class TestMoEModules:
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
 
+    def test_allgather_moe_layer_replays_with_unequal_inference_token_counts(self):
+        """Inference EP ranks may hold different token counts, as when an idle rank runs a
+        one-token dummy forward; the allgather dispatcher gathers and reduce-scatters them as
+        per-rank splits."""
+        if Utils.world_size % 2:
+            pytest.skip("needs a world size divisible by EP=2")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init(ep=2)
+        seeded()
+        config = _moe_config(moe_token_dispatcher_type="allgather", expert_model_parallel_size=2)
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda().eval()
+        layer.set_layer_number(0)
+        num_tokens = 1 + 37 * parallel_state.get_expert_model_parallel_rank()
+        hidden = torch.randn(num_tokens, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                _InInferenceMode(layer),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[allgather, ep=2, unequal inference token counts]",
+            )
+        assert layer.token_dispatcher.split_sizes == [1, 38]
+
     def test_alltoall_dispatcher_releases_router_probs_after_forward(self):
         """combine_preprocess drops ``self.probs`` so it does not pin the recompute graph.
 
