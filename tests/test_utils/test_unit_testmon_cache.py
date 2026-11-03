@@ -31,12 +31,7 @@ BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
 @pytest.fixture
 def source_tree(tmp_path):
     root = tmp_path / "source"
-    for name in (
-        *cache.COMPATIBILITY_FILES,
-        "docker/.ngc_version.dev",
-        "docker/Dockerfile.ci.dev",
-        ".dockerignore",
-    ):
+    for name in (*cache.COMPATIBILITY_FILES, "docker/.ngc_version.dev", "docker/Dockerfile.ci.dev"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
@@ -71,21 +66,15 @@ def _snapshot(directory):
 
 def test_source_edits_preserve_identity(source_tree):
     before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    (source_tree / "megatron/core").mkdir(parents=True)
     (source_tree / "megatron/core/ordinary.py").write_text("changed source")
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
 @pytest.mark.parametrize(
-    "changed",
-    [
-        "uv.lock",
-        "docker/.ngc_version.dev",
-        ".dockerignore",
-        "tests/unit_tests/find_test_cases.py",
-        "tests/unit_tests/testmon_cache.py",
-    ],
+    "changed", ["tests/test_utils/python_scripts/download_unit_tests_dataset.py"]
 )
-def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
+def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generation(
     source_tree, generation, changed
 ):
     directory, producer = generation
@@ -100,6 +89,12 @@ def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
 
 
 def test_platform_and_bucket_are_isolated(source_tree):
+    root_conftest = "tests/unit_tests/conftest.py"
+    nested_conftest = "tests/unit_tests/pipeline_parallel/nested/conftest.py"
+    for name in (root_conftest, nested_conftest):
+        path = source_tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture")
     identities = [
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID),
         cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID),
@@ -109,9 +104,28 @@ def test_platform_and_bucket_are_isolated(source_tree):
     assert all(
         identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
+    assert all(root_conftest in identity["compatibility"]["inputs"] for identity in identities)
+    assert all(
+        nested_conftest in identity["compatibility"]["inputs"] for identity in identities[:2]
+    )
+    assert nested_conftest not in identities[2]["compatibility"]["inputs"]
+
+    unrelated = source_tree / "tests/unit_tests/tuning/conftest.py"
+    unrelated.parent.mkdir()
+    unrelated.write_text("unrelated fixture")
+    for identity in identities:
+        assert (
+            cache.cache_identity(
+                source_tree,
+                identity["compatibility"]["bucket"],
+                identity["compatibility"]["platform"],
+                IMAGE_ID,
+            )
+            == identity
+        )
 
 
-def test_new_platform_uses_registry_and_tracks_its_recipe(source_tree, monkeypatch):
+def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monkeypatch):
     recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
     monkeypatch.setitem(cache.PLATFORMS, "dgx_gb300", {"cloud": "gb300-test", "recipe": recipe})
     (source_tree / recipe).parent.mkdir(parents=True)
@@ -119,13 +133,12 @@ def test_new_platform_uses_registry_and_tracks_its_recipe(source_tree, monkeypat
 
     before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
     assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
-    assert "tests/unit_tests/testmon_cache.py" in before["compatibility"]["inputs"]
-    assert recipe in before["compatibility"]["inputs"]
+    assert "tests/unit_tests/testmon_cache.py" not in before["compatibility"]["inputs"]
+    assert recipe not in before["compatibility"]["inputs"]
 
     (source_tree / recipe).write_text("changed recipe")
     after = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
-    assert after["cache_prefix"] == before["cache_prefix"]
-    assert after["compatibility"] != before["compatibility"]
+    assert after == before
     with pytest.raises(ValueError, match="unsupported Testmon platform"):
         cache.cache_identity(source_tree, BUCKET, "dgx_unknown", IMAGE_ID)
 
@@ -460,7 +473,9 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     elif restore == "missing-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
     elif restore == "changed-config":
-        (source_tree / "tests/unit_tests/find_test_cases.py").write_text("changed")
+        (source_tree / "tests/test_utils/python_scripts/download_unit_tests_dataset.py").write_text(
+            "changed"
+        )
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()

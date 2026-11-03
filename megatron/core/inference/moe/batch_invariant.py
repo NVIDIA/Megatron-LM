@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 import torch
 
 from megatron.core.inference.communication.torch_symm_triton.barrier import symm_mem_sync
+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+    SYMM_MEM_KERNEL_CONFIG,
+)
 from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
@@ -82,7 +85,8 @@ def _squared_relu_with_probs_kernel(
     if pid >= n_used:
         return
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             row_i64 = row.to(tl.int64)
             if tl.load(permutation_map_ptr + row_i64) >= 0:
@@ -133,7 +137,8 @@ def _swiglu_with_probs_kernel(
         return
     two_n = 2 * ffn_size
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             row_i64 = row.to(tl.int64)
             if tl.load(permutation_map_ptr + row_i64) >= 0:
@@ -207,7 +212,7 @@ def _weighted_silu_mul_bounded_kernel(
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
-    xoffset = tl.program_id(0) * XBLOCK
+    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
     while xoffset < xbound:
         xindex = xoffset + tl.arange(0, XBLOCK)[:]
         xmask = (xindex < xbound) & (xindex < xnumel)
@@ -386,10 +391,14 @@ def ordered_reduce_scatter_v(
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
-    block_size = min(triton.next_power_of_2(hidden_size), 1024)
-    num_warps = max(1, block_size // 32)
+    # Do not autotune the number of blocks with Triton: every rank must launch the same grid
+    # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+    # See torch_symm_triton/kernel_config.py.
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    block_size = min(triton.next_power_of_2(hidden_size), SYMM_MEM_KERNEL_CONFIG.max_block_size)
+    num_warps = max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _ordered_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor,
@@ -415,32 +424,38 @@ def _unpermute_tokens_in_expert_order_kernel(
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens
     output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer
     hidden_dim,
+    num_tokens,
     num_local_experts: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     """Token-local batch-invariant unpermute.
 
-    Each program owns one output token and one hidden tile. Contributions are
-    accumulated in fp32 by increasing local expert id, avoiding atomic-add order.
+    Each program owns a strided set of output tokens and one hidden tile. Contributions
+    are accumulated by increasing local expert id, avoiding atomic-add order, in fp64
+    and rounded once to the fp32 rank partial, as training's batch-invariant
+    unpermute does. An fp32 accumulator drops small contributions next to a large one.
+    The fixed grid walks only the valid tokens (read on device), so the work scales with
+    the live tokens rather than the worst-case buffer while staying CUDA-graph safe.
     """
-    tok = tl.program_id(0)
+    pid = tl.program_id(0)
     block_h = tl.program_id(1)
     valid_tokens = tl.load(valid_tokens_ptr)
     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offsets < hidden_dim
 
-    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    if tok < valid_tokens:
+    for tok in tl.range(pid, tl.minimum(valid_tokens, num_tokens), NUM_PROGRAMS):
         tok_i64 = tok.to(tl.int64)
+        acc = tl.zeros([BLOCK_H], dtype=tl.float64)
         for lid in tl.range(0, num_local_experts):
             pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
             if pos >= 0:
                 pos_i64 = pos.to(tl.int64)
                 vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
-                    tl.float32
+                    tl.float64
                 )
                 acc += vals
-        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc, mask=mask_h)
+        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
 
 
 def unpermute_tokens_in_expert_order(
@@ -456,14 +471,17 @@ def unpermute_tokens_in_expert_order(
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))
+    num_programs = max(1, min(num_tokens, 1024))
+    grid = (num_programs, triton.cdiv(hidden_dim, BLOCK_H))
     _unpermute_tokens_in_expert_order_kernel[grid](
         expert_output,
         inverse_map,
         valid_tokens,
         out,
         hidden_dim,
+        num_tokens,
         num_local_experts,
         BLOCK_H=BLOCK_H,
+        NUM_PROGRAMS=num_programs,
     )
     return out

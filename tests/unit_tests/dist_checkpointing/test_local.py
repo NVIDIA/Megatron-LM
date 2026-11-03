@@ -90,7 +90,6 @@ class TestLocalCheckpointing:
             TempNamedDir(tmp_path_dist_ckpt / "owned_rng_local", sync=True) as checkpoint_dir,
             mock.patch("megatron.training.checkpointing.get_args", return_value=args),
             mock.patch("megatron.training.async_utils.get_args", return_value=args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             context = {"local_checkpoint_manager": LocalCheckpointManager(checkpoint_dir)}
             expected_rng = torch.get_rng_state().clone()
@@ -109,7 +108,9 @@ class TestLocalCheckpointing:
             assert saved_config == run_config.to_dict()
             run_config.logger.log_interval += 1
             torch.manual_seed(999)
-            iteration, _ = load_checkpoint(model, optimizer, None, checkpointing_context=context)
+            iteration, _ = load_checkpoint(
+                model, optimizer, None, checkpointing_context=context, restore_training_state=True
+            )
             assert iteration == 1
             assert torch.equal(torch.get_rng_state(), expected_rng)
             assert args.data_parallel_random_init is not owned_dp_random_init
@@ -221,7 +222,6 @@ class TestLocalCheckpointing:
             TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
             mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
             mock.patch('torch.empty', new=deterministic_empty),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
@@ -247,7 +247,11 @@ class TestLocalCheckpointing:
             if async_save:
                 maybe_finalize_async_save(True)
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(iteration)
@@ -257,14 +261,22 @@ class TestLocalCheckpointing:
             backup_path = ckpt_path.with_name('backup_' + ckpt_path.name)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
             shutil.move(ckpt_path, backup_path)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             torch.distributed.barrier()
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 0
             save_checkpoint(
@@ -335,7 +347,6 @@ class TestLocalCheckpointing:
                 TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
                 mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
                 mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-                mock.patch("megatron.training.checkpointing.update_num_microbatches"),
                 mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
                 caplog.at_level(logging.INFO),
             ):
@@ -370,6 +381,7 @@ class TestLocalCheckpointing:
                     optimizer,
                     opt_param_scheduler,
                     checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
                 )
                 assert iteration == 0
                 assert not any((local_ckpt_dir / str(Utils.rank)).iterdir())

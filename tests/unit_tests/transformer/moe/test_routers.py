@@ -25,6 +25,8 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
+    fused_compute_score_for_moe_aux_loss,
+    fused_moe_aux_loss,
     get_default_pg_collection,
     get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
@@ -82,11 +84,19 @@ def test_dense_route_indices_dtype(
             moe_flex_dispatcher_backend=backend,
             moe_hybridep_routing_map_mode=routing_map_mode,
             num_moe_experts=num_experts,
+            moe_virtual_expert_load_balance=False,
+            moe_megakernel_backend=None,
         ),
         expt_tp_group=SimpleNamespace(size=lambda: 1),
+        is_hash_layer=False,
+        routing_type="aux_loss",
     )
 
     assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype
+
+    # MOK always consumes the boolean map, independent of the native dispatcher selection.
+    router.config.moe_megakernel_backend = "mok"
+    assert TopKRouter._dense_route_indices_dtype(router) is None
 
 
 @pytest.mark.parametrize("supports_topk_indices", [False, True])
@@ -466,7 +476,19 @@ class TestDynamicCPRouterDistributed:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
-    def test_runtime_group_aux_loss_gradient_scaling(self, runtime_cp_size):
+    @pytest.mark.parametrize(
+        "token_count_source,empty_first_rank",
+        [
+            ("python_int", False),
+            ("python_int", True),
+            ("tensor", False),
+            ("tensor", True),
+            ("implicit", False),
+        ],
+    )
+    def test_runtime_group_aux_loss_gradient_scaling(
+        self, runtime_cp_size, token_count_source, empty_first_rank, monkeypatch
+    ):
         world_size = torch.distributed.get_world_size()
         if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
             pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
@@ -483,6 +505,20 @@ class TestDynamicCPRouterDistributed:
         activation = torch.zeros(1, device="cuda", requires_grad=True)
         aux_source = torch.tensor(float(runtime_cp_rank + 1), device="cuda", requires_grad=True)
         MoEAuxLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
+        local_valid_tokens = runtime_cp_rank + int(not empty_first_rank)
+        if token_count_source == "tensor":
+            valid_token_count = torch.full(
+                (), local_valid_tokens, dtype=torch.long, device=activation.device
+            )
+        elif token_count_source == "implicit":
+            valid_token_count = None
+            local_valid_tokens = activation.shape[0]
+        else:
+            valid_token_count = local_valid_tokens
+
+        # Python counts must be filled on-device rather than copied from a CPU tensor.
+        scalar_factory = Mock(wraps=torch.full)
+        monkeypatch.setattr(torch, "full", scalar_factory)
         output = self.router.attach_and_log_load_balancing_loss(
             activation,
             aux_loss_coeff=1.0,
@@ -490,12 +526,25 @@ class TestDynamicCPRouterDistributed:
             aux_loss_name="dynamic_cp_gradient_test",
             reduce_group=None,
             needs_dp_avg=False,
-            valid_token_count=runtime_cp_rank + 1,
+            valid_token_count=valid_token_count,
             aux_loss_scale_reduce_groups=loss_groups,
         )
+        if token_count_source == "tensor":
+            scalar_factory.assert_not_called()
+            # The reductions must not modify the caller's local count tensor.
+            assert valid_token_count.item() == local_valid_tokens
+        else:
+            scalar_factory.assert_called_once_with(
+                (), local_valid_tokens, dtype=torch.long, device=activation.device
+            )
         output.sum().mul_(0).backward()
 
-        group_token_count = runtime_cp_size * (runtime_cp_size + 1) // 2
+        if token_count_source == "implicit":
+            group_token_count = runtime_cp_size
+        else:
+            group_token_count = sum(
+                rank + int(not empty_first_rank) for rank in range(runtime_cp_size)
+            )
         expected_grad = 2 * aux_source.detach() * group_token_count
         torch.testing.assert_close(aux_source.grad, expected_grad)
 
@@ -789,6 +838,59 @@ class TestTop2Router:
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
+    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize("with_history", [False, True])
+    def test_aux_loss_with_entirely_padded_input(self, monkeypatch, loss_type, fused, with_history):
+        """Zero valid tokens contribute finite zero auxiliary gradients, even with history."""
+        if fused and (fused_moe_aux_loss is None or fused_compute_score_for_moe_aux_loss is None):
+            pytest.skip("TE fused auxiliary-loss operators are unavailable")
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type=loss_type,
+            moe_aux_loss_coeff=0.001,
+            moe_router_aux_loss_fusion=fused,
+            moe_router_dtype="fp32",
+            params_dtype=torch.float32,
+            add_bias_linear=False,
+        )
+        losses = []
+        compute_aux_loss = router_mod.switch_load_balancing_loss_func
+
+        def record_aux_loss(*args, **kwargs):
+            loss = compute_aux_loss(*args, **kwargs)
+            losses.append(loss.detach())
+            return loss
+
+        monkeypatch.setattr(router_mod, "switch_load_balancing_loss_func", record_aux_loss)
+        router = TopKRouter(config, pg_collection=get_default_pg_collection()).cuda()
+        hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
+        if with_history:
+            probs, _ = router(hidden_states)
+            # Isolate the attached auxiliary gradient from the routing output loss.
+            (probs.sum() * 0).backward()
+            assert torch.isfinite(router.weight.grad).all()
+            assert torch.count_nonzero(router.weight.grad) > 0
+            router.zero_grad(set_to_none=True)
+            hidden_states.grad = None
+        previous_counts = (
+            router.global_tokens_per_expert.clone() if loss_type == "global_aux_loss" else None
+        )
+        padding_mask = torch.ones(8, 2, dtype=torch.bool, device="cuda")
+        probs, _ = router(hidden_states, padding_mask=padding_mask)
+        (probs.sum() * 0).backward()
+        assert len(losses) == (2 if with_history else 1)
+        torch.testing.assert_close(losses[-1], torch.zeros_like(losses[-1]))
+        torch.testing.assert_close(router.weight.grad, torch.zeros_like(router.weight.grad))
+        torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states.grad))
+        if previous_counts is not None:
+            torch.testing.assert_close(router.global_tokens_per_expert, previous_counts)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

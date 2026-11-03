@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 
 try:
-    import nccl
     import nccl.core as nccl_core
     import nccl.m2n as m2n
 
@@ -109,7 +108,14 @@ def _validate_role_roster(roles: list[tuple[bool, bool]]) -> _M2NTopology:
 def _validate_nccl_version(nccl_module: Any) -> None:
     """Ensure the loaded NCCL library supports the current M2N API."""
     try:
-        version = nccl_module.get_version().nccl.version
+        version_info = nccl_module.get_version()
+        if hasattr(version_info, "libnccl"):
+            if version_info.libnccl is None:
+                raise RuntimeError("NCCL M2N requires a loaded NCCL library")
+            version = version_info.libnccl.version
+        else:
+            # NCCL4Py before 0.6 exposes the loaded library as nccl_version.
+            version = version_info.nccl_version
         release = tuple(version.release)
     except AttributeError as exc:
         raise RuntimeError("NCCL M2N requires the current NCCL4Py package") from exc
@@ -226,7 +232,7 @@ class NCCLM2NCopyService(CopyService):
         if not _has_nccl_cuda_backend(group):
             raise RuntimeError("NCCLM2NCopyService requires an NCCL process group")
 
-        _validate_nccl_version(nccl)
+        _validate_nccl_version(nccl_core)
         if not callable(getattr(m2n, "group", None)):
             raise RuntimeError("NCCL M2N refit requires the grouped submission API")
         if max_group_bytes is None:

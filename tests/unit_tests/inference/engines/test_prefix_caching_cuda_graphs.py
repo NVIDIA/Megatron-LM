@@ -349,6 +349,7 @@ class TestHybridChunkedPrefillIntermediateState:
         """Create a hybrid (SSM + attention) model with the requested mixer."""
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
         config = TransformerConfig(
+            flash_attention_version=2,
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,

@@ -2,17 +2,32 @@
 
 import logging
 import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_client import InferenceClient
+    from megatron.core.inference.sampling_params import SamplingParams
 
 GENERATE_NUM = 0
 LOCK = threading.Lock()
 
 logger = logging.getLogger(__name__)
+
+
+def generation_finish_reason(result: dict) -> str:
+    """Use the engine's termination cause, including stops at the token budget.
+
+    The length fallback supports replies from engines predating finish metadata.
+    """
+    reason = result.get("finish_reason")
+    if reason in ("stop", "length"):
+        return reason
+    requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
+    generated = len(result.get("generated_tokens") or [])
+    return "length" if requested is not None and generated >= requested else "stop"
 
 
 def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
@@ -184,3 +199,10 @@ def log_sampling_defaults_once(tokenizer, resolved):
         resolved.get("top_p"),
         resolved.get("top_k"),
     )
+
+
+def sampling_params_for_choice(params: "SamplingParams", index: int) -> "SamplingParams":
+    """Assign stable distinct seeds to choices without mutating shared parameters."""
+    if params.seed is None:
+        return params
+    return replace(params, seed=(params.seed + index) % (2**63), return_prompt_top_n_logprobs=False)

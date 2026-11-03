@@ -217,7 +217,7 @@ write_testmon_summary() {
         echo "- Bucket: \`$BUCKET\`"
         echo "- Result: $result"
         if [[ -n "$selected_count" ]]; then
-            echo "- Selected tests: \`$selected_count\`"
+            echo "- Selected pytest targets across phases: \`$selected_count\`"
         fi
         if [[ -n "$mandatory_count" ]]; then
             echo "- Mandatory test files (changed source mappings): \`$mandatory_count\`"
@@ -337,10 +337,9 @@ run_selected_phase() {
 run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"
-
-    if ! run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
+    if ! rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work" \
+        || ! run_testmon_phase select prod \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target" \
         || ! merge_rank_selections prod \
         || ! apply_mandatory_tests prod \
         || ! run_testmon_phase select experimental \

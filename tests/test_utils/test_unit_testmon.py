@@ -36,7 +36,9 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0):
+def _invoke(
+    project, cache, mode, phase="prod", rank=0, pytest_args=(), target="tests", world_size=4
+):
     return subprocess.run(
         [
             sys.executable,
@@ -51,13 +53,14 @@ def _invoke(project, cache, mode, phase="prod", rank=0):
             "-q",
             "-c",
             str(project / "pytest.ini"),
-            "tests",
+            *pytest_args,
+            target,
         ],
         cwd=project,
         env={
             **os.environ,
             "RANK": str(rank),
-            "WORLD_SIZE": "4",
+            "WORLD_SIZE": str(world_size),
             "PYTHONPATH": str(project),
             "PYTHONDONTWRITEBYTECODE": "1",
         },
@@ -219,6 +222,21 @@ def test_new_test_file_is_discovered_from_old_baseline(project, cache):
     assert selected.read_text().splitlines() == ["tests/test_new.py::test_new"]
 
 
+@pytest.mark.parametrize("target", ["tests", "tests/test_app.py"])
+def test_new_case_in_existing_file_is_discovered_from_old_baseline(project, cache, target):
+    before = _snapshot(cache / "prod")
+    test_file = project / "tests/test_app.py"
+    test_file.write_text(
+        test_file.read_text()
+        + "\ndef test_added():\n    raise AssertionError('selection must not execute tests')\n"
+    )
+    result = _invoke(project, cache, "select", target=target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    selected = cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert "tests/test_app.py::test_added" in selected.read_text().splitlines()
+    assert _snapshot(cache / "prod") == before
+
+
 def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
     parameter_ids = ["space value", 'quote " and $value']
     (project / "tests/test_app.py").write_text(
@@ -377,6 +395,144 @@ def test_empty_phase_does_not_launch_pytest(tmp_path):
     assert "UNEXPECTED_EXECUTION" not in result.stdout
 
 
+@pytest.mark.parametrize("recipe_gpus", [2, 4, 8])
+def test_native_selection_uses_recipe_topology(tmp_path, recipe_gpus):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    start = runner.index("MASTER_ADDR=${MASTER_ADDR:-localhost}")
+    end = runner.index("export ONE_LOGGER_JOB_CATEGORY=test", start)
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                runner[start:end],
+                'uv() { printf "%s\\n" "$@"; }',
+                "UNIT_TESTMON_INSTALLED=true",
+                "run_testmon_phase() {" + _function(runner, "run_testmon_phase") + "\n}",
+                "run_testmon_phase select prod --collect-only tests/unit_tests/example",
+            )
+        ),
+        env={
+            **os.environ,
+            "GPUS_PER_NODE": str(recipe_gpus),
+            "NUM_NODES": "2",
+            "SLURM_NODEID": "1",
+            "LOG_DIR": str(tmp_path),
+            "UNIT_TESTMON_CACHE_DIR": str(tmp_path / "cache"),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    arguments = result.stdout.splitlines()
+    assert arguments[arguments.index("--nproc_per_node") + 1] == str(recipe_gpus)
+    assert arguments[arguments.index("--nnodes") + 1] == "2"
+    assert arguments[arguments.index("--node_rank") + 1] == "1"
+    assert arguments[arguments.index("--mode") + 1] == "select"
+
+
+@pytest.mark.parametrize(
+    "failed_step",
+    [
+        "",
+        "cleanup",
+        "collect/prod",
+        "merge/prod",
+        "mandatory/prod",
+        "collect/experimental",
+        "merge/experimental",
+        "mandatory/experimental",
+    ],
+)
+def test_native_selection_executes_in_bucket_or_falls_back(tmp_path, failed_step):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    cache = tmp_path / "cache"
+    stale = cache / ".testmon-work/stale"
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    # Skip coverage synthesis in this shell orchestration test.
+    (tmp_path / ".coverage.unit_tests").touch()
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "BUCKET=tests/unit_tests/example IGNORE_ARGS=() MARKER_ARG='not flaky'",
+            "UNIT_TEST_REPEAT=2",
+            'rm() { if [[ "$FAILED_STEP" == cleanup ]]; then echo cleanup >> "$EVENTS"; '
+            'return 7; else command rm "$@"; fi; }',
+            'event() { echo "$1/$2" >> "$EVENTS"; [[ "$1/$2" != "$FAILED_STEP" ]] || return 7; }',
+            'run_testmon_phase() { event collect "$2"; }',
+            'merge_rank_selections() { event merge "$1" || return; '
+            'mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
+            'echo tests/unit_tests/test_example.py::test_one > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+            'apply_mandatory_tests() { event mandatory "$1" || return; '
+            ': > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
+            'run_full_tests() { echo full >> "$EVENTS"; }',
+            'run_selected_phase() { event execute "$1"; }',
+            "coverage() { return 0; }",
+            'write_testmon_summary() { echo "$1" >> "$EVENTS"; }',
+            "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+            "run_enforced_tests",
+        )
+    )
+    events = tmp_path / "events"
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+            "FAILED_STEP": failed_step,
+            "EVENTS": str(events),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    executed = events.read_text().splitlines()
+    assert stale.exists() == (failed_step == "cleanup")
+    if failed_step:
+        assert executed[-3:] == [failed_step, "full fallback: Testmon selection failed", "full"]
+        assert not any(event.startswith("execute/") for event in executed)
+    else:
+        assert executed == [
+            "collect/prod",
+            "merge/prod",
+            "mandatory/prod",
+            "collect/experimental",
+            "merge/experimental",
+            "mandatory/experimental",
+            "execute/prod",
+            "execute/experimental",
+            "execute/prod",
+            "execute/experimental",
+            "selective tests passed",
+        ]
+
+
+def test_missing_rank_selection_cannot_be_accepted(tmp_path):
+    phase = tmp_path / ".testmon-work/prod/rank-0"
+    phase.mkdir(parents=True)
+    (phase / "selected-tests").write_text("tests/test_example.py::test_one\n")
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                "NUM_NODES=1 GPUS_PER_NODE=2",
+                "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
+                "merge_rank_selections prod",
+            )
+        ),
+        env={**os.environ, "UNIT_TESTMON_CACHE_DIR": str(tmp_path)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    assert "Expected 2 Testmon selections for prod, found 1" in result.stdout
+    assert not (phase.parent / "selected-tests").exists()
+
+
 def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     result = subprocess.run(
@@ -409,7 +565,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     ("overrides", "expected"),
     [
         ({}, "true"),
-        ({"HAS_UNIT_TESTMON": "false"}, "false"),
+        ({"UNIT_TESTMON_REQUESTED": "false"}, "false"),
         ({"EVENT_NAME": "merge_group"}, "false"),
         ({"REF": "refs/heads/main"}, "false"),
         ({"LABELS_VALID": "false"}, "false"),
@@ -427,7 +583,9 @@ def test_pr_label_gate(overrides, expected):
     environment = {
         **os.environ,
         "LABELS_VALID": "true",
-        "HAS_UNIT_TESTMON": "true",
+        "UNIT_TESTMON_REQUESTED": "true",
+        "IS_CI_WORKLOAD": "false",
+        "IS_MERGE_GROUP": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
         "HAS_RUN_TESTS": "false",

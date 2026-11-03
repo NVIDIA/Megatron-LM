@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from packaging.version import Version
 
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
@@ -24,9 +25,14 @@ from megatron.core.resharding.utils import ReshardPlan, TensorReshardSpec
 from tests.unit_tests.test_utilities import Utils
 
 
-def _nccl_with_version(*release: int):
-    version = SimpleNamespace(release=release)
-    version_info = SimpleNamespace(nccl=SimpleNamespace(version=version))
+def _nccl_with_version(*release: int, legacy: bool = False):
+    version = Version(".".join(str(value) for value in release))
+    if legacy:
+        version_info = SimpleNamespace(nccl_version=version)
+    else:
+        version_info = SimpleNamespace(
+            libnccl=SimpleNamespace(version=version), nccl_bindings=Version("2.31.0")
+        )
     return SimpleNamespace(get_version=lambda: version_info)
 
 
@@ -54,10 +60,28 @@ def _spec(
     )
 
 
-def test_validate_nccl_version():
-    _validate_nccl_version(_nccl_with_version(2, 30, 5))
-    with pytest.raises(RuntimeError, match=r"NCCL >= 2\.30\.5"):
-        _validate_nccl_version(_nccl_with_version(2, 30, 4))
+@pytest.mark.parametrize("legacy", [False, True])
+def test_validate_nccl_version(legacy):
+    _validate_nccl_version(_nccl_with_version(2, 30, 5, legacy=legacy))
+    _validate_nccl_version(_nccl_with_version(2, 31, 0, legacy=legacy))
+    with pytest.raises(RuntimeError, match=r"NCCL >= 2\.30\.5, found 2\.30\.4"):
+        _validate_nccl_version(_nccl_with_version(2, 30, 4, legacy=legacy))
+
+
+def test_validate_nccl_version_rejects_missing_library():
+    nccl_core = SimpleNamespace(
+        get_version=lambda: SimpleNamespace(libnccl=None, nccl_bindings=Version("2.31.0"))
+    )
+    with pytest.raises(RuntimeError, match="requires a loaded NCCL library"):
+        _validate_nccl_version(nccl_core)
+
+
+@pytest.mark.parametrize(
+    "nccl_core", [SimpleNamespace(), SimpleNamespace(get_version=lambda: SimpleNamespace())]
+)
+def test_validate_nccl_version_rejects_unsupported_package(nccl_core):
+    with pytest.raises(RuntimeError, match="requires the current NCCL4Py package"):
+        _validate_nccl_version(nccl_core)
 
 
 @pytest.mark.launch_on_gb200

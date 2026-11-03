@@ -14,7 +14,7 @@ transition matrix; `solve_tril` inverts `I + A` afterwards.
 
 import torch
 
-from megatron.core.ssm.ops.common.determinism import autotune_configs
+from megatron.core.tuning import autotune_configs
 
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, tl, triton
 
