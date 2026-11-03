@@ -28,13 +28,16 @@ def is_dataset_built_on_rank_explicit(
     sequence_packing_scheduler: Optional[str],
     pipeline_model_parallel_layout: Any,
     mtp_num_layers: Optional[int],
+    vp_size: Optional[int] = None,
 ) -> bool:
     """Whether the dataset should be built on the current rank: the GPT and hybrid rule, with the
     run's inputs given explicitly (``is_dataset_built_on_rank`` reads them from the arguments).
 
     Only tensor-parallel rank 0 builds. A sequence-packing scheduler or packed dataset builds
     on every pipeline stage; the others on the first and last stages and on the
-    multi-token-prediction ranks.
+    multi-token-prediction ranks. ``vp_size`` is the model's number of virtual pipeline stages
+    for ``mtp_on_this_rank``, 1 without a virtual pipeline; omitting it falls back to the global
+    size there, with a ``ProcessGroupFallbackWarning``.
     """
     from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -49,6 +52,7 @@ def is_dataset_built_on_rank_explicit(
         ignore_virtual=False,
         vp_stage=vp_stage,
         pp_group=mpu.get_pipeline_model_parallel_group(),
+        vp_size=vp_size,
     )
 
 
@@ -71,6 +75,7 @@ def is_dataset_built_on_rank(
         sequence_packing_scheduler=args.sequence_packing_scheduler,
         pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
+        vp_size=config.virtual_pipeline_model_parallel_size or 1,
     )
 
 

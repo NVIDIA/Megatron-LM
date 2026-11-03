@@ -80,6 +80,7 @@ def initialize_gpt_model(
             ignore_virtual=False,
             vp_stage=i,
             pp_group=parallel_state.get_pipeline_model_parallel_group(),
+            vp_size=transformer_config.virtual_pipeline_model_parallel_size or 1,
         ):
             if is_moe:
                 transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)

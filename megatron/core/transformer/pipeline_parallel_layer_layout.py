@@ -8,6 +8,7 @@ from typing import Optional
 
 from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.transformer.enums import LayerType
 
 logger = logging.getLogger(__name__)
@@ -156,9 +157,27 @@ class PipelineParallelLayerLayout:
         vp_stage: Optional[int] = None,
         pp_rank: Optional[int] = None,
     ):
-        """Get the number of layers to build in the pipeline stage"""
+        """Get the number of layers to build in the pipeline stage.
+
+        Args:
+            layer_type: Type of the layers to count.
+            vp_stage: Virtual pipeline stage; required when the layout has virtual stages.
+            pp_rank: Rank of this stage in the model's pipeline-parallel group. A layout with a
+                single pipeline stage does not need it. With several stages, omitting it is
+                deprecated: the global pipeline rank in ``parallel_state`` is used instead, with
+                a ``ProcessGroupFallbackWarning``.
+        """
         if pp_rank is None:
-            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            if self.pipeline_model_parallel_size == 1:
+                pp_rank = 0
+            else:
+                warn_global_process_group_fallback(
+                    "PipelineParallelLayerLayout.get_num_layers_to_build",
+                    "pp_rank",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
+                pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if self.virtual_pipeline_model_parallel_size > 1:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
@@ -174,9 +193,27 @@ class PipelineParallelLayerLayout:
         vp_stage: Optional[int] = None,
         pp_rank: Optional[int] = None,
     ):
-        """Get the layer offset in the pipeline stage"""
+        """Get the layer offset in the pipeline stage.
+
+        Args:
+            layer_type: Type of the layers to count.
+            vp_stage: Virtual pipeline stage; required when the layout has virtual stages.
+            pp_rank: Rank of this stage in the model's pipeline-parallel group. A layout with a
+                single pipeline stage does not need it. With several stages, omitting it is
+                deprecated: the global pipeline rank in ``parallel_state`` is used instead, with
+                a ``ProcessGroupFallbackWarning``.
+        """
         if pp_rank is None:
-            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            if self.pipeline_model_parallel_size == 1:
+                pp_rank = 0
+            else:
+                warn_global_process_group_fallback(
+                    "PipelineParallelLayerLayout.get_layer_offset",
+                    "pp_rank",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
+                pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if self.virtual_pipeline_model_parallel_size > 1:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
