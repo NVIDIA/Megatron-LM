@@ -2279,6 +2279,31 @@ _te_dpa_supports_softcap = (
 )
 
 
+def _dense_unpacked_qkv(query: Tensor, key: Tensor, value: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Return q, k and v in the memory layout TE's DotProductAttention reads them with.
+
+    TE derives a qkv_layout from the inputs' storages, offsets and strides (``get_qkv_layout``),
+    and its fused (cuDNN) backend reads every tensor with the strides of that layout, not with
+    the tensor's own. TE recognizes views of one packed buffer: q, k and v of a fused QKV
+    projection (``sb3hd``, ``sbh3d``) and k and v of a fused KV projection (``sbhd_sb2hd``,
+    ``sbhd_sbh2d``), and copies inputs whose layout it cannot classify. Every other tensor is
+    taken to be dense in its format (``sbhd``, ``bshd`` or ``thd``) without its strides being
+    checked, so a strided view passed on its own (static inference's query split off the fused
+    QKV projection, a batch slice of the static KV cache) would be read as if it were dense.
+    Such tensors are made contiguous; packed views and dense tensors are passed as they are.
+    """
+    if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
+        return query, key, value
+    q_storage, k_storage, v_storage = (t.untyped_storage().data_ptr() for t in (query, key, value))
+    if q_storage == k_storage == v_storage:
+        # Views of a fused QKV projection.
+        return query, key, value
+    if k_storage == v_storage:
+        # Views of a fused KV projection, next to a separate query.
+        return query.contiguous(), key, value
+    return query.contiguous(), key.contiguous(), value.contiguous()
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2569,6 +2594,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
+        query, key, value = _dense_unpacked_qkv(query, key, value)
+
         if packed_seq_params is not None:
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")

@@ -895,6 +895,75 @@ class TestTEWrappers:
         assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
         assert not bytes_equal(default[0]["out"], scaled[0]["out"])
 
+    @pytest.mark.parametrize("backend", ["fused", "flash"])
+    def test_te_dot_product_attention_strided_query_replays(self, backend, monkeypatch):
+        """A query passed as a strided view beside separate k/v, as static inference without
+        RoPE passes it, replays bit-exactly and matches the dense query bit for bit."""
+        seeded()
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            dot_product_attention as te_dpa,
+        )
+
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+        module = TEDotProductAttention(
+            _config(), layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+        ).cuda()
+        s, b, h, hkv, d = 512, 2, 16, 4, 128
+        # The query is the first half of each head of `packed`: strided, at storage offset 0.
+        packed = torch.randn(
+            s, b, h, 2 * d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(dense_query):
+
+            def run(packed, k, v):
+                query = packed[..., :d]
+                assert not query.is_contiguous()
+                if dense_query:
+                    query = query.contiguous()
+                return module(query, k, v, None, AttnMaskType.causal)
+
+            return run
+
+        try:
+            strided = assert_replays_bit_exact(
+                fn(False),
+                (packed, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, strided query]",
+            )
+            dense = assert_replays_bit_exact(
+                fn(True), (packed, k, v), replays=2, what=f"TEDotProductAttention[{backend}]"
+            )
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+        assert len(strided[1]) == 3  # Replay covers the packed query's gradient, dK and dV.
+        for expected, actual in zip(dense, strided):
+            assert actual.keys() == expected.keys()
+            for name in expected:
+                assert bytes_equal(expected[name], actual[name]), f"strided query: {name}"
+
 
 # --- fused RoPE --------------------------------------------------------------------------------
 
