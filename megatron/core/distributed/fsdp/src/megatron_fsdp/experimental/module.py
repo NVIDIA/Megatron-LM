@@ -25,13 +25,12 @@ from weakref import ref
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .dbuffer import DBuffer
 from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
@@ -53,6 +52,7 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
+    _accumulate_gradients: Callable[[FsdpParameterGroup], None]
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -81,6 +81,15 @@ class FsdpModule:
         self._context = context
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
+        # All groups share this mesh and these gradient placements. Dtype-specific
+        # sharding layouts do not change whether communication is needed.
+        if any(
+            mesh.size(axis) > 1 and placement != Partial("avg")
+            for axis, placement in enumerate(main_grad_placements)
+        ):
+            self._accumulate_gradients = self._reduce_inner_gradients
+        else:
+            self._accumulate_gradients = self._accumulate_local_gradients
         owned_parameters = _collect_owned_parameters(self)
         if grad_scale <= 0:
             raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
@@ -475,15 +484,7 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                partial_grad = None
-                if group.requires_inner_reduction:
-                    with torch.cuda.stream(inner_reduction_stream):
-                        partial_grad = group.allocate_partial_grad_buffer()
-
-                if partial_grad is None:
-                    self._accumulate_local_gradients(group)
-                else:
-                    self._reduce_inner_gradients(group, partial_grad)
+                self._accumulate_gradients(group)
 
                 if not context.is_last_microbatch:
                     continue
@@ -509,14 +510,16 @@ class FsdpModule:
         with torch.cuda.stream(inner_reduction_stream):
             group.accumulate_local_gradients()
 
-    def _reduce_inner_gradients(self, group: FsdpParameterGroup, partial_grad: DBuffer) -> None:
+    def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
 
-        The caller allocates partial_grad on the inner stream. On return, that
-        stream contains the queued reduction and accumulation into main_grad.
+        Allocate the packing buffer on the inner stream. On return, that stream
+        contains the queued reduction and accumulation into main_grad.
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
+        with torch.cuda.stream(inner_reduction_stream):
+            partial_grad = group.allocate_partial_grad_buffer()
         current_stream.wait_stream(inner_reduction_stream)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)

@@ -44,11 +44,51 @@ class TinyModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
-        return self.fc2(torch.relu(self.fc1(x)))
+        return self.fc2(torch.relu(self.fc1(x)).to(self.fc2.weight.dtype))
 
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+@pytest.mark.parametrize("singleton", [False, True], ids=["reduced", "local"])
+def test_mixed_dtype_groups_match_reference_gradients(distributed_setup, singleton):
+    """One module handles both trainable dtypes and skips its frozen parameter group."""
+    setup = distributed_setup
+    if setup.world_size < 2:
+        pytest.skip("Requires a nontrivial data-parallel axis.")
+    mesh = init_device_mesh(
+        setup.device.type, (setup.world_size, 1), mesh_dim_names=("dp", "local")
+    )["local" if singleton else "dp"]
+    torch.manual_seed(1234)
+    model = TinyModel().to(setup.device)
+    model.fc1.to(torch.bfloat16)
+    model.fc1.bias.requires_grad_(False)
+    reference = TinyModel().to(setup.device)
+    reference.fc1.to(torch.bfloat16)
+    reference.fc1.bias.requires_grad_(False)
+    reference.load_state_dict(model.state_dict())
+    with fully_shard_context(FsdpContext(device=setup.device)):
+        fully_shard(
+            model,
+            mesh,
+            Placements([0], [Replicate()], [Replicate()], [Replicate()]),
+            mixed_precision_policy=MixedPrecisionPolicy(main_grads_dtype=torch.float32),
+        )
+
+    inputs = torch.full((4, 8), setup.rank + 1, device=setup.device, dtype=torch.bfloat16)
+    for _ in range(2):
+        reference.zero_grad(set_to_none=True)
+        reference(inputs).sum().backward()
+        model(inputs).sum().backward()
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        if not expected.requires_grad:
+            assert actual.grad is None
+            continue
+        gradient = expected.grad.float()
+        if not singleton:
+            dist.all_reduce(gradient, op=dist.ReduceOp.AVG)
+        torch.testing.assert_close(actual.grad.to_local(), gradient * 2, rtol=0, atol=0)
 
 
 def test_replicated_gradients_still_reduce(distributed_setup):
