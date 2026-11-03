@@ -1019,6 +1019,28 @@ def _emit(x, OPERANDS, indices, rstd, H: gl.constexpr, partition: gl.constexpr, 
 
 
 @g.jit
+def _prefetch_l2(pointers, cols, H: gl.constexpr):
+    """Prefetch the 128-byte lines under ``pointers`` (columns ``cols`` < H) into L2."""
+    LINE: gl.constexpr = 1024 // pointers.dtype.element_ty.primitive_bitwidth  # elements
+    first = (cols < H) & (cols % LINE == 0)  # one prefetch per line
+    gl.inline_asm_elementwise(
+        """
+        { // Begin predicated L2 prefetch scope.
+            .reg .pred p; // Declare the line-leader predicate.
+            setp.ne.u32 p, $2, 0; // Prefetch only from the first column of each line.
+            @p prefetch.global.L2 [$1]; // Hint the line into L2; no data is returned.
+            mov.u32 $0, 0; // Dummy result keeps the side effect in program order.
+        } // End predicated L2 prefetch scope.
+        """,
+        "=r,l,r",
+        [pointers.to(gl.uint64), first.to(gl.int32)],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@g.jit
 def _prepare_coefficients(
     controllers, C, row, TWO_READERS: gl.constexpr, STREAMS: gl.constexpr, RETENTION: gl.constexpr
 ):
@@ -1089,11 +1111,12 @@ def _forward(
         CONFIG: ``_ForwardConfig``.
         EPSILON: RMSNorm epsilon.
         PAD_ROWS: Zero the MXFP8 scales of padded rows in the last 128-row tile.
-        DEPENDENT: Wait for the preceding grid first (programmatic dependent launch).
+        DEPENDENT: Launched as a programmatic dependent (inference): compute the coefficients
+            from the controller logits and prefetch the residual row and gammas into L2, then
+            wait for the preceding grid before reading any of its outputs.
         EXCHANGE: ``_exchange_asm`` PTX for a cluster launch, or None.
     """
-    if DEPENDENT:
-        gdc_wait()  # PDL: wait for the preceding grid before any memory access
+    # Before gdc_wait (DEPENDENT) the kernel reads only parameters, never preceding-grid outputs.
     H: gl.constexpr = GEOMETRY.H
     gammas = read_tensors.gammas
     TWO_READERS: gl.constexpr = len(gammas) == 2  # Split CTAs still mix both updates.
@@ -1127,6 +1150,18 @@ def _forward(
     )
     if K > 1:
         cols += (gl.program_id(0) % K) * (H // K)  # this CTA's column slice
+    if DEPENDENT:
+        # Decode rows are latency bound on cold loads: start the residual row and gamma
+        # fetches into L2 before waiting for the preceding grid. A prefetch is only a hint and
+        # L2 is coherent, so it never observes a stale value; the real loads follow the wait.
+        STREAMS: gl.constexpr = GEOMETRY.STREAMS
+        for segment in gl.static_range(NUM_SEGMENTS):
+            cc = cols + segment * width
+            for stream in gl.static_range(STREAMS):
+                _prefetch_l2(write_tensors.residual + row * (STREAMS * H) + stream * H + cc, cc, H)
+            for reader in gl.static_range(len(gammas)):
+                _prefetch_l2(gammas[reader] + cc, cc, H)
+        gdc_wait()  # PDL: wait for the preceding grid before reading its outputs
     mixed = ()
     totals = (0.0,) * len(gammas)
     # Short rows are latency bound: issue the whole row's loads before any dependent store.
