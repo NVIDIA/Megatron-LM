@@ -46,7 +46,7 @@ def _case(tokens, experts, topk, hidden, seed):
     return idx, vals
 
 
-def _reference(idx, vals, experts, probs=None):
+def _reference(idx, vals, experts):
     """The combine tree in plain torch: leaves summed in expert order, then pairwise."""
     tokens, topk, hidden = vals.shape
     num_leaves = eic.num_leaf_blocks(experts)
@@ -55,8 +55,6 @@ def _reference(idx, vals, experts, probs=None):
     for e in range(experts):
         hit = idx == e
         v = (vals * hit[..., None]).sum(1)  # at most one slot per (token, expert)
-        if probs is not None:
-            v = v * probs[:, e : e + 1]
         leaves[e // leaf_size] = leaves[e // leaf_size] + torch.where(
             hit.any(1, keepdim=True), v, 0.0
         )
@@ -100,23 +98,39 @@ def _rank_inverse_map(idx, rank, experts_per_rank):
     return inv, (t, k)
 
 
+def _dense_slots(row_of_slot, expert_of_slot, num_experts):
+    """[T, K] (row, expert) top-k slots -> [T, num_experts] row per expert (-1 = none)."""
+    valid = (row_of_slot >= 0) & (expert_of_slot >= 0) & (expert_of_slot < num_experts)
+    cols = torch.where(valid, expert_of_slot, num_experts).long()  # spare column, dropped
+    dense = torch.full((row_of_slot.shape[0], num_experts + 1), -1, dtype=torch.int32)
+    dense = dense.to(row_of_slot.device)
+    dense.scatter_(1, cols, torch.where(valid, row_of_slot, -1).to(torch.int32))
+    return dense[:, :num_experts].contiguous()
+
+
+def _all(tokens):
+    """valid_tokens covering every token."""
+    return torch.tensor([tokens], dtype=torch.int32, device="cuda")
+
+
 def _rank_partial(idx, vals, experts, ep, rank):
     """One EP rank's fp32 subtree partial, from rows in arbitrary order."""
     inv, (t, k) = _rank_inverse_map(idx, rank, experts // ep)
     rows = vals[t, k].to(torch.bfloat16).contiguous()
-    return eic.tree_combine_forward(rows, inv, eic.num_leaf_blocks(experts) // ep)
+    return eic.tree_combine_forward(
+        rows, inv, eic.num_leaf_blocks(experts) // ep, _all(idx.shape[0])
+    )
 
 
 @needs_cuda
-@pytest.mark.parametrize("experts,with_probs", [(64, False), (96, True)])
-def test_kernel_matches_reference_tree(experts, with_probs):
-    tokens, topk, hidden = 40, min(6, experts), 1000
+@pytest.mark.parametrize("experts", [64, 96])
+def test_kernel_matches_reference_tree(experts):
+    tokens, topk, hidden = 40, 6, 1000
     idx, vals = _case(tokens, experts, topk, hidden, seed=0)
     rows, inverse_map = _training_inputs(idx, vals)
-    probs = torch.rand(tokens, experts, device="cuda") if with_probs else None
-    slots = eic.dense_slots(inverse_map[0], inverse_map[1], experts)
-    out = eic.tree_combine_forward(rows, slots, eic.num_leaf_blocks(experts), probs)
-    assert torch.equal(_bits(out), _bits(_reference(idx, vals, experts, probs)))
+    slots = _dense_slots(inverse_map[0], inverse_map[1], experts)
+    out = eic.tree_combine_forward(rows, slots, eic.num_leaf_blocks(experts), _all(tokens))
+    assert torch.equal(_bits(out), _bits(_reference(idx, vals, experts)))
     assert not torch.signbit(out[1, 0])  # -0.0 rows add up to +0.0 at every EP
 
 
@@ -126,7 +140,8 @@ def test_kernel_matches_reference_tree(experts, with_probs):
 )
 def test_route_kernel_matches_dense_kernel(experts, topk, hidden, with_probs):
     """Training walks each token's sorted routes; it must give the dense kernel's bits,
-    including slots that route nowhere (dropped or padded)."""
+    including slots that route nowhere (dropped or padded). With probs, the dense kernel
+    gets the rows pre-multiplied in fp32 (torch's fp32 product is the kernel's mul_rn)."""
     tokens = 48
     idx, vals = _case(tokens, experts, topk, hidden, seed=4)
     rows, inverse_map = _training_inputs(idx, vals)
@@ -138,8 +153,15 @@ def test_route_kernel_matches_dense_kernel(experts, topk, hidden, with_probs):
     expert_of_slot[1::7, -1] = -1
     probs = torch.rand(tokens, experts, device="cuda") if with_probs else None
     leaves = eic.num_leaf_blocks(experts)
-    dense = eic.dense_slots(row_of_slot, expert_of_slot, experts)
-    ref = eic.tree_combine_forward(rows, dense, leaves, probs)
+    dense_rows = rows.float()
+    if probs is not None:
+        used = (row_of_slot >= 0) & (expert_of_slot >= 0)
+        t, k = used.nonzero(as_tuple=True)
+        row_prob = torch.zeros(rows.shape[0], device="cuda")
+        row_prob[row_of_slot[t, k]] = probs[t, expert_of_slot[t, k]]
+        dense_rows = dense_rows * row_prob[:, None]
+    dense = _dense_slots(row_of_slot, expert_of_slot, experts)
+    ref = eic.tree_combine_forward(dense_rows, dense, leaves, _all(tokens))
     cols, slot_rows, slot_probs = eic.sorted_routes(row_of_slot, expert_of_slot, experts, probs)
     out = eic.tree_combine_routes_forward(rows, cols, slot_rows, experts, leaves, slot_probs)
     assert torch.equal(_bits(out), _bits(ref))
@@ -247,10 +269,9 @@ def test_inference_unpermute_same_bits_at_every_ep(monkeypatch):
     ref = rank_out(1, 0, eic.num_leaf_blocks(experts))
     n = valid.item()
     assert torch.equal(_bits(ref[:n]), _bits(train[:n]))  # engine == learner
-    assert not ref[n:].any()  # rows past valid_tokens are zero
     for ep in (2, 4, 8):
-        parts = [rank_out(ep, r, eic.num_leaf_blocks(experts) // ep) for r in range(ep)]
-        assert torch.equal(_bits(_pairwise_tree_sum(parts)), _bits(ref)), ep
+        parts = [rank_out(ep, r, eic.num_leaf_blocks(experts) // ep)[:n] for r in range(ep)]
+        assert torch.equal(_bits(_pairwise_tree_sum(parts)), _bits(ref[:n])), ep
     # Flag off: unchanged (fp64 sum rounded to the fp32 rank partial).
     assert rank_out(1, 0, None).dtype == torch.float32
 
@@ -288,7 +309,9 @@ def test_topk_layout_matches_dense_kernel():
             t, k = on_rank.nonzero(as_tuple=True)
             inv = torch.full((tokens, local), -1, dtype=torch.int32, device="cuda")
             inv[t, routing_map[t, k] - start] = (t * topk + k).int()
-            ref = eic.tree_combine_forward(rows.view(tokens * topk, hidden), inv, leaves)
+            ref = eic.tree_combine_forward(
+                rows.view(tokens * topk, hidden), inv, leaves, _all(tokens)
+            )
             assert torch.equal(_bits(out[:n]), _bits(ref[:n])), (ep, rank)
             assert (out[n:] == 7.0).all()  # padded tokens are not written
 
@@ -442,10 +465,12 @@ class TestEPInvariantCollectives:
         t = torch.arange(tokens, device="cuda").repeat_interleave(topk)
         e = idx.flatten()
         rows = expert(x[t], e, probs[t, e])
-        slots = eic.dense_slots(
+        slots = _dense_slots(
             torch.arange(tokens * topk, device="cuda").view(tokens, topk), idx, experts
         )
-        ref = eic.tree_combine_forward(rows, slots, eic.num_leaf_blocks(experts)).to(torch.bfloat16)
+        ref = eic.tree_combine_forward(rows, slots, eic.num_leaf_blocks(experts), _all(tokens)).to(
+            torch.bfloat16
+        )
         assert torch.equal(out.view(-1, hidden).view(torch.int16), ref[mine].view(torch.int16))
 
     @needs_cuda

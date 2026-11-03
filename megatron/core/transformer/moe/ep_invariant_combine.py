@@ -109,12 +109,9 @@ def _add_to_leaf(acc, pending, occupied, cur_leaf, leaf, v, LEVELS: tl.constexpr
 def _tree_combine_kernel(
     rows_ptr,  # [R, H] expert output rows (bf16 or fp32)
     slots_ptr,  # [T, S] int32 row of each (token, column), -1 = none
-    probs_ptr,  # [T, S] fp32 per-(token, column) weight (HAS_PROBS)
-    valid_tokens_ptr,  # scalar int32: tokens >= this get zeros (HAS_VALID_TOKENS)
-    out_ptr,  # [T, H] fp32
+    valid_tokens_ptr,  # scalar int32: tokens >= this get zeros
+    out_ptr,  # [T, H]
     hidden,
-    HAS_PROBS: tl.constexpr,
-    HAS_VALID_TOKENS: tl.constexpr,
     NUM_LEAVES: tl.constexpr,  # power of two
     LEVELS: tl.constexpr,  # log2(NUM_LEAVES)
     LEAF_SIZE: tl.constexpr,  # columns per leaf: S = NUM_LEAVES * LEAF_SIZE
@@ -127,27 +124,20 @@ def _tree_combine_kernel(
     empty subtrees are +0.0 and no node is ever -0.0, so adding one is an exact no-op.
     The kernel visits the token's routed columns in order (an occupancy bitmask per WORD
     columns, walked with ffs), so its work scales with the routed rows like the plain
-    expert-order unpermute. ``acc`` is the subtree grown from the current
-    leaf; pending[l] (non-empty iff bit l of ``occupied``) is a left sibling at level l
-    waiting for it. When the next routed leaf b follows leaf a, the two meet at height
-    h = bit_length(a ^ b): the pending subtrees below level h - 1 fold onto acc, which
-    becomes the pending left sibling at level h - 1, and b starts a new acc.
+    expert-order unpermute; ``_add_to_leaf`` builds the tree as it goes.
     """
     tok = tl.program_id(0).to(tl.int64)
-    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = offs < hidden
-    slot_base = tok * (NUM_LEAVES * LEAF_SIZE)
-    zero = tl.zeros([BLOCK_H], dtype=tl.float32)
-    pending = ()
-    for _ in tl.static_range(LEVELS):
-        pending = pending + (zero,)
-    occupied = tl.full([], 0, tl.int32)
-    acc = zero
-    cur_leaf = tl.full([], -1, tl.int32)
-    live = True
-    if HAS_VALID_TOKENS:
-        live = tok < tl.load(valid_tokens_ptr)
-    if live:
+    if tok < tl.load(valid_tokens_ptr):
+        offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = offs < hidden
+        slot_base = tok * (NUM_LEAVES * LEAF_SIZE)
+        zero = tl.zeros([BLOCK_H], dtype=tl.float32)
+        pending = ()
+        for _ in tl.static_range(LEVELS):
+            pending = pending + (zero,)
+        occupied = tl.full([], 0, tl.int32)
+        acc = zero
+        cur_leaf = tl.full([], -1, tl.int32)
         # Visit only the routed columns: a bitmask per WORD columns, walked with ffs.
         bit_ids = tl.arange(0, WORD)
         for word in tl.range(0, NUM_LEAVES * LEAF_SIZE, WORD):
@@ -161,31 +151,26 @@ def _tree_combine_kernel(
                 bits = bits & (bits - 1)
                 row = tl.load(slots_ptr + slot_base + col).to(tl.int64)
                 v = tl.load(rows_ptr + row * hidden + offs, mask=mask_h, other=0.0)
-                v = v.to(tl.float32)
-                if HAS_PROBS:
-                    # mul_rn: a separately rounded product, never contracted into an FMA.
-                    v = libdevice.mul_rn(v, tl.load(probs_ptr + slot_base + col))
                 leaf = (col // LEAF_SIZE).to(tl.int32)
                 acc, pending, occupied, cur_leaf = _add_to_leaf(
-                    acc, pending, occupied, cur_leaf, leaf, v, LEVELS
+                    acc, pending, occupied, cur_leaf, leaf, v.to(tl.float32), LEVELS
                 )
         acc = _fold_below(acc, pending, occupied, LEVELS, LEVELS)
-    tl.store(out_ptr + tok * hidden + offs, acc, mask=mask_h)
+        tl.store(out_ptr + tok * hidden + offs, acc, mask=mask_h)
 
 
 def tree_combine_forward(
     rows: torch.Tensor,
     slots: torch.Tensor,
     num_leaves: int,
-    probs: Optional[torch.Tensor] = None,
-    valid_tokens: Optional[torch.Tensor] = None,
+    valid_tokens: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """fp32 [T, H]: the combine subtree over ``slots`` [T, S] (row ids, -1 = none).
+    """This rank's fp32 subtree partial per token, from a dense map (the torch backend).
 
-    Column j of ``slots`` belongs to leaf j // (S / num_leaves); columns must be in
-    expert order. ``probs`` [T, S] multiplies each row in fp32 first. Rows of tokens at
-    or beyond ``valid_tokens`` (a scalar int32 CUDA tensor) are zero.
+    ``slots`` [T, S]: row of each (token, local expert), -1 = none; column j belongs to
+    leaf j // (S / num_leaves). Writes the first ``valid_tokens`` (a scalar int32 CUDA
+    tensor) rows of ``out`` [T, H] (allocated fp32 if None; cast to its dtype).
     """
     assert HAVE_TRITON, "moe_ep_invariant_combine requires Triton."
     num_tokens, num_cols = slots.shape
@@ -193,8 +178,6 @@ def tree_combine_forward(
     assert num_leaves & (num_leaves - 1) == 0 and num_cols % num_leaves == 0
     assert num_leaves <= 1 << _MAX_LEVELS
     slots = slots.to(torch.int32).contiguous()
-    if probs is not None:
-        probs = probs.to(torch.float32).contiguous()
     if out is None:
         out = torch.empty(num_tokens, hidden, dtype=torch.float32, device=rows.device)
     if num_tokens == 0:
@@ -204,12 +187,9 @@ def tree_combine_forward(
     _tree_combine_kernel[grid](
         rows,
         slots,
-        probs if probs is not None else slots,
-        valid_tokens if valid_tokens is not None else slots,
+        valid_tokens,
         out,
         hidden,
-        HAS_PROBS=probs is not None,
-        HAS_VALID_TOKENS=valid_tokens is not None,
         NUM_LEAVES=num_leaves,
         LEVELS=num_leaves.bit_length() - 1,
         LEAF_SIZE=num_cols // num_leaves,
@@ -218,19 +198,6 @@ def tree_combine_forward(
         num_warps=4,
     )
     return out
-
-
-def dense_slots(row_of_slot: torch.Tensor, expert_of_slot: torch.Tensor, num_experts: int):
-    """[T, K] (row, expert) top-k slots -> [T, num_experts] row per expert (-1 = none)."""
-    num_tokens = row_of_slot.shape[0]
-    valid = (row_of_slot >= 0) & (expert_of_slot >= 0) & (expert_of_slot < num_experts)
-    # Invalid slots scatter into a spare last column, which is dropped.
-    cols = torch.where(valid, expert_of_slot, num_experts).long()
-    dense = torch.full(
-        (num_tokens, num_experts + 1), -1, dtype=torch.int32, device=row_of_slot.device
-    )
-    dense.scatter_(1, cols, torch.where(valid, row_of_slot, -1).to(torch.int32))
-    return dense[:, :num_experts].contiguous()
 
 
 @triton.jit
