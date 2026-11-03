@@ -294,6 +294,17 @@ def test_small_case_for_sanitizer():
 
 
 @pytest.mark.usefixtures("fresh_wrapper_registry")
+@pytest.mark.sanitizer
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.BLACKWELL)
+def test_sanitizer_mxfp8_small_case():
+    """The GB200 counterpart of ``test_small_case_for_sanitizer``: one padded sequence-parallel
+    MXFP8 case, padded to the 32-row alignment."""
+    tp = 2 if Utils.world_size % 2 == 0 else 1
+    _run("column", tp, "mxfp8", 2 * tp + (0 if tp > 1 else 1), 1, 32)
+
+
+@pytest.mark.usefixtures("fresh_wrapper_registry")
 @ou.requires_sm(ou.HOPPER)
 def test_wrapper_is_transparent_outside_fp8():
     """Outside an FP8 autocast the wrapped module returns its unwrapped output bit for bit."""
