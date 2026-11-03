@@ -677,9 +677,7 @@ class FsdpParameterGroup:
             fsdp_parameter.unsharded.grad = None
         self._install_sharded_grads(self.main_grad)
 
-    def _prepare_main_grad(self) -> bool:
-        """Clear stale storage and report whether this backward must accumulate."""
-        assert self.main_grad is not None
+    def _has_sharded_grads(self) -> bool:
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
@@ -689,13 +687,19 @@ class FsdpParameterGroup:
                 has_any_grad = True
         if has_any_grad and has_any_missing_grad:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+        return has_any_grad
+
+    def _prepare_main_grad(self) -> bool:
+        """Clear stale storage and report whether this backward must accumulate."""
+        assert self.main_grad is not None
+        has_sharded_grads = self._has_sharded_grads()
         if self._main_grad_is_stale:
             # zero_grad(False) only zeros the optimizer view, which can be smaller.
             # With zero_grad(True), this backward overwrites every parameter instead.
-            if has_any_grad:
+            if has_sharded_grads:
                 self.main_grad.local_buffer.zero_()
             self._main_grad_is_stale = False
-        return has_any_grad
+        return has_sharded_grads
 
     def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
