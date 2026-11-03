@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Emerging optimizer registry.
 
@@ -38,7 +38,16 @@ try:
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+
+    try:
+        from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    except ModuleNotFoundError as error:
+        # Emerging-Optimizers >= 0.5.0a0 moved SOAP to ``legacy_soap`` (same registry
+        # name). Without this fallback the import error disables every optimizer of
+        # the package, including Muon.
+        if error.name != 'emerging_optimizers.soap':
+            raise
+        from emerging_optimizers.legacy_soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
