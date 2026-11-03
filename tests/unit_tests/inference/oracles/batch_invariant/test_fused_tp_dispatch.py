@@ -79,9 +79,10 @@ Main vs open PRs:
   fuse). #8561 (d1) fixes them; #8712 (n16) and #8704 (n8) change the same wiring and must keep
   these tests passing; #8868 (t3-r04f3) changes the batch-invariant branch to a rank-ordered
   reduce-scatter (still no residual add without d1).
-- `test_step_sizes_keep_the_residual[narrow_decode]` fails on main in the fused kernel's
-  launcher (one token per rank at H = 128 is under a warp: num_warps = 0); #8880 (t3-r09f2)
-  fixes it.
+- `test_step_sizes_keep_the_residual[narrow_decode]` and the graphed engine cases
+  (`test_engine_steps_keep_the_residual[local|full_iteration]`, whose decode graphs run one
+  token per rank) fail on main in the fused kernel's launcher (one token per rank at H = 128 is
+  under a warp: num_warps = 0); #8880 (t3-r09f2) fixes it.
 - MLA (`test_mla_layers_keep_the_residual`) fails on main at construction: the block asks every
   layer for `linear_qkv`'s norm weights, which MLA does not have (AttributeError). #8704 (n8,
   stacked on #8561) wires MLA and must make it pass; the MLA up projections all-gather back to
@@ -735,7 +736,14 @@ def test_engine_steps_keep_the_residual(case, parallel, monkeypatch):
     The decoder's final norm is removed so its output is the stream; hooks on the embedding
     (which also NaN-poisons the buffer) and the output layer, which run eagerly around graphed
     decoders, compare the two. With `full_iteration_capacity` the buffer holds 64 tokens, so the
-    small (decode) graphs fuse and the larger (mixed) ones do not (fails on main, #8561)."""
+    small (decode) graphs fuse and the larger (mixed) ones do not (fails on main, #8561).
+
+    The graphed cases (`local`, `full_iteration`, `full_iteration_capacity`) fail on main before
+    the oracle can judge: CUDA-graph decode steps run one token per rank, a shard narrower than a
+    warp at this toy H (128), and main's fused-kernel launcher then computes num_warps = 0
+    ("num_warps must be a power of 2"; dfw 21235396). #8880 (t3-r09f2) fixes the launcher, so
+    `local` and `full_iteration` must pass with it and `full_iteration_capacity` with #8561 and
+    #8880 together. `eager` passes on main."""
     tp = parallel
     graphs = case != "eager"
     if case.endswith("_capacity"):
