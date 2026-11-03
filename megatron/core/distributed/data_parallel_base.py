@@ -42,7 +42,7 @@ class _BaseDataParallel(MegatronModule):
         """
         pass
 
-    def scale_gradients(self, scaling_factor: float) -> None:
+    def scale_gradients(self, scaling_factor: torch.Tensor) -> None:
         """Scale all gradients inside the buffers by `scaling_factor`."""
         pass
 
