@@ -793,7 +793,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from megatron.core.ssm.mamba_mixer import BatchInvariantDecodeParams
+        from megatron.core.ssm.mamba_mixer import MambaInferenceParamCache
         from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 
         nh, p, ng, n = self.nh, self.headdim, self.ngroups, self.dstate
@@ -805,7 +805,12 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         def mixer(cached):
             params = (
-                BatchInvariantDecodeParams(A=-torch.exp(A_log.float()), dt_bias=dt_bias.float())
+                MambaInferenceParamCache(
+                    A_neg_exp=-torch.exp(A_log.float()),
+                    conv_weight=torch.empty(0, device=self.device),  # unused by the adapter
+                    conv_bias=torch.empty(0, device=self.device),
+                    dt_bias=dt_bias.float(),
+                )
                 if cached
                 else None
             )

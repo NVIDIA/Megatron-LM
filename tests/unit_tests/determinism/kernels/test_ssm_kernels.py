@@ -316,8 +316,8 @@ def test_mixer_inference_param_caches_match_per_call_casts():
             weight, bias = mixer._get_conv_params(
                 mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
             )
-            assert weight.data_ptr() == mixer._conv_weight_fp32_cache.data_ptr()
-            for got, want in zip((weight, bias, mixer._A_neg_exp_cache), per_call()):
+            assert weight.data_ptr() == mixer._inference_cache.conv_weight.data_ptr()
+            for got, want in zip((weight, bias, mixer._inference_cache.A_neg_exp), per_call()):
                 assert torch.equal(got, want)
 
             batch, dim, width = 64, weight.shape[0], weight.shape[1]
