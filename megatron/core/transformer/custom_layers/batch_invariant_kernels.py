@@ -222,8 +222,16 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM.
+
+    Accumulates in fp32 and rounds once to ``out_dtype`` (default: the inputs' dtype).
+    """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -236,7 +244,7 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     K, N = b.shape
     dtype = a.dtype
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -525,8 +533,8 @@ def mean_dim(
     return output
 
 
-# Production uses DeepGEMM for bf16 and the deterministic Triton kernel for
-# intentional higher-precision operations such as the fp32 MoE router.
+# Production uses DeepGEMM for bf16 operands (bf16 output, or fp32 output such as the
+# MoE router's logits) and the deterministic Triton kernel for fp16/fp32 operands.
 _BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton", "te_native")
 _BATCH_INVARIANT_BACKEND: str = "deepgemm"
 # Whether batch-invariant mode turned on DeepGEMM's deterministic algorithms. DeepGEMM
@@ -551,8 +559,10 @@ def _set_deepgemm_deterministic_algorithms(enabled: bool) -> None:
     _DEEPGEMM_DETERMINISTIC_SET = enabled
 
 
-def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """`a @ b` via DeepGEMM `bf16_gemm_nn`.
+def _mm_deepgemm(
+    a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """`a @ b` via DeepGEMM `bf16_gemm_nn`, in ``out_dtype``: bf16 (the default) or fp32.
 
     Deterministic across runs and batch-invariant. Its bits generally differ from
     `torch.mm`'s, so the processes that must agree bitwise (for example RL
@@ -593,8 +603,11 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b = _align_outer_stride(b)
     M = a.shape[0]
     N = b.shape[1]
-    output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
-    d = a.new_empty_strided((M, N), (output_stride, 1))
+    # DeepGEMM accumulates in fp32 and rounds once to D's dtype.
+    out_dtype = out_dtype or a.dtype
+    output_alignment = 16 // out_dtype.itemsize
+    output_stride = (N + output_alignment - 1) // output_alignment * output_alignment
+    d = a.new_empty_strided((M, N), (output_stride, 1), dtype=out_dtype)
     # Compile only N into the JIT kernel. The token count is K in weight-gradient
     # GEMMs (`grad.t() @ x`, TE's NT layout) and M in all others, so compiling
     # either would build a new kernel for every new token count.
@@ -602,15 +615,20 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return d.contiguous()
 
 
-def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm`."""
+def mm_batch_invariant(a, b, out_dtype: torch.dtype | None = None):
+    """Batch-invariant replacement for `aten::mm`.
+
+    The product is accumulated in fp32 and rounded once to ``out_dtype`` (default: the
+    inputs' dtype), so an fp32 product of bf16 operands is never rounded to bf16.
+    """
     if (
         _BATCH_INVARIANT_BACKEND == "deepgemm"
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
+        and out_dtype in (None, torch.bfloat16, torch.float32)
     ):
-        return _mm_deepgemm(a, b)
-    return matmul_persistent(a, b)
+        return _mm_deepgemm(a, b, out_dtype)
+    return matmul_persistent(a, b, out_dtype=out_dtype)
 
 
 def addmm_batch_invariant(bias, a, b):
@@ -1195,8 +1213,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             leading_shape = ()
             opB_2d = opB
 
-        # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = mm_batch_invariant(opB_2d, opA)
+        # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O). Like TE, write `out_dtype`
+        # from the fp32 accumulator: an fp32 product of bf16 operands (the MoE router's
+        # logits) must not be rounded to bf16 first.
+        base_2d = mm_batch_invariant(opB_2d, opA, out_dtype=out_dtype)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])

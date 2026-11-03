@@ -876,6 +876,27 @@ def test_batch_invariant_kernels_replay():
     )
 
 
+@pytest.mark.parametrize("backend", ["triton", "deepgemm"])
+def test_batch_invariant_fp32_router_gating_replays(backend):
+    """The router's fp32 logits of bf16 operands, written from the GEMM's fp32 accumulator."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+    from megatron.core.transformer.moe.moe_utils import router_gating_linear
+
+    if backend == "deepgemm" and not bik.HAVE_DEEPGEMM_BF16:
+        pytest.skip("DeepGEMM bf16 bindings are unavailable")
+    seeded()
+    x = torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(256, 4096, device="cuda") * 0.02).to(torch.bfloat16)
+    with torch.no_grad(), bik.set_batch_invariant_mode(True, backend=backend):
+        assert_replays_bit_exact(
+            lambda x, w: router_gating_linear(x, w, None, torch.float32),
+            (x, weight),
+            replays=4,
+            backward=False,
+            what=f"fp32 router_gating_linear[{backend}]",
+        )
+
+
 @pytest.mark.parametrize("zero_centered_gamma", [False, True], ids=["gamma", "zero_centered_gamma"])
 def test_batch_invariant_rmsnorm_replays_and_matches_reference(zero_centered_gamma):
     """Replay the batch-invariant RMSNorm autograd function and check it against fp32 torch.

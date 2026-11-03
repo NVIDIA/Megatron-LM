@@ -25,6 +25,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_attention,
 )
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.transformer.moe.moe_utils import router_gating_linear
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -891,3 +892,39 @@ def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
         )
 
     assert torch.equal(full, chunks)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "triton",
+        pytest.param(
+            "deepgemm",
+            marks=pytest.mark.skipif(
+                not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable"
+            ),
+        ),
+    ],
+)
+def test_bik_router_gating_logits_are_fp32(backend):
+    """The router's fp32 logits of bf16 operands keep the GEMM's fp32 accumulator, as in TE.
+
+    They are not rounded to bf16 (relative error up to 2**-8, enough to flip near-tied
+    experts), and a token's logits have the same bits at every batch size.
+    """
+    torch.manual_seed(7)
+    num_experts, hidden = 64, 1024
+    weight = (torch.randn(num_experts, hidden, **_device(torch.float32)) / 32).to(torch.bfloat16)
+    tokens = torch.randn(4096, hidden, **_device(torch.bfloat16))
+    with set_batch_invariant_mode(True, backend=backend):
+        logits = {
+            m: router_gating_linear(tokens[:m], weight, None, torch.float32)
+            for m in (1, 16, 129, 4096)
+        }
+    full = logits[4096]
+    assert full.dtype == torch.float32
+    assert not torch.equal(full, full.bfloat16().float()), "router logits were rounded to bf16"
+    reference = tokens.double() @ weight.double().t()
+    torch.testing.assert_close(full.double(), reference, rtol=1e-4, atol=1e-4)
+    for m, rows in logits.items():
+        assert torch.equal(rows, full[:m]), f"logits of {m} tokens differ from the full batch's"
