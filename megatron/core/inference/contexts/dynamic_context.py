@@ -45,6 +45,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.process_groups_config import (
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -481,18 +485,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Expert tensor-and-model-parallel (tp_ep) group: the group the inference MoE
         # dispatchers gather/scatter tokens over. Equals the EP group when ETP == 1.
-        if pg_collection is not None:
-            # getattr: callers may build a pg_collection without tp_ep; fall back to the EP
-            # group (identical when ETP == 1), matching the engine's fallback.
-            self.expert_tensor_and_model_parallel_group = getattr(
-                pg_collection, "tp_ep", self.expert_model_parallel_group
-            )
-        else:
-            # Migration fallback for callers that do not pass a pg_collection; mirrors
-            # the EP fallback above. None (size 1) when MPU is not initialized.
-            self.expert_tensor_and_model_parallel_group = (
-                parallel_state.get_expert_tensor_and_model_parallel_group(check_initialized=False)
-            )
+        # getattr: callers may build a pg_collection without tp_ep; fall back to the EP
+        # group (identical when ETP == 1), matching the engine's fallback.
+        self.expert_tensor_and_model_parallel_group = getattr(
+            pg_collection, "tp_ep", self.expert_model_parallel_group
+        )
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
@@ -1805,6 +1802,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # The MTP scratch buffers hang off `self.mtp_metadata`, so the sweep above misses them.
             self.mtp_metadata.deallocate()
 
+    @staticmethod
+    def _global_tp_size(owner: str) -> int:
+        """Return the global tensor model parallel size, for a caller of `owner` without `tp_size`.
+
+        This compatibility fallback is deprecated and warns once per `owner`. It returns 1 when
+        `parallel_state` is not initialized.
+        """
+        if not parallel_state.is_initialized():
+            warn_global_process_group_fallback(
+                owner, "tp_size", deprecated_in="0.21", removed_in="0.23"
+            )
+            return 1
+        pg_collection = resolve_process_groups(
+            None,
+            owner=owner,
+            required=("tp",),
+            argument="tp_size",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        return get_pg_size(pg_collection.tp)
+
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
         """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size.
@@ -1813,15 +1832,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             value (int): Token count to round up.
             tp_size (Optional[int]): Tensor model parallel size to align to. A context passes its
                 own `tp_size`. If None, the global tensor model parallel size is used (1 when
-                `parallel_state` is not initialized).
+                `parallel_state` is not initialized); that fallback is deprecated.
         """
         # Make sure divisible by TP size
         if tp_size is None:
-            # Check if parallel state is initialized before trying to get TP size
-            if parallel_state.is_initialized():
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            else:
-                tp_size = 1
+            tp_size = cls._global_tp_size(f"{cls.__name__}.round_up_tokens")
         token_rounder = math.ceil(cls.TOKEN_ROUNDER / tp_size) * tp_size
 
         return token_rounder * int(math.ceil(int(value) / token_rounder))
@@ -1834,15 +1849,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             value (int): Request count to round up.
             tp_size (Optional[int]): Tensor model parallel size to align to. A context passes its
                 own `tp_size`. If None, the global tensor model parallel size is used (1 when
-                `parallel_state` is not initialized).
+                `parallel_state` is not initialized); that fallback is deprecated.
         """
         # Make sure divisible by TP size
         if tp_size is None:
-            # Check if parallel state is initialized before trying to get TP size
-            if parallel_state.is_initialized():
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            else:
-                tp_size = 1
+            tp_size = cls._global_tp_size(f"{cls.__name__}.round_up_requests")
         request_rounder = math.ceil(cls.REQUEST_ROUNDER / tp_size) * tp_size
 
         return request_rounder * int(math.ceil(int(value) / request_rounder))
