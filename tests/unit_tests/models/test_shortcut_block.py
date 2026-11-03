@@ -16,6 +16,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
     api,
     forward_kernel,
     mxfp8_handoff,
+    replay_kernel,
 )
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import residual_replay_scope
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -295,13 +296,17 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         assert kwargs == expected_layer_kwargs
         return hidden_states
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def route(
+        shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None, **_
+    ):
         assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
         assert padding_mask is moe_padding_mask
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def shared(
+        hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None, **_
+    ):
         assert recompute_context is moe_context
         observed["shared_packed"] = packed_seq_params
         assert padding_mask is moe_padding_mask
@@ -315,6 +320,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         moe_unflatten_mbs=None,
         mlp_state=(),
         recompute_context=None,
+        **_,
     ):
         assert recompute_context is moe_context
         observed["postprocess_packed"] = packed_seq_params
@@ -385,11 +391,15 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     def two_stage(*_args, **_kwargs):
         raise AssertionError("inference must not use the two-stage training path")
 
-    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def route(
+        shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None, **_
+    ):
         observed["route_input"] = shortcut_hidden
         return shortcut_hidden, shortcut_hidden
 
-    def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
+    def shared(
+        hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None, **_
+    ):
         observed["shared_input"] = hidden_states
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
@@ -592,14 +602,24 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.mlp = FakeMLP()
 
         def shortcut_route_preprocess(
-            self, shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None
+            self,
+            shortcut_hidden,
+            padding_mask=None,
+            packed_seq_params=None,
+            recompute_context=None,
+            **_,
         ):
             assert recompute_context is None
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
         def shortcut_shared_experts(
-            self, hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None
+            self,
+            hidden_states,
+            padding_mask=None,
+            packed_seq_params=None,
+            recompute_context=None,
+            **_,
         ):
             assert recompute_context is None
             assert_quant_layer(1)
@@ -941,14 +961,8 @@ def _fused_blocks(streams=3, enabled=True, retention=True, pairs=2, hidden=128, 
 def _run_block(block, x, defer=False):
     """Run one block; a PendingShortcutAdd input starts with the two-reader boundary and
     ``defer`` returns one instead of finishing the shortcut add."""
-    pending = x if isinstance(x, PendingShortcutAdd) else None
-    return block(
-        None if pending is not None else x,
-        *(None,) * 6,
-        lambda *a: nullcontext(),
-        pending_prev_shortcut_add=pending,
-        defer_shortcut_add=defer,
-    )
+    block.defers_residual_write = defer
+    return block(x, *(None,) * 6, lambda *a: nullcontext())
 
 
 def _run_blocks(blocks, x, manager=None):
@@ -993,7 +1007,7 @@ def _explicit_pairs(blocks, residual, manager=None, prepared=None):
             residual,
             update,
             producer.write_map(return_logits=True),
-            block._logits(producer, "retention"),
+            producer.write_logits()[1],
             consumer_read.read_map(return_logits=True),
             moe.pre_mlp_layernorm.weight,
             num_streams=block.config.wide_residual.num_streams,
@@ -1008,7 +1022,7 @@ def _explicit_pairs(blocks, residual, manager=None, prepared=None):
                         routed,
                         shared,
                         consumer_write.write_map(return_logits=True),
-                        block._logits(consumer_write, "retention"),
+                        consumer_write.write_logits()[1],
                     ),
                     (
                         nxt.compute_layer.residual_read.read_map(return_logits=True),
@@ -1184,20 +1198,16 @@ def _lone_then_blocks(
 
 def _run_stack(layers, x, manager=None):
     """Drive a lone layer and fused blocks like HybridStack's eager loop."""
-    pending = None
     for i, layer in enumerate(layers):
         block = isinstance(layer, ShortcutMoEBlock)
         if manager is not None:
             manager.advance(2 if block else 1)
         if block:
-            defer = i + 1 < len(layers)
-            x = _run_block(layer, pending if pending is not None else x, defer=defer)
-            pending, x = (x, None) if defer else (None, x)
+            x = _run_block(layer, x, defer=i + 1 < len(layers))
         else:
             x = layer(x)
-            if layer.defers_write_to_shortcut_block:
+            if layer.defers_residual_write:
                 assert isinstance(x, PendingShortcutAdd) and x.shared is None
-                pending, x = x, None
     return x
 
 
@@ -1210,7 +1220,7 @@ def _two_reader_from_lone(lone, block, residual, pending):
             pending.routed,
             None,
             write.write_map(return_logits=True),
-            ShortcutMoEBlock._logits(write, "retention"),
+            write.write_logits()[1],
         ),
         (
             block.compute_layer.residual_read.read_map(return_logits=True),
@@ -1235,8 +1245,8 @@ def test_lone_layer_write_fuses_into_next_block(streams, retention, interval):
     torch.manual_seed(4321)
     layers = _lone_then_blocks(streams, retention, pairs=9 if interval else 2)
     lone, blocks = layers[0], layers[1:]
-    assert lone.defers_write_to_shortcut_block
-    assert not any(b.compute_layer.defers_write_to_shortcut_block for b in blocks)
+    assert lone.defers_residual_write
+    assert not any(b.compute_layer.defers_residual_write for b in blocks)
     blocks[0].config.residual_stream_recompute_num_layers = interval
     explicit = copy.deepcopy(layers)
     hidden = blocks[0].config.hidden_size
@@ -1286,11 +1296,11 @@ def test_lone_layer_write_fuses_into_next_block(streams, retention, interval):
     # The deferred write reproduces the lone layer's own residual write.
     with torch.no_grad():
         current = _two_reader_from_lone(lone, blocks[0], r, lone(r))[0]
-        lone.defers_write_to_shortcut_block = False
+        lone.defers_residual_write = False
         try:
             written = lone(r)
         finally:
-            lone.defers_write_to_shortcut_block = True
+            lone.defers_residual_write = True
     torch.testing.assert_close(current, written, rtol=2e-6, atol=2e-6)
 
 
@@ -1299,13 +1309,13 @@ def test_lone_write_deferral_scope():
     """Only a lone wide-residual Mamba layer directly before a fused block defers its write."""
     layers = _lone_then_blocks(pairs=1)
     assert isinstance(layers[1], ShortcutMoEBlock)
-    assert layers[0].defers_write_to_shortcut_block
+    assert layers[0].defers_residual_write
     unfused = _lone_then_blocks(pairs=1, enabled=False)
     assert not unfused[1].using_shortcut_moe_fused_residual_kernel
-    assert not unfused[0].defers_write_to_shortcut_block
+    assert not unfused[0].defers_residual_write
     trailing = _lone_then_blocks(pairs=1, lone_last=True)
     assert isinstance(trailing[0], ShortcutMoEBlock)
-    assert not trailing[1].defers_write_to_shortcut_block
+    assert not trailing[1].defers_residual_write
 
 
 def taped_forward(forward, *args, **kwargs):
@@ -1464,10 +1474,12 @@ def _hybrid_model(mixer, optimized, hidden, dynamic, pattern=None, fp32_residual
         transformer_impl="inference_optimized" if optimized else "transformer_engine",
     )
     if mixer == "gdp":
-        spec = specs.gated_delta_product_inference_stack_spec
-        spec = spec if optimized else specs.gated_delta_product_stack_spec
+        spec = specs.wide_residual_gated_delta_product_inference_stack_spec
+        spec = spec if optimized else specs.wide_residual_gated_delta_product_stack_spec
     else:
-        spec = specs.hybrid_inference_stack_spec if optimized else specs.hybrid_stack_spec
+        spec = specs.wide_residual_hybrid_inference_stack_spec
+        spec = spec if optimized else specs.wide_residual_hybrid_stack_spec
+    spec = specs.shortcut_fusion_stack_spec(spec)
     model = HybridModel(
         config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
     )
@@ -1612,7 +1624,7 @@ def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden, fp32_resi
     # Without fp32_residual_connection the stream is BF16 (FP32 connection logits).
     model = _hybrid_model("mamba", False, hidden, False, "MMEME", fp32_residual)
     lone, first = model.decoder.layers[0], model.decoder.layers[1]
-    assert lone.defers_write_to_shortcut_block and isinstance(first, ShortcutMoEBlock)
+    assert lone.defers_residual_write and isinstance(first, ShortcutMoEBlock)
     execute = _static_prefill_decode(model, keys=(1, 2, 4))
     launch, dtypes = forward_kernel.forward, set()
 
@@ -1636,65 +1648,59 @@ def test_hybrid_lone_layer_write_fuses_into_block(monkeypatch, hidden, fp32_resi
 
 
 def _unchain(model):
-    """Turn off lone-layer write chaining (each seam writes, then reads and norms unfused)."""
-    for layer in model.decoder.layers:
-        for flag in ("defers_write_to_shortcut_block", "consumes_pending_write"):
-            if getattr(layer, flag, False):
-                setattr(layer, flag, False)
-
-
-@GPU
-@pytest.mark.usefixtures("model_parallel")
-@pytest.mark.parametrize("fp32_residual", [True, False])
-def test_hybrid_lone_seams_fuse(monkeypatch, fp32_residual):
-    """HybridModel M - M [M E] [M E] M - M -: every residual seam runs one fused kernel.
-
-    lone -> lone and fused block -> lone seams apply the predecessor's deferred write with the
-    lone layer's read and RMSNorm (one reader; a block's write is a shortcut add of two
-    updates), bit for bit with the taped forward, and match the unchained model.
-    """
-    model = _hybrid_model("mamba", False, 3072, False, "M-MMEMEM-M-", fp32_residual)
+    """Turn off the lone-layer seams (each writes, then reads and norms unfused); writes into a
+    fused block stay deferred."""
     layers = model.decoder.layers
-    kinds = [
+    for layer, successor in zip(layers, layers[1:]):
+        if not isinstance(successor, ShortcutMoEBlock):
+            layer.defers_residual_write = False
+
+
+# Nano-like stacks: M = lone Mamba, - = MLP-only layer, ME = fused shortcut block.
+LONE_SEAM_STACKS = [
+    # M->-, -->M, M->[ME], [ME]->[ME], [ME]->M, M->-, -->M, M->-
+    ("M-MMEMEM-M-", "MTMBBMTMT", (1, 3, 4, 6, 8, 10), [1, 1, 1, 1, 2, 1, 2, 1, 1, 1]),
+    # M->-, -->[ME], [ME]->M, M->[ME], [ME]->M, M->-, -->M, M->-
+    ("M-MEMMEM-M-", "MTBMBMTMT", (1, 3, 5, 6, 8, 10), [1, 1, 1, 2, 1, 1, 2, 1, 1, 1]),
+]
+
+
+def _kinds(layers):
+    return "".join(
         (
             "B"
             if isinstance(l, ShortcutMoEBlock)
             else "M" if isinstance(l, WideResidualMambaLayer) else "T"
         )
         for l in layers
-    ]
-    assert kinds == ["M", "T", "M", "B", "B", "M", "T", "M", "T"]
-    assert [bool(getattr(l, "defers_write_to_shortcut_block", False)) for l in layers] == [
-        True,
-        True,
-        True,
-        False,
-        False,
-        True,
-        True,
-        True,
-        False,
-    ]
-    assert [bool(getattr(l, "consumes_pending_write", False)) for l in layers] == [
-        False,
-        True,
-        True,
-        False,
-        False,
-        True,
-        True,
-        True,
-        True,
-    ]
-    execute = _static_prefill_decode(model, keys=(1, 3, 4, 6, 8, 10))
+    )
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("fp32_residual", [True, False])
+@pytest.mark.parametrize("pattern,kinds,keys,updates_per_launch", LONE_SEAM_STACKS)
+def test_hybrid_lone_seams_fuse(
+    monkeypatch, fp32_residual, pattern, kinds, keys, updates_per_launch
+):
+    """Every residual seam of a HybridModel runs one fused kernel.
+
+    lone -> lone, lone -> block, block -> block and block -> lone seams apply the predecessor's
+    deferred write with the successor's read(s) and RMSNorm(s) (a block's write is a shortcut
+    add of two updates), bit for bit with the taped forward and within BF16 noise of the model
+    with the lone seams unfused. ``updates_per_launch`` lists each launch's update count.
+    """
+    model = _hybrid_model("mamba", False, 3072, False, pattern, fp32_residual)
+    layers = model.decoder.layers
+    assert _kinds(layers) == kinds
+    # Every layer but the last hands its write to the next layer's kernel.
+    assert [l.defers_residual_write for l in layers] == [True] * (len(layers) - 1) + [False]
+    execute = _static_prefill_decode(model, keys=keys)
     with torch.inference_mode(), InferenceMode.active():
         (outputs, states), (taped_outputs, taped_states), calls = _inference_and_taped(
             monkeypatch, execute
         )
-    # Updates per launch, ten launches per step: M->-, -->M, M->[M E] (one update read twice),
-    # block 1's compute write, block->block (shortcut add), block 2's compute write,
-    # block->M (shortcut add read once), M->-, -->M, M->-.
-    assert calls == [1, 1, 1, 1, 2, 1, 2, 1, 1, 1] * 4
+    assert calls == updates_per_launch * 4
     assert all(torch.equal(a, b) for a, b in zip(outputs, taped_outputs, strict=True))
     for a, b in zip(states, taped_states, strict=True):
         for key in a:
@@ -1730,10 +1736,14 @@ def test_hybrid_lone_seams_fuse_training(fp32_residual):
         }
         return logits.detach().float(), grads
 
-    assert any(getattr(l, "consumes_pending_write", False) for l in model.decoder.layers)
+    layers = model.decoder.layers
+    assert all(l.defers_residual_write for l in layers[:-1])
     chained, chained_grads = step()
     _unchain(model)
-    assert not any(getattr(l, "consumes_pending_write", False) for l in model.decoder.layers)
+    # Only writes into a fused block stay deferred.
+    assert [l.defers_residual_write for l in layers[:-1]] == [
+        isinstance(successor, ShortcutMoEBlock) for successor in layers[1:]
+    ]
     unchained, unchained_grads = step()
     torch.testing.assert_close(chained, unchained, rtol=0, atol=0.1)
     assert chained_grads.keys() == unchained_grads.keys() and len(chained_grads) > 50
@@ -1751,3 +1761,36 @@ def test_hybrid_lone_seams_fuse_training(fp32_residual):
     assert sorted(errors.values())[len(errors) // 2] < 0.05, errors
     worst = max(errors, key=errors.get)
     assert errors[worst] < 0.3, (worst, errors[worst])
+
+
+@GPU
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("interval", [2, 4])
+@pytest.mark.parametrize("pattern", [stack[0] for stack in LONE_SEAM_STACKS])
+def test_hybrid_lone_seams_checkpoint_replay(monkeypatch, pattern, interval):
+    """Checkpoint replay intervals rebuild the chained seams' residuals bit for bit: outputs and
+    every gradient equal training without replay."""
+    model = _hybrid_model("mamba", False, 3072, False, pattern, False).train()
+    assert all(l.defers_residual_write for l in model.decoder.layers[:-1])
+    replays = []
+    launch = replay_kernel.replay_interval
+    monkeypatch.setattr(
+        replay_kernel, "replay_interval", lambda *a, **k: replays.append(1) or launch(*a, **k)
+    )
+    ids = torch.randint(0, 128, (1, 1024), device="cuda")
+    positions = torch.arange(1024, device="cuda")[None]
+
+    def step(num_layers):
+        model.config.residual_stream_recompute_num_layers = num_layers
+        model.zero_grad(set_to_none=True)
+        logits = model(ids, positions, None)
+        logits.float().square().mean().backward()
+        return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    expected, expected_grads = step(None)
+    assert not replays
+    actual, actual_grads = step(interval)
+    assert replays, "checkpoint replay did not run"
+    assert torch.equal(actual, expected)
+    for name, grad in actual_grads.items():
+        assert bytes_equal(grad, expected_grads[name]), name

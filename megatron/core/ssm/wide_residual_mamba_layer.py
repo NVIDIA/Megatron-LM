@@ -19,7 +19,9 @@ from megatron.core.transformer.residual_recompute import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
+    is_fusable_rmsnorm,
     load_residual_state,
+    pending_write,
     write_pending_and_read_norm,
 )
 from megatron.core.typed_torch import apply_module
@@ -33,15 +35,9 @@ class WideResidualMambaLayer(MambaLayer):
     # residual read/norm and write: the layer takes a normalized input and returns the raw
     # mixer output.
     using_shortcut_moe_fused_residual_kernel: bool = False
-    # Set by group_layers_into_shortcut_blocks on a lone layer directly before a fused
-    # consumer (a fused ShortcutMoEBlock, or a lone layer with consumes_pending_write): the
-    # layer returns its residual write as a PendingShortcutAdd (single update) that the
-    # consumer's fused kernel writes together with its own read(s) and RMSNorm(s).
-    defers_write_to_shortcut_block: bool = False
-    # Set by group_layers_into_shortcut_blocks on a lone layer whose predecessor defers its
-    # write: the layer receives that PendingShortcutAdd as hidden_states and applies it with its
-    # own read and RMSNorm in one kernel (shortcut_add_wide_residual_write_read_rmsnorm_quant).
-    consumes_pending_write: bool = False
+    # Set by group_layers_into_shortcut_blocks when the next layer applies this layer's write:
+    # forward returns a PendingShortcutAdd instead of the written residual.
+    defers_residual_write: bool = False
 
     def __init__(
         self,
@@ -99,6 +95,19 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
+    def pending_write_reader(self):
+        """The input read and RMSNorm a fused seam kernel can apply for this lone layer, or None.
+
+        A layer with a reader accepts a PendingShortcutAdd as ``hidden_states``.
+        """
+        if self.using_shortcut_moe_fused_residual_kernel or not is_fusable_rmsnorm(self.norm):
+            return None
+        return self.residual_read, self.norm
+
+    def pending_write_writer(self):
+        """The residual write this lone layer can defer to the next seam, or None."""
+        return None if self.using_shortcut_moe_fused_residual_kernel else self.residual_write
+
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""
 
@@ -114,11 +123,10 @@ class WideResidualMambaLayer(MambaLayer):
         if self.using_shortcut_moe_fused_residual_kernel:
             return ResidualBranchInput(hidden_states, None), None
         if isinstance(hidden_states, PendingShortcutAdd):
-            if not self.consumes_pending_write or residual_stream_recompute_context is not None:
-                raise RuntimeError("this layer cannot consume a deferred residual write")
-            residual, branch_input = write_pending_and_read_norm(
-                hidden_states, self.residual_read, self.norm
-            )
+            reader = self.pending_write_reader()
+            if reader is None or residual_stream_recompute_context is not None:
+                raise RuntimeError("this layer cannot apply a deferred residual write")
+            residual, branch_input = write_pending_and_read_norm(hidden_states, *reader)
             return ResidualBranchInput(branch_input, (residual,)), None
         recompute_context = residual_stream_recompute_context
         if recompute_context is None:
@@ -155,7 +163,7 @@ class WideResidualMambaLayer(MambaLayer):
 
         if self.using_shortcut_moe_fused_residual_kernel:
             return mixer_out_with_bias
-        if self.defers_write_to_shortcut_block:
+        if self.defers_residual_write:
             return self._pending_write(mixer_out_with_bias, state)
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
@@ -178,19 +186,9 @@ class WideResidualMambaLayer(MambaLayer):
 
     def _pending_write(self, mixer_out_with_bias, state: ResidualConnectionState):
         """Return the residual write for the following fused consumer instead of applying it."""
-        update, bias = mixer_out_with_bias
-        if bias is not None:
-            raise ValueError("a deferred shortcut write requires a bias-free mixer projection")
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        write = self.residual_write
-        return PendingShortcutAdd(
-            state[0],
-            update,
-            None,
-            write.write_map(return_logits=True),
-            None if write.retention is None else write.retention(return_logits=True),
-        )
+        return pending_write(state[0], mixer_out_with_bias, self.residual_write)
 
     def _pack_two_stage_output(
         self, ssm_output: Tensor, state: ResidualConnectionState

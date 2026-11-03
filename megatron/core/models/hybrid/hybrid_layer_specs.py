@@ -688,9 +688,33 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 )
 
 
-def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Static split input norms, with canonical sharded checkpoint names retained."""
-    submodules, layers = stack_spec.submodules, {}
+def _split_norm_mlp_layer(linear_fc1: type, linear_fc2: type) -> ModuleSpec:
+    """A wide-residual MLP-only layer whose pre-MLP RMSNorm is a standalone module.
+
+    The fused seam kernels apply that norm, so it cannot live inside linear_fc1. Checkpoints keep
+    the fused-projection name (mlp.linear_fc1.layer_norm_weight).
+    """
+    return ModuleSpec(
+        module=WideResidualTransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            pre_mlp_layernorm=TENorm,
+            mlp=partial(
+                MLP.as_mlp_submodule,
+                submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2),
+            ),
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"},
+        ),
+    )
+
+
+def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec, mlp_layer: ModuleSpec) -> ModuleSpec:
+    """Split every input norm the fused seam kernels apply out of its projection.
+
+    Compute layers (Mamba/GDN/attention) and MLP-only layers get standalone RMSNorms; sharded
+    checkpoint names keep the fused-projection keys.
+    """
+    submodules, layers = stack_spec.submodules, {"mlp_layer": mlp_layer}
     for name, branch_name, norm_name, projection_name in (
         ("mamba_layer", "mixer", "norm", "in_proj"),
         ("gdn_layer", "self_attention", "input_layernorm", "in_proj"),
@@ -719,41 +743,48 @@ def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
                 sharded_state_dict_keys_map=mapping,
             ),
         )
-    # An MLP-only layer's pre-MLP norm feeds linear_fc1; split it so a deferred residual write
-    # can be applied with the layer's read and RMSNorm in one kernel.
-    mlp_spec = submodules.mlp_layer
-    mlp = getattr(getattr(mlp_spec, "submodules", None), "mlp", None)
-    mlp_submodules = mlp.keywords.get("submodules") if isinstance(mlp, partial) else None
-    fc1 = {
-        TELayerNormColumnParallelLinear: TEColumnParallelLinear,
-        InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
-    }.get(getattr(mlp_submodules, "linear_fc1", None))
-    if fc1 is not None and mlp_spec.submodules.pre_mlp_layernorm is IdentityOp:
-        mlp = partial(
-            mlp.func,
-            *mlp.args,
-            **(mlp.keywords | {"submodules": replace(mlp_submodules, linear_fc1=fc1)}),
-        )
-        mapping = dict(mlp_spec.submodules.sharded_state_dict_keys_map)
-        mapping["pre_mlp_layernorm."] = "mlp.linear_fc1.layer_norm_"
-        layers["mlp_layer"] = replace(
-            mlp_spec,
-            submodules=replace(
-                mlp_spec.submodules,
-                mlp=mlp,
-                pre_mlp_layernorm=TENorm,
-                sharded_state_dict_keys_map=mapping,
-            ),
-        )
     return replace(stack_spec, submodules=replace(submodules, **layers))
 
 
+_split_norm_mlp = _split_norm_mlp_layer(TEColumnParallelLinear, TERowParallelLinear)
+_split_norm_inference_mlp = _split_norm_mlp_layer(
+    InferenceColumnParallelLinear, InferenceRowParallelLinear
+)
+# Stacks for --moe-shortcut-wide-residual-norm-fusion (select with shortcut_fusion_stack_spec).
 wide_residual_shortcut_fusion_stack_spec = _shortcut_fusion_stack_spec(
-    wide_residual_hybrid_stack_spec
+    wide_residual_hybrid_stack_spec, _split_norm_mlp
 )
 wide_residual_shortcut_fusion_gdp_stack_spec = _shortcut_fusion_stack_spec(
-    wide_residual_gated_delta_product_stack_spec
+    wide_residual_gated_delta_product_stack_spec, _split_norm_mlp
 )
+wide_residual_shortcut_fusion_inference_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_hybrid_inference_stack_spec, _split_norm_inference_mlp
+)
+wide_residual_shortcut_fusion_gdp_inference_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_inference_stack_spec, _split_norm_inference_mlp
+)
+_SHORTCUT_FUSION_STACK_SPECS = (
+    (wide_residual_hybrid_stack_spec, wide_residual_shortcut_fusion_stack_spec),
+    (wide_residual_gated_delta_product_stack_spec, wide_residual_shortcut_fusion_gdp_stack_spec),
+    (wide_residual_hybrid_inference_stack_spec, wide_residual_shortcut_fusion_inference_stack_spec),
+    (
+        wide_residual_gated_delta_product_inference_stack_spec,
+        wide_residual_shortcut_fusion_gdp_inference_stack_spec,
+    ),
+)
+
+
+def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Return the shortcut-fusion counterpart of a built-in wide-residual stack spec.
+
+    Model builders call this once at construction when moe_shortcut_wide_residual_norm_fusion is
+    set. Fusion specs and custom specs are returned unchanged; ShortcutMoEBlock rejects custom
+    specs whose norms the kernels cannot apply.
+    """
+    for wide, fused in _SHORTCUT_FUSION_STACK_SPECS:
+        if stack_spec is wide:
+            return fused
+    return stack_spec
 
 
 # Backward-compatible aliases
@@ -765,14 +796,3 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 # Preserve the existing --spec import path; C/H/W use the standard static stack spec.
 hybrid_dsv4_stack_spec = hybrid_stack_spec
-
-
-def resolve_fusion_submodules(submodules):
-    """Select split input norms for the built-in training and inference stacks."""
-    for prefix in ("hybrid", "gated_delta_product"):
-        for suffix in ("", "_inference"):
-            name = f"{prefix}{suffix}_stack_spec"
-            original, wide = globals()[name], globals()["wide_residual_" + name]
-            if submodules is original.submodules or submodules is wide.submodules:
-                return _shortcut_fusion_stack_spec(wide).submodules
-    return submodules

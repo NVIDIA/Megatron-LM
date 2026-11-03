@@ -168,6 +168,10 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         self.branch_input_dtype = config.params_dtype
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
 
+    def read_logits(self) -> Tensor:
+        """Raw (padded) read-map logits, as the fused kernels consume them."""
+        return self.read_map(return_logits=True)
+
     def forward(self, hidden_states: Tensor) -> Tensor:
         """Read in branch precision; the operator fixes the output shape and dtype."""
 
@@ -222,6 +226,15 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             if operation == "write" and wr.learned_retention
             else None
         )
+
+    def read_logits(self) -> Tensor:
+        """Raw (padded) read-map logits, as the fused kernels consume them."""
+        return self.read_map(return_logits=True)
+
+    def write_logits(self) -> tuple[Tensor, Tensor | None]:
+        """Raw write-map and retention logits; retention is None for fixed identity retention."""
+        retain = None if self.retention is None else self.retention(return_logits=True)
+        return self.write_map(return_logits=True), retain
 
     def _read(
         self,
@@ -442,6 +455,45 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
     )
 
 
+def _is_rmsnorm(norm: nn.Module) -> bool:
+    if isinstance(norm, nn.RMSNorm):
+        return True
+    try:
+        import transformer_engine.pytorch as te
+    except ImportError:
+        return False
+    return isinstance(norm, te.RMSNorm)
+
+
+def is_fusable_rmsnorm(norm: nn.Module) -> bool:
+    """Whether ``norm`` is a standalone, bias-free RMSNorm the fused seam kernels can apply."""
+    return (
+        _is_rmsnorm(norm)
+        and getattr(norm, "eps", None) is not None
+        and getattr(norm, "weight", None) is not None
+        and getattr(norm, "bias", None) is None
+        and not getattr(norm, "zero_centered_gamma", False)
+        and not getattr(norm, "returns_residual", False)
+    )
+
+
+def pending_write(residual: Tensor, branch_output, write, shared: Tensor | None = None):
+    """Return a branch's residual write as a ``PendingShortcutAdd`` instead of applying it.
+
+    Args:
+        residual: Wide residual the write updates.
+        branch_output: ``(update, bias)``; the fused kernels require a bias-free branch.
+        write: The branch's ``StreamwiseSigmoidWideResidualConnection`` write.
+        shared: A shared-expert update summed with ``update`` (a shortcut add), or None.
+    """
+    from megatron.core.fusions.wide_residual_shortcut import PendingShortcutAdd
+
+    update, bias = branch_output
+    if bias is not None:
+        raise ValueError("a deferred residual write requires a bias-free branch projection")
+    return PendingShortcutAdd(residual, update, shared, *write.write_logits())
+
+
 def write_pending_and_read_norm(
     pending, read: StreamwiseSigmoidWideResidualConnection, norm: nn.Module
 ) -> tuple[Tensor, Tensor]:
@@ -459,25 +511,15 @@ def write_pending_and_read_norm(
     )
 
     residual, branch_input = shortcut_add_wide_residual_write_read_rmsnorm_quant(
-        pending,
-        read.read_map(return_logits=True),
-        norm.weight,
-        num_streams=read.num_streams,
-        epsilon=norm.eps,
+        pending, read.read_logits(), norm.weight, num_streams=read.num_streams, epsilon=norm.eps
     )
     return residual, branch_input
 
 
 def can_read_pending_write(read, norm, num_streams: int) -> bool:
     """Whether a layer's input read and norm can consume a deferred write (fused kernel)."""
-
     return (
         isinstance(read, StreamwiseSigmoidWideResidualConnection)
         and read.num_streams == num_streams
-        and getattr(norm, "eps", None) is not None
-        and getattr(norm, "weight", None) is not None
-        and not getattr(norm, "zero_centered_gamma", False)
-        and not getattr(norm, "returns_residual", False)
-        and getattr(norm, "bias", None) is None
-        and type(norm).__name__ == "RMSNorm"
+        and is_fusable_rmsnorm(norm)
     )

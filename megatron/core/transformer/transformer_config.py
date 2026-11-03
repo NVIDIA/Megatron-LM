@@ -77,12 +77,8 @@ def validate_shortcut_fusion_config(config):
         )
     if config.params_dtype != torch.bfloat16:
         raise ValueError(f"{prefix} requires BF16 branch parameters")
-    if (
-        config.normalization != "RMSNorm"
-        or config.layernorm_epsilon != 1e-5
-        or config.layernorm_zero_centered_gamma
-    ):
-        raise ValueError(f"{prefix} requires ordinary RMSNorm with epsilon 1e-5")
+    if config.normalization != "RMSNorm" or config.layernorm_zero_centered_gamma:
+        raise ValueError(f"{prefix} requires ordinary RMSNorm")
     wr = config.wide_residual
     if wr.learned_retention and wr.retention_max_forget != 0.1:
         raise ValueError(f"{prefix} requires retention_max_forget=0.1 when retention is learned")
@@ -1500,13 +1496,15 @@ class TransformerConfig(ModelParallelConfig):
     # Wide Residual Configuration
     ####################
     moe_shortcut_wide_residual_norm_fusion: bool = False
-    """Fuse wide-residual Mamba/GDN shortcut-MoE write/read/RMSNorm seams.
+    """Fuse each wide-residual write with the next layer's read/RMSNorm seam(s) in one kernel.
 
-    Requires shortcut MoE, 2--6 wide streams, BF16 branches, ordinary RMSNorm,
-    bias-free/dropout-free eager execution, FP32 residuals, and a shared expert.
-    Training requires local flattened tokens divisible by 1024; no-grad inference
-    accepts any positive count (MXFP8 handoffs require multiples of 32).
-    Hidden size must be divisible by 32 and <=10240.
+    Covers shortcut-MoE blocks (Mamba/GDN/attention compute layer + MoE) and the lone wide-residual
+    Mamba and MLP-only layers around them. Requires shortcut MoE, 2--6 wide streams, BF16 branches,
+    ordinary RMSNorm, bias-free/dropout-free eager execution and a shared expert; the residual
+    stream may be FP32 (fp32_residual_connection) or BF16. Training requires local flattened
+    tokens divisible by 1024; no-grad inference accepts any positive count (MXFP8 handoffs require
+    multiples of 32). Hidden size must be divisible by 32 and <=10240 (the validated model widths;
+    the kernels themselves accept up to 16384).
     """
 
     wide_residual: Optional[WideResidualConfig] = None

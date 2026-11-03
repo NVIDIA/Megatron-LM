@@ -26,12 +26,13 @@ output and gradient against independent FP64/autograd references.
 | block → block (shortcut add) | 2 (routed + shared) | 2 | `shortcut_add_..._two_reader_rmsnorm_quant` |
 | lone layer → block (M → [* E]) | 1 | 2 | `shortcut_add_..._two_reader_rmsnorm_quant`, no shared update |
 
-Lone wide-residual Mamba layers (Mamba or GDP mixers) and MLP-only layers defer their write to
-the next seam (`defers_write_to_shortcut_block`) and apply the previous one with their own read
-and RMSNorm (`consumes_pending_write`), so in a stack of such layers every seam after the first
-layer's read is one kernel. MLP-only layers use a standalone pre-MLP RMSNorm under the fusion
-spec. Lone attention/GDN layers are not chained, and checkpoint replay intervals
-(`residual_stream_recompute_num_layers`) keep the lone → lone and block → lone seams unfused.
+Lone wide-residual Mamba layers (Mamba or GDP mixers) and MLP-only layers expose the read/RMSNorm
+they apply (`pending_write_reader`) and the write they produce (`pending_write_writer`). When the
+next layer applies a layer's write in its seam kernel, `group_layers_into_shortcut_blocks` sets
+`defers_residual_write` and the layer returns its write as a `PendingShortcutAdd`, which the next
+layer receives as `hidden_states`. In a stack of such layers every seam after the first layer's
+read is one kernel, including under checkpoint replay intervals. MLP-only layers use a standalone
+pre-MLP RMSNorm in the fusion stack specs; lone attention/GDN layers are not chained.
 
 ## Performance
 

@@ -38,7 +38,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -90,6 +90,24 @@ class HybridStackSubmodules:
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
     mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
+
+
+_FUSED_RESIDUAL_OBSERVATION_WARNED = False
+
+
+def _warn_fused_residuals_unobserved() -> None:
+    """Warn once that residuals written inside fused seam kernels are not observed."""
+    global _FUSED_RESIDUAL_OBSERVATION_WARNED
+    if _FUSED_RESIDUAL_OBSERVATION_WARNED or not (
+        is_observing_tensor("residual_accumulator") or is_observing_tensor("residual_contribution")
+    ):
+        return
+    _FUSED_RESIDUAL_OBSERVATION_WARNED = True
+    warnings.warn(
+        "Residual observation skips layers whose residual write is fused into the next layer's "
+        "seam kernel (moe_shortcut_wide_residual_norm_fusion).",
+        stacklevel=2,
+    )
 
 
 class HybridStack(MegatronModule):
@@ -148,10 +166,6 @@ class HybridStack(MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
-        if config.moe_shortcut_wide_residual_norm_fusion and not is_mtp_layer:
-            from megatron.core.models.hybrid.hybrid_layer_specs import resolve_fusion_submodules
-
-            submodules = resolve_fusion_submodules(submodules)
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
@@ -709,22 +723,9 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
-                # A fused shortcut block hands its unwritten MoE output to an immediately
-                # following fused block, whose two-reader kernel applies it; any other successor
-                # (or the end of the stack) receives the written residual. A lone layer flagged
-                # defers_write_to_shortcut_block likewise hands its single update to the next
-                # (fused) block.
-                fused = [
-                    getattr(layer, "using_shortcut_moe_fused_residual_kernel", False)
-                    for layer in self.layers
-                ]
-                # A lone layer flagged consumes_pending_write also takes the deferred write.
-                consumes = [
-                    f or getattr(layer, "consumes_pending_write", False)
-                    for f, layer in zip(fused, self.layers)
-                ]
-                defer_shortcut_add = [a and b for a, b in zip(fused, consumes[1:] + [False])]
-                pending_shortcut_add = None
+                # With the fused residual kernels a layer flagged defers_residual_write returns
+                # its unwritten write as a PendingShortcutAdd, which the next layer receives as
+                # hidden_states and applies in its seam kernel.
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -756,9 +757,7 @@ class HybridStack(MegatronModule):
                             )
                         moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
                         hidden_states = layer(
-                            hidden_states=(
-                                None if pending_shortcut_add is not None else hidden_states
-                            ),
+                            hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
@@ -771,17 +770,9 @@ class HybridStack(MegatronModule):
                             attn_recompute_context=residual_stream_recompute_context,
                             moe_recompute_context=moe_recompute_context,
                             padding_mask_by_layout=padding_mask_by_layout,
-                            pending_prev_shortcut_add=pending_shortcut_add,
-                            defer_shortcut_add=defer_shortcut_add[layer_idx],
                         )
-                        pending_shortcut_add = None
-                        if defer_shortcut_add[layer_idx]:
-                            pending_shortcut_add, hidden_states = hidden_states, None
                         residual_stream_recompute_context = moe_recompute_context
                     else:
-                        if pending_shortcut_add is not None:
-                            # The layer applies the deferred write with its own read and norm.
-                            hidden_states, pending_shortcut_add = pending_shortcut_add, None
                         if cp_layout_state is not None:
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
@@ -858,14 +849,16 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                 )
 
-                        if getattr(layer, "defers_write_to_shortcut_block", False):
-                            # Unwritten: the next fused consumer's kernel writes it.
-                            pending_shortcut_add, hidden_states = hidden_states, None
+                        if getattr(layer, "defers_residual_write", False):
+                            # Unwritten: the next layer's seam kernel applies it.
+                            _warn_fused_residuals_unobserved()
                         else:
                             if isinstance(hidden_states, tuple):
                                 hidden_states = hidden_states[0]
                             if torch.is_tensor(residual_accumulator):
                                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                            else:
+                                _warn_fused_residuals_unobserved()
                             if cp_layout_state is not None:
                                 hidden_states = cp_layout_state.finalize_layer(
                                     physical_layer_idx, hidden_states

@@ -16,7 +16,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
+    is_fusable_rmsnorm,
     load_residual_state,
+    pending_write,
     write_pending_and_read_norm,
 )
 
@@ -29,13 +31,9 @@ class WideResidualTransformerLayer(TransformerLayer):
     # residual read/norm and write: the layer takes a normalized input and returns the raw
     # attention output with bias.
     using_shortcut_moe_fused_residual_kernel: bool = False
-    # Set by group_layers_into_shortcut_blocks on an MLP-only layer (see
-    # WideResidualMambaLayer): defers_write_to_shortcut_block returns the MLP write as a
-    # PendingShortcutAdd for the next fused consumer; consumes_pending_write takes the previous
-    # layer's PendingShortcutAdd as hidden_states and applies it with this layer's MLP read and
-    # pre-MLP RMSNorm in one kernel.
-    defers_write_to_shortcut_block: bool = False
-    consumes_pending_write: bool = False
+    # Set by group_layers_into_shortcut_blocks on an MLP-only layer when the next layer applies
+    # its write: forward returns a PendingShortcutAdd instead of the written residual.
+    defers_residual_write: bool = False
 
     def __init__(
         self,
@@ -179,22 +177,34 @@ class WideResidualTransformerLayer(TransformerLayer):
             attention_output_with_bias, *args, **kwargs
         )
 
-    def supports_pending_write_chaining(self) -> bool:
-        """Whether this layer is an MLP-only layer that can defer or consume a residual write."""
-
+    def _is_lone_mlp(self) -> bool:
         return (
             isinstance(self.self_attention, IdentityOp)
             and not isinstance(self.mlp, IdentityOp)
-            and isinstance(self.residual_write_mlp, StreamwiseSigmoidWideResidualConnection)
             and not self.is_moe_layer
+            and not self.recompute_pre_mlp_layernorm
         )
+
+    def pending_write_reader(self):
+        """The MLP read and pre-MLP RMSNorm a fused seam kernel can apply, or None.
+
+        Only MLP-only layers qualify; with a reader the layer accepts a PendingShortcutAdd as
+        ``hidden_states``.
+        """
+        if not self._is_lone_mlp() or not is_fusable_rmsnorm(self.pre_mlp_layernorm):
+            return None
+        return self.residual_read_mlp, self.pre_mlp_layernorm
+
+    def pending_write_writer(self):
+        """The MLP residual write an MLP-only layer can defer to the next seam, or None."""
+        return self.residual_write_mlp if self._is_lone_mlp() else None
 
     def _forward_attention(self, hidden_states, *args, **kwargs):
         """An MLP-only layer passes a deferred write straight to its MLP read."""
 
         if isinstance(hidden_states, PendingShortcutAdd):
-            if not self.consumes_pending_write:
-                raise RuntimeError("this layer cannot consume a deferred residual write")
+            if self.pending_write_reader() is None:
+                raise RuntimeError("this layer cannot apply a deferred residual write")
             return hidden_states, kwargs.get("context")
         return super()._forward_attention(hidden_states, *args, **kwargs)
 
@@ -205,7 +215,7 @@ class WideResidualTransformerLayer(TransformerLayer):
             if kwargs.get("residual_stream_recompute_context") is not None:
                 raise RuntimeError("a deferred residual write cannot be replayed here")
             residual, branch_input = write_pending_and_read_norm(
-                hidden_states, self.residual_read_mlp, self.pre_mlp_layernorm
+                hidden_states, *self.pending_write_reader()
             )
             return branch_input, residual, (residual,)
         return super()._pre_mlp_layernorm_and_residual(hidden_states, *args, **kwargs)
@@ -213,18 +223,8 @@ class WideResidualTransformerLayer(TransformerLayer):
     def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=(), **kwargs):
         """Return the MLP write as a PendingShortcutAdd when the next layer applies it."""
 
-        if not self.defers_write_to_shortcut_block:
+        if not self.defers_residual_write:
             return super()._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state, **kwargs)
-        update, bias = mlp_output_with_bias
-        if bias is not None:
-            raise ValueError("a deferred residual write requires a bias-free MLP projection")
         if not mlp_state:
             raise RuntimeError("Missing state for the MLP residual connection.")
-        write = self.residual_write_mlp
-        return PendingShortcutAdd(
-            mlp_state[0],
-            update,
-            None,
-            write.write_map(return_logits=True),
-            None if write.retention is None else write.retention(return_logits=True),
-        )
+        return pending_write(mlp_state[0], mlp_output_with_bias, self.residual_write_mlp)
