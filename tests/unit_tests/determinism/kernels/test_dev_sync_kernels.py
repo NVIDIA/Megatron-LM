@@ -11,7 +11,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    deterministic_algorithms,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -236,6 +241,101 @@ def test_kda_recurrence_replays():
     assert_replays_bit_exact(
         run, (q, k, v, raw_g, raw_beta, a_log, dt_bias), contention=True, what="KDA recurrence"
     )
+
+
+def test_kda_low_rank_projection_replays():
+    """Replay KimiDeltaAttention through its bias-free low-rank F-decay / output-gate path.
+
+    ``kda_f_lora_rank`` / ``kda_gate_lora_rank`` take the layer off the legacy fused
+    Q/K/V/F/G projection: the input projection emits Q/K/V only, the raw decay comes from
+    ``f_a_proj -> f_b_proj``, the output gate from ``g_a_proj -> g_b_proj`` and beta from a
+    TP-replicated projection scattered back to the rank, all feeding the FLA chunk_kda
+    recurrence. Under ``--deterministic-mode`` the convolution and the L2 norm take their
+    torch paths; forward and backward must replay bit-exactly, parameter gradients included.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if kda.chunk_kda is None:
+        pytest.skip("FLA KDA kernel is unavailable")
+    if not HAVE_TE:
+        pytest.skip("needs Transformer Engine")
+
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    f_rank, gate_rank = 16, 32
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            kda_f_lora_rank=f_rank,
+            kda_gate_lora_rank=gate_rank,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            experimental_attention_variant="kda",
+            is_hybrid_model=True,
+            transformer_impl="transformer_engine",
+            deterministic_mode=True,
+        )
+        spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
+        module = kda.KimiDeltaAttention(
+            config,
+            submodules=spec.submodules,
+            layer_number=1,
+            conv_init=1.0,
+            pg_collection=ProcessGroupCollection(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                cp=parallel_state.get_context_parallel_group(),
+            ),
+        ).cuda()
+        assert not module.use_legacy_fused_projections
+        assert module.in_proj_split_names == ["query", "key", "value"]
+        assert module.in_proj_dim == 2 * module.qk_dim + module.v_dim
+        assert module.in_proj.weight.shape == (module.in_proj_dim, config.hidden_size)
+        assert module.f_a_proj.weight.shape == (f_rank, config.hidden_size)
+        assert module.f_b_proj.weight.shape == (module.qk_dim, f_rank)
+        assert module.g_a_proj.weight.shape == (gate_rank, config.hidden_size)
+        assert module.g_b_proj.weight.shape == (module.v_dim, gate_rank)
+        assert module.beta_proj.weight.shape == (module.num_key_heads, config.hidden_size)
+        assert module.gated_delta_rule is kda.chunk_kda
+
+        hidden_states = torch.randn(
+            128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with deterministic_algorithms(True):
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (hidden_states, None),
+                replays=3,
+                contention=True,
+                what="KDA low-rank F/G projections",
+            )
+        assert outputs["out[0]"].shape == hidden_states.shape
+        assert "in[0]" in grads
+        for name in ("in_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "beta_proj"):
+            assert f"chunk0.{name}.weight" in grads, name
+        for name in ("chunk0.conv1d.weight", "chunk0.A_log", "chunk0.dt_bias"):
+            assert name in grads, name
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_mok_route_adapter_replays():

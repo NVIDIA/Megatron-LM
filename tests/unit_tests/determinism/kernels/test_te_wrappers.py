@@ -962,6 +962,122 @@ def test_te_fused_mla_kv_rope_mxfp8_replays():
     )
 
 
+# --- NoPE MLA ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["fused", "flash"])
+def test_mla_no_rope_replays_fwd_bwd(backend, monkeypatch):
+    """An MLA layer built as NoPE (``no_rope_freq``) bypasses every RoPE kernel and replays.
+
+    With ``use_rope`` False the layer builds no rotary embedding, never selects the fused Q
+    up-projection or fused KV RoPE+quant kernels, and hands TE attention the plain
+    concatenation of each head's NoPE and positional channels. The RoPE entry points are
+    replaced with failing stubs, so reaching any of them fails the replay instead of silently
+    rotating.
+    """
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.transformer import multi_latent_attention as mla
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    def forbid_rope(*args, **kwargs):
+        raise AssertionError("a NoPE MLA layer must not apply rotary embeddings")
+
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        # conftest and Utils force both TE attention backends off; pick one explicitly.
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches its backend choice per AttentionParams; force a fresh selection.
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+        for name in (
+            "apply_rotary_pos_emb",
+            "fused_apply_mla_rope_for_q",
+            "fused_apply_mla_rope_for_kv",
+        ):
+            monkeypatch.setattr(mla, name, forbid_rope)
+
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            no_rope_freq=1,
+            rope_type="rope",
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            use_cpu_initialization=True,
+            deterministic_mode=True,
+        )
+        assert config.no_rope_freq == [1]
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        module = mla.MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        assert not module.use_rope
+        assert module.rotary_pos_emb is None
+        assert not module._use_fused_q_uproj and not module._use_fused_kv_rope_quant
+        assert isinstance(module.core_attention, TEDotProductAttention)
+
+        hidden_states = torch.randn(
+            256, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        try:
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (hidden_states, None),
+                replays=3,
+                contention=True,
+                what=f"NoPE MLA[{backend}]",
+            )
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+        assert outputs["out[0]"].shape == hidden_states.shape
+        assert "in[0]" in grads
+        for name in (
+            "linear_q_down_proj",
+            "linear_q_up_proj",
+            "linear_kv_down_proj",
+            "linear_kv_up_proj",
+            "linear_proj",
+        ):
+            assert any(key.startswith(f"chunk0.{name}.") for key in grads), name
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_te_quantile_balancing_histogram_replays(dtype):
     """Exercise the QB-capable TE dispatch, including its atomic histogram output."""

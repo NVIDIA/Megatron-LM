@@ -201,8 +201,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/gated_delta_net/kda.py",),
         tests=(K + "test_dev_sync_kernels.py",),
         kind="dispatch",
-        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1. "
-        "Multi-rank convolution and chunkwise CP remain in the existing parity suite.",
+        notes="KDA gate preparation and the selected FLA chunk_kda forward/backward at CP1, plus "
+        "a module-level replay of the Kimi-K3 bias-free low-rank F-decay / output-gate "
+        "projections (kda_f_lora_rank / kda_gate_lora_rank) with the TP-replicated beta "
+        "projection under deterministic_mode. Multi-rank convolution and chunkwise CP remain "
+        "in the existing parity suite.",
     ),
     KernelEntry(
         name="balanced_cp_route_metadata",
@@ -677,7 +680,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "The GDN family pins SiLU for its convolution and output gate independently of the FFN "
+        "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
+        "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule).",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -906,8 +912,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
-        "GEMM path and mxfp8_quantize_only are not replayed.",
+        "softmax_scale MultiLatentAttention hands to its core attention. NoPE layers "
+        "(no_rope_freq) build no rotary embedding and bypass every RoPE kernel; such a layer's "
+        "forward/backward is replayed in test_te_wrappers.py with the RoPE entry points stubbed "
+        "out. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
