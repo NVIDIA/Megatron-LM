@@ -118,7 +118,6 @@ SHAPES = [
     (16392, 1),
 ]
 TINY_ROWS = [(8, 1), (64, 1), (128, 1), (128, 2), (8, 129)]
-SANITIZER_CASE = (1152, 1, 2)  # (H, tokens per rank, ws)
 
 
 def gpu_test(fn):
@@ -139,7 +138,6 @@ def _sweep_params():
     params = []
     for c in cases:
         hidden, tokens = c["shape"]
-        marks = [pytest.mark.sanitizer] if (hidden, tokens, c["ws"]) == SANITIZER_CASE else []
         params.append(
             pytest.param(
                 c["ws"],
@@ -149,7 +147,6 @@ def _sweep_params():
                 c["data"],
                 c["eps"],
                 id=f"ws{c['ws']}-H{hidden}-tpr{tokens}-{c['residual']}-{c['data']}-eps{c['eps']:g}",
-                marks=marks,
             )
         )
     return params
@@ -337,6 +334,16 @@ def test_fused_matches_nccl_and_fp64(
     """residual_out, Y on every rank, and the untouched memory, across the structure sweep."""
     g = nvls_groups.get(ws)
     run_and_check(g, hidden, tokens_per_rank, residual_mode, data, eps, what="fused sweep")
+
+
+@gpu_test
+@pytest.mark.sanitizer
+def test_sanitizer_small_case(nvls_groups):
+    """Small case for compute-sanitizer, the same on every world size: ws 2, H 8200 (1025 lanes:
+    a full 1024-lane window, then a window with one live lane) and 3 tokens per rank (4 blocks
+    on main's shard-sized launch, the last with no token), separate residual buffers (input
+    read-only, output NaN-poisoned) and N(0, 1) data with the all-zero last token."""
+    run_and_check(nvls_groups.get(2), 8200, 3, "separate", "randn", 1e-5, what="sanitizer")
 
 
 @gpu_test
