@@ -165,6 +165,25 @@ def test_embedding_min_norm_stats_recorded_once_per_model_replica(
     assert DistributedOptimizer._consume_embedding_min_norm_stats(optimizer) is None
 
 
+def test_embedding_min_norm_projects_tied_copy_without_recounting_it(monkeypatch):
+    """A tied copy on another pipeline stage is projected, but its rows are not counted twice."""
+    embedding = torch.nn.Parameter(torch.zeros(1, 2, dtype=torch.bfloat16))
+    embedding.main_param = torch.tensor([0.25, 0.0])
+    embedding.shared = True
+    optimizer = _fake_distributed_optimizer(embedding, min_norm=1.0)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.distrib_optimizer.tensor_parallel.gtp_local_pad_zero_count",
+        lambda *_: 0,
+    )
+    _initialize_embedding_min_norm(optimizer)
+
+    DistributedOptimizer._post_optimizer_step(optimizer)
+
+    torch.testing.assert_close(embedding.main_param, torch.tensor([2.0, 0.0]))
+    assert DistributedOptimizer._consume_embedding_min_norm_stats(optimizer) is None
+
+
 def test_embedding_min_norm_excludes_complete_gtp_padding_rows(monkeypatch):
     full_master = torch.tensor([[0.25, 0.0], [2.0, 0.0], [0.1, 0.2]], dtype=torch.float32)
     embedding = torch.nn.Parameter(torch.zeros_like(full_master, dtype=torch.bfloat16))
@@ -274,6 +293,17 @@ def test_embedding_min_norm_rejects_nonpositive_or_nonfinite_values(value):
 def test_embedding_min_norm_rejects_optimizer_cuda_graph():
     with pytest.raises(ValueError, match="optimizer_cuda_graph"):
         OptimizerConfig(embedding_min_norm=1.0, optimizer_cuda_graph=True).validate()
+
+
+@pytest.mark.parametrize("offload_fraction", [0.0, 0.5, 1.0])
+def test_embedding_min_norm_rejects_optimizer_cpu_offload(offload_fraction):
+    with pytest.raises(ValueError, match="CPU offload"):
+        OptimizerConfig(
+            embedding_min_norm=1.0,
+            optimizer_cpu_offload=True,
+            optimizer_offload_fraction=offload_fraction,
+            use_precision_aware_optimizer=True,
+        ).validate()
 
 
 def test_embedding_min_norm_rejects_non_distributed_embedding_optimizer():

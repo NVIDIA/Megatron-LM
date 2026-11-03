@@ -459,6 +459,12 @@ class OptimizerConfig:
         if self.embedding_min_norm is not None and self.optimizer_cuda_graph:
             raise ValueError("embedding_min_norm is not supported with optimizer_cuda_graph")
 
+        # HybridDeviceOptimizer keeps the authoritative master copy of offloaded parameters
+        # on the CPU and overwrites the GPU copy from it, which would undo the projection.
+        # Offload also requires the precision-aware optimizer, which has no FP32 master here.
+        if self.embedding_min_norm is not None and self.optimizer_cpu_offload:
+            raise ValueError("embedding_min_norm is not supported with optimizer CPU offload")
+
         if self.rmsnorm_weight_decay_mult is not None and (
             not math.isfinite(self.rmsnorm_weight_decay_mult)
             or self.rmsnorm_weight_decay_mult < 0.0

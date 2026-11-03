@@ -124,6 +124,35 @@ def _is_trailing_padding_only_shard(
     return data_parallel_rank * gbuf_local_numel >= gbuf_world_numel_unpadded
 
 
+def _add_row_square_sums(
+    row_sums: torch.Tensor, values: torch.Tensor, start: int, row_width: int
+) -> None:
+    """Add the squares of a contiguous flat range of a row-major matrix to its row sums.
+
+    ``values`` holds flat elements ``[start, start + values.numel())``. A DP shard can begin
+    and end inside a row, so the range splits into a partial head row, whole rows and a
+    partial tail row. Plain reductions keep the result bit-exact, unlike an atomic scatter.
+    """
+    row = start // row_width
+    position = 0
+    offset = start % row_width
+    if offset:
+        head = min(row_width - offset, values.numel())
+        row_sums[row] += values[:head].square().sum()
+        position = head
+        row += 1
+    num_full_rows = (values.numel() - position) // row_width
+    if num_full_rows:
+        full_end = position + num_full_rows * row_width
+        row_sums[row : row + num_full_rows] += (
+            values[position:full_end].view(num_full_rows, row_width).square().sum(dim=1)
+        )
+        position = full_end
+        row += num_full_rows
+    if position < values.numel():
+        row_sums[row] += values[position:].square().sum()
+
+
 @dataclass
 class _EmbeddingMinNormState:
     """Invariant layout and reusable workspace for one input embedding."""
@@ -908,13 +937,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optimized_params = {
                 param
                 for param_group in self.optimizer.param_groups
-                for param in param_group['params']
+                for param in param_group["params"]
             }
             seen_params = set()
             for buffer in self.buffers:
                 for param in buffer.params:
                     if (
-                        getattr(param, 'is_word_embedding_parameter', False)
+                        getattr(param, "is_word_embedding_parameter", False)
                         and param in optimized_params
                         and param not in seen_params
                     ):
@@ -1036,8 +1065,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                     row_indices = torch.arange(
                         param_range.start, valid_end, dtype=torch.int64, device=main_param.device
-                    ).div_(row_width, rounding_mode='floor')
-                    row_sums.scatter_add_(0, row_indices, main_param.square())
+                    ).div_(row_width, rounding_mode="floor")
+                    _add_row_square_sums(row_sums, main_param, param_range.start, row_width)
 
             torch.distributed.all_reduce(row_sums, group=self.data_parallel_group)
 
@@ -1048,7 +1077,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 target_norm / row_norms.clamp_min(torch.finfo(row_norms.dtype).tiny),
                 1.0,
             )
-            if self.data_parallel_group.rank() == 0 and self.distributed_optimizer_instance_id == 0:
+            # Tied copies on other pipeline stages get the same transform but are not
+            # counted again, so the statistics describe the logical input table.
+            if (
+                self.data_parallel_group.rank() == 0
+                and self.distributed_optimizer_instance_id == 0
+                and not getattr(model_param, "shared", False)
+            ):
                 if self._embedding_min_norm_stats is None:
                     # Rows scaled, rows checked, squared norm delta, exact-zero rows.
                     self._embedding_min_norm_stats = torch.zeros(
@@ -1066,7 +1101,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def _consume_embedding_min_norm_stats(self) -> Optional[torch.Tensor]:
         """Return and clear ``[scaled, checked, delta squared, zero]`` interval stats."""
-        stats = getattr(self, '_embedding_min_norm_stats', None)
+        stats = getattr(self, "_embedding_min_norm_stats", None)
         if stats is None:
             return None
         self._embedding_min_norm_stats = None

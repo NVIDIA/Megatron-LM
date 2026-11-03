@@ -4233,13 +4233,13 @@ def training_log(
 
         if embedding_min_norm_metrics is not None:
             log_string += (
-                ' embedding norm floor row events: '
+                " embedding norm floor row events: "
                 f'{int(embedding_min_norm_metrics["embedding-min-norm/row-events-rescaled"])} |'
-                ' fraction: '
+                " fraction: "
                 f'{embedding_min_norm_metrics["embedding-min-norm/fraction-rescaled"]:.3E} |'
-                ' delta RMS: '
+                " delta RMS: "
                 f'{embedding_min_norm_metrics["embedding-min-norm/projection-delta-rms"]:.3E} |'
-                ' zero-row events: '
+                " zero-row events: "
                 f'{int(embedding_min_norm_metrics["embedding-min-norm/zero-row-events"])} |'
             )
 
@@ -4332,12 +4332,12 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
 def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
     """Globally aggregate and reset embedding norm-floor interval statistics."""
     # [rows scaled, rows checked, squared norm delta, exact-zero rows].
-    local_stats = torch.zeros(4, dtype=torch.float64, device='cuda')
+    local_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
     leaf_optimizers = (
-        getattr(optimizer, 'chained_optimizers', [optimizer]) if optimizer is not None else ()
+        getattr(optimizer, "chained_optimizers", [optimizer]) if optimizer is not None else ()
     )
     for current_optimizer in leaf_optimizers:
-        consume_stats = getattr(current_optimizer, '_consume_embedding_min_norm_stats', None)
+        consume_stats = getattr(current_optimizer, "_consume_embedding_min_norm_stats", None)
         if consume_stats is not None:
             stats = consume_stats()
             if stats is not None:
@@ -4352,10 +4352,10 @@ def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
         math.sqrt(norm_delta_squared / rows_rescaled) if rows_rescaled > 0.0 else 0.0
     )
     return {
-        'embedding-min-norm/row-events-rescaled': rows_rescaled,
-        'embedding-min-norm/fraction-rescaled': fraction_rescaled,
-        'embedding-min-norm/projection-delta-rms': norm_delta_rms,
-        'embedding-min-norm/zero-row-events': zero_rows,
+        "embedding-min-norm/row-events-rescaled": rows_rescaled,
+        "embedding-min-norm/fraction-rescaled": fraction_rescaled,
+        "embedding-min-norm/projection-delta-rms": norm_delta_rms,
+        "embedding-min-norm/zero-row-events": zero_rows,
     }
 
 
@@ -5553,7 +5553,7 @@ def train(
             embedding_min_norm_metrics = None
 
             if (
-                getattr(args, 'embedding_min_norm', None) is not None
+                getattr(args, "embedding_min_norm", None) is not None
                 and iteration % cfg.logger.log_interval == 0
             ):
                 embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)

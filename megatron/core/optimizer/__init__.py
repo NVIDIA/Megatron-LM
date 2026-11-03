@@ -579,9 +579,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
     has_word_embedding = any(
-        getattr(param, 'is_word_embedding_parameter', False)
+        getattr(param, "is_word_embedding_parameter", False)
         for param_group in param_groups
-        for param in param_group['params']
+        for param in param_group["params"]
     )
     if config.embedding_min_norm is not None and has_word_embedding:
         if not config.use_distributed_optimizer:

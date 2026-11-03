@@ -304,7 +304,7 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
-    if hasattr(source, 'is_word_embedding_parameter'):
+    if hasattr(source, "is_word_embedding_parameter"):
         destination.is_word_embedding_parameter = source.is_word_embedding_parameter
 
 
