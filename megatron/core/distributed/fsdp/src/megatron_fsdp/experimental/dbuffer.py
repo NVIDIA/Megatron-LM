@@ -489,7 +489,6 @@ class DBuffer:
 
         Gather outer-to-inner, writing each intermediate into a view of the final
         output. This reuses existing mesh groups without allocating scratch storage.
-        If every gathered axis has size one, return a view or fill the explicit ``out``.
         """
         axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(sorted(mesh_axis))
         assert axes, "allgather() requires at least one mesh axis."
@@ -500,12 +499,6 @@ class DBuffer:
             if not isinstance(placements[axis], Shard):
                 raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
             placements[axis] = Replicate()
-        if all(self.mesh.size(axis) == 1 for axis in axes):
-            if out is None:
-                return self.view(placements)
-            out = self._create_or_validate_out(out, placements=placements)
-            out.local_buffer.copy_(self.local_buffer)
-            return out
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer
         placements = list(self.placements)
@@ -528,19 +521,15 @@ class DBuffer:
         for axis in axes:
             input_placements = tuple(placements)
             placements[axis] = Replicate()
-            if self.mesh.size(axis) == 1:
-                # Only the placement changes; the next gather can read the same input.
-                continue
             view = out.view(placements)
+            group = self.mesh.get_group(axis)
             if self.layout.has_equal_shard_sizes:
                 # Symmetric-memory registration is scoped to the collective's process
                 # group, so rendezvous the output on the same mesh axis as the all-gather.
                 if out.is_symmetric_memory:
                     out.rendezvous(axis)
                 dist.all_gather_into_tensor(
-                    output_tensor=view.local_buffer,
-                    input_tensor=local_buffer,
-                    group=self.mesh.get_group(axis),
+                    output_tensor=view.local_buffer, input_tensor=local_buffer, group=group
                 )
             else:
                 # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
@@ -550,7 +539,7 @@ class DBuffer:
                         "Symmetric-memory allgather() requires equal shard sizes."
                     )
                 chunks = self._peer_chunks(view, input_placements, axis)
-                dist.all_gather(chunks, local_buffer, group=self.mesh.get_group(axis))
+                dist.all_gather(chunks, local_buffer, group=group)
             local_buffer = view.local_buffer
         return out
 
@@ -563,12 +552,6 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
-        if self.mesh.size(axis) == 1:
-            if out is None:
-                return self.view(placements)
-            out = self._create_or_validate_out(out, placements=placements)
-            out.local_buffer.copy_(self.local_buffer)
-            return out
         out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
@@ -590,12 +573,6 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
-        if self.mesh.size(axis) == 1:
-            if out is None:
-                return self.view(placements)
-            out = self._create_or_validate_out(out, placements=placements)
-            out.local_buffer.copy_(self.local_buffer)
-            return out
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
         group = self.mesh.get_group(axis)

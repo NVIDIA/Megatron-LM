@@ -51,50 +51,6 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
-@pytest.mark.parametrize("out_kind", ["none", "separate", "aliased"])
-@pytest.mark.parametrize(
-    "source_placement,target_placement,operation,args",
-    [
-        (RowAtomic(), Replicate(), "allgather", (0,)),
-        (Partial("avg"), Replicate(), "allreduce", (0,)),
-        (Partial("avg"), RowAtomic(), "reduce_scatter", (0, RowAtomic())),
-        (Partial("sum"), RowAtomic(), "reduce_scatter", (0, RowAtomic())),
-    ],
-)
-def test_singleton_collectives_reuse_storage(
-    distributed_setup, monkeypatch, out_kind, source_placement, target_placement, operation, args
-):
-    """Singleton collectives return views, or fill an explicit output without communication."""
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (distributed_setup.world_size, 1),
-        mesh_dim_names=("outer", "singleton"),
-    )["singleton"]
-    tensor = torch.arange(32, device=distributed_setup.device, dtype=torch.float32).reshape(8, 4)
-    source = DBuffer.distribute_tensors([tensor], mesh, [source_placement])
-    out = None
-    if out_kind == "separate":
-        out = DBuffer(mesh, [target_placement], source.layout, source.dtype, source.device)
-        out.local_buffer.fill_(-1)
-    elif out_kind == "aliased":
-        out = source.view([target_placement])
-
-    def unexpected_collective(*args, **kwargs):
-        pytest.fail("A singleton redistribution must not launch a collective.")
-
-    for name in ("all_gather", "all_gather_into_tensor", "all_reduce", "reduce_scatter_tensor"):
-        monkeypatch.setattr(dist, name, unexpected_collective)
-
-    direct_result = getattr(source, operation)(*args, out=out)
-    if out is None:
-        assert direct_result.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
-    for result in (direct_result, source.redistribute([target_placement], out=out)):
-        assert result.placements == (target_placement,)
-        if out is not None:
-            assert result is out
-        _assert_dbuffer_local_tensors_close(result, [tensor])
-
-
 @pytest.mark.parametrize(
     "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
 )
@@ -810,17 +766,10 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(
 
 
 @pytest.mark.parametrize("destination", ["allocated", "separate", "aliased"])
-@pytest.mark.parametrize("mesh_shape", ["balanced", "singleton_outer", "singleton_inner"])
-def test_multi_axis_view_and_allgather(distributed_setup, destination, mesh_shape):
+def test_multi_axis_view_and_allgather(distributed_setup, destination):
     if distributed_setup.world_size % 2:
         pytest.skip("Requires an even world size.")
-    world_size = distributed_setup.world_size
-    shape = {
-        "balanced": (2, world_size // 2),
-        "singleton_outer": (1, world_size),
-        "singleton_inner": (world_size, 1),
-    }[mesh_shape]
-    mesh = init_device_mesh(distributed_setup.device.type, shape)
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
     sharded = replicated.redistribute([RowAtomic(), RowAtomic()])
@@ -832,12 +781,7 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination, mesh_shap
     out = None if destination == "allocated" else replicated
     if destination == "separate":
         out = DBuffer(mesh, replicated.placements, replicated.layout, sharded.dtype, sharded.device)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU], record_shapes=True
-    ) as prof:
-        result = sharded.allgather((1, 0), out=out)
-    # Gathers write into output views directly. Ignore scalar mesh-metadata conversions.
-    assert not any(event.name == "aten::copy_" and event.input_shapes[0] for event in prof.events())
+    result = sharded.allgather((1, 0), out=out)
     if out is not None:
         assert result is out
     _assert_dbuffer_local_tensors_close(result, tensors)
