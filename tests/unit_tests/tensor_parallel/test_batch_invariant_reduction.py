@@ -215,11 +215,12 @@ def test_reduction_is_position_invariant(tp_group, entry):
             out = _call(reduce, partial.expand(t, 1, H).contiguous())
             assert out.shape == (t if all_reduce else t // tp, 1, H), out.shape
             if expected is None:
-                # Every rank's first row of the first step; all_ranks below compares ranks.
-                expected = _bits(out).view(-1, H)[0].clone()
-                gathered = torch.empty(tp, H, dtype=torch.int16, device="cuda")
-                dist.all_gather_into_tensor(gathered, expected, group=tp_group)
-                expected = gathered[0]
+                # The first row of the first step on TP rank 0, gathered in its own dtype
+                # (NCCL has no int16) and compared bit for bit.
+                first_row = out.reshape(-1, H)[0].contiguous()
+                gathered = torch.empty(tp, H, dtype=first_row.dtype, device="cuda")
+                dist.all_gather_into_tensor(gathered, first_row, group=tp_group)
+                expected = _bits(gathered[0])
             bad = int((_bits(out).view(-1, H) != expected).any(dim=-1).sum())
             if bad:
                 differing_rows[t] = bad
