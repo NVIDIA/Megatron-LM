@@ -2014,6 +2014,8 @@ def test_fused_seams_run_norm_forward_pre_hooks():
 @GPU
 @pytest.mark.usefixtures("model_parallel")
 def test_layers_without_fused_seams_reject_pending_writes():
+    """A layer with no fused seam reader, or an unfused block, refuses a PendingShortcutAdd
+    instead of misreading it as a residual."""
     model = _hybrid_model("mamba", False, 256, False, "M-MMEMEM-M-")
     lone = model.decoder.layers[0]
     pending = PendingShortcutAdd(torch.zeros(4, 1, 768, device="cuda"), None, None, None, None)

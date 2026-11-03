@@ -1523,9 +1523,10 @@ class TransformerConfig(ModelParallelConfig):
     With moe_shortcut_wide_residual_norm_fusion, ``None`` or 1 saves every layer's residual;
     a value N > 1 saves one residual checkpoint every N physical layers and rebuilds the residuals
     in between in backward by replaying their writes bit for bit (no other recompute flag
-    needed). Complete shortcut pairs stay in one interval. Without fusion, ``None`` places all
-    local layers in one block and this setting requires selective recomputation with
-    ``"residual_stream"`` in ``recompute_modules``.
+    needed). Complete shortcut pairs stay in one interval. A residual write the replay cannot
+    reproduce (e.g. a shape the native writer rejects) is saved instead and starts a new interval.
+    Without fusion, ``None`` places all local layers in one block and this setting requires
+    selective recomputation with ``"residual_stream"`` in ``recompute_modules``.
     """
 
     ####################
@@ -3201,7 +3202,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "residual_stream_recompute_num_layers must be a positive integer or None."
             )
-        if self.moe_shortcut_wide_residual_norm_fusion and not use_residual_stream_recompute:
+        if self.moe_shortcut_wide_residual_norm_fusion:
             # The fused seams replay residual checkpoints themselves (residual_replay_scope).
             if (
                 replay_interval is not None

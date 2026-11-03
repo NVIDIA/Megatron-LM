@@ -353,33 +353,10 @@ class ShortcutMoEBlock(MegatronModule):
         streams = self.config.wide_residual.num_streams
         parts = self.compute_layer.shortcut_compute_parts()
         compute_read, compute_norm = parts.read, parts.input_norm
-        mixer, linear = parts.branch, parts.input_projection
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
-            # A GDP input-projection checkpoint keeps its weight hooks in an inner autograd
-            # graph that the boundary's weight edge cannot order; only GTP's explicit
-            # finalization follows the deferred weight GEMM. With activation offload, its
-            # weight-ready notifications are not preserved either, so that combination stays
-            # on the qualified BF16 handoff.
-            recompute = getattr(mixer, "recompute_in_proj", False)
-            offload = recompute and getattr(
-                mixer.config, "fine_grained_activation_offloading", False
+            direct = self.compute_layer.direct_input_consumer(
+                lambda linear: mxfp8_handoff.eligible(linear, pending.routed, streams)
             )
-            direct = (
-                linear
-                if not offload and mxfp8_handoff.eligible(linear, pending.routed, streams)
-                else None
-            )
-            if (
-                torch.is_grad_enabled()
-                and direct is not None
-                and recompute
-                and not getattr(direct.weight, "is_gtp_weight_remat", False)
-            ):
-                raise ValueError(
-                    "direct shortcut MXFP8 requires deferred weight gradients; "
-                    "GDP input-projection recompute requires GTP weight finalization. "
-                    "Disable gdp_in_proj recompute or use a BF16 handoff."
-                )
             return kernels.shortcut_add_wide_residual_write_two_reader_rmsnorm_quant(
                 pending,
                 (compute_read.read_logits(), self.shortcut_residual_read.read_logits()),

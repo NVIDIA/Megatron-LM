@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     ShortcutComputeParts,
     StreamwiseSigmoidWideResidualConnection,
+    direct_input_consumer,
     load_residual_state,
     lone_seam_reader,
     lone_seam_writer,
@@ -107,6 +108,12 @@ class WideResidualMambaLayer(MambaLayer):
             mixer,
             getattr(mixer, "in_proj", None),
         )
+
+    def direct_input_consumer(self, eligible):
+        """The compute branch's input projection if a fused seam may hand it a direct MXFP8
+        input (``eligible`` is the handoff's own check), else None."""
+        parts = self.shortcut_compute_parts()
+        return direct_input_consumer(parts.branch, parts.input_projection, eligible)
 
     def pending_write_reader(self):
         """The input read and RMSNorm a fused seam kernel can apply for this lone layer, or None.

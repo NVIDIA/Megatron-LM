@@ -17,6 +17,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.transformer.wide_residual import (
     ShortcutComputeParts,
     StreamwiseSigmoidWideResidualConnection,
+    direct_input_consumer,
     load_residual_state,
     lone_seam_reader,
     lone_seam_writer,
@@ -194,6 +195,12 @@ class WideResidualTransformerLayer(TransformerLayer):
             attention,
             getattr(attention, "in_proj", getattr(attention, "linear_qkv", None)),
         )
+
+    def direct_input_consumer(self, eligible):
+        """The compute branch's input projection if a fused seam may hand it a direct MXFP8
+        input (``eligible`` is the handoff's own check), else None."""
+        parts = self.shortcut_compute_parts()
+        return direct_input_consumer(parts.branch, parts.input_projection, eligible)
 
     def _is_lone_mlp(self) -> bool:
         return (

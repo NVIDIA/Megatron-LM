@@ -96,9 +96,9 @@ def _warn_fused_residuals_unobserved() -> None:
     """Warn (once per call site, Python's default filter) that fused seams are not observed."""
     if is_observing_tensor("residual_accumulator") or is_observing_tensor("residual_contribution"):
         warnings.warn(
-            "Residual observation covers only lone layers that write their residual; it skips "
-            "layers whose write is fused into the next layer's seam kernel "
-            "(moe_shortcut_wide_residual_norm_fusion).",
+            "Residual observation covers only lone layers that read and write the residual "
+            "themselves; it skips layers whose input or output residual write is fused into a "
+            "seam kernel (moe_shortcut_wide_residual_norm_fusion).",
             stacklevel=2,
         )
 

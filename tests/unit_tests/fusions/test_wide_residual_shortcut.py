@@ -681,10 +681,20 @@ def test_unused_outputs_and_frozen_parameters(streams, route, retention):
 
 @GPU
 @pytest.mark.parametrize(
-    "invalid", ["residual_dtype", "residual_layout", "update", "controller", "gamma"]
+    "invalid,message",
+    [
+        ("residual_dtype", "FP32 or BF16 residuals"),
+        ("residual_layout", "contiguous"),
+        ("update", "update"),
+        ("controller", "controllers require"),
+        ("gamma", "gamma"),
+    ],
 )
-def test_boundary_rejects_invalid_inputs_before_backward(invalid):
-    """The forward owner validates state before the trusted backward executor uses it."""
+def test_boundary_rejects_invalid_inputs_before_backward(invalid, message):
+    """The forward validates every input before a kernel (or the trusted backward) uses it.
+
+    No-grad, so the check runs on any GPU (training is GB300-only).
+    """
     residual, updates, controllers, gammas = inputs(3, 1, 128)
     if invalid == "residual_dtype":
         residual = residual.half()  # FP32 and BF16 streams are supported; FP16 is not
@@ -696,7 +706,7 @@ def test_boundary_rejects_invalid_inputs_before_backward(invalid):
         controllers = (controllers[0][:2], *controllers[1:])
     else:
         gammas = (gammas[0][:-1],)
-    with pytest.raises(ValueError):
+    with torch.no_grad(), pytest.raises(ValueError, match=message):
         run((residual, updates, controllers, gammas), 3)
 
 
@@ -2188,30 +2198,55 @@ def test_generic_norm_matches_unfused_oracle(hidden):
 
 @GPU
 def test_replay_interrupts_at_an_unqualified_native_write():
-    """A residual write the native Triton writer cannot take (here a 32-column stream) ends the
-    replay chain instead of failing: autograd saves it, and the result matches no replay."""
+    """A write the native Triton writer cannot take (here: a non-contiguous update) ends the open
+    replay interval instead of failing: autograd saves it, the next write starts a new interval
+    anchored at its output, and replay inside that interval stays bit-exact."""
     from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 
     config = SimpleNamespace(
-        moe_shortcut_wide_residual_norm_fusion=True, residual_stream_recompute_num_layers=2
+        moe_shortcut_wide_residual_norm_fusion=True, residual_stream_recompute_num_layers=8
     )
     torch.manual_seed(5)
+    rows, hidden, streams = 1024, 128, 3
     leaves = (
-        torch.randn(1024, 3 * 32, device="cuda", requires_grad=True),
-        torch.randn(1024, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True),
-        torch.randn(3, device="cuda", requires_grad=True),
+        torch.randn(rows, streams * hidden, device="cuda", requires_grad=True),
+        *(
+            torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(4)
+        ),
+        torch.randn(4, streams, device="cuda", requires_grad=True),  # write logits
+        torch.randn(4, streams, device="cuda", requires_grad=True),  # retention logits
     )
 
-    def write(replay):
-        args = tuple(t.detach().clone().requires_grad_(True) for t in leaves)
+    def chain(replay):
+        x, *updates, write, retain = (t.detach().clone().requires_grad_(True) for t in leaves)
+        outputs = []
         with residual_replay_scope(config, training=replay) as manager:
-            out = streamwise_sigmoid_writeback(args[0], args[1], args[2], 3)
+            residual = x
+            for i, update in enumerate(updates):
+                # Write 2 takes a strided (non-contiguous) update view; the others are contiguous.
+                update = update[:, ::2] if i == 1 else update[:, :hidden].contiguous()
+                if manager is not None:
+                    manager.advance(1)
+                residual = streamwise_sigmoid_writeback(
+                    residual,
+                    update,
+                    write[i],
+                    streams,
+                    retention_logits=retain[i],
+                    retention_max_forget=0.1,
+                )
+                outputs.append(residual)
             if replay:
-                assert manager is not None and manager.last is None and manager.active is None
-        out.backward(torch.ones_like(out))
-        return out.detach(), [t.grad for t in args]
+                # The interval opened by write 3 is anchored at the unreplayed write 2's output.
+                assert manager.active.checkpoint.tensor.data_ptr() == outputs[1].data_ptr()
+                assert len(manager.active.transitions) == 2
+                assert outputs[2].untyped_storage().nbytes() == 0  # freed, replayed in backward
+        residual.float().square().mean().backward()
+        grads = [t.grad for t in (x, *updates, write, retain)]
+        return residual.detach(), grads
 
-    expected, expected_grads = write(replay=False)
-    actual, actual_grads = write(replay=True)
+    expected, expected_grads = chain(replay=False)
+    actual, actual_grads = chain(replay=True)
     assert torch.equal(actual, expected)
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))

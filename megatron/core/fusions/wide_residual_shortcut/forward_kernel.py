@@ -372,6 +372,20 @@ def _training_config(h, streams, readers, mxfp8):
     )  # pairing needs two readers
 
 
+# In batch-invariant mode, inference uses the schedule chosen for this row count at every row
+# count, so each row's arithmetic (and its RMSNorm reduction order) does not depend on the batch
+# (e.g. CUDA-graph padding). It is a decode-cluster schedule and a multiple of 32 for MXFP8.
+_BATCH_INVARIANT_ROWS = 32
+
+
+def _batch_invariant_mode() -> bool:
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    return is_batch_invariant_mode_enabled()
+
+
 @lru_cache
 def _programmatic_launch(device):
     """Return whether a device supports PDL launches and CTA clusters (sm_90+).
@@ -535,7 +549,7 @@ def forward(
     for gamma in gammas:
         _tensor(gamma, (h,), torch.bfloat16, device, "gamma")
     config = choose_forward_config(
-        m,
+        _BATCH_INVARIANT_ROWS if inference and _batch_invariant_mode() else m,
         h,
         num_streams,
         n,

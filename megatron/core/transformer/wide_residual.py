@@ -553,6 +553,32 @@ class ShortcutComputeParts(NamedTuple):
     input_projection: nn.Module | None
 
 
+def direct_input_consumer(branch: nn.Module, projection, eligible):
+    """``projection`` if a fused seam may hand it a direct MXFP8 input, else None.
+
+    ``eligible(projection)`` is the handoff's own shape/recipe/device check. A checkpointed input
+    projection (``branch.recompute_in_proj``, e.g. GDP) keeps its weight hooks in an inner autograd
+    graph that the boundary's weight edge cannot order: with fine-grained activation offload its
+    weight-ready notifications are lost, so it stays on the BF16 handoff, and in training only GTP's
+    explicit weight finalization follows the deferred weight GEMM.
+    """
+    recompute = getattr(branch, "recompute_in_proj", False)
+    offload = recompute and getattr(branch.config, "fine_grained_activation_offloading", False)
+    if projection is None or offload or not eligible(projection):
+        return None
+    if (
+        torch.is_grad_enabled()
+        and recompute
+        and not getattr(projection.weight, "is_gtp_weight_remat", False)
+    ):
+        raise ValueError(
+            "direct shortcut MXFP8 requires deferred weight gradients; "
+            "GDP input-projection recompute requires GTP weight finalization. "
+            "Disable gdp_in_proj recompute or use a BF16 handoff."
+        )
+    return projection
+
+
 def _seam_connection(connection, num_streams: int):
     """``connection`` if the fused seam kernels implement it, else None."""
     if (

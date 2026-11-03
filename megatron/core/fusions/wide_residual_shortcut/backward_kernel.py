@@ -1026,8 +1026,8 @@ def _backward(
         # Two-reader gradient schedule. Each part reads its shared slices once, then
         # one barrier releases the carry targets and the next dy/U slice; afterwards one
         # barrier per stream releases the consumed carry together with the next stream's
-        # predecessor slice. Controller reductions run from registers after the transfers
-        # they used to delay, as packed per-thread FMA chains.
+        # predecessor slice. Controller reductions run from registers after those transfers,
+        # as packed per-thread FMA chains, so they do not delay them.
         PAIRED: gl.constexpr = TWO
         # Predecessor slices read before the part's first barrier.
         HELD: gl.constexpr = min(2, streams)
