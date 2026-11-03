@@ -34,6 +34,9 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -55,9 +58,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.dsv4_batched_linear import (
-    DSv4BatchedLinear,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -101,6 +101,7 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+_dsv4_o_group_proj = dsv4_hybrid_specs.get_dsv4_o_group_proj_spec()
 
 
 # MTP block spec - provides norms and projection only.
@@ -278,7 +279,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
-                        linear_o_group_proj=DSv4BatchedLinear,
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
@@ -305,7 +306,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
-                        linear_o_group_proj=DSv4BatchedLinear,
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=_csa_qk_norm,
                         kv_layernorm=_csa_qk_norm,
