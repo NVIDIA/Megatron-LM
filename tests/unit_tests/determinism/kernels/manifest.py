@@ -679,7 +679,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "SwiGLU options (clamp, linear offset, interleave), the squared-ReLU gate of the GLU kernels and "
         "input-side routing probabilities replay too. The batch-invariant clamped SwiGLU matches "
         "training's fused kernel, and the batch-invariant gated squared ReLU training's unfused GLU, "
-        "bit for bit. "
+        "bit for bit. The squared-ReLU kernels keep NaN NaN, as training's F.relu does, and replay "
+        "NaN, infinite and signed-zero inputs bit-exactly. "
         "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
     ),
     KernelEntry(

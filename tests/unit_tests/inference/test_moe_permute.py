@@ -189,6 +189,47 @@ def test_glu_propagates_nan(kernel, clamp_value, squared_relu_gate):
     assert torch.equal(run().isnan(), expected_nan)
 
 
+@pytest.mark.parametrize("clamp_scale", [None, 16.0], ids=["unclamped", "clamped"])
+@pytest.mark.parametrize("kernel", ["padded_squared_relu", "squared_relu_with_probs"])
+def test_squared_relu_propagates_nan(kernel, clamp_scale):
+    """NaN FC1 outputs stay NaN, as in training's F.relu, instead of being ReLU'd to 0.
+    Infinities and signed zeros give training's values too."""
+    from megatron.core.fusions.fused_weighted_squared_relu import (
+        weighted_clamped_squared_relu,
+        weighted_squared_relu,
+    )
+    from megatron.core.inference.moe.activations import padded_squared_relu
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(41)
+    rows, hidden = 4, 64
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = x[2, 60] = float("nan")
+    x[1, 5] = float("inf")
+    x[1, 6] = float("-inf")
+    x[3, 7] = -0.0
+    perm = torch.arange(rows, device="cuda", dtype=torch.int32)
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+
+    if kernel == "padded_squared_relu":
+        actual = padded_squared_relu(x, perm, _vt(rows), clamp_scale=clamp_scale)
+        relu = torch.relu(x.float())
+        if clamp_scale is not None:
+            relu = clamp_scale * torch.tanh(relu / clamp_scale)
+        expected = (relu**2).to(torch.bfloat16)
+    else:
+        actual = squared_relu_with_probs(x, perm, _vt(rows), probs, clamp_scale)
+        if clamp_scale is None:
+            expected = weighted_squared_relu(x, probs.unsqueeze(1))
+        else:
+            expected = weighted_clamped_squared_relu(x, probs.unsqueeze(1), clamp_scale)
+
+    nan = expected.isnan()
+    assert int(nan.sum()) == 2
+    assert torch.equal(actual.isnan(), nan)
+    assert torch.equal(actual[~nan].view(torch.int16), expected[~nan].view(torch.int16))
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 

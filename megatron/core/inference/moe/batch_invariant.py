@@ -106,7 +106,8 @@ def _squared_relu_with_probs_kernel(
                     value = tl.load(input_ptr + row_i64 * hidden_size + cols, mask=mask).to(
                         tl.float32
                     )
-                    value = tl.maximum(value, 0.0)
+                    # Keeps NaN NaN, as training's F.relu does.
+                    value = tl.maximum(value, 0.0, propagate_nan=tl.PropagateNan.ALL)
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
                     value = value * value

@@ -215,8 +215,9 @@ def _fused_moe_kernel(
 
             # Megatron-only: squared-relu fused on the fp32 accumulator before
             # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
+            # The relu keeps NaN NaN, as training's F.relu does.
             if FUSE_SQUARED_RELU:
-                accumulator = tl.maximum(accumulator, 0.0)
+                accumulator = tl.maximum(accumulator, 0.0, propagate_nan=tl.PropagateNan.ALL)
                 if CLAMP_ACTIVATION:
                     # Tanh soft clamp of the pre-activation (training's
                     # activation_func_tanh_clamp_scale), bounding the squared-relu output

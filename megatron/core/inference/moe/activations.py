@@ -136,8 +136,11 @@ def _clamped_relu(x, clamp_scale, CLAMP: tl.constexpr):
     The clamped value stays in FP32, matching training's fused
     ``weighted_clamped_squared_relu``, which squares ``clamp_scale * tanh(...)`` directly
     with no intermediate downcast.
+
+    Like training's F.relu, it keeps NaN inputs NaN. tl.maximum's default lowering
+    (maxnum) would return 0 for them and hide an upstream NaN.
     """
-    r = tl.maximum(x, 0.0)
+    r = tl.maximum(x, 0.0, propagate_nan=tl.PropagateNan.ALL)
     if CLAMP:
         r = clamp_scale * libdevice.tanh(r / clamp_scale)
     return r

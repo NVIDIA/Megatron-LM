@@ -632,6 +632,42 @@ class TestVllmFusedMoe:
         assert result.shape == (max_tokens, hidden_size)
         assert (result - expected).norm() / expected.norm() < 2e-2
 
+    @pytest.mark.parametrize("clamp_scale", [None, 16.0], ids=["unclamped", "clamped"])
+    def test_nan_token_propagates(self, clamp_scale):
+        """A NaN in a token's hidden state makes its output NaN, as training's F.relu keeps
+        the FC1 output NaN, instead of the fused squared ReLU zeroing it. Other tokens are
+        unchanged."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 16, 128, 128, 2, 4
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+
+        def run(h):
+            return vllm_fused_moe(
+                h,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                _vt(max_tokens),
+                routing_map,
+                activation_clamp_scale=clamp_scale,
+            ).clone()
+
+        clean = run(hidden)
+        poisoned = hidden.clone()
+        poisoned[5, 7] = float("nan")
+        result = run(poisoned)
+
+        assert bool(result[5].isnan().all())
+        others = torch.arange(max_tokens, device="cuda") != 5
+        assert torch.equal(result[others], clean[others])
+
     def test_rejects_gemm_input_width_mismatch(self):
         """FC2 must read its whole input: a gated FC1 output that reaches it un-reduced
         (here through the non-gated activation) is rejected instead of half-read."""

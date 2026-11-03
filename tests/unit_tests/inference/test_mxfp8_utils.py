@@ -807,6 +807,35 @@ class TestSquaredReluAndQuantizeMxfp8Clamped:
         )
 
 
+@pytest.mark.parametrize("clamp_scale", [None, CLAMP_SCALE], ids=["unclamped", "clamped"])
+def test_squared_relu_and_quantize_mxfp8_propagates_nan(clamp_scale):
+    """A NaN FC1 output quantizes to the E4M3 NaN, as training's F.relu keeps it NaN, instead
+    of being ReLU'd to 0. The fused and unfused routes still agree bit for bit."""
+    from megatron.core.inference.moe.activations import (
+        padded_squared_relu,
+        squared_relu_and_quantize_mxfp8,
+    )
+
+    torch.manual_seed(43)
+    M, K = 128, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = x[70, 100] = float("nan")
+    x[1, 6] = float("-inf")
+    x[2, 7] = -0.0
+    perm_map = _make_permutation_map(M, num_padding=0)
+
+    fused = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=clamp_scale)
+    expected_nan = torch.zeros(M, K, dtype=torch.bool, device="cuda")
+    expected_nan[0, 3] = expected_nan[70, 100] = True
+    assert torch.equal(fused.data.float().isnan(), expected_nan)
+
+    unfused = MXFP8Tensor.from_bf16(
+        padded_squared_relu(x, perm_map, _vt(M), clamp_scale=clamp_scale), backend="triton"
+    )
+    assert torch.equal(fused.data.view(torch.uint8), unfused.data.view(torch.uint8))
+    assert torch.equal(fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # permute_and_quantize_mxfp8
 # ──────────────────────────────────────────────────────────────────────

@@ -510,6 +510,96 @@ def test_batch_invariant_inference_activations_replay():
     )
 
 
+def _with_special_values(x, count):
+    """``x`` with ``count`` random elements set to NaN, +inf, -inf and -0.0 in turn."""
+    special = torch.tensor(
+        [float("nan"), float("inf"), float("-inf"), -0.0], device=x.device, dtype=x.dtype
+    )
+    picks = torch.randint(0, x.numel(), (count,), device=x.device)
+    x.view(-1)[picks] = special[torch.arange(count, device=x.device) % special.numel()]
+    return x
+
+
+@pytest.mark.parametrize("clamp_scale", [None, 10.0], ids=["unclamped", "clamped"])
+def test_squared_relu_special_values_replay(clamp_scale):
+    """The squared-ReLU kernels keep NaN NaN, as training's F.relu does, so NaN, infinite
+    and signed-zero FC1 outputs reach the outputs and must replay bit-exactly too."""
+    from megatron.core.inference.moe import activations, batch_invariant
+
+    seeded()
+    rows, ffn, n_used = 4096, 2688, 3000
+    perm, n_used_t = _padded_layout(rows, ffn, n_used)
+    probs = torch.rand(rows, device="cuda")
+    x = _with_special_values(torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16) * 5, 4096)
+
+    def live(out):
+        return out[:n_used][perm[:n_used] >= 0]
+
+    assert_replays_bit_exact(
+        lambda x: live(activations.padded_squared_relu(x, perm, n_used_t, clamp_scale)),
+        (x,),
+        backward=False,
+        what="padded_squared_relu (special values)",
+    )
+    assert_replays_bit_exact(
+        lambda x: live(
+            batch_invariant.squared_relu_with_probs(x, perm, n_used_t, probs, clamp_scale)
+        ),
+        (x,),
+        backward=False,
+        what="squared_relu_with_probs (special values)",
+    )
+    if hasattr(torch, "float8_e8m0fnu"):
+
+        def quant(x):
+            q = activations.squared_relu_and_quantize_mxfp8(x, perm, n_used_t, clamp_scale)
+            return live(q.data.view(torch.uint8)), q.scale.view(torch.uint8)
+
+        assert_replays_bit_exact(
+            quant, (x,), backward=False, what="squared_relu_and_quantize_mxfp8 (special values)"
+        )
+
+
+@pytest.mark.parametrize("clamp_scale", [None, 10.0], ids=["unclamped", "clamped"])
+def test_vllm_fused_squared_relu_special_values_replay(clamp_scale):
+    """The squared ReLU fused into the vLLM FC1 epilogue keeps NaN NaN too."""
+    from megatron.core.inference.moe.fused_moe import ActivationType
+    from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+    seeded()
+    max_tokens, hidden, ffn, topk, experts = 1024, 1024, 1024, 4, 8
+    hidden_states = _with_special_values(
+        torch.randn(max_tokens, hidden, device="cuda", dtype=torch.bfloat16), 64
+    )
+    probs = torch.rand(max_tokens, topk, device="cuda")
+    routing_map = torch.randint(0, experts, (max_tokens, topk), device="cuda")
+    fc1 = torch.randn(experts, ffn, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
+    valid = _dev_scalar(max_tokens)
+
+    def moe(h, p):
+        return vllm_fused_moe(
+            h,
+            p,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            experts,
+            0,
+            valid,
+            routing_map,
+            activation_clamp_scale=clamp_scale,
+        )
+
+    assert_replays_bit_exact(
+        moe,
+        (hidden_states, probs),
+        replays=4,
+        backward=False,
+        what="vllm_fused_moe (squared ReLU, special values)",
+    )
+
+
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_replays():
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
