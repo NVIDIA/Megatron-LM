@@ -2,6 +2,8 @@
 
 """Tests for configurable defaults on the dynamic text generation server."""
 
+import asyncio
+
 import pytest
 
 quart = pytest.importorskip("quart")
@@ -179,6 +181,8 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         default_top_p=0.8,
         default_top_k=5,
         eval_mode=True,
+        max_inflight_requests=7,
+        max_inflight_bytes=2**31,
     )
 
     # The port is taken from the socket; no fd is handed to the replica, which
@@ -201,6 +205,8 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         # frontend does not hash and the coordinator keeps doing it.
         None,
         None,
+        7,
+        2**31,
     )
     assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
@@ -266,6 +272,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
         default_top_p=0.8,
         default_top_k=5,
         eval_mode=True,
+        max_inflight_requests=7,
+        max_inflight_bytes=2**31,
     )
 
     app_config = captured["app"].config
@@ -283,6 +291,11 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     assert app_config["default_top_p"] == 0.8
     assert app_config["default_top_k"] == 5
     assert app_config["eval_mode"] is True
+    assert isinstance(captured["app"].asgi_app, server._InflightHTTPLimit)
+    assert captured["app"].asgi_app.max_inflight_requests == 7
+    assert captured["app"].asgi_app.max_inflight_bytes == 2**31
+    assert captured["app"].asgi_app.max_request_content_size == app_config["MAX_CONTENT_LENGTH"]
+    assert captured["hypercorn_config"].h2_max_concurrent_streams == 7
     assert captured["hypercorn_config"].bind == ["fd://23"]
     assert captured["listener_closed"] is True
 
@@ -334,3 +347,73 @@ async def test_completions_request_uses_sampling_defaults_and_overrides(
     assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body_size", "max_request_content_size", "expected_status"),
+    [(8, 2**30, 200), (64, 2**30, 503), (24, 16, 413)],
+)
+async def test_quart_request_over_byte_limit_is_rejected(
+    body_size, max_request_content_size, expected_status
+):
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    app = Quart(__name__)
+    handled = []
+
+    @app.post("/echo")
+    async def echo():
+        handled.append(len(await quart.request.get_data()))
+        return "ok"
+
+    app.asgi_app = server._InflightHTTPLimit(
+        app.asgi_app,
+        max_inflight_requests=10,
+        max_inflight_bytes=32,
+        max_request_content_size=max_request_content_size,
+    )
+
+    chunk = body_size // 2
+    messages = [
+        {"type": "http.request", "body": b"x" * chunk, "more_body": True},
+        {"type": "http.request", "body": b"x" * chunk, "more_body": False},
+    ]
+    disconnected = asyncio.Event()
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body"):
+            disconnected.set()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/echo",
+        "raw_path": b"/echo",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost"), (b"content-length", str(body_size).encode())],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 80),
+        "extensions": {},
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=5)
+
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert [m["status"] for m in starts] == [expected_status]
+    assert handled == ([body_size] if expected_status == 200 else [])
+    assert app.asgi_app.inflight_bytes == 0 and app.asgi_app.inflight == 0
