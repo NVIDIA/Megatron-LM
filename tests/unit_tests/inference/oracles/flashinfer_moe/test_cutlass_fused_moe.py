@@ -13,19 +13,25 @@ Contract (from the call sites, MCore's MoE math and FlashInfer's documented API)
   ``(L * tanh(relu(z) / L))**2`` (FlashInfer ``ClampedRelu2``, SM10x only). FP32 routing
   weights; ``W1 [E_local, I, H]``, ``W2 [E_local, H, I]`` BF16 (or canonical MXFP8, whose
   scales Megatron views as CUTLASS's packed int32 without moving bytes).
-* BF16: GEMMs accumulate in FP32; the activation output (the FC2 input) is stored in BF16; the
-  routes are summed into the BF16 output (the default fused finalize uses BF16 atomics; with
-  ``use_fused_finalize=False`` a separate finalize kernel sums them). Megatron takes element 0
-  of FlashInfer's returned list: the ``[T, H]`` BF16 output.
+* BF16 precision (FlashInfer ``cutlass_fused_moe_kernels.cuh``): GEMMs accumulate in FP32.
+  ``Relu2`` is not fused: GEMM1 writes its output in BF16 and a separate kernel applies the
+  activation to it, in FP32, and stores BF16; so the FC1 output is rounded to BF16 before the
+  activation, as in MCore's own BF16 path (TE GroupedLinear and the torch backend output BF16
+  before the activation). ``ClampedRelu2`` is fused into the GEMM1 epilogue (FlashInfer requires
+  a fusion tactic for it) and runs on the FP32 accumulator. Either way the FC2 input is BF16.
+  The routes are summed into the BF16 output (the default fused finalize uses BF16 atomics;
+  with ``use_fused_finalize=False`` a separate finalize kernel sums them). Megatron takes
+  element 0 of FlashInfer's returned list: the ``[T, H]`` BF16 output.
 * MXFP8: the input is quantized to MXFP8 with swizzled scales, the FC2 input is requantized to
   MXFP8 inside the kernel; output BF16 ``[T, H]``.
 * Inputs are read only. Open PR #8574 (s3) passes ``use_fused_finalize=False`` under
   deterministic or batch-invariant configs; both finalize paths are covered here and the
   results are the same contract.
 
-Oracle: ``spec.moe_reference`` in fp64. BF16: random inputs; the reference rounds the
-activation output to BF16 (the contract's storage precision) and the trusted implementation is
-torch in fp32 (TF32 off) with the same BF16 activation storage and BF16 route accumulation;
+Oracle: ``spec.moe_reference`` in fp64. BF16: random inputs; the reference rounds to BF16
+where the contract stores BF16 (the FC1 output for Relu2, the FC2 input) and the trusted
+implementation is torch in fp32 (TF32 off) with the same BF16 storage and BF16 route
+accumulation;
 tolerance class floating point, per row, factor 2 (one BF16 rounding of the FC2 input more or
 less moves the output by less than half a BF16 ulp, so the bound does not depend on which side
 of a rounding boundary each implementation lands). MXFP8 ``ClampedRelu2``: a rank-1 ``W1`` and
@@ -51,6 +57,9 @@ import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.inference.oracles.flashinfer_moe import spec
+
+# The BF16 Relu2 activation as the contract evaluates it (FC1 output stored in BF16).
+BF16_RELU2 = spec.relu2_of_bf16
 
 
 def _cutlass_module_ready():
@@ -210,7 +219,7 @@ def _run_bf16(case, monkeypatch, activation, clamp=None):
         problem.w1, problem.w2, ep_size=ep_size, ep_rank=ep_rank, activation=activation, clamp=clamp
     )
     out = _forward(experts, problem.x, problem.ids, problem.probs)
-    act = spec.relu2 if clamp is None else spec.clamped_relu2(clamp)
+    act = BF16_RELU2 if clamp is None else spec.clamped_relu2(clamp)
     problem.check(out, act, what=f"{activation}{'' if clamp is None else f'(L={clamp})'}")
 
 
@@ -253,7 +262,7 @@ def test_bf16_relu2_small_case():
         pattern="empty-rows",
     )
     experts = _experts(problem.w1, problem.w2, ep_size=2, ep_rank=1, activation="Relu2")
-    problem.check(_forward(experts, problem.x, problem.ids, problem.probs), spec.relu2, "small")
+    problem.check(_forward(experts, problem.x, problem.ids, problem.probs), BF16_RELU2, "small")
 
 
 _GEMM1, _GEMM2 = "trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"
@@ -292,12 +301,12 @@ def test_bf16_relu2_every_gemm2_tactic(finalize, monkeypatch):
         tokens=129, hidden=256, inter=384, local=8, ep_size=2, ep_rank=1, top_k=2, pattern="random"
     )
     experts = _experts(problem.w1, problem.w2, ep_size=2, ep_rank=1, activation="Relu2")
-    problem.check(_forward(experts, problem.x, problem.ids, problem.probs), spec.relu2, "default")
+    problem.check(_forward(experts, problem.x, problem.ids, problem.probs), BF16_RELU2, "default")
     assert pin.valid, "FlashInfer reported no valid GEMM2 tactic"
     for tactic in pin.valid:
         pin.tactic = tactic
         out = _forward(experts, problem.x, problem.ids, problem.probs)
-        problem.check(out, spec.relu2, what=f"GEMM2 tactic {tactic} ({finalize} finalize)")
+        problem.check(out, BF16_RELU2, what=f"GEMM2 tactic {tactic} ({finalize} finalize)")
 
 
 def _cutlass_mxfp8(values):

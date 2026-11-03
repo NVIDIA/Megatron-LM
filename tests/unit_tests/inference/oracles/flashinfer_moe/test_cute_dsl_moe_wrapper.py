@@ -13,8 +13,10 @@ Contract (from the call site, MCore's MoE math and FlashInfer's documented API):
 * Megatron quantizes the BF16 expert weights to NVFP4 (per-expert FP32 scale ``448 * 6 / amax``,
   E4M3 block scales per 16, H and I padded to 256, gated FC1 reordered to FlashInfer's 64-row
   ``[up, gate]`` interleave) and every token to per-token NVFP4 (per-token scale
-  ``amax / (448 * 6)``); the kernel requantizes the FC2 input per token (``fc2_input_scale =
-  1 / 2688``). Quantization error is the only approximation the contract allows.
+  ``amax / (448 * 6)``). With per-token activations FlashInfer's GEMM1 + activation writes the
+  FC2 input in the output dtype (BF16; ``_intermediate_c_dtype`` in ``cute_dsl/fused_moe.py``)
+  and a separate per-token NVFP4 quantizer requantizes it (``fc2_input_scale = 1 / 2688``).
+  Quantization and that BF16 storage are the only approximations the contract allows.
 * Output: BF16 ``[rows, H]``. ``out``, ``token_capacity`` and ``use_bounded_rows`` behave as for
   routed MXFP8 (only ``out[:rows]`` is written; the bounded prefix is ``min(capacity, T)``).
   The activation enum must match the weights' gating, else ValueError; non-FP32 probabilities
@@ -29,9 +31,13 @@ Contract (from the call site, MCore's MoE math and FlashInfer's documented API):
 Oracle: ``spec.moe_reference`` in fp64 on the unquantized BF16 inputs. The inputs make every
 quantization lossless: NVFP4-exact ``W2`` and tokens (E2M1 values, a +-6 in every 16-block, block
 exponents within 3 of the row's), and a rank-1 ``W1 = u v^T`` with ``u = +-2**-n`` in
-constant-level blocks of 16 along I. Then each route's FC2 input is ``c**2`` (or ``c`` times
-``|z_gate|`` for SwiGLU, whose gates are kept beyond |64| so ``silu(g) = g`` or 0 in FP32 and
-FP64) times a pattern that per-token NVFP4 represents exactly for any ``c``. Per-token
+constant-level blocks of 16 along I. Then each route's FC2 input is ``c**2`` (``c = v . x``,
+also for SwiGLU, whose gates are kept beyond |64| so ``silu(g) = g`` or 0 in FP32 and FP64)
+times a power-of-two pattern, which BF16 storage keeps and per-token NVFP4 represents exactly
+for any ``c``. The BF16 storage rounds ``c**2``, a common factor of the row: the reference and
+the trusted implementation round it too, and tokens whose ``c**2`` lies within 2**-16
+(relative) of a BF16 rounding boundary are redrawn, so FP32 noise cannot round it the other
+way. Per-token
 magnitudes span 2**-13..2**13 (2**4..2**12 gated), so a per-token scale error shows (a cosine
 check would not see it for Relu2: ``relu(s z)**2 = s**2 relu(z)**2``). Tolerance class: floating
 point, per row, bounded by a trusted fp32 torch implementation whose weighted route outputs are
@@ -52,6 +58,10 @@ from tests.unit_tests.inference.oracles.flashinfer_moe import spec
 
 RELU2, SWIGLU = 6, 3  # FlashInfer ActivationType values Megatron passes
 GATE_MIN = 64.0  # |gate| beyond this: sigmoid is exactly 1 (or 0) in FP32 and its silu exact
+# Tokens keep c**2 at least this far (relative) from a BF16 rounding boundary: FP32 evaluation
+# noise (a few 2**-23) cannot then round the BF16-stored FC2 input to the other neighbour.
+TIE_MARGIN = 2.0**-16
+BF16 = spec.round_to(torch.bfloat16)
 
 
 def _two_stage(monkeypatch):
@@ -96,6 +106,16 @@ class Problem:
         x = spec.nvfp4_exact_values(tokens, hidden, generator=g, row_exponents=rows)
         if gated:  # v0 . x > 0 and large: every gate is beyond GATE_MIN
             x = x.abs() * torch.sign(self.v0)
+        for _ in range(100):  # redraw tokens whose c**2 is near a BF16 rounding boundary
+            near = spec.bf16_tie_distance((x @ self.v0).square()) < TIE_MARGIN
+            if not bool(near.any()):
+                break
+            fresh = spec.nvfp4_exact_values(
+                int(near.sum()), hidden, generator=g, row_exponents=rows
+            )
+            x[near] = fresh.abs() * torch.sign(self.v0) if gated else fresh
+        else:
+            raise AssertionError("could not draw tokens away from BF16 rounding boundaries")
         empty_rows, empty_expert = (), None
         if pattern == "empty-rows":
             empty_rows = list(range(0, tokens, 3))
@@ -144,6 +164,7 @@ class Problem:
             probs,
             activation=self.activation,
             local_offset=self.offset,
+            act_round=BF16,
         )
         with spec.exact_fp32_matmul():
             trusted = spec.moe_reference(
@@ -154,6 +175,7 @@ class Problem:
                 probs,
                 activation=self.activation,
                 local_offset=self.offset,
+                act_round=BF16,
                 out_dtype=torch.bfloat16,
             )
         return ref, trusted
@@ -185,8 +207,9 @@ def _check(problem, out, what, rows=None, inputs=None):
 
 def test_structured_inputs_are_lossless():
     """CPU check of the oracle's inputs: tokens and weights are NVFP4-exact (per token and per
-    tensor), every gate is beyond GATE_MIN, and every route's FC2 input is per-token NVFP4-exact,
-    for both activations."""
+    tensor), every gate is beyond GATE_MIN, and every route's FC2 input, stored in BF16, is
+    per-token NVFP4-exact, for both activations; the token redraw keeps every c**2 away from BF16
+    rounding boundaries."""
     g = ou.make_generator()
     inter, hidden = 96, 160
     for gated in (False, True):
@@ -213,10 +236,13 @@ def test_structured_inputs_are_lossless():
         ou.assert_exact(spec.nvfp4_per_token_roundtrip(x), x, what="tokens per token")
         for e in range(3):
             ou.assert_exact(spec.nvfp4_weight_roundtrip(w1[e]), w1[e], what="W1 per tensor")
-        a = a.reshape(-1, inter)
+        a = BF16(a.reshape(-1, inter))  # the kernel stores the FC2 input in BF16
         ou.assert_exact(spec.nvfp4_per_token_roundtrip(a), a, what=f"FC2 input (gated={gated})")
     w2 = spec.nvfp4_exact_values(256, 96, generator=g)
     ou.assert_exact(spec.nvfp4_weight_roundtrip(w2), w2, what="W2 per tensor")
+    exact = torch.tensor([1.0, 1.0 + 2.0**-8, 3.0, 0.0], dtype=torch.float64)  # 1 + 2**-8: a tie
+    distance = spec.bf16_tie_distance(exact)
+    assert distance[1] == 0 and bool((distance[[0, 2, 3]] >= 2.0**-9).all()), distance
 
 
 @pytest.mark.parametrize("bad", ["activation", "probs", "hidden"])

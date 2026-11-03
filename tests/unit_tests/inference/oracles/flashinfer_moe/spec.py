@@ -342,6 +342,12 @@ def relu2(z: torch.Tensor) -> torch.Tensor:
     return torch.relu(z).square()
 
 
+def relu2_of_bf16(z: torch.Tensor) -> torch.Tensor:
+    """Squared ReLU of the FC1 output stored in BF16: GEMM1 writes BF16 and a separate kernel
+    applies the activation (FlashInfer's unfused CUTLASS MoE activation; MCore's BF16 path)."""
+    return relu2(z.to(torch.bfloat16).to(z.dtype))
+
+
 def clamped_relu2(limit: float) -> Callable[[torch.Tensor], torch.Tensor]:
     """``(L * tanh(relu(z) / L))**2``: MCore's squared ReLU with ``activation_func_tanh_clamp_scale
     = L``."""
@@ -391,6 +397,15 @@ def moe_reference(
             a = act_round(a)
         out[rows] += (weight[:, None] * (a @ w2[j].to(x.dtype).T)).to(out.dtype)
     return out
+
+
+def bf16_tie_distance(values: torch.Tensor) -> torch.Tensor:
+    """Distance from each value to the nearest BF16 rounding boundary (the midpoint between two
+    BF16 neighbours), relative to the value; ``inf`` for zeros (fp64)."""
+    v = values.double()
+    r = v.to(torch.bfloat16).double()
+    dist = ou.ulp(v, torch.bfloat16) / 2 - (v - r).abs()
+    return torch.where(v != 0, dist / v.abs().clamp(min=1e-300), torch.full_like(v, math.inf))
 
 
 def round_to(dtype: torch.dtype) -> Callable[[torch.Tensor], torch.Tensor]:

@@ -261,33 +261,50 @@ def _decode_routed(x: torch.Tensor, padded: int) -> torch.Tensor:
     return spec.mxfp8_decode(codes.cpu(), scales.cpu())
 
 
+def _assert_other_blocks_exact(x: torch.Tensor, row: int, block: int, what: str):
+    """Every block but ``(row, block)`` equals the spec, so the special value stayed in its own
+    block (the routed call pads to 128 columns: 4 blocks per row here)."""
+    keep = torch.ones(x.shape[0], 4, dtype=torch.bool)
+    keep[row, block] = False  # the special value's own block is otherwise unspecified
+    finite = x.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+    ref_codes, ref_scales = _expected(finite, 128)
+    codes, scales = _quantize_routed(x.cuda(), 128)
+    mask = keep.repeat_interleave(32, -1)
+    ou.assert_exact(codes.cpu()[mask], ref_codes[mask], what=f"codes outside the {what} block")
+    ou.assert_exact(scales.cpu()[keep], ref_scales[keep], what=f"scales outside the {what} block")
+
+
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
 def test_nan_element_stays_nan_and_is_isolated():
+    """A NaN element must decode to NaN (E4M3 0x7F/0xFF or an E8M0 0xFF scale), as the OCP FP8
+    conversion and torch's float8 cast keep NaN. FlashInfer 0.7.2.post1 gives a finite value
+    (finding O4b-N1, GB200): its amax ignores NaN (``__hmax2``) and its saturating clamp
+    (``fminf``/``fmaxf``) turns the NaN into +448."""
     spec.require_flashinfer()
     x = _hidden(4, 128, ou.make_generator())
     x[1, 37] = float("nan")
+    _assert_other_blocks_exact(x, 1, 1, "NaN")
     decoded = _decode_routed(x.cuda(), 128)
     assert torch.isnan(decoded[1, 37]), (
         f"a NaN input element decoded to the finite value {float(decoded[1, 37])!r}: MXFP8 has"
         " NaN encodings (E4M3 0x7F/0xFF, E8M0 0xFF) and NaN must not be masked"
     )
-    keep = torch.ones(4, 4, dtype=torch.bool)
-    keep[1, 1] = False  # the NaN's own block is otherwise unspecified
-    ref_codes, ref_scales = _expected(x, 128)
-    codes, scales = _quantize_routed(x.cuda(), 128)
-    mask = keep.repeat_interleave(32, -1)
-    ou.assert_exact(codes.cpu()[mask], ref_codes[mask], what="codes outside the NaN block")
-    ou.assert_exact(scales.cpu()[keep], ref_scales[keep], what="scales outside the NaN block")
 
 
 @pytest.mark.launch_on_gb200
 @ou.requires_sm(ou.BLACKWELL)
 @pytest.mark.parametrize("sign", [1.0, -1.0], ids=["+inf", "-inf"])
 def test_infinite_element_saturates_with_its_sign_and_is_isolated(sign):
+    """An infinite element must decode to NaN or to the largest MXFP8 magnitude with its sign
+    (saturating conversion; FlashInfer's own comment: "inf / overflow map to the max finite
+    value"). FlashInfer 0.7.2.post1 turns -inf into +448 * 2**127 (finding O4b-N2, GB200): the
+    scale saturates to 2**127, ``rcp.approx.ftz`` of it flushes to 0, ``-inf * 0`` is NaN and the
+    clamp makes it +448."""
     spec.require_flashinfer()
     x = _hidden(4, 128, ou.make_generator())
     x[2, 70] = sign * float("inf")
+    _assert_other_blocks_exact(x, 2, 2, "inf")
     decoded = _decode_routed(x.cuda(), 128)
     got = float(decoded[2, 70])
     largest = 448.0 * 2.0**127
@@ -295,13 +312,6 @@ def test_infinite_element_saturates_with_its_sign_and_is_isolated(sign):
         f"{sign * float('inf')} decoded to {got!r}; expected NaN or {sign * largest!r} (the"
         " largest MXFP8 magnitude, with the input's sign)"
     )
-    keep = torch.ones(4, 4, dtype=torch.bool)
-    keep[2, 2] = False
-    ref_codes, ref_scales = _expected(x.nan_to_num(posinf=0.0, neginf=0.0), 128)
-    codes, scales = _quantize_routed(x.cuda(), 128)
-    mask = keep.repeat_interleave(32, -1)
-    ou.assert_exact(codes.cpu()[mask], ref_codes[mask], what="codes outside the inf block")
-    ou.assert_exact(scales.cpu()[keep], ref_scales[keep], what="scales outside the inf block")
 
 
 SWIZZLED = ou.pairwise_cases({"rows": [1, 127, 128, 129, 300], "hidden": [32, 160, 2688, 4096]})
