@@ -26,6 +26,8 @@ from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
+    _get_megatron_emerging_optimizer,
+    _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
@@ -1858,3 +1860,23 @@ def test_float16_optimizer_rejects_unmatchable_main_params():
     new_optimizer = _float16_optimizer(_decay_layer_params(fp32_decay=True))
     with pytest.raises(RuntimeError, match="Cannot match the 9 saved main params"):
         new_optimizer.load_state_dict(state_dict)
+
+
+def test_param_group_optimizer_requires_resolved_collection(mocker):
+    """The helpers below get_megatron_optimizer never resolve process groups themselves."""
+    mocker.patch('megatron.core.optimizer.FP32Optimizer')
+    param = torch.nn.Parameter(torch.zeros(2, device='cuda'))
+    with pytest.raises(ValueError, match='pg_collection must be resolved'):
+        _get_megatron_optimizer_based_on_param_groups(
+            OptimizerConfig(optimizer='sgd', lr=0.1),
+            model_chunks=[nn.Linear(2, 2)],
+            param_groups=[{'params': [param]}],
+        )
+
+
+@pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")
+def test_emerging_optimizer_requires_resolved_collection():
+    with pytest.raises(ValueError, match='pg_collection must be resolved'):
+        _get_megatron_emerging_optimizer(
+            OptimizerConfig(optimizer='muon', lr=0.01), [nn.Linear(2, 2)]
+        )
