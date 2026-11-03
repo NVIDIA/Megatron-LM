@@ -35,9 +35,9 @@ constant-level blocks of 16 along I. Then each route's FC2 input is ``c**2`` (``
 also for SwiGLU, whose gates are kept beyond |64| so ``silu(g) = g`` or 0 in FP32 and FP64)
 times a power-of-two pattern, which BF16 storage keeps and per-token NVFP4 represents exactly
 for any ``c``. The BF16 storage rounds ``c**2``, a common factor of the row: the reference and
-the trusted implementation round it too, and tokens whose ``c**2`` lies within 2**-16
-(relative) of a BF16 rounding boundary are redrawn, so FP32 noise cannot round it the other
-way. Per-token
+the trusted implementation round it too, and tokens whose ``c**2`` lies closer to a BF16
+rounding boundary than FP32 evaluation noise could move it (``spec.near_bf16_tie``) are
+redrawn, so the kernel cannot round it the other way. Per-token
 magnitudes span 2**-13..2**13 (2**4..2**12 gated), so a per-token scale error shows (a cosine
 check would not see it for Relu2: ``relu(s z)**2 = s**2 relu(z)**2``). Tolerance class: floating
 point, per row, bounded by a trusted fp32 torch implementation whose weighted route outputs are
@@ -58,9 +58,6 @@ from tests.unit_tests.inference.oracles.flashinfer_moe import spec
 
 RELU2, SWIGLU = 6, 3  # FlashInfer ActivationType values Megatron passes
 GATE_MIN = 64.0  # |gate| beyond this: sigmoid is exactly 1 (or 0) in FP32 and its silu exact
-# Tokens keep c**2 at least this far (relative) from a BF16 rounding boundary: FP32 evaluation
-# noise (a few 2**-23) cannot then round the BF16-stored FC2 input to the other neighbour.
-TIE_MARGIN = 2.0**-16
 BF16 = spec.round_to(torch.bfloat16)
 
 
@@ -106,8 +103,8 @@ class Problem:
         x = spec.nvfp4_exact_values(tokens, hidden, generator=g, row_exponents=rows)
         if gated:  # v0 . x > 0 and large: every gate is beyond GATE_MIN
             x = x.abs() * torch.sign(self.v0)
-        for _ in range(100):  # redraw tokens whose c**2 is near a BF16 rounding boundary
-            near = spec.bf16_tie_distance((x @ self.v0).square()) < TIE_MARGIN
+        for _ in range(100):  # redraw tokens whose c**2 FP32 noise could round the other way
+            near = spec.near_bf16_tie(x @ self.v0, x * self.v0, power=2)
             if not bool(near.any()):
                 break
             fresh = spec.nvfp4_exact_values(
@@ -243,6 +240,9 @@ def test_structured_inputs_are_lossless():
     exact = torch.tensor([1.0, 1.0 + 2.0**-8, 3.0, 0.0], dtype=torch.float64)  # 1 + 2**-8: a tie
     distance = spec.bf16_tie_distance(exact)
     assert distance[1] == 0 and bool((distance[[0, 2, 3]] >= 2.0**-9).all()), distance
+    terms = torch.ones(4, 256, dtype=torch.float64)  # noise 2**-20 * 16 * 16 = 2**-12 absolute
+    near = spec.near_bf16_tie(exact * 256, terms)
+    assert near.tolist() == [False, True, False, True], near
 
 
 @pytest.mark.parametrize("bad", ["activation", "probs", "hidden"])

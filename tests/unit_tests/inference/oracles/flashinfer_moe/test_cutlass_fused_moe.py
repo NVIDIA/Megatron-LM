@@ -28,10 +28,11 @@ Contract (from the call sites, MCore's MoE math and FlashInfer's documented API)
   deterministic or batch-invariant configs; both finalize paths are covered here and the
   results are the same contract.
 
-Oracle: ``spec.moe_reference`` in fp64. BF16: random inputs; the reference rounds to BF16
-where the contract stores BF16 (the FC1 output for Relu2, the FC2 input) and the trusted
-implementation is torch in fp32 (TF32 off) with the same BF16 storage and BF16 route
-accumulation;
+Oracle: ``spec.moe_reference`` in fp64. BF16: random ``x`` and ``W2``; ClampedRelu2 random
+``W1``, Relu2 a rank-1 ``W1`` (``Bf16Problem``: the BF16-stored FC1 output then has one rounding
+decision per token, kept away from BF16 ties); the reference rounds to BF16 where the contract
+stores BF16 (the FC1 output for Relu2, the FC2 input) and the trusted implementation is torch in
+fp32 (TF32 off) with the same BF16 storage and BF16 route accumulation;
 tolerance class floating point, per row, factor 2 (one BF16 rounding of the FC2 input more or
 less moves the output by less than half a BF16 ulp, so the bound does not depend on which side
 of a rounding boundary each implementation lands). MXFP8 ``ClampedRelu2``: a rank-1 ``W1`` and
@@ -133,15 +134,43 @@ def _unfused_finalize(monkeypatch):
 
 
 class Bf16Problem:
-    """Random BF16 routed-MoE inputs on CUDA."""
+    """BF16 routed-MoE inputs on CUDA: random, or (``rank1``) with a rank-1 FC1.
 
-    def __init__(self, *, tokens, hidden, inter, local, ep_size, ep_rank, top_k, pattern, seed=0):
+    Unfused Relu2 stores the FC1 output in BF16, so an FC1 output within FP32 noise of a BF16
+    rounding boundary may round either way, and one such element with a large activation moves
+    its whole output row by up to an ulp (seen on H100). ``rank1`` makes ``W1[e] = u v^T`` with
+    ``u = +-2**-n``: every FC1 output of a token is ``u_i * c`` with one ``c = v . x`` (up to a
+    power of two per expert), so one rounding decision per token remains, and tokens whose ``c``
+    is that close to a BF16 tie are redrawn. ``x`` and ``W2`` stay random and dense.
+    """
+
+    def __init__(
+        self, *, tokens, hidden, inter, local, ep_size, ep_rank, top_k, pattern, seed=0, rank1=False
+    ):
         g = ou.make_generator(ou.DEFAULT_SEED + seed)
         self.local, self.offset = local, ep_rank * local
         experts = local * ep_size
-        self.w1 = (torch.randn(local, inter, hidden, generator=g) / hidden**0.5).bfloat16().cuda()
+        if rank1:
+            u, v = spec.rank1_factors(
+                local, inter, hidden, row_block=32, generator=g, v_scale_exponents=(-1, 1)
+            )
+            w1 = (u[:, :, None] * v[:, None, :] * 2.0**-3).bfloat16()
+        else:
+            w1 = (torch.randn(local, inter, hidden, generator=g) / hidden**0.5).bfloat16()
+        self.w1 = w1.cuda()
         self.w2 = (torch.randn(local, hidden, inter, generator=g) / inter**0.5).bfloat16().cuda()
-        self.x = torch.randn(tokens, hidden, generator=g).bfloat16().cuda()
+        x = torch.randn(tokens, hidden, generator=g).bfloat16()
+        if rank1:
+            v0 = (v[0] / v[0, 0]).bfloat16()
+            for _ in range(100):  # redraw tokens whose c FP32 noise could round the other way
+                terms = x.double() * v0.double()
+                near = spec.near_bf16_tie(terms.sum(-1), terms)
+                if not bool(near.any()):
+                    break
+                x[near] = torch.randn(int(near.sum()), hidden, generator=g).bfloat16()
+            else:
+                raise AssertionError("could not draw tokens away from BF16 rounding boundaries")
+        self.x = x.cuda()
         empty_rows = list(range(0, tokens, 3)) if pattern == "empty-rows" else ()
         empty_expert = self.offset + local // 2 if pattern == "empty-expert" else None
         top_k = min(top_k, experts - (empty_expert is not None))
@@ -214,6 +243,7 @@ def _run_bf16(case, monkeypatch, activation, clamp=None):
         ep_rank=ep_rank,
         top_k=case["top_k"],
         pattern=case["pattern"],
+        rank1=clamp is None,  # unfused Relu2 stores the FC1 output in BF16
     )
     experts = _experts(
         problem.w1, problem.w2, ep_size=ep_size, ep_rank=ep_rank, activation=activation, clamp=clamp
@@ -260,6 +290,7 @@ def test_bf16_relu2_small_case():
         ep_rank=1,
         top_k=2,
         pattern="empty-rows",
+        rank1=True,
     )
     experts = _experts(problem.w1, problem.w2, ep_size=2, ep_rank=1, activation="Relu2")
     problem.check(_forward(experts, problem.x, problem.ids, problem.probs), BF16_RELU2, "small")
@@ -298,7 +329,15 @@ def test_bf16_relu2_every_gemm2_tactic(finalize, monkeypatch):
 
     monkeypatch.setattr(AutoTuner, "choose_one", pinned)
     problem = Bf16Problem(
-        tokens=129, hidden=256, inter=384, local=8, ep_size=2, ep_rank=1, top_k=2, pattern="random"
+        tokens=129,
+        hidden=256,
+        inter=384,
+        local=8,
+        ep_size=2,
+        ep_rank=1,
+        top_k=2,
+        pattern="random",
+        rank1=True,
     )
     experts = _experts(problem.w1, problem.w2, ep_size=2, ep_rank=1, activation="Relu2")
     problem.check(_forward(experts, problem.x, problem.ids, problem.probs), BF16_RELU2, "default")

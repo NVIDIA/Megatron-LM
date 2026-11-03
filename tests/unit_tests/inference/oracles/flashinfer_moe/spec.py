@@ -104,10 +104,9 @@ def clear_nvfp4_recipe_env(monkeypatch) -> None:
 
 
 def pow2(e: torch.Tensor) -> torch.Tensor:
-    """Exact fp64 ``2**e`` for integer-valued ``e`` in [-1022, 1023], built from the exponent bits
-    (``torch.pow`` on CUDA is not exact for fp64)."""
-    bits = (e.to(torch.int64) + 1023) << 52
-    return bits.view(torch.float64)
+    """Exact fp64 ``2**e`` for integer-valued ``e`` (the harness's bit-built ``pow2``; ``torch.pow``
+    on CUDA is not exact for fp64)."""
+    return ou.pow2(e)
 
 
 def e4m3_values(device_: torch.device | str = "cpu") -> torch.Tensor:
@@ -406,6 +405,28 @@ def bf16_tie_distance(values: torch.Tensor) -> torch.Tensor:
     r = v.to(torch.bfloat16).double()
     dist = ou.ulp(v, torch.bfloat16) / 2 - (v - r).abs()
     return torch.where(v != 0, dist / v.abs().clamp(min=1e-300), torch.full_like(v, math.inf))
+
+
+FP32_SUM_NOISE = 2.0**-20
+"""Bound, per ``sqrt(n) * ||t||_2``, on how far an FP32 evaluation of ``c = sum_h t_h`` (n terms,
+any order or blocking) lands from the exact value. A sequential FP32 sum errs by about
+``2**-24 sqrt(n) ||t||_2`` (rms of a random walk of roundings of partial sums ~ sqrt(k) |t|);
+the bound is 16x that."""
+
+
+def near_bf16_tie(c: torch.Tensor, terms: torch.Tensor, power: int = 1) -> torch.Tensor:
+    """True where FP32 noise in ``c = terms.sum(-1)`` could round ``c**power`` to the other BF16
+    neighbour than the exact value does (fp64 in; ``c == 0`` counts as near).
+
+    The kernel stores ``u * c**power`` in BF16 with ``u`` a power of two (``spec.rank1_factors``),
+    so one rounding decision per token decides the whole row: redraw the tokens this flags.
+    """
+    c, terms = c.double(), terms.double()
+    noise = FP32_SUM_NOISE * terms.shape[-1] ** 0.5 * terms.norm(dim=-1)
+    noise = noise / c.abs().clamp(min=1e-300)
+    # Scale factors applied in FP32 after the sum (per-token and per-expert scales) add ~2**-23.
+    relative = power * (noise + 2.0**-21)
+    return (c == 0) | (bf16_tie_distance(c**power) <= relative)
 
 
 def round_to(dtype: torch.dtype) -> Callable[[torch.Tensor], torch.Tensor]:
