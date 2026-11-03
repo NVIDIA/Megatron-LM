@@ -5,8 +5,8 @@
 The `qwen` variant splits its n-gram windows on an EOS token, so packed rows work for it
 without any extra information. The `deepseek` variant has no such token, so its boundaries
 come from `cu_seqlens`. Both end up in the same place: a window never reaches back past the
-first token of its own document, while the causal convolution deliberately still mixes across
-the boundary — that is what both published references do.
+first token of its own document. The causal convolution restarts at each packed document as
+well (module-level checks: ``test_qwen_variant.py`` and ``test_fused_dense.py``).
 """
 
 import torch

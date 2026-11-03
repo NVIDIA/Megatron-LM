@@ -212,20 +212,31 @@ if HAVE_TRITON:
         cols,
         gamma,
         B,
+        seg_ptr,
         NS: tl.constexpr,
         H: tl.constexpr,
         K: tl.constexpr,
         DIL: tl.constexpr,
         DT: tl.constexpr,
+        SEG: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """Depthwise causal convolution of the normed value; also returns the value at rows."""
+        """Depthwise causal convolution of the normed value; also returns the value at rows.
+
+        With ``SEG``, ``seg_ptr`` holds each row's offset in its packed document, and a tap
+        that would reach before the document start reads zero.
+        """
         acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
         value_t = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
+        offset = tl.zeros((BLOCK_T,), dtype=tl.int64)
+        if SEG:
+            offset = tl.load(seg_ptr + rows, mask=rmask, other=0)
         for j in tl.static_range(K):
             src = rows - ((K - 1 - j) * DIL) * B
             valid = rmask & (src >= 0)
+            if SEG:
+                valid = valid & (offset >= (K - 1 - j) * DIL)
             value, rv = _value_tile(sv_ptr, gate_ptr, rv_ptr, src, valid, s, hc, NS, H, DT)
             normed = _rnd((value * rv[:, None]) * gamma[None, :], DT)
             w = tl.load(w_ptr + cols * K + j).to(tl.float32)
@@ -248,6 +259,7 @@ if HAVE_TRITON:
         gc_ptr,
         w_ptr,
         out_ptr,
+        seg_ptr,
         T,
         B,
         NS: tl.constexpr,
@@ -255,6 +267,7 @@ if HAVE_TRITON:
         K: tl.constexpr,
         DIL: tl.constexpr,
         ZC: tl.constexpr,
+        SEG: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -265,8 +278,8 @@ if HAVE_TRITON:
         rv_ptr = stats_ptr + 4 * T * NS
         gamma = _load_gamma(gc_ptr, cols, ZC)
         acc, value_t = _conv_tile(
-            sv_ptr, gate_ptr, rv_ptr, w_ptr, rows, rmask, s, hc, cols, gamma, B,
-            NS, H, K, DIL, DT, BLOCK_T, BLOCK_C,
+            sv_ptr, gate_ptr, rv_ptr, w_ptr, rows, rmask, s, hc, cols, gamma, B, seg_ptr,
+            NS, H, K, DIL, DT, SEG, BLOCK_T, BLOCK_C,
         )  # fmt: skip
         conv = _rnd(acc, DT)
         silu = _rnd(conv / (1.0 + tl.exp(-conv)), DT)
@@ -282,6 +295,7 @@ if HAVE_TRITON:
         w_ptr,
         gconv_ptr,
         dw_ptr,
+        seg_ptr,
         T,
         B,
         NS: tl.constexpr,
@@ -289,6 +303,7 @@ if HAVE_TRITON:
         K: tl.constexpr,
         DIL: tl.constexpr,
         ZC: tl.constexpr,
+        SEG: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -299,8 +314,8 @@ if HAVE_TRITON:
         rv_ptr = stats_ptr + 4 * T * NS
         gamma = _load_gamma(gc_ptr, cols, ZC)
         acc, _ = _conv_tile(
-            sv_ptr, gate_ptr, rv_ptr, w_ptr, rows, rmask, s, hc, cols, gamma, B,
-            NS, H, K, DIL, DT, BLOCK_T, BLOCK_C,
+            sv_ptr, gate_ptr, rv_ptr, w_ptr, rows, rmask, s, hc, cols, gamma, B, seg_ptr,
+            NS, H, K, DIL, DT, SEG, BLOCK_T, BLOCK_C,
         )  # fmt: skip
         conv = _rnd(acc, DT)
         sig = 1.0 / (1.0 + tl.exp(-conv))
@@ -310,9 +325,14 @@ if HAVE_TRITON:
         tl.store(gconv_ptr + offs, gconv.to(DT), mask=rmask[:, None])
         # Weight gradient partial for this token tile: sum_t gconv[t] * normed[t - shift_j].
         pid_t = tl.program_id(0).to(tl.int64)
+        offset = tl.zeros((BLOCK_T,), dtype=tl.int64)
+        if SEG:
+            offset = tl.load(seg_ptr + rows, mask=rmask, other=0)
         for j in tl.static_range(K):
             src = rows - ((K - 1 - j) * DIL) * B
             valid = rmask & (src >= 0)
+            if SEG:
+                valid = valid & (offset >= (K - 1 - j) * DIL)
             value, rv = _value_tile(sv_ptr, gate_ptr, rv_ptr, src, valid, s, hc, NS, H, DT)
             normed = _rnd((value * rv[:, None]) * gamma[None, :], DT)
             tl.store(dw_ptr + (pid_t * K + j) * C + cols, tl.sum(gconv * normed, axis=0))
@@ -327,6 +347,7 @@ if HAVE_TRITON:
         gnormed_ptr,
         dot_ptr,
         dgc_ptr,
+        seg_ptr,
         T,
         B,
         NS: tl.constexpr,
@@ -334,6 +355,7 @@ if HAVE_TRITON:
         K: tl.constexpr,
         DIL: tl.constexpr,
         ZC: tl.constexpr,
+        SEG: tl.constexpr,
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
@@ -347,6 +369,10 @@ if HAVE_TRITON:
         for j in tl.static_range(K):
             dst = rows + ((K - 1 - j) * DIL) * B
             valid = rmask & (dst < T)
+            if SEG:
+                # The output at dst used this row only if dst is still inside this document.
+                dst_offset = tl.load(seg_ptr + dst, mask=valid, other=0)
+                valid = valid & (dst_offset >= (K - 1 - j) * DIL)
             w = tl.load(w_ptr + cols * K + j).to(tl.float32)
             g = tl.load(
                 gconv_ptr + dst[:, None] * C + cols[None, :], mask=valid[:, None], other=0.0
@@ -576,8 +602,13 @@ class FusedEngramDense(torch.autograd.Function):
         eps: float,
         zero_centered: bool,
         dilation: int,
+        segment_offsets: Tensor | None = None,
     ) -> Tensor:
-        """Gate, conv-norm and short convolution of the Engram dense half."""
+        """Gate, conv-norm and short convolution of the Engram dense half.
+
+        ``segment_offsets`` (int64 ``[S * B]``, optional) is each row's offset in its packed
+        document; the convolution does not reach before a document start.
+        """
         seq, batch = hidden.shape[0], hidden.shape[1]
         hidden_size = value.shape[-1]
         block_c = channel_block(hidden_size)
@@ -598,6 +629,16 @@ class FusedEngramDense(torch.autograd.Function):
             (_NUM_STATS, tokens, num_streams), device=hidden.device, dtype=torch.float32
         )
         output = torch.empty_like(hidden)
+        has_segments = segment_offsets is not None
+        if has_segments:
+            segment_offsets = segment_offsets.to(device=hidden.device, dtype=torch.int64)
+            segment_offsets = segment_offsets.contiguous()
+            if segment_offsets.numel() != tokens:
+                raise ValueError(
+                    f"segment_offsets has {segment_offsets.numel()} entries for {tokens} rows."
+                )
+        # Unused unless has_segments; any int64 tensor serves as the placeholder pointer.
+        seg_arg = segment_offsets if has_segments else stats
         block_h = triton.next_power_of_2(hidden_size)
         if tokens > 0:
             _gate_fwd_kernel[(tokens,)](
@@ -623,6 +664,7 @@ class FusedEngramDense(torch.autograd.Function):
                 conv_gamma,
                 conv_weight,
                 output,
+                seg_arg,
                 tokens,
                 batch,
                 NS=num_streams,
@@ -630,20 +672,22 @@ class FusedEngramDense(torch.autograd.Function):
                 K=kernel_size,
                 DIL=dilation,
                 ZC=zero_centered,
+                SEG=has_segments,
                 BLOCK_T=_BLOCK_T,
                 BLOCK_C=block_c,
                 num_warps=_TILE_WARPS,
             )
         ctx.save_for_backward(
-            key, hidden, value, key_gamma, query_gamma, conv_gamma, conv_weight, stats
+            key, hidden, value, key_gamma, query_gamma, conv_gamma, conv_weight, stats, seg_arg
         )
+        ctx.has_segments = has_segments
         ctx.config = (num_streams, zero_centered, dilation, seq, batch)
         return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         """Fused backward: key, hidden, value, gamma and convolution-weight gradients."""
-        key, hidden, value, key_gamma, query_gamma, conv_gamma, conv_weight, stats = (
+        key, hidden, value, key_gamma, query_gamma, conv_gamma, conv_weight, stats, seg_arg = (
             ctx.saved_tensors
         )
         num_streams, zero_centered, dilation, seq, batch = ctx.config
@@ -674,7 +718,7 @@ class FusedEngramDense(torch.autograd.Function):
         grad_key = torch.empty_like(key)
         grad_hidden = torch.empty_like(hidden)
         common = dict(NS=num_streams, H=hidden_size, BLOCK_T=_BLOCK_T, BLOCK_C=block_c)
-        conv = dict(K=kernel_size, DIL=dilation, ZC=zero_centered)
+        conv = dict(K=kernel_size, DIL=dilation, ZC=zero_centered, SEG=ctx.has_segments)
 
         if tokens > 0:
             _conv_bwd_kernel[grid](
@@ -685,6 +729,7 @@ class FusedEngramDense(torch.autograd.Function):
                 conv_weight,
                 grad_conv,
                 dw_partial,
+                seg_arg,
                 tokens,
                 batch,
                 **common,
@@ -700,6 +745,7 @@ class FusedEngramDense(torch.autograd.Function):
                 grad_normed,
                 dot_partial,
                 dgc_partial,
+                seg_arg,
                 tokens,
                 batch,
                 **common,
@@ -782,6 +828,7 @@ class FusedEngramDense(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -797,6 +844,7 @@ def fused_engram_dense(
     eps: float,
     zero_centered: bool,
     dilation: int,
+    segment_offsets: Tensor | None = None,
 ) -> Tensor:
     """Functional entry point for :class:`FusedEngramDense`."""
     return FusedEngramDense.apply(
@@ -811,4 +859,5 @@ def fused_engram_dense(
         eps,
         zero_centered,
         dilation,
+        segment_offsets,
     )

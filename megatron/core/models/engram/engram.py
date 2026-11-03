@@ -33,7 +33,11 @@ from .cp_layout import (
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .fused_dense import HAVE_TRITON, channel_block, fused_engram_dense
-from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .hashing import (
+    build_ngram_hashes,
+    segment_starts_from_cu_seqlens,
+    slice_hashes_for_sequence_parallel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +174,62 @@ def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
     if cu_seqlens is None:
         return None
     return cu_seqlens.reshape(-1)
+
+
+def _segment_offsets(cu_seqlens: Tensor, sequence_length: int) -> Tensor:
+    """Offset of each of ``sequence_length`` positions in its packed document (int64 ``[S]``)."""
+    starts = segment_starts_from_cu_seqlens(cu_seqlens, 1, sequence_length)[0]
+    return torch.arange(sequence_length, device=starts.device, dtype=torch.int64) - starts
+
+
+class _SegmentedCausalConv(torch.autograd.Function):
+    """Dilated depthwise causal convolution that does not reach across packed documents.
+
+    ``padded`` is ``[B, C, history + S]`` (left context first), ``weight`` ``[C, 1, K]`` and
+    ``offsets`` ``[S]`` each output position's offset in its document. Tap ``j`` reads
+    ``(K - 1 - j) * dilation`` positions back and contributes only where the offset reaches
+    that far, so every document is convolved as if it stood alone. Accumulates in at least
+    fp32 (fp64 inputs stay fp64), like the dense convolution it replaces for packed rows.
+    Static shapes, no host reads.
+    """
+
+    @staticmethod
+    def forward(ctx, padded: Tensor, weight: Tensor, offsets: Tensor, dilation: int) -> Tensor:
+        """Convolve ``padded`` with taps masked at each position's document start."""
+        kernel_size = weight.shape[-1]
+        length = offsets.shape[0]
+        history = (kernel_size - 1) * dilation
+        accumulate = torch.promote_types(padded.dtype, torch.float32)
+        output = None
+        for tap in range(kernel_size):
+            shift = (kernel_size - 1 - tap) * dilation
+            window = padded[..., history - shift : history - shift + length]
+            term = window.to(accumulate) * weight[:, :, tap].to(accumulate)
+            if shift:
+                term = term * (offsets >= shift)
+            output = term if output is None else output + term
+        ctx.save_for_backward(padded, weight, offsets)
+        ctx.dilation = dilation
+        return output.to(padded.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """Input and weight gradients with the forward's document masks."""
+        padded, weight, offsets = ctx.saved_tensors
+        kernel_size = weight.shape[-1]
+        length = offsets.shape[0]
+        history = (kernel_size - 1) * ctx.dilation
+        accumulate = torch.promote_types(padded.dtype, torch.float32)
+        grad = grad_output.to(accumulate)
+        grad_padded = torch.zeros(padded.shape, dtype=accumulate, device=padded.device)
+        grad_weight = torch.empty(weight.shape, dtype=accumulate, device=weight.device)
+        for tap in range(kernel_size):
+            shift = (kernel_size - 1 - tap) * ctx.dilation
+            masked = grad * (offsets >= shift) if shift else grad
+            window = slice(history - shift, history - shift + length)
+            grad_padded[..., window] += masked * weight[:, :, tap].to(accumulate)
+            grad_weight[:, 0, tap] = (masked * padded[..., window].to(accumulate)).sum(dim=(0, 2))
+        return grad_padded.to(padded.dtype), grad_weight.to(weight.dtype), None, None
 
 
 class _ContextParallelConvHalo(torch.autograd.Function):
@@ -466,6 +526,13 @@ class Engram(MegatronModule):
         return _SequenceParallelConvHalo.apply(normed, self.conv_history_length, self.tp_group)
 
     def _short_convolution(self, value: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
+        """Causal short convolution of the gated value.
+
+        With ``cu_seqlens`` (a packed THD row) the convolution restarts at every document
+        start, so a packed row matches its documents run as separate samples (as the
+        reference model sees them), the same isolation attention, GDN and the n-gram hashes
+        keep.
+        """
         cp_size = get_pg_size(self.cp_group)
         if cp_size > 1 and cu_seqlens is not None:
             # Packed rows zigzag per document, so the chunk map changes with the batch and
@@ -479,7 +546,9 @@ class Engram(MegatronModule):
             total_length = int(cu_seqlens[-1].item())
             restored = gather_sequence_thd(value, self.cp_group, cu_seqlens, total_length)
             convolved = scatter_sequence_thd(
-                self._short_convolution_local(restored), self.cp_group, cu_seqlens
+                self._short_convolution_local(restored, _segment_offsets(cu_seqlens, total_length)),
+                self.cp_group,
+                cu_seqlens,
             )
             if sequence_parallel:
                 convolved = scatter_to_sequence_parallel_region(convolved, group=self.tp_group)
@@ -514,17 +583,40 @@ class Engram(MegatronModule):
             if sequence_parallel:
                 convolved = scatter_to_sequence_parallel_region(convolved, group=self.tp_group)
             return convolved
-        return self._short_convolution_local(value)
+        offsets = None
+        if cu_seqlens is not None:
+            local_length = value.shape[0]
+            tp_size = get_pg_size(self.tp_group)
+            if self.config.sequence_parallel and tp_size > 1:
+                # This rank holds positions [rank * L, (rank + 1) * L) of the row; its halo
+                # holds the positions just before them.
+                offsets = _segment_offsets(cu_seqlens, local_length * tp_size)
+                start = get_pg_rank(self.tp_group) * local_length
+                offsets = offsets[start : start + local_length]
+            else:
+                offsets = _segment_offsets(cu_seqlens, local_length)
+        return self._short_convolution_local(value, offsets)
 
-    def _convolve_with_history(self, normed: Tensor, history: Tensor) -> Tensor:
-        """Valid causal convolution of ``normed`` given its explicit left context."""
+    def _convolve_with_history(
+        self, normed: Tensor, history: Tensor, offsets: Tensor | None = None
+    ) -> Tensor:
+        """Valid causal convolution of ``normed`` given its explicit left context.
+
+        ``offsets`` (``[S]``, optional) is each position's offset in its packed document; taps
+        that would reach before the document start read zero.
+        """
         sequence_length, batch_size, num_streams, hidden_size = normed.shape
         with_history = torch.cat((history, normed), dim=0)
         channels_first = with_history.permute(1, 2, 3, 0).reshape(
             batch_size, num_streams * hidden_size, sequence_length + self.conv_history_length
         )
         # Valid causal convolution over [history + local]: output length equals sequence_length.
-        convolved = self.short_conv(channels_first)
+        if offsets is None:
+            convolved = self.short_conv(channels_first)
+        else:
+            convolved = _SegmentedCausalConv.apply(
+                channels_first, self.short_conv.weight, offsets, self.short_conv.dilation[0]
+            )
         return (
             F.silu(convolved)
             .view(batch_size, num_streams, hidden_size, sequence_length)
@@ -532,10 +624,10 @@ class Engram(MegatronModule):
             .contiguous()
         )
 
-    def _short_convolution_local(self, value: Tensor) -> Tensor:
+    def _short_convolution_local(self, value: Tensor, offsets: Tensor | None = None) -> Tensor:
         """Convolve one contiguous slice, taking its left context from the SP halo or zeros."""
         normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
-        return self._convolve_with_history(normed, self._convolution_history(normed))
+        return self._convolve_with_history(normed, self._convolution_history(normed), offsets)
 
     def _short_convolution_cp_halo(self, value: Tensor) -> Tensor:
         """Phase B: give each of this rank's two zigzag chunks its own one-hop left context.
@@ -581,10 +673,10 @@ class Engram(MegatronModule):
     ) -> Tensor:
         """Return an Engram residual with the same standard or mHC layout as input.
 
-        ``packed_seq_params`` carries the packed (THD) document boundaries. It is only used to
-        stop an n-gram window from reaching back into the previous document of the same row;
-        the causal convolution deliberately still mixes across the boundary, matching both
-        published reference implementations.
+        ``packed_seq_params`` carries the packed (THD) document boundaries. Neither an n-gram
+        window nor the causal convolution reaches back into the previous document of the same
+        row: a packed row computes what its documents compute as separate samples, which is
+        how both published reference implementations see them (one sample per row).
         """
         if hidden_states.ndim != 3:
             raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
@@ -652,7 +744,7 @@ class Engram(MegatronModule):
         finally:
             nvtx_range_pop(message)
         if self._use_fused_dense(hidden_states):
-            return self._dense_fused(memory, hidden_states)
+            return self._dense_fused(memory, hidden_states, row_cu_seqlens)
         return self._dense_reference(memory, hidden_states, row_cu_seqlens)
 
     def _use_fused_dense(self, hidden_states: Tensor) -> bool:
@@ -670,7 +762,9 @@ class Engram(MegatronModule):
         # The sequence-parallel halo needs a left context from the previous TP rank.
         return not (self.config.sequence_parallel and get_pg_size(self.tp_group) > 1)
 
-    def _dense_fused(self, memory: Tensor, hidden_states: Tensor) -> Tensor:
+    def _dense_fused(
+        self, memory: Tensor, hidden_states: Tensor, row_cu_seqlens: Tensor | None = None
+    ) -> Tensor:
         """Projections in PyTorch, everything after them in the fused Triton kernels."""
         message = "engram.gate-projection"
         nvtx_range_push(message)
@@ -679,6 +773,17 @@ class Engram(MegatronModule):
             key = self.key_projection(memory)
         finally:
             nvtx_range_pop(message)
+
+        segment_offsets = None
+        if row_cu_seqlens is not None:
+            # One offset per [S, B] row, row-major like the kernels' flattened layout.
+            sequence_length, batch_size = hidden_states.shape[0], hidden_states.shape[1]
+            segment_offsets = (
+                _segment_offsets(row_cu_seqlens, sequence_length)
+                .unsqueeze(1)
+                .expand(sequence_length, batch_size)
+                .reshape(-1)
+            )
 
         message = "engram.fused-dense"
         nvtx_range_push(message)
@@ -695,6 +800,7 @@ class Engram(MegatronModule):
                 self.key_norm.eps,
                 self.key_norm.zero_centered,
                 self.engram_config.max_ngram_order,
+                segment_offsets,
             )
         finally:
             nvtx_range_pop(message)

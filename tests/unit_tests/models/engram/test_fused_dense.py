@@ -29,6 +29,7 @@ from megatron.core.models.engram.fused_dense import (
     FusedEngramDense,
     fused_engram_dense,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 
 from ._test_utils import make_module_config, make_pg_collection
 
@@ -73,12 +74,12 @@ def _build(hidden_size, num_streams, memory_dim, heads, order, kernel_size, voca
     return module.cuda()
 
 
-def _run(module, impl, hidden, tokens, grad):
+def _run(module, impl, hidden, tokens, grad, packed_seq_params=None):
     module.dense_impl = impl
     for parameter in module.parameters():
         parameter.grad = None
     hidden = hidden.detach().clone().requires_grad_(True)
-    output = module(hidden, tokens)
+    output = module(hidden, tokens, packed_seq_params=packed_seq_params)
     output.backward(grad)
     grads = {name: p.grad.detach().clone() for name, p in module.named_parameters()}
     grads["hidden"] = hidden.grad.detach().clone()
@@ -165,6 +166,55 @@ def test_fused_matches_reference(
             f"{name}: fused is further from fp64 ({fused_err:.3e}) than the reference "
             f"({ref_err:.3e})"
         )
+
+
+@pytest.mark.parametrize("zero_centered", [True, False])
+def test_fused_packed_rows_match_reference_and_standalone_documents(zero_centered):
+    """Packed THD rows: the fused convolution restarts at each document like the reference.
+
+    Documents include ones shorter than the receptive field and a one-token document. The
+    fused output of the packed row is bitwise the concatenation of the fused outputs of the
+    documents run alone (masked taps and the sequence start read the same zeros), and fused
+    matches the reference on the packed row within the bf16 floor of the dense test above.
+    """
+    module = _build(128, 2, 64, 4, 3, 4, 1000, torch.bfloat16)
+    for norm in (module.key_norm, module.query_norm, module.conv_norm):
+        norm.zero_centered = zero_centered
+    lengths = (100, 5, 1, 130, 64)
+    total = sum(lengths)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+    )
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_kv=max(lengths),
+    )
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    tokens = torch.randint(0, 1000, (1, total), device="cuda", generator=generator)
+    hidden = torch.randn(total, 1, 256, device="cuda", generator=generator).bfloat16()
+    grad = torch.randn(total, 1, 256, device="cuda", generator=generator).bfloat16()
+
+    out_ref, grads_ref = _run(module, "reference", hidden, tokens, grad, params)
+    out_fused, grads_fused = _run(module, "fused", hidden, tokens, grad, params)
+    for name in ("output", "value_projection.weight", "conv_norm.weight", "short_conv.weight"):
+        actual = out_fused if name == "output" else grads_fused[name]
+        expected = out_ref if name == "output" else grads_ref[name]
+        assert _rel_l2(actual, expected) <= 1e-3, name
+
+    starts = cu_seqlens[:-1].tolist()
+    alone = [
+        _run(module, "fused", hidden[s : s + n], tokens[:, s : s + n], grad[s : s + n])[0]
+        for s, n in zip(starts, lengths)
+    ]
+    assert torch.equal(out_fused, torch.cat(alone))
+
+    # Without the boundaries the convolution reaches across documents, so the packed row
+    # differs at the start of every later document: the test above is not vacuous.
+    out_unsegmented, _ = _run(module, "fused", hidden, tokens, grad)
+    assert not torch.equal(out_unsegmented[starts[1]], out_fused[starts[1]])
 
 
 def _reference_intermediates(module, key, hidden, value, grad):

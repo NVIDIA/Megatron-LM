@@ -20,7 +20,7 @@ variant-specific conditionals:
 | Table primes | next unused prime above each order budget | n-th prime after `ngram_vocab_size_base − 1`, per head |
 | n-gram boundary | left-pad with the compressed pad token | window resets at every EOS (`--engram-eos-token-id`) |
 | Projection bias / gamma | biased projections, ordinary gamma | bias-free, zero-centered group-norm gamma |
-| Packed (THD) rows | supported; boundaries come from `cu_seqlens` | supported; boundaries come from EOS and `cu_seqlens`, whichever is later |
+| Packed (THD) rows | supported; hash windows and the convolution restart at each `cu_seqlens` document | supported; hash windows restart at EOS and at each `cu_seqlens` document, the convolution at each `cu_seqlens` document |
 
 The qwen variant additionally requires `--engram-unigram-vocab-size` (the HF
 `config.vocab_size` bounding the multipliers; the padded vocabulary must not exceed it) and
@@ -29,8 +29,12 @@ fused key projection and one group RMSNorm per role across all residual streams 
 official Qwen layout, mathematically identical to per-stream projections and norms.
 
 The official convolution takes zero left context at the sequence start and does **not**
-segment at document boundaries: only the hash windows reset at EOS, while the 9-position
-convolution mixes across boundaries exactly as the reference implementation does.
+segment at EOS inside a row: only the hash windows reset at EOS, while the 9-position
+convolution mixes across them exactly as the reference implementation does. A packed (THD)
+row is different: its `cu_seqlens` documents are separate samples, which the reference model
+sees one per row. There both the hash windows and the convolution restart at every document
+start, so a packed row computes exactly what its documents compute alone, like attention and
+GDN do on the same row.
 Packed rows shorter than the capacity are zero-padded end to end (tokens by the prefetch,
 hidden states by ``pad_sequence_for_thd``); the padded tail is dummy sequence and the causal
 convolution cannot leak it into valid positions. Packed training with PP >= 3 is currently

@@ -23,6 +23,7 @@ from megatron.core.models.engram.config import (
 )
 from megatron.core.models.engram.engram import Engram
 from megatron.core.models.engram.hashing import build_ngram_hashes, shift_right_reset_at_eos
+from megatron.core.packed_seq_params import PackedSeqParams
 
 from ._test_utils import make_module_config, make_pg_collection
 
@@ -311,6 +312,58 @@ def test_thd_packed_row_matches_per_document_rows():
     torch.testing.assert_close(output_packed[doc_a.shape[1] + 1 + history :], output_b[history:])
     # Within the receptive field they intentionally differ (official conv is unsegmented).
     assert not torch.allclose(output_packed[doc_a.shape[1] + 1], output_b[0])
+
+
+def test_cu_seqlens_packed_row_equals_documents_standing_alone():
+    """A packed THD row (boundaries from cu_seqlens) computes what its documents compute as
+    separate samples: outputs and every gradient, n-gram windows and the causal convolution
+    both restarting at each document. Includes documents shorter than the convolution's
+    receptive field and a one-token document."""
+    module = _build_qwen_module(num_streams=2)
+    lengths = (20, 3, 1, 16)
+    assert min(lengths) < module.conv_history_length
+    docs = [torch.randint(0, _UNIGRAM_VOCAB - 1, (1, n), dtype=torch.int64) for n in lengths]
+    for doc in docs:
+        doc[doc == _EOS] = 1
+    packed = torch.cat(docs, dim=1)
+    total = packed.shape[1]
+    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_kv=max(lengths),
+    )
+    hidden = torch.randn(total, 1, 16, dtype=torch.float64)
+    projection = torch.randn(total, 1, 16, dtype=torch.float64)
+
+    def run(hidden_part, tokens, packed_seq_params=None):
+        hidden_part = hidden_part.detach().clone().requires_grad_(True)
+        output = module(hidden_part, tokens, packed_seq_params=packed_seq_params)
+        return output, hidden_part
+
+    module.zero_grad(set_to_none=True)
+    packed_out, packed_hidden = run(hidden, packed, params)
+    (packed_out * projection).sum().backward()
+    packed_grads = {n: p.grad.clone() for n, p in module.named_parameters() if p.grad is not None}
+
+    module.zero_grad(set_to_none=True)
+    starts = cu_seqlens[:-1].tolist()
+    alone_out, alone_hidden_grads = [], []
+    for start, doc in zip(starts, docs):
+        span = slice(start, start + doc.shape[1])
+        out, doc_hidden = run(hidden[span], doc)
+        (out * projection[span]).sum().backward()
+        alone_out.append(out.detach())
+        alone_hidden_grads.append(doc_hidden.grad)
+    alone_grads = {n: p.grad for n, p in module.named_parameters() if p.grad is not None}
+
+    torch.testing.assert_close(packed_out.detach(), torch.cat(alone_out))
+    torch.testing.assert_close(packed_hidden.grad, torch.cat(alone_hidden_grads))
+    assert packed_grads.keys() == alone_grads.keys()
+    for name, grad in packed_grads.items():
+        torch.testing.assert_close(grad, alone_grads[name], msg=name)
 
 
 @pytest.mark.skipif(
