@@ -635,17 +635,17 @@ class FsdpParameterGroup:
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack on the caller's stream, which must wait for gradient production."""
-        current_stream = torch.cuda.current_stream(partial_grad.device)
+        """Pack full local gradients on compute into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            grad = fsdp_parameter.unsharded.grad
-            # Retain compute-allocated storage until this stream finishes copying it.
-            grad.record_stream(current_stream)
-            partial_grad.get_tensor_view(index).copy_(grad)
+            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:
-        """Accumulate locally on the caller's stream, which must wait for gradient production."""
+        """Accumulate on the caller's stream, retaining source gradients for caller cleanup.
+
+        The caller must wait for gradient production before this call and order
+        compute after accumulation before clearing the source .grad references.
+        """
         assert self.main_grad is not None
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
@@ -653,12 +653,8 @@ class FsdpParameterGroup:
 
         has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
-        current_stream = torch.cuda.current_stream(self.main_grad.device)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
-            # Autograd produced this storage on compute; retain it until this stream
-            # finishes reading it, even after casting or clearing the original .grad.
-            grad.record_stream(current_stream)
             destination = self.main_grad.get_tensor_view(index)
             if not has_sharded_grads and self.grad_comm_dtype == self.main_grad.dtype:
                 # Convert before scaling: mul(bf16_grad, scale, out=fp32) rounds in bf16.
@@ -674,7 +670,6 @@ class FsdpParameterGroup:
                     destination.add_(grad)
                 else:
                     destination.copy_(grad)
-            fsdp_parameter.unsharded.grad = None
         self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
