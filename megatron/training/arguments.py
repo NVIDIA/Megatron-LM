@@ -1579,6 +1579,11 @@ def validate_args(args, defaults={}):
             "--dynamic-context-parallel"
         )
 
+    # Per-document CP padding can change the physical microbatch length even
+    # without a packing scheduler. Pipeline peers must exchange the actual shape.
+    if args.context_parallel_size > 1 and (args.sft or args.dataloader_inter_document_masking):
+        args.variable_seq_lengths = True
+
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True
         # Packed microbatches carry different numbers of valid tokens, so the
