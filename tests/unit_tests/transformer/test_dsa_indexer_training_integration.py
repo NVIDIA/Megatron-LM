@@ -13,11 +13,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
 )
-from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
