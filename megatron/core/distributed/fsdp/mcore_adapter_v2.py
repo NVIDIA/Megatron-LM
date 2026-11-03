@@ -447,7 +447,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
             raise ValueError(
                 "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
-                "symmetric-memory collectives require equal shard sizes."
+                "symmetric-memory collectives require equal shard sizes for unsharding. "
+                "Remove --no-megatron-fsdp-padded-shards or disable --use-nccl-ub."
             )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")

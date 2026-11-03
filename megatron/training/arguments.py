@@ -1046,7 +1046,7 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
-        if args.nccl_ub:
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
             args.fsdp_manual_registration = True
