@@ -34,33 +34,10 @@ sharded        ``Replicate``  ``allgather()``
 import enum
 from collections.abc import Iterable
 
-from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = [
-    "BlockAtomic",
-    "RowAtomic",
-    "ShardLayout",
-    "TensorAtomic",
-    "can_redistribute_locally",
-    "changed_mesh_axis",
-]
-
-
-def can_redistribute_locally(
-    mesh: DeviceMesh, placements: Iterable[Placement], new_placements: Iterable[Placement]
-) -> bool:
-    """Whether redistribution only relabels or slices local storage.
-
-    A singleton axis needs no communication, including Partial-to-Replicate.
-    On larger axes, only unchanged placements and Replicate-to-Shard are views.
-    In particular, full local tensors can still require a reduction.
-    """
-    return all(
-        old == new or mesh.size(axis) == 1 or (old.is_replicate() and new.is_shard())
-        for axis, (old, new) in enumerate(zip(placements, new_placements, strict=True))
-    )
+__all__ = ["BlockAtomic", "RowAtomic", "ShardLayout", "TensorAtomic", "changed_mesh_axis"]
 
 
 class ShardLayout(enum.Enum):

@@ -242,6 +242,7 @@ def test_non_leaf_parameter_view_survives_storage_resize(
     unsharded = group._unsharded_model_weight
     assert unsharded.placements == (Replicate(),)
     shared = singleton or parameter_placement.is_replicate()
+    assert group.model_weight.can_be_viewed_as([Replicate()]) == shared
     assert (
         unsharded.local_buffer.untyped_storage()
         is group.model_weight.local_buffer.untyped_storage()

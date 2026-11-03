@@ -298,6 +298,7 @@ def test_view_rejects_non_aliasing_placement_change(distributed_setup):
 
     with pytest.raises(ValueError, match="DBuffer.view"):
         buffer.view([Replicate()])
+    assert not buffer.can_be_viewed_as([Replicate()])
 
 
 def test_replicate_get_tensor_view_and_dtensor(distributed_setup):
@@ -416,6 +417,7 @@ def test_replicate_view_round_trip(distributed_setup, shard_layout):
         tensors, mesh, [Replicate()], layout=_row_atomic_layout(tensors, mesh, shard_layout)
     )
     sharded_buffer = replicated_buffer.view([RowAtomic()])
+    assert replicated_buffer.can_be_viewed_as([RowAtomic()])
     redistribute_destination = DBuffer.empty(
         mesh=mesh,
         placements=[RowAtomic()],

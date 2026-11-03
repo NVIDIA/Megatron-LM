@@ -264,17 +264,25 @@ def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setu
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
 
 
-def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
+@pytest.mark.parametrize("singleton", [False, True])
+def test_quantized_dbuffer_view_shares_every_plane(distributed_setup, singleton):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )["local" if singleton else "dp"]
     source = QuantizedDBuffer.empty(
         mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
     )
     for plane in source.planes:
         plane.local_buffer.zero_()
     assert source.view([Replicate()]) is source
+    assert source.can_be_viewed_as([Replicate()])
 
     view = source.view([BlockAtomic(32)])
+    assert source.can_be_viewed_as([BlockAtomic(32)])
+    assert view.can_be_viewed_as([Replicate()]) == (mesh.size() == 1)
     assert view.view([BlockAtomic(32)]) is view
     assert source.is_alias_of(view)
     assert view.is_alias_of(source)

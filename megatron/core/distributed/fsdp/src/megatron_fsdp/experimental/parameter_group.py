@@ -33,7 +33,7 @@ from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
-from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic, can_redistribute_locally
+from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
@@ -350,7 +350,7 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if can_redistribute_locally(self.mesh, self.model_weight.placements, unsharded_placements):
+        if self.model_weight.can_be_viewed_as(unsharded_placements):
             self._unsharded_model_weight = self.model_weight.view(unsharded_placements)
         else:
             with self._symmetric_memory_context():
@@ -620,8 +620,9 @@ class FsdpParameterGroup:
     def requires_inner_reduction(self) -> bool:
         """Whether unreduced gradients need communication to reach main_grad's placements."""
         assert self.main_grad is not None
-        return not can_redistribute_locally(
-            self.mesh, (Partial("avg"),) * self.mesh.ndim, self.main_grad.placements
+        return any(
+            self.mesh.size(axis) > 1 and placement != Partial("avg")
+            for axis, placement in enumerate(self.main_grad.placements)
         )
 
     def allocate_partial_grad_buffer(self) -> DBuffer:

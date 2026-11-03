@@ -287,6 +287,17 @@ class DBuffer:
         buffer.local_buffer = local_buffer
         return buffer
 
+    def can_be_viewed_as(self, placements: Iterable[Placement]) -> bool:
+        """Whether a local view preserves the values required by the target placements.
+
+        Singleton axes need no communication. On larger axes, only unchanged
+        placements and Replicate-to-Shard transitions preserve values through a view.
+        """
+        return all(
+            old == new or self.mesh.size(axis) == 1 or (old.is_replicate() and new.is_shard())
+            for axis, (old, new) in enumerate(zip(self.placements, placements, strict=True))
+        )
+
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
         """View a contained local range with the requested ``placements``.
 
