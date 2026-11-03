@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from copy import deepcopy
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -15,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
@@ -29,21 +31,29 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
     setup_moe_model_and_optimizer,
 )
+from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
 from tests.unit_tests.test_utilities import Utils
 
 
-def check_equal(input_1, input_2):
+def check_equal(input_1, input_2, path='root'):
     """Check if two inputs are equal, used for checking checkpointing."""
     if isinstance(input_1, dict) and isinstance(input_2, dict):
         assert input_1.keys() == input_2.keys()
         for key in input_1.keys():
-            check_equal(input_1[key], input_2[key])
+            check_equal(input_1[key], input_2[key], f'{path}.{key}')
     elif isinstance(input_1, list) and isinstance(input_2, list):
         assert len(input_1) == len(input_2)
         for i in range(len(input_1)):
-            check_equal(input_1[i], input_2[i])
+            check_equal(input_1[i], input_2[i], f'{path}[{i}]')
     elif isinstance(input_1, torch.Tensor) and isinstance(input_2, torch.Tensor):
-        assert torch.all(input_1 == input_2), f"Input 1: {input_1} != Input 2: {input_2}"
+        if not torch.equal(input_1, input_2):
+            mismatches = (input_1 != input_2).flatten()
+            first = torch.nonzero(mismatches, as_tuple=False)[0].item()
+            raise AssertionError(
+                f'{path}: {mismatches.sum().item()} tensor elements differ; '
+                f'first mismatch at flat index {first}: '
+                f'{input_1.flatten()[first]} != {input_2.flatten()[first]}'
+            )
     elif type(input_1) != type(input_2):
         assert False, f"Input 1 type: {type(input_1)} != Input 2 type: {type(input_2)}"
     else:
@@ -249,6 +259,86 @@ class TestLayerWiseOptimizer:
                 plain_sd_B = load_plain_tensors(ckpt_dir_B)
 
                 check_equal(plain_sd_A, plain_sd_B)
+
+    @pytest.mark.parametrize('num_instances,ep,expert_bias', [(2, 1, False), (4, 1, False), (2, 2, True)])
+    def test_layer_wise_multi_instance_save_load(
+        self, tmp_path_dist_ckpt, num_instances, ep, expert_bias
+    ):
+        """Round-trip dense and expert Muon state with replicated optimizer instances."""
+        if Utils.world_size < num_instances * ep or Utils.world_size % (num_instances * ep):
+            pytest.skip("World size must be divisible by instances times expert parallelism")
+
+        Utils.initialize_model_parallel(
+            expert_model_parallel_size=ep,
+            num_distributed_optimizer_instances=num_instances,
+        )
+        metadata = {
+            'distrib_optim_sharding_type': 'dp_reshardable',
+            'chained_optim_avoid_prefix': True,
+        }
+        initialize_fn = (
+            partial(initialize_moe_model, add_bias_linear=expert_bias)
+            if ep > 1
+            else initialize_gpt_model
+        )
+        with TempNamedDir(tmp_path_dist_ckpt / 'multi_instance_A', sync=True) as ckpt_dir_A:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                use_param_layout=True,
+                ep=ep,
+                initialize_fn=initialize_fn,
+                optimizer='dist_muon',
+                num_distributed_optimizer_instances=num_instances,
+            )
+            assert isinstance(optimizer_A.chained_optimizers[0], LayerWiseDistributedOptimizer)
+            if expert_bias:
+                expert_dp = parallel_state.get_expert_data_parallel_group(
+                    with_gtp_remat=False, partial_expert_data_parallel=True
+                )
+                assert any(
+                    isinstance(child, DistributedOptimizer)
+                    and child.data_parallel_group is expert_dp
+                    for child in optimizer_A.chained_optimizers
+                ), 'Expected an expert scalar fallback optimizer'
+            model_sharded_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata), ckpt_dir_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                use_param_layout=True,
+                ep=ep,
+                initialize_fn=initialize_fn,
+                optimizer='dist_muon',
+                num_distributed_optimizer_instances=num_instances,
+            )
+            model_sharded_sd_B = model_B[0].sharded_state_dict()
+            load_sharded_sd = optimizer_B.sharded_state_dict(
+                model_sharded_sd_B, is_loading=True, metadata=metadata
+            )
+            optimizer_B.load_state_dict(load(load_sharded_sd, ckpt_dir_A))
+
+            # The on-disk DistOpt bucket format includes torch.empty padding. Compare
+            # live parameter and optimizer state so padding bytes do not affect this test.
+            check_equal(
+                optimizer_A.chained_optimizers[0].state_dict(),
+                optimizer_B.chained_optimizers[0].state_dict(),
+            )
+            for source, restored in zip(
+                optimizer_A.chained_optimizers, optimizer_B.chained_optimizers
+            ):
+                if isinstance(source, DistributedOptimizer):
+                    check_equal(
+                        source.get_parameter_state_dp_reshardable(),
+                        restored.get_parameter_state_dp_reshardable(),
+                    )
 
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])

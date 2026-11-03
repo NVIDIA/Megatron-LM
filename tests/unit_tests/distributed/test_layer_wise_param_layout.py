@@ -81,7 +81,7 @@ class TestLayerwiseParameterRouting:
 def test_checkpoint_metadata_uses_owning_module_group(is_expert, group_name, group_size):
     dp_cp = mock.Mock()
     expt_dp = mock.Mock()
-    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp)
+    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp, intra_dp_cp=None, intra_expt_dp=None)
     param_group = {"is_expert_parallel": is_expert, "params": True}
     expected_group = getattr(pg_collection, group_name)
 
