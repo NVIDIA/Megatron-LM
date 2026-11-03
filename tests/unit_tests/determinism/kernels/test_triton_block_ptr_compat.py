@@ -9,6 +9,8 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 @triton.jit
 def _copy_advance(x, y, N: tl.constexpr, STRIDE: tl.constexpr, BLOCK: tl.constexpr):
