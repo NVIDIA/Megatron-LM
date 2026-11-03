@@ -185,17 +185,15 @@ def _reduce_scatter_along_first_dim(
         return input_
 
     if ordered and use_ordered_tp_reduce(group, input_.dtype):
+        assert (
+            input_split_sizes is None
+        ), "uneven splits in the batch-invariant ordered reduce-scatter are not built yet"
         output = None
         if use_global_buffer:
-            rows = (
-                input_.size(0) // world_size
-                if input_split_sizes is None
-                else input_split_sizes[group.rank()]
-            )
             output = get_global_memory_buffer().get_tensor(
-                [rows, *input_.shape[1:]], input_.dtype, "mpu"
+                [input_.size(0) // world_size, *input_.shape[1:]], input_.dtype, "mpu"
             )
-        return ordered_reduce_scatter(input_, group, output, input_split_sizes)
+        return ordered_reduce_scatter(input_, group, output)
 
     if input_split_sizes is None:
         dim_size = list(input_.size())

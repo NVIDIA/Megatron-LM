@@ -505,17 +505,19 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            output_parallel = output_parallel.transpose(0, 1).contiguous()
+            output_parallel = output_parallel.transpose(0, 1)
             if self.use_inference_optimized_reduce_scatter and InferenceMode.is_active():
                 # Deferred to avoid circular import: inference_layers → TE → layers.
                 from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
 
+                # Passes the transposed view: the symmetric-memory paths copy it into their
+                # buffer in [s b h] layout directly, without a separate contiguous copy.
                 output = inference_reduce_scatter_to_sequence_parallel_region(
                     output_parallel, self.tp_group, self.config
                 )
             else:
                 output = reduce_scatter_to_sequence_parallel_region(
-                    output_parallel, group=self.tp_group
+                    output_parallel.contiguous(), group=self.tp_group
                 )
         elif self.tp_group.size() > 1:
             # Reduce across all the model parallel GPUs.

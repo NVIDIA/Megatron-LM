@@ -101,8 +101,7 @@ class TestShardReductions:
         parts = orr.row_parallel_shard_partials(
             x[:, r * kl : (r + 1) * kl], w[:, r * kl : (r + 1) * kl], c, out=symm["tensor"]
         )
-        out = torch.empty((m // tp, n), dtype=torch.bfloat16, device="cuda")
-        orr.symm_ordered_reduce_scatter_shards(out, parts, symm["handle"])
+        out = orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"])
         ref = _canonical(x, w, shards)[r * (m // tp) : (r + 1) * (m // tp)]
         assert torch.equal(_bits(out), _bits(ref))
 

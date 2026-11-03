@@ -561,10 +561,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 # The GEMM writes the shard partials straight into the symmetric buffer; one
                 # kernel pulls the owned rows of every peer's partials and folds them.
                 parts = row_parallel_shard_partials(x, self.weight, c, out=symm["tensor"])
-                out_dims = list(parts.shape[1:])
-                out_dims[0] //= self.tp_size
-                output = torch.empty(out_dims, dtype=x.dtype, device=x.device)
-                return symm_ordered_reduce_scatter_shards(output, parts, symm["handle"])
+                return symm_ordered_reduce_scatter_shards(parts, symm["handle"])
         parts = row_parallel_shard_partials(x, self.weight, c)
         return ordered_reduce_scatter_shards(parts, self.tp_group if self.tp_size > 1 else None)
 
@@ -581,18 +578,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             and symm_mem_buffer["handle"] is not None
             and can_use_symm_pull(symm_mem_buffer["handle"], x)
         ):
-            symm_tensor = symm_mem_buffer["tensor"]
-            if use_mxfp8 or get_batch_invariant_backend() == "te_native":
-                # Native kernels: writing into the buffer gives the same bits.
-                x = _apply_linear(x, self.weight, self.config, out=symm_tensor)
-            else:
-                # The batch-invariant GEMM backends patch aten::mm, not its out= variant.
-                symm_tensor.copy_(_apply_linear(x, self.weight, self.config))
-                x = symm_tensor
-            output_dims = list(x.size())
-            output_dims[0] = x.size(0) // self.tp_size
-            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
-            return symm_ordered_reduce_scatter(output, x, symm_mem_buffer["handle"])
+            # The GEMM writes straight into the symmetric buffer: native kernels, and the
+            # batch-invariant aten::mm.out override, give the same bits as without out=.
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
+            return symm_ordered_reduce_scatter(x, symm_mem_buffer["handle"])
         x = _apply_linear(x, self.weight, self.config)
         return reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
 
@@ -693,6 +682,10 @@ def inference_reduce_scatter_to_sequence_parallel_region(
 
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
+
+    ``x`` may be a non-contiguous view (e.g. the embedding's [b, s, h] -> [s, b, h]
+    transpose): the symmetric-memory paths copy it into the buffer in the target layout,
+    so the caller needs no separate ``.contiguous()`` copy.
     """
     # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
     # to use this function for its non-fused NVLS reduce-scatter path.
@@ -713,13 +706,10 @@ def inference_reduce_scatter_to_sequence_parallel_region(
                 symm_mem_buffer["handle"], x
             ):
                 symm_mem_buffer["tensor"].copy_(x)
-                output_dims = list(x.size())
-                output_dims[0] = x.size(0) // tp_size
-                output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
                 return symm_ordered_reduce_scatter(
-                    output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
+                    symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
                 )
-        return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
+        return reduce_scatter_to_sequence_parallel_region(x.contiguous(), group=tp_group)
 
     # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
     # training (TP <= 2 here). This does not affect MoE EP NVLS.
@@ -743,4 +733,4 @@ def inference_reduce_scatter_to_sequence_parallel_region(
             multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
             return output
 
-    return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
+    return reduce_scatter_to_sequence_parallel_region(x.contiguous(), group=tp_group)

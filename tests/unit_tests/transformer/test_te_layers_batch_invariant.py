@@ -807,6 +807,24 @@ def test_te_native_device_metadata_workspace(monkeypatch, supported):
 # ============================================================================
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_matmul_out_writes_batch_invariant_result_in_place():
+    """`torch.matmul(..., out=buf)` (aten::mm.out) gives the batch-invariant GEMM's bits and
+    writes them into ``buf``, e.g. a symmetric-memory buffer, with no extra copy."""
+    torch.manual_seed(0)
+    x = torch.randn(48, 2, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(768, 1024, device="cuda", dtype=torch.bfloat16)
+    with set_batch_invariant_mode(True, backend="triton"):
+        ref = torch.matmul(x, w.t())
+        storage = torch.empty(
+            2 * x.shape[0] * x.shape[1] * w.shape[0], device="cuda", dtype=x.dtype
+        )
+        out = storage[: ref.numel()].view(ref.shape)
+        result = torch.matmul(x, w.t(), out=out)
+    assert result.data_ptr() == out.data_ptr()
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_bik_te_general_gemm_chunking_deterministic(dtype):
     torch.manual_seed(123)

@@ -89,15 +89,6 @@ class TestOrderedReduce:
         rank = self.group.rank()
         assert torch.equal(_bits(out), _bits(ref[rank * k : (rank + 1) * k]))
 
-    def test_reduce_scatter_uneven_splits(self):
-        splits = [3, 5, 1, 7]
-        x = _partials((sum(splits), 512), torch.bfloat16, seed=7)
-        ref = _left_fold(_all_partials(x, self.group))
-        out = orr.ordered_reduce_scatter(x, self.group, input_split_sizes=splits)
-        rank = self.group.rank()
-        start = sum(splits[:rank])
-        assert torch.equal(_bits(out), _bits(ref[start : start + splits[rank]]))
-
     @pytest.mark.parametrize("exact", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("shape", [(1, 2688), (3, 1, 4096), (7, 100), (128, 8192)])
@@ -146,14 +137,37 @@ class TestOrderedReduce:
         if hdl is None:
             pytest.skip("symmetric memory is not available")
         for dtype in (torch.bfloat16, torch.float32):
-            for rows, hidden in ((4, 2688), (64, 4096), (512, 8192)):
+            # (rows, hidden, byte offset in the buffer). The last case is not 16-byte aligned
+            # (odd slice size, tensor not at the buffer start): the unhinted path.
+            for rows, hidden, off in ((4, 2688, 0), (64, 4096, 0), (512, 8192, 0), (4, 1001, 4)):
                 x = _partials((rows, hidden), dtype, seed=rows + hidden)
-                sin = buf[: x.numel() * x.element_size()].view(dtype).view(x.shape)
+                nbytes = x.numel() * x.element_size()
+                sin = buf[off : off + nbytes].view(dtype).view(x.shape)
                 sin.copy_(x)
                 rs = torch.empty(rows // TP, hidden, dtype=dtype, device="cuda")
-                orr.symm_ordered_reduce_scatter(rs, sin, hdl, exact=exact)
+                orr.symm_ordered_reduce_scatter(sin, hdl, rs, exact=exact)
                 ref_rs = orr.ordered_reduce_scatter(x, self.group, exact=exact)
                 assert torch.equal(_bits(rs), _bits(ref_rs))
+
+    def test_inference_embedding_reduce_scatter_takes_a_view(self):
+        """The engine's embedding reduce-scatter gets the [b, s, h] -> [s, b, h] transpose as a
+        view and copies it into the symmetric buffer itself: same bits as contiguous input."""
+        from types import SimpleNamespace
+
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.tensor_parallel.inference_layers import (
+            inference_reduce_scatter_to_sequence_parallel_region,
+        )
+
+        if torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("symmetric memory needs sm90+")
+        SymmetricMemoryManager.get_buffer("tp", process_group=self.group)
+        config = SimpleNamespace(inference_disable_triton_nvls_kernels=False)
+        x = _partials((2, 32, 1024), torch.bfloat16, seed=9).transpose(0, 1)  # [s, b, h] view
+        with set_batch_invariant_mode(True):
+            got = inference_reduce_scatter_to_sequence_parallel_region(x, self.group, config)
+            want = orr.ordered_reduce_scatter(x.contiguous(), self.group)
+        assert torch.equal(_bits(got), _bits(want))
 
     @pytest.mark.parametrize("exact", [False, True])
     def test_symmetric_push_matches_all_to_all(self, exact, monkeypatch):
@@ -199,7 +213,7 @@ class TestOrderedReduce:
             rs = orr.ordered_reduce_scatter(static_in, self.group)
             ar = orr.ordered_all_reduce(static_in, self.group)
             if sin is not None:
-                orr.symm_ordered_reduce_scatter(symm_rs, sin, hdl)
+                orr.symm_ordered_reduce_scatter(sin, hdl, symm_rs)
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
@@ -207,17 +221,6 @@ class TestOrderedReduce:
         assert torch.equal(_bits(ar), _bits(expected_ar))
         if sin is not None:
             assert torch.equal(_bits(symm_rs), _bits(expected_rs))
-
-    def test_destroy_drops_cached_peer_views(self):
-        """Views are keyed by id(handle); a new handle may reuse the id of a destroyed one."""
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
-        x = _partials((64, 1024), torch.bfloat16, seed=5)
-        with set_batch_invariant_mode(True):
-            orr.ordered_reduce_scatter(x, self.group)  # push: caches the staging views
-        assert orr._PEER_VIEWS
-        SymmetricMemoryManager.destroy()
-        assert not orr._PEER_VIEWS
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 GPUs")
@@ -289,7 +292,9 @@ def _check_te_row_parallel_linear(sequence_parallel):
         skip_bias_add=False,
         is_expert=False,
     ).cuda()
-    assert layer._explicit_bi_tp_reduce
+    assert layer._bi_tp_forward.value == "ordered_reduce"
+    # The push staging is allocated at construction, outside any forward or graph capture.
+    assert orr.SymmetricMemoryManager.is_initialized(orr._push_staging_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
@@ -355,8 +360,7 @@ def test_tp3_symmetric_memory_paths():
         buf = symm.maybe_get_tensor(list(x.shape), dtype=x.dtype)
         assert orr.can_use_symm_pull(buf["handle"], x)
         buf["tensor"].copy_(x)
-        out = torch.empty(32, 1024, dtype=x.dtype, device="cuda")
-        orr.symm_ordered_reduce_scatter(out, buf["tensor"], buf["handle"])
+        out = orr.symm_ordered_reduce_scatter(buf["tensor"], buf["handle"])
         assert torch.equal(_bits(out), _bits(ref))
     finally:
         torch.cuda.synchronize()
