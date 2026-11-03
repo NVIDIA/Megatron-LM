@@ -141,8 +141,8 @@ workload rather than generalizing from any single comparison.
 > Enable it with `batch_invariant_mode` on the model's `TransformerConfig` — it
 > is *not* an `InferenceConfig` field, so it must be set when you build the
 > model, not on the engine config. Two companion fields tune it:
-> `batch_invariant_backend` (`te_native` by default, or `deepgemm` / `triton`)
-> selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
+> `batch_invariant_backend` (`te_native` by default, or `triton`; `deepgemm` is
+> deprecated and runs as `te_native`) selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
 > Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
@@ -152,8 +152,9 @@ workload rather than generalizing from any single comparison.
 > `nvls` token dispatcher when `EP > 1`). FlashInfer supports MXFP8 non-gated
 > squared-ReLU experts, including selective BF16 layers, but its batch invariance
 > does not imply bitwise parity with TE training. Use Torch/vLLM for exact
-> training-policy comparisons. Some backend combinations additionally need DeepGEMM
-> bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
+> training-policy comparisons. The `triton` backend's MoE experts and the `torch`
+> inference backend's BF16 experts additionally need DeepGEMM bf16 grouped-GEMM
+> bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
 > attention dropout are not supported in either case. MXFP8 training uses
 > `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
 > default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into

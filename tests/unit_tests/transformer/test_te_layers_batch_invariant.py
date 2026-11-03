@@ -17,8 +17,8 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    get_batch_invariant_backend,
     matmul_persistent,
     mean_batch_invariant,
     set_batch_invariant_mode,
@@ -871,23 +871,8 @@ def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
     assert weight.stride(1) == 1
 
 
-@pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
-def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
-    torch.manual_seed(123)
-    M1, M2, K, N = 37, 23, 128, 128
-    A1 = torch.randn(M1, K, **_device(torch.float32))
-    A2 = torch.randn(M2, K, **_device(torch.float32))
-    A = torch.cat([A1, A2], dim=0)
-    B = torch.randn(K, N, **_device(torch.float32))
-
-    with set_batch_invariant_mode(True, backend="deepgemm"):
-        full = _te_general_gemm(A, B, out_dtype=torch.float32, layout="TN")[0]
-        chunks = torch.cat(
-            [
-                _te_general_gemm(A1, B, out_dtype=torch.float32, layout="TN")[0],
-                _te_general_gemm(A2, B, out_dtype=torch.float32, layout="TN")[0],
-            ],
-            dim=1,
-        )
-
-    assert torch.equal(full, chunks)
+def test_deepgemm_backend_is_deprecated_to_te_native():
+    """The removed DeepGEMM dense backend still enables, as te_native, with a warning."""
+    with pytest.warns(DeprecationWarning, match="deepgemm"):
+        with set_batch_invariant_mode(True, backend="deepgemm"):
+            assert get_batch_invariant_backend() == "te_native"

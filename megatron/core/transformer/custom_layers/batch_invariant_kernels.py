@@ -7,6 +7,7 @@ import contextlib
 import importlib
 import importlib.util
 import logging
+import warnings
 from collections import namedtuple
 from collections.abc import Callable
 from functools import lru_cache
@@ -525,66 +526,33 @@ def mean_dim(
     return output
 
 
-# Production uses DeepGEMM for bf16 and the deterministic Triton kernel for
-# intentional higher-precision operations such as the fp32 MoE router.
-_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton", "te_native")
-_BATCH_INVARIANT_BACKEND: str = "deepgemm"
+_BATCH_INVARIANT_BACKENDS = ("triton", "te_native")
+# Deprecated: the DeepGEMM dense backend runs as "te_native" (see _resolve_backend).
+_DEPRECATED_BACKENDS = {"deepgemm": "te_native"}
+_BATCH_INVARIANT_BACKEND: str = "te_native"
 
 
-def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
-
-    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
-    runs, batch-invariant.
-    """
-    if a.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"The DeepGEMM batch-invariant backend requires bf16 inputs "
-            f"(got {a.dtype}); use backend='triton' for fp16/fp32."
-        )
-    # TMA descriptors require 16-byte outer strides, not padded logical shapes.
-    stride_alignment = 16 // a.element_size()
-
-    def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:
-        if t.stride(0) % stride_alignment == 0:
-            return t
-        outer_stride = (t.shape[1] + stride_alignment - 1) // stride_alignment * stride_alignment
-        aligned = t.new_empty_strided(t.shape, (outer_stride, 1))
-        aligned.copy_(t)
-        return aligned
-
-    a = _align_outer_stride(a)
-    b = _align_outer_stride(b)
-    M = a.shape[0]
-    N = b.shape[1]
-    output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
-    d = a.new_empty_strided((M, N), (output_stride, 1))
-    deep_gemm.bf16_gemm_nn(a, b, d)
-    return d.contiguous()
+def _resolve_backend(backend: str) -> str:
+    """Map a deprecated backend name to its replacement, with a DeprecationWarning."""
+    replacement = _DEPRECATED_BACKENDS.get(backend)
+    if replacement is None:
+        return backend
+    warnings.warn(
+        f"batch_invariant_backend={backend!r} is deprecated and runs as {replacement!r}: the "
+        f"DeepGEMM dense GEMM backend is removed. Set batch_invariant_backend={replacement!r}.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return replacement
 
 
 def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm`."""
-    if (
-        _BATCH_INVARIANT_BACKEND == "deepgemm"
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-    ):
-        return _mm_deepgemm(a, b)
+    """Batch-invariant replacement for `aten::mm` (the "triton" backend)."""
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm`."""
-    if (
-        _BATCH_INVARIANT_BACKEND == "deepgemm"
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-    ):
-        out = _mm_deepgemm(a, b)
-        if bias is not None:
-            out = out + bias
-        return out
+    """Batch-invariant replacement for `aten::addmm` (the "triton" backend)."""
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -1133,10 +1101,9 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
         # Triton's persistent GEMM consumes the operand strides directly. A
         # contiguous copy here materializes large TE projection weights on
-        # every forward, including each CUDA-graph replay. DeepGEMM still
-        # requires contiguous operands, and non-transposed layouts retain
-        # their existing behavior.
-        if not (transa and _BATCH_INVARIANT_BACKEND == "triton"):
+        # every forward, including each CUDA-graph replay. Non-transposed
+        # layouts retain their existing behavior.
+        if not transa:
             opA = opA.contiguous()
         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
 
@@ -1838,14 +1805,12 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
 
     Args:
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
-            "te_native" (default) keeps the native cuBLASLt kernels and obtains
-            invariance via workspace starvation. "deepgemm" routes bf16 CUDA
-            inputs through DeepGEMM `bf16_gemm_nn`. "triton" routes through the batch-invariant
-            Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
-            on any CUDA device). "te_native" keeps the native cuBLASLt
-            kernels (aten and TE) and obtains invariance via workspace
-            starvation instead of kernel substitution. Grouped GEMM uses
-            DeepGEMM for "deepgemm"/"triton"; "te_native" leaves it native.
+            "te_native" (default) keeps the native cuBLASLt kernels (aten and TE)
+            and obtains invariance via workspace starvation instead of kernel
+            substitution. "triton" routes through the batch-invariant Triton
+            `matmul_persistent` kernel (works for bf16/fp16/fp32 and on any CUDA
+            device). Grouped GEMM uses DeepGEMM for "triton"; "te_native" leaves
+            it native. "deepgemm" is deprecated and runs as "te_native".
     """
     global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     global _BATCH_INVARIANT_COLLECTIVE
@@ -1853,15 +1818,11 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
         return
     assert collective in ("ordered", "multimem"), f"Unknown collective {collective!r}"
     _BATCH_INVARIANT_COLLECTIVE = collective
+    backend = _resolve_backend(backend)
     if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
             f"Unknown batch-invariant backend {backend!r}; "
             f"expected one of {_BATCH_INVARIANT_BACKENDS}."
-        )
-    if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
-        raise RuntimeError(
-            "The DeepGEMM batch-invariant backend requires DeepGEMM with "
-            "bf16 bindings. Install DeepGEMM or use backend='triton'."
         )
     _BATCH_INVARIANT_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
@@ -2017,6 +1978,8 @@ def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None
     # nested usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
     prev_backend = _BATCH_INVARIANT_BACKEND
+    if backend is not None:
+        backend = _resolve_backend(backend)
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:

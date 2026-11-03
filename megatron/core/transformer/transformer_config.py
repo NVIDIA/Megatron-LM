@@ -1492,8 +1492,9 @@ class TransformerConfig(ModelParallelConfig):
     enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
     invariance via workspace starvation — lowest overhead, no extra
     dependencies, and the configuration verified bitwise-identical to the TE
-    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
-    (persistent Triton matmul; any dtype)."""
+    training forward) or "triton" (persistent Triton matmul; any dtype).
+    "deepgemm" is deprecated: it is accepted with a DeprecationWarning and runs
+    as "te_native"."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
@@ -4719,8 +4720,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                 _BATCH_INVARIANT_BACKENDS,
+                _resolve_backend,
             )
 
+            # "deepgemm" is deprecated: warn and run as "te_native".
+            self.batch_invariant_backend = _resolve_backend(self.batch_invariant_backend)
             # argparse validates via the Literal annotation; guard here too so
             # programmatic TransformerConfig construction fails at build time
             # rather than inside enable_batch_invariant_mode() after model init.
@@ -4809,10 +4813,10 @@ class TransformerConfig(ModelParallelConfig):
                     and self.fp8_param
                     and not self.fp4
                 )
-                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference path for BF16 experts. MXFP8 experts use
-                # torch scaled_grouped_mm directly and do not need DeepGEMM.
-                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
+                # DeepGEMM grouped GEMMs are used by the "triton" backend and by the
+                # torch inference path for BF16 experts. MXFP8 experts use torch
+                # scaled_grouped_mm directly and do not need DeepGEMM.
+                needs_deepgemm = self.batch_invariant_backend == "triton" or (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
                     and not mxfp8_params_enabled
