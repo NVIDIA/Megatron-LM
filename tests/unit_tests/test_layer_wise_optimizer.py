@@ -379,6 +379,38 @@ class TestLayerWiseOptimizer:
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
 
+    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
+    def test_frozen_stage_builds_an_optimizer(self, use_param_layout):
+        """A pipeline stage whose params are all frozen has no routing tags; building the
+        layer-wise optimizer must not mistake it for a model wrapped without a layout."""
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = SimpleModel().bfloat16().cuda()
+        model.requires_grad_(False)
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(
+                layer_wise_param_layout='compact' if use_param_layout == 'compact' else None
+            ),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer='muon',
+                lr=0.01,
+                bf16=True,
+                muon_tp_mode="duplicated",
+                use_layer_wise_distributed_optimizer=True,
+            ),
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+        layer_wise = _layer_wise(optimizer)
+        assert not any(group['params'] for group in layer_wise.param_groups)
+
     def test_explicit_muon_exclusion_updates_with_param_layout(self):
         """An excluded 2D matrix is updated and synchronized by the scalar DistOpt."""
         model, optimizer, pg_collection = self.create_model_and_optimizer(
