@@ -1722,3 +1722,34 @@ def test_packed_sequence_dataset_built_on_rank(
             assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("metadata_only", [False, True], ids=["token-stage", "middle-stage"])
+@pytest.mark.parametrize(
+    "cp_rank, expected_padding",
+    [(0, [False, True, False, False, True, True]),
+     (1, [False, False, False, False, False, True])],
+)
+def test_padded_zigzag_constructs_padding_mask(metadata_only, cp_rank, expected_padding):
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 3, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([5], dtype=torch.int32),
+    }
+    if not metadata_only:
+        batch["tokens"] = torch.arange(8).view(1, 8)
+        # A real token excluded from LM loss must still be visible to MoE.
+        batch["loss_mask"] = torch.zeros(1, 8)
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=cp_rank),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch, boundary_layout="zigzag", dynamic_cp=False,
+            cp_group=MagicMock(), use_per_sequence_balancing=True,
+        )
+
+    torch.testing.assert_close(
+        cp_batch.get_batch()["padding_mask"], torch.tensor([expected_padding])
+    )
+    assert cp_batch.get_batch()["padding_mask"].dtype == torch.bool

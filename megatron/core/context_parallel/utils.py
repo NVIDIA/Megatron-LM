@@ -116,7 +116,6 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
     if cp_size == 1:
         return batch
 
-    sequence_tensor = None
     sequence_keys = (
         "tokens",
         "labels",
@@ -126,32 +125,27 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         "mtp_input_mask",
         "padding_mask",
     )
-    for key in sequence_keys:
-        sequence_tensor = batch.get(key)
-        if sequence_tensor is not None:
-            break
     cu_seqlens = batch['cu_seqlens'].squeeze(0)
     cu_seqlens_padded = batch.get('cu_seqlens_padded')
     if cu_seqlens_padded is not None:
         cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
     physical_cu_seqlens = cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded
-    if sequence_tensor is not None:
-        source_positions = torch.arange(
-            sequence_tensor.size(1), dtype=physical_cu_seqlens.dtype, device=sequence_tensor.device
-        )
-        sequence_ids = torch.searchsorted(physical_cu_seqlens[1:], source_positions, right=True)
-        valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
-        source_valid = source_positions < valid_ends.index_select(0, sequence_ids)
-        index = rank_order_indices.view(cp_size, -1)[cp_rank]
-        valid_index = index.clamp_min(0)
-        padding = (index < 0) | ~source_valid.index_select(0, valid_index)
-        for key in sequence_keys:
-            tensor = batch.get(key)
-            if tensor is not None:
-                local_tensor = tensor.index_select(1, valid_index)
-                padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
-                fill_value = True if key == "padding_mask" else 0
-                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
+    # Check only this rank's source indices. This also works on metadata-only PP
+    # stages, without reading a GPU sequence length to allocate a full-source mask.
+    index = rank_order_indices.view(cp_size, -1)[cp_rank]
+    valid_index = index.clamp_min(0)
+    sequence_ids = torch.searchsorted(physical_cu_seqlens[1:], valid_index, right=True)
+    valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
+    padding = (index < 0) | (valid_index >= valid_ends.index_select(0, sequence_ids))
+    for key in sequence_keys:
+        tensor = batch.get(key)
+        if tensor is not None:
+            local_tensor = tensor.index_select(1, valid_index)
+            padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
+            fill_value = True if key == "padding_mask" else 0
+            batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
+    if batch.get('padding_mask') is None:
+        batch['padding_mask'] = padding.unsqueeze(0)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()

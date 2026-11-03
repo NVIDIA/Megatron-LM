@@ -361,6 +361,15 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params(attention_layout)
         padding_mask = batch.get("padding_mask")
+        if (
+            padding_mask is not None
+            and config.sequence_parallel
+            and not get_attr_wrapped_model(model, "pre_process")
+        ):
+            # GPTModel scatters the mask with embeddings only on the first PP stage.
+            padding_mask = padding_mask.chunk(config.tensor_model_parallel_size, dim=1)[
+                mpu.get_tensor_model_parallel_rank()
+            ].contiguous()
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 

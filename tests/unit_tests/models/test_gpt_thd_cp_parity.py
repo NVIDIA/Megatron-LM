@@ -307,3 +307,33 @@ def test_pretrain_gpt_thd_cp2_with_mtp_matches_thd_cp1():
 
     assert thd_cp1.shape == thd_cp2.shape
     _assert_close(thd_cp2, thd_cp1)
+
+
+@pytest.mark.parametrize(
+    "pre_process, expected_mask",
+    [
+        (True, [[False, True, False, False, True, True]]),
+        (False, [[False, True, True]]),
+    ],
+    ids=["embedding-stage-scatters-in-model", "middle-stage-scatters-in-forward-step"],
+)
+def test_forward_step_shards_padding_mask_once(monkeypatch, pre_process, expected_mask):
+    mask = torch.tensor([[False, True, False, False, True, True]])
+    cp_batch = ContextParallelBatch.from_single_layout("zigzag", {"padding_mask": mask}, None)
+    model = MagicMock(pre_process=pre_process, vp_stage=None, pg_collection=object())
+    config = SimpleNamespace(
+        attention_cp_layout="zigzag", sequence_parallel=True, tensor_model_parallel_size=2
+    )
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    monkeypatch.setattr(pretrain_gpt, "get_batch", lambda *args, **kwargs: cp_batch)
+    monkeypatch.setattr(pretrain_gpt, "get_timers", MagicMock())
+    monkeypatch.setattr(pretrain_gpt, "stimer", _NullStragglerTimer())
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        "megatron.training.distillation.logits_saver.get_logits_saver", lambda: None
+    )
+
+    pretrain_gpt.forward_step(None, model)
+
+    torch.testing.assert_close(model.call_args.kwargs["padding_mask"], torch.tensor(expected_mask))
