@@ -30,8 +30,9 @@ dtype; ``BLOCK_SIZE = 1024``; grid ``num_sms`` (cached process-wide from the dev
 ``total_blocks = cdiv(valid * topk, 1024)``, ``blocks_per_cta = cdiv(total_blocks, num_sms)``.
 Inputs therefore cover ``num_sms`` in {1, 2, total_blocks-1, total_blocks, total_blocks+1, 132
 (H100), 1000} against ``valid * topk`` at block boundaries, ``valid`` in {0, 1, rows-1, rows},
-the ``E_l`` / slice / topk / dtype variants pairwise, ``-1`` ids, production sizes and, opt-in,
-2^31 pairs.
+the ``E_l`` / slice / topk / dtype variants pairwise, ``-1`` ids, production sizes and, opt-in
+(``large``), live pair counts at the int32 limits (the ``cdiv`` adds 1023 first) and a map of
+more than 2^31 pairs behind a front guard.
 
 Memory: canary-tailed routing maps (reads past the rows change a count), guard bands around the
 caller-zeroed output, the map checked unchanged; one ``sanitizer`` case.
@@ -319,21 +320,23 @@ def test_valid_above_rows_in_cuda_graph_replay():
         )
 
 
-@pytest.mark.parametrize("rows", ou.int32_overflow_params(8))
-def test_int32_pair_offsets(rows):
-    """``rows * topk`` at 2^31 pairs (opt-in ``large``; 16 GiB map); closed-form counts.
+@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8))
+def test_int32_pair_count(rows):
+    """Live pair counts ``valid * topk`` at the int32 limits (opt-in ``large``; 16 GiB map).
 
-    Suspected finding O1-N1 (by reading; not run): ``valid * topk`` and the pair offsets are
-    int32, so this case is expected to fail on origin/main and with #8563 alike. Unreachable at
-    production sizes (it needs 2^31 routed pairs in one routing map)."""
-    dev = rr.require_cuda()
-    topk, num_local = 8, 32
-    pairs = rows * topk
-    ou.require_free_memory(pairs * 8 + (2 << 30))
-    flat = torch.empty(pairs, dtype=torch.int64, device=dev)
-    torch.arange(pairs, out=flat)
-    flat.remainder_(num_local)
-    counts = _count(flat.view(rows, topk), 0, num_local, rr.valid_tensor(rows, dev))
-    expected = torch.full((num_local,), pairs // num_local, dtype=torch.int64)
-    expected[: pairs % num_local] += 1
-    ou.assert_exact(counts, expected, what=f"counts at {pairs} pairs")
+    Suspected finding O1-N1 (GPU-confirmed for the non-persistent kernel at 2^31 pairs, dfw
+    21220533): ``valid * topk`` is int32, and so is ``cdiv``'s ``valid_pairs + 1023``. Expected
+    on origin/main and with #8563: ``count-fits`` passes; ``cdiv-wraps`` (2^31 - 8 pairs) and
+    ``count-wraps`` (2^31 pairs) count nothing (``total_blocks`` < 0). Unreachable at
+    production sizes (2^31 pairs is about 268M routing rows at top-8).
+    """
+    rr.check_int32_pair_count(_count, rows, dev=rr.require_cuda())
+
+
+@pytest.mark.large
+def test_int32_block_offsets():
+    """Control for O1-N2: a map of 2^31 + 8 pairs behind a 2^31-entry front guard, 1000 live
+    rows. This variant bounds its blocks by ``valid`` (``block_id * 1024`` stays small), so it
+    must count only the live rows; expected to pass on origin/main. 32 GiB, opt-in ``large``.
+    """
+    rr.check_int32_block_offsets(_count, dev=rr.require_cuda())

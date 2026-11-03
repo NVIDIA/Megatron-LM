@@ -20,8 +20,9 @@ and fails the exact comparison.
 """
 
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import pytest
 import torch
 
 from tests.unit_tests.inference.oracles import oracle_utils as ou
@@ -251,3 +252,86 @@ def assert_untouched(t: torch.Tensor, *, what: str, poison: Optional[float] = No
             f"{what}: {count} of {t.numel()} elements were written (must be untouched);"
             f" first flat indices {first}"
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# int32 limits of the count kernels (opt-in ``large`` cases)
+# ---------------------------------------------------------------------------------------------
+
+INT32_LIMIT = 2**31
+
+
+def int32_pair_count_params(topk: int) -> List[Any]:
+    """Row counts whose live pair count ``rows * topk`` (``valid == rows``) sits at the int32
+    limits of a pair count, all with element offsets below 2^31:
+
+    * ``count-fits``: ``2^31 - 1024`` pairs; ``pairs + 1023`` (a ceiling division by the
+      1024-pair block) still fits int32.
+    * ``cdiv-wraps``: ``2^31 - topk`` pairs; the pair count fits, ``pairs + 1023`` does not.
+    * ``count-wraps``: ``2^31`` pairs, one past ``INT32_MAX``; the last element offset is
+      ``2^31 - 1`` and still fits.
+
+    ``topk`` must divide 1024. Each case needs a 16 GiB int64 map.
+    """
+    cases = [
+        (INT32_LIMIT - COUNT_BLOCK, "count-fits"),
+        (INT32_LIMIT - topk, "cdiv-wraps"),
+        (INT32_LIMIT, "count-wraps"),
+    ]
+    return [
+        pytest.param(p // topk, id=f"{p // topk}[pairs={p}-{label}]", marks=pytest.mark.large)
+        for p, label in cases
+    ]
+
+
+def check_int32_pair_count(count: Callable, rows: int, *, topk: int = 8, dev: str = "cuda"):
+    """All ``rows`` live, ids ``pair % 32`` on 32 local experts: closed-form expected counts
+    ``P // 32 (+1 for e < P % 32)`` with ``P = rows * topk``."""
+    num_local = 32
+    pairs = rows * topk
+    ou.require_free_memory(pairs * 8 + (2 << 30))
+    flat = torch.empty(pairs, dtype=torch.int64, device=dev)
+    torch.arange(pairs, out=flat)
+    flat.remainder_(num_local)
+    counts = count(flat.view(rows, topk), 0, num_local, valid_tensor(rows, dev))
+    expected = torch.full((num_local,), pairs // num_local, dtype=torch.int64)
+    expected[: pairs % num_local] += 1
+    ou.assert_exact(counts, expected, what=f"counts with {pairs} live pairs (valid = rows)")
+
+
+GUARD_EXPERT = 31
+"""Local expert id filling the front guard of ``check_int32_block_offsets``; the map itself
+never routes to it, so any count on it is a read before the map."""
+
+
+def check_int32_block_offsets(
+    count: Callable,
+    *,
+    topk: int = 8,
+    valid: int = 1000,
+    guard: int = INT32_LIMIT,
+    pairs: int = INT32_LIMIT + 8,
+    dev: str = "cuda",
+):
+    """A map of ``pairs > 2^31`` entries (so its last 1024-pair block starts at offset 2^31)
+    placed right after a ``guard``-entry front guard routing to ``GUARD_EXPERT``, with only the
+    first ``valid`` rows live (``valid * topk`` far below any int32 limit). Only those rows may
+    be counted; a block offset that wraps to ``-2^31`` reads the guard. 32 GiB at the defaults.
+    """
+    num_local = 32
+    rows = pairs // topk
+    ou.require_free_memory((guard + rows * topk) * 8 + (2 << 30))
+    buf = torch.full((guard + rows * topk,), GUARD_EXPERT, dtype=torch.int64, device=dev)
+    routing_map = buf[guard:].view(rows, topk)
+    routing_map.fill_(GUARD_EXPERT - 1)
+    head = torch.arange(valid * topk, device=dev).remainder_(GUARD_EXPERT - 1)
+    routing_map[:valid] = head.view(valid, topk)
+    counts = count(routing_map, 0, num_local, valid_tensor(valid, dev))
+    ou.assert_exact(
+        counts,
+        local_counts(routing_map, valid, 0, num_local),
+        what=(
+            f"counts of {valid} live rows in a {rows * topk}-pair map (expert {GUARD_EXPERT}"
+            f" counts reads of the {guard}-entry front guard)"
+        ),
+    )

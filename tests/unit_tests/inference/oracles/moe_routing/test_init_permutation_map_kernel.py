@@ -22,7 +22,8 @@ Structure: ``BLOCK_SIZE = 1024``; grid ``cdiv(output_size, 1024)``. Inputs cover
 ``output_size`` and ``n_used`` at B-1/B/B+1 and 2B, ``n_used`` in {0, 1, output_size - 1,
 output_size}, and CUDA-graph replays with ``n_used`` growing and shrinking (the buffer is
 re-poisoned between replays, so a write past the new ``n_used`` shows up). The buffer sits
-between guard bands and starts poisoned (``INT32_MIN``).
+between guard bands and starts poisoned (``INT32_MIN``). Opt-in (``large``): a buffer of
+more than 2^31 entries behind a 2^31-entry front guard (block offsets).
 """
 
 import pytest
@@ -86,3 +87,31 @@ def test_cuda_graph_replay_follows_n_used():
         graph.replay()
         torch.cuda.synchronize()
         _check(buf, n, f"replay n_used={n}")
+
+
+@pytest.mark.large
+def test_int32_block_offsets():
+    """Finding O1-N2: ``pid * 1024`` is int32. For a buffer of ``2^31 + 1`` entries the last
+    program's offsets wrap to ``-2^31 .. -2^31 + 1023``, pass the ``< n_used`` mask for any
+    ``n_used >= 0`` and write ``-1`` 8 GiB before the buffer.
+
+    The buffer sits behind a 2^31-entry front guard in one allocation, so the stray writes land
+    in the guard. Expected to fail on origin/main (1024 guard entries written). 16 GiB plus a
+    4 GiB mask; opt-in ``large``.
+    """
+    dev = rr.require_cuda()
+    guard, size, n_used, sentinel = 2**31, 2**31 + 1, 5, 0x5A5A5A5A
+    ou.require_free_memory((guard + size) * 5 + (2 << 30))
+    buf = torch.full((guard + size,), sentinel, dtype=torch.int32, device=dev)
+    permute.init_permutation_map(buf[guard:], rr.valid_tensor(n_used, dev))
+    torch.cuda.synchronize()
+    written = buf != sentinel
+    ou.assert_exact(buf[guard : guard + n_used], torch.full((n_used,), -1, dtype=torch.int32))
+    written[guard : guard + n_used] = False
+    stray = int(written.sum())
+    if stray:
+        first = (written.nonzero()[:8].reshape(-1) - guard).tolist()
+        raise AssertionError(
+            f"{stray} entries outside [0, n_used={n_used}) were written; first offsets relative"
+            f" to the buffer start: {first}"
+        )

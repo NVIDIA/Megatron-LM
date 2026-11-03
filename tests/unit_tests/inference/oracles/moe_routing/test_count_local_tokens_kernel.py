@@ -32,7 +32,8 @@ no autotune. Inputs therefore cover ``rows * topk`` and ``valid * topk`` at 1024
 boundaries (B-1/B/B+1 and 2B), ``valid`` in {0, 1, rows-1, rows}, ``topk`` in {1 (integer
 specialisation), 2, 6, 8, 16}, ``E_l`` in {1, 2, 7, 16, 32, 128}, the first / second / last
 local slice of a 4-rank model (``start`` 0, 1, 16 included), ids at the slice edges, all pairs
-on one expert (atomic contention), production sizes and, opt-in, ``rows * topk`` at 2^31.
+on one expert (atomic contention), production sizes and, opt-in (``large``), live pair counts
+at the int32 limits and a map of more than 2^31 pairs behind a front guard (block offsets).
 
 Memory: every routing map is the head of a canary buffer whose tail routes to a local expert
 (a read past the map's rows changes a count); the caller-zeroed output sits between guard
@@ -280,25 +281,28 @@ def test_valid_above_rows_counts_only_the_map_rows(rows, topk, extra):
     _check(routing_map, start, num_local, rows + extra, what="valid > rows", dev=dev)
 
 
-@pytest.mark.parametrize("rows", ou.int32_overflow_params(8))
-def test_int32_pair_offsets(rows):
-    """``rows * topk`` at 2^31 pairs (opt-in ``large``; 16 GiB map).
+@pytest.mark.parametrize("rows", rr.int32_pair_count_params(8))
+def test_int32_pair_count(rows):
+    """Live pair counts ``valid * topk`` at the int32 limits (opt-in ``large``; 16 GiB map).
 
-    Ids are ``pair % E`` (``E = E_l = 32``, start 0), so the expected counts are closed-form:
-    ``P // E (+1 for e < P % E)`` with ``P = rows * topk``.
-
-    Suspected finding O1-N1 (by reading; not run): ``valid * topk`` and the pair offsets are
-    int32, so this case is expected to fail on origin/main and with #8563 alike. Unreachable at
-    production sizes (it needs 2^31 routed pairs in one routing map).
+    Finding O1-N1 (GPU-confirmed, dfw 21220533: 0 instead of 2^26 on every expert at 2^31
+    pairs): ``valid * topk`` is int32 and wraps to ``-2^31``, so the mask drops every pair.
+    Expected on origin/main and with #8563: ``count-fits`` and ``cdiv-wraps`` pass,
+    ``count-wraps`` fails. Unreachable at production sizes (2^31 pairs is about 268M routing
+    rows at top-8).
     """
-    dev = rr.require_cuda()
-    topk, num_local = 8, 32
-    pairs = rows * topk
-    ou.require_free_memory(pairs * 8 + (2 << 30))
-    flat = torch.empty(pairs, dtype=torch.int64, device=dev)
-    torch.arange(pairs, out=flat)
-    flat.remainder_(num_local)
-    counts = _count(flat.view(rows, topk), 0, num_local, rr.valid_tensor(rows, dev))
-    expected = torch.full((num_local,), pairs // num_local, dtype=torch.int64)
-    expected[: pairs % num_local] += 1
-    ou.assert_exact(counts, expected, what=f"counts at {pairs} pairs")
+    rr.check_int32_pair_count(_count, rows, dev=rr.require_cuda())
+
+
+@pytest.mark.large
+def test_int32_block_offsets():
+    """Finding O1-N2: ``pid * 1024`` is int32, so with a map of more than 2^31 pairs the last
+    program's offsets wrap to ``-2^31 .. -2^31 + 1023``, pass the ``< valid * topk`` mask and
+    read 16 GiB before the map, whatever ``valid`` is.
+
+    The map (2^31 + 8 pairs, 1000 live rows) sits behind a 2^31-entry front guard routed to
+    expert 31, so the stray read is counted instead of faulting. Expected to fail on
+    origin/main and with #8563 (``counts[31] = 1024``). On dfw 21220533 the unguarded
+    ``2^31 + 8``-pair case faulted with an illegal memory access. 32 GiB, opt-in ``large``.
+    """
+    rr.check_int32_block_offsets(_count, dev=rr.require_cuda())
