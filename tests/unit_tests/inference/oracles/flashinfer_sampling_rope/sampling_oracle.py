@@ -469,24 +469,46 @@ def build_batch(
     return Batch(list(specs), logits, temperature, top_k, top_p, groups)
 
 
+# What ``pad_active_slices`` writes into the GPU view's slots past the active requests.
+NEUTRAL_SAMPLING_PARAMS = {"temperature": 1.0, "top_k": 0, "top_p": 0.0}
+
+
 def stub_context(
-    temperature: Sequence[float], top_k: Sequence[int], top_p: Sequence[float]
+    temperature: Sequence[float],
+    top_k: Sequence[int],
+    top_p: Sequence[float],
+    *,
+    capacity: Optional[int] = None,
 ) -> SimpleNamespace:
     """The part of ``DynamicInferenceContext`` the FlashInfer sampler reads, one entry per request.
 
     Per-request parameters live in pinned-CPU-like metadata (fp32 temperature, int32 top-k, fp32
     top-p, as ``DynamicInferenceRequest.get_metadata_types`` declares them) and in their GPU view;
     the batch-level filter flags come from the real ``active_sampling_filter_flags``.
+
+    ``capacity`` sizes the GPU view as production's ``ContextGPUView`` is sized (``max_requests``
+    slots; those past the active requests hold ``NEUTRAL_SAMPLING_PARAMS``), so a sampler that
+    reads row ``i``'s parameters from slot ``i`` instead of from its request gets plausible but
+    wrong values, not an index error. Default: one slot per request.
     """
     metadata = {
         "temperature": torch.tensor(list(temperature), dtype=torch.float32),
         "top_k": torch.tensor(list(top_k), dtype=torch.int32),
         "top_p": torch.tensor(list(top_p), dtype=torch.float32),
     }
+    requests = len(metadata["temperature"])
+    capacity = requests if capacity is None else capacity
+    if capacity < requests:
+        raise ValueError(f"capacity {capacity} is below the {requests} active requests")
+    gpu_view = {}
+    for key, value in metadata.items():
+        slots = torch.full((capacity,), NEUTRAL_SAMPLING_PARAMS[key], dtype=value.dtype)
+        slots[:requests] = value
+        gpu_view[key] = slots.to(DEVICE)
     context = SimpleNamespace(
         active_request_metadata=metadata,
-        gpu_view=SimpleNamespace(**{key: value.to(DEVICE) for key, value in metadata.items()}),
-        total_request_count=len(metadata["temperature"]),
+        gpu_view=SimpleNamespace(**gpu_view),
+        total_request_count=requests,
         paused_request_count=0,
         config=SimpleNamespace(num_speculative_tokens=0),
     )

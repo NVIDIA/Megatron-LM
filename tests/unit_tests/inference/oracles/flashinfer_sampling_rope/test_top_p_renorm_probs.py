@@ -19,7 +19,8 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   boundary excludes the next token. fp32 in and out; the input is not modified; the result does
   not depend on ``is_deterministic`` (Megatron's main passes False, open PR #8572 passes True).
 * ``log_probs_kernel``: row ``r`` is ``log pi_r`` (``sampling_oracle.reference_distribution``,
-  top-k first, then top-p): finite exactly on the kept set, ``-inf`` elsewhere.
+  top-k first, then top-p): finite exactly on the kept set, ``-inf`` elsewhere. Under
+  ``token_to_request_index`` (speculative decoding) row ``r`` takes its request's T, k and p.
 * Determinism: ``log_probs_kernel`` replays bit-exactly (RL compares these log-probs with the
   trainer's). On main, ``top_p_renorm_probs`` builds its radix histograms with float atomics and
   ``top_k_renorm_probs`` sums rows split over several CTAs with float atomics, so a row whose
@@ -184,6 +185,37 @@ def test_log_probs_kernel_scores_the_nucleus(vocab):
     probs = torch.softmax(batch.logits / temperature.to(so.DEVICE)[:, None], dim=-1)
     trusted = torch.log(so.trusted_renorm(probs, refs))
     so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel")
+
+
+def test_log_probs_kernel_maps_rows_to_requests():
+    """Under ``token_to_request_index`` each logits row is scored with its request's T, k and p.
+
+    The layout of a speculative step as ``calculate_log_probs_tensors`` passes it (a CPU
+    ``row_to_request``): four decode requests with two draft tokens (three rows each), then two
+    prefill requests (one row each). The GPU view has a slot per row, as production's
+    ``max_requests`` buffer does, so parameters read by row position instead of by request are
+    wrong (another request's, or the neutral padding), not out of range.
+    """
+    vocab = 32000
+    specs = _log_prob_specs(vocab)
+    rows_per_request = torch.tensor([3, 3, 3, 3, 1, 1])
+    request_of_row = torch.arange(len(specs)).repeat_interleave(rows_per_request)
+    row_specs = [specs[r] for r in request_of_row.tolist()]
+    batch = so.build_batch(row_specs, replicas=1)
+    context = so.stub_context(
+        [s.temperature for s in specs],
+        [s.top_k for s in specs],
+        [s.top_p for s in specs],
+        capacity=batch.rows,
+    )
+    log_probs = so.make_sampler(vocab).log_probs_kernel(
+        batch.logits, context, token_to_request_index=request_of_row
+    )
+    refs = torch.stack([s.reference() for s in row_specs])
+    temperature = torch.tensor([so.clamped_temperature(s.temperature) for s in row_specs])
+    probs = torch.softmax(batch.logits / temperature.to(so.DEVICE)[:, None], dim=-1)
+    trusted = torch.log(so.trusted_renorm(probs, refs))
+    so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel, token_to_request_index")
 
 
 def test_log_probs_kernel_replays_bit_exactly():

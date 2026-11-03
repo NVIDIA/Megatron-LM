@@ -36,7 +36,8 @@ the SGL/vLLM implementation"; written before reading the kernel):
   The pass-through span exact. A second, independent check (``test_matches_the_rope_definition``)
   recomputes the frequencies in fp64 from the RoPE definition (base, rotary_percent, position
   interpolation, llama-3 scaling) and bounds the fused path by Megatron's unfused
-  ``_apply_rotary_pos_emb_bshd`` in the same dtype.
+  ``_apply_rotary_pos_emb_bshd`` in the same dtype, fed those angles rounded to fp32: neither
+  side shares ``RotaryEmbedding``'s frequencies with the cache under test.
 
 Structure (read from FlashInfer 0.7.2 after the contract, ``include/flashinfer/pos_enc.cuh``):
 D in {64, 128, 256, 512} runs a dedicated kernel (:1502-1575) with ``vec = max(8, D / 32)``
@@ -51,13 +52,14 @@ vec (finding R08-F1). Inputs: D in {16, 32, 40, 48, 64, 72, 80, 96, 112, 128, 16
 nnz in {1, bdy-1, bdy, bdy+1, 4096, 65536}; MHA, GQA 32:8 and one K head; Q/K contiguous or
 strided views of a fused QKV buffer; positions 0, 1, L-2, L-1 and random, L up to 131072.
 
-Main vs open PR #8862 (``fix/flashinfer-fused-rope-shapes``): main sends every shape but NeoX
-D16 to FlashInfer, which mis-rotates NeoX shapes whose R/2 is not a multiple of its vec (e.g.
-D 40, 48, 72, 80, 112; 128/40, 96/48, 96/24, 512/48; most D/4 rotary dims) and overlaps its
-stores past the rotary span of interleaved shapes whose R is not a multiple of 16 (e.g. 40/40,
-72/72, 80/40, 96/24). ``test_fused_rope_rotates_shapes_flashinfer_cannot`` holds exactly those
-shapes: it fails on main and passes with #8862, which rotates them in fp32. Every other test
-takes the shapes FlashInfer rotates exactly and passes on both.
+Main vs open PR #8862 (``fix/flashinfer-fused-rope-shapes``): main rotates NeoX D16 itself in
+fp32, at any rotary dim (``test_fused_rope_rotates_neox_head_dim_16``, which passes on both), and
+sends every other shape to FlashInfer, which mis-rotates NeoX shapes whose R/2 is not a multiple
+of its vec (e.g. D 40, 48, 72, 80, 112; 128/40, 96/48, 96/24, 512/48; most D/4 rotary dims) and
+overlaps its stores past the rotary span of interleaved shapes whose R is not a multiple of 16
+(e.g. 40/40, 72/72, 80/40, 96/24). ``test_fused_rope_rotates_shapes_flashinfer_cannot`` holds
+exactly those shapes: it fails on main and passes with #8862, which rotates them in fp32. Every
+other test takes shapes main rotates correctly and passes on both.
 
 Memory: Q/K, the positions and the cache inside NaN guard bands (an out-of-range read turns an
 output NaN), positions past n poisoned, the in-place kernel on guard-banded buffers (an
@@ -128,6 +130,11 @@ INEXACT_SHAPES = [
     for interleaved in (False, True)
     if not flashinfer_rotates_exactly(d, r, interleaved)
 ]
+# NeoX D16: FlashInfer's 16-lane vector crosses the half-head boundary, so Megatron's call site
+# rotates these shapes itself (on main for D16 NeoX at any rotary dim; with #8862 every inexact
+# shape). The rest of INEXACT_SHAPES main sends to FlashInfer.
+NEOX_D16_SHAPES = [s for s in INEXACT_SHAPES if s[0] == 16 and not s[2]]
+MISROTATED_ON_MAIN = [s for s in INEXACT_SHAPES if s not in NEOX_D16_SHAPES]
 
 
 def shape_id(d, r, interleaved=None):
@@ -317,6 +324,20 @@ def test_fused_rope_matches_the_rotation(d, r, interleaved, dtype, monkeypatch):
     run_case(case, monkeypatch, shape_id(d, r, interleaved))
 
 
+@pytest.mark.parametrize("fused_qkv", [True, False], ids=["fused", "contig"])
+@pytest.mark.parametrize("dtype", list(DTYPES.values()), ids=list(DTYPES))
+@pytest.mark.parametrize(
+    "d,r,interleaved", NEOX_D16_SHAPES, ids=[shape_id(*s) for s in NEOX_D16_SHAPES]
+)
+def test_fused_rope_rotates_neox_head_dim_16(d, r, interleaved, dtype, fused_qkv, monkeypatch):
+    """NeoX D16 at full, half and quarter rotary, which the call site rotates without FlashInfer
+    (on main, and in fp32 with #8862): the first R lanes rotated by the cache's R/2 frequencies,
+    the rest passed through bit for bit."""
+    n = block_tokens(d, r) + 1
+    case = Case(d, r, interleaved, dtype, n, hq=6, hk=2, fused_qkv=fused_qkv)
+    run_case(case, monkeypatch, shape_id(d, r, interleaved))
+
+
 def _inexact_cases():
     cases = [
         pytest.param(
@@ -328,7 +349,7 @@ def _inexact_cases():
             4096,
             id=f"{shape_id(d, r, interleaved)}-{dtype}",
         )
-        for d, r, interleaved in INEXACT_SHAPES
+        for d, r, interleaved in MISROTATED_ON_MAIN
         for dtype in DTYPES
     ]
     for d, r, interleaved in ((80, 80, False), (72, 72, True)):  # the R08-F1 examples
@@ -365,10 +386,11 @@ def test_fused_rope_rotates_shapes_flashinfer_cannot(
 ):
     """Head shapes FlashInfer's vectorization cannot rotate exactly (R08-F1) are still rotated.
 
-    Fails on main, which sends all of them but NeoX D16 to FlashInfer (wrong lanes, neighbor
-    heads read, overlapping stores; D72 interleaved stores past the output); passes with PR
-    #8862, which rotates them in fp32. The sanitizer cases show the out-of-bounds stores under
-    memcheck on main.
+    Fails on main, which sends all of them to FlashInfer (wrong lanes, neighbor heads read,
+    overlapping stores; D72 interleaved stores past the output); passes with PR #8862, which
+    rotates them in fp32. NeoX D16, which main rotates itself, is
+    ``test_fused_rope_rotates_neox_head_dim_16``. The sanitizer cases show the out-of-bounds
+    stores under memcheck on main.
     """
     hq, hk = (2, 1) if n >= 4096 else (6, 2)
     case = Case(d, r, interleaved, DTYPES[dtype], n, hq, hk, fused_qkv=n < 4096, max_len=max_len)
@@ -472,18 +494,25 @@ DEFINITION_CASES = {
 def test_matches_the_rope_definition(name, monkeypatch):
     """Fused RoPE with GPTModel's cache against RoPE from the definition in fp64, bounded by
     Megatron's unfused ``_apply_rotary_pos_emb_bshd`` in bf16 (an independent implementation).
+
+    The trusted path takes the definition's angles rounded to fp32, laid out as ``get_emb`` lays
+    out its own (the R/2 angles twice: concatenated for NeoX, each repeated for GPT-J), not
+    ``RotaryEmbedding``'s frequencies: a cache built from wrong frequencies is then outside the
+    bound instead of shared by both sides.
     """
     spec = DEFINITION_CASES[name]
     d, r, interleaved, kwargs = spec["d"], spec["r"], spec["interleaved"], spec["kwargs"]
     max_len, n = 8192, 512
     case = Case(d, r, interleaved, torch.bfloat16, n, 8, 2, fused_qkv=True, max_len=max_len)
-    cache, embedding = megatron_cache(d, r, max_len, interleaved, **kwargs)
+    cache, _ = megatron_cache(d, r, max_len, interleaved, **kwargs)
     case.cache.copy_(cache)
     query_out, key_out = case.apply()
     pos = case.pos_buf.tensor[:n].cpu()
     inv = _inv_freq_fp64(r, kwargs.get("rotary_base", 10000), kwargs.get("rope_scaling_factor"))
     angles = pos.to(torch.float64)[:, None] / kwargs.get("seq_len_interpolation_factor", 1.0) * inv
-    emb = embedding.get_emb(max_len)[pos.to(DEVICE)]  # [n, 1, 1, R] fp32, Megatron's layout
+    freqs = angles.float()
+    emb = freqs.repeat_interleave(2, dim=-1) if interleaved else torch.cat((freqs, freqs), dim=-1)
+    emb = emb[:, None, None, :].to(DEVICE)  # [n, 1, 1, R] fp32, Megatron's layout
     for actual, x in ((query_out, case.query[:n]), (key_out, case.key[:n])):
         reference = ou.fp64_reference(
             rotate, x, angles.cos().to(DEVICE), angles.sin().to(DEVICE), interleaved

@@ -21,8 +21,9 @@ sampling, written before reading the kernel):
   ``(m+1)``-th token: the top m already reach p (FlashInfer's own ``top_p_renorm_probs`` docs
   define the same threshold). Megatron cannot hit it through ``softmax`` except by chance; the
   direct case below builds it from exact dyadic probabilities.
-* Rows of one batch take their own ``p`` and temperature; rows with the no-op sentinel are
-  sampled unfiltered.
+* Rows of one batch take their own ``p`` and temperature (their request's under
+  ``token_to_request_index``, as speculative decoding passes it); rows with the no-op sentinel
+  are sampled unfiltered.
 * Outputs, RNG, degenerate rows: as for ``sampling_from_logits`` (int64 ids in ``[0, V)``; the
   same generator state replays bit-exactly, every call advances it).
 * Tolerance class: sampler. Chi-square per row group against the fp64 reference, false-failure
@@ -176,6 +177,41 @@ def test_seeded_replay_and_fresh_draws():
     ou.assert_exact(so.sample(sampler, batch.logits, batch.rows, context), first, what="replay")
     fresh = so.sample(sampler, batch.logits, batch.rows, context)
     assert not torch.equal(fresh, first), "the generator did not advance between calls"
+
+
+def test_token_to_request_index(monkeypatch):
+    """Under ``token_to_request_index`` (speculative decoding) each row takes its request's top-p
+    and temperature.
+
+    Rows map to four requests in a seeded random order; the GPU view has a slot per row, as
+    production's ``max_requests`` buffer does, so parameters read by row position instead of by
+    request are wrong (a sentinel past the requests), not out of range.
+    """
+    per_request, launches = 768, 32
+    g = ou.make_generator()
+    nucleus = _nucleus_specs()
+    specs = [nucleus[i] for i in (0, 1, 2, 7)]  # p = 1e-6, mid cut, T = 0.3 mid cut, sentinel
+    request_of_row = torch.arange(len(specs)).repeat_interleave(per_request)
+    request_of_row = request_of_row[torch.randperm(len(request_of_row), generator=g)]
+    n, vocab = len(request_of_row), specs[0].logits.numel()
+    assert all(torch.equal(s.logits, specs[0].logits) for s in specs)
+    logits = specs[0].logits.to(so.DEVICE).expand(n, vocab).contiguous()
+    context = so.stub_context(
+        [s.temperature for s in specs],
+        [s.top_k for s in specs],
+        [s.top_p for s in specs],
+        capacity=n,
+    )
+    sampler = so.make_sampler(vocab)
+    spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
+    index = request_of_row.to(so.DEVICE)
+    counts = torch.zeros((len(specs), vocab), dtype=torch.int64)
+    for _ in range(launches):
+        tokens = so.sample(sampler, logits, n, context, token_to_request_index=index).cpu()
+        for r in range(len(specs)):
+            counts[r] += torch.bincount(tokens[request_of_row == r], minlength=vocab)
+    spy.assert_only(KERNEL, launches)
+    so.assert_batch_distribution(counts, specs, what=f"{KERNEL} token_to_request_index")
 
 
 @pytest.mark.parametrize("vocab", so.SAMPLING_VOCAB_SIZES)

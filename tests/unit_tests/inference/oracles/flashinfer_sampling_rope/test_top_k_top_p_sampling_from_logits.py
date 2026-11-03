@@ -17,6 +17,8 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   row with both filters keeps a subset of what either filter alone would keep on the raw
   distribution (the rows below are built so that the two orders differ).
 * Rows of one batch take their own k, p and temperature: k only, p only, both, neither.
+  ``k >= V`` and the sentinel ``k <= 0`` (which Megatron passes as ``V``) keep every token;
+  ``k = V - 1`` drops exactly the least likely one.
 * Greedy: a ``top_k == 1`` row samples the lowest-index argmax of its logits, whatever its top-p
   (open PR #8875). On main such a row with tied maxima draws at random among them (R08-F2):
   ``test_greedy_rows_in_a_mixed_batch`` fails on main and passes with #8875.
@@ -89,6 +91,29 @@ def test_mixed_rows_of_a_batch(monkeypatch):
     )
     spy.assert_only(KERNEL, launches)
     so.assert_batch_distribution(counts, specs, what=KERNEL)
+
+
+def test_k_around_the_vocabulary(monkeypatch):
+    """k = V-1 drops exactly the least likely token; V, V+1 and the sentinel keep every token, in
+    p-only and unfiltered rows of a mixed batch too.
+
+    The rows elsewhere have many background tokens tied at the bottom, which a tie-inclusive
+    top-(V-1) keeps; here all 64 logits are distinct and, at T = 8, the least likely token
+    carries 0.9% of the mass (about 300 of each row's draws), so a row that drops it fails.
+    """
+    vocab, launches = 64, 32
+    g = ou.make_generator()
+    row = (-torch.arange(vocab, dtype=torch.float32) / 8)[torch.randperm(vocab, generator=g)]
+    specs = [so.RowSpec(row, 8.0, top_k=k, name=f"k={k}") for k in (vocab - 1, vocab, vocab + 1, 0)]
+    specs += [
+        so.RowSpec(row, 8.0, top_p=0.999, name="sentinel k, p=0.999 (keeps all)"),
+        so.RowSpec(row, 8.0, top_p=1.0, name="sentinel k, p=1"),
+    ]
+    batch = so.build_batch(specs, replicas=1024)
+    spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
+    counts = so.sample_counts(so.make_sampler(vocab), batch, so.batch_context(batch), launches)
+    spy.assert_only(KERNEL, launches)
+    so.assert_batch_distribution(counts, specs, what=f"{KERNEL} V={vocab}")
 
 
 def test_greedy_rows_in_a_mixed_batch():

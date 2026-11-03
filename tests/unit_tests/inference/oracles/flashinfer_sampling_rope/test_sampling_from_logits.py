@@ -151,30 +151,39 @@ def test_seeded_replay_and_fresh_draws():
 
 
 def test_gather_indices_and_output_buffer(monkeypatch):
-    """Row i samples logits[gather_indices[i]] with its own temperature into ``output``."""
+    """Row i samples logits[gather_indices[i]] with its own temperature into ``output``.
+
+    Every source row is gathered by rows of both temperatures, in a seeded random order, so a row
+    that took the temperature of the row it gathers (or of any fixed row) samples the wrong
+    distribution in at least one (source, temperature) group.
+    """
     vocab, n, launches = 4097, 3000, 32
+    temperatures = (0.5, 1.0)
     g = ou.make_generator()
     sources = [
         so.ramp_logits(vocab, so.spread_positions(vocab, 16, g), dtype=torch.float32)
         for _ in range(3)
     ]
     logits = torch.stack(sources).to(so.DEVICE)
+    combos = [(s, t) for s in range(len(sources)) for t in temperatures]
+    combo_of_row = torch.arange(len(combos)).repeat(n // len(combos))
+    combo_of_row = combo_of_row[torch.randperm(n, generator=g)]
     gather = ou.poisoned_empty((n + 64,), torch.int64)  # entries past n index out of range
-    gather[:n] = torch.arange(n, device=so.DEVICE) % 3
-    temperature = [0.5 if i % 3 == 1 else 1.0 for i in range(n)]
+    gather[:n] = torch.tensor([combos[c][0] for c in combo_of_row.tolist()], device=so.DEVICE)
+    temperature = [combos[c][1] for c in combo_of_row.tolist()]
     context = so.stub_context(temperature, [0] * n, [0.0] * n)
-    specs = [so.RowSpec(sources[s], 0.5 if s == 1 else 1.0, name=f"source {s}") for s in range(3)]
+    specs = [so.RowSpec(sources[s], t, name=f"source {s}, T={t}") for s, t in combos]
     sampler = so.make_sampler(vocab)
     spy = so.KernelSpy(monkeypatch, so.SAMPLER_KERNELS)
-    counts = torch.zeros((3, vocab), dtype=torch.int64)
+    counts = torch.zeros((len(combos), vocab), dtype=torch.int64)
     for _ in range(launches):
         out = ou.guarded_empty((n,), torch.int64)
         returned = so.sample(sampler, logits, n, context, gather_indices=gather, output=out.tensor)
         ou.check_guards(out=out)
         assert returned.data_ptr() == out.tensor.data_ptr(), "tokens not returned in `output`"
         tokens = out.tensor.cpu()
-        for s in range(3):
-            counts[s] += torch.bincount(tokens[s::3], minlength=vocab)
+        for c in range(len(combos)):
+            counts[c] += torch.bincount(tokens[combo_of_row == c], minlength=vocab)
     spy.assert_only(KERNEL, launches)
     so.assert_batch_distribution(counts, specs, what=f"{KERNEL} gather_indices")
 

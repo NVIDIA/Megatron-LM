@@ -17,11 +17,12 @@ Contract (from the call site and FlashInfer's documented API, written before rea
   Megatron relies on ``k = V`` meaning no filter). fp32 in and out; the input is not modified.
 * ``log_probs_kernel``: row ``r`` is ``log pi_r``, with ``pi_r`` the distribution the sampler
   draws row ``r`` from (``sampling_oracle.reference_distribution``): finite exactly on the kept
-  set, ``-inf`` elsewhere. Rows with neither filter are ``log_softmax(l / max(T, 1e-6))`` in fp32,
-  bit for bit. Greedy rows (``top_k == 1``) are one-hot on the lowest-index argmax (``0`` there,
-  ``-inf`` elsewhere): the contract of open PR #8875. On main a greedy row with tied maxima puts
-  ``log(1/2)`` on both (R08-F2), so ``test_greedy_rows_score_one_hot`` fails on main and passes
-  with #8875.
+  set, ``-inf`` elsewhere. Rows with neither filter (``k <= 0`` or ``k >= V``, no top-p) are
+  ``log_softmax(l / max(T, 1e-6))`` in fp32, bit for bit. ``T = 0`` is that clamp, not a
+  division by zero, also for filtered rows that are not greedy. Greedy rows (``top_k == 1``) are
+  one-hot on the lowest-index argmax (``0`` there, ``-inf`` elsewhere): the contract of open PR
+  #8875. On main a greedy row with tied maxima puts ``log(1/2)`` on both (R08-F2), so
+  ``test_greedy_rows_score_one_hot`` fails on main and passes with #8875.
 * Every token the sampler draws has a finite processed log-prob, and the draws follow
   ``exp(log_probs)``: sampling and scoring describe one distribution.
 * Every vocabulary launches: a row is split over as many CTAs as its shared memory needs.
@@ -192,10 +193,62 @@ def _check_top_k_log_probs(vocab):
     assert log_probs.dtype == torch.float32 and log_probs.shape == batch.logits.shape
     trusted = _trusted_log_probs(batch.logits, specs, refs)
     so.assert_log_probs(log_probs, refs, trusted, what="log_probs_kernel (top-k)")
-    # Unfiltered rows of a filtered batch are torch's log_softmax of the fp32-scaled logits.
+    _assert_unfiltered_rows_are_log_softmax(batch, log_probs, specs)
+
+
+def _assert_unfiltered_rows_are_log_softmax(batch, log_probs, specs):
+    """Rows with neither filter (k <= 0 or k >= V, p <= 0 or p >= 1) of a filtered batch are
+    torch's log_softmax of the fp32-scaled logits, bit for bit."""
+    vocab = batch.vocab
+    rows = [
+        i
+        for i, s in enumerate(specs)
+        if (s.top_k <= 0 or s.top_k >= vocab) and not 0.0 < s.top_p < 1.0
+    ]
+    assert rows, "the batch needs a row with neither filter"
     temperature = torch.tensor(batch.temperature, dtype=torch.float32, device=so.DEVICE)
     scaled = batch.logits / temperature.clamp(min=so.MIN_SAMPLING_TEMPERATURE)[:, None]
-    ou.assert_exact(log_probs[-1:], torch.log_softmax(scaled, dim=-1)[-1:], what="unfiltered row")
+    names = ", ".join(specs[i].name for i in rows)
+    ou.assert_exact(
+        log_probs[rows],
+        torch.log_softmax(scaled, dim=-1)[rows],
+        what=f"rows with neither filter ({names})",
+    )
+
+
+def test_log_probs_kernel_at_zero_temperature():
+    """Rows with T = 0 that are not greedy (k != 1) score the distribution at the clamped
+    temperature ``max(T, 1e-6)``, not a division by zero.
+
+    Over hot logits ``2**-20`` apart (exact in fp32; about 0.95 apart after the clamp) the
+    distribution is not degenerate: a three-token top-k, a top-k then top-p, and an unfiltered row
+    of the filtered batch (``log_softmax`` of the clamped scale, bit for bit). Over the ramp
+    (logits 0.25 apart) a top-k row is one-hot on its unique maximum. Holds on main, on #8875
+    (which maps a request's T = 0 to greedy before the kernel; the kernel still clamps) and on
+    #8572; the greedy T = 0 rows are ``test_greedy_rows_score_one_hot``.
+    """
+    vocab = 32000
+    g = ou.make_generator()
+    positions = so.spread_positions(vocab, 48, g)
+    fine = so.ramp_logits(vocab, positions, top=0.0, step=2.0**-20, dtype=torch.float32)
+    ramp = so.ramp_logits(vocab, positions, dtype=torch.float32)
+    specs = [
+        so.RowSpec(fine, 0.0, top_k=3, name="T=0, k=3"),
+        so.RowSpec(
+            fine, 0.0, top_k=8, top_p=so.mid_cut_top_p(fine, 0.0, 8, 4), name="T=0, k=8 then p"
+        ),
+        so.RowSpec(ramp, 0.0, top_k=32, name="T=0, unique maximum (one-hot)"),
+        so.RowSpec(fine, 0.0, name="T=0, unfiltered"),
+    ]
+    batch = so.build_batch(specs, replicas=1)
+    log_probs = so.make_sampler(vocab).log_probs_kernel(batch.logits, so.batch_context(batch))
+    filtered = specs[:3]
+    # The unfiltered row's reference is 0 on the background (exp(-1.6e7)) where its log_softmax is
+    # finite: it is checked bit for bit only.
+    refs = torch.stack([s.reference() for s in filtered])
+    trusted = _trusted_log_probs(batch.logits[:3], filtered, refs)
+    so.assert_log_probs(log_probs[:3], refs, trusted, what="log_probs_kernel at T = 0")
+    _assert_unfiltered_rows_are_log_softmax(batch, log_probs, specs)
 
 
 def test_greedy_rows_score_one_hot():
