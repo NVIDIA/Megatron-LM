@@ -393,8 +393,13 @@ def _check_fused_norms(layers, fused_norms, expect_fused, problems, what=""):
 def _verdict(case, branches, problems, *, stage=0):
     """Share every rank's verdict before asserting (no rank may stop early); the ranks of a
     stage must have taken the same branches."""
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, (stage, branches, problems))
+    # The verdicts are Python objects: exchange them over gloo, off the GPUs under test.
+    group = dist.new_group(backend="gloo")
+    try:
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, (stage, branches, problems), group=group)
+    finally:
+        dist.destroy_process_group(group)
     for s in sorted({st for st, _, _ in gathered}):
         traces = [b for st, b, _ in gathered if st == s]
         assert all(t == traces[0] for t in traces), f"stage {s}: ranks took different branches"
