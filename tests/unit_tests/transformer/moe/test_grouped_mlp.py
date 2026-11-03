@@ -539,7 +539,7 @@ def _fused_forward_shell(config, fused_ops, use_bias):
 
 
 @pytest.mark.parametrize("global_mode", [False, True])
-@pytest.mark.parametrize("unsupported", [None, "bias", "output_buffer"])
+@pytest.mark.parametrize("unsupported", [None, "bias", "output_buffer", "mxfp8_combine_bwd"])
 def test_deterministic_fused_forward_probability_gradients(global_mode, unsupported):
     """The real dispatch method moves probability gradients outside the fused activation."""
     seen = []
@@ -555,6 +555,7 @@ def test_deterministic_fused_forward_probability_gradients(global_mode, unsuppor
             fp4=False,
             moe_router_padding_for_quantization=True,
             moe_paged_stash=False,
+            moe_combine_bwd_dtype="mxfp8" if unsupported == "mxfp8_combine_bwd" else "bf16",
         ),
         fused_ops,
         use_bias=unsupported == "bias",
@@ -568,7 +569,11 @@ def test_deterministic_fused_forward_probability_gradients(global_mode, unsuppor
     try:
         torch.use_deterministic_algorithms(global_mode)
         if unsupported is not None:
-            message = "FC2 without bias" if unsupported == "bias" else "zero-copy"
+            message = {
+                "bias": "FC2 without bias",
+                "output_buffer": "zero-copy",
+                "mxfp8_combine_bwd": "moe_combine_bwd_dtype='bf16'",
+            }[unsupported]
             with pytest.raises(RuntimeError, match=message):
                 TEGroupedMLP._fused_forward(
                     module, hidden, torch.tensor([1, 1]), probabilities, **kwargs

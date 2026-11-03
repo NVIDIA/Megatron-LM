@@ -998,6 +998,12 @@ class TEGroupedMLP(MegatronModule):
                         "deterministic operation-fuser grouped MLP does not support NCCL-EP "
                         "zero-copy output buffers: probability scaling changes the output storage."
                     )
+                if self.config.moe_combine_bwd_dtype != "bf16":
+                    raise RuntimeError(
+                        "deterministic operation-fuser grouped MLP requires "
+                        "moe_combine_bwd_dtype='bf16': FC2 consumes the quantized combine "
+                        "gradient as-is, so probability scaling cannot run after FC2."
+                    )
                 # TE's fused scaled-activation dprob uses atomics. With no FC2 bias,
                 # applying the probabilities after FC2 gives an ordinary torch reduction.
                 post_probs = permuted_probs
