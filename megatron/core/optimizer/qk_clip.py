@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.process_groups_config import resolve_process_groups
 
 
 def clip_qk(model, log_max_only=False, *, dp_cp_group=None) -> float:
@@ -14,7 +14,8 @@ def clip_qk(model, log_max_only=False, *, dp_cp_group=None) -> float:
         log_max_only (bool): If True, only computes max logit without clipping.
         dp_cp_group (torch.distributed.ProcessGroup, optional): Group over which the maximum
             logits are reduced: the model's data- and context-parallel group including its
-            GTP-remat peers (``pg_collection.dp_cp_gtp_remat``). Defaults to the global
+            GTP-remat peers (``pg_collection.dp_cp_gtp_remat``). Omitting it is deprecated:
+            ``clip_qk`` then warns and uses the global
             ``parallel_state.get_data_parallel_group(with_context_parallel=True)``.
 
     Returns:
@@ -32,10 +33,16 @@ def clip_qk(model, log_max_only=False, *, dp_cp_group=None) -> float:
                     ):
                         continue
                     if dp_cp_group is None:
-                        # Migration fallback for callers that do not pass the model's group.
-                        dp_cp_group = parallel_state.get_data_parallel_group(
-                            with_context_parallel=True
-                        )
+                        # Only a model with logits to reduce needs the group, so only such a
+                        # model warns when the caller omits it.
+                        dp_cp_group = resolve_process_groups(
+                            None,
+                            owner="clip_qk",
+                            required=("dp_cp_gtp_remat",),
+                            argument="dp_cp_group",
+                            deprecated_in="0.21",
+                            removed_in="0.23",
+                        ).dp_cp_gtp_remat
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
                         op=torch.distributed.ReduceOp.MAX,

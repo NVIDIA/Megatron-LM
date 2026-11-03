@@ -2,15 +2,17 @@
 
 """``clip_qk`` reduces the maximum attention logits over the group its caller passes."""
 
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.optimizer.qk_clip import clip_qk
-from tests.unit_tests.test_utilities import Utils
+from megatron.core.process_groups_config import ProcessGroupFallbackWarning
+from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
 
 
 class _SelfAttention:
@@ -39,6 +41,12 @@ def _rank_logits():
     return torch.tensor([float(rank), -float(rank)], device='cuda')
 
 
+@pytest.fixture
+def fresh_warning_registry(monkeypatch):
+    """The test observes the first fallback warning of clip_qk in this process."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
 class TestClipQKGroup:
 
     def setup_method(self, method):
@@ -47,7 +55,7 @@ class TestClipQKGroup:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_reduces_over_the_given_group_without_global_reads(self):
+    def test_reduces_over_the_given_group_without_global_reads(self, fresh_warning_registry):
         world_size = Utils.world_size
         if world_size % 2 != 0:
             pytest.skip(f"world size {world_size} must be even to form pairs")
@@ -58,11 +66,8 @@ class TestClipQKGroup:
         )
         model, self_attention = _model_with_logits(_rank_logits())
 
-        with mock.patch.object(
-            parallel_state,
-            'get_data_parallel_group',
-            side_effect=AssertionError("clip_qk read the global data-parallel group"),
-        ):
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
             log_max = clip_qk(model, dp_cp_group=pair_group)
 
         rank = torch.distributed.get_rank()
@@ -71,12 +76,35 @@ class TestClipQKGroup:
         assert torch.equal(self_attention.clipped_with, expected)
         assert log_max == float(high)
 
-    def test_without_a_group_reduces_over_the_global_dp_cp_group(self):
+    def test_without_a_group_warns_and_reduces_over_the_global_dp_cp_group(
+        self, fresh_warning_registry
+    ):
         model, self_attention = _model_with_logits(_rank_logits())
 
-        log_max = clip_qk(model)
+        with (
+            mock.patch.object(
+                torch.distributed, 'all_reduce', wraps=torch.distributed.all_reduce
+            ) as all_reduce,
+            pytest.warns(
+                ProcessGroupFallbackWarning, match="clip_qk was called without `dp_cp_group`"
+            ),
+        ):
+            log_max = clip_qk(model)
 
+        # The fallback reduces over the global DP x CP group, GTP-remat peers included.
+        global_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        assert all_reduce.call_args.kwargs['group'] is global_dp_cp_group
         world_size = Utils.world_size
         expected = torch.tensor([float(world_size - 1), 0.0], device='cuda')
         assert torch.equal(self_attention.clipped_with, expected)
         assert log_max == float(world_size - 1)
+
+    def test_without_logits_needs_no_group(self, fresh_warning_registry):
+        model, self_attention = _model_with_logits(None)
+
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            log_max = clip_qk(model)
+
+        assert log_max == 0
+        assert self_attention.clipped_with is None
