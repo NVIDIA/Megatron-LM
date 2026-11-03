@@ -28,7 +28,6 @@ import pytest
 import torch
 
 import megatron.core.transformer.attention as attention_module
-import megatron.core.transformer.utils as transformer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -318,6 +317,7 @@ def test_te_flash_attention_4_causal_matches_reference(monkeypatch, batch_invari
     """
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("Transformer Engine runs FlashAttention-4 on SM90 and newer")
+    import transformer_engine
     from transformer_engine.pytorch.attention.dot_product_attention import (
         dot_product_attention as te_dpa,
     )
@@ -328,8 +328,9 @@ def test_te_flash_attention_4_causal_matches_reference(monkeypatch, batch_invari
         te_supports_batch_invariant_attention,
     )
 
-    # The CI images ship FA4, so a missing or too-old one is a failure, not a skip.
-    assert attention_module.HAVE_FA4, attention_module._FA4_UNAVAILABLE
+    # The CI images ship FA4, so a missing or too-old one is a failure, not a skip. This test uses
+    # only what main already has, so it also runs as a negative control against main.
+    assert attention_module.HAVE_FA4, "flash-attn-4 is not usable in this environment"
     if batch_invariant and not te_supports_batch_invariant_attention():
         pytest.skip("this Transformer Engine has no batch-invariant attention")
 
@@ -374,9 +375,8 @@ def test_te_flash_attention_4_causal_matches_reference(monkeypatch, batch_invari
         reference = _causal_reference(q, k, v)
         error = ((out.float() - reference).norm() / reference.norm()).item()
         assert error <= 2e-2, (
-            f"Transformer Engine {transformer_utils.get_te_version()} on flash-attn-4 "
-            f"{attention_module._FA4_VERSION} (FA4 backend {backend}) differs from fp32 causal "
-            f"attention by rel {error:.3g}"
+            f"Transformer Engine {transformer_engine.__version__} on flash-attn-4 {backend} "
+            f"differs from fp32 causal attention by rel {error:.3g}"
         )
     finally:
         backends["backend_selection_requires_update"] = True
