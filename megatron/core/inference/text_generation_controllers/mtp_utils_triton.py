@@ -305,6 +305,12 @@ def _prepare_next_forward_pass_kernel(
 
         count = tl.sum((accepted & spec_valid).to(tl.int64))
         tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, count)
+    else:
+        spec_offsets = tl.arange(0, SPEC_BLOCK_SIZE)
+        spec_valid = spec_offsets < NUM_SPEC_TOKENS
+        out_base = pid.to(tl.int64) * accepted_tokens_out_stride
+        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, -1, mask=spec_valid)
+        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, 0)
 
 
 def prepare_next_forward_pass(
