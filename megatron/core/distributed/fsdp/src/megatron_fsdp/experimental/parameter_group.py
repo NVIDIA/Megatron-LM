@@ -665,20 +665,15 @@ class FsdpParameterGroup:
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
             destination = self.main_grad.get_tensor_view(index)
-            if not has_sharded_grads and self.grad_comm_dtype == self.main_grad.dtype:
-                # Convert before scaling: mul(bf16_grad, scale, out=fp32) rounds in bf16.
+            if not has_sharded_grads:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
             else:
-                # Preserve the packed path's cast, scale, then accumulate ordering.
-                grad = grad.to(self.grad_comm_dtype)
                 if self.grad_scale != 1:
-                    grad = grad * self.grad_scale
-                if has_sharded_grads:
-                    destination.add_(grad)
-                else:
-                    destination.copy_(grad)
+                    # Scale in the accumulation dtype, independently of grad_comm_dtype.
+                    grad = grad.to(destination.dtype) * self.grad_scale
+                destination.add_(grad)
         self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:

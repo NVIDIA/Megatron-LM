@@ -124,7 +124,7 @@ def test_replicated_gradients_still_reduce(distributed_setup):
 def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
     distributed_setup, outer_optimizer, grad_comm_dtype, set_to_none, sync_each_microbatch
 ):
-    """Local accumulation preserves cast-before-scale precision and deferred outer reduction."""
+    """Local accumulation uses main-grad precision regardless of the communication dtype."""
     setup = distributed_setup
     if setup.world_size < 2:
         pytest.skip("Requires a nontrivial outer data-parallel axis.")
@@ -160,13 +160,11 @@ def test_singleton_inner_gradients_preserve_scaling_and_accumulation(
                     (1, 8), setup.rank + index + 1, device=setup.device, dtype=torch.bfloat16
                 )
                 model(inputs).float().sum().backward()
-            # Independently form each rank's contribution in the configured reduction dtype.
+            # Local contributions are scaled in main-grad precision, even with BF16 comms.
             contributions = torch.arange(
-                index + 1, setup.world_size + index + 1, device=setup.device, dtype=torch.bfloat16
+                index + 1, setup.world_size + index + 1, device=setup.device, dtype=torch.float32
             )
-            expected_by_rank.add_(
-                (contributions.to(grad_comm_dtype or torch.float32) * scale).float()
-            )
+            expected_by_rank.add_(contributions * scale)
             if sync_each_microbatch or index == 1:
                 context.finish_grad_sync()
                 expected = expected_by_rank.mean() if index == 1 else expected_by_rank[setup.rank]
