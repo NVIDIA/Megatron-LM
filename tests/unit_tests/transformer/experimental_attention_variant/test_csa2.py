@@ -924,3 +924,271 @@ def test_packed_selection_matches_scoring_precision(monkeypatch, ratio, heads, c
     for _ in range(3):
         graph.replay()
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+def _cp_compressor_tokens(rank, device="cpu"):
+    """Include empty segments, padding and groups spanning a CP boundary."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+        CSA2THDLayout,
+        get_thd_token_metadata,
+    )
+
+    logical = torch.tensor([0, 3, 3, 14, 25], dtype=torch.int32, device=device)
+    padded = torch.tensor([0, 4, 4, 16, 32], dtype=torch.int32, device=device)
+    rows = torch.arange(rank * 8, (rank + 1) * 8, device=device)
+    seq, positions, valid = get_thd_token_metadata(logical, padded, rows)
+    return CSA2THDLayout(8, 16, logical, padded, seq, positions, valid, rank, 4)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("sanitized", [False, True])
+def test_cp_compressor_projects_before_compaction_and_reuses_hidden(ratio, rank, sanitized):
+    """Compare all gradients and saved hidden storage to the compact-hidden oracle."""
+    import copy
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_context_parallel import (
+        build_csa2_cp_compression_layout,
+    )
+
+    cfg, _ = _setup()
+    compressor = CSA2Compressor(
+        cfg,
+        CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        ratio,
+        ProcessGroupCollection(tp=Group()),
+    )
+    reference = copy.deepcopy(compressor)
+    tokens = _cp_compressor_tokens(rank)
+    layout = build_csa2_cp_compression_layout(tokens, ratio, 4)
+    x = torch.randn(8, 1, cfg.hidden_size)
+    boundary = torch.randn(4, 1, cfg.hidden_size)
+    x[~tokens.valid_tokens] = 0 if sanitized else torch.nan
+    x.requires_grad_()
+    boundary.requires_grad_()
+    xr, br = (t.detach().clone().requires_grad_() for t in (x, boundary))
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        output, actual_layout = compressor(
+            x, thd_layout=tokens, boundary_hidden=boundary, input_is_sanitized=sanitized
+        )
+    joined = torch.cat((br, xr))
+    inputs = joined[layout.local.source_indices].reshape(-1, 1, cfg.hidden_size)
+    inputs = inputs.masked_fill(
+        ~layout.local.valid_groups.repeat_interleave(ratio)[:, None, None], 0
+    )
+    latent, gate = reference._project(inputs)
+    if ratio == 2:
+        latent = reference._pool_r2(latent, gate, xr.dtype, layout.local.valid_groups)
+    expected = reference._normalize_thd(latent, layout.local)
+    probe = torch.randn_like(output)
+    output.backward(probe)
+    expected.backward(probe)
+    torch.testing.assert_close(output, expected)
+    for actual, wanted in [(x.grad, xr.grad), (boundary.grad, br.grad)]:
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, wanted)
+    for actual, wanted in zip(compressor.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, wanted.grad)
+    assert torch.equal(actual_layout.gather_indices, layout.gather_indices)
+    hidden_saved = [t for t in saved if t.ndim >= 2 and t.shape[-1] == cfg.hidden_size]
+    assert all(t.numel() <= x.numel() for t in hidden_saved)
+    if sanitized:
+        # Linear's [rows, hidden] view must retain the existing hidden storage,
+        # never a compact hidden allocation with aligned CP capacity.
+        assert any(
+            t.untyped_storage().data_ptr() == x.untyped_storage().data_ptr() for t in hidden_saved
+        )
+        assert all(
+            t.shape[0] in (ratio, x.shape[0]) or t is compressor.linear_wkv.weight
+            for t in hidden_saved
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy,fine_grained,overwrite,delayed,expected",
+    [
+        (None, False, False, False, False),
+        (None, False, True, False, True),
+        (None, False, False, True, True),
+        ("no_shard", True, False, False, False),
+        ("optim", False, False, False, True),
+        ("optim_grads", False, False, False, True),
+        ("optim_grads_params", True, False, False, True),
+        ("optim_grads_params", False, False, False, False),
+    ],
+)
+def test_cp_compressor_single_projection_contract(
+    strategy, fine_grained, overwrite, delayed, expected
+):
+    """Catch overwrite requirements even before FSDP's late first-forward hook."""
+    from types import SimpleNamespace
+
+    cfg, _ = _setup()
+    compressor = CSA2Compressor(
+        cfg,
+        CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        2,
+        ProcessGroupCollection(tp=Group()),
+    )
+    cfg.delay_wgrad_compute = delayed
+    weight = compressor.linear_wgate.weight
+    weight.overwrite_main_grad = overwrite
+    if strategy is not None:
+        weight._megatron_fsdp_model = SimpleNamespace(
+            data_parallel_sharding_strategy=strategy,
+            enable_fine_grained_param_gather_hook=fine_grained,
+        )
+    calls = []
+    hook = compressor.linear_wkv.register_forward_pre_hook(
+        lambda _module, args: calls.append(args[0])
+    )
+    x = torch.randn(8, 1, cfg.hidden_size, requires_grad=True)
+    output, _ = compressor(x, thd_layout=_cp_compressor_tokens(1), boundary_hidden=x[:4])
+    output.sum().backward()
+    hook.remove()
+    assert compressor._cp_requires_single_projection() is expected
+    assert len(calls) == (1 if expected else 2)
+    assert torch.isfinite(compressor.linear_wkv.weight.grad).all()
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("late_overwrite", [False, True])
+def test_cp_compressor_accumulates_both_gemms_on_each_microbatch(ratio, late_overwrite):
+    """Model TE's first-microbatch overwrite and verify split GEMMs accumulate."""
+    import copy
+    from types import SimpleNamespace
+
+    class FusedWgrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, overwrite):
+            ctx.save_for_backward(x, weight)
+            ctx.overwrite = overwrite
+            return torch.nn.functional.linear(x, weight)
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, weight = ctx.saved_tensors
+            dw = grad.flatten(0, -2).t() @ x.flatten(0, -2)
+            if ctx.overwrite:
+                weight.main_grad.copy_(dw)
+            else:
+                weight.main_grad.add_(dw)
+            return grad @ weight, None, None
+
+    class FusedLinear(Linear):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.disable_parameter_transpose_cache = False
+            self.is_first_microbatch = True
+            self.weight.main_grad = torch.zeros_like(self.weight)
+
+        def forward(self, x):
+            first = None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            self.is_first_microbatch = False
+            if late_overwrite:
+                self.weight.overwrite_main_grad = True
+            return FusedWgrad.apply(x, self.weight, first is True or late_overwrite), None
+
+    cfg, _ = _setup()
+    reference = CSA2Compressor(
+        cfg,
+        CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        ratio,
+        ProcessGroupCollection(tp=Group()),
+    )
+    compressor = CSA2Compressor(
+        copy.deepcopy(cfg),
+        CompressorSubmodules(linear_wkv=FusedLinear, linear_wgate=FusedLinear, norm=Norm),
+        ratio,
+        ProcessGroupCollection(tp=Group()),
+    )
+    compressor.load_state_dict(reference.state_dict())
+    if late_overwrite:
+        for linear in (compressor.linear_wkv, compressor.linear_wgate):
+            if linear is not None:
+                linear.weight._megatron_fsdp_model = SimpleNamespace(
+                    data_parallel_sharding_strategy="optim_grads",
+                    enable_fine_grained_param_gather_hook=False,
+                )
+    for _ in range(2):
+        if late_overwrite:
+            # FSDP overwrites its per-microbatch buffer before reducing it.
+            reference.zero_grad(set_to_none=True)
+        x = torch.randn(8, 1, cfg.hidden_size, requires_grad=True)
+        boundary = torch.randn(4, 1, cfg.hidden_size, requires_grad=True)
+        xr, br = (t.detach().clone().requires_grad_() for t in (x, boundary))
+        tokens = _cp_compressor_tokens(1)
+        actual, _ = compressor(x, thd_layout=tokens, boundary_hidden=boundary)
+        expected, _ = reference(xr, thd_layout=tokens, boundary_hidden=br)
+        probe = torch.randn_like(actual)
+        actual.backward(probe)
+        expected.backward(probe)
+        for linear, wanted in (
+            (compressor.linear_wkv, reference.linear_wkv),
+            (compressor.linear_wgate, reference.linear_wgate),
+        ):
+            if linear is not None:
+                torch.testing.assert_close(linear.weight.main_grad, wanted.weight.grad)
+                assert linear.disable_parameter_transpose_cache is False
+        torch.testing.assert_close(x.grad, xr.grad)
+        torch.testing.assert_close(boundary.grad, br.grad)
+
+
+@pytest.mark.parametrize("local_rows,halo_rows", [(0, 0), (0, 2), (2, 0), (2, 2)])
+@pytest.mark.parametrize("empty_compact", [False, True])
+def test_cp_projection_empty_storage_and_backward(local_rows, halo_rows, empty_compact):
+    """Never index an absent source or gradient tensor, including all-padding maps."""
+    from megatron.core.ops.attention.csa.compressor_projection import (
+        compact_cp_projection,
+        cp_projection_maps,
+    )
+
+    total = local_rows + halo_rows
+    count = 0 if empty_compact else max(total, 1) + 1
+    source = torch.arange(count).reshape(-1, 1).clamp_max(max(total - 1, 0))
+    valid = torch.arange(count) < total
+    mapping, inverse = cp_projection_maps(source, valid, halo_rows, halo_rows, local_rows)
+    local = torch.randn(local_rows, 1, 4, requires_grad=True)
+    halo = torch.randn(halo_rows, 1, 4, requires_grad=True)
+    output = compact_cp_projection(local, halo, mapping, inverse)
+    expected = torch.zeros(count, 1, 4)
+    if total and count:
+        expected[:total] = torch.cat((halo, local))
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    for value in (local, halo):
+        expected_grad = torch.zeros_like(value) if empty_compact else torch.ones_like(value)
+        torch.testing.assert_close(value.grad, expected_grad)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_cp_compressor_rejects_empty_shard_and_short_halo(ratio):
+    """Keep the existing nonempty-CP contract and fail before projecting a short halo."""
+    from dataclasses import replace
+
+    cfg, _ = _setup()
+    compressor = CSA2Compressor(
+        cfg,
+        CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        ratio,
+        ProcessGroupCollection(tp=Group()),
+    )
+    tokens = _cp_compressor_tokens(1)
+    x = torch.randn(8, 1, cfg.hidden_size)
+    with pytest.raises(ValueError, match="compression halo"):
+        compressor(x, thd_layout=tokens, boundary_hidden=x[: ratio - 1])
+    empty = replace(
+        tokens,
+        total_tokens=0,
+        sequence_ids=tokens.sequence_ids[:0],
+        position_ids=tokens.position_ids[:0],
+        valid_tokens=tokens.valid_tokens[:0],
+    )
+    with pytest.raises(ValueError, match="nonempty contiguous CP"):
+        compressor(x[:0], thd_layout=empty, boundary_hidden=x[:4])

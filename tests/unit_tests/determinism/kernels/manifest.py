@@ -909,6 +909,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa2_cp_projection_compaction",
+        sources=("megatron/core/ops/attention/csa/compressor_projection.py",),
+        tests=(
+            K + "test_csa_packed_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
+        ),
+        kind="triton",
+        notes="Compiled narrow CP projection gather and unique-source inverse gather. "
+        "Bit-exact forward/backward replay and live-map graph replay cover r1/r2; CPU "
+        "compressor tests check hidden-storage ownership, NaN padding and wgrad accumulation.",
+    ),
+    KernelEntry(
         name="csa2_cudnn_r2_pool",
         sources=("megatron/core/ops/attention/csa/cudnn_pooling.py",),
         tests=(

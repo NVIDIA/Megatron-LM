@@ -22,6 +22,10 @@ from torch import nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.ops._backends import require
+from megatron.core.ops.attention.csa.compressor_projection import (
+    compact_cp_projection,
+    cp_projection_maps,
+)
 from megatron.core.ops.attention.csa.cudnn_pooling import get_cudnn_r2_pool
 from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -318,6 +322,22 @@ def select_candidate_blocks_thd(
     )
 
 
+def _weight_requires_single_cp_projection(weight: nn.Parameter) -> bool:
+    """Detect wgrad overwrite contracts before FSDP's first pre-forward hook."""
+    if getattr(weight, "overwrite_main_grad", False):
+        return True
+    fsdp = getattr(weight, "_megatron_fsdp_model", None)
+    if fsdp is None:
+        return False
+    strategy = getattr(fsdp, "data_parallel_sharding_strategy", "no_shard")
+    if strategy == "no_shard":
+        return False
+    return getattr(fsdp, "enable_fine_grained_param_gather_hook", False) or strategy in (
+        "optim",
+        "optim_grads",
+    )
+
+
 class CSA2Compressor(MegatronModule):
     """Produce pre-RoPE global latents from complete, non-overlapping token groups."""
 
@@ -398,7 +418,9 @@ class CSA2Compressor(MegatronModule):
             if thd_layout.cp_size > 1:
                 if boundary_hidden is None:
                     raise ValueError("CSA2 CP compression requires the DSv4 left boundary")
-                return self._forward_thd_cp(x, boundary_hidden, thd_layout)
+                return self._forward_thd_cp(
+                    x, boundary_hidden, thd_layout, input_is_sanitized=input_is_sanitized
+                )
             return self._forward_thd(
                 x,
                 thd_layout.for_compression(self.compress_ratio),
@@ -461,33 +483,92 @@ class CSA2Compressor(MegatronModule):
             latent = self.norm(latent)
         return latent.masked_fill(~layout.valid_groups[:, None, None], 0)
 
-    def _forward_thd_cp(self, x, boundary_hidden, token_layout):
-        """Compress DSv4's compact local/halo groups before any K communication."""
+    def _cp_requires_single_projection(self):
+        """Deferred or overwriting wgrad cannot consume two calls to one Linear."""
+        return self.config.delay_wgrad_compute or any(
+            _weight_requires_single_cp_projection(linear.weight)
+            for linear in (self.linear_wkv, self.linear_wgate)
+            if linear is not None
+        )
+
+    def _forward_thd_cp(self, x, boundary_hidden, token_layout, *, input_is_sanitized=False):
+        """Project original local/halo storage before compacting narrow KV/gate.
+
+        Reuse the caller's sanitized local hidden rather than saving a separate
+        hidden-size compact allocation. Both
+        projections share the source/inverse maps and the small sanitized halo.
+        """
         if boundary_hidden.ndim != x.ndim or boundary_hidden.shape[1:] != x.shape[1:]:
             raise ValueError("CSA2 compressor boundary must match local hidden dimensions")
         layout = build_csa2_cp_compression_layout(
             token_layout, self.compress_ratio, boundary_hidden.shape[0]
         )
-        if self.use_fused_compressor and x.is_cuda and x.dtype == torch.bfloat16:
-            inputs, *_ = cp_utils.prepare_cp_compressor_input(
-                x,
-                boundary_hidden,
-                token_layout.cu_seqlens_padded,
-                token_layout.global_start,
-                token_layout.cp_size,
-                self.compress_ratio,
+        if self._cp_requires_single_projection():
+            # FSDP may set overwrite_main_grad only inside Linear's pre-forward
+            # hook; inspect wrapping state above, before splitting the GEMMs.
+            latent = self._forward_thd_cp_single_projection(
+                x, boundary_hidden, token_layout, layout
             )
-            # DSv4 compaction follows physical lengths; remove logical padding
-            # before either Linear so NaN padding cannot affect weight gradients.
-            inputs = inputs.masked_fill(
-                ~layout.local.valid_groups.repeat_interleave(self.compress_ratio)[:, None, None], 0
-            )
-            latent, gate = self._project(inputs)
-            if self.compress_ratio == 2:
-                latent = self._pool_r2(latent, gate, x.dtype, layout.local.valid_groups)
         else:
-            latent = self._forward_thd_grouped(torch.cat((boundary_hidden, x)), layout.local)
+            halo_rows = self.compress_ratio
+            sources, inverse = cp_projection_maps(
+                layout.local.source_indices,
+                layout.local.valid_groups,
+                boundary_hidden.shape[0],
+                halo_rows,
+                x.shape[0],
+            )
+            local = x
+            if not input_is_sanitized:
+                # Standalone calls may contain NaN padding. Attention forwards
+                # pass their already sanitized storage without another copy.
+                local = local.masked_fill((inverse[halo_rows:] < 0)[:, None, None], 0)
+            halo = boundary_hidden[-halo_rows:].masked_fill(
+                (inverse[:halo_rows] < 0)[:, None, None], 0
+            )
+            projections = []
+            with get_fp8_disabled_context(self.config):
+                for linear in (self.linear_wkv, self.linear_wgate):
+                    if linear is None:
+                        continue
+                    cache_setting = getattr(linear, "disable_parameter_transpose_cache", None)
+                    if cache_setting is not None:
+                        # TELinear then passes is_first_microbatch=None. Both
+                        # backwards must accumulate, including microbatch one.
+                        linear.disable_parameter_transpose_cache = True
+                    try:
+                        local_projected, _ = linear(local)
+                        halo_projected, _ = linear(halo)
+                    finally:
+                        if cache_setting is not None:
+                            linear.disable_parameter_transpose_cache = cache_setting
+                    projections.append(
+                        compact_cp_projection(local_projected, halo_projected, sources, inverse)
+                    )
+            latent = projections[0]
+            if self.compress_ratio == 2:
+                latent = self._pool_r2(latent, projections[1], x.dtype, layout.local.valid_groups)
         return self._normalize_thd(latent.to(x.dtype), layout.local), layout
+
+    def _forward_thd_cp_single_projection(self, x, boundary_hidden, token_layout, layout):
+        """Preserve a single wgrad GEMM for delayed/overwrite-only contracts."""
+        inputs, *_ = cp_utils.prepare_cp_compressor_input(
+            x,
+            boundary_hidden,
+            token_layout.cu_seqlens_padded,
+            token_layout.global_start,
+            token_layout.cp_size,
+            self.compress_ratio,
+        )
+        # Physical compaction includes logical padding; clear it before Linear
+        # so a zero output gradient cannot multiply a saved NaN input in wgrad.
+        inputs = inputs.masked_fill(
+            ~layout.local.valid_groups.repeat_interleave(self.compress_ratio)[:, None, None], 0
+        )
+        latent, gate = self._project(inputs)
+        if self.compress_ratio == 2:
+            latent = self._pool_r2(latent, gate, x.dtype, layout.local.valid_groups)
+        return latent
 
     def _forward_thd_projected(self, x, layout, cu_seqlens_padded, *, input_is_sanitized):
         """Project token-order inputs before gathering the smaller KV/gate tensors."""

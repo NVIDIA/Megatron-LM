@@ -98,3 +98,50 @@ def test_async_context_parallel_collectives_replay():
         assert_replays_bit_exact(reduce, (global_grad,), backward=False, contention=True)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_cp_projected_compaction_replay_and_live_graph_maps(ratio):
+    """Unique-source backward remains bit exact when captured padding maps change."""
+    from megatron.core.ops.attention.csa.compressor_projection import (
+        compact_cp_projection,
+        cp_projection_maps,
+    )
+
+    seeded()
+    sources = torch.arange(32, device="cuda").reshape(-1, ratio)
+    valid = torch.ones(sources.shape[0], dtype=torch.bool, device="cuda")
+    local = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    halo = torch.randn(ratio, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def run(x, boundary):
+        mapping, inverse = cp_projection_maps(sources, valid, ratio, ratio, x.shape[0])
+        return compact_cp_projection(x, boundary, mapping, inverse)
+
+    assert_replays_bit_exact(
+        run, (local, halo), contention=True, what="CSA2 projected CP compaction"
+    )
+    probe = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16)
+
+    def forward_backward():
+        output = run(local, halo)
+        return output, *torch.autograd.grad(output, (local, halo), probe)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward_backward()
+        forward_backward()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = forward_backward()
+    for shift in (0, 1):
+        sources.copy_(torch.arange(32, device="cuda").roll(shift).reshape_as(sources))
+        valid.fill_(True)
+        valid[shift::3] = False
+        expected = forward_backward()
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, wanted in zip(captured, expected):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
