@@ -26,7 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import BlockAtomic, ShardLayout, TensorAtomic, can_redistribute_locally
+from .placement import BlockAtomic, ShardLayout, TensorAtomic
 from .range import Range, intersect_ranges
 
 
@@ -430,22 +430,22 @@ class DBuffer:
 
         Only Shard-to-Replicate gathers and Replicate-to-Shard views may change
         multiple axes. Reductions and other transitions must change one axis.
-        Without ``out``, local transitions (including singleton-axis changes)
-        return a view and unchanged placements return ``self``. Other transitions
-        allocate the destination as needed. An explicit ``out`` receives a copy.
+        Without ``out``, sharding returns a view and unchanged placements return
+        ``self``. Other transitions allocate the destination as needed.
         """
         new_placements = tuple(new_placements)
         changed_axes = [
             axis
-            for axis, (old, new) in enumerate(zip(self.placements, new_placements, strict=True))
+            for axis, (old, new) in enumerate(zip(self.placements, new_placements))
             if old != new
         ]
-        if changed_axes and all(
-            self.placements[axis].is_shard() and new_placements[axis].is_replicate()
+        # all() is True for an empty changed_axes, so unchanged placements also
+        # use this path. view() then returns self, avoiding allocation/copying
+        # when out is omitted; an explicit out still receives a copy.
+        if all(
+            self.placements[axis].is_replicate() and new_placements[axis].is_shard()
             for axis in changed_axes
         ):
-            return self.allgather(changed_axes, out=out)
-        if can_redistribute_locally(self.mesh, self.placements, new_placements):
             view = self.view(new_placements)
             if out is None:
                 return view
@@ -453,6 +453,11 @@ class DBuffer:
             out.local_buffer.copy_(view.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=new_placements)
+        if all(
+            self.placements[axis].is_shard() and new_placements[axis].is_replicate()
+            for axis in changed_axes
+        ):
+            return self.allgather(changed_axes, out=out)
         if len(changed_axes) != 1:
             raise NotImplementedError(
                 "Only all-gather and sharding views support multiple changed placement axes."
@@ -559,7 +564,11 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = Replicate()
         if self.mesh.size(axis) == 1:
-            return self.redistribute(placements, out=out)
+            if out is None:
+                return self.view(placements)
+            out = self._create_or_validate_out(out, placements=placements)
+            out.local_buffer.copy_(self.local_buffer)
+            return out
         out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
@@ -582,7 +591,11 @@ class DBuffer:
         placements[axis] = new_placement
         _validate_placements(placements)
         if self.mesh.size(axis) == 1:
-            return self.redistribute(placements, out=out)
+            if out is None:
+                return self.view(placements)
+            out = self._create_or_validate_out(out, placements=placements)
+            out.local_buffer.copy_(self.local_buffer)
+            return out
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
         group = self.mesh.get_group(axis)

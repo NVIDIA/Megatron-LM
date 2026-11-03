@@ -85,14 +85,12 @@ def test_singleton_collectives_reuse_storage(
     for name in ("all_gather", "all_gather_into_tensor", "all_reduce", "reduce_scatter_tensor"):
         monkeypatch.setattr(dist, name, unexpected_collective)
 
-    for result in (
-        source.redistribute([target_placement], out=out),
-        getattr(source, operation)(*args, out=out),
-    ):
+    direct_result = getattr(source, operation)(*args, out=out)
+    if out is None:
+        assert direct_result.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+    for result in (direct_result, source.redistribute([target_placement], out=out)):
         assert result.placements == (target_placement,)
-        if out is None:
-            assert result.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
-        else:
+        if out is not None:
             assert result is out
         _assert_dbuffer_local_tensors_close(result, [tensor])
 
