@@ -89,9 +89,11 @@ except ImportError:
     tl = MagicMock()
     HAVE_TRITON = False
 
-# Peer pointers are passed to the pull kernel as separate arguments so that Triton
-# specializes them on 16-byte alignment and emits vectorized loads.
-_MAX_PULL_WORLD_SIZE = 8
+# Largest TP group of the symmetric-memory push and pull kernels. They take one pointer
+# argument per peer (p0..p7 / s0..s7) rather than a pointer array, so Triton specializes each
+# on 16-byte alignment and emits vectorized loads and stores. Larger groups use
+# all-to-all + fold (same bits).
+_MAX_SYMM_WORLD_SIZE = 8
 
 
 def use_ordered_tp_reduce(group, dtype: torch.dtype) -> bool:
@@ -489,10 +491,10 @@ def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
     if not (
         HAVE_TRITON
         and tensor.is_cuda
-        and 2 <= group.size() <= _MAX_PULL_WORLD_SIZE
-        # The cap is speed-only (see above). With several shard partials per rank the push
-        # beat the all-to-all at every measured size (GB200, TP2/TP4, up to 16k x 8192), so
-        # it applies only to one partial per rank.
+        and 2 <= group.size() <= _MAX_SYMM_WORLD_SIZE
+        # The input-size cap only affects speed (PUSH_MAX_INPUT_BYTES). With several shard
+        # partials per rank the push beat the all-to-all at every measured size (GB200,
+        # TP2/TP4, up to 16k x 8192), so the cap applies only to one partial per rank.
         and (num_parts > 1 or tensor.numel() * tensor.element_size() <= PUSH_MAX_INPUT_BYTES)
     ):
         return None
@@ -527,7 +529,7 @@ def _launch_push_fold(
     acc_fp64, round_fp32 = _acc_flags(output.dtype, exact)
     stage_numel = 2 * num_blocks * ws * num_parts * block
     views = _peer_views(hdl, 0, stage_numel, input_.dtype)
-    ptrs = list(views) + [views[0]] * (_MAX_PULL_WORLD_SIZE - ws)
+    ptrs = list(views) + [views[0]] * (_MAX_SYMM_WORLD_SIZE - ws)
     _ordered_push_fold_kernel[(num_blocks, 1, 1)](
         input_,
         *ptrs,
@@ -649,7 +651,7 @@ def can_use_symm_pull(symm_mem_hdl, tensor: torch.Tensor) -> bool:
     return (
         HAVE_TRITON
         and symm_mem_hdl is not None
-        and 2 <= symm_mem_hdl.world_size <= _MAX_PULL_WORLD_SIZE
+        and 2 <= symm_mem_hdl.world_size <= _MAX_SYMM_WORLD_SIZE
         and tensor.is_cuda
         and tensor.dtype.is_floating_point
     )
@@ -683,7 +685,7 @@ def _launch_pull(
     acc_fp64, round_fp32 = _acc_flags(out.dtype, exact)
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
     ws = symm_mem_hdl.world_size
-    ptrs = list(views) + [views[0]] * (_MAX_PULL_WORLD_SIZE - ws)
+    ptrs = list(views) + [views[0]] * (_MAX_SYMM_WORLD_SIZE - ws)
     _ordered_pull_kernel[(num_blocks, 1, 1)](
         *ptrs,
         out,
