@@ -58,10 +58,16 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
     yq.write_text(
         f"#!{sys.executable}\n"
         "import json, sys, yaml\n"
-        "assert sys.argv[1:4] == ['-o', 'json', '[.products[].test_case[]]']\n"
-        "with open(sys.argv[4]) as stream:\n"
+        "assert sys.argv[1:3] == ['-o', 'json']\n"
+        "if len(sys.argv) == 5:\n"
+        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
+        "else:\n"
+        "    assert sys.argv[3] == "
+        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
+        "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "print(json.dumps([case for product in recipe['products'] for case in product['test_case']]))\n"
+        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
+        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
@@ -760,123 +766,88 @@ def test_full_test_guards_override_selective_requests(
     assert "| `unit_testmon_eligible` | `false` |" in summary
 
 
-@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
-def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
-    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
-    zstd = tmp_path / "zstd"
-    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
-    zstd.chmod(0o755)
-    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
-    result, compression = _run(
-        _step("_unit-tests.yml", "select", "cache-compression")["run"],
-        tmp_path,
-        {**environment, "RUNNER_TEMP": str(tmp_path)},
-    )
-    assert result.returncode == 0, result.stderr
-    restore = _step("_unit-tests.yml", "select", "baseline")
-    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+@pytest.mark.parametrize("platform", ["h100", "gb200"])
+def test_unit_tests_select_and_execute_in_each_existing_gpu_bucket(
+    tmp_path, shell_environment, platform
+):
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert all(
-        "PATH" not in step.get("env", {})
-        for step in workflow["jobs"]["select"]["steps"]
-        if step.get("id") != "baseline"
-    )
-    probe = subprocess.run(
-        ["zstd", "--quiet", "--version"],
-        env={**environment, "PATH": compression["path"]},
-        text=True,
-        capture_output=True,
-    )
-    # The pinned cache action uses gzip when the version probe emits no output.
-    assert probe.stdout == probe.stderr == ""
-    assert probe.returncode != 0
+    assert set(workflow["jobs"]) == {"run"}
+    job = workflow["jobs"]["run"]
+    assert "needs" not in job and "if" not in job
+    assert job["runs-on"] == "${{ fromJSON(inputs.runner) }}"
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"]["include"] == "${{ fromJSON(inputs.buckets) }}"
+    action = job["steps"][-1]["with"]
+    assert action["container-image"] == "${{ inputs.container-image }}"
+    assert action["test_case"] == "${{ matrix.bucket }}"
+    assert action["timeout"] == "${{ matrix.timeout || 30 }}"
+    assert action["sha"] == "${{ inputs.sha }}"
     assert (
-        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
-        == "1.5.7\n"
+        action["unit_test_pr_files_artifact_id"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
     )
+    assert "unit_testmon_plan_artifact" not in action
+    assert "UNIT_TESTMON_COMPARE_SELECTIONS" not in yaml.safe_dump(workflow)
 
-    bucket = "tests/unit_tests/test_example.py"
-    result, outputs = _run(
-        _step("_unit-tests.yml", "select", "result")["run"],
-        tmp_path,
-        {
-            "PLAN_MODE": "selected",
-            "HAS_TESTS": str(has_tests).lower(),
-            "PLAN_OUTCOME": "success",
-            "UPLOAD_OUTCOME": "success",
-            "PLAN_ARTIFACT": "plan",
-            "BUCKET": bucket,
-        },
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    suffix = "" if platform == "h100" else "-gb200"
+    caller = callers[f"cicd-unit-tests-latest{suffix}"]
+    parser_job = f"cicd-parse-unit-tests{suffix}"
+    output = f"unit-tests{suffix}"
+    assert caller["uses"] == "./.github/workflows/_unit-tests.yml"
+    assert "strategy" not in caller
+    assert parser_job in caller["needs"]
+    assert caller["with"]["buckets"] == "${{ needs." + parser_job + ".outputs." + output + " }}"
+    assert caller["with"]["runner"] == (
+        "${{ needs.configure.outputs.h100_gpu_runs_on }}"
+        if platform == "h100"
+        else "${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}"
     )
+    assert caller["with"]["unit_testmon_mode"] == (
+        "${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}"
+    )
+    parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
+    result, parsed = _run(parser["run"], tmp_path, shell_environment)
     assert result.returncode == 0, result.stderr
-    assert outputs == {
-        "mode": "selected",
-        "has_tests": str(has_tests).lower(),
-        "plan_artifact": "plan",
-    }
-    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
-    assert workflow["jobs"]["run"]["needs"] == "select"
-    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
-    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
-    needs = SimpleNamespace(
-        select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
+    recipe = yaml.safe_load(
+        (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
-    context = {"needs": needs, "inputs": inputs}
-    assert eval(expression, {"__builtins__": {}}, context) == has_tests
-    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
-    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
-    assert eval(mode, {"__builtins__": {}}, context) == "preselected"
+    assert json.loads(parsed[output]) == [
+        {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+    ]
 
-    # Setup failures must fail on CPU rather than move selection onto the GPU.
-    needs.select.result = "failure"
-    assert not eval(expression, {"__builtins__": {}}, context)
-    needs.select.result = "success"
 
-    # When CPU selection requires the full bucket, GPU execution receives full.
-    result, full = _run(
-        _step("_unit-tests.yml", "select", "result")["run"],
-        tmp_path,
-        {
-            "PLAN_MODE": "full",
-            "HAS_TESTS": "true",
-            "PLAN_OUTCOME": "success",
-            "UPLOAD_OUTCOME": "skipped",
-            "PLAN_ARTIFACT": "plan",
-            "BUCKET": bucket,
-        },
+@pytest.mark.parametrize("mode", ["enforce", "full"])
+@pytest.mark.parametrize("branch", ["main", "dev", "core_r0.20.0", "pull-request/8523", ""])
+def test_gpu_selection_preserves_main_only_baselines_and_full_requests(mode, branch):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    action = workflow["jobs"]["run"]["steps"][-1]["with"]
+    expression = action["unit_testmon_mode"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("&&", "and").replace("||", "or")
+    inputs = SimpleNamespace(unit_testmon_mode=mode, unit_testmon_target_branch=branch)
+    assert eval(expression, {"__builtins__": {}}, {"inputs": inputs}) == (
+        "enforce" if mode == "enforce" and branch == "main" else "full"
     )
-    assert result.returncode == 0, result.stderr
-    assert full == {"mode": "full", "has_tests": "true", "plan_artifact": ""}
-    needs.select.outputs = SimpleNamespace(**full)
-    assert eval(expression, {"__builtins__": {}}, context)
-    assert eval(mode, {"__builtins__": {}}, context) == "full"
 
-    for platform in ("dgx_h100", "dgx_gb200"):
-        directory = tmp_path / f"unit-test-plan-{platform}"
-        directory.mkdir()
-        (directory / "plan.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "source_sha": "a" * 40,
-                    "bucket": bucket,
-                    "platform": platform,
-                    "mode": "selected",
-                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
-                }
-            )
-        )
-    result, outputs = _run(
-        _step("cicd-main.yml", "Coverage", "coverage")["run"],
-        tmp_path,
-        {
-            "SELECTIVE": "true",
-            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
-            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
-            "SOURCE_SHA": "a" * 40,
-        },
+
+@pytest.mark.parametrize("has_coverage", [True, False])
+def test_gpu_selection_requires_uploaded_coverage_without_plan_exceptions(tmp_path, has_coverage):
+    coverage = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"][
+        "Coverage"
+    ]
+    assert coverage["needs"] == ["Nemo_CICD_Test", "pre-flight"]
+    assert "unit-test-plan-" not in yaml.safe_dump(coverage)
+    assert "has_coverage" not in yaml.safe_dump(coverage)
+    stale_plan = tmp_path / "unit-test-plan-old"
+    stale_plan.mkdir()
+    (stale_plan / "plan.json").write_text(
+        json.dumps({"mode": "selected", "phases": {"prod": [], "experimental": []}})
     )
-    # Missing coverage is valid only when every bucket selected no tests.
-    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
-    assert outputs == ({} if has_tests else {"has_coverage": "false"})
+    if has_coverage:
+        report = tmp_path / "coverage-unit-test-example"
+        report.mkdir()
+        (report / ".coverage").touch()
+    result, outputs = _run(_step("cicd-main.yml", "Coverage", "coverage")["run"], tmp_path, {})
+    assert (result.returncode == 0) == has_coverage, result.stdout + result.stderr
+    assert outputs == {}
+    if not has_coverage:
+        assert "Missing unit-test coverage artifacts" in result.stderr

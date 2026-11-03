@@ -337,9 +337,8 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
     # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
-    # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
-    # representation. The reshard transform updates those canonical buffers, then
-    # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
+    # Once built, routed FlashInfer MoE weights are written through from these canonical
+    # buffers (attach_routed_mxfp8_writeback), so the transform updates them directly.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
@@ -653,6 +652,15 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+    # Raised after the plan so that every rank has finished its collectives.
+    if tgt_core is not None and any(
+        getattr(module, "_nvfp4_weights", None) is not None for module in tgt_core.modules()
+    ):
+        raise NotImplementedError(
+            "Refit of per-token NVFP4 expert weights (inference_moe_nvfp4_recipe) is not "
+            "supported yet: the BF16 experts were updated, but the derived NVFP4 copy the "
+            "FlashInfer kernel reads was not, so generation would run on the old weights."
+        )
     if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
         refreshed = False
         for module in tgt_core.modules():
