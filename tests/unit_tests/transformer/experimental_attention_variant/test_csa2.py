@@ -154,6 +154,111 @@ def test_shared_owners_receive_main_and_auxiliary_gradients(monkeypatch):
     assert torch.isfinite(first_inputs[0][0].grad).all()
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "batch,dim,padded", [(1, 128, False), (1, 512, True), (2, 128, True), (2, 512, False)]
+)
+def test_cudnn_r2_pool_matches_fp32_reference_and_graph(monkeypatch, batch, dim, padded):
+    """Exercise fused dispatch, padding gradients and warmed CUDA Graph replay."""
+    import copy
+
+    from tests.unit_tests.determinism.kernels.harness import deterministic_algorithms
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("cuDNN compressor requires SM100 or newer")
+    pytest.importorskip("cudnn.csa.compressor")
+    cfg, _ = _setup()
+    cfg.dsa_kernel_backend = "cudnn"
+    cfg.params_dtype = torch.bfloat16
+    cfg.v_head_dim = dim
+    compressor = CSA2Compressor(
+        cfg,
+        CompressorSubmodules(linear_wkv=Linear, linear_wgate=Linear, norm=Norm),
+        2,
+        ProcessGroupCollection(tp=Group()),
+    )
+    assert compressor._fused_r2_pool is not None
+    copy.deepcopy(compressor)
+    monkeypatch.setattr(
+        compressor,
+        "_pool_r2_native",
+        lambda *args: pytest.fail("the cuDNN pooling test must use the fused path"),
+    )
+    torch.manual_seed(790)
+    kv = torch.randn(66, batch, dim, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(kv)
+    valid = torch.arange(33, device="cuda") % 5 != 2 if padded else None
+    if valid is not None:
+        invalid = ~valid.repeat_interleave(2)[:, None, None]
+        kv = kv.masked_fill(invalid, torch.nan)
+        gate = gate.masked_fill(invalid, torch.nan)
+    kv.requires_grad_()
+    gate.requires_grad_()
+    clean_kv = kv if valid is None else kv.masked_fill(invalid, 0)
+    clean_gate = gate if valid is None else gate.masked_fill(invalid, 0)
+    expected = (
+        (
+            clean_kv.float().reshape(33, 2, batch, dim)
+            * clean_gate.float().reshape(33, 2, batch, dim).softmax(1)
+        )
+        .sum(1)
+        .bfloat16()
+    )
+    if valid is not None:
+        expected = expected.masked_fill(~valid[:, None, None], 0)
+    probe = torch.randn_like(expected)
+    if valid is not None:
+        probe = probe.masked_fill(~valid[:, None, None], torch.nan)
+    reference_grads = torch.autograd.grad(expected, (kv, gate), probe)
+
+    def run(keys=kv, gates=gate):
+        output = compressor._pool_r2(keys, gates, keys.dtype, valid)
+        return output, *torch.autograd.grad(output, (keys, gates), probe)
+
+    with deterministic_algorithms(False):
+        actual = run()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            static_kv = kv.detach().clone().requires_grad_()
+            static_gate = gate.detach().clone().requires_grad_()
+            # Autograd leaves must warm up on the stream used for capture.
+            run(static_kv, static_gate)
+            run(static_kv, static_gate)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run(static_kv, static_gate)
+        graph.replay()
+        torch.cuda.synchronize()
+    for observed, reference in zip(actual, (expected, *reference_grads)):
+        assert torch.isfinite(observed).all()
+        assert observed.dtype == torch.bfloat16
+        cosine = torch.nn.functional.cosine_similarity(
+            observed.float().flatten(), reference.float().flatten(), dim=0
+        )
+        assert cosine >= 0.999999
+    for observed, reference in zip(captured, actual):
+        torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+
+
+def test_r2_pool_keeps_native_fallback(monkeypatch):
+    """Unsupported inputs and strict determinism must not launch the frontend."""
+    from megatron.core.ops.attention.csa.cudnn_pooling import _pool_r2
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("native fallback must not launch a cuDNN kernel")
+
+    kv = torch.randn(8, 2, 8)
+    assert _pool_r2(kv, kv, kv.dtype, forward_fn=forbidden, backward_fn=forbidden) is None
+    _, layers = _setup()
+    compressor = layers[0].compressor
+    compressor._fused_r2_pool = lambda *args: None
+    expected = (kv.reshape(4, 2, 2, 8) * kv.reshape(4, 2, 2, 8).softmax(1)).sum(1)
+    torch.testing.assert_close(compressor._pool_r2(kv, kv, kv.dtype), expected)
+
+
 def test_auxiliary_objective_does_not_train_main_compressor(monkeypatch):
     monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **kwargs: None)
     _, layers = _setup()
@@ -474,7 +579,8 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
 @pytest.mark.parametrize(
     "ratio,heads,cp", [(r, h, c) for r in (1, 2) for h in (32, 64) for c in (1, 2)]
 )
-def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, heads, cp):
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_packed_selection_matches_scoring_precision(monkeypatch, ratio, heads, cp, precision):
     """Check compact/source/Reindex selection across empty, padded and CP-cut segments."""
     from dataclasses import replace
     from types import SimpleNamespace
@@ -487,7 +593,7 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
     )
     from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
         fused_candidate_topk,
-        fused_mxfp8_topk,
+        fused_compact_topk,
         prepare_csa2_indexer_inputs,
     )
     from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
@@ -496,7 +602,7 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
     from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("MXFP8 selection requires SM100")
+        pytest.skip("Compact selection requires SM100")
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(487)
     logical = torch.tensor([0, 65, 65, 322], dtype=torch.int32, device="cuda")
@@ -519,6 +625,8 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
     inputs = prepare_csa2_indexer_inputs(q, k, w, ratio, None, layout, compressed)
 
     def dequantize(x):
+        if precision == "bf16":
+            return x.float()
         data, scales = quantize_indexer_mxfp8_logical(x)
         scale = torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
         return (data.float().reshape(-1, 128) * scale).reshape(x.shape)
@@ -538,9 +646,9 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
         return ids.masked_fill(ids == sentinel, -1).int()
 
     expected = topk(scores)
-    torch.testing.assert_close(fused_mxfp8_topk(inputs, 7), expected)
+    torch.testing.assert_close(fused_compact_topk(inputs, 7, precision), expected)
     selected, blocks = fused_candidate_blocks(
-        inputs, topk_blocks=3, block_size=8, precision="mxfp8", token_topk=7
+        inputs, topk_blocks=3, block_size=8, precision=precision, token_topk=7
     )
     torch.testing.assert_close(selected, expected)
     local_keys = inputs.starts[:, None] + torch.arange(inputs.max_keys, device=q.device)
@@ -551,7 +659,7 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
     torch.testing.assert_close(blocks.lengths, expected_blocks.lengths)
     mask = blocks.to_mask(k.shape[0], thd_layout=layout, compressed_layout=compressed)
     torch.testing.assert_close(
-        fused_candidate_topk(replace(inputs, candidates=blocks), 7, "mxfp8"),
+        fused_candidate_topk(replace(inputs, candidates=blocks), 7, precision),
         topk(scores.masked_fill(~mask, -torch.inf)),
     )
 
@@ -560,15 +668,15 @@ def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, hea
             query, keys, weights, ratio, None, layout, compressed
         )
         source_topk, candidates = fused_candidate_blocks(
-            prepared, topk_blocks=3, block_size=8, precision="mxfp8", token_topk=7
+            prepared, topk_blocks=3, block_size=8, precision=precision, token_topk=7
         )
         return (
-            fused_mxfp8_topk(prepared, 7),
+            fused_compact_topk(prepared, 7, precision),
             source_topk,
             candidates.indices,
-            fused_candidate_topk(replace(prepared, candidates=candidates), 7, "mxfp8"),
+            fused_candidate_topk(replace(prepared, candidates=candidates), 7, precision),
         )
 
     assert_replays_bit_exact(
-        select, (q, k, w), backward=False, replays=3, what="CSA2 MXFP8 packed selection"
+        select, (q, k, w), backward=False, replays=3, what=f"CSA2 {precision} packed selection"
     )
