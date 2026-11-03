@@ -243,6 +243,7 @@ class TestDSAIndexShareHelpers:
                 dsa_indexer_topk_freq=4,
                 fp8=False,
                 fp4=False,
+                enable_mhc_connections=False,
                 distribute_saved_activations=False,
                 recompute_method=recompute_method,
                 recompute_num_layers=1,
