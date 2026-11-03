@@ -22,18 +22,36 @@ the eval-mode `TopKRouter` the model was trained with):
   softmax(z) over all experts (k > 1), not renormalized, unscaled. Hash layers take the experts
   from the token-id table and weight them by the score function as above.
 - Group-limited routing is not supported and must be rejected at construction.
+- Quantile balancing (`moe_router_load_balancing_type='quantile_balancing'`, documented in
+  `TransformerConfig` and `qb_dual_update`): micro-batch QB selects the k largest z - beta,
+  with the per-expert bias beta (`qb_beta`), and weights those experts with the score function
+  as above; global-batch QB (sigmoid only) selects the k largest sigmoid(z) + b with its derived
+  bias b (`expert_bias`) and weights them with sigmoid(z) normalized. Inference reads both biases
+  and never updates them or the QB accumulators; micro-batch QB with TE's fused router must be
+  refused, not routed without beta.
+- Router replay (`moe_enable_routing_replay`, `docs/api-guide/router_replay.md`): RECORD routes
+  as without replay and records exactly the routed experts (as a tensor, into the first T rows of
+  a static [max_tokens, k] buffer, or into one bank and layer of the double-buffered
+  [2, max_tokens, layers, k] buffer), writing nothing else; REPLAY_FORWARD routes each token to
+  its target experts, weighted by the score function as above; with no action, routing is
+  unchanged. Under CUDA-graph replay the recording lands in the bank selected at replay time.
 - Dispatch (exact, from `inference_moe_router_backend`'s documentation): backend 'triton' with
   sigmoid scores, an expert bias, fp32 logits, 1 < k <= min(32, E), E <= 512 and no
-  batch-invariant mode, group-limited routing, router replay or fusion runs the Triton kernel;
-  batch-invariant mode runs the routing eagerly; everything else runs the compiled routing.
+  batch-invariant mode, group-limited routing, router replay, micro-batch QB or fusion runs the
+  Triton kernel (global-batch QB's bias is an expert bias); batch-invariant mode runs the routing
+  eagerly; everything else runs the compiled routing.
 - CUDA-graph replay with new inputs gives the eager bits.
 
 Reference: fp64 routing written from the semantics above (`routing_reference`), on logits built
 to be exact in bf16 (the router weight is the identity) with a selection margin, so that every
 correct implementation selects the same experts. Trusted implementation: the same reference
-evaluated in fp32 on the device. Tolerance class: exact for expert sets, shapes, dtypes and
-dispatch; floating point for probs (bounded over the tensor, factor 4, see PROB_FACTOR);
-bit-exact for CUDA-graph replay. `test_gating_logits_are_fp32` checks the router GEMM itself against fp64.
+evaluated in fp32 on the device. QB and replay have their own fp64 references
+(`qb_reference`, `replay_reference`); QB logits keep the margin on z - beta, and z - beta is
+exact in fp32 (`make_qb_beta`). The eval-mode TopKRouter outside InferenceMode is checked against
+the same QB references (R06's cross-check). Tolerance class: exact for expert sets, shapes,
+dtypes, dispatch, QB state and recorded indices (and every untouched buffer element); floating
+point for probs (bounded over the tensor, factor 4, see PROB_FACTOR); bit-exact for CUDA-graph
+replay. `test_gating_logits_are_fp32` checks the router GEMM itself against fp64.
 
 Structure (read after the contract): `_forward` squeezes dim 1 of the logits (main), takes QB
 precomputed indices, then chooses the Triton kernel (`_uses_sigmoid_topk_kernel`), eager
@@ -44,8 +62,18 @@ keys built from their bits, with a separate rule for negative scores. Covered: E
 (and 1024 for the dispatch boundary), k in {1, 2, 6, 8, 32, E}, T in {0, 1, 7, 128, 129, 4096},
 B in {1, 2, 3}, every score function, expert bias, scaling, sinkhorn, hash layers, fusion, all
 three paths, CUDA-graph replay, and expert biases that make the k-th selected score (and the
-order among the selected ones) negative (`test_negative_routing_scores_select_like_fp64`). Not covered: quantile balancing and router replay (separate features
-with their own config switches).
+order among the selected ones) negative (`test_negative_routing_scores_select_like_fp64`).
+QB (`_forward`: micro-batch QB precomputes the indices, so it takes the compiled routing; global
+QB's bias goes through the expert-bias route, so the Triton kernel where the shape allows):
+micro-batch pairwise over 3 score functions x 3 paths x E {8, 64, 256} x k {2, 6, 8} (k < E) x
+T {0, 1, 7, 128, 129} x scaling; global-batch pairwise over 3 paths x E x k {2, 6, 8, 32} x T x
+scaling; CUDA-graph replay with an in-place bias update for both scopes on the compiled and
+Triton backends; fusion refused. Router replay (`RouterReplay.get_replay_topk` inside the
+compiled routing; `record_indices` has a tensor, a static-buffer and a banked index_put branch):
+RECORD pairwise over 4 score kinds x 3 paths x {no action, tensor, static, banked} x E x
+T {0, 1, 7, 129}; REPLAY_FORWARD pairwise over 4 kinds x 3 paths x E x T x scaling, with targets
+that differ from the natural top-k; RECORD captured in a CUDA graph into the static and the
+banked buffer, the bank switched between replays.
 
 Main vs open PRs (#8562, d4-d9 "Return dense [num_tokens, topk] routing from InferenceTopKRouter
 with router fusion and top-1", which also routes sinkhorn like the eval router):
@@ -66,11 +94,13 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.router import InferenceTopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.oracles import oracle_utils as ou
 from tests.unit_tests.test_utilities import Utils
@@ -201,7 +231,7 @@ def bf16_pool(span):
     return torch.cat([-values.flip(0), values])
 
 
-def make_logits(tokens, num_experts, topk, kind, bias, seed):
+def make_logits(tokens, num_experts, topk, kind, bias, seed, keys=None):
     """bf16-exact logits with a selection margin, a different set of values for every token.
 
     Each token draws ``num_experts`` distinct bf16 values (in random order) from a pool, so the
@@ -209,7 +239,8 @@ def make_logits(tokens, num_experts, topk, kind, bias, seed):
     to token: with one shared set, every token's probs would repeat the same few values and an
     rms bound would rest on those few. A token is redrawn until its k-th and (k+1)-th selection
     keys differ by more than 1e-4 of the k-th, far above fp32 rounding, so no correct
-    implementation can select differently.
+    implementation can select differently. ``keys`` (fp64 row -> selection keys) replaces the
+    score function's keys, e.g. for quantile balancing's z - beta.
     """
     span = 16.0 if KINDS[kind]["score"] == "softmax" else 8.0
     pool = bf16_pool(span)
@@ -222,8 +253,8 @@ def make_logits(tokens, num_experts, topk, kind, bias, seed):
             row = pool[torch.randperm(pool.numel(), generator=g)[:num_experts]]
             if topk >= num_experts:
                 break
-            keys = selection_keys(row[None], kind, bias)
-            top = keys.topk(topk + 1, dim=-1).values[0]
+            row_keys = selection_keys(row[None], kind, bias) if keys is None else keys(row[None])
+            top = row_keys.topk(topk + 1, dim=-1).values[0]
             if top[topk - 1] - top[topk] > 1e-4 * max(1.0, abs(float(top[topk - 1]))):
                 break
         else:
@@ -268,6 +299,13 @@ def run_router(router, x, path):
 
 def check_routing(probs, experts, logits, topk, kind, bias, scaling, what):
     """Exact shapes, dtypes and expert sets; probs bounded against fp64 per token."""
+    check_against(
+        probs, experts, logits, topk, routing_reference, (topk, kind, bias, scaling), what
+    )
+
+
+def check_against(probs, experts, logits, topk, reference, args, what):
+    """``check_routing`` against ``reference(logits, *args)``, a (probs, sorted experts) pair."""
     tokens = logits.shape[0]
     assert tuple(probs.shape) == (tokens, topk), f"{what}: probs {tuple(probs.shape)}"
     assert tuple(experts.shape) == (tokens, topk), f"{what}: experts {tuple(experts.shape)}"
@@ -275,9 +313,9 @@ def check_routing(probs, experts, logits, topk, kind, bias, scaling, what):
     assert experts.dtype == torch.int64, f"{what}: experts dtype {experts.dtype}"
     order = experts.argsort(dim=-1)
     got_experts, got_probs = experts.gather(-1, order), probs.gather(-1, order)
-    ref_probs, ref_experts = ou.fp64_reference(routing_reference, logits, topk, kind, bias, scaling)
+    ref_probs, ref_experts = ou.fp64_reference(reference, logits, *args)
     ou.assert_exact(got_experts, ref_experts, what=f"{what}: expert sets")
-    trusted, trusted_experts = routing_reference(logits.float(), topk, kind, bias, scaling)
+    trusted, trusted_experts = reference(logits.float(), *args)
     assert torch.equal(trusted_experts, ref_experts), "the fp32 trusted routing selects differently"
     ou.assert_close_to_reference(
         got_probs, ref_probs, trusted, factor=PROB_FACTOR, what=f"{what}: probs"
@@ -604,3 +642,436 @@ def test_gating_logits_are_fp32(bi_backend):
         dim=-1,
         what=f"router logits (batch-invariant backend {bi_backend})",
     )
+
+
+# ---- Quantile balancing ------------------------------------------------------------------------
+#
+# Micro-batch QB selects the k largest z - beta (per-expert `qb_beta`) and weights them with the
+# score function, exactly as without QB. Global-batch QB derives a bias for sigmoid scores
+# (`expert_bias`) and selects the k largest sigmoid(z) + bias, weighted by sigmoid(z) normalized.
+# In inference both biases are read, never updated (the QB accumulators stay as they were).
+
+QB_SCOPES = ("micro_batch", "global_batch")
+
+
+def build_qb_router(num_experts, topk, kind, scope, **kwargs):
+    """An InferenceTopKRouter with quantile balancing at the given estimation scope."""
+    return build_router(
+        num_experts,
+        topk,
+        kind,
+        load_balancing="quantile_balancing",
+        moe_router_quantile_balancing_estimation_scope=scope,
+        **kwargs,
+    )
+
+
+def make_qb_beta(num_experts, seed=11):
+    """Micro-batch QB biases in [-2, 2], multiples of 1/64.
+
+    The bf16 logits of `make_logits` are multiples of 2**-11 below 8 in magnitude, so z - beta
+    is a multiple of 2**-11 below 2**4: exact in fp32, and the margin holds on every path.
+    """
+    g = ou.make_generator(seed)
+    beta = torch.randint(-128, 129, (num_experts,), generator=g).double() / 64
+    return beta.float().to(_DEVICE)
+
+
+def make_qb_bias(num_experts, seed=12):
+    """Global-batch QB biases in [-1, 1] (`qb_bin_bounds`' default range), multiples of 1/64."""
+    g = ou.make_generator(seed)
+    bias = torch.randint(-64, 65, (num_experts,), generator=g).double() / 64
+    return bias.float().to(_DEVICE)
+
+
+def qb_keys(beta):
+    """Micro-batch QB selection keys z - beta, for `make_logits`' margin (fp64 rows)."""
+    beta = beta.detach().double().cpu()
+    return lambda rows: rows - beta
+
+
+def qb_reference(logits, topk, kind, beta, scaling):
+    """Micro-batch QB: the k largest z - beta, weighted by the score function."""
+    experts = (logits - beta).topk(topk, dim=-1).indices.sort(dim=-1).values
+    return weights_of(logits, experts, kind, scaling), experts
+
+
+def eval_router_routing(router, x):
+    """Route outside InferenceMode: the eval-mode TopKRouter the model was trained with, its
+    [T, E] probs and map converted to dense [T, k] (experts ascending)."""
+    topk = router.topk
+    with torch.no_grad():
+        probs, routing_map = router(x)
+    experts = routing_map.nonzero()[:, 1].view(-1, topk)
+    return probs.gather(-1, experts), experts
+
+
+def _qb_id(case):
+    return "-".join(f"{k}{v}" for k, v in case.items())
+
+
+_QB_MICRO_CASES = ou.pairwise_cases(
+    {
+        "kind": ("softmax", "softmax_pre", "sigmoid"),
+        "path": PATHS,
+        "e": (8, 64, 256),
+        "topk": (2, 6, 8),
+        "t": (0, 1, 7, 128, 129),
+        "scaling": (None, 2.5),
+    }
+)
+
+
+@pytest.mark.parametrize("case", _QB_MICRO_CASES, ids=[_qb_id(c) for c in _QB_MICRO_CASES])
+def test_quantile_balancing_micro_batch_selects_on_logits_minus_beta(case, monkeypatch):
+    """Micro-batch QB on every path: the experts with the k largest z - beta, probs from the
+    score function, and the QB state read only. The compiled routing (or eager routing in
+    batch-invariant mode) runs, never the sigmoid kernel, which knows no QB bias. The eval-mode
+    router outside InferenceMode selects the same experts."""
+    num_experts, kind, tokens = case["e"], case["kind"], case["t"]
+    topk = min(case["topk"], num_experts - 1)  # QB requires k < E
+    backend = "torch" if case["path"] == "compiled" else "triton"
+    router = build_qb_router(
+        num_experts, topk, kind, "micro_batch", backend=backend, scaling=case["scaling"]
+    )
+    beta = make_qb_beta(num_experts)
+    router.qb_beta.copy_(beta)
+    state = {n: getattr(router, n).clone() for n in ("qb_beta", "qb_beta_accum", "qb_beta_count")}
+    logits = make_logits(tokens, num_experts, topk, kind, None, seed=21, keys=qb_keys(beta))
+    x = logits.view(tokens, 1, num_experts)
+    spy = _PathSpy(monkeypatch)
+    probs, experts = run_router(router, x, case["path"])
+    want = [] if case["path"] == "batch_invariant" else ["compiled"]
+    assert spy.calls == want, f"ran {spy.calls}, expected {want}"
+    args = (topk, kind, beta, case["scaling"])
+    check_against(probs, experts, logits, topk, qb_reference, args, f"QB micro {_qb_id(case)}")
+    for name, before in state.items():
+        ou.assert_exact(getattr(router, name), before, what=f"{name} after inference routing")
+    if tokens:
+        eval_probs, eval_experts = eval_router_routing(router, x)
+        check_against(
+            eval_probs, eval_experts, logits, topk, qb_reference, args, "eval-mode QB router"
+        )
+
+
+_QB_GLOBAL_CASES = ou.pairwise_cases(
+    {
+        "path": PATHS,
+        "e": (8, 64, 256),
+        "topk": (2, 6, 8, 32),
+        "t": (0, 1, 7, 128, 129),
+        "scaling": (None, 2.5),
+    }
+)
+
+
+@pytest.mark.parametrize("case", _QB_GLOBAL_CASES, ids=[_qb_id(c) for c in _QB_GLOBAL_CASES])
+def test_quantile_balancing_global_batch_routes_with_its_bias(case, monkeypatch):
+    """Global-batch QB on every path: the k largest sigmoid(z) + bias, probs sigmoid(z)
+    normalized, histogram and bias read only. The QB bias is an expert bias, so the Triton
+    backend runs the sigmoid kernel wherever it supports the shape. The eval-mode router
+    selects the same experts."""
+    num_experts, tokens, scaling = case["e"], case["t"], case["scaling"]
+    topk = min(case["topk"], num_experts - 1)
+    backend = "torch" if case["path"] == "compiled" else "triton"
+    router = build_qb_router(
+        num_experts, topk, "sigmoid", "global_batch", backend=backend, scaling=scaling
+    )
+    assert router.qb_beta is None and router.expert_bias is not None
+    bias = make_qb_bias(num_experts)
+    router.expert_bias.copy_(bias)
+    state = {n: getattr(router, n).clone() for n in ("expert_bias", "qb_histogram")}
+    logits = make_logits(tokens, num_experts, topk, "sigmoid_bias", bias, seed=22)
+    x = logits.view(tokens, 1, num_experts)
+    spy = _PathSpy(monkeypatch)
+    probs, experts = run_router(router, x, case["path"])
+    if case["path"] == "batch_invariant":
+        want = []
+    elif case["path"] == "triton" and is_sigmoid_topk_supported(num_experts, topk):
+        want = ["triton_kernel"]
+    else:
+        want = ["compiled"]
+    assert spy.calls == want, f"ran {spy.calls}, expected {want}"
+    what = f"QB global {_qb_id(case)}"
+    check_routing(probs, experts, logits, topk, "sigmoid_bias", bias, scaling, what)
+    for name, before in state.items():
+        ou.assert_exact(getattr(router, name), before, what=f"{name} after inference routing")
+    if tokens:
+        eval_probs, eval_experts = eval_router_routing(router, x)
+        check_routing(
+            eval_probs, eval_experts, logits, topk, "sigmoid_bias", bias, scaling, "eval QB"
+        )
+
+
+@pytest.mark.parametrize("path", ["compiled", "triton"])
+@pytest.mark.parametrize("scope", QB_SCOPES)
+def test_quantile_balancing_cuda_graph_replay(scope, path):
+    """Captured once, replayed with new tokens: the eager bits, right against fp64. A QB bias
+    updated in place (as a weight refit does) is the one the next replay routes with."""
+    tokens, num_experts, topk = 128, 64, 6
+    backend = "torch" if path == "compiled" else "triton"
+    if scope == "micro_batch":
+        kind = "softmax"
+        router = build_qb_router(num_experts, topk, kind, scope, backend=backend)
+        bias_buffer, biases = router.qb_beta, [make_qb_beta(num_experts, s) for s in (11, 13)]
+    else:
+        kind = "sigmoid_bias"
+        router = build_qb_router(num_experts, topk, "sigmoid", scope, backend=backend)
+        bias_buffer, biases = router.expert_bias, [make_qb_bias(num_experts, s) for s in (12, 14)]
+
+    def logits_for(bias, seed):
+        if scope == "micro_batch":
+            return make_logits(tokens, num_experts, topk, kind, None, seed, keys=qb_keys(bias))
+        return make_logits(tokens, num_experts, topk, kind, bias, seed)
+
+    def check(probs, experts, logits, bias, what):
+        if scope == "micro_batch":
+            args = (topk, kind, bias, None)
+            check_against(probs, experts, logits, topk, qb_reference, args, what)
+        else:
+            check_routing(probs, experts, logits, topk, kind, bias, None, what)
+
+    bias_buffer.copy_(biases[0])
+    x_buf = logits_for(biases[0], 1).view(tokens, 1, num_experts).clone()
+    with torch.no_grad(), InferenceMode.active():
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):  # compile and warm up outside the capture
+                router(x_buf)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            probs_buf, experts_buf = router(x_buf)
+        for seed, bias in ((31, biases[0]), (32, biases[1]), (33, biases[0])):
+            bias_buffer.copy_(bias)
+            new = logits_for(bias, seed)
+            x_buf.copy_(new.view(tokens, 1, num_experts))
+            graph.replay()
+            eager_probs, eager_experts = router(new.view(tokens, 1, num_experts))
+            ou.assert_exact(experts_buf, eager_experts, what=f"replay experts seed {seed}")
+            ou.assert_exact(probs_buf, eager_probs, what=f"replay probs seed {seed}")
+            check(probs_buf, experts_buf, new, bias, f"QB {scope} replay {seed}")
+
+
+def test_quantile_balancing_with_router_fusion_is_rejected():
+    """Micro-batch QB selects outside the score function, which TE's fused router cannot take:
+    the router must refuse, not route without the QB bias. (Under torch.compile the refusal can
+    surface as a RuntimeError wrapping the assertion.)"""
+    router = build_qb_router(64, 6, "sigmoid", "micro_batch", moe_router_fusion=True)
+    router.qb_beta.copy_(make_qb_beta(64))
+    logits = make_logits(7, 64, 6, "sigmoid", None, seed=23, keys=qb_keys(router.qb_beta))
+    with pytest.raises((AssertionError, ValueError, RuntimeError)):
+        run_router(router, logits.view(7, 1, 64), "compiled")
+
+
+# ---- Router replay ----------------------------------------------------------------------------
+#
+# With `moe_enable_routing_replay`, each router owns a RouterReplay. RECORD routes as usual and
+# records the routed experts: as a tensor, into a static [max_tokens, k] buffer (rows past the
+# step's tokens untouched), or into bank `buffer_index` and layer `layer_index` of a
+# double-buffered [2, max_tokens, layers, k] buffer (the async engine's), every other row,
+# layer and bank untouched. REPLAY_FORWARD routes each token to the target experts, weighted as
+# the score function weights those experts (an expert bias steers selection only). Without an
+# action, routing is unchanged. The Triton sigmoid kernel does not record or replay, so the
+# compiled routing runs.
+
+SENTINEL = -7  # never an expert id
+REPLAY_MAX_TOKENS = 160
+
+
+@pytest.fixture
+def replay_registry():
+    """RouterReplay keeps every instance in a class-level list; start and end empty."""
+    RouterReplay.clear_global_router_replay_instances()
+    yield
+    RouterReplay.clear_global_router_replay_action()
+    RouterReplay.clear_global_indices()
+    RouterReplay.clear_global_static_buffers()
+    RouterReplay.clear_global_router_replay_instances()
+
+
+def replay_reference(logits, target, kind, scaling):
+    """REPLAY_FORWARD: the target experts, weighted by the score function."""
+    experts = target.sort(dim=-1).values
+    return weights_of(logits, experts, kind, scaling), experts
+
+
+def make_record_buffer(record, topk):
+    """(buffer, set_static_buffer kwargs, the view of the buffer this router records into)."""
+    if record == "static":
+        buffer = torch.full((REPLAY_MAX_TOKENS, 2, topk), SENTINEL, dtype=torch.int32)
+        buffer = buffer.to(_DEVICE)
+
+        def select(b):
+            return b[:, 1, :]  # layer 1 of 2, as RouterReplay.set_global_static_buffers gives
+
+        return buffer, dict(buffer=select(buffer)), select
+    buffer = torch.full((2, REPLAY_MAX_TOKENS, 2, topk), SENTINEL, dtype=torch.int32)
+    buffer = buffer.to(_DEVICE)
+    bank = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
+    layer = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
+
+    def select(b):
+        return b[int(bank), :, int(layer), :]
+
+    return buffer, dict(buffer=buffer, buffer_index=bank, layer_index=layer), select
+
+
+def check_recorded_rows(buffer, select, experts, what):
+    """The first T rows of the router's view hold the routed experts (as sets); every other
+    element of the buffer keeps its sentinel."""
+    tokens = experts.shape[0]
+    rows = select(buffer)[:tokens].long().sort(dim=-1).values
+    ou.assert_exact(rows, experts.sort(dim=-1).values, what=f"{what}: recorded rows")
+    expected = torch.full_like(buffer, SENTINEL)
+    select(expected)[:tokens] = select(buffer)[:tokens]
+    ou.assert_exact(buffer, expected, what=f"{what}: elements outside the recorded rows")
+
+
+_RECORD_CASES = ou.pairwise_cases(
+    {
+        "kind": ("softmax", "softmax_pre", "sigmoid", "sigmoid_bias"),
+        "path": PATHS,
+        "record": ("off", "tensor", "static", "banked"),
+        "e": (8, 64, 256),
+        "t": (0, 1, 7, 129),
+    }
+)
+
+
+@pytest.mark.parametrize("case", _RECORD_CASES, ids=[_qb_id(c) for c in _RECORD_CASES])
+def test_router_replay_record_routes_and_records(case, monkeypatch, replay_registry):
+    """RECORD (and replay enabled without an action) routes as the router without replay does;
+    RECORD records exactly the routed experts and writes nothing else. The compiled routing
+    runs (eager routing in batch-invariant mode)."""
+    num_experts, kind, tokens, topk = case["e"], case["kind"], case["t"], 6
+    backend = "torch" if case["path"] == "compiled" else "triton"
+    router, bias, logits, x = _setup(
+        num_experts, topk, kind, tokens, seed=41, backend=backend, moe_enable_routing_replay=True
+    )
+    replay = router.router_replay
+    assert replay is not None, "moe_enable_routing_replay builds no RouterReplay"
+    buffer = select = None
+    if case["record"] != "off":
+        replay.set_router_replay_action(RouterReplayAction.RECORD)
+    if case["record"] in ("static", "banked"):
+        buffer, kwargs, select = make_record_buffer(case["record"], topk)
+        replay.set_static_buffer(**kwargs)
+    spy = _PathSpy(monkeypatch)
+    probs, experts = run_router(router, x, case["path"])
+    want = [] if case["path"] == "batch_invariant" else ["compiled"]
+    assert spy.calls == want, f"ran {spy.calls}, expected {want}"
+    what = f"record {_qb_id(case)}"
+    check_routing(probs, experts, logits, topk, kind, bias, None, what)
+    recorded = replay.get_recorded_indices()
+    if case["record"] == "off":
+        assert recorded is None, "recorded without the RECORD action"
+        return
+    ou.assert_exact(
+        recorded.long().sort(dim=-1).values,
+        experts.sort(dim=-1).values,
+        what=f"{what}: recorded experts",
+    )
+    if buffer is not None:
+        check_recorded_rows(buffer, select, experts, what)
+
+
+def make_replay_targets(logits, topk, kind, bias, seed):
+    """Target experts per token, never the token's own top-k for even tokens: its weakest
+    selected expert is swapped for its lowest-scoring one. Odd tokens get k random experts.
+    Each row is in random order."""
+    keys = selection_keys(
+        logits.double().cpu(), kind, None if bias is None else bias.double().cpu()
+    )
+    tokens, num_experts = keys.shape
+    g = ou.make_generator(seed)
+    rows = []
+    for t in range(tokens):
+        if t % 2 == 0:
+            row = keys[t].topk(topk).indices.clone()
+            row[-1] = keys[t].argmin()
+        else:
+            row = torch.randperm(num_experts, generator=g)[:topk]
+        rows.append(row[torch.randperm(topk, generator=g)])
+    targets = torch.stack(rows) if rows else torch.empty(0, topk, dtype=torch.int64)
+    return targets.long().to(_DEVICE)
+
+
+_REPLAY_CASES = ou.pairwise_cases(
+    {
+        "kind": ("softmax", "softmax_pre", "sigmoid", "sigmoid_bias"),
+        "path": PATHS,
+        "e": (8, 64, 256),
+        "t": (0, 1, 7, 129),
+        "scaling": (None, 2.5),
+    }
+)
+
+
+@pytest.mark.parametrize("case", _REPLAY_CASES, ids=[_qb_id(c) for c in _REPLAY_CASES])
+def test_router_replay_forward_routes_to_the_target_experts(case, monkeypatch, replay_registry):
+    """REPLAY_FORWARD: every token goes to its target experts (whatever its scores), weighted
+    as the score function weights those experts and scaled; the compiled routing runs."""
+    num_experts, kind, tokens, topk = case["e"], case["kind"], case["t"], 6
+    backend = "torch" if case["path"] == "compiled" else "triton"
+    router, bias, logits, x = _setup(
+        num_experts,
+        topk,
+        kind,
+        tokens,
+        seed=42,
+        backend=backend,
+        scaling=case["scaling"],
+        moe_enable_routing_replay=True,
+    )
+    targets = make_replay_targets(logits, topk, kind, bias, seed=43)
+    replay = router.router_replay
+    replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    replay.set_target_indices(targets)
+    spy = _PathSpy(monkeypatch)
+    probs, experts = run_router(router, x, case["path"])
+    want = [] if case["path"] == "batch_invariant" else ["compiled"]
+    assert spy.calls == want, f"ran {spy.calls}, expected {want}"
+    args = (targets, kind, case["scaling"])
+    what = f"replay {_qb_id(case)}"
+    check_against(probs, experts, logits, topk, replay_reference, args, what)
+
+
+@pytest.mark.parametrize("record", ["static", "banked"])
+@pytest.mark.parametrize("path", ["compiled", "triton"])
+def test_router_replay_records_under_cuda_graph_replay(path, record, replay_registry):
+    """RECORD captured into a CUDA graph, as the engine's warmup captures it: every replay
+    writes the replayed experts into the static buffer and nothing else. With the
+    double-buffered layout, into the bank the GPU selector names at replay time."""
+    tokens, num_experts, topk, kind = 128, 64, 6, "sigmoid_bias"
+    backend = "torch" if path == "compiled" else "triton"
+    router, bias, logits, x = _setup(
+        num_experts, topk, kind, tokens, seed=44, backend=backend, moe_enable_routing_replay=True
+    )
+    replay = router.router_replay
+    replay.set_router_replay_action(RouterReplayAction.RECORD)
+    buffer, kwargs, select = make_record_buffer(record, topk)
+    replay.set_static_buffer(**kwargs)
+    x_buf = x.clone()
+    with torch.no_grad(), InferenceMode.active():
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):  # compile and warm up outside the capture
+                router(x_buf)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            probs_buf, experts_buf = router(x_buf)
+        for step, seed in enumerate((45, 46, 47)):
+            if record == "banked":
+                kwargs["buffer_index"].fill_(step % 2)
+            buffer.fill_(SENTINEL)
+            new = make_logits(tokens, num_experts, topk, kind, bias, seed)
+            x_buf.copy_(new.view(tokens, 1, num_experts))
+            graph.replay()
+            torch.cuda.synchronize()
+            what = f"graph record {record} step {step}"
+            check_routing(probs_buf, experts_buf, new, topk, kind, bias, None, what)
+            check_recorded_rows(buffer, select, experts_buf, what)
