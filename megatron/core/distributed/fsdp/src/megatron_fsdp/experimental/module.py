@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
@@ -469,7 +470,6 @@ class FsdpModule:
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
-            current_stream = context.current_stream()
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
@@ -480,16 +480,10 @@ class FsdpModule:
                     with torch.cuda.stream(inner_reduction_stream):
                         partial_grad = group.allocate_partial_grad_buffer()
 
-                current_stream.wait_stream(inner_reduction_stream)
                 if partial_grad is None:
-                    group.accumulate_local_gradients()
+                    self._accumulate_local_gradients(group)
                 else:
-                    group.copy_gradients_to_partial_buffer(partial_grad)
-
-                inner_reduction_stream.wait_stream(current_stream)
-                if partial_grad is not None:
-                    with torch.cuda.stream(inner_reduction_stream):
-                        group.reduce_inner_gradients(partial_grad)
+                    self._reduce_packed_gradients(group, partial_grad)
 
                 if not context.is_last_microbatch:
                     continue
@@ -502,6 +496,32 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+
+    def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
+        """Accumulate on compute and join that work into the inner reduction stream.
+
+        On return, the inner stream waits for the queued accumulation, so outer
+        reduction and finish_grad_sync() can use their existing stream dependencies.
+        """
+        current_stream = self.context.current_stream()
+        inner_reduction_stream = self.context.inner_reduction_stream
+        current_stream.wait_stream(inner_reduction_stream)
+        group.accumulate_local_gradients()
+        inner_reduction_stream.wait_stream(current_stream)
+
+    def _reduce_packed_gradients(self, group: FsdpParameterGroup, partial_grad: DBuffer) -> None:
+        """Pack on compute and enqueue reduction on the inner reduction stream.
+
+        The caller allocates partial_grad on the inner stream. On return, that
+        stream contains the queued reduction and accumulation into main_grad.
+        """
+        current_stream = self.context.current_stream()
+        inner_reduction_stream = self.context.inner_reduction_stream
+        current_stream.wait_stream(inner_reduction_stream)
+        group.copy_gradients_to_partial_buffer(partial_grad)
+        inner_reduction_stream.wait_stream(current_stream)
+        with torch.cuda.stream(inner_reduction_stream):
+            group.reduce_inner_gradients(partial_grad)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
