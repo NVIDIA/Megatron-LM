@@ -510,12 +510,18 @@ class TestInferenceRoutingExpertParallel:
                 per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
                 topk=topk,
                 hidden_size=config.hidden_size,
-                ep_group=get_expert_model_parallel_group(),
+                tp_ep_group=get_expert_model_parallel_group(),
             )
         hidden = torch.randn(16, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             training_output, _ = layer(hidden.clone())
         with torch.inference_mode(), InferenceMode.active():
+            # The dispatchers and experts consume the router's output without a shape check:
+            # a full-width or squeezed routing misroutes tokens or faults on the device. Check
+            # the dense [num_tokens, topk] contract first, so a violation fails here.
+            probs, top_indices = layer.router(hidden.clone())
+            assert probs.shape == top_indices.shape == (hidden.shape[0] * hidden.shape[1], topk)
+            assert top_indices.dtype == torch.int64
             inference_output, _ = layer(hidden.clone())
 
         error = (inference_output.float() - training_output.float()).norm()
