@@ -14,6 +14,7 @@ import torch
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
+    KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
@@ -1038,6 +1039,28 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             ctx8.mamba_slot_allocator.free_count == initial_free - 3
             and ctx8.mamba_slot_allocator.has_state(bids8[0])
         )
+
+    @pytest.mark.internal
+    def test_recompute_resume_with_static_buffers_clears_mamba_cache(self):
+        # With unified memory or torch_memory_saver, a RECOMPUTE resume keeps the buffers
+        # and resets only the metadata. That empties the KV prefix cache, and the Mamba
+        # states cached under its block hashes must go with it.
+        ctx = self._mctx()
+        ctx.add_request(self._req(ctx, self._prompt(ctx.block_size_tokens * 2)))
+        blocks = self._block_ids(ctx, 0, 2)
+        self._mamba_allocate_and_register(ctx, blocks)
+        msa = ctx.mamba_slot_allocator
+        assert len(msa.hash_to_block_id) == 2
+
+        ctx.kv_cache_management_mode = KVCacheManagementMode.RECOMPUTE
+        ctx.unified_memory_level = 1
+        ctx.deallocate_inference_state_buffers()
+        ctx.reinitialize_inference_state_buffers()
+
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not msa.hash_to_block_id
+        assert not any(msa.has_state(block) for block in blocks)
+        assert msa.free_count == msa.max_slots
 
     @pytest.mark.internal
     def test_hybrid_prefix_caching_without_mamba_budget_warns(self, caplog):

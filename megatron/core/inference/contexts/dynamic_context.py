@@ -3179,6 +3179,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.reset_mamba_state()
         if not preserve_prefix_cache:
             self.kv_block_allocator.reset()
+            # Cached Mamba states are keyed by the hashes of these KV blocks.
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset chunked prefill state. The MTP draft-KV boundary carry is keyed to the request
@@ -3233,9 +3236,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.step_count = 0
             self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state.
-        if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
         if not preserve_prefix_cache:
             self.dynamo_helper.notify_kv_cache_cleared()
 
