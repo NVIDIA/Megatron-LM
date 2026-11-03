@@ -1490,7 +1490,10 @@ def _deepgemm_m_alignment() -> int:
 
 
 def grouped_gemm_batch_invariant_alignment() -> int:
-    """Return the M alignment required by the DeepGEMM grouped-GEMM backend."""
+    """Return the M alignment required by the DeepGEMM grouped-GEMM backend.
+
+    Every expert block passed to grouped_gemm_batch_invariant must start at a multiple of it.
+    """
     _require_deepgemm_bf16("get_m_alignment_for_contiguous_layout")
     return _deepgemm_m_alignment()
 
@@ -1659,7 +1662,33 @@ def _bf16_grouped_gemm_wgrad_contiguous(
 def grouped_gemm_batch_invariant(
     a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, m_total: int
 ) -> torch.Tensor:
-    """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks."""
+    """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks.
+
+    Args:
+        a: [m_total, K] bf16 rows, grouped by expert.
+        b: [E, N, K] bf16 per-expert weights.
+        offs: [E] int32 on a's device. offs[e] is the end row of expert e's block, which
+            starts at offs[e - 1] (row 0 for expert 0). Every block must start at a multiple
+            of grouped_gemm_batch_invariant_alignment(), as the inference permute lays them
+            out (permute_tokens with alignment=grouped_gemm_batch_invariant_alignment()).
+            Rows from offs[-1] to m_total belong to no expert; their output is unspecified.
+        m_total: number of rows of a.
+
+    Returns:
+        [m_total, N] bf16, where row r of expert e's block is a[r] @ b[e].T.
+
+    The block alignment is a precondition and is not checked. DeepGEMM computes each M tile
+    with the expert of the tile's first row, so the rows of a block that starts inside a tile
+    are silently multiplied by the weights of the expert owning that tile's first row. The
+    offsets are on the device and change between replays of a captured CUDA graph, so
+    checking them would take a host sync, or a device-side assert that adds kernels to every
+    MoE GEMM and kills the process on a violation. Per-expert counts known on the host need
+    not be aligned: _bf16_grouped_gemm_contiguous pads them.
+    """
+    assert offs.shape == (b.shape[0],), (
+        f"offs must hold one end row per expert: got shape {tuple(offs.shape)} for "
+        f"{b.shape[0]} experts"
+    )
     m_indices = _offs_to_m_indices(offs, m_total).contiguous()
     return _bf16_grouped_gemm_aligned_contiguous(a.contiguous(), b.contiguous(), m_indices)
 

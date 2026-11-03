@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for batch-invariant MoE grouped GEMM."""
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     _bf16_grouped_gemm_contiguous,
     _m_splits_to_m_indices,
     _offs_to_m_indices,
+    grouped_gemm_batch_invariant,
+    grouped_gemm_batch_invariant_alignment,
     set_batch_invariant_mode,
 )
 
@@ -123,6 +126,76 @@ def test_grouped_gemm_per_expert_token_count_invariance():
     # The 8 rows assigned to expert 1 inside y_B must match y_A bitwise.
     y_B_target = y_B[16 : 16 + 8]
     assert torch.equal(y_A, y_B_target)
+
+
+# ---------------------------------------------------------------------------
+# Inference entry point: the offsets contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_offs", [1, 3], ids=["fewer_than_experts", "more_than_experts"])
+def test_grouped_gemm_rejects_offsets_not_one_per_expert(num_offs):
+    """offs must hold one end row per expert of the weights, checked before DeepGEMM runs."""
+    align = grouped_gemm_batch_invariant_alignment()
+    a = torch.randn(align, 64, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
+    # Every block past the first is empty, so no row is assigned past the weights' experts.
+    offs = torch.full((num_offs,), align, device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError, match="one end row per expert"):
+        grouped_gemm_batch_invariant(a, w, offs=offs, m_total=align)
+
+
+def test_inference_moe_aligns_every_expert_block(monkeypatch):
+    """The inference MoE hands the grouped GEMM the aligned expert blocks it requires.
+
+    grouped_gemm_batch_invariant cannot check the block alignment without a host sync, and a
+    misaligned block silently takes the previous expert's weights, so this pins the caller:
+    expert counts around the alignment must reach both grouped GEMMs as aligned blocks.
+    """
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+
+    torch.manual_seed(3)
+    align = grouped_gemm_batch_invariant_alignment()
+    counts = [align + 5, 1, 0, 2 * align + 1]
+    num_experts, hidden_size, ffn = len(counts), 128, 128
+    routes = torch.repeat_interleave(
+        torch.arange(num_experts, device="cuda"), torch.tensor(counts, device="cuda")
+    )
+    num_tokens = routes.numel()
+    routing_map = routes[torch.randperm(num_tokens, device="cuda")].unsqueeze(1)
+    probs = torch.rand(num_tokens, 1, device="cuda")
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    fc1 = torch.randn(num_experts, ffn, hidden_size, device="cuda", dtype=torch.bfloat16)
+    fc2 = torch.randn(num_experts, hidden_size, ffn, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor([num_tokens], device="cuda", dtype=torch.int32)
+
+    seen = []
+    grouped_gemm = batch_invariant.grouped_gemm_batch_invariant
+
+    def recording_grouped_gemm(a, b, *, offs, m_total):
+        seen.append(offs.clone())
+        return grouped_gemm(a, b, offs=offs, m_total=m_total)
+
+    monkeypatch.setattr(batch_invariant, "grouped_gemm_batch_invariant", recording_grouped_gemm)
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        mcore_fused_moe(
+            x,
+            probs,
+            fc1,
+            fc2,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            valid_tokens,
+            routing_map,
+        )
+
+    blocks = torch.tensor([-(-count // align) * align for count in counts])
+    expected = blocks.cumsum(0).to(device="cuda", dtype=torch.int32)
+    assert len(seen) == 2, f"expected FC1 and FC2 grouped GEMMs, got {len(seen)} calls"
+    for offs in seen:
+        assert torch.equal(offs, expected), f"offs {offs.tolist()} != {expected.tolist()}"
 
 
 # ---------------------------------------------------------------------------

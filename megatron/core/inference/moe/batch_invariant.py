@@ -47,7 +47,12 @@ def enabled() -> bool:
 
 
 def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """Batch-invariant BF16 grouped GEMM used by inference fused MoE."""
+    """Batch-invariant BF16 grouped GEMM used by inference fused MoE.
+
+    ``offs`` are the permute's inclusive expert offsets, built with
+    ``alignment=grouped_mm_alignment()``: the GEMM does not check that every expert block
+    starts at a multiple of it (see ``grouped_gemm_batch_invariant``).
+    """
     return grouped_gemm_batch_invariant(
         x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
     )
