@@ -122,6 +122,32 @@ def test_kernel_matches_reference_tree(experts, with_probs):
 
 
 @needs_cuda
+@pytest.mark.parametrize(
+    "experts,topk,hidden", [(64, 6, 1000), (96, 8, 700), (512, 22, 1536), (8, 8, 300)]
+)
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_route_kernel_matches_dense_kernel(experts, topk, hidden, with_probs):
+    """Training walks each token's sorted routes; it must give the dense kernel's bits,
+    including slots that route nowhere (dropped or padded)."""
+    tokens = 48
+    idx, vals = _case(tokens, experts, topk, hidden, seed=4)
+    rows, inverse_map = _training_inputs(idx, vals)
+    # Top-k slot order, not expert order: the route list sorts it.
+    shuffle = torch.rand(tokens, topk, device="cuda").argsort(dim=1)
+    row_of_slot = inverse_map[0].gather(1, shuffle)
+    expert_of_slot = inverse_map[1].gather(1, shuffle)
+    row_of_slot[::5, 0] = -1  # unused slots
+    expert_of_slot[1::7, -1] = -1
+    probs = torch.rand(tokens, experts, device="cuda") if with_probs else None
+    leaves = eic.num_leaf_blocks(experts)
+    dense = eic.dense_slots(row_of_slot, expert_of_slot, experts)
+    ref = eic.tree_combine_forward(rows, dense, leaves, probs)
+    cols, slot_rows, slot_probs = eic.sorted_routes(row_of_slot, expert_of_slot, experts, probs)
+    out = eic.tree_combine_routes_forward(rows, cols, slot_rows, experts, leaves, slot_probs)
+    assert torch.equal(_bits(out), _bits(ref))
+
+
+@needs_cuda
 @pytest.mark.parametrize("experts", [64, 96])
 def test_rank_partials_same_bits_at_every_ep(experts):
     tokens, topk, hidden = 64, 6, 512
@@ -181,8 +207,9 @@ def test_training_unpermute_backward(monkeypatch):
     idx, vals = _case(tokens, experts, topk, hidden, seed=3)
     rows, inverse_map = _training_inputs(idx, vals)
     rows = rows.float()
-    probs = torch.rand(tokens, experts, device="cuda")
-    grad = torch.randn(tokens, hidden, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    probs = torch.rand(tokens, experts, device="cuda", generator=gen)
+    grad = torch.randn(tokens, hidden, device="cuda", generator=gen)
     outs = []
     outputs = []
     for on in (True, None, True):
@@ -191,9 +218,15 @@ def test_training_unpermute_backward(monkeypatch):
         out = _unpermute(r, inverse_map, experts, 2, monkeypatch, on, p)
         outputs.append(out.detach().clone())
         outs.append(torch.autograd.grad(out, (r, p), grad))
-    # The tree has the gradient of the plain sum.
+    # The tree has the gradient of the plain sum: d_row = grad * prob exactly, and d_prob is
+    # the fp32 dot <grad, row>, checked against fp64 relative to the sum of its |terms|.
     torch.testing.assert_close(outs[0][0], outs[1][0], rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(outs[0][1], outs[1][1], rtol=1e-5, atol=1e-5)
+    row_of_slot, expert_of_slot = inverse_map[0], inverse_map[1]
+    terms = grad.double()[:, None, :] * rows.double()[row_of_slot]  # [T, K, H]
+    exact = torch.zeros(tokens, experts, dtype=torch.float64, device="cuda")
+    exact.scatter_(1, expert_of_slot, terms.sum(-1))
+    bound = torch.zeros_like(exact).scatter_(1, expert_of_slot, terms.abs().sum(-1))
+    assert ((outs[0][1].double() - exact).abs() <= 1e-6 * bound + 1e-30).all()
     # Replaying the new tree must preserve every bit of the output and both gradients.
     assert torch.equal(_bits(outputs[0]), _bits(outputs[2]))
     for first, replay in zip(outs[0], outs[2]):
