@@ -8,9 +8,11 @@ row-parallel linears (non-fused TP) and of the vocab-parallel embedding.
 Contract (from the launcher's docstring and its callers, inference_layers.py:461-526, 616-656):
 every rank q of a group of ws ranks has written its input P_q (N elements, bf16 or fp32) at
 offset 0 of its symmetric buffer. Rank r's output is out_r[i] = sum_q P_q[r * N/ws + i] for
-i < N/ws: bf16 inputs accumulate in fp32 and round once to nearest even (the kernel's
-`multimem.ld_reduce ... .add.acc::f32.v4.bf16x2`); fp32 inputs are added in fp32 in an order the
-switch picks. Nothing else is written: the buffers are only read. The kernel barriers on entry
+i < N/ws: bf16 inputs accumulate in fp32 (the kernel's
+`multimem.ld_reduce ... .add.acc::f32.v4.bf16x2`) and the switch rounds the sum to bf16: to
+nearest even on Hopper; on Blackwell to one of the two bf16 values adjacent to the fp32 sum,
+mostly toward zero (as s4f-multimem-rounding-doc documents in `multimem_asm.ld_128`; finding
+O5-N4). fp32 inputs are added in fp32 in an order the switch picks. Nothing else is written: the buffers are only read. The kernel barriers on entry
 (every rank's input is written before any rank reads) and not on exit: when it returns on one
 rank, peers may still be reading their segments of its buffer, so the next write to the buffer
 must be an all-gather of the same per-rank size (which writes only this rank's segment) or come
@@ -27,10 +29,12 @@ Tolerance classes:
     element by element (``nu.assert_fp32_sum_within_bound``). NCCL's ring is not a comparable
     trusted implementation here: its order differs from the switch's, and on H100 the switch's
     order differs between GPU sets (finding O5-N3);
-  * the bf16 rounding itself: exact against the exact sum rounded to nearest even, on designed
-    sums (ties, quarter and three-quarter ulps, sticky bits, carries, sign, binade, and for
-    ws >= 3 fp32 accumulation), in `test_bf16_in_switch_sum_rounding`. Fails on GB200 (finding
-    O5-N4); its message lists, per class, which rounding rule the hardware followed.
+  * the bf16 rounding itself, on designed sums (ties, quarter and three-quarter ulps, sticky
+    bits, carries, sign, binade, and for ws >= 3 fp32 accumulation), in
+    `test_bf16_in_switch_sum_rounding`: on Hopper exact against the exact sum rounded to nearest
+    even; on Blackwell exact against the set of the two bf16 values adjacent to the exact sum
+    (the documented rounding, finding O5-N4). A failure lists, per class, which rounding rule the
+    hardware followed.
 
 Structure-derived inputs: 16-byte chunks per thread (8 bf16 or 4 fp32: the two compiled
 variants, REDUCE_F32 False/True), blocks of 1024 threads, grids of at most 128 blocks with a
@@ -307,6 +311,25 @@ def rounding_rules(exact, contributions):
     return rules
 
 
+def assert_adjacent_bf16(got, rules, names, what):
+    """Every result is one of the two bf16 values adjacent to its exact fp32 sum (the sum itself
+    when it is a bf16 value): a faithful rounding, within one bf16 ulp of the sum. bf16
+    accumulation fails it on the accumulate-in-fp32 class (its result is 1.125 to 2.625 ulps
+    off)."""
+    g = got.view(torch.int16)
+    below, above = rules["toward-zero"].view(torch.int16), rules["away-from-zero"].view(torch.int16)
+    bad = ((g != below) & (g != above)).nonzero().flatten().tolist()
+    if bad:
+        shown = "; ".join(
+            f"{names[i]}: {float(got[i])!r} not in {{{float(rules['toward-zero'][i])!r},"
+            f" {float(rules['away-from-zero'][i])!r}}}"
+            for i in bad[:8]
+        )
+        raise AssertionError(
+            f"{what}: {len(bad)} of {g.numel()} results are not adjacent to the exact sum: {shown}"
+        )
+
+
 def rounding_report(got, names, rules):
     """Per class: how many results each rule explains (bit for bit)."""
     lines = ["per class, results explained by each rule (matches / columns):"]
@@ -323,14 +346,19 @@ def rounding_report(got, names, rules):
 @gpu_test
 @pytest.mark.parametrize("ws", nu.group_size_params())
 def test_bf16_in_switch_sum_rounding(nvls_groups, ws):
-    """The bf16 in-switch sum accumulates in fp32 and rounds once to nearest even (the
-    kernel's `.acc::f32`; what the unfused path and NCCL's fp32 accumulation give): checked bit
-    for bit on designed sums whose exact value is known (see TWO_TERM_SUMS and SMALL_TERM).
-    Every rank's shard holds every case, so each rank reads every case as the reducing GPU.
+    """The bf16 in-switch sum accumulates in fp32 (the kernel's `.acc::f32`) and the switch rounds
+    it once, checked bit for bit on designed sums whose exact value is known (see TWO_TERM_SUMS
+    and SMALL_TERM). Every rank's shard holds every case, so each rank reads every case as the
+    reducing GPU.
 
-    Passes on H100. Fails on GB200 (finding O5-N4: the dyadic sweeps of the first GPU run saw
-    1-2 ulp differences there, identical in both ws=2 groups, so deterministic); the failure
-    message lists, per class, which rounding rule the results follow."""
+    Hopper rounds to nearest even (what the unfused path and NCCL's fp32 accumulation give):
+    exact against it. Blackwell's switch does not (finding O5-N4; GB200 hsg 8573706, 8584972:
+    deterministic, ties and three-quarter ulps toward zero, 1 - 2**-20 to 1.0 and a carried tie
+    away from zero). Its documented contract (s4f-multimem-rounding-doc, `multimem_asm.ld_128`:
+    the sum rounded by the switch, mostly toward zero, within one bf16 ulp) is a faithful
+    rounding of the fp32 sum: exact against the set of its two adjacent bf16 values, which still
+    tells fp32 from bf16 accumulation. A failure lists, per class, which rule the results
+    follow."""
     g = nvls_groups.get(ws)
     symm = g.buffer()
     names, contributions = designed_sums(ws)
@@ -350,7 +378,10 @@ def test_bf16_in_switch_sum_rounding(nvls_groups, ws):
         ou.check_guards(output=out)
         rules = rounding_rules(exact.cuda(), contributions.cuda())
         try:
-            ou.assert_exact(got, rules["nearest-even"], what="bf16 in-switch sum")
+            if ou.device_sm_major() == ou.HOPPER:
+                ou.assert_exact(got, rules["nearest-even"], what="bf16 in-switch sum")
+            else:
+                assert_adjacent_bf16(got, rules, names, what="bf16 in-switch sum")
         except AssertionError as error:
             raise AssertionError(f"{error}\n{rounding_report(got, names, rules)}") from None
 
