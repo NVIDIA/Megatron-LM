@@ -40,7 +40,22 @@ or in the kernel); D_has_hdim on/off. Inputs: b in {1, 2, 3, 8}; heads x groups 
 (the TP = H case); prompt lengths 3, 4, 5 (around d_conv = 4, the F.pad handoff at :634-636) and 127, 128,
 129 (around the prefill scan's chunk_size = 128); 1 and 3 consecutive decode steps; a NaN in one request.
 bf16 model (production): with an fp32 model the step also carries finding O7-N1 (the decode kernel's fp32
-softplus, see test_selective_state_update.py), which the kernel-level oracle covers.
+softplus, see test_selective_state_update.py), which the kernel-level oracle covers. The static caches
+take in_proj.weight's dtype (`_get_states_from_cache`), so a bf16 model keeps a bf16 SSM state and O7-N1
+cannot show here.
+
+Production sizes (`PRODUCTION_LAYERS`, the Mamba layers of the Nemotron-H configs under
+examples/post_training/modelopt/conf/nvidia/): Nemotron-H 8B (hidden 4096, 128 heads of 64, 8 groups,
+dstate 128), Nemotron Nano 9B v2 (hidden 4480, 128 heads of 80: a head dim that is not a multiple of the
+Blackwell tile's BLOCK_SIZE_M = 32) and Nemotron-H 56B (hidden 8192, 256 heads of 64, dstate 256: the
+Hopper (4, 8) tile for dstate > 128), at TP 1, two chained decode steps each. One request (passes on
+main) and a full static batch (64, or 32 for the 56B layer; needs #8568). The decode kernel's tile
+depends on the architecture (BLOCK_SIZE_M, num_warps = (4, 4)/(4, 8) on Hopper, (32, 8) on Blackwell
+for dstate > 64, mamba_ssm.py:380-395), so the production and memory cases also run on GB200.
+
+Memory: `test_static_decode_caches_in_guard_bands` hands the mixer static caches that sit in guard bands
+(the context's cache slots, reused because the batch size matches) and checks them after two steps; it is
+the file's `sanitizer` case (b = 1, so it passes on main).
 
 Main vs open PRs:
 * #8568 (d6, fix/d6-static-mamba-batch) makes `_static_decode` pass a batch-first (b, 1, proj) input.
@@ -70,6 +85,17 @@ HIDDEN = 256
 D_CONV = 4  # MambaMixer default (mamba_mixer.py:180)
 PREFILL_CHUNK = 128  # MambaMixer chunk_size default (mamba_mixer.py:195)
 HEAD_CONFIGS = {"h8g8": (None, 8), "h8g1": (None, 1), "h1g1": (1, 1)}  # (mamba_num_heads, groups)
+
+PRODUCTION_LAYERS = {
+    # name: (hidden, mamba_num_heads, mamba_head_dim, mamba_num_groups, mamba_state_dim, full batch),
+    # from examples/post_training/modelopt/conf/nvidia/{Nemotron-H-8B-Base-8K, NVIDIA-Nemotron-Nano-9B-v2,
+    # Nemotron-H-56B-Base-8K}.sh (the 56B file sets only the state dim; the rest are the defaults,
+    # transformer_config.py mamba_* and MambaMixer expand=2). The full batch is a large static batch
+    # (the 56B layer's SSM state is 4 MiB elements per request, so it gets half).
+    "nemotron_h_8b": (4096, 128, 64, 8, 128, 64),
+    "nemotron_nano_9b_v2": (4480, 128, 80, 8, 128, 64),
+    "nemotron_h_56b": (8192, 256, 64, 8, 256, 32),
+}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -147,22 +173,32 @@ def model_parallel():
 
 
 def build_mixer(head_config, *, rmsnorm=True, D_has_hdim=False, dtype=torch.bfloat16):
-    """A MambaMixer (TE spec, TP = 1) with random parameters that make every term visible."""
-    num_heads, groups = HEAD_CONFIGS[head_config]
+    """A MambaMixer (TE spec, TP = 1) with random parameters that make every term visible.
+
+    `head_config` names a small layout (`HEAD_CONFIGS`, hidden `HIDDEN`, default head dim and dstate)
+    or a production layer (`PRODUCTION_LAYERS`, initialized on the GPU: its in_proj has up to 3e8
+    parameters).
+    """
+    if head_config in PRODUCTION_LAYERS:
+        hidden, num_heads, head_dim, groups, dstate, _ = PRODUCTION_LAYERS[head_config]
+        shape = dict(mamba_head_dim=head_dim, mamba_state_dim=dstate, use_cpu_initialization=False)
+    else:
+        hidden, (num_heads, groups) = HIDDEN, HEAD_CONFIGS[head_config]
+        shape = dict(use_cpu_initialization=True)
     config = TransformerConfig(
-        hidden_size=HIDDEN,
+        hidden_size=hidden,
         num_layers=1,
         num_attention_heads=1,
-        use_cpu_initialization=True,
         bf16=dtype == torch.bfloat16,
         params_dtype=dtype,
         mamba_num_heads=num_heads,
         mamba_num_groups=groups,
+        **shape,
     )
     mixer = MambaMixer(
         config,
         hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
-        HIDDEN,
+        hidden,
         D_has_hdim=D_has_hdim,
         rmsnorm=rmsnorm,
         layer_number=1,
@@ -286,6 +322,25 @@ def random_states(mixer, context, batch, g):
     conv_state.copy_(torch.randn(conv_state.shape, device="cuda", generator=g))
     ssm_state.copy_(torch.randn(ssm_state.shape, device="cuda", generator=g))
     return conv_state, ssm_state
+
+
+def guarded_states(mixer, context, batch, g):
+    """Like `random_states`, but the static caches are views into guard-banded buffers.
+
+    The context's cache slot is filled before the first forward with the shapes and dtypes
+    `_get_states_from_cache` allocates (`mamba_state_shapes_per_request`), and the mixer's cached
+    batch size set to match, so the mixer reuses them in place (seqlen_offset > 0: not zeroed).
+    """
+    conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+    conv = ou.guarded_empty((batch, *conv_shape), mixer.conv1d_weight.dtype)
+    ssm = ou.guarded_empty((batch, *ssm_shape), mixer.in_proj.weight.dtype)
+    conv.tensor.copy_(torch.randn(conv.shape, device="cuda", generator=g))
+    ssm.tensor.copy_(torch.randn(ssm.shape, device="cuda", generator=g))
+    context.key_value_memory_dict[mixer.layer_number] = (conv.tensor, ssm.tensor)
+    mixer.cached_batch_size = batch
+    conv_state, ssm_state = mixer._get_states_from_cache(context, batch)
+    assert conv_state is conv.tensor and ssm_state is ssm.tensor, "the mixer reallocated its caches"
+    return conv, ssm
 
 
 # ---------------------------------------------------------------------------------------------
@@ -436,6 +491,57 @@ def test_nan_in_one_request_stays_in_that_request(model_parallel):
     check_step(
         mixer, **{k: v[keep] for k, v in step.items()}, what="requests 0 and 2 beside a NaN request"
     )
+
+
+def _production_decode(layer, batch):
+    """Two chained static decode steps of a production Mamba layer from random per-request states,
+    each step against the fp64 reference from the states the previous step left."""
+    mixer = build_mixer(layer)
+    g = ou.make_generator(device="cuda")
+    context = static_context(batch, offset=8)
+    random_states(mixer, context, batch, g)
+    hiddens = [
+        torch.randn(1, batch, mixer.d_model, device="cuda", generator=g).bfloat16()
+        for _ in range(2)
+    ]
+    for k, step in enumerate(decode_steps(mixer, context, hiddens)):
+        check_step(mixer, **step, what=f"{layer} b={batch} step {k}")
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
+@pytest.mark.parametrize("layer", list(PRODUCTION_LAYERS))
+def test_production_layer_one_request(model_parallel, layer):
+    """Production Mamba layers (`PRODUCTION_LAYERS`), one request: passes on main."""
+    _production_decode(layer, 1)
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
+@pytest.mark.parametrize("layer", list(PRODUCTION_LAYERS))
+def test_production_layer_full_batch(model_parallel, layer):
+    """Production Mamba layers at a full static batch (64 requests; 32 for the 56B layer). Fails on
+    main and passes with #8568 (on main the b requests are decoded as one request of b tokens)."""
+    _production_decode(layer, PRODUCTION_LAYERS[layer][-1])
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
+@pytest.mark.sanitizer
+def test_static_decode_caches_in_guard_bands(model_parallel):
+    """Small case for compute-sanitizer (b = 1, per-head D: passes on main): two decode steps of the
+    h8g1 layout (8 heads share one B/C group; dstate 128, so the Blackwell (32, 8) tile on GB200) on
+    static caches that sit in guard bands. The conv update and the decode kernel write the caches in
+    place: nothing outside them may change, and each step must match the reference."""
+    mixer = build_mixer("h8g1")
+    g = ou.make_generator(device="cuda")
+    context = static_context(1, offset=8)
+    conv, ssm = guarded_states(mixer, context, 1, g)
+    hiddens = [torch.randn(1, 1, HIDDEN, device="cuda", generator=g).bfloat16() for _ in range(2)]
+    steps = decode_steps(mixer, context, hiddens)
+    ou.check_guards(conv_state=conv, ssm_state=ssm)
+    for k, step in enumerate(steps):
+        check_step(mixer, **step, what=f"guarded caches, step {k}")
 
 
 def test_case_list_isolates_each_pr():

@@ -55,7 +55,10 @@ zero-centered gamma output norms. Sizes from the kernel's structure: FLA's KDA c
 (``chunk_kda_fwd(chunk_size=64)``) and the conv width W=4: T in {1, 2, W-1, W, 63, 64, 65, 127,
 128, 129}; packs with sequence boundaries at chunk offsets 0, 1 and 63 and single-token sequences;
 head dim K in {32, 64, 128, 96 (not a power of two: FLA pads to 128 and masks)}; heads per rank
-H in {1, 4}; factors combined pairwise.
+H in {1, 4}; factors combined pairwise. Production (``test_kda_production_shapes``): a Kimi Linear
+layer at TP 1 (hidden 2304, H = 32, K = V = 128) with its two-stage gates on a 4096-token pack of
+six sequences (2048, 1024, 769, 191, 63, 1: boundaries at chunk offsets 0, 1 and 63), and with
+direct gates and the safe gate on 4 x 1024 tokens; same three checks and factors.
 
 Memory: the call site's kernel inputs (q, k, v, g, beta, A_log, dt_bias) are handed to the kernel
 in NaN guard buffers, so a read past any of them turns outputs NaN and a write fails the guard
@@ -79,7 +82,8 @@ Main vs open PRs:
 * #8710 (n13) adds a single-token ``fused_recurrent_kda`` path for context-free MTP drafts; a plain
   forward never takes it, so it is not covered here.
 
-Hardware: one H100 (FLA, Transformer Engine). Not covered: TP>1 / SP / CP (collectives, owned by
+Hardware: one H100 (FLA, Transformer Engine); the production cases also on one GB200, where FLA
+autotunes over a different tile list. Not covered: TP>1 / SP / CP (collectives, owned by
 other tests), the inference-optimized spec's projections (``InferenceColumnParallelLinear`` needs
 the symmetric-memory setup of the inference engine), FP8/MXFP8 projections, the backward pass.
 """
@@ -140,6 +144,16 @@ PACKS = {
     "pack-1-2-63-0": (1, 1, 61, 129),
     # Sequences shorter than and equal to the conv width inside a pack.
     "pack-short": (3, 4, 127),
+}
+
+KIMI_LINEAR = dict(hidden=2304, heads=32, head_dim=128)
+"""A Kimi Linear KDA layer at TP 1: Kimi-Linear-48B-A3B's published config (hidden 2304, 32 KDA heads
+with K = V = 128, conv width 4, low-rank gates; no such config is in this tree, so taken from the
+model card as recalled, offline)."""
+
+PRODUCTION_PACKS = {
+    # A 4096-token prefill pack: sequence boundaries at chunk offsets 0, 0, 1, 0, 63, 0.
+    "pack-prod-4096": (2048, 1024, 769, 191, 63, 1)
 }
 
 
@@ -404,6 +418,9 @@ class Case:
     zero_centered: bool = False
     gain: Optional[float] = None
     """Fill ``out_norm.weight`` with this value (else random around 1, or 0 when zero-centered)."""
+    hidden: int = HIDDEN
+    batch: int = BATCH
+    """Sequences of an SBHD input (``steps`` each)."""
 
 
 @pytest.fixture(scope="module")
@@ -428,7 +445,7 @@ def _build_module(case: Case):
     model_parallel_cuda_manual_seed(123)
     safe_gate, lower_bound = GATE_FORMS[case.gate_form]
     config = KDALayerConfig(
-        hidden_size=HIDDEN,
+        hidden_size=case.hidden,
         num_layers=1,
         num_attention_heads=case.heads,
         num_query_groups=case.heads,
@@ -478,9 +495,10 @@ def _randomize(module, case: Case, generator: torch.Generator) -> Dict[str, torc
     head_dim = case.head_dim
     values = {}
     with torch.no_grad():
-        linears = {"in_proj": HIDDEN, "beta_proj": HIDDEN, "out_proj": case.heads * head_dim}
+        hidden = case.hidden
+        linears = {"in_proj": hidden, "beta_proj": hidden, "out_proj": case.heads * head_dim}
         if case.gates == "two_stage":
-            linears.update(f_a_proj=HIDDEN, f_b_proj=head_dim, g_a_proj=HIDDEN, g_b_proj=head_dim)
+            linears.update(f_a_proj=hidden, f_b_proj=head_dim, g_a_proj=hidden, g_b_proj=head_dim)
         for name, fan_in in linears.items():
             weight = getattr(module, name).weight
             weight.copy_(normal(weight, fan_in**-0.5))
@@ -514,7 +532,7 @@ def _run(case: Case):
     g = ou.make_generator(device="cuda")
     params = _randomize(module, case, g)
     if case.pack is not None:
-        lengths = PACKS[case.pack]
+        lengths = {**PACKS, **PRODUCTION_PACKS}[case.pack]
         cu = [0]
         for n in lengths:
             cu.append(cu[-1] + n)
@@ -526,11 +544,11 @@ def _run(case: Case):
             max_seqlen_q=max(lengths),
             max_seqlen_kv=max(lengths),
         )
-        shape = (cu[-1], 1, HIDDEN)
+        shape = (cu[-1], 1, case.hidden)
         cu_seqlens = cu
     else:
         packed, cu_seqlens = None, None
-        shape = (case.steps, BATCH, HIDDEN)
+        shape = (case.steps, case.batch, case.hidden)
     hidden = torch.randn(shape, generator=g, device="cuda").to(torch.bfloat16)
     hidden_before = hidden.clone()
 
@@ -684,6 +702,31 @@ def test_kda_matches_fp64_reference(model_parallel, case):
     ``[two_stage-zero_centered]`` fails on main (R01-F1) and passes with #8882; see the module
     docstring.
     """
+    _run(case)
+
+
+PRODUCTION_CASES = [
+    # Kimi Linear's own layer: low-rank (two-stage) gates, softplus decay, one 4096-token pack.
+    pytest.param(
+        Case(gates="two_stage", gate_form="softplus", pack="pack-prod-4096", **KIMI_LINEAR),
+        id="kimi_linear-pack4096-two_stage-softplus",
+    ),
+    # The same head layout with direct gates and the safe-gate kernel path, 4 x 1024 tokens (SBHD).
+    pytest.param(
+        Case(gates="direct", gate_form="safe_lb-5", steps=1024, batch=4, **KIMI_LINEAR),
+        id="kimi_linear-T1024x4-direct-safe_lb-5",
+    ),
+]
+
+
+@pytest.mark.launch_on_gb200
+@ou.requires_sm(ou.HOPPER, ou.BLACKWELL)
+@pytest.mark.parametrize("case", PRODUCTION_CASES)
+def test_kda_production_shapes(model_parallel, case):
+    """A Kimi Linear KDA layer (32 heads, K = V = 128, hidden 2304) on a 4096-token prefill pack and
+    an SBHD batch, with the checks of ``test_kda_matches_fp64_reference``. Also on GB200: FLA picks
+    its forward tiles from per-architecture autotune lists (``IS_NVIDIA_HOPPER``: num_warps
+    [2, 4] on Hopper, up to 8 or 16 elsewhere, fla/ops/common/chunk_delta_h.py, chunk_o.py)."""
     _run(case)
 
 
