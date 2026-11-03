@@ -107,7 +107,10 @@ dev = [
     "av",
     "Pillow>=13.0.0",
     "flashinfer-python>=0.7.2,<0.8.0",
-    "flash-attn-4>=4.0.0b27",                           # First FA4 that runs with quack-kernels>=0.6.5; matches _MIN_FA4_VERSION
+    # Floor: the first FA4 that runs with quack-kernels>=0.6.5 (_MIN_FA4_VERSION). Ceiling: FA4 4.0.0b30+
+    # reads the -1 window bound that Transformer Engine <= 2.20 passes for causal masks as an empty
+    # window (fixed in TE 2.21 by TE #3532/#3540); it comes off with the TE bump.
+    "flash-attn-4>=4.0.0b27,<4.0.0b30",
     "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",
     "onnxscript",

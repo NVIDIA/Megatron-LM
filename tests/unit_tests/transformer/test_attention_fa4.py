@@ -9,6 +9,11 @@ also shares FlashAttention 2's ``flash_attn`` package, so the copy that ``import
 loads can differ from the first ``flash-attn-4`` metadata on the path when the two are installed
 in layered environments (a venv over a base image). Megatron gates on the copy that imports, and
 the CI image installs the locked FA4 next to FA2 so that copy is the locked one.
+
+FA4 must also work with the Transformer Engine Megatron locks. TE before 2.21 passes FA4 the window
+(-1, 0) for causal masks, with -1 meaning unbounded; flash-attn-4 4.0.0b30 and later read -1 as a
+literal offset, so TE's FA4 backend returns zeros for causal attention. The lock keeps FA4 below
+4.0.0b30 until TE moves, and set_attention_backend refuses the pairing.
 """
 
 import ast
@@ -23,11 +28,13 @@ import pytest
 import torch
 
 import megatron.core.transformer.attention as attention_module
+import megatron.core.transformer.utils as transformer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from tests.unit_tests.test_utilities import Utils
 
 # The SM100 forward runs only on Blackwell; the environment checks belong on both CI images.
 pytestmark = pytest.mark.launch_on_gb200
@@ -278,3 +285,97 @@ def test_fa4_paged_attention_on_sm100(is_decode_only):
         q.squeeze(1), k_cache, v_cache, cu_seqlens_q, seqlens_k, block_table, HEAD_DIM**-0.5
     )
     torch.testing.assert_close(out.squeeze(1).float(), expected, atol=2e-2, rtol=2e-2)
+
+
+_NVTE_ATTENTION_ENV = (
+    "NVTE_FLASH_ATTN",
+    "NVTE_FUSED_ATTN",
+    "NVTE_UNFUSED_ATTN",
+    "NVTE_FLASH_ATTN_V2",
+    "NVTE_FLASH_ATTN_V3",
+    "NVTE_FLASH_ATTN_V4",
+)
+
+
+def _causal_reference(q, k, v):
+    """fp32 causal attention for sbhd q/k/v; returns [s, b, heads * head_dim]."""
+    s, b, heads, dim = q.shape
+    scores = torch.einsum("sbhd,tbhd->bhst", q.float(), k.float()) * dim**-0.5
+    mask = torch.ones(s, s, dtype=torch.bool, device=q.device).triu(1)
+    probs = scores.masked_fill(mask, float("-inf")).softmax(-1)
+    return torch.einsum("bhst,tbhd->sbhd", probs, v.float()).reshape(s, b, heads * dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch_invariant"])
+@pytest.mark.parametrize("head_dim", [32, 128])
+def test_te_flash_attention_4_causal_matches_reference(monkeypatch, batch_invariant, head_dim):
+    """Transformer Engine's FlashAttention-4 backend computes causal attention.
+
+    With TE before 2.21 and flash-attn-4 4.0.0b30 or later, every row comes out zero. The
+    batch-invariant configuration is the one Megatron's training path uses next to the dynamic
+    engine's FA4 kernel.
+    """
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Transformer Engine runs FlashAttention-4 on SM90 and newer")
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+        te_supports_batch_invariant_attention,
+    )
+
+    # The CI images ship FA4, so a missing or too-old one is a failure, not a skip.
+    assert attention_module.HAVE_FA4, attention_module._FA4_UNAVAILABLE
+    if batch_invariant and not te_supports_batch_invariant_attention():
+        pytest.skip("this Transformer Engine has no batch-invariant attention")
+
+    # Only TE's FlashAttention-4 backend, as Megatron configures it for flash_attention_version=4.
+    for name, value in zip(_NVTE_ATTENTION_ENV, ("1", "0", "0", "0", "0", "1")):
+        monkeypatch.setenv(name, value)
+    backends = te_dpa._attention_backends
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        backends["attention_params"] = None
+        backends["backend_selection_requires_update"] = True
+        heads, seq, batch = 4, 24, 2
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            batch_invariant_mode=batch_invariant,
+            flash_attention_version=4,
+            attention_backend=AttnBackend.flash,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        attn = TEDotProductAttention(
+            config=config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+        )
+        # q, k and v as Megatron's training forward passes them: views of the fused projection.
+        g = torch.Generator(device="cuda").manual_seed(0)
+        mixed = torch.randn(seq, batch, heads, 3 * head_dim, generator=g, device="cuda").bfloat16()
+        q, k, v = mixed.split(head_dim, dim=-1)
+        with torch.no_grad(), set_batch_invariant_mode(batch_invariant):
+            out = attn(q, k, v, attention_mask=None, attn_mask_type=AttnMaskType.causal)
+        backend = backends.get("flash_attention_backend")
+        assert backends.get("use_flash_attention") and backend is not None and backend.major == 4, (
+            f"Transformer Engine did not run FlashAttention-4 (flash backend {backend}, "
+            f"fused {backends.get('use_fused_attention')}, "
+            f"unfused {backends.get('use_unfused_attention')})"
+        )
+        reference = _causal_reference(q, k, v)
+        error = ((out.float() - reference).norm() / reference.norm()).item()
+        assert error <= 2e-2, (
+            f"Transformer Engine {transformer_utils.get_te_version()} on flash-attn-4 "
+            f"{attention_module._FA4_VERSION} (FA4 backend {backend}) differs from fp32 causal "
+            f"attention by rel {error:.3g}"
+        )
+    finally:
+        backends["backend_selection_requires_update"] = True
+        Utils.destroy_model_parallel()

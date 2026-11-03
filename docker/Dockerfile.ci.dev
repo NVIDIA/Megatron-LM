@@ -192,10 +192,14 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
         test -x "${BASE_PYTHON}"
         uv pip install --python "${BASE_PYTHON}" --break-system-packages --no-config --no-deps \
             --require-hashes -r /tmp/flash-attn-4.txt
-        # Fail the build unless the venv imports the locked flash-attn-4. The import is resolved
-        # without running FA2's or FA4's __init__, so this needs no GPU.
+        # Fail the build unless the venv imports the locked flash-attn-4, and unless the image's
+        # Transformer Engine can drive it: TE before 2.21 passes FA4 a window bound of -1, which
+        # flash-attn-4 4.0.0b30 and later read as an empty window (TE #3532/#3540). The import is
+        # resolved without running FA2's or FA4's __init__, so this needs no GPU.
         "${UV_PROJECT_ENVIRONMENT}/bin/python" - "${FA4_VERSION}" <<"PY"
 import importlib.machinery, importlib.metadata, os, sys
+
+from packaging.version import Version
 
 locked = sys.argv[1]
 package = importlib.machinery.PathFinder.find_spec("flash_attn")
@@ -211,7 +215,10 @@ owners = {
 if owners != {locked}:
     sys.exit(f"flash_attn.cute imports from {origin} (flash-attn-4 {sorted(owners)}), "
              f"not the locked flash-attn-4 {locked}")
-print(f"flash_attn.cute imports the locked flash-attn-4 {locked} from {origin}")
+te = Version(importlib.metadata.version("transformer-engine"))
+if te < Version("2.21.0") and Version(locked) >= Version("4.0.0b30"):
+    sys.exit(f"Transformer Engine {te} cannot drive flash-attn-4 {locked}: it needs TE >= 2.21.0")
+print(f"flash_attn.cute imports the locked flash-attn-4 {locked} from {origin} (TE {te})")
 PY
     fi
     rm /tmp/flash-attn-4.txt
