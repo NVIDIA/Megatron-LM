@@ -18,10 +18,6 @@ Determinism:
   The native, Triton, and cuTile backends are currently tagged ``unknown``.
   Numerical and gradient parity are covered, but bit-exact repeatability has
   not been certified. The accelerated backends use timing-based autotuning.
-  When torch deterministic algorithms are enabled, the Triton Sinkhorn kernels
-  and the H_post BDA weight-gradient reduction bypass their autotuners and
-  launch with fixed configurations, because the selected configuration changes
-  their floating-point reduction order. The cuTile kernels keep autotuning.
 """
 
 import logging
@@ -317,13 +313,7 @@ if _TRITON_AVAILABLE:
         out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         inp = input_logits.contiguous().view(N_batch, hc, hc)
-        kernel = _triton_sinkhorn_fwd_kernel
-        launch_kwargs = {}
-        if torch.are_deterministic_algorithms_enabled():
-            # Fix the reduction layout, bypassing any timing-selected autotuner cache entry.
-            kernel = kernel.fn
-            launch_kwargs = {"num_warps": 4}
-        kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations, **launch_kwargs)
+        _triton_sinkhorn_fwd_kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations)
         return out.view(original_shape), M_init.view(original_shape)
 
     def _triton_sinkhorn_bwd(
@@ -339,24 +329,8 @@ if _TRITON_AVAILABLE:
         ws_M = torch.empty(N_batch * 2 * num_iterations * hc * hc, dtype=torch.float32, device=dev)
         ws_rs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
-        kernel = _triton_sinkhorn_bwd_kernel
-        launch_kwargs = {}
-        if torch.are_deterministic_algorithms_enabled():
-            # The backward row/column reductions need the same fixed launch policy.
-            kernel = kernel.fn
-            launch_kwargs = {"num_warps": 4}
-        kernel[(N_batch,)](
-            go,
-            mi,
-            grad_input,
-            ws_M,
-            ws_rs,
-            ws_cs,
-            N_batch,
-            eps,
-            hc,
-            num_iterations,
-            **launch_kwargs,
+        _triton_sinkhorn_bwd_kernel[(N_batch,)](
+            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations
         )
         return grad_input.view(original_shape)
 
@@ -784,14 +758,7 @@ if _TRITON_AVAILABLE:
         )
 
         grid_b = lambda META: (triton.cdiv(sb, META["BLOCK_S"]),)
-        # Autotuned BLOCK_C changes the channel reduction tree and therefore g_hr/g_hp bits.
-        # Bypass the autotuner (including any non-deterministic-mode cache) for strict replay.
-        h_grad_kernel = _triton_hpb_bwd_g_hp_hr_kernel
-        h_grad_launch_kwargs = {}
-        if torch.are_deterministic_algorithms_enabled():
-            h_grad_kernel = h_grad_kernel.fn
-            h_grad_launch_kwargs = {"BLOCK_C": 512, "BLOCK_S": 1, "num_warps": 4}
-        h_grad_kernel[grid_b](
+        _triton_hpb_bwd_g_hp_hr_kernel[grid_b](
             go_flat,
             orig_flat,
             x_flat,
@@ -811,7 +778,6 @@ if _TRITON_AVAILABLE:
             g_hr.stride(1),
             g_hr.stride(2),
             HAS_BIAS=(bias is not None),
-            **h_grad_launch_kwargs,
         )
 
         g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
