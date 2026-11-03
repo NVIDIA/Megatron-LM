@@ -77,8 +77,29 @@ def _streamwise_block_config(batch: int, stream_width: int) -> tuple[int, int, i
     return block_batch, min(128, stream_width), 4
 
 
+def _streamwise_backward_block_config(batch: int, stream_width: int) -> tuple[int, int, int]:
+    """Use a 16 x 512 tile for the backward kernels when 512 divides the stream width.
+
+    The backward kernels keep FP32 tiles live across the loop over streams. With an FP32
+    residual stream, the forward tile of 32 x 256 exceeds the register budget: on GB300,
+    with 24,576 tokens of width 3,072 and three streams, the write backward spills about
+    1,300 words per thread and takes 3.0 ms per call. The 16 x 512 tile covers as many
+    elements per program, spills about 50 words and takes 0.5 ms; for BF16 streams both
+    backward kernels are also slightly faster with it.
+
+    With 512 dividing the width, this tile writes no more logit-gradient partials than the
+    forward tile, so it never pushes a shape past the partial reduction limit. Activation
+    gradients are elementwise and do not depend on the tile; only the summation order of
+    the logit gradients does.
+    """
+
+    if stream_width % 512 == 0:
+        return 16, 512, 4
+    return _streamwise_block_config(batch, stream_width)
+
+
 def _num_gradient_partials(batch: int, stream_width: int) -> int:
-    block_batch, block_width, _ = _streamwise_block_config(batch, stream_width)
+    block_batch, block_width, _ = _streamwise_backward_block_config(batch, stream_width)
     return math.ceil(batch / block_batch) * math.ceil(stream_width / block_width)
 
 
@@ -600,7 +621,7 @@ def _streamwise_sigmoid_read_backward_triton(
     grad_output_flat, _ = _flatten_leading(grad_output)
     batch = hidden_flat.shape[0]
     stream_width = hidden_flat.shape[1] // num_streams
-    block_batch, block_width, num_warps = _streamwise_block_config(batch, stream_width)
+    block_batch, block_width, num_warps = _streamwise_backward_block_config(batch, stream_width)
     num_width_blocks = math.ceil(stream_width / block_width)
     num_partials = math.ceil(batch / block_batch) * num_width_blocks
     grad_hidden = torch.empty_like(hidden_flat)
@@ -678,7 +699,7 @@ def _streamwise_sigmoid_write_backward_triton(
     )
     batch = grad_output_flat.shape[0]
     stream_width = grad_output_flat.shape[1] // num_streams
-    block_batch, block_width, num_warps = _streamwise_block_config(batch, stream_width)
+    block_batch, block_width, num_warps = _streamwise_backward_block_config(batch, stream_width)
     num_width_blocks = math.ceil(stream_width / block_width)
     num_partials = math.ceil(batch / block_batch) * num_width_blocks
     grad_residual = (

@@ -16,7 +16,7 @@ from megatron.core.transformer.residual_recompute import (
     checkpoint_residual_write,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
 )
