@@ -5873,14 +5873,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         prompt = torch.arange(1, 25, dtype=torch.int64, device=torch.cuda.current_device())
 
         def add(request_id, **sampling_kwargs):
-            engine._add_request(
-                DynamicInferenceRequest(
-                    request_id=request_id,
-                    prompt_tokens=prompt.clone(),
-                    sampling_params=SamplingParams(
-                        num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs
-                    ),
-                )
+            # The public path computes the prompt's prefix-cache block hashes.
+            engine.add_request(
+                request_id,
+                prompt.clone(),
+                SamplingParams(num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs),
             )
 
         add(0, return_log_probs=True, skip_prompt_log_probs=False)
