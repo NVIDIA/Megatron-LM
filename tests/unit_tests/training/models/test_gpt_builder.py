@@ -88,7 +88,7 @@ class TestDefaultLayerSpecDispatch:
         config = _make_dispatch_config()
         config.restore_modelopt_state = True
 
-        result = default_layer_spec(config, vp_stage=None)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
         mock_get_spec.assert_called_once_with(
             config=config.transformer,
@@ -96,6 +96,8 @@ class TestDefaultLayerSpecDispatch:
             remap_te_layernorm=True,
             real_quant_cfg="None",
             use_arbitrary_attention_mask=True,
+            vp_stage=2,
+            pp_rank=1,
         )
         assert result is spec
 
