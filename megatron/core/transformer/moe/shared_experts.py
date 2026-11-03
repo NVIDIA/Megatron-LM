@@ -484,6 +484,16 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"{self.__class__.__name__} expects FC2 to be Transformer Engine Linear, "
                 f"but found {self.linear_fc2.__class__.__name__}."
             )
+        # TE's scaled GLU kernels, fused or not, read interleaved blocks of a multiple of 32
+        # columns that tile each rank's FFN shard.
+        interleave = self.config.moe_shared_expert_glu_interleave_size
+        ffn_shard = self.linear_fc2.weight.size(1)
+        if interleave % 32 or ffn_shard % interleave:
+            raise ValueError(
+                f"{self.__class__.__name__} requires moe_shared_expert_glu_interleave_size to be "
+                "a multiple of 32 that divides the shared expert FFN size per tensor-parallel "
+                f"rank, but got {interleave} for an FFN shard of {ffn_shard}."
+            )
 
     def _get_fused_grouped_swiglu_recipe(self):
         """Create the TE recipe used to select the fused grouped MLP kernel."""
@@ -609,9 +619,15 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
                 self._fused_grouped_swiglu_ops = (self._make_fused_grouped_swiglu_ops(),)
 
+        # One unit scale per row, as a stride-0 view (no allocation or kernel here). Whether TE
+        # fuses these ops is decided inside its op fuser: by the TE version,
+        # NVTE_CUTEDSL_FUSED_GROUPED_MLP at TE import, the cuDNN frontend and the shapes. The
+        # fused grouped MLP ignores the scales (the activation op is marked
+        # _grouped_mlp_unit_activation_scale); the unfused ScaledSwiGLU / ScaledClampedQGeGLU
+        # require one scale per row.
         with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
             output = self._fused_grouped_swiglu_ops[0](
-                hidden_states_2d, tokens_per_expert, scales, tokens_per_expert
+                hidden_states_2d, tokens_per_expert, scales.expand(total_tokens), tokens_per_expert
             )
         return output.view(*orig_shape[:-1], output.size(-1))
 
