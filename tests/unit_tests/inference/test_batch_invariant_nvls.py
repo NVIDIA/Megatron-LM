@@ -2,9 +2,12 @@
 """Real NVLS batch invariance at EP = world size.
 
 Both combine collectives run in one process; each test enables and disables the mode around a
-freshly built layer. MCORE_BI_TEST_BACKEND selects the GEMM backend (default te_native). In this
-layer the backend changes only the router's TE GEMM: the dispatch, the experts and the combine
-run the same Triton or DeepGEMM kernels under every backend.
+freshly built layer. The ordered combine must equal the rank-order fp32 sum bit for bit; the
+multimem in-switch fp32 sum must stay within the fp32 summation bound of the exact sum. Under
+either, a target row keeps its fp32 bits across co-batches. MCORE_BI_TEST_BACKEND selects the
+GEMM backend (default te_native). In this layer the backend changes only the router's TE GEMM:
+the dispatch, the experts and the combine run the same Triton or DeepGEMM kernels under every
+backend.
 """
 
 import os
@@ -195,7 +198,10 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         def reduce(*args, original=original, name=name, **kwargs):
             assert args[0].shape[0] == phase["counts"][rank]
             phase.setdefault("collectives", []).append(name)
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            # token_combine allocates this fp32 output per call and casts it to bf16 afterwards.
+            phase["combined"] = args[0]
+            return result
 
         monkeypatch.setattr(owner, name, reduce)
 
@@ -227,16 +233,28 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         partials = [torch.empty_like(partial) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(partials, partial)
         phase["partial_sums"] = [contribution.double().sum().item() for contribution in partials]
-        if collective == "multimem":
-            expected = torch.stack(partials).double().sum(dim=0).float()
-        else:
-            expected = torch.zeros_like(partial)
-            for contribution in partials:
-                expected = expected + contribution
         if rank == 0:
+            # Rank zero's AGV offset is 0, so its local rows are the global target rows.
+            combined = phase["combined"][target_row : target_row + 8].clone()
+            if collective == "ordered":
+                expected = torch.zeros_like(partial)
+                for contribution in partials:
+                    expected = expected + contribution
+                assert torch.equal(combined, expected), "ordered combine is not the rank-order sum"
+            else:
+                # The in-switch fp32 sum adds in an order the switch picks and is not correctly
+                # rounded on H100, so it is held to the recursive-summation bound for any order,
+                # gamma_(ws-1) * sum|x| with u = 2**-24 (Higham, eq. 4.4); its bits are pinned
+                # across co-batches below.
+                stacked = torch.stack(partials).double()
+                k, u = Utils.world_size - 1, 2.0**-24
+                bound = k * u / (1 - k * u) * stacked.abs().sum(dim=0)
+                error = (combined.double() - stacked.sum(dim=0)).abs()
+                assert torch.all(error <= bound), "multimem combine exceeds the fp32 sum bound"
             selected = output[target_row : target_row + 8, 0].clone()
             assert selected.abs().max() > 0
-            assert torch.equal(selected, expected.bfloat16()), "actual NVLS combine changed target"
+            assert torch.equal(selected, combined.bfloat16()), "actual NVLS combine changed target"
+            phase["combined"] = combined
             phase["output"] = selected
             phase["output_bits"] = selected.view(torch.int16).long().sum().item()
         evidence.append(dict(phase))
@@ -258,6 +276,7 @@ def test_nvls_target_batch_invariance(nvls_runtime, monkeypatch, grouped_backend
         assert torch.equal(actual["target_experts"], evidence[0]["target_experts"])
         if rank == 0:
             assert torch.equal(actual["gate"], evidence[0]["gate"])
+            assert torch.equal(actual["combined"], evidence[0]["combined"])
             assert torch.equal(actual["output"], evidence[0]["output"])
     selected_experts = evidence[0]["target_experts"][0]
     assert torch.all(
