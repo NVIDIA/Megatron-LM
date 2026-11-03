@@ -758,6 +758,37 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
     assert bookkeeping_done_event == "bookkeeping"
 
 
+def test_async_sched_finalize_keeps_top_n_rows_for_prompt_score_commit():
+    """Finalizing finished requests must not shorten the top-n rows the commit stores.
+
+    Under async scheduling the engine finalizes finished requests before the step's
+    prompt log-probs are cached. A stop sequence there trims the request's top-n rows
+    in place, which left the prompt-score commit with fewer top-n rows than prompt rows.
+    """
+    controller = _make_async_sched_controller()
+    top_n = {0: [(torch.tensor([-0.5]), torch.tensor([7]))] * 4}
+    request_result = SimpleNamespace(
+        log_probs_result=([[-0.1, -0.2, -0.3, -0.4]], top_n),
+        active_request_ids=torch.tensor([10]),
+        finished_request_ids=torch.tensor([10]),
+        sampled_tokens_cpu=torch.tensor([3]),
+        accepted_tokens_cpu=None,
+        finished_routing_block_ids={},
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
+    )
+
+    def finalize_requests(*, top_n_logprobs, **kwargs):
+        # The engine's stop-sequence trim, as in post_process_requests.
+        top_n_logprobs[0] = top_n_logprobs[0][:-3]
+
+    controller._finalize_async_sched_requests(request_result, None, None, finalize_requests)
+
+    _, commit_top_n = request_result.log_probs_result
+    assert len(commit_top_n[0]) == 4
+
+
 def test_run_async_sched_prepare_stops_before_bookkeeping_h2d():
     context = _make_async_sched_context()
     controller = _make_async_sched_controller(context)

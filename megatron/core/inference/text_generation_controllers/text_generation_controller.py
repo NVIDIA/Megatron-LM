@@ -2903,7 +2903,9 @@ class TextGenerationController(MTPControllerMixin):
             sample=request_result.sampled_tokens_cpu,
             accepted_tokens=request_result.accepted_tokens_cpu,
             log_probs=log_probs,
-            top_n_logprobs=top_n_logprobs,
+            # The engine trims a finished request's top-n rows in place, and the
+            # prompt-score commit later in this step still needs every row.
+            top_n_logprobs=dict(top_n_logprobs) if top_n_logprobs is not None else None,
             finished_routing_block_ids=request_result.finished_routing_block_ids,
             finished_handoff_block_ids=request_result.finished_handoff_block_ids,
             finished_handoff_ssm_slots=request_result.finished_handoff_ssm_slots,
