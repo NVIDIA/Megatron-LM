@@ -10,6 +10,8 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -355,6 +357,200 @@ def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers)
                     _equal(a, b)
             else:
                 _equal(left, right)
+
+
+def _entrypoint_iterator(args, lane, iteration, *, encoder=False):
+    """Resolve native state through the same data provider used by pretrain_mimo."""
+    from examples.mimo.training.data import build_train_valid_test_data_loaders
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+    group = SimpleNamespace(rank=lambda: lane)
+    topology = SimpleNamespace(
+        grids={
+            MIMO_LANGUAGE_MODULE_KEY: SimpleNamespace(is_current_rank_in_grid=lambda: not encoder),
+            "sound_encoder": SimpleNamespace(is_current_rank_in_grid=lambda: encoder),
+        },
+        module_pgs={
+            MIMO_LANGUAGE_MODULE_KEY: SimpleNamespace(dp_gtp_remat=group),
+            "sound_encoder": SimpleNamespace(dp=group),
+        },
+    )
+    with patch(
+        "megatron.training.get_train_state", return_value=SimpleNamespace(iteration=iteration)
+    ):
+        train, valid, test = build_train_valid_test_data_loaders(args, topology)
+    assert valid is None and test is None
+    return train
+
+
+def _resume_entrypoint_in_fresh_process(args, iteration, output):
+    languages = [_entrypoint_iterator(args, lane, iteration) for lane in range(args.mimo_llm_dp)]
+    encoder = _entrypoint_iterator(args, 0, iteration, encoder=True)
+    try:
+        torch.save(
+            {
+                "encoder": [next(encoder) for _ in range(4)],
+                "languages": [[next(language) for _ in range(4)] for language in languages],
+            },
+            output,
+        )
+    finally:
+        encoder.close()
+        for language in languages:
+            language.close()
+
+
+def test_checkpoint_hook_and_data_entrypoint_compose_native_lane_state(tmp_path):
+    """The public hook's rank-local files replay both module roles after process exit."""
+    from megatron.training.checkpointing import maybe_save_dataloader_state
+
+    root, iteration = tmp_path / "checkpoints", 23
+    args = _args(
+        _jsonl(tmp_path / "data.jsonl"),
+        "randomized_config",
+        mimo_llm_dp=2,
+        num_workers=2,
+        load=None,
+        energon_dataloader_load=None,
+    )
+    languages = [_entrypoint_iterator(args, lane, 0) for lane in range(2)]
+    encoder = _entrypoint_iterator(args, 0, 0, encoder=True)
+    barriers = []
+    singleton = SimpleNamespace(rank=0, size=1)
+    encoder_dp = SimpleNamespace(rank=0, size=1)
+    paths = [
+        root / "iter_0000023" / "mp_rank_00" / f"train_dataloader_dprank{lane:03d}.pt"
+        for lane in range(2)
+    ]
+    try:
+        for _ in range(3):
+            batches = [next(language) for language in languages]
+            assert torch.equal(
+                next(encoder)["input_ids"], torch.cat([b["input_ids"] for b in batches])
+            )
+        with (
+            patch(
+                "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+            ),
+            patch(
+                "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+            ),
+            patch(
+                "megatron.training.checkpointing.torch.distributed.barrier",
+                side_effect=lambda *, group: barriers.append(group),
+            ),
+            patch(
+                "megatron.training.checkpointing.mpu.get_data_parallel_rank",
+                side_effect=AssertionError("global group fallback"),
+            ),
+        ):
+            for lane, language in enumerate(languages):
+                assert not getattr(language, "is_save_state_rank_independent", False)
+                dp = SimpleNamespace(rank=lane, size=2)
+                maybe_save_dataloader_state(
+                    SimpleNamespace(iterable=language),
+                    iteration,
+                    root,
+                    tp_group=singleton,
+                    pp_group=singleton,
+                    dp_group=dp,
+                    cp_group=singleton,
+                )
+                assert barriers[-2:] == [dp, dp]
+            before = [path.read_bytes() for path in paths]
+            maybe_save_dataloader_state(
+                SimpleNamespace(iterable=encoder),
+                iteration,
+                root,
+                tp_group=singleton,
+                pp_group=singleton,
+                dp_group=encoder_dp,
+                cp_group=singleton,
+            )
+            assert barriers[-2:] == [encoder_dp, encoder_dp]
+            assert [path.read_bytes() for path in paths] == before
+            # A non-writer must neither snapshot a real loader nor enter DP barriers.
+            with patch.object(
+                languages[0], "save_state", side_effect=AssertionError("not a writer")
+            ):
+                maybe_save_dataloader_state(
+                    SimpleNamespace(iterable=languages[0]),
+                    iteration,
+                    root,
+                    tp_group=SimpleNamespace(rank=1, size=2),
+                    pp_group=singleton,
+                    dp_group=encoder_dp,
+                    cp_group=singleton,
+                )
+            assert len(barriers) == 6
+        assert sorted(paths[0].parent.iterdir()) == paths
+        for lane, path in enumerate(paths):
+            state = torch.load(path, weights_only=False)
+            assert state.keys() == {"dataloader_state_dict"}
+            assert state["dataloader_state_dict"]["contract"]["lane"] == lane
+        expected = {
+            "encoder": [next(encoder) for _ in range(4)],
+            "languages": [[next(language) for _ in range(4)] for language in languages],
+        }
+    finally:
+        encoder.close()
+        for language in languages:
+            language.close()
+    args.load = str(tmp_path / "model-checkpoints")
+    args.energon_dataloader_load = str(root)
+    args.iteration = 999  # The data provider must use the model-resolved train state instead.
+    request, output = tmp_path / "request.pt", tmp_path / "continued.pt"
+    torch.save((args, iteration), request)
+    code = (
+        "import torch; "
+        f"from {__name__} import _resume_entrypoint_in_fresh_process; "
+        f"args, iteration = torch.load({str(request)!r}, weights_only=False); "
+        f"_resume_entrypoint_in_fresh_process(args, iteration, {str(output)!r})"
+    )
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(Path(__file__).parent), *sys.path]))
+    subprocess.run([sys.executable, "-c", code], env=env, check=True, timeout=90)
+    actual = torch.load(output, weights_only=False)
+    for key in expected:
+        for left, right in zip(actual[key], expected[key], strict=True):
+            if key == "languages":
+                for a, b in zip(left, right, strict=True):
+                    _equal(a, b)
+            else:
+                _equal(left, right)
+
+
+@pytest.mark.parametrize("flags", [{}, {"finetune": True}, {"pretrained_checkpoint": "weights"}])
+def test_data_entrypoint_distinguishes_resume_from_initial_weights(tmp_path, flags):
+    args = _args(
+        _jsonl(tmp_path / "data.jsonl"),
+        mimo_llm_dp=1,
+        num_workers=1,
+        load=str(tmp_path / "checkpoints"),
+        energon_dataloader_load=None,
+        **flags,
+    )
+    # Even initial-weight flags cannot forgive missing state at a resumed iteration.
+    with pytest.raises(FileNotFoundError, match="iter_0000007.*dprank000"):
+        _entrypoint_iterator(args, 0, 7)
+    if flags:
+        fresh = _entrypoint_iterator(args, 0, 0)
+        baseline_args = argparse.Namespace(**{**vars(args), "load": None})
+        baseline = _entrypoint_iterator(baseline_args, 0, 0)
+        try:
+            _equal(next(fresh), next(baseline))
+        finally:
+            fresh.close()
+            baseline.close()
+    else:
+        with pytest.raises(FileNotFoundError, match="iter_0000000"):
+            _entrypoint_iterator(args, 0, 0)
+    state_path = (
+        tmp_path / "checkpoints" / "iter_0000007" / "mp_rank_00" / "train_dataloader_dprank000.pt"
+    )
+    state_path.parent.mkdir(parents=True)
+    torch.save({"dataloader_state_dict": {"contract": {"seed": -1}, "energon": None}}, state_path)
+    with pytest.raises(ValueError, match="incompatible"):
+        _entrypoint_iterator(args, 0, 7)
 
 
 def test_native_state_rejects_changed_application_and_seed(tmp_path):
