@@ -15,7 +15,7 @@
 """Experimental Megatron-FSDP implementation."""
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .context import FsdpContext
+from .context import FsdpContext, PrefetchOrder
 from .dbuffer import DBuffer
 from .fully_shard import Placements, fully_shard, fully_shard_context, microbatch
 from .optimizer import fully_shard_optimizer, init_optimizer_state
@@ -27,6 +27,7 @@ __all__ = [
     "DBuffer",
     "FsdpContext",
     "Placements",
+    "PrefetchOrder",
     "RuntimePolicy",
     "SchedulePolicy",
     "ShardLayout",
