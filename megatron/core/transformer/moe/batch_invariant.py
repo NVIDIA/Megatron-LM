@@ -267,6 +267,7 @@ def unpermute(
     probs: Optional[torch.Tensor],
     num_experts: int,
     inverse_map: torch.Tensor,
+    ep_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Batch-invariant MoE unpermute.
 
@@ -274,8 +275,13 @@ def unpermute(
     shapes and adds contributions by EP rank then top-k slot, matching the
     inference NVLS rank-ordered combine. Without ``probs`` the tree runs as one
     Triton kernel; with ``probs`` it runs as a loop over EP ranks and top-k slots.
+    `ep_size` is the expert-parallel size of the caller's token dispatcher, which
+    splits the experts into `ep_size` contiguous per-rank shards; None uses the
+    global expert-parallel size.
     """
-    ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+    if ep_size is None:
+        # Migration fallback for callers that do not pass their dispatcher's EP size.
+        ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
     assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
     if probs is None and HAVE_TRITON and permuted_tokens.is_cuda:
         out = _RankTreeUnpermute.apply(
