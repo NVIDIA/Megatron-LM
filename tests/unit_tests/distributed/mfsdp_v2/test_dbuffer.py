@@ -51,7 +51,7 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
-@pytest.mark.parametrize("explicit_out", [False, True])
+@pytest.mark.parametrize("out_kind", ["none", "separate", "aliased"])
 @pytest.mark.parametrize(
     "source_placement,target_placement,operation,args",
     [
@@ -62,13 +62,7 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
     ],
 )
 def test_singleton_collectives_reuse_storage(
-    distributed_setup,
-    monkeypatch,
-    explicit_out,
-    source_placement,
-    target_placement,
-    operation,
-    args,
+    distributed_setup, monkeypatch, out_kind, source_placement, target_placement, operation, args
 ):
     """Singleton collectives return views, or fill an explicit output without communication."""
     mesh = init_device_mesh(
@@ -79,9 +73,11 @@ def test_singleton_collectives_reuse_storage(
     tensor = torch.arange(32, device=distributed_setup.device, dtype=torch.float32).reshape(8, 4)
     source = DBuffer.distribute_tensors([tensor], mesh, [source_placement])
     out = None
-    if explicit_out:
+    if out_kind == "separate":
         out = DBuffer(mesh, [target_placement], source.layout, source.dtype, source.device)
         out.local_buffer.fill_(-1)
+    elif out_kind == "aliased":
+        out = source.view([target_placement])
 
     def unexpected_collective(*args, **kwargs):
         pytest.fail("A singleton redistribution must not launch a collective.")
@@ -267,6 +263,18 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
         device=distributed_setup.device,
     )
     tensor_view = buffer.get_tensor_view(0)
+    buffer.local_buffer.fill_(7.0)
+    # Even an unchanged-placement view borrows storage. A nested sharded view
+    # must neither free the base nor shrink its allocation on reallocation.
+    for view in (buffer.view([Replicate()]), buffer.view([RowAtomic()]).view([RowAtomic()])):
+        assert view is not buffer
+        view.release_storage()
+        view.reallocate_storage()
+        assert (
+            buffer.local_buffer.untyped_storage().nbytes()
+            == 16 * buffer.local_buffer.element_size()
+        )
+        torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 
     buffer.release_storage()
     assert buffer.local_buffer.untyped_storage().nbytes() == 0
@@ -278,6 +286,36 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     )
     buffer.local_buffer.fill_(7.0)
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
+
+
+@pytest.mark.parametrize("singleton", [False, True])
+@pytest.mark.parametrize("placement", [Replicate(), RowAtomic(), Partial("avg")])
+def test_prepared_redistribution_preserves_source_storage(distributed_setup, singleton, placement):
+    """Reusable destinations borrow local storage or own a separate collective output."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )["local" if singleton else "dp"]
+    tensor = torch.arange(32, device=distributed_setup.device, dtype=torch.float32).reshape(8, 4)
+    source = DBuffer.distribute_tensors([tensor], mesh, [placement])
+    destination = source.prepare_redistribute([Replicate()])
+    borrowed = singleton or placement.is_replicate() or mesh.size() == 1
+    source_storage = source.local_buffer.untyped_storage()
+    destination_storage = destination.local_buffer.untyped_storage()
+    assert (destination_storage is source_storage) == borrowed
+    saved_view = destination.get_tensor_view(0)
+    source_before = source.local_buffer.clone()
+
+    for _ in range(2):
+        destination.release_storage()
+        assert destination.is_allocated == borrowed
+        assert source.is_allocated
+        torch.testing.assert_close(source.local_buffer, source_before)
+        destination.reallocate_storage()
+        assert destination.local_buffer.untyped_storage() is destination_storage
+        source.redistribute([Replicate()], out=destination)
+        torch.testing.assert_close(saved_view, tensor)
 
 
 def test_is_allocated_follows_storage_release(distributed_setup):

@@ -95,6 +95,8 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
+    # Views retain their storage owner; only that owner may resize the allocation.
+    _base: "DBuffer | None"
 
     def __init__(
         self,
@@ -127,6 +129,7 @@ class DBuffer:
         local_range = self.layout.get_local_range(self.mesh, self.placements)
         self.offset = local_range.start
         self.local_buffer = torch.empty(local_range.numel, dtype=dtype, device=device)
+        self._base = None
 
     @classmethod
     def empty(
@@ -182,20 +185,24 @@ class DBuffer:
     def is_allocated(self) -> bool:
         """Whether the local buffer has backing storage.
 
-        ``release_storage()`` clears this and ``reallocate_storage()`` restores it.
+        The storage owner controls release and reallocation; views follow it.
         Empty local buffers are always allocated.
         """
         return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
     def reallocate_storage(self) -> None:
-        """Restore the local buffer's backing storage to its logical size."""
+        """Restore owned storage to its logical size; leave borrowed storage alone."""
+        if self._base is not None:
+            return
         # The allocator may hand back a different address than release_storage() freed.
         # Tensors sharing this Storage read its pointer on each access, so views into the
         # buffer -- including ones autograd saved -- follow it to the new allocation.
         self._resize_storage(self.local_buffer.numel())
 
     def release_storage(self) -> None:
-        """Release local buffer storage without replacing the Storage object."""
+        """Release owned storage without replacing it; views never release their base."""
+        if self._base is not None:
+            return
         # Autograd may save views that share this Storage object. Resizing the
         # existing Storage releases the allocation while preserving those aliases
         # for a later reallocate_storage().
@@ -248,6 +255,9 @@ class DBuffer:
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
+        The returned buffer controls this storage's release and reallocation.
+        Use ``view()`` to borrow another DBuffer's storage without that ownership.
+
         Args:
             local_buffer: Contiguous local tensor storage for this rank. DBuffer
                 uses it directly in collectives such as all-gather and
@@ -285,12 +295,15 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = local_range.start
         buffer.local_buffer = local_buffer
+        buffer._base = None
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
         """View a contained local range with the requested ``placements``.
 
-        This only slices and relabels storage; it performs no communication.
+        This always returns a distinct wrapper borrowing this buffer's storage,
+        even for unchanged placements. It performs no communication. Releasing or
+        reallocating the view leaves the base's storage alone.
         When changing Partial placements, callers must populate the view with
         values appropriate to its new placements before reading it.
         """
@@ -301,18 +314,30 @@ class DBuffer:
             )
 
         _validate_placements(placements)
-        if self.placements == placements:
-            return self
         local_range = self.layout.get_local_range(self.mesh, placements)
         local_offset = local_range.start - self.offset
         if local_offset < 0 or local_offset + local_range.numel > self.local_buffer.numel():
             raise ValueError("DBuffer.view() requires a range contained in its local buffer.")
-        return DBuffer.from_local(
+        view = DBuffer.from_local(
             self.local_buffer.narrow(0, local_offset, local_range.numel),
             self.mesh,
             placements,
             self.layout,
         )
+        view._base = self._base if self._base is not None else self
+        return view
+
+    def prepare_redistribute(self, placements: Iterable[Placement]) -> "DBuffer":
+        """Prepare a reusable redistribution destination without communicating.
+
+        Local transitions borrow the source's storage. Otherwise, allocate an
+        uninitialized destination whose storage can be released and reallocated
+        between calls to ``redistribute(..., out=destination)``.
+        """
+        placements = tuple(placements)
+        if can_redistribute_locally(self.mesh, self.placements, placements):
+            return self.view(placements)
+        return self._create_or_validate_out(None, placements=placements)
 
     @classmethod
     def distribute_tensors(
@@ -442,11 +467,14 @@ class DBuffer:
         ):
             return self.allgather(changed_axes, out=out)
         if can_redistribute_locally(self.mesh, self.placements, new_placements):
+            if not changed_axes and out is None:
+                return self
             view = self.view(new_placements)
             if out is None:
                 return view
             out = self._create_or_validate_out(out, placements=new_placements)
-            out.local_buffer.copy_(view.local_buffer)
+            if not out.local_buffer.is_set_to(view.local_buffer):
+                out.local_buffer.copy_(view.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=new_placements)
         if len(changed_axes) != 1:
@@ -495,7 +523,8 @@ class DBuffer:
             if out is None:
                 return self.view(placements)
             out = self._create_or_validate_out(out, placements=placements)
-            out.local_buffer.copy_(self.local_buffer)
+            if not out.local_buffer.is_set_to(self.local_buffer):
+                out.local_buffer.copy_(self.local_buffer)
             return out
         out = self._create_or_validate_out(out, placements=placements)
         local_buffer = self.local_buffer

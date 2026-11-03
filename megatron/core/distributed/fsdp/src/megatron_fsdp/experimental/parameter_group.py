@@ -350,22 +350,10 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         unsharded_placements = (Replicate(),) * self.mesh.ndim
-        if not self._requires_allgather:
-            self._unsharded_model_weight = self.model_weight.view(unsharded_placements)
-        else:
-            with self._symmetric_memory_context():
-                if isinstance(self.model_weight, DBuffer):
-                    self._unsharded_model_weight = DBuffer(
-                        mesh=self.mesh,
-                        placements=unsharded_placements,
-                        layout=layout,
-                        dtype=self.dtype,
-                        device=self.main_weight.device,
-                    )
-                else:
-                    self._unsharded_model_weight = QuantizedDBuffer(
-                        self.mesh, unsharded_placements, layout, self.main_weight.device
-                    )
+        with self._symmetric_memory_context():
+            self._unsharded_model_weight = self.model_weight.prepare_redistribute(
+                unsharded_placements
+            )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -461,18 +449,9 @@ class FsdpParameterGroup:
         )
 
     @property
-    def _requires_allgather(self) -> bool:
-        """Whether compute weights need temporary storage to become fully replicated."""
-        return not can_redistribute_locally(
-            self.mesh, self.model_weight.placements, (Replicate(),) * self.mesh.ndim
-        )
-
-    @property
     def is_rowwise_unsharded(self) -> bool:
-        """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
+        """Whether MXFP8 rowwise planes are available for compute."""
         buffer = self._unsharded_model_weight
-        if not self._requires_allgather:
-            return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
             return False
@@ -498,16 +477,23 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
 
-        if not self._requires_allgather:
-            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
-        elif isinstance(self._unsharded_model_weight, DBuffer):
+        if isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
             self._allgather_model_weight(
                 rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
-            ready_phases = missing_phases
+            # Borrowed storage can already contain both planes. Install every
+            # available phase that does not yet have a readiness event.
+            ready_phases = tuple(
+                p
+                for p, allocated in (
+                    (Phase.FORWARD, self._unsharded_model_weight.is_rowwise_allocated),
+                    (Phase.BACKWARD, self._unsharded_model_weight.is_columnwise_allocated),
+                )
+                if allocated and p not in self._unshard_events
+            )
         self._install_unsharded_parameters(
             rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
         )
@@ -547,7 +533,7 @@ class FsdpParameterGroup:
                 )
 
     def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
-        """Allocate the gather buffer and fill it from sharded compute weights.
+        """Materialize the compute buffer; borrowed storage needs no allocation or copy.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
         compute weights ignore them and gather their whole buffer.
@@ -600,10 +586,6 @@ class FsdpParameterGroup:
         else:
             self._unshard_events.clear()
 
-        # Clear readiness so the next unshard refreshes Parameter data/scales,
-        # but never free persistent compute weights or their padded scale copies.
-        if not self._requires_allgather:
-            return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
             unsharded_model_weight.release_storage()
@@ -614,13 +596,23 @@ class FsdpParameterGroup:
             # TE #3518 requires padded scale copies on the Parameter, separate
             # from the buffer's compact scales. Release these copies too.
             # https://github.com/NVIDIA/TransformerEngine/issues/3518
-            if weight._rowwise_scale_inv is not None:
+            if (
+                not unsharded_model_weight.is_rowwise_allocated
+                and weight._rowwise_scale_inv is not None
+            ):
                 weight._rowwise_scale_inv.untyped_storage().resize_(0)
-            if not rowwise_only and weight._columnwise_scale_inv is not None:
+            if (
+                not unsharded_model_weight.is_columnwise_allocated
+                and weight._columnwise_scale_inv is not None
+            ):
                 weight._columnwise_scale_inv.untyped_storage().resize_(0)
             # Keep an empty data view for TE's device queries when neither plane
             # remains. Otherwise, remove the released plane from the tensor.
-            if rowwise_only and weight._columnwise_data is not None:
+            if (
+                rowwise_only
+                and not unsharded_model_weight.is_rowwise_allocated
+                and weight._columnwise_data is not None
+            ):
                 weight.update_usage(rowwise_usage=False)
 
     @property
@@ -751,7 +743,7 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
-        if self.pre_optimizer_main_grad is self.main_grad:
+        if self.pre_optimizer_main_grad.placements == self.main_grad.placements:
             # Optimizer layout equals the accumulation layout (e.g. plain DP): no
             # DP-outer axis to reduce, so grads already rest finalized.
             self._install_sharded_grads(self.main_grad)

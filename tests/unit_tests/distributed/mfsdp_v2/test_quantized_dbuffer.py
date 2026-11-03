@@ -272,10 +272,15 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     )
     for plane in source.planes:
         plane.local_buffer.zero_()
-    assert source.view([Replicate()]) is source
+    replicated_view = source.view([Replicate()])
+    assert replicated_view is not source
+    replicated_view.release_storage()
+    assert source.is_rowwise_allocated and source.is_columnwise_allocated
 
     view = source.view([BlockAtomic(32)])
-    assert view.view([BlockAtomic(32)]) is view
+    view = view.view([BlockAtomic(32)])
+    view.release_storage()
+    view.reallocate_storage()
     for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
         assert actual.placements == ((RowAtomic(),) if index == 3 else (BlockAtomic(32),))
         chunks = original.local_buffer.view(mesh.size(), -1)
@@ -288,6 +293,51 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
         for rank in range(mesh.size()):
             if rank != mesh.get_local_rank():
                 assert chunks[rank].eq(0).all()
+
+
+@pytest.mark.parametrize("singleton", [False, True])
+@pytest.mark.parametrize("placement", [Replicate(), BlockAtomic(32)])
+def test_quantized_prepared_redistribution_preserves_source_storage(
+    distributed_setup, singleton, placement
+):
+    """Releasing prepared MXFP8 planes never frees persistent compute weights."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )["local" if singleton else "dp"]
+    source = QuantizedDBuffer.empty(mesh, [placement], [(128, 64)], distributed_setup.device)
+    for index, plane in enumerate(source.planes):
+        plane.local_buffer.fill_(index + 1)
+    destination = source.prepare_redistribute([Replicate()])
+    borrowed = singleton or placement.is_replicate() or mesh.size() == 1
+    for original, prepared in zip(source.planes, destination.planes):
+        assert prepared.placements == (Replicate(),)
+        assert (
+            prepared.local_buffer.untyped_storage() is original.local_buffer.untyped_storage()
+        ) == borrowed
+
+    for _ in range(2):
+        destination.release_storage()
+        assert destination.is_rowwise_allocated == borrowed
+        assert destination.is_columnwise_allocated == borrowed
+        destination.reallocate_storage()
+        source.redistribute([Replicate()], out=destination)
+        destination.release_storage(rowwise_only=True)
+        assert destination.is_rowwise_allocated == borrowed
+        assert destination.is_columnwise_allocated
+        for index, plane in enumerate(source.planes):
+            assert plane.is_allocated
+            torch.testing.assert_close(
+                plane.local_buffer, torch.full_like(plane.local_buffer, index + 1)
+            )
+        for plane in destination.planes_for(rowwise=True, columnwise=False):
+            plane.reallocate_storage()
+        source.redistribute([Replicate()], out=destination, rowwise=True, columnwise=False)
+        for index, plane in enumerate(destination.planes):
+            torch.testing.assert_close(
+                plane.local_buffer, torch.full_like(plane.local_buffer, index + 1)
+            )
 
 
 @pytest.mark.parametrize("use_out", [False, True])

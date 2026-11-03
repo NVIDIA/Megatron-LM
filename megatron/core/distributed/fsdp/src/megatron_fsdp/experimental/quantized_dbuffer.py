@@ -356,15 +356,23 @@ class QuantizedDBuffer:
             plane.release_storage()
 
     def view(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
-        """Return a storage-sharing view of every physical plane."""
+        """Return a distinct wrapper borrowing every physical plane's storage."""
         placements = tuple(placements)
-        if self.rowwise_data.placements == placements:
-            return self
         return QuantizedDBuffer._from_planes(
             self.rowwise_data.view(placements),
             self.columnwise_data.view(placements),
             self.rowwise_scale.view(placements),
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
+        )
+
+    def prepare_redistribute(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
+        """Prepare each plane's redistribution destination without communicating."""
+        placements = tuple(placements)
+        return self._from_planes(
+            self.rowwise_data.prepare_redistribute(placements),
+            self.columnwise_data.prepare_redistribute(placements),
+            self.rowwise_scale.prepare_redistribute(placements),
+            self.columnwise_scale.prepare_redistribute(_block_atomic_to_flat(placements)),
         )
 
     def redistribute(
