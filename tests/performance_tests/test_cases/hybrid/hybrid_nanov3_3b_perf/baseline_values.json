@@ -6,7 +6,7 @@
       "num_input_tokens_avg": 60.2,
       "num_output_tokens": 128,
       "num_iters": 5,
-      "throughput_tok_per_sec": 174.53474487231847,
+      "throughput_tok_per_sec": 216.92393849957742,
       "avg_latency_ms": 733.3438616711646,
       "p50_latency_ms": 725.6480471696705,
       "p99_latency_ms": 760.1394890807569,
