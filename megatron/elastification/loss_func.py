@@ -12,7 +12,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import global_process_group_fallback
 from megatron.core.utils import get_attr_wrapped_model, get_pg_rank, get_pg_size, unwrap_model
 from megatron.training import get_args
 
@@ -51,13 +51,13 @@ def _mask_loss(output_tensor, loss_mask, tp_group: Optional[torch.distributed.Pr
             param_loss = -args.router_beta * param_loss
 
     if (tp_reduce or is_sequence_parallel) and tp_group is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "megatron.elastification.loss_func._mask_loss",
             "tp_group",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
+        ):
+            tp_group = parallel_state.get_tensor_model_parallel_group()
 
     if is_sequence_parallel:
         # Sequence-parallel tensor derived from intermediate activation - need to split loss mask.

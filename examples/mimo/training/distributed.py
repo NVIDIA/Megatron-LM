@@ -30,28 +30,22 @@ def initialize_distributed() -> None:
 
 
 def assert_parallel_state_uninitialized() -> None:
-    """Assert no Megatron model-parallel globals are set so the hetero path owns setup."""
-    # Defensive parallel_state reads (allowed compatibility point); check each global MIMO
-    # constructs, since model_parallel_is_initialized() omits CP/embedding.
-    checks = (
-        ("data_parallel", parallel_state.is_initialized),
-        ("tensor_model_parallel", _grp(parallel_state.get_tensor_model_parallel_group)),
-        ("pipeline_model_parallel", _grp(parallel_state.get_pipeline_model_parallel_group)),
-        ("context_parallel", _grp(parallel_state.get_context_parallel_group)),
-        ("embedding", _grp(parallel_state.get_embedding_group)),
-        ("position_embedding", _grp(parallel_state.get_position_embedding_group)),
-    )
-    initialized = [label for label, predicate in checks if predicate()]
-    if initialized:
+    """Assert no Megatron model-parallel globals are set so the hetero path owns setup.
+
+    initialize_model_parallel() and register_process_groups() set the global groups by
+    registering a collection, so a registered collection means that some of them are set.
+    """
+    registered = parallel_state.get_registered_process_groups()
+    if registered is not None:
         raise RuntimeError(
             "Hetero MIMO bootstrap expects Megatron parallel_state process groups to be "
-            f"uninitialized, but found: {', '.join(initialized)}"
+            f"uninitialized, but found: {registered}"
         )
-
-
-def _grp(getter):
-    """Turn a group getter into a no-arg "is it set?" predicate."""
-    return lambda: getter(check_initialized=False) is not None
+    if parallel_state.is_initialized():
+        raise RuntimeError(
+            "Hetero MIMO bootstrap expects Megatron parallel_state process groups to be "
+            "uninitialized, but found: data_parallel"
+        )
 
 
 def shutdown_distributed() -> None:
