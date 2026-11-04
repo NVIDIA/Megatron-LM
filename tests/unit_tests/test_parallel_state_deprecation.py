@@ -4,11 +4,12 @@
 
 Every group, rank and size accessor, pipeline-stage predicate, virtual-pipeline getter and
 setter, rank and size override, and memory-buffer alias emits a ParallelStateDeprecationWarning
-once per call site. The warning names its replacement and the releases that deprecate and remove
-the function. Bootstrap, teardown and the registry do not warn, and neither do Megatron Core's
-own compatibility fallbacks, which report a single ProcessGroupFallbackWarning instead; the
-fallbacks of training read the grid in a global_process_group_fallback() block to the same
-effect. Strict process-group fallbacks leave the accessor warning a warning.
+once per call site, and so does ProcessGroupCollection.use_mpu_process_groups(), which builds a
+collection from the accessors. The warning names its replacement and the releases that deprecate
+and remove the function. Bootstrap, teardown and the registry do not warn, and neither do
+Megatron Core's own compatibility fallbacks, which report a single ProcessGroupFallbackWarning
+instead; the fallbacks of training read the grid in a global_process_group_fallback() block to
+the same effect. Strict process-group fallbacks leave the accessor warning a warning.
 
 The CPU tests run without torch.distributed. The tests on the standard grid need GPUs; they use
 a TP2 x PP2 grid on 4 or more ranks, and smaller grids otherwise.
@@ -215,11 +216,15 @@ def _recorded_warnings():
 
 
 def _deprecated_calls(record):
-    """Return (function, file name, line number) for each accessor warning in ``record``."""
+    """Return (function, file name, line number) for each deprecation warning in ``record``."""
     calls = []
     for warning in record:
         if issubclass(warning.category, ParallelStateDeprecationWarning):
-            name = re.match(r"megatron\.core\.parallel_state\.(\w+)\(\)", str(warning.message))
+            name = re.match(
+                r"megatron\.core\.(?:parallel_state|process_groups_config\.ProcessGroupCollection)"
+                r"\.(\w+)\(\)",
+                str(warning.message),
+            )
             calls.append((name.group(1), warning.filename, warning.lineno))
     return calls
 
@@ -430,13 +435,21 @@ def test_the_test_suite_ignores_the_warning(pytestconfig):
 
 
 def test_calls_from_megatron_core_do_not_warn():
-    """A caller whose source file is in megatron/core is exempt; core warns for its fallbacks."""
+    """A caller whose source file is in megatron/core is exempt; core warns for its fallbacks.
+
+    The accessors that use_mpu_process_groups() calls do not warn either.
+    """
     core_caller = compile(
-        "parallel_state.get_virtual_pipeline_model_parallel_rank()", parallel_state.__file__, "exec"
+        "parallel_state.get_virtual_pipeline_model_parallel_rank()\n"
+        "ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp', 'ep'])",
+        parallel_state.__file__,
+        "exec",
     )
     with _recorded_warnings() as record:
-        exec(core_caller, {"parallel_state": parallel_state})
-        ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp", "cp", "ep"])
+        exec(
+            core_caller,
+            {"parallel_state": parallel_state, "ProcessGroupCollection": ProcessGroupCollection},
+        )
 
     assert _deprecated_calls(record) == []
 
@@ -622,7 +635,7 @@ class TestStandardGrid:
             # from megatron/core, so neither adds an accessor warning.
             fallbacks = _fallbacks(record)
             tp_group = get_tensor_model_parallel_group_if_none(None)
-            shim = ProcessGroupCollection.use_mpu_process_groups()
+        shim = ProcessGroupCollection.use_mpu_process_groups()
 
         assert [owner for owner, _ in fallbacks] == ["Owner"]
         assert _deprecated_calls(record) == []
