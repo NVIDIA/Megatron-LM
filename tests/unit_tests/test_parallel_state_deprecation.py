@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import warnings
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -36,7 +37,7 @@ from megatron.core.process_groups_config import (
     resolve_process_groups,
 )
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
-from megatron.training import checkpointing
+from megatron.training import checkpointing, initialize, training
 from megatron.training.utils.common_utils import (
     average_losses_across_data_parallel_group,
     is_first_or_last_pipeline_stage,
@@ -45,6 +46,7 @@ from tasks import finetune_utils
 from tests.unit_tests.test_utilities import Utils
 
 VERSIONS = "is deprecated since Megatron Core 0.21 and will be removed in 0.23."
+SHIM = "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
 PP_UTILS = "megatron.core.pipeline_parallel.utils"
 # What each deprecated function's warning names as its replacement, by tier.
 GROUPS = {
@@ -578,6 +580,135 @@ def test_finetuning_samples_over_the_registered_grid(monkeypatch, fields):
         data_loader = finetune_utils.build_data_loader(range(8), 2, 0, drop_last=False)
 
     assert (data_loader.sampler.num_replicas, data_loader.sampler.rank) == (4, 3)
+    assert _deprecated_calls(record) == []
+    assert _fallbacks(record) == []
+
+
+# ProcessGroupCollection.use_mpu_process_groups() and the bootstrap reads through it
+
+
+def test_the_shim_warns_outside_megatron_core_before_it_reads_the_grid(monkeypatch):
+    """The warning names the replacements, and an error filter stops the call unchanged."""
+    read = Mock()
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_group", read)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ParallelStateDeprecationWarning)
+        with pytest.raises(ParallelStateDeprecationWarning) as raised:
+            ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+
+    read.assert_not_called()
+    message = str(raised.value)
+    assert message.startswith(f"{SHIM}() {VERSIONS}")
+    replacement = message.partition(" Replace it with ")[2]
+    assert "the ProcessGroupCollection that the code which needs the groups receives" in replacement
+    assert "megatron.core.parallel_state.get_registered_process_groups()" in replacement
+
+
+def test_each_shim_call_site_warns_once():
+    with _recorded_warnings() as record:
+        for _ in range(3):
+            ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+        ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"])
+
+    calls = _deprecated_calls(record)
+    assert [name for name, _, _ in calls] == ["use_mpu_process_groups"] * 2
+    # Two call sites, and the warning points at the caller, not at process_groups_config.
+    assert len({line for _, _, line in calls}) == 2
+    assert {filename for _, filename, _ in calls} == {__file__}
+
+
+def test_an_error_filter_raises_at_every_shim_call():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ParallelStateDeprecationWarning)
+        for _ in range(2):
+            with pytest.raises(ParallelStateDeprecationWarning):
+                ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+
+
+def test_the_shim_in_a_fallback_block_reports_one_fallback_warning():
+    with _recorded_warnings() as record:
+        with global_process_group_fallback("Owner", deprecated_in="0.21", removed_in="0.23"):
+            ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+
+    assert _fallbacks(record) == [("Owner", "pg_collection")]
+    assert _deprecated_calls(record) == []
+
+
+def test_strict_fallbacks_leave_the_shim_warning_a_warning():
+    with _recorded_warnings() as record:
+        enable_strict_process_group_fallbacks()
+        ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+
+    assert [name for name, _, _ in _deprecated_calls(record)] == ["use_mpu_process_groups"]
+
+
+def test_the_shim_still_builds_a_new_collection_of_the_global_groups(monkeypatch):
+    groups = {"tp": Mock(), "pp": Mock(), "cp": Mock()}
+    for field, name in (
+        ("tp", "_TENSOR_MODEL_PARALLEL_GROUP"),
+        ("pp", "_PIPELINE_MODEL_PARALLEL_GROUP"),
+        ("cp", "_CONTEXT_PARALLEL_GROUP"),
+    ):
+        monkeypatch.setattr(parallel_state, name, groups[field])
+    undecorated = vars(ProcessGroupCollection)["use_mpu_process_groups"].__func__.__wrapped__
+
+    with _recorded_warnings():
+        first, second = (
+            ProcessGroupCollection.use_mpu_process_groups(required_pgs=list(groups))
+            for _ in range(2)
+        )
+
+    assert type(first) is type(second) is ProcessGroupCollection
+    assert first is not second
+    assert vars(first) == vars(second) == groups
+    assert vars(undecorated(ProcessGroupCollection, required_pgs=list(groups))) == groups
+
+
+def _set_data_parallel_groups(monkeypatch):
+    """Set the data-parallel groups that a read of every field of the grid requires."""
+    for name in (
+        "_DATA_PARALLEL_GROUP",
+        "_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
+        "_DATA_PARALLEL_GROUP_WITH_CP",
+        "_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+        "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+    ):
+        monkeypatch.setattr(parallel_state, name, Mock())
+
+
+@pytest.mark.usefixtures("run_config")
+def test_pretrain_builds_its_collection_from_the_grid_without_a_warning(monkeypatch):
+    """The collection that pretrain() runs on is read at bootstrap: no deprecation or fallback
+    warning, also under strict fallbacks."""
+    _set_data_parallel_groups(monkeypatch)
+    args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+
+    with _recorded_warnings() as record:
+        enable_strict_process_group_fallbacks()
+        pg_collection = training._build_pg_collection_from_parallel_state(args)
+
+    assert pg_collection.dp is parallel_state._DATA_PARALLEL_GROUP
+    assert _deprecated_calls(record) == []
+    assert _fallbacks(record) == []
+
+
+@pytest.mark.usefixtures("run_config")
+def test_initialization_reads_a_grid_set_up_before_it_without_a_warning(monkeypatch):
+    """initialize_megatron() seeds from a grid that its caller set up, read at bootstrap."""
+    _set_data_parallel_groups(monkeypatch)
+    monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(initialize, "print_rank_0", Mock())
+    monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(initialize.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(initialize.torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+
+    with _recorded_warnings() as record:
+        enable_strict_process_group_fallbacks()
+        pg_collection = initialize._initialize_distributed(None, None, None)
+
+    assert pg_collection.dp is parallel_state._DATA_PARALLEL_GROUP
     assert _deprecated_calls(record) == []
     assert _fallbacks(record) == []
 
