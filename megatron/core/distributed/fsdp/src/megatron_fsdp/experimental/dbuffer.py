@@ -496,7 +496,7 @@ class DBuffer:
                 raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
             placements[axis] = Replicate()
         out = self._create_or_validate_out(out, placements=placements)
-        local_buffer = self.local_buffer
+        input_buffer = self
         placements = list(self.placements)
         # DBuffer requires sharded axes to form a suffix (see _validate_placements).
         # GlobalLayout.get_local_range() partitions the global buffer from the last
@@ -521,11 +521,15 @@ class DBuffer:
             group = self.mesh.get_group(axis)
             if self.layout.has_equal_shard_sizes:
                 # Symmetric-memory registration is scoped to the collective's process
-                # group, so rendezvous the output on the same mesh axis as the all-gather.
+                # group, so rendezvous both buffers on the all-gather's mesh axis.
                 if out.is_symmetric_memory:
                     out.rendezvous(axis)
+                    if input_buffer.is_symmetric_memory:
+                        input_buffer.rendezvous(axis)
                 dist.all_gather_into_tensor(
-                    output_tensor=view.local_buffer, input_tensor=local_buffer, group=group
+                    output_tensor=view.local_buffer,
+                    input_tensor=input_buffer.local_buffer,
+                    group=group,
                 )
             else:
                 # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
@@ -535,8 +539,8 @@ class DBuffer:
                         "Symmetric-memory allgather() requires equal shard sizes."
                     )
                 chunks = self._peer_chunks(view, input_placements, axis)
-                dist.all_gather(chunks, local_buffer, group=group)
-            local_buffer = view.local_buffer
+                dist.all_gather(chunks, input_buffer.local_buffer, group=group)
+            input_buffer = view
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
