@@ -100,6 +100,9 @@ class FullyParallelSaveStrategyWrapper:
         self.pg_cache_create = pg_cache_create
 
         self.cached_distribution: Optional[ShardDistribution] = None
+        # A singleton group legitimately caches None. Track global validation
+        # separately so it is skipped on the same save calls on every rank.
+        self._access_integrity_validated = False
 
     def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """ """
@@ -149,11 +152,13 @@ class FullyParallelSaveStrategyWrapper:
         pg_cache_read = self.pg_cache_path is not None and not self.pg_cache_create
         if (
             self.cached_distribution is None
+            and (not self.do_cache_distribution or not self._access_integrity_validated)
             and not pg_cache_read
             and self.validate_access_integrity
         ):
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
+            self._access_integrity_validated = True
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
         end = time()
