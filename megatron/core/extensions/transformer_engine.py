@@ -2279,6 +2279,84 @@ _te_dpa_supports_softcap = (
 )
 
 
+def _packed_view_strides(view: Tensor, count: int, interleave_dim: int) -> Tuple[int, ...]:
+    """Strides of one of ``count`` views interleaved at ``interleave_dim`` (-3 or -2) of a dense
+    buffer, e.g. q of a dense ``[s, b, h, 3, d]`` buffer for ``count=3, interleave_dim=-2``."""
+    shape = list(view.shape)
+    shape.insert(view.dim() + interleave_dim + 1, count)
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * shape[i + 1]
+    del strides[view.dim() + interleave_dim + 1]
+    return tuple(strides)
+
+
+def _te_reads_as_packed(views: Tuple[Tensor, ...], offset: int) -> bool:
+    """Whether TE's ``get_qkv_layout`` takes ``views`` (q, k, v or k, v) for one packed buffer at
+    storage offset ``offset``, and its fused backend then reads each view with its own strides."""
+    heads, dim = views[0].shape[-2:]
+    # TE tries the interleave before the heads (sb3hd, sbhd_sb2hd) first, then the one after them
+    # (sbh3d, sbhd_sbh2d), and takes the first whose storage offsets match.
+    for interleave_dim, step in ((-3, heads * dim), (-2, dim)):
+        if all(view.storage_offset() == offset + i * step for i, view in enumerate(views)):
+            # Size-1 dims are never stepped along, so their strides do not matter.
+            return all(
+                size == 1 or stride == packed_stride
+                for view in views
+                for size, stride, packed_stride in zip(
+                    view.shape,
+                    view.stride(),
+                    _packed_view_strides(view, len(views), interleave_dim),
+                )
+            )
+    return False
+
+
+def _dense_unpacked_qkv(query: Tensor, key: Tensor, value: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Return q, k and v in the memory layouts TE's DotProductAttention reads them with.
+
+    TE derives a qkv_layout from the inputs' storages, offsets and strides (``get_qkv_layout``),
+    and its fused (cuDNN) backend reads every tensor with the strides of that layout, not with
+    the tensor's own. Views that share one storage at the offsets of a packed layout (q, k and v:
+    ``sb3hd``, ``sbh3d``; k and v: ``sbhd_sb2hd``, ``sbhd_sbh2d``) are read as views of a dense
+    packed buffer. Every other tensor is read as dense in its format (``sbhd``, ``bshd`` or
+    ``thd``). So a strided view that is not packed (static inference's query split off the fused
+    QKV projection, a batch slice of the static KV cache), or a view of a packed buffer that is
+    not dense, would be read wrongly. This mirrors TE's detection: dense tensors and the packed
+    views TE reads correctly (training's fused QKV, cross-attention's fused KV) are passed as
+    they are, and every other input is made contiguous. It reads only host-side metadata.
+    """
+    if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
+        return query, key, value
+    # Local import: fp8_utils imports this module.
+    from megatron.core.fp8_utils import is_float8tensor
+
+    if any(is_float8tensor(t) for t in (query, key, value)):
+        # TE detects the layout of quantized q/k/v from their data, not from these wrappers.
+        return query, key, value
+    q_storage, k_storage, v_storage = (t.untyped_storage().data_ptr() for t in (query, key, value))
+    shared = q_storage == k_storage == v_storage
+    if (
+        shared
+        and query.shape == key.shape == value.shape
+        and query.stride() == key.stride() == value.stride()
+        and _te_reads_as_packed((query, key, value), offset=0)
+    ):
+        return query, key, value
+    if not query.is_contiguous():
+        query = query.contiguous()
+        shared = False
+    if (
+        k_storage == v_storage
+        and key.shape[:-1] == value.shape[:-1]
+        and [s / key.shape[-1] for s in key.stride()[:-1]]
+        == [s / value.shape[-1] for s in value.stride()[:-1]]
+        and _te_reads_as_packed((key, value), offset=query.numel() if shared else 0)
+    ):
+        return query, key, value
+    return query, key.contiguous(), value.contiguous()
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2569,6 +2647,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
+        query, key, value = _dense_unpacked_qkv(query, key, value)
+
         if packed_seq_params is not None:
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
