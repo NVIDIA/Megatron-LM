@@ -55,6 +55,7 @@ except ImportError:
     HAVE_TRITON = False
 
 # Persistent grid: each CTA strides over the live rows, so idle CTAs cost nothing at decode loads.
+# The stride is the launch grid read at run time, so one compiled kernel serves every row count.
 # GB300, 65,536 live rows: 4096 CTAs x 4 warps 240 us (512 x 4: 438 us).
 _FINALIZE_CTAS = 4096
 
@@ -84,12 +85,11 @@ def _finalize_routed_rows_kernel(
     gemm2_stride,  # row stride of gemm2_ptr (padded hidden size)
     TOPK: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,  # persistent grid size
 ):
     """Gather each live token's local-expert FC2 rows, weighted by its bf16 routing weights."""
     pid = tl.program_id(0)
     num_active_tokens = tl.load(num_active_tokens_ptr)
-    for row in tl.range(pid, num_active_tokens, NUM_BLOCKS):
+    for row in tl.range(pid, num_active_tokens, tl.num_programs(0)):
         row64 = tl.cast(row, tl.int64)
         for h in tl.range(0, hidden, BLOCK_H):
             offs = h + tl.arange(0, BLOCK_H)
@@ -122,13 +122,12 @@ def _combine_valid_rows_kernel(
     TOPK: tl.constexpr,
     TOPK_PAD: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,  # persistent grid size
 ):
     """Copy each live token's row to fp32, or zero it when none of its experts is local."""
     pid = tl.program_id(0)
     num_active_tokens = tl.load(num_active_tokens_ptr)
     k = tl.arange(0, TOPK_PAD)
-    for row in tl.range(pid, num_active_tokens, NUM_BLOCKS):
+    for row in tl.range(pid, num_active_tokens, tl.num_programs(0)):
         row64 = tl.cast(row, tl.int64)
         experts = tl.load(routing_ptr + row64 * TOPK + k, mask=k < TOPK, other=-1)
         experts = experts - local_expert_offset
@@ -168,7 +167,6 @@ def finalize_routed_rows(
         gemm2_output.shape[1],
         TOPK=topk,
         BLOCK_H=min(triton.next_power_of_2(hidden), 1024),
-        NUM_BLOCKS=num_blocks,
     )
     return output
 
@@ -202,7 +200,6 @@ def combine_valid_rows(
         TOPK=topk,
         TOPK_PAD=triton.next_power_of_2(topk),
         BLOCK_H=min(triton.next_power_of_2(hidden), 1024),
-        NUM_BLOCKS=num_blocks,
     )
     return output
 

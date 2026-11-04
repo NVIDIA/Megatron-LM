@@ -307,6 +307,7 @@ def mxfp8_quantize_rows(
 
 # Persistent grid for the routed-layout quantizer; each CTA strides over the live rows, so idle
 # CTAs cost nothing at decode. GB300, 65,536 live rows: 2048 CTAs x 8 warps 94 us (512 x 4: 196 us).
+# The stride is the launch grid read at run time, so one compiled kernel serves every row count.
 _ROUTED_ROWS_CTAS = 2048
 
 
@@ -320,7 +321,6 @@ def _mxfp8_quant_routed_rows_kernel(
     padded_K,  # row stride of out_ptr (multiple of 128)
     BLOCK_K: tl.constexpr,  # next_power_of_2(padded_K)
     BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32
-    NUM_PROGRAMS: tl.constexpr,  # persistent grid size
 ):
     """Quantize the live rows to MXFP8 in the row-major layout the TRT-LLM routed MoE reads."""
     pid = tl.program_id(0)
@@ -331,7 +331,7 @@ def _mxfp8_quant_routed_rows_kernel(
     store_mask = offs < padded_K
     group_offs = tl.arange(0, BLOCK_GROUPS)
     group_mask = group_offs < padded_groups
-    for row in tl.range(pid, n_rows, NUM_PROGRAMS):
+    for row in tl.range(pid, n_rows, tl.num_programs(0)):
         row64 = tl.cast(row, tl.int64)
         # Padding columns load as 0, so they quantize to 0 with a 0 scale exponent.
         x = tl.load(src_ptr + row64 * K + offs, mask=load_mask, other=0.0).to(tl.float32)
@@ -374,7 +374,6 @@ def quantize_routed_mxfp8_input(
         padded_hidden_size,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
-        NUM_PROGRAMS=num_programs,
         num_warps=8,
     )
     return data, scale
