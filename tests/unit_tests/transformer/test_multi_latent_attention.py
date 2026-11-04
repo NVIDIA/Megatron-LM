@@ -8,18 +8,11 @@ import pytest
 import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
-from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -33,74 +26,18 @@ from megatron.core.transformer.multi_latent_attention import (
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.utils import get_device_arch_version
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.mla_test_utils import check_mla_parallel_correctness
+from tests.unit_tests.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params as make_test_packed_seq_params,
+)
+from tests.unit_tests.transformer.packed_seq_test_utils import (
+    make_test_packed_seq_params_with_padding as make_test_packed_seq_params_with_padding,
+)
 
 pytestmark = pytest.mark.usefixtures("run_config")
-
-
-def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [0, 6, 19, 22, sequence_length]
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = seqlens.max().item()
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
-
-
-def make_test_packed_seq_params_with_padding(
-    sequence_length=None, cu_seqlens=None, cu_seqlens_padded=None
-):
-    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""
-    if cu_seqlens is None:
-        assert sequence_length is not None
-        cu_seqlens = [
-            0,
-            6,
-            19,
-            22,
-            sequence_length - 8,
-        ]  # Actual sequence lengths (with some padding removed)
-    if cu_seqlens_padded is None:
-        assert sequence_length is not None
-        cu_seqlens_padded = [0, 8, 22, 28, sequence_length]  # Padded sequence lengths
-
-    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
-    cu_seqlens_padded = torch.IntTensor(cu_seqlens_padded).cuda()
-
-    # Use padded lengths for max_seqlen calculation
-    seqlens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen, _ = seqlens_padded.max(dim=0, keepdim=True)
-    max_seqlen = max_seqlen.tolist()[0]
-
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format='thd',
-    )
-    return packed_seq_params
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
@@ -1436,12 +1373,7 @@ class TestMLAClipQK:
 
 @pytest.mark.experimental
 @pytest.mark.parametrize(
-    ("rope_type", "apply_rope_fusion"),
-    [
-        ("rope", False),
-        ("yarn", False),
-        ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ],
+    ("rope_type", "apply_rope_fusion"), [("rope", False), ("yarn", False), ("yarn", True)]
 )
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -1457,217 +1389,7 @@ class TestMLAClipQK:
 def test_parallel_multi_latent_attention_correctness(
     tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, run_config
 ):
-    if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
-        pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
-    if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
-        pytest.skip("MLA yarn rope fusion requires PyTorch >= 2.5.0")
-    if (
-        cp > 1
-        and rope_type == "yarn"
-        and apply_rope_fusion
-        and not is_te_min_version("2.6.0", check_equality=True)
-    ):
-        pytest.skip("MLA CP + yarn rope fusion requires PyTorch >= 2.6.0")
-
-    # Non-deterministic mode has bug to be fixed with MLA
-    _environ = os.environ.copy()
-    os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = "1"
-    os.environ['NVTE_FUSED_ATTN'] = "1"
-    os.environ['NVTE_FLASH_ATTN'] = "0"
-
-    # Constants
-    seed = 123
-    sequence_length = 256
-    micro_batch_size = 4
-    hidden_size = 128
-
-    # Model initialization function
-    def initialize_gpt_model(
-        pre_process=True, post_process=True, vp_stage=None, pg_collection=None, config=None
-    ):
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=True)
-        gpt_model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=128,
-            max_sequence_length=sequence_length,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-        )
-        return gpt_model
-
-    # Initialize baseline parallel state
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
-    )
-
-    # Initialize input hidden states
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
-    input_hidden_states = (
-        torch.rand((sequence_length, micro_batch_size, hidden_size))
-        .cuda()
-        .bfloat16()
-        .requires_grad_(True)
-    )
-
-    # Initialize transformer config
-    transformer_config = MLATransformerConfig(
-        num_layers=1,
-        hidden_size=hidden_size,
-        num_attention_heads=4,
-        q_lora_rank=32,
-        kv_lora_rank=32,
-        qk_head_dim=128,
-        v_head_dim=128,
-        qk_pos_emb_head_dim=64,
-        rotary_base=10000,
-        original_max_position_embeddings=64,
-        context_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
-        bf16=True,
-        rope_type=rope_type,
-        apply_rope_fusion=apply_rope_fusion,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-    )
-
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:
-        # Set argument
-        mock_args = parse_args(ignore_unknown_args=True)
-        mock_args.save_tokenizer_assets = False
-        set_args(mock_args)
-
-        # Initialize baseline model
-        init_basic_mock_args(mock_args, 1, 1, bf16=True)
-        mock_args.context_parallel_size = 1
-        mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-
-        # Initialize args and save checkpoint
-        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
-        mock_args.no_save_optim = True
-        mock_args.no_save_rng = True
-        mock_args.no_load_optim = True
-        mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0)
-
-        # Calculate baseline output
-        attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_baseline, bias_hidden_states_baseline = attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_baseline.sum().backward()
-
-        # Save baseline output
-        input_grad_baseline = input_hidden_states.grad.detach()
-        output_hidden_states_baseline = output_hidden_states_baseline.detach()
-        bias_hidden_states_baseline = bias_hidden_states_baseline.detach()
-
-        # Initialize parallel model
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
-        )
-        torch.manual_seed(seed)
-        model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
-        transformer_config.tensor_model_parallel_size = tp
-        transformer_config.sequence_parallel = sp
-        init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
-        mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            load_checkpoint(gpt_model, None, None)
-
-        # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-        def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
-            if tp > 1 and sp:
-                sp_seg = sequence_length // tp // cp
-                tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
-            return tensor
-
-        # Calculate parallel model output
-        input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
-        input_hidden_states = input_hidden_states.detach().requires_grad_(True)
-        parallel_attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_parallel.sum().backward()
-        input_grad_parallel = input_hidden_states.grad.detach()
-
-        # Check if the output is the same
-        if cp:
-            atol, rtol = 5e-3, 5e-3
-        else:
-            atol, rtol = 5e-4, 5e-4
-        output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
-        input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
-
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains inf"
-        assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
-        assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains inf"
-        assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
-        assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
-
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            bias_hidden_states_baseline,
-            bias_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
-
-        Utils.destroy_model_parallel()
-
-    os.environ.clear()
-    os.environ.update(_environ)
+    check_mla_parallel_correctness(tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp)
 
 
 @pytest.mark.parametrize("mla_down_proj_fusion", [False, True])
