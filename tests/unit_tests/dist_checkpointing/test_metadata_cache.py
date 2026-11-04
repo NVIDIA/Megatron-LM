@@ -2,10 +2,7 @@
 
 """Regression coverage for shared checkpoint metadata reads."""
 
-import gc
-import os
 import pickle
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,13 +18,11 @@ from megatron.core.dist_checkpointing import (
     save,
 )
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
+    CachedMetadataFileSystemReader,
     TorchDistLoadShardedStrategy,
     _get_filesystem_reader,
 )
@@ -39,9 +34,11 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.fixture(autouse=True)
 def clear_reader_cache():
     """Keep test files and metadata references isolated between tests."""
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if CachedMetadataFileSystemReader is not None:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
     yield
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if CachedMetadataFileSystemReader is not None:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def _write_metadata(directory, label="first", filename=".metadata"):
@@ -49,9 +46,9 @@ def _write_metadata(directory, label="first", filename=".metadata"):
     metadata = Metadata(
         state_dict_metadata={label: BytesStorageMetadata()}, planner_data={}, storage_data={}
     )
-    metadata.all_local_plans = []
     path = directory / filename
-    path.write_bytes(pickle.dumps(metadata))
+    with path.open("wb") as metadata_file:
+        pickle.dump(metadata, metadata_file)
     return path
 
 
@@ -64,157 +61,56 @@ def base_reads():
         yield reads
 
 
-def test_metadata_copies_preserve_reader_identity(tmp_path, base_reads):
-    """Reader IDs and save-side attribute replacement cannot change other readers' metadata."""
+def test_reader_without_nvrx(tmp_path, monkeypatch):
+    """Synchronous reads remain supported when the optional dependency is unavailable."""
+    from megatron.core.dist_checkpointing.strategies import torch as strategy_module
+
     _write_metadata(tmp_path)
-    first_reader = _get_filesystem_reader(tmp_path, cache_metadata=False)
-    second_reader = _get_filesystem_reader(str(tmp_path), cache_metadata=True)
-    first = first_reader.read_metadata()
-    second = second_reader.read_metadata()
-    assert base_reads.call_count == 1
-    assert first is not second
-    assert first.state_dict_metadata is second.state_dict_metadata
-    assert first.all_local_plans is second.all_local_plans
-    assert first.storage_meta.load_id == first_reader.load_id
-    assert second.storage_meta.load_id == second_reader.load_id
-    first.storage_data = {"replacement": None}
-    first.storage_meta.load_id = "modified"
-    again = second_reader.read_metadata()
-    assert again.storage_data == {}
-    assert again.storage_meta.load_id == second_reader.load_id
-
-
-def test_replacement_with_same_size_and_mtime(tmp_path, base_reads):
-    """Atomic replacement must invalidate even when size and mtime have been preserved."""
-    path = _write_metadata(tmp_path, "first")
+    monkeypatch.setattr(strategy_module, "CachedMetadataFileSystemReader", None)
     reader = _get_filesystem_reader(tmp_path)
+    assert type(reader) is FileSystemReader
     assert "first" in reader.read_metadata().state_dict_metadata
-    original_stat = path.stat()
-    replacement = _write_metadata(tmp_path, "other", filename=".metadata.new")
-    assert replacement.stat().st_size == original_stat.st_size
-    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    replacement.replace(path)
-    assert "other" in reader.read_metadata().state_dict_metadata
-    assert base_reads.call_count == 2
 
 
-def test_file_changed_during_read_is_not_cached(tmp_path):
-    """Do not associate a read with an identity that changed during deserialization."""
-    _write_metadata(tmp_path, "first")
-    original = FileSystemReader.read_metadata
-
-    def read_and_replace(reader):
-        metadata = original(reader)
-        # Use atomic replacement so invalidation does not depend on timestamp resolution.
-        _write_metadata(tmp_path, "other", filename=".metadata.new").replace(tmp_path / ".metadata")
-        return metadata
-
-    with mock.patch.object(FileSystemReader, "read_metadata", read_and_replace):
-        assert "first" in _get_filesystem_reader(tmp_path).read_metadata().state_dict_metadata
-    assert "other" in _get_filesystem_reader(tmp_path).read_metadata().state_dict_metadata
-
-
-def test_cache_is_bounded_and_can_be_cleared_by_directory(tmp_path, base_reads):
-    """Switching checkpoints evicts the old entry; clearing another directory is harmless."""
-    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
-    _write_metadata(first_dir)
-    _write_metadata(second_dir)
-    first, second = map(_get_filesystem_reader, (first_dir, second_dir))
-    first.read_metadata()
-    CachedMetadataFileSystemReader.clear_metadata_cache(second_dir)
-    first.read_metadata()
-    assert base_reads.call_count == 1
-    second.read_metadata()
-    first.read_metadata()
-    assert base_reads.call_count == 3
-    CachedMetadataFileSystemReader.clear_metadata_cache(first_dir)
-    first.read_metadata()
-    assert base_reads.call_count == 4
-    first.reset(second_dir)
-    first.read_metadata()
-    assert base_reads.call_count == 5
-
-
-@pytest.mark.skipif(
-    not hasattr(FileSystemReader, "_get_metadata_path"), reason="Requires rank-local metadata API"
-)
-def test_rank_local_metadata(tmp_path, base_reads):
-    """Different rank-local metadata files must not alias the directory's cache entry."""
-    _write_metadata(tmp_path, "first", "__0.metadata")
-    _write_metadata(tmp_path, "other", "__1.metadata")
-    reader = _get_filesystem_reader(tmp_path)
-    assert "first" in reader.read_metadata(rank=0).state_dict_metadata
-    assert "first" in reader.read_metadata(rank=0).state_dict_metadata
-    assert base_reads.call_count == 1
-    assert "other" in reader.read_metadata(rank=1).state_dict_metadata
-    CachedMetadataFileSystemReader.clear_metadata_cache(tmp_path)
-    reader.read_metadata(rank=1)
-    assert base_reads.call_count == 3
-
-
-def test_concurrent_readers(tmp_path, base_reads):
-    """Concurrent readers deserialize once and retain separate load identities."""
-    _write_metadata(tmp_path)
-    readers = [_get_filesystem_reader(tmp_path) for _ in range(4)]
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        metadatas = list(pool.map(lambda reader: reader.read_metadata(), readers))
-    assert base_reads.call_count == 1
-    for reader, metadata in zip(readers, metadatas):
-        assert metadata.storage_meta.load_id == reader.load_id
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_gc_restored_on_success_and_failure(tmp_path, enabled, fail):
-    """Restore the caller's GC setting, including when unpickling raises."""
-    _write_metadata(tmp_path)
-    original = FileSystemReader.read_metadata
-
-    def read(reader):
-        assert not gc.isenabled()
-        if fail:
-            raise pickle.UnpicklingError("invalid metadata")
-        return original(reader)
-
-    previous = gc.isenabled()
-    try:
-        (gc.enable if enabled else gc.disable)()
-        with mock.patch.object(FileSystemReader, "read_metadata", read):
-            if fail:
-                with pytest.raises(pickle.UnpicklingError):
-                    _get_filesystem_reader(tmp_path).read_metadata()
-            else:
-                _get_filesystem_reader(tmp_path).read_metadata()
-        assert gc.isenabled() == enabled
-    finally:
-        (gc.enable if previous else gc.disable)()
-
-
+@pytest.mark.skipif(CachedMetadataFileSystemReader is None, reason="Requires NVRx")
 @pytest.mark.parametrize("retain", [False, True])
-def test_training_load_failure_releases_transient_metadata(
-    tmp_path, monkeypatch, retain, base_reads
+@pytest.mark.parametrize("outcome", ["error", "empty"])
+def test_training_load_releases_transient_metadata(
+    tmp_path, monkeypatch, retain, outcome, base_reads
 ):
-    """Even a failure before the tensor-load phase respects the cache-retention setting."""
+    """Exceptions and early returns after metadata reads respect cache retention."""
     from megatron.training import checkpointing
 
     _write_metadata(tmp_path)
 
-    def fail_after_read():
+    def read_checkpoint(*args, **kwargs):
         _get_filesystem_reader(tmp_path).read_metadata()
-        raise RuntimeError("load interrupted")
+        if outcome == "error":
+            raise RuntimeError("load interrupted")
+        return None, "", False, None
 
     monkeypatch.setattr(
-        checkpointing, "get_args", lambda: SimpleNamespace(ckpt_assume_constant_structure=retain)
+        checkpointing,
+        "get_args",
+        lambda: SimpleNamespace(
+            ckpt_assume_constant_structure=retain,
+            load=str(tmp_path),
+            ckpt_format="torch_dist",
+            auto_detect_ckpt_format=True,
+        ),
     )
-    monkeypatch.setattr(checkpointing, "get_run_config", fail_after_read)
-    with pytest.raises(RuntimeError, match="load interrupted"):
-        checkpointing.load_checkpoint([], None, None)
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", read_checkpoint)
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="load interrupted"):
+            checkpointing.load_checkpoint([], None, None)
+    else:
+        assert checkpointing.load_checkpoint([], None, None) == (0, 0)
     _get_filesystem_reader(tmp_path).read_metadata()
     assert base_reads.call_count == (1 if retain else 2)
 
 
 def test_worker_reset_releases_metadata(tmp_path, monkeypatch, base_reads):
-    """Worker reset also releases the metadata cache owned by MCore."""
+    """Worker reset releases the same NVRx cache used by load phases."""
     pytest.importorskip(
         "nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader"
     )
@@ -229,6 +125,7 @@ def test_worker_reset_releases_metadata(tmp_path, monkeypatch, base_reads):
     assert base_reads.call_count == 2
 
 
+@pytest.mark.skipif(CachedMetadataFileSystemReader is None, reason="Requires NVRx")
 def test_removing_shards_invalidates_metadata(tmp_path, base_reads):
     """Metadata rewrites performed by the removal API invalidate the shared entry."""
     _write_metadata(tmp_path, "remove")
@@ -239,8 +136,8 @@ def test_removing_shards_invalidates_metadata(tmp_path, base_reads):
     assert base_reads.call_count == 3  # cached read, removal's direct read, read after invalidation
 
 
-def test_multi_storage_reader_is_unchanged(monkeypatch):
-    """The local-filesystem cache must not intercept remote-storage paths."""
+def test_multi_storage_backend_is_preserved(monkeypatch):
+    """MSC keeps its own reader for path resolution and storage access."""
     factory = mock.Mock()
     monkeypatch.setattr(MultiStorageClientFeature, "is_enabled", lambda: True)
     monkeypatch.setattr(
@@ -252,6 +149,7 @@ def test_multi_storage_reader_is_unchanged(monkeypatch):
     factory.assert_called_once_with("msc://checkpoint", thread_count=2)
 
 
+@pytest.mark.skipif(CachedMetadataFileSystemReader is None, reason="Requires NVRx")
 class TestMetadataCacheLoad:
     """Validate the read sequence against real distributed checkpoints."""
 

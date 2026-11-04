@@ -51,7 +51,6 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
-from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .nvrx import has_nvrx_async_support, make_nvrx_async_request
 
@@ -65,6 +64,13 @@ else:
     AsyncRequest = Any
 
 HAVE_NVRX = has_nvrx_async_support()
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader,
+    )
+except ImportError:
+    CachedMetadataFileSystemReader = None
 
 try:
     if not torch.cuda.is_available():
@@ -914,6 +920,8 @@ def _get_filesystem_reader(
 
     # All local load phases share the same deserialization. cache_metadata controls whether
     # the load strategy retains metadata for subsequent save-plan reuse, not this reader cache.
+    if CachedMetadataFileSystemReader is None:
+        return FileSystemReader(checkpoint_dir)
     return CachedMetadataFileSystemReader(checkpoint_dir)
 
 
@@ -1112,4 +1120,5 @@ class TorchDistLoadShardedStrategy:
             raise e
         else:
             fs_writer.fs.rm_file(old_path)
-            CachedMetadataFileSystemReader.clear_metadata_cache(checkpoint_dir)
+            if CachedMetadataFileSystemReader is not None:
+                CachedMetadataFileSystemReader.clear_metadata_cache(checkpoint_dir)
