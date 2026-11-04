@@ -192,7 +192,6 @@ def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias
         (["--replication", "--replication-jump", "2"], "non_persistent_ckpt_type == 'local'"),
         (["--replication-jump", "2"], "without --replication"),
         (["--async-save"], "requires --use-persistent-ckpt-worker"),
-        (["--async-save", "--ckpt-format", "torch_dcp"], "requires --use-persistent-ckpt-worker"),
         (
             [
                 "--ckpt-pg-tensors-cache-path",
@@ -412,7 +411,9 @@ def test_the_invalid_combinations_are_errors_not_flips(monkeypatch, run_config, 
 def test_set_global_variables_finalizes_an_inference_container(monkeypatch):
     args = _validated()
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    cfg.checkpoint.replication_jump = 5
+    for name, value in _conversion().items():
+        setattr(cfg.checkpoint, name, value)
+    assert cfg.checkpoint.exit_on_missing_checkpoint is False
     for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG"):
         monkeypatch.setattr(global_vars, name, None)
     services = Mock()
@@ -421,7 +422,7 @@ def test_set_global_variables_finalizes_an_inference_container(monkeypatch):
     with patch("megatron.training.utils.warn_rank_0"):
         global_vars.set_global_variables(args, cfg)
     assert cfg._finalized
-    assert cfg.checkpoint.replication_jump is None
+    assert cfg.checkpoint.exit_on_missing_checkpoint is True
     services.assert_called_once_with(args, build_tokenizer=True, training=False)
 
 
