@@ -100,6 +100,14 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    mtp_detach_output_weight: bool = False
+    """Detach only the output projection weight when computing MTP losses.
+
+    Unlike ``mtp_detach_heads``, this leaves MTP gradients to the backbone and
+    input embeddings enabled. The main language-model output remains trainable.
+    ``mtp_detach_heads`` continues to detach the output weight independently.
+    """
+
     mtp_hsm: bool = False
     """Enable uniform per-token Hidden State Mixing (HSM) for MTP layers.
     At every MTP depth, each token independently draws its input from the main model

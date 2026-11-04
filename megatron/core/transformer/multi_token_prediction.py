@@ -1107,7 +1107,7 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
-    if config.mtp_detach_heads:
+    if config.mtp_detach_heads or config.mtp_detach_output_weight:
         if output_weight is not None:
             output_weight = output_weight.detach()
         else:
