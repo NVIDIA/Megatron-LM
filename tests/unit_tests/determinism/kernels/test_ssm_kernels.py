@@ -23,6 +23,7 @@ import torch
 
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
@@ -86,6 +87,40 @@ def _assert_pinned(*tuners):
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mixer_type", ["mamba", "gdp"])
+def test_mixer_rmsnorm_gamma_replays(mixer_type):
+    """Actual mixer constructors mark gamma without changing gated norm forward/backward."""
+    if mamba_mixer_module.mamba_chunk_scan_combined is None:
+        pytest.skip("needs mamba_ssm")
+    if mixer_type == "gdp":
+        from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+        from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+        from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+        if not HAVE_GDP_DEPS:
+            pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        if mixer_type == "mamba":
+            mixer = _build_mixer(deterministic_mode=False)
+        else:
+            Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+            model_parallel_cuda_manual_seed(123)
+            mixer = build_gdp(_make_config([]))
+        norm = mixer.norm
+        assert norm.weight.is_rmsnorm_weight
+        x = torch.randn(
+            4096, 2, norm.weight.numel(), device="cuda", dtype=norm.weight.dtype, requires_grad=True
+        )
+        gate = torch.randn_like(x, requires_grad=True)
+        assert_module_replays_bit_exact(
+            norm, (x, gate), replays=3, contention=True, what=f"{mixer_type} RMSNorm gamma"
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_mamba_chunk_scan_combined_varlen_replays():
@@ -449,7 +484,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
+@pytest.mark.parametrize("M", [2, 3])
+@pytest.mark.parametrize("compact_output", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays(M, compact_output):
     """Speculative decode: ``S`` draft tokens of ``M`` Householder steps each.
 
     Exercises the slot-indexed state cache and ``intermediate_states``, which the
@@ -460,7 +497,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
-    B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
+    B, S, H, K, V = 64, 4, 8, 128, 128
     T = S * M
     slots = B + 8
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
@@ -487,6 +524,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
             state_indices=state_indices,
             intermediate_states=intermediate,
             steps_per_token=M,
+            compact_output=compact_output,
         )
         return o, final_state, intermediate
 
@@ -496,7 +534,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
         replays=4,
         backward=False,
         contention=True,
-        what="fused_recurrent_gated_delta_rule_update (speculative decode)",
+        what=f"fused_recurrent_gated_delta_rule_update (speculative decode, compact={compact_output})",
     )
 
 
@@ -549,12 +587,13 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
 
 
 @pytest.mark.parametrize("S", [1, 4])
-def test_gdp_decode_prepare_replays(S):
-    """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
+@pytest.mark.parametrize("M", [1, 2, 3])
+def test_gdp_decode_prepare_replays(S, M):
+    """Replay all copy-index paths in plain and speculative decode."""
     from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
 
     seeded()
-    n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
+    n, H, G, P, N = 256, 16, 4, 128, 128
     x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
     # `ba` reaches the kernel as a slice of the input projection, so only its last
     # dimension is contiguous and the token stride comes from the view, not the width.
@@ -566,7 +605,7 @@ def test_gdp_decode_prepare_replays(S):
         (x, ba, A_log, dt_bias),
         replays=4,
         backward=False,
-        what=f"gdp_decode_prepare (S={S})",
+        what=f"gdp_decode_prepare (S={S}, M={M})",
     )
 
 

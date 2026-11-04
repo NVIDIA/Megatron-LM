@@ -1,8 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
 import os
+import re
 import signal
 import sys
 from argparse import Namespace
@@ -198,6 +199,7 @@ def initialize_runtime_services(
     if build_tokenizer:
         _build_tokenizer(cfg, args)
     resolve_tokenizer_vocab_size(cfg)
+    _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -341,6 +343,27 @@ def rebuild_tokenizer(cfg, args):
     return _build_tokenizer(cfg, args)
 
 
+def _bind_dataset_tokenizer(cfg) -> None:
+    """Bind the run's tokenizer to ``cfg.data.dataset`` (Megatron Core's ``validate()`` runs then).
+
+    Only GPT entry points carry a dataset there, and nothing happens without a tokenizer
+    (``build_tokenizer=False``: the provider then reports the unbound config). The container must
+    be finalized first, as ``initialize_megatron`` and ``set_global_variables`` do (the fields other
+    sections own are written then). ``DataConfig.bind_tokenizer`` decides the rest: a config bound
+    earlier to this tokenizer is left as is, one bound to another tokenizer is an error.
+    """
+    data = getattr(cfg, "data", None)
+    if getattr(data, "dataset", None) is None or _GLOBAL_TOKENIZER is None:
+        return
+    if not getattr(cfg, "_finalized", False):
+        raise RuntimeError(
+            "cfg.data.dataset cannot bind the tokenizer before the container is finalized: call "
+            "cfg.finalize() before initialize_runtime_services(), as initialize_megatron() and "
+            "set_global_variables() do."
+        )
+    data.bind_tokenizer(_GLOBAL_TOKENIZER)
+
+
 def _set_tensorboard_writer(args):
     """Set tensorboard writer."""
     cfg = get_run_config()
@@ -359,6 +382,16 @@ def _set_tensorboard_writer(args):
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
+
+
+def _wandb_run_id(exp_name: str) -> str:
+    """A wandb run id derived from the experiment name.
+
+    The id is part of the run URL, so wandb rejects the characters that would be
+    ambiguous there. Experiment names are often paths, so substitute rather than fail;
+    the unmodified name is still what gets displayed.
+    """
+    return re.sub(r"[/\\#?%:]", "-", exp_name)
 
 
 def _set_wandb_writer(args):
@@ -384,11 +417,23 @@ def _set_wandb_writer(args):
             # settings were.
             with open(wandb_config['kitchen_config_file'], "r") as f:
                 wandb_config['kitchen_config_file_contents'] = f.read()
+        # wandb.init() creates a new run unless it is given an id to resume, and this
+        # runs on every process start. A long job restarts many times -- a requeue, a
+        # node failure, an in-job restarter -- and each restart would otherwise open a
+        # fresh run, scattering one training run across many and leaving every chart
+        # covering only the stretch between two failures. Deriving a stable id from the
+        # experiment name and resuming it keeps them a single timeline. An unnamed run has
+        # nothing stable to derive an id from, so wandb assigns one as before.
+        run_id = cfg.logger.wandb_run_id or (
+            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
+        )
         wandb_kwargs = {
             'dir': save_dir,
+            "id": run_id,
             'name': cfg.logger.wandb_exp_name,
             'project': cfg.logger.wandb_project,
-            'config': wandb_config}
+            'config': wandb_config,
+            "resume": "allow"}
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
