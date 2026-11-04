@@ -18,7 +18,6 @@ import scipy.signal as signal
 
 from examples.mimo.model_providers.llava_avlm import model_provider_llava_avlm
 from megatron.core import dist_checkpointing, parallel_state, tensor_parallel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training import print_rank_0
@@ -142,9 +141,9 @@ def main():
 
 
     init_distributed(args.tp, args.pp)
-    # Collect the process groups of the parallel grid once; the rest of this script passes
-    # them explicitly instead of reading the global grid.
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # The process groups of the grid that init_distributed() built and registered; the rest of
+    # this script passes them explicitly instead of reading the global grid.
+    pg_collection = parallel_state.get_registered_process_groups()
     # get_pg_rank and get_pg_size also accept the None that a grid without GTP weight
     # rematerialization may hold in gtp_remat and expt_gtp_remat.
     model_parallel_cuda_manual_seed(

@@ -11,7 +11,6 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.trtllm_helper import TRTLLMHelper
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
@@ -29,8 +28,9 @@ def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel
     torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
-    return ProcessGroupCollection.use_mpu_process_groups()
+    return parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size, pipeline_model_parallel_size
+    )
 
 def model_provider(pg_collection):
     """Build the model on the grid whose process groups are in pg_collection."""

@@ -27,7 +27,7 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -52,12 +52,12 @@ def model_provider_llava_avlm(
     if pg_collection is None:
         # Callers that omit the process groups get those of the global parallel grid; that
         # fallback is deprecated.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "examples.mimo.model_providers.llava_avlm.model_provider_llava_avlm",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # NOTE: Pipeline parallelism for the encoder/decoder is not yet supported in this
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.

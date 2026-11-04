@@ -24,7 +24,7 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -43,12 +43,12 @@ def model_provider_mock_vlm_single_encoder(
     if pg_collection is None:
         # Callers that omit the process groups get those of the global parallel grid; that
         # fallback is deprecated.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "examples.mimo.model_providers.mock.model_provider_mock_vlm_single_encoder",
             deprecated_in="0.21",
             removed_in="0.23",
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # PP not supported, so add_encoder/add_decoder are ignored
     # Get configs for each component
