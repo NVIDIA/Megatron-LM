@@ -23,7 +23,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
@@ -32,6 +31,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
     QuantizedDBuffer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from tests.unit_tests.distributed.mfsdp_v2.training_utils import train_with_mse
 
 
 class TinyModel(nn.Module):
@@ -288,21 +288,15 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
     )
     microbatches = tuple(zip(inputs.unbind(), targets.unbind()))
 
-    def train(model, optimizer, *, reduce_grads: bool) -> list[torch.Tensor]:
-        losses = []
-        for _ in range(5):
-            optimizer.zero_grad(set_to_none=set_to_none)
-            for index, (inputs, targets) in enumerate(microbatches):
-                with microbatch(context, is_last=index == num_microbatches - 1):
-                    loss = torch.nn.functional.mse_loss(model(inputs), targets)
-                    losses.append(loss.detach())
-                    (loss / num_microbatches).backward()
-            if reduce_grads:
-                for parameter in model.parameters():
-                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-            optimizer.step()
-        return losses
-
-    actual_losses = train(model, optimizer, reduce_grads=False)
-    expected_losses = train(reference, reference_optimizer, reduce_grads=True)
+    actual_losses = train_with_mse(
+        model, optimizer, microbatches, context=context, set_to_none=set_to_none
+    )
+    expected_losses = train_with_mse(
+        reference,
+        reference_optimizer,
+        microbatches,
+        context=context,
+        set_to_none=set_to_none,
+        reduce_grads=True,
+    )
     torch.testing.assert_close(torch.stack(actual_losses), torch.stack(expected_losses))

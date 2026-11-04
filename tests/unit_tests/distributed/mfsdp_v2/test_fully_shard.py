@@ -36,6 +36,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
+from tests.unit_tests.distributed.mfsdp_v2.training_utils import train_with_mse
 
 logger = logging.getLogger(__name__)
 
@@ -459,21 +460,12 @@ def test_losses_match_baseline(
     target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer) -> list[torch.Tensor]:
-        losses = []
-        for _ in range(5):
-            optimizer.zero_grad(set_to_none=set_to_none)
-            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                is_last = microbatch_index == num_microbatches - 1
-                with microbatch(context, is_last=is_last):
-                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                    (loss / num_microbatches).backward()
-                losses.append(loss.detach())
-            optimizer.step()
-        return losses
-
-    baseline_losses = train(baseline, baseline_optimizer)
-    sharded_losses = train(model, optimizer)
+    baseline_losses = train_with_mse(
+        baseline, baseline_optimizer, microbatches, context=context, set_to_none=set_to_none
+    )
+    sharded_losses = train_with_mse(
+        model, optimizer, microbatches, context=context, set_to_none=set_to_none
+    )
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
@@ -904,20 +896,8 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
     target = torch.randn(num_microbatches, 2, 4, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer) -> list[torch.Tensor]:
-        losses = []
-        for _ in range(5):
-            optimizer.zero_grad()
-            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
-                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                    losses.append(loss.detach())
-                    (loss / num_microbatches).backward()
-            optimizer.step()
-        return losses
-
-    baseline_losses = train(baseline, baseline_optimizer)
-    sharded_losses = train(model, optimizer)
+    baseline_losses = train_with_mse(baseline, baseline_optimizer, microbatches, context=context)
+    sharded_losses = train_with_mse(model, optimizer, microbatches, context=context)
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
