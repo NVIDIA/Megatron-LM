@@ -200,7 +200,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             ignore_virtual=False,
             vp_stage=vp_stage,
             pp_group=self.pg_collection.pp,
-            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_size=self.config.virtual_pipeline_model_parallel_size or 1,
         )
 
         if self.pre_process or self.mtp_process:
