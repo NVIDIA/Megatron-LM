@@ -31,8 +31,8 @@ full-iteration graphs remain unsupported.
 `delay_offload_until_cuda_graph` uses the existing replay flush.
 
 The manager's minimum tensor size, offload fraction and last-group margin apply.
-After warmup, fraction zero selects no transfers. Warmup can still copy eligible
-tensors to collect size statistics. The default minimum is 1,048,576 elements;
+Fraction zero selects no transfers, including during warmup. Eligible sizes are
+collected even when a group stays resident. The default minimum is 1,048,576 elements;
 short correctness tests use 1024 elements to exercise copies. Current validation
 covers fixed-length training initialized by a training step; evaluation-first
 initialization and tensor-size changes after warmup are not qualified. Use multiple GDN

@@ -361,6 +361,32 @@ def test_batch_invariant_inference_activations_replay():
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+def test_batch_invariant_squared_relu_quantize_replays():
+    """The fused BI activation + MXFP8 quantize replays and equals the two-kernel path."""
+    from megatron.core.inference.moe import batch_invariant
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    seeded()
+    rows, ffn, n_used = 16384, 1856, 12000
+    perm, n_used_t = _padded_layout(rows, ffn, n_used)
+    probs = torch.rand(rows, device="cuda")
+    x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16) * 5
+
+    def fn(x):
+        out = batch_invariant.squared_relu_with_probs_quantize_mxfp8(x, perm, n_used_t, probs)
+        return out.data[:n_used].view(torch.uint8), out.scale.view(torch.uint8)
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="squared_relu_with_probs_quantize")
+    data, scale = fn(x)
+    ref = _quantize_mxfp8_used_rows(
+        batch_invariant.squared_relu_with_probs(x, perm, n_used_t, probs, zero_padding=True),
+        n_used_t,
+    )
+    assert torch.equal(data, ref.data[:n_used].view(torch.uint8))
+    assert torch.equal(scale, ref.scale.view(torch.uint8))
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_replays():
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
 
@@ -435,6 +461,45 @@ def test_mixed_precision_parameter_conversion_replays():
 
     assert_replays_bit_exact(
         convert, (attention, expert), backward=False, what="selective MXFP8 parameter conversion"
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer routed MXFP8 needs Blackwell",
+)
+def test_flashinfer_routed_mxfp8_writeback_replays():
+    """Refit writes through to FlashInfer's routed MXFP8 layout bit-exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        attach_routed_mxfp8_writeback,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_ROUTED_MXFP8:
+        pytest.skip("needs FlashInfer routed MXFP8")
+    seeded()
+    initial, update = (
+        torch.randn(2, 96, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+
+    def refit(initial, update):
+        experts = [MXFP8Tensor.from_bf16(w, backend="triton") for w in initial]
+        routed = prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([e.data for e in experts]),
+                scale=torch.stack([e.scale for e in experts]),
+                backend="triton",
+            )
+        )
+        for i, (expert, value) in enumerate(zip(experts, update)):
+            attach_routed_mxfp8_writeback(expert, routed, i)
+            expert.copy_(value)
+        return routed.data.view(torch.uint8), routed.scale
+
+    assert_replays_bit_exact(
+        refit, (initial, update), backward=False, contention=True, what="routed MXFP8 writeback"
     )
 
 
@@ -782,6 +847,27 @@ def test_vllm_moe_align_block_size_replays():
         backward=False,
         contention=True,
         what="_moe_align_block_size_cuda_graphable",
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,topk,scaling_factor",
+    [(128, 6, 2.5), (512, 6, 5.0), (512, 22, 5.0)],
+    ids=["nano", "512-experts", "super-ultra"],
+)
+@pytest.mark.parametrize("num_tokens", [2, 2048])
+def test_sigmoid_topk_routing_replay(num_experts, topk, scaling_factor, num_tokens):
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+
+    seeded()
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.05
+    assert_replays_bit_exact(
+        lambda lg, b: sigmoid_topk_routing(lg, b, topk, scaling_factor),
+        (logits, expert_bias),
+        replays=4,
+        backward=False,
+        what=f"sigmoid_topk_routing[tokens={num_tokens}, experts={num_experts}, topk={topk}]",
     )
 
 

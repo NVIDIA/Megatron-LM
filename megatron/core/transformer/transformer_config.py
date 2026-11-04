@@ -1334,6 +1334,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_thd_max_packed_sequences: Optional[int] = None
+    """THD metadata capacity, including the dummy padding document.
+
+    Bounds real-document packing and fixes all four cumulative-offset tensor
+    shapes in eager and TE graph execution. Padding reserves one document slot.
+    Setting this capacity also applies during eager execution; it does not enable CUDA graphs.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1546,6 +1554,16 @@ class TransformerConfig(ModelParallelConfig):
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
     fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
     True to disable fusion and use separate kernel launches (useful for debugging)."""
+
+    inference_moe_router_backend: Literal['torch', 'triton'] = 'triton'
+    """Backend for InferenceTopKRouter top-k routing in inference mode.
+    - 'torch': torch.compile'd PyTorch routing.
+    - 'triton': A fused Triton sigmoid top-k kernel for sigmoid scores with an expert
+      bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
+      outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
+      below eight and to within the last fp32 bit otherwise. Other score functions,
+      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
+      use the 'torch' path. Default."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
@@ -2202,6 +2220,11 @@ class TransformerConfig(ModelParallelConfig):
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
                 self.inference_grouped_gemm_backend
             )
+            if self.inference_moe_router_backend not in ('torch', 'triton'):
+                raise ValueError(
+                    "inference_moe_router_backend must be 'torch' or 'triton', "
+                    f"got {self.inference_moe_router_backend!r}"
+                )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if (
@@ -4048,6 +4071,30 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+
+        if self.cuda_graph_thd_max_packed_sequences is not None:
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.dynamic_context_parallel
+            pad_enabled = self.pad_packed_seq_alignment is not None or (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
+            )
+            assert self.cuda_graph_thd_max_packed_sequences >= (
+                2 if pad_enabled else 1
+            ), "THD metadata capacity must leave room for the dummy padding document."
+        scheduler_te_graphs = (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+        )
+        if scheduler_te_graphs and self.pipeline_model_parallel_size > 1:
+            assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
+            assert not self.moe_paged_stash
+        if scheduler_te_graphs:
+            assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+            assert self.cuda_graph_thd_max_packed_sequences is not None
+            assert self.cuda_graph_modules == [
+                CudaGraphModule.attn
+            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
