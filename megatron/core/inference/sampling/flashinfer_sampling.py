@@ -21,9 +21,9 @@ from megatron.core.inference.sampling_params import (
 class FlashInferSampling(Sampling):
     """FlashInfer sampling with per-step unfiltered / top-p-only / top-k-only / joint dispatch.
 
-    Each step selects a kernel from the batch's active filters: the logits kernel
-    when nothing filters, the dedicated exact top-p or top-k kernel when only one filter is in use,
-    and the joint kernel only for genuinely mixed batches.
+    Each step selects a kernel from the batch's active filters: argmax when every request is
+    greedy (top-k 1), the logits kernel when nothing filters, the dedicated exact top-p or top-k
+    kernel when only one filter is in use, and the joint kernel only for genuinely mixed batches.
     The dispatch flags are read from the pinned CPU sampling metadata.
 
     The sampler runs eagerly. Its kernel choice is data-dependent (it varies with
@@ -79,6 +79,22 @@ class FlashInferSampling(Sampling):
             Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
         del eager, cache_key
+
+        # Greedy batch (every request top-k 1, read from the pinned CPU metadata, so no sync):
+        # argmax, as TorchSampling does, instead of a vocab softmax and a top-k sampling kernel.
+        # The speculative path (per-token parameters) keeps the kernel dispatch below.
+        if (
+            token_to_request_index is None
+            and no_top_p
+            and not no_top_k
+            and bool((context.active_request_metadata["top_k"][:n] == 1).all())
+        ):
+            rows = logits[:n] if gather_indices is None else logits[gather_indices[:n], :]
+            sampled_tokens = torch.argmax(rows, dim=-1)
+            if output is None:
+                return sampled_tokens
+            output.copy_(sampled_tokens)
+            return output
 
         # Per-row sampling params (GPU) for the kernel. gpu_view mirrors the pinned
         # CPU `active_request_metadata` via the per-step coalesced H2D.
