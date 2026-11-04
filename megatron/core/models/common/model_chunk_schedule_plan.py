@@ -424,7 +424,14 @@ class TransformerLayerSchedulePlan:
         return self.layer.get_inner_quantization_context()
 
     @staticmethod
-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
+    def run(
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        is_last_layer_in_bwd=False,
+        fill_comm_window: Optional[Callable[[], None]] = None,
+    ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
@@ -444,6 +451,10 @@ class TransformerLayerSchedulePlan:
             b_grad (Tensor): Gradient for backward computation
             is_last_layer_in_bwd (bool):
                 Whether the current layer is the last layer in the backward pass.
+            fill_comm_window (callable or None): Only for an unpaired layer (exactly one of
+                f_layer / b_layer). Computation issued on the computation stream while the
+                layer's EP communication is in flight: after the dispatch of a forward-only
+                layer, or after the combine backward of a backward-only layer.
 
         Returns:
             Functions or values for next iteration's computation
@@ -455,6 +466,13 @@ class TransformerLayerSchedulePlan:
                 b_layer.recompute_segment.recompute(b_layer)
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
+
+        if fill_comm_window is not None:
+            assert (f_layer is None) != (
+                b_layer is None
+            ), "fill_comm_window is only supported for an unpaired layer"
+        if fill_comm_window is not None and f_layer is None:
+            fill_comm_window()
 
         if f_layer is not None:
             # Full recompute: retain this segment's input for the backward-time replay.
@@ -469,6 +487,9 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
+
+        if fill_comm_window is not None and b_layer is None:
+            fill_comm_window()
 
         if b_layer is not None:
             b_layer.mlp.backward_dw()
@@ -612,6 +633,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # the EP A2A overlap scheduler, so recompute_granularity alone decides (not
         # re-checking overlap_moe_expert_parallel_comm keeps the schedule unit-testable).
         self.recompute_full = model.config.recompute_granularity == "full"
+        self.unpaired_layer_post_process = model.config.ep_overlap_unpaired_layer_post_process
         self._recompute_segments = []
         self._num_decoder_layers = 0
 
@@ -796,6 +818,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = None
 
     @staticmethod
+    def _post_process_forward(f_schedule_plan, f_input):
+        """Run the forward post-process (output layer + loss) of a model chunk."""
+        if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
+            # The last layer ran under no_grad, so post_process needs a grad-tracking
+            # leaf to seed the replayed last segment's backward.
+            f_input.requires_grad_(True)
+        return f_schedule_plan.post_process.forward(f_input)
+
+    @staticmethod
     def run(
         f_schedule_plan,
         b_schedule_plan,
@@ -840,6 +871,30 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.record_current_stream()
             f_input = f_schedule_plan.pre_process.forward()
 
+        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
+        b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
+        overlapped_layers = min(f_num_layers, b_num_layers)
+
+        # Unpaired layers (the chunks have different layer counts) have no partner to hide
+        # their EP communication behind. Optionally fill the first unpaired layer's comm
+        # window with the other microbatch's post-process (output layer + loss).
+        # - defer_b_post: the backward chunk has the post-process and fewer layers; its
+        #   output-layer backward fills the first unpaired forward layer's dispatch window.
+        # - early_f_post: the forward chunk has the post-process and fewer layers; its
+        #   output-layer forward fills the first unpaired backward layer's combine window.
+        defer_b_post = (
+            b_schedule_plan is not None
+            and b_schedule_plan.unpaired_layer_post_process
+            and b_schedule_plan.post_process is not None
+            and f_num_layers > b_num_layers
+        )
+        early_f_post = (
+            f_schedule_plan is not None
+            and f_schedule_plan.unpaired_layer_post_process
+            and f_schedule_plan.post_process is not None
+            and b_num_layers > f_num_layers
+        )
+
         if b_schedule_plan:
             b_schedule_plan.record_current_stream()
             assert b_grad is not None
@@ -850,19 +905,41 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # Before any layer backward: post_process keeps its own graph and detaches
             # its input, and releasing it first avoids co-materializing a large vocab
             # graph with a recomputed segment on the last PP stage.
-            if b_schedule_plan.post_process is not None:
+            # With defer_b_post it still runs before any layer backward, inside the first
+            # unpaired forward layer below.
+            if b_schedule_plan.post_process is not None and not defer_b_post:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
 
-        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
-        b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
-        overlapped_layers = min(f_num_layers, b_num_layers)
-
         f_layer = b_layer = None
+        # Index of the first forward layer that is paired with a backward layer.
+        f_start = 0
+        if defer_b_post:
+            # The backward layers need the post-process gradient, so the unpaired forward
+            # layers run first and the remaining forward layers pair with all backward layers.
+            b_grad_box = [b_grad]
+
+            def b_post_process_backward():
+                b_grad_box[0] = b_schedule_plan.post_process.backward(b_grad_box[0])
+
+            f_start = f_num_layers - b_num_layers
+            for i in range(f_start):
+                f_layer = f_schedule_plan.get_layer(i)
+                nvtx_msg = f"layer_{i}f"
+                nvtx_range_push(nvtx_msg)
+                f_input, _ = TransformerLayerSchedulePlan.run(
+                    f_layer,
+                    None,
+                    f_input=f_input,
+                    fill_comm_window=b_post_process_backward if i == 0 else None,
+                )
+                nvtx_range_pop(nvtx_msg)
+            b_grad = b_grad_box[0]
+
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
-            f_layer = f_schedule_plan.get_layer(i)
+            f_layer = f_schedule_plan.get_layer(f_start + i)
             b_layer = b_schedule_plan.pop_layer()
-            nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
+            nvtx_msg = f"layer_{f_start + i}f-layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
@@ -875,20 +952,36 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_layer.release_state()
             nvtx_range_pop(nvtx_msg)
 
+        # With early_f_post the forward chunk is done here, and its post-process output
+        # lands in f_post_box.
+        f_post_box = [None]
+        f_post_process_forward = None
+        if early_f_post:
+            f_hidden = f_input
+
+            def f_post_process_forward():
+                f_post_box[0] = TransformerModelChunkSchedulePlan._post_process_forward(
+                    f_schedule_plan, f_hidden
+                )
+
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
             _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                None,
+                b_layer,
+                b_grad=b_grad,
+                is_last_layer_in_bwd=(i == b_num_layers - 1),
+                fill_comm_window=f_post_process_forward if i == overlapped_layers else None,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
             nvtx_range_pop(nvtx_msg)
 
         # forward pass for the remaining layers
-        for i in range(overlapped_layers, f_num_layers):
+        for i in range(f_start + overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
@@ -916,12 +1009,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer.release_state()
 
         # post process forward
-        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
-            if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
-                # The last layer ran under no_grad, so post_process needs a grad-tracking
-                # leaf to seed the replayed last segment's backward.
-                f_input.requires_grad_(True)
-            f_input = f_schedule_plan.post_process.forward(f_input)
+        if early_f_post:
+            f_input = f_post_box[0]
+        elif f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            f_input = TransformerModelChunkSchedulePlan._post_process_forward(
+                f_schedule_plan, f_input
+            )
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)

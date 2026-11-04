@@ -1,11 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
 from contextlib import contextmanager
+from unittest import mock
 
 import pytest
 import torch
 
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    TransformerLayerSchedulePlan,
+    TransformerModelChunkSchedulePlan,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_mtp_block_spec,
@@ -533,6 +537,43 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [3, 1], [1, 3], [1, 1]])
+    def test_1f1b_schedule_model_chunk_unpaired_layer_post_process(
+        self, mtp_layers, dispatcher_type, flex_backend, layers
+    ):
+        """Filling an unpaired layer's comm window with the other microbatch's post-process
+        reorders the schedule only: grads still match the reference.
+
+        [2, 1]-style chunks make the forward chunk (with post-process) shorter than the
+        backward one, so its output-layer forward moves into the first unpaired backward
+        layer; [1, 2]-style chunks defer the backward chunk's output-layer backward into the
+        first unpaired forward layer. Equal layer counts have no unpaired layer.
+        """
+        extra_kwargs = {
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_unpaired_layer_post_process": True,
+        }
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+        if mtp_layers > 0:
+            extra_kwargs["mtp_num_layers"] = mtp_layers
+            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
+
+        layer_run = TransformerLayerSchedulePlan.run
+        filled = []
+
+        def spy_run(*args, fill_comm_window=None, **kwargs):
+            if fill_comm_window is not None:
+                filled.append(fill_comm_window)
+            return layer_run(*args, fill_comm_window=fill_comm_window, **kwargs)
+
+        with mock.patch.object(TransformerLayerSchedulePlan, "run", staticmethod(spy_run)):
+            run_two_chunk_parity(layers, extra_kwargs)
+        # Only the overlapped step (chunk 1 fwd + chunk 0 bwd) has unpaired layers.
+        assert len(filled) == (1 if layers[0] != layers[1] else 0)
 
     def _run_full_recompute_parity(
         self,
