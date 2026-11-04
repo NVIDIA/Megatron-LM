@@ -422,14 +422,34 @@ plumbing changes in their own PR so the fix can be reviewed and reverted indepen
 
 **Changing code outside Megatron Core in this repository?** Take the groups from the model, the
 caller or the registered collection. A fallback reads the grid in a
-`global_process_group_fallback()` block, and bootstrap code that reads the grid on purpose
-ignores `ParallelStateDeprecationWarning` in a `warnings.catch_warnings()` block, so a stock run
-emits no `ParallelStateDeprecationWarning`.
+`global_process_group_fallback()` block. Code that still calls a deprecated function on purpose
+reports it first with its own `warnings.warn(..., ParallelStateDeprecationWarning)`, and only
+then ignores that warning with `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)`
+in a `warnings.catch_warnings()` block around the calls, as the lazy initialization in
+`megatron/training/initialize.py` does. No code reads, writes or deletes a private attribute of
+`parallel_state`, even in a fallback, and no code takes the memory buffer from `parallel_state`:
+`megatron.core.utils` has it, and `tests/unit_tests/test_global_memory_buffer_imports.py`
+rejects `get_global_memory_buffer()`, `destroy_global_memory_buffer()` and
+`_set_global_memory_buffer()` from `parallel_state` under `megatron/`, `examples/` and `tools/`
+and in the top-level scripts, even in a fallback. A stock run emits no
+`ParallelStateDeprecationWarning`.
 
-**Reviewing?** Flag new calls of the deprecated functions and of `use_mpu_process_groups()` in
-`megatron/core`. Allowed exceptions: `parallel_state.py` itself, `process_groups_config.py`,
-bootstrap code that materializes a collection from the globals, tests, and warned compatibility
-fallbacks.
+**Reviewing?** In `megatron/core`, flag a new call of a deprecated function, of
+`use_mpu_process_groups()` or `get_registered_process_groups()`, or of a guarded helper such as
+`resolve_process_groups()`, unless it replaces a read in the same function: a new fallback is a
+new read even when it warns. Flag any use of a private attribute of `parallel_state` there too,
+and any memory-buffer alias taken from `parallel_state`; a fallback does not make either acceptable.
+Only `parallel_state.py` and `process_groups_config.py` are exempt.
+Outside Megatron Core, flag a deprecated call in the code that the
+[guard](#the-ci-check) covers, including `megatron/training`, unless it is in a
+`global_process_group_fallback()` block or in bootstrap code, in a `warnings.catch_warnings()` block
+whose body calls `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the matching
+`warnings.filterwarnings()`), after reporting the call itself: a statement that is only a call of
+`warnings.warn(..., ParallelStateDeprecationWarning)` or `warn_global_process_group_fallback()`
+comes before the `with`, in the block that holds it or in a block that contains that block, of the
+same function (of the module for module-level code), as the guard requires. Also flag any use of a
+private attribute of `parallel_state`, and any memory-buffer alias taken from it,
+`_set_global_memory_buffer()` included. Unit tests may use the global grid.
 
 **Using Megatron Core with your own parallel grid?** Build a `ProcessGroupCollection` for that
 grid and pass it in. See
@@ -452,7 +472,11 @@ Two checks report new reads of the global grid. CI runs both.
 - the helpers of `process_groups_config.py` that read the grid when the caller omits its groups
   and warn for that fallback: `resolve_process_groups()`, `resolve_gtp_remat_group()`,
   `ProcessGroupCollection.setup_process_groups_for_ddp()` and
-  `setup_process_groups_for_optimizer()` (kind `guarded`).
+  `setup_process_groups_for_optimizer()` (kind `guarded`);
+- reads, writes and deletions of the private attributes of `parallel_state`, such as
+  `_DATA_PARALLEL_GROUP` or an `_MPU_*` override (kind `private`); the deprecated
+  `_set_global_memory_buffer()` counts as a function. That state is not an interface, so a
+  fallback warning does not make such an entry warned.
 
 `tools/process_group_usage_allowlist.json` records the existing calls. An entry records the
 file, the enclosing function or class, and the function called, but not the line number, so code
@@ -464,23 +488,55 @@ call earlier in the same function, in its block or in a block that contains it, 
 finds a call that the allowlist does not hold, a warned call that lost its warning, or an entry
 whose call is gone.
 
-The check is syntactic. It follows calls made through `parallel_state`, `mpu`, an
-`import ... as` alias, or a direct `from megatron.core.parallel_state import ...`, but not
-through an assigned alias (`grid = parallel_state`) or a dynamic lookup
-(`getattr(parallel_state, name)`). Reviewers still look for reads it cannot see.
+The check is syntactic. It counts every reference, called or not (a function passed as a
+callback counts too), made through `parallel_state`, `mpu`, an import (`import ... as`,
+`from megatron.core.parallel_state import ...` or a star import, `megatron.core`'s included), an
+assigned alias (`grid = parallel_state`, `grid = parallel_state if lazy else None`, an
+assignment expression, a name declared `global` or `nonlocal`, `self.grid = parallel_state`, or a
+class attribute reached through `self`, `cls` or the class), `getattr()`, `setattr()` or
+`delattr()` with a constant name, `importlib.import_module()` with a constant name, relative or
+not, or `sys.modules`. It does not follow a module passed as an argument or a parameter default,
+returned by a function, stored in a container or bound by `for` or `with ... as`, an import in a
+class body that methods reach through `self`, or a name built at run time
+(`getattr(parallel_state, name)`). An attribute alias such as `self.grid` is known by its
+spelling in the whole file, so it also counts in the other classes of the file, the subclasses
+that inherit it included. Reviewers still look for reads it cannot see.
 
 `tests/unit_tests/test_parallel_state_accessor_uses.py` guards the code outside Megatron Core:
-the non-test code under `megatron/`, `examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
+the functional tests under `tests/functional_tests/`, the non-test code under `megatron/`,
+`examples/`, `tools/`, `tasks/`, `scripts/` and `docs/`, and
 the top-level scripts. It allows a call of a deprecated function or of `use_mpu_process_groups()`
-only in a `global_process_group_fallback()` block or in a bootstrap block that ignores
-`ParallelStateDeprecationWarning`. It also follows the module through assigned aliases,
-`getattr()` with a constant name, `importlib.import_module()` and `sys.modules`.
+only in a `global_process_group_fallback()` block, or in a `warnings.catch_warnings()` block
+whose body calls `warnings.simplefilter("ignore", ParallelStateDeprecationWarning)` (or the
+matching `warnings.filterwarnings()`) after the code has reported the call itself: a statement
+that is only a call of `warnings.warn(..., ParallelStateDeprecationWarning)`, with the category as
+its second argument or as `category=`, or of `warn_global_process_group_fallback()` comes before
+the `with`, in the block that holds it or in a block that contains that block, of the same
+function (of the module for module-level code). A warning inside an earlier branch, loop or
+`with`, or inside the `catch_warnings()` block, does not count, and neither does another function
+named `warn`, such as a logger's. A reference in a function or lambda defined inside either block
+runs later, outside it, and is not allowed. It never allows a
+read, write or deletion of a private attribute of `parallel_state`, apart from the deprecated
+`_set_global_memory_buffer()`, which it treats like the other deprecated functions. It also
+follows the module through assigned aliases, `getattr()`, `setattr()` and `delattr()` with a
+constant name, `importlib.import_module()` and `sys.modules`, and does not follow the forms the
+checker does not follow.
 
 In CI, the *Process group usage check* workflow runs the checker and the guard as report-only
 steps: what they find is listed in the step's log, and the job still passes. The job fails when
 the checker's own tests fail, or when `tests/unit_tests/test_removal_versions.py` finds code that
 announces a removal the package version has reached (see [Removal schedule](#removal-schedule)).
+The checker's tests include one over the tree: every read that the checker counts in
+`megatron/core` must be guarded or warned, apart from the reads listed in `UNWARNED_READS` in
+`tests/unit_tests/test_check_process_group_usage.py`. A new unwarned read, or a warned read that
+loses its warning, therefore fails the job whether or not the allowlist holds it; how many warned
+fallbacks Megatron Core may add is left to the report-only ratchet.
 [API backward compatibility checking](../api-backwards-compatibility-check.md) describes the job.
+
+The unit-test buckets run the three test files as well. They read the source as text, so a
+selective (Testmon) run would never select them for a source change;
+`tests/unit_tests/testmon_mandatory_tests.yaml` adds them whenever a pull request changes a file
+under the folders they scan or a top-level script. A new top-level script needs an entry there.
 
 ### When the check reports a new read
 
