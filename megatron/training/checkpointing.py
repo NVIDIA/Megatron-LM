@@ -1676,7 +1676,11 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    state_dict['args'] = copy.copy(args)
+    # Preserve the resolved vocabulary for checkpoint-args readers without updating runtime args.
+    padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
+    if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
+        state_dict['args'].padded_vocab_size = padded_vocab_size
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration

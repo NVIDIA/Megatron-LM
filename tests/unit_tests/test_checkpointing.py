@@ -855,6 +855,8 @@ def test_load_checkpoint(
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 128
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
@@ -904,7 +906,10 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            saved_args = serialized.call_args.args[0]["args"]
+            assert saved_args is not args
+            assert vars(saved_args) == {**vars(args), "padded_vocab_size": 128}
+        assert args.padded_vocab_size is None
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
