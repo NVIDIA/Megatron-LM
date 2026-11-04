@@ -2093,7 +2093,9 @@ def _load_global_dist_base_checkpoint(
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
     if gtp_pad_for_alignment is None:
         gtp_pad_for_alignment = _gtp_pad_for_alignment_from_args(args)
-    grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
+    grant_shape_mismatch_for_gtp_padding(
+        sharded_state_dict, checkpoint_name, gtp_pad_for_alignment, sharded_strategy=load_strategy
+    )
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,

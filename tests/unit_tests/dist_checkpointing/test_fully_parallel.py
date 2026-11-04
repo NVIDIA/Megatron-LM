@@ -39,7 +39,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
-from megatron.core.utils import get_pg_rank
+from megatron.core.utils import get_pg_rank, grant_shape_mismatch_for_gtp_padding
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -477,9 +477,14 @@ class TestFullyParallelSaveAndLoad:
                 with mock.patch.object(
                     FileSystemReader, 'read_metadata', autospec=True, side_effect=read_metadata
                 ) as storage_reads:
-                    # Same sequence as a training load: common-state pre-pass, then full load.
+                    # Same sequence as a training load: common-state pre-pass, GTP padding
+                    # check, then full load.
                     load_common_state_dict(ckpt_dir, cache_metadata=True)
-                    loaded_state_dict = load(get_sharded_state_dict(), ckpt_dir, load_strategy)
+                    sharded_state_dict = get_sharded_state_dict()
+                    grant_shape_mismatch_for_gtp_padding(
+                        sharded_state_dict, ckpt_dir, 1, sharded_strategy=load_strategy
+                    )
+                    loaded_state_dict = load(sharded_state_dict, ckpt_dir, load_strategy)
             finally:
                 cached_reader_cls.clear_metadata_cache()
 
