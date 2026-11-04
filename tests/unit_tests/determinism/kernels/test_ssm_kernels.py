@@ -173,6 +173,113 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def _varlen_chunk_metadata(lens, chunk):
+    """Chunks that restart at every sequence start, as the varlen training path builds them."""
+    bounds, last, seq = [0], [], []
+    for i, n in enumerate(lens):
+        end = bounds[-1] + n
+        while bounds[-1] + chunk < end:
+            bounds.append(bounds[-1] + chunk)
+            seq.append(i)
+        bounds.append(end)
+        seq.append(i)
+        last.append(len(bounds) - 2)
+    as_int32 = lambda v: torch.tensor(v, dtype=torch.int32, device="cuda")
+    return as_int32(bounds), as_int32(last), as_int32(seq)
+
+
+@pytest.mark.parametrize("state_dtype", [None, torch.float32])
+def test_mamba_chunk_scan_combined_varlen_fn_replays_fwd_bwd(state_dtype):
+    """The differentiable varlen SSD; dA and dt_bias reduce over every chunk in the backward."""
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen_fn
+
+    seeded()
+    lens, nheads, headdim, ngroups, dstate, chunk = [1500, 1, 1283, 1312], 32, 64, 2, 128, 128
+    seqlen = sum(lens)
+    cu_chunk_seqlens, last_chunk_indices, seq_idx = _varlen_chunk_metadata(lens, chunk)
+    bf16 = lambda *shape: torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+    x = bf16(seqlen, nheads, headdim).requires_grad_()
+    z = bf16(seqlen, nheads, headdim).requires_grad_()
+    dt = bf16(seqlen, nheads).requires_grad_()
+    B = (bf16(seqlen, ngroups, dstate) * 0.3).requires_grad_()
+    C = (bf16(seqlen, ngroups, dstate) * 0.3).requires_grad_()
+    A = (-torch.rand(nheads, device="cuda") - 1.0).requires_grad_()
+    D = torch.randn(nheads, device="cuda", requires_grad=True)
+    dt_bias = torch.rand(nheads, device="cuda", requires_grad=True)
+
+    def fn(x, dt, A, B, C, D, z, dt_bias):
+        return mamba_chunk_scan_combined_varlen_fn(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk,
+            cu_chunk_seqlens,
+            last_chunk_indices,
+            seq_idx,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_dtype=state_dtype,
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (x, dt, A, B, C, D, z, dt_bias),
+        replays=3,
+        contention=True,
+        what="mamba_chunk_scan_combined_varlen_fn",
+    )
+
+
+@requires_deterministic_conv1d
+def test_mamba_split_conv1d_scan_combined_varlen_replays_fwd_bwd():
+    """The fused split + causal_conv1d + varlen SSD; the conv1d is recomputed in the backward."""
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_split_conv1d_scan_combined_varlen
+
+    seeded()
+    lens, nheads, headdim, ngroups, dstate, chunk = [1500, 1, 1283, 1312], 32, 64, 2, 128, 128
+    seqlen, dim = sum(lens), nheads * headdim
+    conv_dim = dim + 2 * ngroups * dstate
+    metadata = _varlen_chunk_metadata(lens, chunk)
+    zxbcdt = torch.randn(
+        seqlen, dim + conv_dim + nheads, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    conv1d_weight = (
+        torch.randn(conv_dim, 4, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).requires_grad_()
+    conv1d_bias = (
+        torch.randn(conv_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).requires_grad_()
+    dt_bias = torch.rand(nheads, device="cuda", requires_grad=True)
+    A = (-torch.rand(nheads, device="cuda") - 1.0).requires_grad_()
+    D = torch.randn(nheads, device="cuda", requires_grad=True)
+
+    def fn(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D):
+        return mamba_split_conv1d_scan_combined_varlen(
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D,
+            chunk,
+            *metadata,
+            headdim=headdim,
+            ngroups=ngroups,
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D),
+        replays=3,
+        contention=True,
+        what="mamba_split_conv1d_scan_combined_varlen",
+    )
+
+
 def test_batch_invariant_decode_step_replays():
     """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
     current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""

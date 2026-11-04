@@ -204,6 +204,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_num_heads": 64,
     "mamba_state_dim": 128,
     "mamba_training_ssm_states_dtype": None,
+    "mamba_varlen_ssd_training": False,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
     "mhc_fused_backend": "auto",
