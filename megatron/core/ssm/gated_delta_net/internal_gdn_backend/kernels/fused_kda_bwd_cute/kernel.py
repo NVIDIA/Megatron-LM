@@ -1398,6 +1398,19 @@ class FusedKdaBwdKernel:
                 # An empty sequence passes its final-state gradient through.
                 for c in cutlass.range_constexpr(_DV):
                     dh0[sequence, head, ttidx, c] = dht[sequence, head, ttidx, c]
+        # The gate column of each chunk is loaded ahead: the first one here,
+        # each next one while the current chunk's epilogue runs.
+        if self._chunk_count > 0:
+            first = num_chunks - 1 - self._chunk_first
+            self._load_gate_column(
+                half,
+                gc,
+                seq_start + first * _BT,
+                cutlass.min(_BT, seq_len - first * _BT),
+                head,
+                ttidx,
+                cm,
+            )
         for j in cutlass.range(self._chunk_count):
             # This CTA's chunks; j indexes them for the one-shot edges.
             it = self._chunk_first + j * self._chunk_stride
@@ -1411,9 +1424,8 @@ class FusedKdaBwdKernel:
                     s_beta[ttidx] = (
                         beta[0, tok0 + ttidx, head] if ttidx < valid else cutlass.Float32(0.0)
                     )
-            # The gate column and the state seed do not read q, k or Aqk, so
-            # they run before the late loads land (inside _cm_phase_a).
-            self._load_gate_column(half, gc, tok0, valid, head, ttidx, cm)
+            # The gate column (loaded ahead) and the state seed do not read q, k
+            # or Aqk, so they run before the late loads land (inside _cm_phase_a).
             self._wait(edges, _E_LOAD_EARLY, j)
             self._stamp(trace, half, 0, j)
             if half == 1:
@@ -1588,6 +1600,18 @@ class FusedKdaBwdKernel:
                 gchunk,
             )
             self._stamp(trace, half, 15, j)
+            if j + 1 < self._chunk_count:
+                # The fold no longer reads the gate registers.
+                nxt = chunk - self._chunk_stride
+                self._load_gate_column(
+                    half,
+                    gc,
+                    seq_start + nxt * _BT,
+                    cutlass.min(_BT, seq_len - nxt * _BT),
+                    head,
+                    ttidx,
+                    cm,
+                )
             self._cm_epilogue(
                 half,
                 ttidx,
