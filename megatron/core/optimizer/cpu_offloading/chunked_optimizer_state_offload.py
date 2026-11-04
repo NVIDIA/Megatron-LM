@@ -64,6 +64,8 @@ class _StateStagingSlot:
     """
 
     buffers: Dict[torch.device, torch.Tensor] = dataclasses.field(default_factory=dict)
+    allocation_ready: torch.cuda.Event | None = None
+    d2h_done: torch.cuda.Event | None = None
 
 
 class _StagingSlotPool:
@@ -78,8 +80,10 @@ class _StagingSlotPool:
     every H2D already waits for the shared D2H stream.
     """
 
-    def __init__(self) -> None:
-        self.slots = (_StateStagingSlot(), _StateStagingSlot())
+    def __init__(self, num_buffers: int = 2) -> None:
+        if num_buffers not in (2, 3):
+            raise ValueError('offload staging requires two or three buffers')
+        self.slots = tuple(_StateStagingSlot() for _ in range(num_buffers))
         self.next_slot = 0
         self._holds = 0
 
@@ -108,7 +112,25 @@ class _StagingSlotPool:
             return
         for slot in self.slots:
             slot.buffers.clear()
+            slot.allocation_ready = None
+            slot.d2h_done = None
         self.next_slot = 0
+
+
+def _select_offload_bundles(params, fraction, bundle_bytes, has_master):
+    """Use the same byte budget and stable master-first order before and after wrapping."""
+    if not params or fraction == 0.0:
+        return ()
+    if fraction == 1.0:
+        return tuple(params)
+    target = math.ceil(sum(bundle_bytes(param) for param in params) * fraction)
+    selected, total = [], 0
+    for param in sorted(params, key=lambda param: not has_master(param)):
+        if total >= target:
+            break
+        selected.append(param)
+        total += bundle_bytes(param)
+    return tuple(selected)
 
 
 class ChunkedOptimizerStateOffloader:
@@ -146,6 +168,8 @@ class ChunkedOptimizerStateOffloader:
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
     """
 
+    chunk_master_params = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -156,6 +180,9 @@ class ChunkedOptimizerStateOffloader:
         optimizer_owned_master_dtypes: Mapping[torch.Tensor, torch.dtype] | None = None,
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
+        chunk_master_params: bool = False,
+        copy_updated_params: Callable | None = None,
+        num_staging_buffers: int = 2,
     ) -> None:
         if chunk_size_bytes < 0:
             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
@@ -164,6 +191,13 @@ class ChunkedOptimizerStateOffloader:
         if not state_dtypes:
             raise ValueError("state_dtypes must contain at least one optimizer-state dtype")
 
+        if chunk_master_params and copy_updated_params is None:
+            raise ValueError("chunked masters require a per-chunk model copy callback")
+        if chunk_master_params and getattr(optimizer, "master_weights", False):
+            raise ValueError("chunked masters currently require MCore-owned masters")
+        self.chunk_master_params = chunk_master_params
+        self.copy_updated_params = copy_updated_params
+        self.grad_proxies = {}
         self.optimizer = optimizer
         self.chunk_size_bytes = chunk_size_bytes
         self.offload_fraction = offload_fraction
@@ -178,7 +212,9 @@ class ChunkedOptimizerStateOffloader:
             for group_index, group in enumerate(optimizer.param_groups)
             for param in group["params"]
         }
-        self._param_devices = {param: param.device for param in self._params}
+        self._param_devices = {
+            param: getattr(param, '_offload_original_device', param.device) for param in self._params
+        }
         self._explicit_master_param_ids = {id(param) for param in master_params}
         self._master_in_optimizer_state = bool(getattr(optimizer, "master_weights", False))
         if self._explicit_master_param_ids and self._master_in_optimizer_state:
@@ -228,8 +264,11 @@ class ChunkedOptimizerStateOffloader:
         self._d2h_stream = d2h_stream if d2h_stream is not None else torch.cuda.Stream()
         self._h2d_stream = h2d_stream if h2d_stream is not None else torch.cuda.Stream()
         self._master_h2d_event: torch.cuda.Event | None = None
-        self._master_weights_resident = True
-        self._staging_pool = _StagingSlotPool()
+        self._master_weights_resident = self._master_bindings_are_cuda()
+        self._staging_pool = _StagingSlotPool(num_staging_buffers)
+        self._param_staging_slots = {}
+        self._cpu_source_ready = {}
+        self._prefetch_slot = None
         self._first_prefetch: _StatePrefetch | None = None
 
     @staticmethod
@@ -259,27 +298,25 @@ class ChunkedOptimizerStateOffloader:
         )
 
     def _select_params_for_offload(self) -> tuple[torch.Tensor, ...]:
-        if not self._params or self.offload_fraction == 0.0:
-            return ()
-        if self.offload_fraction == 1.0:
-            return self._params
-
-        target_bytes = math.ceil(
-            sum(self._estimated_bundle_bytes(param) for param in self._params)
-            * self.offload_fraction
+        return _select_offload_bundles(
+            self._params, self.offload_fraction, self._estimated_bundle_bytes, self._param_has_master
         )
-        # Prefer bundles that actually have a separate master, so a partial byte budget removes
-        # both state and master residency before selecting state-only bundles. Python's sort is
-        # stable, preserving optimizer order within the two classes.
-        candidates = sorted(self._params, key=lambda param: not self._param_has_master(param))
-        selected = []
-        selected_bytes = 0
-        for param in candidates:
-            if selected_bytes >= target_bytes:
-                break
-            selected.append(param)
-            selected_bytes += self._estimated_bundle_bytes(param)
-        return tuple(selected)
+
+    @classmethod
+    def cpu_initial_master_param_ids(cls, optimizer, fraction):
+        """Select BF16 model parameters whose future FP32 masters start on CPU.
+
+        Only the ordinary BF16 Muon schema (one FP32 momentum) is admitted by the
+        LayerWise caller. Account for FP32 bytes rather than the model's BF16 dtype.
+        """
+        params = cls._unique_optimizer_params(optimizer.param_groups)
+        has_master = lambda param: param.dtype == torch.bfloat16 and param.requires_grad
+        selected = _select_offload_bundles(
+            params, fraction,
+            lambda param: param.numel() * (4 + (4 if has_master(param) else 0)),
+            has_master,
+        )
+        return {id(param) for param in selected if has_master(param)}
 
     def _estimated_state_bytes(self, param: torch.Tensor) -> int:
         """Bytes one state chunk stages for ``param``, an optimizer-owned master included."""
@@ -300,7 +337,10 @@ class ChunkedOptimizerStateOffloader:
         oversized_param_count = 0
         largest_oversized_param_bytes = 0
         for param in params:
-            param_bytes = self._estimated_state_bytes(param)
+            param_bytes = (
+                self._estimated_bundle_bytes(param)
+                if self.chunk_master_params else self._estimated_state_bytes(param)
+            )
             if param_bytes > self.chunk_size_bytes:
                 oversized_param_count += 1
                 largest_oversized_param_bytes = max(largest_oversized_param_bytes, param_bytes)
@@ -317,8 +357,8 @@ class ChunkedOptimizerStateOffloader:
             log_single_rank(
                 logger,
                 logging.WARNING,
-                "Optimizer-state offload target is %.2f MiB, but %d selected parameter(s) "
-                "have an atomic tensor-state payload larger than the target; the largest is "
+                "Optimizer offload target is %.2f MiB, but %d selected parameter(s) "
+                "have an atomic staging payload larger than the target; the largest is "
                 "%.2f MiB for %s. These parameters cannot be split, so this manager's "
                 "two-slot GPU tensor-state window can exceed roughly twice the configured "
                 "target.",
@@ -450,6 +490,7 @@ class ChunkedOptimizerStateOffloader:
                 cpu_tensor.copy_(gpu_tensor, non_blocking=True)
                 gpu_tensor.record_stream(self._d2h_stream)
                 self.optimizer.state[param][key] = cpu_tensor
+        self._record_d2h_completion(tuple(param for param, _, _ in transfers))
 
     def adopt_cpu_optimizer_state(self, params: Sequence[torch.Tensor] | None = None) -> None:
         """Register CPU tensor states created or loaded outside the manager.
@@ -505,8 +546,11 @@ class ChunkedOptimizerStateOffloader:
 
         # Checkpoint preparation may have put explicit MCore masters on CPU. Restore the
         # selected master window so third-party initializers always observe CUDA parameters.
-        self._schedule_master_h2d()
-        self._wait_master_h2d()
+        if self.chunk_master_params:
+            self.offload_for_forward()
+        else:
+            self._schedule_master_h2d()
+            self._wait_master_h2d()
 
         original_groups = list(self.optimizer.param_groups)
         base_group_metadata = self._snapshot_group_metadata(original_groups)
@@ -523,8 +567,12 @@ class ChunkedOptimizerStateOffloader:
                 initialize_subset(self._resident_params)
 
             for chunk in self._chunks:
+                if self.chunk_master_params:
+                    self._wait_state_prefetch(self._prefetch_state(chunk))
                 initialize_subset(chunk.params)
                 self._schedule_state_d2h(chunk.params)
+                if self.chunk_master_params:
+                    self._schedule_master_d2h(chunk.params)
                 # Initialization is an infrequent checkpoint operation. Synchronizing one
                 # chunk here bounds its CUDA allocation and makes the CPU destination stable
                 # for distributed-checkpoint sharded-state construction.
@@ -691,7 +739,7 @@ class ChunkedOptimizerStateOffloader:
             "H2D restore is still pending"
         )
 
-    def _schedule_master_d2h(self) -> None:
+    def _schedule_master_d2h(self, params=None) -> None:
         if not self._selected_params:
             return
         self._validate_master_storage()
@@ -701,7 +749,7 @@ class ChunkedOptimizerStateOffloader:
 
         transfers = [
             param
-            for param in self._selected_params
+            for param in (self._selected_params if params is None else params)
             if id(param) in self._explicit_master_param_ids and param.data.is_cuda
         ]
         if not transfers:
@@ -718,7 +766,9 @@ class ChunkedOptimizerStateOffloader:
                 # CPU is the canonical binding as soon as the copy is enqueued. CUDA's
                 # allocator keeps the source alive through record_stream(), and any H2D
                 # consumer waits on the D2H stream before reading this buffer.
+                param.grad = None
                 param.data = cpu_tensor
+        self._record_d2h_completion(tuple(transfers))
 
     def _schedule_master_h2d(self) -> None:
         if not self._selected_params or self._master_h2d_event is not None:
@@ -772,6 +822,31 @@ class ChunkedOptimizerStateOffloader:
         self._h2d_stream.wait_stream(self._d2h_stream)
         self._h2d_stream.wait_stream(torch.cuda.current_stream())
 
+    def _record_d2h_completion(self, params) -> None:
+        """Protect only the written CPU bundles and the GPU slots read by this D2H."""
+        if len(self._staging_pool.slots) != 3:
+            return
+        event = torch.cuda.Event()
+        event.record(self._d2h_stream)
+        for param in params:
+            self._cpu_source_ready[param] = event
+            slot = self._param_staging_slots.get(param)
+            if slot is not None:
+                slot.d2h_done = event
+
+    def _order_chunk_h2d(self, chunk, slot) -> None:
+        """Wait for this slot and these CPU sources, without draining unrelated streams."""
+        if len(self._staging_pool.slots) != 3:
+            self._order_h2d_after_source_streams()
+            return
+        events = [slot.allocation_ready, slot.d2h_done]
+        events.extend(self._cpu_source_ready.get(param) for param in chunk.params)
+        seen = set()
+        for event in events:
+            if event is not None and id(event) not in seen:
+                self._h2d_stream.wait_event(event)
+                seen.add(id(event))
+
     def _state_staging_views(
         self, chunk: OptimizerStateChunk
     ) -> List[tuple[torch.Tensor, str, torch.Tensor, torch.Tensor]]:
@@ -781,8 +856,15 @@ class ChunkedOptimizerStateOffloader:
         required_bytes = collections.defaultdict(int)
         for param in chunk.params:
             state = self.optimizer.state.get(param, {})
-            for key, cpu_tensor in self._cpu_state.get(param, {}).items():
-                current = state.get(key)
+            tensors = list(self._cpu_state.get(param, {}).items())
+            if (
+                self.chunk_master_params
+                and id(param) in self._explicit_master_param_ids
+                and not param.data.is_cuda
+            ):
+                tensors.append((None, param.data))
+            for key, cpu_tensor in tensors:
+                current = param.data if key is None else state.get(key)
                 if not isinstance(current, torch.Tensor) or current.is_cuda:
                     continue
                 device = self._param_devices[param]
@@ -796,10 +878,20 @@ class ChunkedOptimizerStateOffloader:
         pool = self._staging_pool
         slot = pool.slots[pool.next_slot]
         pool.next_slot = (pool.next_slot + 1) % len(pool.slots)
+        allocated = False
         for device, nbytes in required_bytes.items():
             buffer = slot.buffers.get(device)
             if buffer is None or buffer.numel() < nbytes:
                 slot.buffers[device] = torch.empty(nbytes, dtype=torch.uint8, device=device)
+                allocated = True
+        if allocated and len(pool.slots) == 3:
+            # New storage belongs to the compute stream's allocator pool. Order
+            # its first H2D use after allocation; reused slots wait only on D2H.
+            slot.allocation_ready = torch.cuda.Event()
+            slot.allocation_ready.record(torch.cuda.current_stream())
+        self._prefetch_slot = slot
+        for param in chunk.params:
+            self._param_staging_slots[param] = slot
 
         views = []
         for param, key, cpu_tensor, device, offset in entries:
@@ -826,12 +918,16 @@ class ChunkedOptimizerStateOffloader:
         if not staging_views:
             return _StatePrefetch(None)
 
-        self._order_h2d_after_source_streams()
+        self._order_chunk_h2d(chunk, self._prefetch_slot)
         with torch.cuda.stream(self._h2d_stream):
             for param, key, cpu_tensor, gpu_tensor in staging_views:
                 gpu_tensor.copy_(cpu_tensor, non_blocking=cpu_tensor.is_pinned())
                 gpu_tensor.record_stream(self._h2d_stream)
-                self.optimizer.state[param][key] = gpu_tensor
+                if key is None:
+                    self._cpu_master[param] = cpu_tensor
+                    param.data = gpu_tensor
+                else:
+                    self.optimizer.state[param][key] = gpu_tensor
             event = torch.cuda.Event()
             event.record(self._h2d_stream)
         return _StatePrefetch(event)
@@ -847,7 +943,10 @@ class ChunkedOptimizerStateOffloader:
 
         if not self._selected_params:
             return
-        self._schedule_master_h2d()
+        if not self.chunk_master_params:
+            self._schedule_master_h2d()
+        elif self._first_prefetch is None:
+            self._schedule_master_d2h()
         if self._chunks and self._first_prefetch is None:
             self._first_prefetch = self._prefetch_state(self._chunks[0])
 
@@ -855,7 +954,11 @@ class ChunkedOptimizerStateOffloader:
         """Asynchronously restore only MCore-owned masters, leaving tensor state CPU-resident."""
 
         if self._selected_params:
-            self._schedule_master_h2d()
+            if self.chunk_master_params:
+                if self._first_prefetch is None:
+                    self._schedule_master_d2h()
+            else:
+                self._schedule_master_h2d()
 
     def ensure_master_for_param_sync(self) -> None:
         """Ensure selected MCore-owned masters are available for pre-forward FP8 staging."""
@@ -1023,6 +1126,8 @@ class ChunkedOptimizerStateOffloader:
             self.optimizer.step()
             return
 
+        if self.chunk_master_params and self._first_prefetch is None:
+            self._schedule_master_d2h()
         self.prefetch_for_step()
         self._wait_master_h2d()
 
@@ -1041,6 +1146,9 @@ class ChunkedOptimizerStateOffloader:
                     resulting_group_metadata,
                 )
 
+                if self.chunk_master_params:
+                    self.copy_updated_params(self._resident_params)
+
             current_prefetch = self._first_prefetch
             self._first_prefetch = None
             for chunk_index, chunk in enumerate(self._chunks):
@@ -1052,11 +1160,19 @@ class ChunkedOptimizerStateOffloader:
                 if chunk_index + 1 < len(self._chunks):
                     next_prefetch = self._prefetch_state(self._chunks[chunk_index + 1])
 
+                if self.chunk_master_params:
+                    for param in chunk.params:
+                        proxy = self.grad_proxies.get(param)
+                        param.grad = proxy.grad if proxy is not None else None
                 self._step_subset(
                     chunk.params, original_groups, base_group_metadata, resulting_group_metadata
                 )
+                if self.chunk_master_params:
+                    self.copy_updated_params(chunk.params)
                 created_state = self._has_unregistered_cuda_state(chunk.params)
                 self._schedule_state_d2h(chunk.params)
+                if self.chunk_master_params:
+                    self._schedule_master_d2h(chunk.params)
                 if created_state:
                     # External optimizers commonly allocate moments lazily on their first step.
                     # That storage is not backed by the reusable pool yet, so drain this one-time

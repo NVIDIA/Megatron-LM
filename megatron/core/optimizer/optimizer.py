@@ -219,6 +219,11 @@ class MegatronOptimizer(ABC):
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
             h2d_stream=h2d_stream,
+            chunk_master_params=(
+                self.config.chunked_optimizer_main_params and self._layer_wise_non_distopt_child
+            ),
+            copy_updated_params=getattr(self, '_copy_main_param_subset_to_model', None),
+            num_staging_buffers=self.config.optimizer_state_offload_num_buffers,
         )
 
     def set_optimizer_state_offload_deferred_lifecycle(
@@ -310,10 +315,12 @@ class MegatronOptimizer(ABC):
         Get list of parameters wrapped in optimizer.
         """
         params = []
+        manager = self._optimizer_state_offloader
+        proxies = manager.grad_proxies if manager is not None and manager.chunk_master_params else {}
         if hasattr(self.optimizer, 'param_groups'):
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
-                    params.append(param)
+                    params.append(proxies.get(param, param))
         return params
 
     def prepare_model_params_for_param_sync(self) -> None:
@@ -926,6 +933,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
+        if (
+            self._optimizer_state_offloader is not None
+            and self._optimizer_state_offloader.chunk_master_params
+        ):
+            # Model weights were copied per chunk before the masters returned to CPU.
+            return True
+
         # Update params from main params.
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -1127,11 +1141,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        cpu_main_param_ids: set[int] | None = None,
     ):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
-        # Handle main parameters.
+        # Handle main parameters. cpu_main_param_ids is passed only by LayerWise
+        # Muon joint offload; sibling Adam and ordinary wrappers keep GPU masters.
 
         if optimizer:
             # Three groups of parameters:
@@ -1167,7 +1183,23 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                 if get_high_precision_init_val is not None
                                 else None
                             )
-                            if high_precision_init_val is not None:
+                            if cpu_main_param_ids is not None and id(param) in cpu_main_param_ids:
+                                # Allocate the destination on CPU first. Do not clone/convert
+                                # the full parameter on CUDA before offloading it.
+                                main_param = torch.empty_like(
+                                    param, device='cpu', dtype=torch.float32, pin_memory=True
+                                )
+                                source = (
+                                    high_precision_init_val
+                                    if high_precision_init_val is not None else param.detach()
+                                )
+                                # Convert on CPU explicitly: cross-device copy_ with
+                                # different dtypes must not create a CUDA FP32 temporary.
+                                main_param.copy_(source.detach().to(device='cpu'))
+                                main_param._offload_original_device = param.device
+                                if high_precision_init_val is not None:
+                                    param.clear_high_precision_init_val()
+                            elif high_precision_init_val is not None:
                                 main_param = high_precision_init_val.to(
                                     device=param.device, dtype=torch.float32, copy=True
                                 )
@@ -1217,6 +1249,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         used by this field can be safely deallocated at this point."""
         if self.is_stub_optimizer:
             return
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.grad_proxies.clear()
         for group in self.float16_groups:
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_float16_groups:
@@ -1255,8 +1289,29 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def _copy_model_grads_to_main_grads(self):
         # This only needs to be done for the float16 group.
+        manager = self._optimizer_state_offloader
+        if manager is not None and manager.chunk_master_params:
+            manager.grad_proxies.clear()
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
+                if (
+                    manager is not None
+                    and manager.chunk_master_params
+                    and manager.is_param_offloaded(main_param)
+                ):
+                    grad = getattr(model_param, 'main_grad', model_param.grad)
+                    if grad is None:
+                        proxy = torch.empty(0, device=model_param.device)
+                    else:
+                        grad = grad.float()
+                        proxy = grad.detach()
+                        proxy.grad = grad
+                    tensor_parallel.copy_tensor_model_parallel_attributes(proxy, main_param)
+                    tensor_parallel.copy_gtp_attributes(proxy, main_param)
+                    copy_optimizer_param_metadata(proxy, main_param)
+                    manager.grad_proxies[main_param] = proxy
+                    model_param.grad = None
+                    continue
                 if hasattr(model_param, 'main_grad'):
                     main_param.grad = model_param.main_grad.float()
                 else:
@@ -1272,6 +1327,21 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for model_group in self.fp32_from_fp32_groups:
             for model_param in model_group:
                 model_param.grad = model_param.main_grad
+
+    def _copy_main_param_subset_to_model(self, params):
+        """Copy updated BF16 matrices before their chunk's masters return to CPU."""
+        mapping = getattr(self, '_chunk_main_to_model', None)
+        if mapping is None:
+            mapping = {
+                id(main): model
+                for models, mains in zip(self.float16_groups, self.fp32_from_float16_groups)
+                for model, main in zip(models, mains)
+            }
+            self._chunk_main_to_model = mapping
+        for main in params:
+            model = mapping.get(id(main))
+            if model is not None:
+                model.data.copy_(main.data)
 
     def _copy_main_params_to_model_params(self):
         self.ensure_master_weights_for_param_sync()

@@ -3876,6 +3876,15 @@ def _add_training_args(parser):
         help='Disable pinning of CPU memory for parameters.',
     )
     group.add_argument(
+        '--optimizer-state-offload-num-buffers', type=int, choices=[2, 3], default=2,
+        help='Shared GPU staging slots. Three enables slot-local waits for H2D/D2H overlap; '
+             'requires --chunked-optimizer-main-params and uses one additional window.',
+    )
+    group.add_argument(
+        '--chunked-optimizer-main-params', action='store_true',
+        help='Stage BF16 LayerWise Muon master weights in the same bounded chunks as state.',
+    )
+    group.add_argument(
         '--chunked-optimizer-state-offload',
         action='store_true',
         help='Keep selected optimizer tensor states and master weights in CPU memory between '

@@ -417,6 +417,12 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    optimizer_state_offload_num_buffers: int = 2
+    """GPU staging windows: two for lower residency, three for bidirectional overlap."""
+
+    chunked_optimizer_main_params: bool = False
+    """Stage BF16 LayerWise Muon masters together with each optimizer-state chunk."""
+
     chunked_optimizer_state_offload: bool = False
     """Keep selected optimizer tensor states and master weights on CPU between updates."""
 
@@ -482,6 +488,21 @@ class OptimizerConfig:
         assert (
             0.0 <= self.optimizer_state_offload_fraction <= 1.0
         ), "optimizer_state_offload_fraction must be in [0.0, 1.0]"
+
+        if self.optimizer_state_offload_num_buffers not in (2, 3):
+            raise ValueError('optimizer_state_offload_num_buffers must be 2 or 3')
+        if self.optimizer_state_offload_num_buffers == 3 and not self.chunked_optimizer_main_params:
+            raise ValueError('Three offload buffers require chunked_optimizer_main_params')
+        if self.chunked_optimizer_main_params:
+            if not (
+                self.chunked_optimizer_state_offload
+                and self.optimizer == 'muon'
+                and self.bf16
+                and self.use_layer_wise_distributed_optimizer
+            ):
+                raise ValueError('chunked_optimizer_main_params requires BF16 LayerWise Muon state offload')
+            if self.optimizer_state_offload_chunk_size_mb <= 0:
+                raise ValueError('chunked_optimizer_main_params requires a positive chunk size')
 
         if self.chunked_optimizer_state_offload and self.optimizer_state_offload_fraction > 0.0:
             if used_deprecated_optimizer_state_offload:

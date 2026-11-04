@@ -112,3 +112,72 @@ The deprecated `--offload-optimizer-states` argument remains as a parser compati
 Configuration validation emits a visible `FutureWarning`, enables the new mode, and consumes the
 legacy field so copying the normalized configuration does not warn again. Its default-equivalent
 settings are chunk size `0` and fraction `1.0`, with the restrictions above.
+
+
+## Chunked main parameters (BF16 LayerWise Muon)
+
+Add `--chunked-optimizer-main-params` to `--chunked-optimizer-state-offload`
+with a positive `--optimizer-state-offload-chunk-size-mb` to stage MCore FP32
+masters in the same two reusable windows as momentum. This opt-in changes the
+chunk target to **master plus state bytes**. Whole matrices remain atomic; a
+single oversized matrix can exceed the target. The ordinary two-window bound
+is approximately twice the target, plus alignment, gradients, Muon workspace,
+and unselected parameters. A sibling Adam manager retains the original state-only
+window accounting, so the target is not a process-wide memory limit.
+
+CUDA gradient proxies preserve gradient clipping/statistics while masters are CPU
+bound. Each updated chunk is copied to its BF16 model parameters before its masters
+and momentum are queued for D2H. H2D for the next chunk overlaps current compute;
+the existing shared D2H/H2D streams order reuse of the two windows. State creation
+for distributed checkpoint loading also restores masters per chunk.
+
+This first implementation supports BF16 LayerWise Muon with compact parameter
+layout (`--no-use-layer-wise-param-layout`). FP8 parameters/gather and
+precision-aware optimizer-owned masters are unsupported by the new switch.
+Adam siblings keep their existing offloader. Without the new switch, behavior
+is unchanged. Fraction zero disables transfers as before.
+
+Selected FP32 masters are created directly in pinned CPU memory during wrapper
+construction, using the same byte-budget selection as the runtime offloader. This
+avoids first materializing all selected masters on CUDA. Unselected masters stay
+on CUDA. Model weights and gradients remain GPU-resident. External full-model
+reload/copy APIs may still explicitly restore all masters; the bounded window does
+not cover all external master readers or checkpoint-strategy transport temporaries. The existing
+synchronous distributed-checkpoint restrictions still apply.
+
+Example:
+
+```bash
+--optimizer muon --bf16 --use-distributed-optimizer \
+--no-use-layer-wise-param-layout --chunked-optimizer-state-offload \
+--chunked-optimizer-main-params --optimizer-state-offload-chunk-size-mb 256 \
+--optimizer-state-offload-fraction 1.0 --ckpt-format torch_dist
+```
+
+CPU planning/scheduling tests can run with:
+
+```bash
+python -m pytest --noconftest tests/unit_tests/test_chunked_main_params.py
+```
+
+CUDA transfer tests in that file and the parametrized LayerWise integration test
+must also pass in the Megatron CUDA test environment before deployment.
+
+
+### Experimental bidirectional transfer overlap
+
+Keep all other settings fixed and add `--optimizer-state-offload-num-buffers 3`
+to joint main-parameter offload to compare against the default of `2`. Three
+shared GPU windows separate previous D2H, current compute and next H2D. Prefetch
+waits on that slot's D2H completion and its CPU sources, rather than all queued
+D2H/compute work. New or resized buffers still wait on a compute-stream allocation
+event. Sibling managers share the same three-slot pool. Full-master external
+restore paths retain their original stream-wide safety dependencies.
+
+This can improve throughput only if bidirectional transfers are exposed on the
+critical path and the hardware sustains concurrent transfers. The GPU staging
+budget increases from approximately two to three chunk windows (plus alignment
+and oversized atomic matrices). It is not a hard process-wide memory cap. First
+state initialization still synchronizes lazy allocations. Measure fresh-process
+steady-state step time, H2D/D2H overlap and peak allocated/reserved memory before
+choosing this mode. CUDA validation remains required.
