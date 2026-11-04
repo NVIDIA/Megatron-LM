@@ -806,7 +806,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
@@ -831,15 +833,17 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ matrix.mode || 'full' }}"
+        "${{ inputs.unit_testmon_mode == 'enforce' && "
+        "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
     )
+    assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
 
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
     needs.select.result = "failure"
@@ -896,6 +900,33 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     # Missing coverage is valid only when every bucket selected no tests.
     assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
     assert outputs == ({} if has_tests else {"has_coverage": "false"})
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "target_branch", "cpu_mode", "expected_mode"),
+    [
+        pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
+        pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("full", "main", "", "full", id="explicit-full"),
+        pytest.param("full", "", "", "full", id="merge-group-full"),
+        pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
+    ],
+)
+def test_gpu_reselection_respects_full_run_guards(
+    requested_mode, target_branch, cpu_mode, expected_mode
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    expression = mode.removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("&&", "and").replace("||", "or")
+    inputs = SimpleNamespace(
+        unit_testmon_mode=requested_mode, unit_testmon_target_branch=target_branch
+    )
+    matrix = SimpleNamespace(mode=cpu_mode)
+    assert (
+        eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix})
+        == expected_mode
+    )
 
 
 @pytest.mark.parametrize(
