@@ -246,6 +246,40 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _post_o_group_proj(
+        self, attn_out: torch.Tensor, q_compressed: torch.Tensor
+    ) -> torch.Tensor:
+        """Hook between the grouped output projection and ``linear_proj``.
+
+        Runs after the grouped output projection (wo_a, ``linear_o_group_proj``) and before
+        ``linear_proj`` (wo_b). The default returns ``attn_out`` unchanged, which leaves the
+        forward pass, the backward pass and the state dict bitwise unchanged. A subclass can
+        override it, for example to gate ``attn_out`` with a projection of ``q_compressed``.
+        DSv4 attention asserts a tensor-parallel size of 1, so the widths below are global.
+
+        Args:
+            attn_out: Grouped output projection result in
+                ``[s, b, output_projection_groups * output_projection_lora_rank]`` layout,
+                or ``[t, 1, output_projection_groups * output_projection_lora_rank]`` for
+                packed THD input.
+            q_compressed: ``q_layernorm`` output, reshaped to the leading dims of
+                ``attn_out``: ``[s, b, q_lora_rank]``, or ``[t, 1, q_lora_rank]`` for packed
+                THD input.
+
+        Returns:
+            A tensor with the shape and dtype of ``attn_out``. It becomes the ``linear_proj``
+            input.
+
+        Note:
+            This hook runs before the ``attn_proj`` fine-grained activation offload group,
+            whose input (the tensor returned here) is force-released after it is offloaded.
+            An override must therefore not save the returned tensor, or a tensor that shares
+            its storage, for backward. An override that builds Transformer Engine linears
+            under ``delay_wgrad_compute`` must also override ``backward_dw`` so that their
+            weight gradients are computed.
+        """
+        return attn_out
+
     def forward(
         self,
         hidden_states,
@@ -379,6 +413,9 @@ class DSv4HybridAttention(Attention):
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = self._post_o_group_proj(
+            core_attn_out, q_compressed.reshape(*core_attn_out.shape[:-1], q_compressed.size(-1))
+        )
 
         # =================
         # Output. [sq, b, h]
