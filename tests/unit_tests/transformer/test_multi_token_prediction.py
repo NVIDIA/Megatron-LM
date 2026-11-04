@@ -18,8 +18,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -53,6 +57,7 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor_precomputed_embeddings,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_pg_rank,
@@ -4242,6 +4247,135 @@ class TestMultiTokenPredictionHybrid:
 
         for name, param in model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    def _build_shortcut_mtp_model(self, *, disable_mtp=None, repeated=True, wide=False):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        overrides = {} if disable_mtp is None else {"moe_shortcut_disable_mtp": disable_mtp}
+        config = TransformerConfig(
+            num_layers=2,
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=repeated,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            moe_ffn_hidden_size=128,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
+            moe_shortcut_post_norm=True,
+            wide_residual=WideResidualConfig(num_streams=3) if wide else None,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            **overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=wide_residual_hybrid_stack_spec if wide else hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*E/*E/*E",
+            position_embedding_type="none",
+        ).cuda()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+    @pytest.mark.parametrize("repeated", [False, True], ids=["separate", "repeated"])
+    @pytest.mark.parametrize("wide", [False, True], ids=["ordinary", "wide-decoder"])
+    def test_disable_mtp_shortcuts_runs_sequential_moe(self, repeated, wide):
+        """Both MTP depths route normalized attention outputs and backpropagate through the norm."""
+        model = self._build_shortcut_mtp_model(disable_mtp=True, repeated=repeated, wide=wide)
+        decoder_block = model.decoder.layers[0]
+        assert isinstance(decoder_block, ShortcutMoEBlock)
+        assert decoder_block.overlap_mode
+        assert model.decoder.config is model.config
+        assert model.decoder.uses_wide_residual_stream == wide
+        assert len(model.mtp.layers) == (1 if repeated else 2)
+
+        shortcut_flags = (
+            "moe_shortcut_connection",
+            "moe_shortcut_parallel",
+            "moe_shortcut_post_norm",
+        )
+        recordings = []
+        handles = []
+        for mtp_layer in model.mtp.layers:
+            stack = mtp_layer.mtp_model_layer
+            assert stack.config is not model.config
+            for flag in shortcut_flags:
+                assert getattr(model.config, flag)
+                assert not getattr(stack.config, flag)
+                assert not any(getattr(layer.config, flag) for layer in stack.layers)
+            assert not stack.uses_wide_residual_stream
+            assert stack.residual_stream_readout is None
+            assert len(stack.layers) == 2
+            attention, moe = stack.layers
+            assert attention._get_self_attention_residual_connection(operation="read") is None
+            assert moe._get_mlp_residual_connection(operation="read") is None
+            assert list(moe.pre_mlp_layernorm.parameters()), "MTP must retain its MoE norm"
+            calls = {"attention": [], "norm": []}
+            recordings.append((moe, calls))
+
+            def record_attention(_module, _inputs, output, calls=calls):
+                calls["attention"].append(output[0].detach().clone())
+
+            def record_norm(_module, inputs, calls=calls):
+                calls["norm"].append(inputs[0].detach().clone())
+
+            handles.append(attention.register_forward_hook(record_attention))
+            handles.append(moe.pre_mlp_layernorm.register_forward_pre_hook(record_norm))
+
+        hidden_states = torch.randn(
+            4, 1, model.config.hidden_size, device="cuda", requires_grad=True
+        )
+        input_ids = torch.arange(4, device="cuda").unsqueeze(0)
+        try:
+            output = model.mtp(
+                input_ids=input_ids,
+                position_ids=input_ids,
+                hidden_states=hidden_states,
+                attention_mask=None,
+                embedding=model.embedding,
+            )
+            assert output.shape == (12, 1, model.config.hidden_size)
+            (output * torch.randn_like(output)).sum().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        expected_calls = 2 if repeated else 1
+        for moe, calls in recordings:
+            assert len(calls["attention"]) == len(calls["norm"]) == expected_calls
+            for attention_output, norm_input in zip(calls["attention"], calls["norm"]):
+                torch.testing.assert_close(norm_input, attention_output, rtol=0, atol=0)
+            norm_grad = moe.pre_mlp_layernorm.weight.grad
+            assert norm_grad is not None and torch.isfinite(norm_grad).all()
+            assert torch.count_nonzero(norm_grad) > 0
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        assert all(layer.eh_proj.weight.grad is not None for layer in model.mtp.layers)
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+    def test_mtp_shortcuts_remain_enabled_by_default(self):
+        """Omitting the new flag preserves repeated shortcut MTP under a wide decoder."""
+        model = self._build_shortcut_mtp_model(wide=True)
+        assert model.config.moe_shortcut_disable_mtp is False
+        assert isinstance(model.decoder.layers[0], ShortcutMoEBlock)
+        assert len(model.mtp.layers) == 1
+        stack = model.mtp.layers[0].mtp_model_layer
+        assert stack.config is model.config
+        assert len(stack.layers) == 1
+        shortcut = stack.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert shortcut.is_mtp_layer and shortcut.overlap_mode
+        assert shortcut.shortcut_residual_read is None
+        assert list(shortcut.shortcut_post_norm.parameters())
+        assert not stack.uses_wide_residual_stream
 
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.
