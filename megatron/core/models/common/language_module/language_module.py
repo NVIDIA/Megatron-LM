@@ -7,11 +7,14 @@ import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import (
     backend_slot,
     get_backend_from_config,
     select_cross_entropy,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -316,6 +319,88 @@ class LanguageModule(MegatronModule):
         if self.config.mup_output_mult != 1.0:
             return logits * self.config.mup_output_mult
         return logits
+
+    def _rotary_pos_emb_inputs(
+        self,
+        inference_context: Optional[BaseInferenceContext],
+        decoder_input: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        position_ids: Optional[Tensor] = None,
+        decoder_uses_mla: bool = False,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+        """RoPE inputs of this model's attention layers for one forward.
+
+        Returns `(rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin)`. In
+        inference, attention applies RoPE from precomputed tables instead of rotary_pos_emb:
+        cosines and sines under flash_decode, and both concatenated when the context uses
+        FlashInfer's fused RoPE. The tables cover the context's maximum sequence length and are
+        cached in `self.rotary_pos_emb_cache`.
+
+        Args:
+            inference_context (BaseInferenceContext, optional): the inference context.
+            decoder_input (Tensor, optional): the decoder input, which sizes rotary_pos_emb.
+            packed_seq_params (PackedSeqParams, optional): packed-sequence parameters.
+            position_ids (Tensor, optional): position ids, for multimodal RoPE.
+            decoder_uses_mla (bool): whether the decoder uses MLA, which applies its own RoPE
+                and takes no tables.
+        """
+        rotary_pos_emb = rotary_pos_cos = rotary_pos_sin = rotary_pos_cos_sin = None
+        if not hasattr(self, 'rotary_pos_emb'):
+            return rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
+
+        in_inference_mode = InferenceMode.is_active()
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        cp_group = packed_seq_params.cp_group if packed_seq_params is not None else None
+        if self.position_embedding_type == 'rope':
+            use_flashinfer_fused_rope = getattr(
+                inference_context, 'use_flashinfer_fused_rope', False
+            )
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and not decoder_uses_mla
+                and (self.config.flash_decode or use_flashinfer_fused_rope)
+            ):
+                max_sequence_length = inference_context.max_sequence_length_for_model
+                if max_sequence_length not in self.rotary_pos_emb_cache:
+                    cos, sin = self.rotary_pos_emb.get_cos_sin(max_sequence_length)
+                    self.rotary_pos_emb_cache[max_sequence_length] = (
+                        (cos, sin) if self.config.flash_decode else torch.cat((cos, sin), -1)
+                    )
+                if self.config.flash_decode:
+                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache[max_sequence_length]
+                else:
+                    rotary_pos_cos_sin = self.rotary_pos_emb_cache[max_sequence_length]
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
+                )
+        elif self.position_embedding_type == 'yarn':
+            if in_inference_mode and self.config.flash_decode:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "YarnRotaryEmbedding yet."
+                )
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            # YarnRotaryEmbedding returns (emb, mscale); attention applies mscale itself.
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
+            )
+        elif self.position_embedding_type == 'mrope':
+            if in_inference_mode and self.config.flash_decode:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "MultimodalRotaryEmbedding yet."
+                )
+            rotary_pos_emb = self.rotary_pos_emb(
+                position_ids, self.mrope_section, cp_group=cp_group
+            )
+        return rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True

@@ -885,6 +885,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "container and is tracked as a follow-up.",
     ),
     KernelEntry(
+        name="inference_flashinfer_fused_rope",
+        sources=("megatron/core/inference/contexts/dynamic_context.py",),
+        tests=(K + "test_inference_kernels.py",),
+        kind="dispatch",
+        training_path=False,
+        notes="DynamicInferenceContext.apply_fused_qk_rotary_emb sends the head shapes FlashInfer "
+        "rotates exactly (flashinfer_fused_rope_supports) to flashinfer.rope."
+        "apply_rope_with_cos_sin_cache and rotates the others with fp32 elementwise ops; both "
+        "paths are replayed in test_inference_kernels.py::test_flashinfer_fused_rope_replays.",
+    ),
+    KernelEntry(
         name="inference_tp_layers",
         sources=("megatron/core/tensor_parallel/inference_layers.py",),
         kind="dispatch",

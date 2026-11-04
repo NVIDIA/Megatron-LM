@@ -250,6 +250,21 @@ def get_mem_size_str(n_bytes: int) -> str:
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
 
 
+def flashinfer_fused_rope_supports(head_dim: int, rotary_dim: int, interleaved: bool) -> bool:
+    """Whether FlashInfer's fused cos/sin-cache RoPE rotates heads of this shape exactly.
+
+    Each FlashInfer thread rotates one vector of `vec` lanes with one sign, partner offset and
+    cos/sin index, through 16-byte loads and stores. Head dims 64/128/256/512 use a dedicated
+    kernel with `vec = max(8, head_dim / 32)`; every other head dim uses `vec = 16`. A NeoX half
+    (`rotary_dim / 2`) or interleaved span (`rotary_dim`) that is not a whole number of vectors
+    is silently mis-rotated, faults on a misaligned partner load, or spills into the lanes after
+    it; a head dim that is not a multiple of 8 misaligns the 16-byte head bases.
+    """
+    vec = max(8, head_dim // 32) if head_dim in (64, 128, 256, 512) else 16
+    span = rotary_dim if interleaved else rotary_dim // 2
+    return head_dim % 8 == 0 and span % vec == 0
+
+
 @dataclass
 class PrefixMatch:
     """What `_compute_prefix_match` decided for one request chunk.
@@ -401,6 +416,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Flash decoding keeps each layer's KV cache in a static per-layer buffer; attention
+        # runs it only under static batching.
+        if model_config.flash_decode:
+            raise ValueError(
+                "Flash decode is only applicable to static batching; set flash_decode=False "
+                "to use the dynamic inference context."
+            )
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -2228,6 +2251,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     ) -> Tuple[Tensor, Tensor]:
         """
         Apply rotary embedding to query and key tensors using flashinfer's fused rope.
+
+        Head shapes FlashInfer gets wrong (see `flashinfer_fused_rope_supports`) are rotated
+        exactly in fp32 instead, with the same cos/sin cache.
+
         Args:
             query (Tensor): Query tensor.
             key (Tensor): Key tensor.
@@ -2241,23 +2268,24 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         n = self.padded_active_token_count
         num_q_heads, head_size = query.shape[-2], query.shape[-1]
         num_k_heads = key.shape[-2]
+        rotary_dim = cos_sin_emb.shape[-1]
 
-        if head_size == 16 and not config.rotary_interleaved:
-            # FlashInfer's NeoX D16 vector crosses the half-head boundary and reads other heads.
-            rotary_dim = cos_sin_emb.shape[-1]
+        if not flashinfer_fused_rope_supports(head_size, rotary_dim, config.rotary_interleaved):
             cos, sin = cos_sin_emb[self.gpu_view.token_to_pos_ids[:n]].float().chunk(2, dim=-1)
             cos, sin = cos[:, None, None, :], sin[:, None, None, :]
 
             def rotate(tensor):
-                first, second = tensor[:n, ..., :rotary_dim].float().chunk(2, dim=-1)
-                return torch.cat(
-                    (
-                        first * cos - second * sin,
-                        second * cos + first * sin,
-                        tensor[:n, ..., rotary_dim:],
-                    ),
-                    dim=-1,
-                ).to(tensor.dtype)
+                rotated = tensor[:n, ..., :rotary_dim].float()
+                if config.rotary_interleaved:
+                    first, second = rotated[..., 0::2], rotated[..., 1::2]
+                else:
+                    first, second = rotated.chunk(2, dim=-1)
+                first, second = first * cos - second * sin, second * cos + first * sin
+                if config.rotary_interleaved:
+                    rotated = torch.stack((first, second), dim=-1).flatten(-2)
+                else:
+                    rotated = torch.cat((first, second), dim=-1)
+                return torch.cat((rotated, tensor[:n, ..., rotary_dim:]), dim=-1).to(tensor.dtype)
 
             return rotate(query), rotate(key)
 

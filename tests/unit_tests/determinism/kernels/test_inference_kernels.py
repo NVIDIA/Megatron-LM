@@ -8,8 +8,9 @@ fused KV append, the inference MoE activations and MXFP8 quantisation, the infer
 permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
 control), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM
 and top-k sum, the batch-invariant GEMM / log-softmax / mean kernels, the CUDA-graph
-routing-map padding mask, and the zeroing of padding-token rows. Multi-rank NVLS
-symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
+routing-map padding mask, the zeroing of padding-token rows, and the dynamic-inference
+fused RoPE (FlashInfer's kernel and its fp32 fallback). Multi-rank NVLS symmetric-memory
+collectives are exempted in the manifest (they need NVLink peers).
 """
 
 import inspect
@@ -979,6 +980,55 @@ def test_zero_padding_rows_replays():
         return activations
 
     assert_replays_bit_exact(fn, (activations,), backward=False, what="zero_padding_rows")
+
+
+@pytest.mark.parametrize(
+    "head_dim,rotary_dim,interleaved",
+    [(128, 128, False), (96, 24, True)],
+    ids=["flashinfer-D128-R128-neox", "fp32-D96-R24-interleaved"],
+)
+def test_flashinfer_fused_rope_replays(head_dim, rotary_dim, interleaved):
+    """Dynamic-inference fused RoPE replays bit-exactly on both of its paths.
+
+    D128-R128 NeoX runs FlashInfer's kernel. FlashInfer's interleaved kernel races on D96-R24
+    (its last vector spills into lanes other blocks store), so that shape is rotated in fp32
+    instead; sending it back to the kernel can show up here as a replay mismatch.
+    """
+    from megatron.core.inference.contexts import dynamic_context
+
+    assert dynamic_context.HAVE_FLASHINFER, "FlashInfer is not installed"
+    on_kernel = dynamic_context.flashinfer_fused_rope_supports(head_dim, rotary_dim, interleaved)
+    assert on_kernel == (head_dim == 128)
+    seeded()
+    tokens, max_positions = 4096, 8192
+    freqs = torch.outer(
+        torch.arange(max_positions, device="cuda", dtype=torch.float32),
+        torch.rand(rotary_dim // 2, device="cuda"),
+    )
+    cos_sin = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+    context = SimpleNamespace(
+        use_flashinfer_fused_rope=True,
+        padded_active_token_count=tokens,
+        gpu_view=SimpleNamespace(
+            token_to_pos_ids=torch.randint(0, max_positions, (tokens,), device="cuda")
+        ),
+    )
+    config = SimpleNamespace(rotary_interleaved=interleaved)
+    query = torch.randn(tokens, 1, 16, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(tokens, 1, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    def fn(query, key):
+        return dynamic_context.DynamicInferenceContext.apply_fused_qk_rotary_emb(
+            context, query, key, cos_sin, config
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (query, key),
+        backward=False,
+        contention=True,
+        what=f"fused RoPE D{head_dim}-R{rotary_dim}-{'interleaved' if interleaved else 'neox'}",
+    )
 
 
 @pytest.mark.launch_on_gb200
