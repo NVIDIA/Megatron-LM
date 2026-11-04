@@ -537,7 +537,9 @@ def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction):
             model = (
                 GPTModel(
                     config=config,
-                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True),
+                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                        qk_layernorm=True
+                    ),
                     vocab_size=256,
                     max_sequence_length=128,
                 )
