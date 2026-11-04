@@ -137,6 +137,8 @@ def test_fsdp2_swiglu_sharded_tensor_factory():
     """
     Test construction of a TP2 DP{N} ShardedTensor for SwiGLU.
     """
+    if Utils.world_size not in (4, 8):
+        pytest.skip("Expected offsets are tabulated for TP2-DP2 and TP2-DP4 (4 or 8 GPUs).")
     # Initialize distributed with TP2.
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -224,16 +226,12 @@ def test_fsdp2_swiglu_sharded_tensor_factory():
     assert shard.global_shape[0] == tp_size * dp_cp_size * toy_tensor_shape[0]
     # Expected global data offsets considering the parallelism ranks and tensor shape.
     expected_global_rank_offsets = {
-        # (TP Rank, DP Rank) -> Global Data Rank Location / Offset
-        (0, 0): 0,
-        (0, 1): 1,
-        (0, 2): 4,
-        (0, 3): 5,
-        (1, 0): 2,
-        (1, 1): 3,
-        (1, 2): 6,
-        (1, 3): 7,
-    }
+        # DP size -> (TP Rank, DP Rank) -> Global Data Rank Location / Offset
+        # TP2-DP2: checkpoint [W_tp0 W_tp1 V_tp0 V_tp1], model {W_tp0; V_tp0} {W_tp1; V_tp1}.
+        2: {(0, 0): 0, (0, 1): 2, (1, 0): 1, (1, 1): 3},
+        # TP2-DP4: see the mapping above.
+        4: {(0, 0): 0, (0, 1): 1, (0, 2): 4, (0, 3): 5, (1, 0): 2, (1, 1): 3, (1, 2): 6, (1, 3): 7},
+    }[dp_cp_size]
     assert (
         shard.global_offset[0]
         == expected_global_rank_offsets[(tp_rank, dp_cp_rank)] * toy_tensor_shape[0]

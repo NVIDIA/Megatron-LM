@@ -165,6 +165,15 @@ class MoEModelTestContainer:
         self.test_dtype = test_dtype
         if moe_tp_size is None:
             moe_tp_size = tp_size
+        # Decide on every rank, before any collective, whether this layout fits the launch, so
+        # an undersized launch skips the case instead of failing it on a rank-dependent schedule.
+        dense_size = tp_size * pp_size * cp_size
+        expert_size = moe_tp_size * ep_size * pp_size
+        if Utils.world_size % dense_size or Utils.world_size % expert_size:
+            pytest.skip(
+                f"needs a world size divisible by tp*pp*cp={dense_size} and "
+                f"etp*ep*pp={expert_size}; got {Utils.world_size}"
+            )
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=pp_size,
@@ -238,11 +247,6 @@ class MoEModelTestContainer:
         moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
-
-    def __del__(self):
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
-        Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def dispatcher_dropless_test(self):

@@ -5,6 +5,14 @@
 import pytest
 import torch
 import torch.nn.functional as F
+
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+# Without TE >= 2.19 the GTP core module stubs its TE symbols with MagicMock; running these
+# tests against the stubs fails with unrelated TypeError/ValueError instead of skipping.
+if not HAVE_GTP:
+    pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
+
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import MXFP8BlockScaling
 from transformer_engine.pytorch import fp8_autocast

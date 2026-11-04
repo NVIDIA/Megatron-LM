@@ -1328,6 +1328,10 @@ _unique_buffer_counts = {}
 
 class TestTECudaGraphHelper:
     @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.18.0")),
+        reason="Scheduler-produced THD TE CUDA graphs require TransformerEngine >= 2.18.0",
+    )
     @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
     def test_scheduler_thd_replay_preserves_pipeline_inputs(
         self, monkeypatch, pp_size, cp_size, chunks
