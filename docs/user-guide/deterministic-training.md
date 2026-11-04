@@ -58,7 +58,7 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 
 | Flag | Behavior under `--deterministic-mode` |
 |---|---|
-| `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
+| `--cross-entropy-loss-fusion` | Supported with `--cross-entropy-fusion-impl native`; the separate `te` implementation is rejected |
 | `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
 | `moe_router_aux_loss_fusion` | Must be off — asserted (TE's fused aux-loss kernel is non-deterministic); follows `moe_router_fusion` when unset |
 | `torch.use_deterministic_algorithms` | Set to `True` |

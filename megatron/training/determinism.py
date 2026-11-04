@@ -28,10 +28,7 @@ import torch.utils.deterministic
 
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
-ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
-    "cross_entropy_loss_fusion": False,
-    "tp_comm_overlap": False,
-}
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"tp_comm_overlap": False}
 
 # Not in the dict above because it inherits: unset means "follow moe_router_fusion".
 # TE's fused aux-loss kernel is non-deterministic: on identical input it returns a
@@ -158,9 +155,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     # haven't validated as deterministic; unset is fine.
     for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
         val = env.get(name)
-        assert val is None or val in accepted, (
-            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
-        )
+        assert (
+            val is None or val in accepted
+        ), f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
 
     # Mamba SSM and causal_conv1d auto-follow torch when unset; only reject an
     # explicit non-deterministic override.
@@ -229,6 +226,14 @@ def apply_determinism_to_args(args) -> None:
         for name, required in ARG_VALUES_REQUIRED_FOR_DETERMINISM.items()
         if (actual := getattr(args, name)) != required
     ]
+
+    # Native CE uses torch.compile reductions, whose configurations follow
+    # torch.use_deterministic_algorithms(True). TE is a separate backend and
+    # has not been qualified by the native CE replay matrix.
+    if getattr(args, "cross_entropy_loss_fusion", False):
+        ce_impl = getattr(args, "cross_entropy_fusion_impl", "native")
+        if ce_impl != "native":
+            mismatched.append(f"cross_entropy_fusion_impl='native' (got {ce_impl!r})")
 
     # Mirrors the TransformerConfig.__post_init__ fallback; no config exists yet here.
     aux_loss_fusion = getattr(args, AUX_LOSS_FUSION_ARG, None)

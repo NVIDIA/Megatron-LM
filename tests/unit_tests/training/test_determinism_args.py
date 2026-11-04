@@ -32,14 +32,18 @@ def restore_torch_determinism():
     """apply_determinism_to_args flips a torch global on the paths that don't raise."""
     was_enabled = torch.are_deterministic_algorithms_enabled()
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    was_filling = torch.utils.deterministic.fill_uninitialized_memory
     yield
     torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
+    torch.utils.deterministic.fill_uninitialized_memory = was_filling
 
 
 def make_args(**kwargs):
     """A Namespace holding only what apply_determinism_to_args reads."""
     defaults = {
         **ARG_VALUES_REQUIRED_FOR_DETERMINISM,
+        "cross_entropy_loss_fusion": False,
+        "cross_entropy_fusion_impl": "native",
         "moe_router_fusion": False,
         "moe_router_aux_loss_fusion": None,
     }
@@ -71,8 +75,24 @@ def test_guard_agrees_with_config_resolution(router_fusion, aux_loss_fusion):
 @pytest.mark.internal
 def test_other_required_args_still_checked():
     """The aux-loss branch is additive -- it must not shadow the dict-driven checks."""
-    with pytest.raises(AssertionError, match="cross_entropy_loss_fusion"):
-        apply_determinism_to_args(make_args(cross_entropy_loss_fusion=True))
+    with pytest.raises(AssertionError, match="tp_comm_overlap"):
+        apply_determinism_to_args(make_args(tp_comm_overlap=True))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("implementation", ["native", "te"])
+def test_cross_entropy_guard_distinguishes_backends(enabled, implementation):
+    """Allow native fusion under strict algorithms without enabling TE's separate path."""
+    args = make_args(cross_entropy_loss_fusion=enabled, cross_entropy_fusion_impl=implementation)
+    if enabled and implementation == "te":
+        with pytest.raises(AssertionError, match="cross_entropy_fusion_impl='native'"):
+            apply_determinism_to_args(args)
+    else:
+        apply_determinism_to_args(args)
+        assert torch.are_deterministic_algorithms_enabled()
+        assert not torch.utils.deterministic.fill_uninitialized_memory
+    assert args.cross_entropy_loss_fusion is enabled
+    assert args.cross_entropy_fusion_impl == implementation
 
 
 @pytest.mark.parametrize("scan_mode", [None, "1", "0"])
