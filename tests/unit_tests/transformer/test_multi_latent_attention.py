@@ -1753,7 +1753,7 @@ class TestFusedMLAPreMLPResidualNorm:
         results = []
         for layer in (reference, fused):
             layer_input = hidden_states.clone().requires_grad_(True)
-            output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
+            output, _ = layer(layer_input, attention_mask=attention_mask)
             output.backward(output_grad)
             grads = {
                 name: param.grad
