@@ -3027,7 +3027,14 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            # Materialize only the meta tensors. Keep tensors the module already
+                            # created on a device, such as a router's expert_bias zero-initialized
+                            # in __init__, since reset_parameters() does not restore them.
+                            device = self.device
+                            m._apply(
+                                lambda t: torch.empty_like(t, device=device) if t.is_meta else t,
+                                recurse=False,
+                            )
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
