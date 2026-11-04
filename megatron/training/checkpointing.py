@@ -134,6 +134,17 @@ _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_retention_max_forget', 0.10),
 )
 
+# Compared the same way as the wide-residual options rather than through _compare: a checkpoint
+# written before DSA existed has none of these attributes, and the correct substitute for an
+# absent one is None, which _compare reads as "no default was supplied".
+_DSA_ARG_DEFAULTS = (
+    ('experimental_attention_variant', None),
+    ('dsa_indexer_mode', 'standard'),
+    ('dsa_indexer_n_heads', None),
+    ('dsa_indexer_head_dim', None),
+    ('dsa_indexer_topk', None),
+)
+
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -182,9 +193,7 @@ def check_checkpoint_args(
     cfg = get_run_config()
     args = get_args()
     skip_args = skip_args or set()
-    no_default = object()
-
-    def _compare(arg_name, old_arg_name=None, default=no_default, *, config_section=None):
+    def _compare(arg_name, old_arg_name=None, default=None, *, config_section=None):
         """Prefer saved config values, falling back to args for older checkpoints."""
         if arg_name in skip_args:
             return
@@ -197,21 +206,14 @@ def check_checkpoint_args(
             if checkpoint_config is not None and config_section is not None
             else {}
         )
-        current_config = getattr(cfg, config_section) if config_section is not None else args
         if arg_name in saved_config:
             checkpoint_value = saved_config[arg_name]
-        elif default is not no_default:
+        elif default is not None:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name, default)
         else:
             checkpoint_value = getattr(checkpoint_args, ckpt_arg_name)
-        if default is not no_default:
-            # A supplied default also covers the attribute being absent outright, which is how a
-            # checkpoint written before an option existed compares equal to a run that leaves it
-            # unset. ``None`` is a legitimate default for the DSA options, so the sentinel rather
-            # than ``None`` marks "no default".
-            current_value = getattr(current_config, arg_name, default)
-        else:
-            current_value = getattr(current_config, arg_name)
+        current_config = getattr(cfg, config_section) if config_section is not None else args
+        current_value = getattr(current_config, arg_name)
         error_message = (
             '{} value from checkpoint ({}) is not equal to the input value ({}).'.format(
                 arg_name, checkpoint_value, current_value
@@ -243,12 +245,16 @@ def check_checkpoint_args(
     # values, so comparing them against the runtime's would reject exactly the
     # conversion the flag requests. The indexer is being rebuilt, not resumed, so
     # its geometry is not required to match. Every non-indexer comparison still runs.
-    if not getattr(args, 'dsa_reset_indexer_on_load', False):
-        _compare('experimental_attention_variant', default=None)
-        _compare('dsa_indexer_mode', default='standard')
-        _compare('dsa_indexer_n_heads', default=None)
-        _compare('dsa_indexer_head_dim', default=None)
-        _compare('dsa_indexer_topk', default=None)
+    if not args.dsa_reset_indexer_on_load:
+        for arg_name, default in _DSA_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
     if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
         def _dsa_trainability_mode(namespace):
             if getattr(namespace, 'dsa_train_indexer_only', False):
