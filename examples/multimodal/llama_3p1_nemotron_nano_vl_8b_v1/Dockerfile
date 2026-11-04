@@ -3,6 +3,7 @@ FROM nvcr.io/nvidia/pytorch:25.04-py3
 RUN apt update && \
     apt -y upgrade && \
     apt install -y --no-install-recommends \
+        ca-certificates \
         software-properties-common \
         build-essential \
         python3-pip \
