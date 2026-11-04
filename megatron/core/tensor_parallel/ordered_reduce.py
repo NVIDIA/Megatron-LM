@@ -2,54 +2,25 @@
 
 """Batch-invariant tensor-parallel reductions with a fixed rank-order sum.
 
-At TP >= 3 the order in which NCCL adds the TP partials of an element depends on where
-the element sits in the message (ring rotation, chunking, algorithm choice by message
-size). The training forward ([s, b] rows) and the inference engine (flat decode rows)
-place the same token at different positions, so the same token gets different bits.
-At TP = 2 the sum is a single commutative addition and NCCL is already exact.
-
-Every path in this module computes, for each element,
+At TP >= 3, NCCL's summation order for an element depends on its position in the message,
+so training and inference give the same token different bits. Every path here computes
 
     out = cast(((p_0 + p_1) + p_2) + ... + p_{TP-1})
 
-with p_r the partial of TP rank r upcast to fp32 (fp64 for fp64 inputs), the adds done
-in that accumulator with round-to-nearest, and a single final rounding to the output
-dtype. The bits of an element depend only on its TP partials, never on its position,
-the message size or the path that computed it, so the size thresholds below cannot
-change results.
+in an fp32 accumulator with one final rounding (fp64 inputs accumulate in fp64;
+``batch_invariant_collective="multimem"`` accumulates in fp64 and rounds to fp32 first), so
+the bits depend only on the partials.
 
-Paths:
-  * all-to-all + fold (any group, NCCL): one ``all_to_all_single`` of the partials
-    (the bytes a ring reduce-scatter moves, (TP-1)/TP of the input per rank) and one
-    Triton pass that reads the TP partials of the owned rows and writes the output dtype.
-  * symmetric-memory push (training, NVLink): the partials are in ordinary memory (the TE
-    GEMM output). One kernel stores each peer's rows into that peer's fixed-size symmetric
-    staging buffer (chunked, double-buffered, one block-level barrier per chunk) and folds
-    the staged partials in rank order. No receive buffer of the input's size, no NCCL.
-    Falls back to all-to-all + fold only without symmetric memory (e.g. a TP group
-    spanning NVLink domains).
-  * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
-    buffer; one kernel barriers through the signal pad, reads the owned slice from every
-    peer with plain loads (not multimem, whose in-switch reduction order is unspecified)
-    and folds in rank order.
+Paths (all bitwise identical):
+  * push (training): one kernel stores each peer's rows into its symmetric staging buffer
+    over NVLink and folds them in rank order.
+  * pull (inference): the GEMM writes into a symmetric buffer; one kernel reads the owned
+    rows from every peer and folds them in rank order.
+  * all-to-all + fold: NCCL fallback for groups without symmetric memory.
 
-Both symmetric-memory kernels read the peers' buffer addresses from the handle's device
-pointer array (``buffer_ptrs_dev``), so they run at any TP size within an NVLink domain; the
-16-byte alignment that vectorized loads need is checked at launch and stated to the compiler
-(see ``_peer_ptr``).
-
-The ordered all-reduce is ordered reduce-scatter + all-gather.
-Only forward reductions use these paths; backward keeps the stock collectives.
-
-With ``batch_invariant_tp_shards`` (see the last section) the partials are those of fixed
-reduction-dim shards rather than of TP ranks, so the bits do not depend on the TP size either.
-A rank that owns several shards passes one partial per shard to the paths above.
-
-The vocab-parallel cross-entropy denominator uses the same definition (last section).
-
-``batch_invariant_collective="multimem"`` (the EP combine's exact-sum setting) switches every
-path to an fp64 accumulator with one rounding to fp32 before the final cast. All paths stay
-bitwise identical to each other in either setting.
+The all-reduce is reduce-scatter + all-gather. Only forward reductions use these paths.
+With ``batch_invariant_tp_shards`` the partials are those of fixed reduction-dim shards, so
+the bits do not depend on the TP size either (see the last sections).
 """
 
 from typing import Optional, Tuple
