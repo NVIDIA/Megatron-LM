@@ -277,29 +277,6 @@ class ConfigContainerBase:
         return result
 
 
-def _derive_checkpoint_policy(checkpoint: CheckpointConfig) -> None:
-    """The checkpoint derivations both containers apply at finalize: the ones ``validate_args``
-    applies to the arguments (a conversion exits on a missing checkpoint; an asynchronous
-    distributed save needs the persistent worker; a replication jump without replication is
-    dropped). Each warning fires only when a value changes, so a CLI run stays silent; a second
-    finalize changes nothing. The training container adds the ``skip_train`` rule inline."""
-    from megatron.training.utils import warn_rank_0
-
-    if checkpoint.ckpt_convert_format is not None:
-        checkpoint.exit_on_missing_checkpoint = True
-    if checkpoint.use_dist_ckpt and checkpoint.async_save and not checkpoint.use_persistent_ckpt_worker:
-        # A legacy torch save keeps async_save and reaches the unsupported-async error in
-        # save_checkpoint, as before.
-        warn_rank_0(
-            '--async-save is not supported without --use-persistent-ckpt-worker. '
-            'Disabling --async-save.'
-        )
-        checkpoint.async_save = False
-    if not checkpoint.replication and checkpoint.replication_jump:
-        warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
-        checkpoint.replication_jump = None
-
-
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
@@ -603,9 +580,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         from megatron.training import get_args
 
         # Checkpoint derivations first: the RL check below reads the derived load_optim. The
-        # conditions are validate_args', and each warning fires only when a value changes, so a
-        # CLI run, whose arguments validate_args already normalized, stays silent.
-        _derive_checkpoint_policy(self.checkpoint)
+        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
+        # run, whose arguments validate_args already normalized, stays silent.
+        if self.checkpoint.ckpt_convert_format is not None:
+            # A conversion run exits instead of training from random weights.
+            self.checkpoint.exit_on_missing_checkpoint = True
         if self.validation.skip_train and self.checkpoint.load_optim:
             from megatron.training.utils import warn_rank_0
 
@@ -735,4 +714,7 @@ class InferenceConfigContainer(ConfigContainerBase):
 
     def _finalize(self) -> None:
         super()._finalize()
-        _derive_checkpoint_policy(self.checkpoint)
+        if self.checkpoint.ckpt_convert_format is not None:
+            # A conversion run (the checkpoint converters bootstrap through this container) exits
+            # instead of loading random weights, as validate_args derives it.
+            self.checkpoint.exit_on_missing_checkpoint = True

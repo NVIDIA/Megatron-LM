@@ -622,15 +622,17 @@ class CheckpointConfig:
     Makes DistributedOptimizer checkpoint non-reshardable."""
 
     async_save: bool = False
-    """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
+    """Save checkpoints asynchronously. Distributed formats only (torch_dist, torch_dcp,
+    fsdp_dtensor; a legacy torch save cannot be asynchronous), and requires
+    ``use_persistent_ckpt_worker``."""
 
     async_strategy: Literal["nvrx"] = "nvrx"
     """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
-    """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
-    worker thread/process for handling async saves. When disabled, uses temporal workers that are
-    created and destroyed for each save operation."""
+    """Use a persistent background worker for async checkpoint saves: a dedicated worker
+    thread/process that outlives each save. Required when ``async_save`` is set (an asynchronous
+    distributed save is rejected without it)."""
 
     async_ckpt_cpu_priority: int = 10
     """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
@@ -806,18 +808,19 @@ class CheckpointConfig:
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
-        # The effective async policy: without a persistent worker a distributed async save is
-        # disabled when the container finalizes, so the capability is only required
-        # when the save stays asynchronous.
-        if (
-            self.async_save
-            and self.use_persistent_ckpt_worker
-            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
-        ):
-            assert has_nvrx_checkpointing_async_support(), (
-                "A compatible nvidia-resiliency-ext installation is required to enable "
-                "async save with async_strategy='nvrx'."
+        # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
+        # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes
+        # the same requirement; Megatron-LM used to warn and fall back to a synchronous save.
+        if self.use_dist_ckpt and self.async_save:
+            assert self.use_persistent_ckpt_worker, (
+                "--async-save requires --use-persistent-ckpt-worker: an asynchronous distributed "
+                "save needs the persistent checkpoint worker."
             )
+            if self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+                assert has_nvrx_checkpointing_async_support(), (
+                    "A compatible nvidia-resiliency-ext installation is required to enable "
+                    "async save with async_strategy='nvrx'."
+                )
 
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
@@ -903,6 +906,11 @@ class CheckpointConfig:
             assert not self.finetune, \
                 "Cannot override checkpoint iteration together with finetune flag."
 
+        if self.replication_jump and not self.replication:
+            raise AssertionError(
+                "--replication-jump was specified without --replication; pass --replication or "
+                "drop the jump (Megatron-LM used to ignore it)."
+            )
         if self.replication:
             assert self.replication_jump is not None, \
                 "--replication requires the value of --replication-jump!"

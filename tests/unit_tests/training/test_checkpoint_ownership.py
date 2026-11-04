@@ -190,6 +190,9 @@ def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias
         (["--override-ckpt-iteration", "3", "--finetune"], "Cannot override checkpoint iteration"),
         (["--replication"], "requires the value of --replication-jump"),
         (["--replication", "--replication-jump", "2"], "non_persistent_ckpt_type == 'local'"),
+        (["--replication-jump", "2"], "without --replication"),
+        (["--async-save"], "requires --use-persistent-ckpt-worker"),
+        (["--async-save", "--ckpt-format", "torch_dcp"], "requires --use-persistent-ckpt-worker"),
         (
             [
                 "--ckpt-pg-tensors-cache-path",
@@ -220,8 +223,9 @@ def test_validation_accepts_what_validate_args_accepted():
     for argv in (
         [],
         CLI_CASE,
-        ["--replication-jump", "2"],
-        ["--async-save"],
+        ["--async-save", "--use-persistent-ckpt-worker"],
+        ["--async-save", "--ckpt-format", "torch"],  # rejected by save_checkpoint, not here
+        ["--replication-jump", "0"],  # a zero jump is not a jump
         ["--save", "/s"],
         ["--save", "/s", "--save-interval", "0"],
     ):
@@ -243,13 +247,14 @@ def test_inference_defaults_apply_before_the_checkpoint_checks():
 
 
 @pytest.mark.parametrize("supported", [False, True])
-def test_format_prerequisites_follow_the_effective_async_policy(monkeypatch, supported):
+def test_an_async_save_needs_the_worker_before_the_format_capability(monkeypatch, supported):
     from megatron.training import utils
 
     monkeypatch.setattr(utils, "has_nvrx_checkpointing_async_support", lambda: supported)
-    # Without a persistent worker a distributed async save is disabled at finalize, so the
-    # capability is not required; with one it is.
-    CheckpointConfig(async_save=True, ckpt_format="torch_dcp").validate()
+    # The worker requirement is reported first, whatever the capability; with the worker, the
+    # torch_dcp / fsdp_dtensor formats need the NVRx capability.
+    with pytest.raises(AssertionError, match="requires --use-persistent-ckpt-worker"):
+        CheckpointConfig(async_save=True, ckpt_format="torch_dcp").validate()
     config = CheckpointConfig(
         async_save=True, ckpt_format="torch_dcp", use_persistent_ckpt_worker=True
     )
@@ -343,48 +348,53 @@ def warnings_log(monkeypatch):
     return log
 
 
-def _flippable():
-    return dict(
-        async_save=True,
-        use_persistent_ckpt_worker=False,
-        replication_jump=3,
-        ckpt_convert_format="torch",
-        ckpt_convert_save="/converted",
-        load="/ckpt",
-    )
+def _conversion():
+    return dict(ckpt_convert_format="torch", ckpt_convert_save="/converted", load="/ckpt")
 
 
 @pytest.mark.parametrize("inference", [False, True])
-def test_finalize_applies_the_legacy_flips_once(monkeypatch, run_config, warnings_log, inference):
+def test_finalize_derives_the_conversion_exit_flag_once(
+    monkeypatch, run_config, warnings_log, inference
+):
+    """The one derivation left on the section (a conversion run exits on a missing checkpoint)
+    runs at finalize on both containers; the training container adds the skip_train rule."""
     if inference:
-        cfg = _inference_container(**_flippable())
+        cfg = _inference_container(**_conversion())
     else:
         cfg = run_config
-        cfg.checkpoint = CheckpointConfig(**_flippable())
+        cfg.checkpoint = CheckpointConfig(**_conversion())
         cfg.validation.skip_train = True
         cfg.train.micro_batch_size = 1
         monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     cfg.validate()
-    assert warnings_log == []
+    assert cfg.checkpoint.exit_on_missing_checkpoint is False and warnings_log == []
     cfg.finalize()
     checkpoint = cfg.checkpoint
     assert checkpoint.exit_on_missing_checkpoint is True
-    assert checkpoint.async_save is False
-    assert checkpoint.replication_jump is None
     assert checkpoint.load_optim is inference
-    assert len(warnings_log) == (2 if inference else 3)
+    assert len(warnings_log) == (0 if inference else 1)
     # Already derived: a second finalize changes nothing and repeats no warning.
     cfg.finalize()
-    assert len(warnings_log) == (2 if inference else 3)
+    assert len(warnings_log) == (0 if inference else 1)
 
 
-def test_the_flips_keep_their_legacy_conditions(monkeypatch, run_config, warnings_log):
-    # The async flip applies to distributed formats only: a legacy torch save keeps async_save.
+def test_the_invalid_combinations_are_errors_not_flips(monkeypatch, run_config, warnings_log):
+    """What validate_args used to warn about and rewrite is rejected by validate() (as
+    Megatron-Bridge does): an asynchronous distributed save without the persistent worker, a
+    replication jump without replication. The legacy conditions still bound the rules."""
+    with pytest.raises(AssertionError, match="requires --use-persistent-ckpt-worker"):
+        _inference_container(async_save=True, ckpt_format="torch_dist").validate()
+    with pytest.raises(AssertionError, match="without --replication"):
+        _inference_container(replication_jump=3).validate()
+    # The worker rule applies to distributed formats only: a legacy torch async save is rejected
+    # later, by save_checkpoint, as before.
     legacy_torch = _inference_container(async_save=True, ckpt_format="torch")
+    legacy_torch.validate()
     legacy_torch.finalize()
     assert legacy_torch.checkpoint.async_save is True
-    # A zero jump is not "a jump": nothing to clear.
+    # A zero jump is not "a jump".
     zero_jump = _inference_container(replication_jump=0)
+    zero_jump.validate()
     zero_jump.finalize()
     assert zero_jump.checkpoint.replication_jump == 0
     # --skip-train only evaluates, under an RL step too (rollout collection without updates is
@@ -518,14 +528,9 @@ def test_autoresume_saves_only_when_the_section_has_a_save_directory(
 
 def test_fault_tolerance_sees_the_finalized_checkpoint_policy(monkeypatch, run_config):
     """pretrain() finalizes the container before fault tolerance captures the checkpoint policy
-    (save directory, async mode): the setup sees the derived values, here the async flip of a
-    distributed save without a persistent worker."""
-    run_config.checkpoint = CheckpointConfig(
-        save="/ckpt/out",
-        async_save=True,
-        ckpt_format="torch_dist",
-        use_persistent_ckpt_worker=False,
-    )
+    (save directory, async mode): the setup sees the derived values, here the conversion run's
+    exit flag."""
+    run_config.checkpoint = CheckpointConfig(save="/ckpt/out", **_conversion())
     run_config.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     monkeypatch.setattr(run_config, "_validate_rl_config", lambda *a, **k: None)
@@ -535,13 +540,13 @@ def test_fault_tolerance_sees_the_finalized_checkpoint_policy(monkeypatch, run_c
         pass
 
     def setup():
-        seen.append(global_vars.get_run_config().checkpoint.async_save)
+        seen.append(global_vars.get_run_config().checkpoint.exit_on_missing_checkpoint)
         raise StopAtFaultTolerance  # Before initialize_megatron.
 
     monkeypatch.setattr(training.ft_integration, "setup", setup)
     with patch("megatron.training.utils.warn_rank_0"), pytest.raises(StopAtFaultTolerance):
         training.pretrain(run_config, None, None, None)
-    assert seen == [False] and run_config._finalized
+    assert seen == [True] and run_config._finalized
 
 
 # ---- the cross-section rules reach every CLI entry point ----

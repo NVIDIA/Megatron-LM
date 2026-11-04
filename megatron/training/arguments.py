@@ -1695,14 +1695,6 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
-    if args.use_dist_ckpt and args.async_save:
-        if not args.use_persistent_ckpt_worker:
-            warn_rank_0(
-                '--async-save is not supported without --use-persistent-ckpt-worker. '
-                'Disabling --async-save.'
-            )
-            args.async_save = False
-
     if args.logits_save_dir is not None:
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
@@ -1769,10 +1761,8 @@ def validate_args(args, defaults={}):
         ),
     )
 
-    # Local checkpointing and replication prerequisites are checked by CheckpointConfig.validate().
-    if not args.replication and args.replication_jump:
-        warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
-        args.replication_jump = None
+    # Local checkpointing and replication prerequisites, the async-save worker requirement and a
+    # replication jump without replication are checked by CheckpointConfig.validate().
 
     if args.delay_wgrad_compute:
         assert args.transformer_impl == 'transformer_engine', \
