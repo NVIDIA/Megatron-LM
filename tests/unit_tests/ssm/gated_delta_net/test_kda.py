@@ -501,6 +501,14 @@ def test_kda_packed_matches_unpacked_cp1():
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
 def test_kda_selective_recompute(recompute_module):
     Utils.initialize_model_parallel(1, 1)
+    # The bitwise checks below need both forwards to run the same code. The checkpointed "gdn"
+    # forward is the only no-grad call of the torch.compile'd GDN/KDA helpers in this module, so
+    # it needs new Dynamo cache entries; the preceding tests (TP, sequence-parallel, low-rank and
+    # legacy projections) already fill the per-function recompile limit of the shared
+    # _prepare_input_for_gated_delta_rule, and a call past that limit silently runs eagerly,
+    # which differs from the compiled base forward at the BF16 ULP level. Start from an empty
+    # compile cache so both passes compile.
+    torch._dynamo.reset()
     try:
 
         def run(module, hidden_states):
