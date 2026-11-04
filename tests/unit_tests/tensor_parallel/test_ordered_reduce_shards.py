@@ -42,7 +42,6 @@ def _inputs(m, k, n, seed):
 @requires_4
 class TestShardReductions:
     def teardown_method(self, method):
-
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
@@ -60,7 +59,7 @@ class TestShardReductions:
     def test_reduce_scatter_shards_is_the_canonical_value(self, tp, shards, path, monkeypatch):
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        if path == "all_to_all":  # no staging -> grouped NCCL send/recv + fold
+        if path == "all_to_all":  # no staging -> all-to-all + fold
             monkeypatch.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
         m, k, n = 64 * tp, 512 * shards, 448
         x, w = _inputs(m, k, n, 1)  # identical on every rank
@@ -120,7 +119,6 @@ class TestTERowParallelShards:
     @pytest.mark.parametrize("tp", [1, 2, 4])
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     def test_te_row_parallel_tp_invariant(self, tp, sequence_parallel):
-
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
         shards, k, n, m = 4, 2048, 512, 64
@@ -246,8 +244,25 @@ def test_cross_entropy_is_tp_and_batch_invariant():
         Utils.destroy_model_parallel()
 
 
-def test_config_rejects_unsupported_multi_shard_combinations():
+def test_config_rejects_fused_tp_communication_under_batch_invariance():
+    """The fused NVLS reduce-scatter + add + norm + all-gather is not used under batch
+    invariance, so the next layer would read a symmetric buffer nothing wrote."""
+    with pytest.raises(AssertionError, match="inference_fuse_tp_communication"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            batch_invariant_mode=True,
+            transformer_impl="inference_optimized",
+            inference_fuse_tp_communication=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+        )
 
+
+def test_config_rejects_unsupported_multi_shard_combinations():
     base = dict(
         num_layers=1,
         hidden_size=64,

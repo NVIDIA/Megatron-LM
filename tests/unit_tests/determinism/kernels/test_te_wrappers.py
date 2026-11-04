@@ -1082,7 +1082,7 @@ def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_par
             HIDDEN,
             config=_config(
                 tensor_model_parallel_size=tp,
-                sequence_parallel=sequence_parallel and tp > 1,
+                sequence_parallel=sequence_parallel,
                 batch_invariant_mode=True,
                 batch_invariant_tp_shards=shards,
                 add_bias_linear=False,

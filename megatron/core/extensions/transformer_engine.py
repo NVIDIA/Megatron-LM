@@ -1273,9 +1273,9 @@ class TENorm:
 class _BITPForward(enum.Enum):
     """How a row-parallel TELinear does its forward TP reduction (see TELinear.__init__)."""
 
-    TE = "te"  # TE's linear and reduction (stock; also batch-invariant at TP <= 2)
-    ORDERED_REDUCE = "ordered_reduce"  # TE's local GEMM, then Megatron's ordered reduction
-    SHARD_GEMMS = "shard_gemms"  # Megatron's shard GEMMs and shard-order reduction
+    TE = enum.auto()  # TE's linear and reduction (stock; also batch-invariant at TP <= 2)
+    ORDERED_REDUCE = enum.auto()  # TE's local GEMM, then Megatron's ordered reduction
+    SHARD_GEMMS = enum.auto()  # Megatron's shard GEMMs and shard-order reduction
 
 
 class TELinear(te.pytorch.Linear):

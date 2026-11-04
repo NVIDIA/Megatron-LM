@@ -4822,6 +4822,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.num_moe_experts is None
             ), "--inference-fuse-tp-communication is not supported for MoE models."
+            # The fused reduce-scatter + add + norm + all-gather is an NVLS multimem kernel;
+            # batch-invariant mode reduces with the ordered sum instead, and the next layer
+            # would read a symmetric buffer that the fused kernel never wrote.
+            assert (
+                not self.batch_invariant_mode
+            ), "inference_fuse_tp_communication with batch_invariant_mode is not built yet."
 
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (

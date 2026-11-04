@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.extensions.transformer_engine import TERowParallelLinear
+from megatron.core.extensions.transformer_engine import TERowParallelLinear, _BITPForward
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel import ordered_reduce as orr
@@ -127,7 +127,7 @@ class TestOrderedReduce:
             assert torch.equal(y.grad, torch.ones_like(y))
 
     @pytest.mark.parametrize("exact", [False, True])
-    def test_symmetric_memory_paths_match_all_to_all(self, exact):
+    def test_symmetric_memory_paths_match_all_to_all(self, exact, monkeypatch):
         """The inference (symmetric-memory pull) path gives the all-to-all path's bits."""
         buf, hdl = _symm_buffer(self.group, 64 << 20)
         if hdl is None:
@@ -142,7 +142,9 @@ class TestOrderedReduce:
                 sin.copy_(x)
                 rs = torch.empty(rows // TP, hidden, dtype=dtype, device="cuda")
                 orr.symm_ordered_reduce_scatter(sin, hdl, rs, exact=exact)
-                ref_rs = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                with monkeypatch.context() as m:  # no staging -> all-to-all + fold
+                    m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
+                    ref_rs = orr.ordered_reduce_scatter(x, self.group, exact=exact)
                 assert torch.equal(_bits(rs), _bits(ref_rs))
 
     def test_inference_embedding_reduce_scatter_takes_a_view(self):
@@ -281,7 +283,7 @@ def _check_te_row_parallel_linear(sequence_parallel):
         skip_bias_add=False,
         is_expert=False,
     ).cuda()
-    assert layer._bi_tp_forward.value == "ordered_reduce"
+    assert layer._bi_tp_forward is _BITPForward.ORDERED_REDUCE
     # The push staging is allocated at construction, outside any forward or graph capture.
     assert SymmetricMemoryManager.is_initialized(orr._push_staging_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
@@ -346,7 +348,7 @@ def test_tp3_symmetric_memory_paths():
 
         symm = SymmetricMemoryManager.get_buffer("tp3_test", process_group=group)
         buf = symm.maybe_get_tensor(list(x.shape), dtype=x.dtype)
-        assert orr.can_use_symm_pull(buf["handle"], x)
+        assert buf["handle"] is not None
         buf["tensor"].copy_(x)
         out = orr.symm_ordered_reduce_scatter(buf["tensor"], buf["handle"])
         assert torch.equal(_bits(out), _bits(ref))

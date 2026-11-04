@@ -8,7 +8,7 @@ from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import divide, get_pg_rank, get_pg_size
 
 from .ordered_reduce import batch_invariant_vocab_sum
 from .utils import VocabUtility
@@ -123,7 +123,9 @@ class VocabParallelCrossEntropy:
             predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
         world_size = get_pg_size(tp_group)
-        local_shards = batch_invariant_tp_shards // world_size if batch_invariant_tp_shards else 1
+        local_shards = (
+            divide(batch_invariant_tp_shards, world_size) if batch_invariant_tp_shards else 1
+        )
         sum_exp_logits = batch_invariant_vocab_sum(vocab_parallel_logits, tp_group, local_shards)
         return (
             target_mask,

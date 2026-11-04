@@ -26,7 +26,6 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.tensor_parallel.ordered_reduce import (
-    can_use_symm_pull,
     ordered_reduce_scatter_shards,
     row_parallel_shard_partials,
     symm_ordered_reduce_scatter,
@@ -485,7 +484,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
 
         if use_ordered_tp_reduce(self.tp_group, x.dtype):
-            return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer, use_mxfp8)
+            return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer)
 
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
@@ -557,15 +556,15 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             # do not fit, and the NCCL path below gives the same bits.
             dims = [c, *x.shape[:-1], self.weight.size(0)]
             symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
-            if symm["handle"] is not None and can_use_symm_pull(symm["handle"], x):
+            if symm["handle"] is not None:
                 # The GEMM writes the shard partials straight into the symmetric buffer; one
                 # kernel pulls the owned rows of every peer's partials and folds them.
                 parts = row_parallel_shard_partials(x, self.weight, c, out=symm["tensor"])
                 return symm_ordered_reduce_scatter_shards(parts, symm["handle"])
         parts = row_parallel_shard_partials(x, self.weight, c)
-        return ordered_reduce_scatter_shards(parts, self.tp_group if self.tp_size > 1 else None)
+        return ordered_reduce_scatter_shards(parts, self.tp_group)
 
-    def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer, use_mxfp8):
+    def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer):
         """Batch-invariant mode at TP >= 3: reduce-scatter with the fixed rank-order sum.
 
         Gives the same bits as the training forward (tensor_parallel/ordered_reduce.py).
@@ -573,11 +572,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         from every peer and folds them; otherwise all-to-all + fold. Called from
         _matmul_reduce_scatter when ``use_ordered_tp_reduce`` holds (one shard per rank).
         """
-        if (
-            self.triton_nvls_kernels_allowed
-            and symm_mem_buffer["handle"] is not None
-            and can_use_symm_pull(symm_mem_buffer["handle"], x)
-        ):
+        if self.triton_nvls_kernels_allowed and symm_mem_buffer["handle"] is not None:
             # The GEMM writes straight into the symmetric buffer: native kernels, and the
             # batch-invariant aten::mm.out override, give the same bits as without out=.
             x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
@@ -702,9 +697,7 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
             buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
             symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
-            if symm_mem_buffer["handle"] is not None and can_use_symm_pull(
-                symm_mem_buffer["handle"], x
-            ):
+            if symm_mem_buffer["handle"] is not None:
                 symm_mem_buffer["tensor"].copy_(x)
                 return symm_ordered_reduce_scatter(
                     symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
