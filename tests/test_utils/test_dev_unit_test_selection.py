@@ -81,6 +81,5 @@ def test_every_unit_file_has_exactly_one_platform_bucket(monkeypatch, capsys, pl
             "tests/unit_tests/ssm/test_gdn_gated_output_norm_distributed.py",
             "tests/unit_tests/fusions/test_fused_mhc_kernels.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py",
-            "tests/unit_tests/optimizer/test_muon_sync_qkv_cpu.py",
         ):
             assert owners[path] == 1
