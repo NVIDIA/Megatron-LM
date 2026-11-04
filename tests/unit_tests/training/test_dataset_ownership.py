@@ -1203,3 +1203,52 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
             cfg.validate()
         transformer.variable_seq_lengths = True  # the pair a Python caller must set together
         cfg.validate()
+
+
+@pytest.mark.parametrize("legacy_length", [32, None])
+def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, legacy_length):
+    """Packed metadata must describe the actual samples even with stale or missing args."""
+    from unittest.mock import MagicMock
+
+    import torch
+
+    import pretrain_gpt
+    from megatron.training.distillation import logits_saver
+
+    args = Namespace() if legacy_length is None else Namespace(seq_length=legacy_length)
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    cfg = SimpleNamespace(data=DataConfig(dataset=dataset), model=SimpleNamespace(seq_length=64))
+    cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32)
+    tokens = torch.zeros((1, 16), dtype=torch.long)
+    batch = (
+        None,
+        cu_seqlens,
+        cu_seqlens,
+        None,
+        tokens,
+        None,
+        tokens,
+        torch.tensor(8),
+        tokens,
+        tokens,
+    )
+    model = MagicMock(vp_stage=None, pg_collection=None)
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(pretrain_gpt, "get_batch", lambda *a, **kw: batch)
+    monkeypatch.setattr(pretrain_gpt, "get_timers", MagicMock())
+    monkeypatch.setattr(pretrain_gpt, "stimer", MagicMock())
+    monkeypatch.setattr(pretrain_gpt, "update_seqlen_stats_from_cu_seqlens", lambda *a: None)
+    monkeypatch.setattr(logits_saver, "get_logits_saver", lambda: None)
+
+    pretrain_gpt.forward_step(None, model)
+
+    packed = model.call_args.kwargs["packed_seq_params"]
+    assert packed.tokens_per_sample == 16
+    assert torch.equal(packed.cu_seqlens_q, cu_seqlens.squeeze(0))

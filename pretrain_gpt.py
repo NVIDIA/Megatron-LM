@@ -30,9 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import (
-    get_mtp_ranks,
-)
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -407,7 +405,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=hybrid_cp_group,
-                    tokens_per_sample=args.seq_length,
+                    tokens_per_sample=data_sequence_length(get_run_config(), args),
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
