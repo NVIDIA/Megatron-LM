@@ -1671,15 +1671,14 @@ def _reset_dsa_indexer_modules_with_current_rng(model) -> int:
             if not _is_dsa_indexer_module_name(module_name):
                 continue
             reset_module_count += 1
-            for child_name, child in module.named_modules():
-                if child_name == "":
-                    continue
+            for _child_name, child in module.named_modules():
                 child_params = list(child.named_parameters(recurse=False))
                 if not child_params:
                     continue
-                has_matrix_param = any(param.ndim >= 2 for _, param in child_params)
-                if has_matrix_param:
+                if any(param.ndim >= 2 for _, param in child_params):
                     for param_name, param in child_params:
+                        if not param.requires_grad:
+                            continue
                         with torch.no_grad():
                             if param.ndim >= 2:
                                 if init_method is None:
@@ -1690,19 +1689,8 @@ def _reset_dsa_indexer_modules_with_current_rng(model) -> int:
                                 init_method(param)
                             elif param_name == "bias":
                                 param.zero_()
-                            elif param_name == "weight":
-                                param.fill_(1.0)
                 elif hasattr(child, "reset_parameters"):
                     child.reset_parameters()
-                else:
-                    for param_name, param in child_params:
-                        with torch.no_grad():
-                            if param_name == "bias":
-                                param.zero_()
-                            elif param_name == "weight":
-                                param.fill_(1.0)
-                            else:
-                                param.zero_()
 
     return reset_module_count
 
@@ -1760,12 +1748,10 @@ def _broadcast_dsa_indexer_params(model) -> None:
     if get_pg_size(data_parallel_group) == 1:
         return
     src_rank = torch.distributed.get_global_rank(data_parallel_group, 0)
-    seen_param_ids = set()
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
-            if not _is_dsa_indexer_param_name(name) or id(param) in seen_param_ids:
+            if not _is_dsa_indexer_param_name(name):
                 continue
-            seen_param_ids.add(id(param))
             torch.distributed.broadcast(param.data, src=src_rank, group=data_parallel_group)
 
 
@@ -1797,15 +1783,10 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
         return 0
 
     cleared = 0
-    seen_param_ids = set()
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
             if not _is_dsa_indexer_param_name(name):
                 continue
-            param_id = id(param)
-            if param_id in seen_param_ids:
-                continue
-            seen_param_ids.add(param_id)
             optim_param = param_to_optim_param.get(param)
             if optim_param is not None and optim_param in optimizer_state:
                 optimizer_state.pop(optim_param, None)
@@ -1831,12 +1812,10 @@ def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
         getattr(optimizer, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False
     )
     refreshed = 0
-    seen_param_ids = set()
     for model_chunk in model:
         for name, model_param in model_chunk.named_parameters():
-            if not _is_dsa_indexer_param_name(name) or id(model_param) in seen_param_ids:
+            if not _is_dsa_indexer_param_name(name):
                 continue
-            seen_param_ids.add(id(model_param))
             optim_param = param_to_optim_param.get(model_param)
             if optim_param is None:
                 # A distributed-optimizer rank need not own a shard of every model parameter.
