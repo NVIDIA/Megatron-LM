@@ -767,10 +767,21 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     no ``.item()`` -- so this is a fused kernel launch with no host sync. The
     ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
     the all-reduce; BSHD callers that never invoke this function leave the
-    flag at ``False`` and pay zero collective cost.
+    flag at ``False`` and pay zero collective cost. Once
+    ``set_seqlen_stats_in_iteration`` has seeded the iteration with global-batch sums
+    (sequence-packing scheduler), per-micro-batch contributions are ignored until the
+    stats are consumed.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return
+    if _seqlen_stats_are_global:
+        # The sequence-packing scheduler already seeded this iteration with the exact
+        # global-batch sums (``set_seqlen_stats_in_iteration``). Its ContextParallelBatch
+        # still carries ``cu_seqlens``, so the per-micro-batch callers run on every rank;
+        # adding their contributions here would switch the accumulator back to per-rank
+        # mode and ``consume_*`` would all-reduce the seeded sums once per rank on top of
+        # them, inflating the reported FLOPs. The seeded values are authoritative.
         return
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
