@@ -243,7 +243,6 @@ def _mxfp8_quant_swizzle_rows_kernel(
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
 ):
     """Persistent variant: a fixed grid quantizes only the first ``n_rows`` rows.
 
@@ -253,7 +252,7 @@ def _mxfp8_quant_swizzle_rows_kernel(
     """
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr).to(tl.int64)
-    for row in tl.range(pid, n_rows, NUM_PROGRAMS):
+    for row in tl.range(pid, n_rows, tl.num_programs(0)):
         _mxfp8_quant_swizzle_row(
             row.to(tl.int64),
             out_ptr,
@@ -300,7 +299,6 @@ def mxfp8_quantize_rows(
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
-        NUM_PROGRAMS=num_programs,
     )
     return out_data, out_scale.view(torch.float8_e8m0fnu)
 

@@ -3,7 +3,8 @@
 
 FlashInfer is adding the matching `num_active_tokens` argument to the two kernels Megatron calls:
 
-- `cutlass_fused_moe` (bf16 experts): flashinfer-ai/flashinfer#6783
+- `cutlass_fused_moe` (bf16 experts, and MXFP8 experts with the tanh-clamped activation):
+  flashinfer-ai/flashinfer#6783, which also has to accept the fp32 `output` for MXFP8 activations
 - `trtllm_fp8_block_scale_routed_moe` (MXFP8 experts): flashinfer-ai/flashinfer#6784
 
 Until a FlashInfer release ships them, this module exports both kernels under their own names,
@@ -17,7 +18,8 @@ UNWIND, once `pyproject.toml` requires a FlashInfer release that ships both chan
 1. `megatron/core/transformer/moe/experts.py`:
     import `cutlass_fused_moe` from `flashinfer.fused_moe` instead of this module.
 2. `megatron/core/inference/moe/flashinfer_mxfp8.py`:
-    import `trtllm_fp8_block_scale_routed_moe` from `flashinfer.fused_moe` instead of this module.
+    import `cutlass_fused_moe` and `trtllm_fp8_block_scale_routed_moe` from `flashinfer.fused_moe`
+    instead of this module.
 3. Delete this file, `tests/unit_tests/determinism/kernels/test_flashinfer_active_tokens.py` and
    the `inference_flashinfer_active_tokens` entry of
    `tests/unit_tests/determinism/kernels/manifest.py`.
@@ -214,6 +216,9 @@ def cutlass_fused_moe(
     *,
     activation_type: int,
     quant_scales: list[torch.Tensor] | None = None,
+    input_sf: torch.Tensor | None = None,
+    swizzled_input_sf: bool = True,
+    use_mxfp8_act_scaling: bool = False,
     clamped_relu2_limit: torch.Tensor | None = None,
     ep_size: int = 1,
     ep_rank: int = 0,
@@ -225,7 +230,8 @@ def cutlass_fused_moe(
     Forwarded unchanged when FlashInfer accepts the argument, or when it is None. Otherwise the
     kernel runs with its non-filling finalize (`enable_alltoall=True`), which writes a bf16 row
     only for tokens that route to a local expert, and `combine_valid_rows` copies the live rows
-    into the fp32 `output`. Returns `[output]`, as the kernel does.
+    into the fp32 `output`. MXFP8 activations (`use_mxfp8_act_scaling` with `input_sf`) take the
+    same path; the kernel finalizes them to bf16 before the copy. Returns `[output]`, as the kernel.
     """
     if _cutlass_fused_moe is None:
         raise RuntimeError("flashinfer-python is required for cutlass_fused_moe.")
@@ -237,6 +243,9 @@ def cutlass_fused_moe(
         fc1_expert_weights,
         fc2_expert_weights,
         quant_scales=quant_scales,
+        input_sf=input_sf,
+        swizzled_input_sf=swizzled_input_sf,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         activation_type=activation_type,
         clamped_relu2_limit=clamped_relu2_limit,
         ep_size=ep_size,
@@ -247,7 +256,9 @@ def cutlass_fused_moe(
     if CUTLASS_MOE_HAS_ACTIVE_TOKENS:
         return kernel(output_dtype, output=output, num_active_tokens=num_active_tokens)
     assert output is not None, "the emulated num_active_tokens needs an fp32 output buffer"
-    kernel_rows = kernel(input.dtype, enable_alltoall=True)[0]
+    # Quantized activations finalize to bf16; bf16 and fp16 activations keep their dtype.
+    native_dtype = input.dtype if input.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+    kernel_rows = kernel(native_dtype, enable_alltoall=True)[0]
     num_local_experts = fc1_expert_weights.shape[0]
     combine_valid_rows(
         kernel_rows,

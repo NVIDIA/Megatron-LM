@@ -9,7 +9,6 @@ import torch
 
 try:
     from flashinfer import mxfp8_quantize
-    from flashinfer.fused_moe import cutlass_fused_moe
 
     HAVE_FLASHINFER_CUTLASS_MXFP8 = True
     _FLASHINFER_CUTLASS_MXFP8_IMPORT_ERROR: ImportError | None = None
@@ -28,10 +27,16 @@ except ImportError as exc:
     HAVE_FLASHINFER_ROUTED_MXFP8 = False
     _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR = exc
 
-# UNWIND(flashinfer num_active_tokens): once flashinfer-ai/flashinfer#6784 ships,
-# import trtllm_fp8_block_scale_routed_moe from flashinfer.fused_moe instead.
-from megatron.core.inference.moe.flashinfer_active_tokens import trtllm_fp8_block_scale_routed_moe
-from megatron.core.inference.quantization.mxfp8_quantize import quantize_routed_mxfp8_input
+# UNWIND(flashinfer num_active_tokens): once flashinfer-ai/flashinfer#6783 and #6784 ship, import
+# cutlass_fused_moe and trtllm_fp8_block_scale_routed_moe from flashinfer.fused_moe instead.
+from megatron.core.inference.moe.flashinfer_active_tokens import (
+    cutlass_fused_moe,
+    trtllm_fp8_block_scale_routed_moe,
+)
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    mxfp8_quantize_rows,
+    quantize_routed_mxfp8_input,
+)
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.utils import null_decorator
 
@@ -436,8 +441,9 @@ def flashinfer_cutlass_mxfp8_moe(
     activation_type,
     out: torch.Tensor | None = None,
     activation_clamp_limit: torch.Tensor | None = None,
+    valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run full-row MXFP8 MoE through FlashInfer's CUTLASS backend."""
+    """Run MXFP8 MoE through FlashInfer's CUTLASS backend."""
     require_flashinfer_cutlass_mxfp8()
     if hidden_states.dtype != torch.bfloat16:
         raise TypeError(
@@ -457,6 +463,47 @@ def flashinfer_cutlass_mxfp8_moe(
         raise TypeError(
             f"FlashInfer CUTLASS MXFP8 requires FP32 probabilities; got {probabilities.dtype}"
         )
+    quant_scales = [
+        fc1_weight.scale,
+        fc1_weight.input_scale,
+        fc2_weight.scale,
+        fc2_weight.input_scale,
+    ]
+
+    if valid_tokens is not None:
+        rows, hidden_size = hidden_states.shape[0], fc2_weight.logical_rows
+        if (
+            out is None
+            or out.shape != (rows, hidden_size)
+            or out.dtype != torch.float32
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"valid_tokens needs a contiguous fp32 [{rows}, {hidden_size}] out buffer; got "
+                f"{None if out is None else (out.dtype, tuple(out.shape))}"
+            )
+        quantized_hidden, hidden_scale = mxfp8_quantize_rows(
+            hidden_states.contiguous(), valid_tokens
+        )
+        cutlass_fused_moe(
+            quantized_hidden,
+            routing_map.to(torch.int32).contiguous(),
+            probabilities.contiguous(),
+            fc1_weight.data,
+            fc2_weight.data,
+            torch.float32,
+            quant_scales=quant_scales,
+            input_sf=hidden_scale.view(torch.uint8),
+            clamped_relu2_limit=activation_clamp_limit,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            use_mxfp8_act_scaling=True,
+            activation_type=activation_type,
+            swizzled_input_sf=True,
+            output=out,
+            num_active_tokens=valid_tokens,
+        )
+        return out
 
     quantized_hidden, hidden_scale = mxfp8_quantize(hidden_states.contiguous(), True, 32)
 
@@ -468,12 +515,7 @@ def flashinfer_cutlass_mxfp8_moe(
             fc1_weight.data,
             fc2_weight.data,
             hidden_states.dtype,
-            quant_scales=[
-                fc1_weight.scale,
-                fc1_weight.input_scale,
-                fc2_weight.scale,
-                fc2_weight.input_scale,
-            ],
+            quant_scales=quant_scales,
             input_sf=hidden_scale,
             clamped_relu2_limit=activation_clamp_limit,
             ep_size=ep_size,

@@ -10,11 +10,15 @@ import torch
 
 import megatron.core.inference.moe.flashinfer_active_tokens as shim
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    HAVE_FLASHINFER_CUTLASS_MXFP8,
     HAVE_FLASHINFER_ROUTED_MXFP8,
     _unwrap_output,
+    flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
+    prepare_cutlass_mxfp8_weights,
     prepare_routed_mxfp8_weights,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize_rows
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
@@ -29,6 +33,10 @@ requires_blackwell_cutlass = pytest.mark.skipif(
 requires_blackwell_routed = pytest.mark.skipif(
     not (_BLACKWELL and shim.HAVE_TRITON and HAVE_FLASHINFER_ROUTED_MXFP8),
     reason="needs Blackwell, Triton and FlashInfer's routed MXFP8 MoE",
+)
+requires_blackwell_cutlass_mxfp8 = pytest.mark.skipif(
+    not (_BLACKWELL and shim.HAVE_TRITON and HAVE_FLASHINFER_CUTLASS_MXFP8),
+    reason="needs Blackwell, Triton and FlashInfer's CUTLASS MXFP8 MoE",
 )
 BF16 = dict(dtype=torch.bfloat16)
 RELU2 = 6  # flashinfer ActivationType.Relu2
@@ -78,6 +86,34 @@ def _cutlass(**kwargs):
     )
 
 
+# MXFP8 activations: fp8 rows with their block scales and the MXFP8 flag.
+MXFP8_ACTIVATION_ARGS = dict(
+    quant_scales=[torch.zeros(16, dtype=torch.uint8)] * 4,
+    input_sf=torch.zeros(16, dtype=torch.uint8),
+    swizzled_input_sf=True,
+    use_mxfp8_act_scaling=True,
+)
+
+
+def _cutlass_mxfp8(**kwargs):
+    x = torch.zeros(4, 8, **BF16).to(torch.float8_e4m3fn)
+    fc1 = torch.empty(2, 16, 8, dtype=torch.float8_e4m3fn)
+    fc2 = torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn)
+    return shim.cutlass_fused_moe(
+        x,
+        torch.zeros(4, 2, dtype=torch.int32),
+        torch.zeros(4, 2),
+        fc1,
+        fc2,
+        torch.float32,
+        activation_type=RELU2,
+        ep_size=4,
+        ep_rank=1,
+        **MXFP8_ACTIVATION_ARGS,
+        **kwargs,
+    )
+
+
 def _routed(**kwargs):
     ids = torch.zeros(4, 2, dtype=torch.int32)
     return shim.trtllm_fp8_block_scale_routed_moe(topk_ids=ids, top_k=2, **ROUTED_ARGS, **kwargs)
@@ -85,6 +121,7 @@ def _routed(**kwargs):
 
 KERNELS = {
     "cutlass": ("_cutlass_fused_moe", "CUTLASS_MOE_HAS_ACTIVE_TOKENS", _cutlass),
+    "cutlass-mxfp8": ("_cutlass_fused_moe", "CUTLASS_MOE_HAS_ACTIVE_TOKENS", _cutlass_mxfp8),
     "routed": ("_trtllm_fp8_block_scale_routed_moe", "ROUTED_MOE_HAS_ACTIVE_TOKENS", _routed),
 }
 
@@ -113,6 +150,8 @@ def test_count_is_forwarded_only_when_flashinfer_has_it(monkeypatch, kernel, fla
         call(output=out, num_active_tokens=count)
         assert seen["output"] is out and seen["num_active_tokens"] is count
         assert "enable_alltoall" not in seen and seen.get("do_finalize", True) is True
+    if kernel == "cutlass-mxfp8":
+        assert all(seen[key] is value for key, value in MXFP8_ACTIVATION_ARGS.items())
 
 
 @requires_cuda_triton
@@ -221,24 +260,37 @@ def test_stand_in_kernels_replay(kernel):
     assert_replays_bit_exact(fn, (src,), backward=False, what=kernel)
 
 
-def _routed_mxfp8_weight(weight):
-    """Quantize a bf16 expert stack per expert and repack it into TRT-LLM's routed layout."""
+def _stacked_mxfp8(weight):
+    """Quantize a bf16 expert stack per expert into one stacked MXFP8 tensor."""
     experts = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
-    stacked = MXFP8Tensor(
+    return MXFP8Tensor(
         data=torch.stack([expert.data for expert in experts]).contiguous(),
         scale=torch.stack([expert.scale for expert in experts]).contiguous(),
         backend="triton",
         dtype=torch.bfloat16,
     )
-    return prepare_routed_mxfp8_weights(stacked)
+
+
+def _routed_mxfp8_weight(weight):
+    """Quantize a bf16 expert stack per expert and repack it into TRT-LLM's routed layout."""
+    return prepare_routed_mxfp8_weights(_stacked_mxfp8(weight))
+
+
+def _cutlass_mxfp8_weight(weight):
+    """Quantize a bf16 expert stack per expert and repack it for the CUTLASS MXFP8 kernel."""
+    return prepare_cutlass_mxfp8_weights(_stacked_mxfp8(weight))
 
 
 @requires_blackwell_cutlass
-def test_cutlass_emulation_matches_the_kernel_finalize(monkeypatch):
-    """The real kernel's non-filling finalize plus `combine_valid_rows` equals its own filling
-    finalize on the live rows; rows beyond the count stay untouched."""
+@pytest.mark.parametrize("experts", ["bf16", "mxfp8"])
+def test_cutlass_emulation_matches_the_kernel_finalize(monkeypatch, experts):
+    """The real kernel's non-filling finalize plus `combine_valid_rows` equals the kernel's own
+    filling finalize on the live rows, for bf16 experts through the stand-in and for MXFP8 experts
+    through `flashinfer_cutlass_mxfp8_moe`; rows beyond the count stay untouched."""
     from flashinfer.fused_moe import ActivationType
 
+    if experts == "mxfp8" and not HAVE_FLASHINFER_CUTLASS_MXFP8:
+        pytest.skip("needs FlashInfer's CUTLASS MXFP8 MoE")
     monkeypatch.setattr(shim, "CUTLASS_MOE_HAS_ACTIVE_TOKENS", False)
     seeded()
     rows, valid, hidden, inter, local_experts, topk = 64, 40, 256, 256, 2, 2
@@ -251,23 +303,40 @@ def test_cutlass_emulation_matches_the_kernel_finalize(monkeypatch):
         torch.bfloat16
     )
     fc2 = (torch.randn(local_experts, hidden, inter, device="cuda") / inter**0.5).to(torch.bfloat16)
-    common = dict(activation_type=ActivationType.Relu2, ep_size=2, ep_rank=1)
+    out, count = torch.full((rows, hidden), 7.0, device="cuda"), _count(valid, "cuda")
 
-    reference = shim._cutlass_fused_moe(
-        x, routing, probs, fc1, fc2, torch.bfloat16, quant_scales=None, **common
-    )[0]
-    out = torch.full((rows, hidden), 7.0, device="cuda")
-    shim.cutlass_fused_moe(
-        x,
-        routing,
-        probs,
-        fc1,
-        fc2,
-        torch.float32,
-        output=out,
-        num_active_tokens=_count(valid, "cuda"),
-        **common,
-    )
+    if experts == "bf16":
+        common = dict(activation_type=ActivationType.Relu2, ep_size=2, ep_rank=1)
+        reference = shim._cutlass_fused_moe(
+            x, routing, probs, fc1, fc2, torch.bfloat16, quant_scales=None, **common
+        )[0]
+        shim.cutlass_fused_moe(
+            x,
+            routing,
+            probs,
+            fc1,
+            fc2,
+            torch.float32,
+            output=out,
+            num_active_tokens=count,
+            **common,
+        )
+    else:
+        fc1, fc2 = _cutlass_mxfp8_weight(fc1), _cutlass_mxfp8_weight(fc2)
+        clamped = getattr(ActivationType, "ClampedRelu2", None)
+        common = dict(
+            ep_size=2,
+            ep_rank=1,
+            activation_type=clamped if clamped is not None else ActivationType.Relu2,
+            activation_clamp_limit=(
+                torch.tensor([16.0], device="cuda") if clamped is not None else None
+            ),
+        )
+        reference = flashinfer_cutlass_mxfp8_moe(x, routing, probs, fc1, fc2, **common)
+        returned = flashinfer_cutlass_mxfp8_moe(
+            x, routing, probs, fc1, fc2, out=out, valid_tokens=count, **common
+        )
+        assert returned is out
 
     # The default top-k finalize accumulates atomically, so allow bf16 rounding.
     torch.testing.assert_close(out[:valid], reference[:valid].float(), rtol=2**-7, atol=2**-7)
@@ -318,3 +387,49 @@ def test_routed_emulation_matches_the_kernel_finalize(monkeypatch):
 
     torch.testing.assert_close(out[:valid], reference[:valid].float(), rtol=2**-7, atol=2**-7)
     assert not reference[:2].any() and torch.all(out[valid:] == 7.0)
+
+
+def test_cutlass_emulation_runs_quantized_activations_in_bf16(monkeypatch):
+    """Emulating the count for MXFP8 activations: the kernel runs in bf16, the dtype a quantized
+    CUTLASS MoE finalizes to, and `combine_valid_rows` widens those rows into the fp32 output."""
+    seen = {}
+    monkeypatch.setattr(
+        shim,
+        "_cutlass_fused_moe",
+        lambda *a, **k: seen.update(k, dtype=a[5]) or [torch.empty(4, 8, **BF16)],
+    )
+    monkeypatch.setattr(
+        shim,
+        "combine_valid_rows",
+        lambda rows, ids, count, out, **k: seen.update(combined=(rows.dtype, out)) or out,
+    )
+    monkeypatch.setattr(shim, "CUTLASS_MOE_HAS_ACTIVE_TOKENS", False)
+    out = torch.empty(4, 8)
+
+    assert _cutlass_mxfp8(output=out, num_active_tokens=_count(3))[0] is out
+    assert seen["dtype"] is torch.bfloat16 and seen["enable_alltoall"] is True
+    assert all(seen[key] is value for key, value in MXFP8_ACTIVATION_ARGS.items())
+    combined_dtype, combined_out = seen["combined"]
+    assert combined_dtype is torch.bfloat16 and combined_out is out
+
+
+@requires_blackwell_cutlass_mxfp8
+def test_row_quantizer_matches_flashinfer_swizzled_quantizer():
+    """MCore's row-bounded quantizer writes the bytes FlashInfer's swizzled quantizer writes, so the
+    bounded CUTLASS MXFP8 path quantizes exactly as the unbounded one; rows past the count are not
+    written."""
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+
+    seeded()
+    rows, valid, hidden = 300, 190, 256
+    x = torch.randn(rows, hidden, device="cuda", **BF16) * 3
+
+    data, scale = mxfp8_quantize_rows(x, _count(rows, "cuda"))
+    reference_data, reference_scale = flashinfer_mxfp8_quantize(x, True, 32)
+    assert torch.equal(data.view(torch.uint8), reference_data.view(torch.uint8))
+    assert torch.equal(
+        scale.view(torch.uint8).flatten(), reference_scale.view(torch.uint8).flatten()
+    )
+
+    bounded_data, _ = mxfp8_quantize_rows(x, _count(valid, "cuda"))
+    assert torch.equal(bounded_data[:valid].view(torch.uint8), data[:valid].view(torch.uint8))

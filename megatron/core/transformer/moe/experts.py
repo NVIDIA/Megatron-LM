@@ -1785,6 +1785,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
             out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
             if isinstance(self._fc1_weight, FlashInferCutlassMXFP8Weight):
+                # The NVLS dispatcher reads the fp32 RSV buffer back whenever its expert-TP x EP
+                # group has more than one rank; then only the live rows are quantized, computed
+                # and finalized, in fp32, into it. Otherwise token_combine takes the bf16 rows.
+                bounded = (
+                    out is not None
+                    and self.ep_group.size() * self.config.expert_tensor_parallel_size > 1
+                )
                 output = flashinfer_cutlass_mxfp8_moe(
                     hidden_states,
                     routing_map,
@@ -1796,6 +1803,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     activation_type=self._flashinfer_activation_type,
                     out=out,
                     activation_clamp_limit=self._flashinfer_clamp_limit,
+                    valid_tokens=(
+                        InferenceAllGatherDispatcherBase._valid_tokens() if bounded else None
+                    ),
                 )
             else:
                 output = flashinfer_routed_mxfp8_moe(
