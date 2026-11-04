@@ -4241,10 +4241,11 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         context = self.context
         token_budget = context.max_tokens - context.active_token_count
-        # The context sets max_prefill_tokens below max_tokens only for batch-invariant
-        # hybrid chunked prefill (it adds one SSM chunk of decode headroom); otherwise the
-        # two are equal and this is the plain step-capacity budget.
         if context.max_prefill_tokens < context.max_tokens:
+            assert context.batch_invariant_mode, (
+                "max_prefill_tokens below max_tokens is set only for batch-invariant hybrid "
+                "chunked prefill"
+            )
             decode_token_count = context.num_decode_requests * (context.num_speculative_tokens + 1)
             prefill_token_count = context.active_token_count - decode_token_count
             token_budget = min(token_budget, context.max_prefill_tokens - prefill_token_count)

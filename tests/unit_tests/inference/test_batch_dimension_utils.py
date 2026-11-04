@@ -270,8 +270,16 @@ class TestGenerateCUDAGraphEdgeCases:
         _, without = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
             **kwargs
         )
+        extra = dict(extra_prefill_token_counts=(256, 384, 1000))
+        if not batch_invariant:
+            # Only batch-invariant hybrid chunked prefill has a prefill budget below max_tokens.
+            with pytest.raises(AssertionError, match="extra_prefill_token_counts"):
+                CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                    **kwargs, **extra
+                )
+            return
         _, counts = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
-            **kwargs, extra_prefill_token_counts=(256, 384, 1000)
+            **kwargs, **extra
         )
         assert 256 not in without and 256 in counts
         assert set(counts) == set(without) | {256}  # at/above the ceiling: ignored

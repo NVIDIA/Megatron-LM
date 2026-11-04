@@ -495,8 +495,9 @@ class CUDAGraphBatchDimensionBuilder:
                 matching the config default. HYBRID is resolved here into EXPONENTIAL for the
                 prefill/mixed family and LINEAR for the decode-only family.
             extra_prefill_token_counts: Additional prefill/mixed token counts to capture
-                (TP- and, under batch invariance, 64-aligned), e.g. a prefill budget below
-                ``max_tokens``. Counts at or above ``cuda_graph_max_tokens`` are ignored.
+                (64- and TP-aligned): the batch-invariant hybrid prefill budget below
+                ``max_tokens``. Batch-invariant mode only. Counts at or above
+                ``cuda_graph_max_tokens`` are ignored.
 
         Returns:
             Tuple containing:
@@ -578,12 +579,14 @@ class CUDAGraphBatchDimensionBuilder:
                 )
             )
 
-            # Token counts the caller needs captured exactly, e.g. a prefill budget below
-            # the step capacity, so steps of that size do not pad to the next rung.
+            # Token counts the caller needs captured exactly: the batch-invariant hybrid
+            # prefill budget below the step capacity, so those steps do not pad to the next rung.
+            assert not extra_prefill_token_counts or _batch_invariant_mode_enabled(), (
+                "extra_prefill_token_counts is used only by batch-invariant hybrid chunked "
+                "prefill"
+            )
             for count in extra_prefill_token_counts:
-                if _batch_invariant_mode_enabled():
-                    count = _batch_invariant_token_align(count)
-                count = count // tp_size * tp_size
+                count = _batch_invariant_token_align(count) // tp_size * tp_size
                 if (
                     0 < count < cuda_graph_max_tokens
                     and count not in cuda_graph_prefill_token_counts
