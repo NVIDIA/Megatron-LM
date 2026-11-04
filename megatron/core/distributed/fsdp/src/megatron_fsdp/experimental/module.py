@@ -486,17 +486,15 @@ class FsdpModule:
                     group.reduce_outer_gradients()
 
     def _accumulate_local_gradients(self, group: FsdpParameterGroup) -> None:
-        """Accumulate on the inner stream, then release source gradients safely."""
-        current_stream = self.context.current_stream()
-        inner_reduction_stream = self.context.inner_reduction_stream
-        inner_reduction_stream.wait_stream(current_stream)
-        with torch.cuda.stream(inner_reduction_stream):
-            group.accumulate_local_gradients()
-        # Gradients were allocated on compute. Order their next storage reuse after
-        # the inner stream's reads before dropping the references in .grad.
-        current_stream.wait_stream(inner_reduction_stream)
+        """Accumulate on compute without waiting for other groups' inner reductions."""
+        group.accumulate_local_gradients()
+        # The source gradients are read on compute, where they were allocated,
+        # so their storage can be released without joining the reduction stream.
         for fsdp_parameter in group.fsdp_parameters:
             fsdp_parameter.unsharded.grad = None
+        # Preserve the existing completion dependency for outer reduction and
+        # finish_grad_sync(), without making compute wait for earlier collectives.
+        self.context.inner_reduction_stream.wait_stream(self.context.current_stream())
 
     def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
