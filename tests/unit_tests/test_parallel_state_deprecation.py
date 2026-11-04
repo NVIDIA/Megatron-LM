@@ -664,38 +664,36 @@ def test_the_shim_still_builds_a_new_collection_of_the_global_groups(monkeypatch
     assert vars(undecorated(ProcessGroupCollection, required_pgs=list(groups))) == groups
 
 
-def _set_data_parallel_groups(monkeypatch):
-    """Set the data-parallel groups that a read of every field of the grid requires."""
-    for name in (
-        "_DATA_PARALLEL_GROUP",
-        "_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
-        "_DATA_PARALLEL_GROUP_WITH_CP",
-        "_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
-        "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
-    ):
-        monkeypatch.setattr(parallel_state, name, Mock())
+def _register_data_parallel_groups(monkeypatch):
+    """Register a collection with the data-parallel groups that a collection of the grid sets."""
+    registered = ProcessGroupCollection(
+        dp=Mock(), dp_gtp_remat=Mock(), dp_cp=Mock(), dp_cp_gtp_remat=Mock(), intra_dp_cp=Mock()
+    )
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
+    return registered
 
 
 @pytest.mark.usefixtures("run_config")
-def test_pretrain_builds_its_collection_from_the_grid_without_a_warning(monkeypatch):
-    """The collection that pretrain() runs on is read at bootstrap: no deprecation or fallback
-    warning, also under strict fallbacks."""
-    _set_data_parallel_groups(monkeypatch)
+def test_pretrain_builds_its_collection_from_the_registered_grid_without_a_warning(monkeypatch):
+    """The collection that pretrain() runs on is read from the registry at bootstrap: no
+    deprecation or fallback warning, also under strict fallbacks."""
+    registered = _register_data_parallel_groups(monkeypatch)
     args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
 
     with _recorded_warnings() as record:
         enable_strict_process_group_fallbacks()
         pg_collection = training._build_pg_collection_from_parallel_state(args)
 
-    assert pg_collection.dp is parallel_state._DATA_PARALLEL_GROUP
+    assert pg_collection.dp is registered.dp
     assert _deprecated_calls(record) == []
     assert _fallbacks(record) == []
 
 
 @pytest.mark.usefixtures("run_config")
 def test_initialization_reads_a_grid_set_up_before_it_without_a_warning(monkeypatch):
-    """initialize_megatron() seeds from a grid that its caller set up, read at bootstrap."""
-    _set_data_parallel_groups(monkeypatch)
+    """initialize_megatron() seeds from the groups that its caller registered, read at
+    bootstrap."""
+    registered = _register_data_parallel_groups(monkeypatch)
     monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 1)
@@ -708,7 +706,7 @@ def test_initialization_reads_a_grid_set_up_before_it_without_a_warning(monkeypa
         enable_strict_process_group_fallbacks()
         pg_collection = initialize._initialize_distributed(None, None, None)
 
-    assert pg_collection.dp is parallel_state._DATA_PARALLEL_GROUP
+    assert pg_collection.dp is registered.dp
     assert _deprecated_calls(record) == []
     assert _fallbacks(record) == []
 

@@ -6,7 +6,8 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as ps
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -688,13 +689,16 @@ def test_valid_dynamic_cp_group_sizes():
         ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
-def test_separate_all_gather_group():
+def test_separate_all_gather_group(monkeypatch):
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     Utils.initialize_model_parallel(context_parallel_size=world_size)
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    # Without a collection, the deprecated form reads the global grid.
+    with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
+        dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"

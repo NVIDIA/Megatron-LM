@@ -203,7 +203,7 @@ def test_get_model_without_a_collection_warns_and_builds_one(monkeypatch, run_co
     model_provider = mock.Mock(side_effect=_GlobalRead)
 
     _assert_warns_then_reads_global("get_model", lambda: training.get_model(model_provider))
-    build.assert_called_once_with(args)
+    build.assert_called_once_with(args, owner="get_model")
     assert model_provider.call_args.kwargs["pg_collection"] is built
 
 
@@ -448,15 +448,44 @@ def test_grid_initialized_before_initialize_megatron_is_returned_for_seeding(
     monkeypatch, run_config
 ):
     # The seeding reads its groups from the returned collection, so it does not warn.
+    grid = ProcessGroupCollection(
+        **{
+            name: _Group()
+            for name in ("pp", "dp", "dp_gtp_remat", "dp_cp", "dp_cp_gtp_remat", "intra_dp_cp")
+        }
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args: 4)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_registered_process_groups", lambda: grid)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", classmethod(_raise_global_read)
+    )
+    monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
+
+    with _record_fallbacks() as record:
+        pg_collection = initialize._initialize_distributed(None, None, None)
+
+    assert all(getattr(pg_collection, name) is group for name, group in vars(grid).items())
+    assert _owners(record) == []
+
+
+def test_unregistered_grid_initialized_before_initialize_megatron_warns(monkeypatch, run_config):
+    """A grid set up without registering its groups is read from the global parallel state."""
     grid = ProcessGroupCollection()
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args: 4)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_registered_process_groups", lambda: None)
     monkeypatch.setattr(
         ProcessGroupCollection, "use_mpu_process_groups", classmethod(lambda cls: grid)
     )
     monkeypatch.setattr(initialize, "get_args", lambda: SimpleNamespace())
 
-    assert initialize._initialize_distributed(None, None, None) is grid
+    with _record_fallbacks() as record:
+        assert initialize._initialize_distributed(None, None, None) is grid
+    assert _owners(record) == ["initialize_megatron"]

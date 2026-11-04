@@ -119,23 +119,18 @@ class TestTrainingPgCollection:
         assert _ranks(pg_collection.expt_dp_ag) == _ranks(pg_collection.expt_dp)
 
     @pytest.mark.usefixtures("run_config")
-    @pytest.mark.parametrize("mismatched", ["dense", "expert"])
-    def test_all_gather_groups_must_span_the_data_parallel_ranks(self, monkeypatch, mismatched):
+    def test_all_gather_groups_are_built_from_the_collection(self, monkeypatch):
+        """The builder passes its own collection, not the registered one, to
+        create_all_gather_groups(), whose groups then mirror its groups."""
         Utils.initialize_model_parallel(expert_model_parallel_size=2)
-        grid = ProcessGroupCollection.use_mpu_process_groups()
-        # The expert-parallel ranks stand in for an all-gather group laid out in another rank
-        # order: they differ from both the dense and the expert data-parallel ranks.
-        if mismatched == "dense":
-            all_gather_groups = (grid.ep, grid.expt_dp)
-        else:
-            all_gather_groups = (grid.dp_cp, grid.ep)
-        monkeypatch.setattr(
-            training, "create_all_gather_groups", lambda **kwargs: all_gather_groups
-        )
+        create_all_gather_groups = Mock(wraps=training.create_all_gather_groups)
+        monkeypatch.setattr(training, "create_all_gather_groups", create_all_gather_groups)
         args = SimpleNamespace(create_all_gather_group=True, expert_model_parallel_size=2)
 
-        with pytest.raises(ValueError, match="all-gather groups whose ranks differ"):
-            training._build_pg_collection_from_parallel_state(args)
+        pg_collection = training._build_pg_collection_from_parallel_state(args)
+
+        assert create_all_gather_groups.call_args.kwargs["pg_collection"] is pg_collection
+        assert pg_collection is not parallel_state.get_registered_process_groups()
 
     @pytest.mark.usefixtures("run_config")
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
