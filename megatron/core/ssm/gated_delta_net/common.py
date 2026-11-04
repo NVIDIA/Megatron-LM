@@ -328,7 +328,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
-            config=self.config,
+            config=self._out_norm_config(),
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
@@ -376,6 +376,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _out_norm_config(self) -> TransformerConfig:
+        """Config ``out_norm`` is built from: the layer's own, unless a variant fixes its type."""
+        return self.config
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.

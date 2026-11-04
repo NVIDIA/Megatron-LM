@@ -63,3 +63,40 @@ def test_output_norm_replays(zero_centered, strided_gate, batch, length, heads, 
         )
         assert fused.call_count >= 3
     assert len(outputs) == 1 and len(grads) == 3
+
+
+@pytest.mark.parametrize("zero_centered", [False, True])
+def test_kda_two_stage_output_norm_replays(zero_centered):
+    """KDA's two-stage gates run FLA's fused RMSNorm/sigmoid gating; a zero-centered gain is
+    formed in FP32 before the kernel."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    pytest.importorskip("fla.modules.fused_norm_gate")
+    from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+
+    seeded()
+    dim = 128
+    norm = te.RMSNorm(
+        dim, eps=1e-5, params_dtype=torch.bfloat16, zero_centered_gamma=zero_centered, device="cuda"
+    )
+    with torch.no_grad():
+        norm.weight.add_(torch.randn_like(norm.weight) * 1e-2)
+
+    class GatedNorm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                layernorm_zero_centered_gamma=zero_centered, layernorm_epsilon=1e-5
+            )
+            self.two_stage_gates = True
+            self.out_norm = norm
+            self.value_head_dim = dim
+
+        def forward(self, x, gate):
+            return KimiDeltaAttention._apply_gated_norm(self, x, gate)
+
+    x = torch.randn((2, 1027, 8, dim), device="cuda", dtype=torch.bfloat16).requires_grad_()
+    gate = torch.randn_like(x).requires_grad_()
+    outputs, grads = assert_module_replays_bit_exact(
+        GatedNorm(), (x, gate), replays=3, contention=True, what="KDA two-stage output norm"
+    )
+    assert len(outputs) == 1 and len(grads) == 3
