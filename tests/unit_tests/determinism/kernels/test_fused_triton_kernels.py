@@ -148,6 +148,42 @@ def test_dsa_weights_projection_replays():
     assert outputs["out"].dtype == torch.float32
 
 
+def test_dsa_indexer_scoring_replays():
+    """Replay the cuDNN DSA indexer scoring choke point for BF16 and FP8 precision."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels as kern
+
+    if torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("cuDNN DSA scoring requires SM90+ (Hopper or later)")
+    try:
+        from cudnn import DSA  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"cuDNN DSA bindings unavailable: {exc}")
+
+    kern._ensure_dsa_namespace()
+    seeded()
+    b, sq, sk, h, d = 1, 128, 128, 32, 128
+    q = torch.randn(b, sq, h, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, sk, 1, d, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(b, sq, h, device="cuda", dtype=torch.bfloat16)
+
+    for precision in ("bf16", "fp8"):
+        assert_replays_bit_exact(
+            lambda qq, kk, ww, p=precision: kern._indexer_forward(
+                qq,
+                kk,
+                ww,
+                ratio=kern._INDEXER_RATIO,
+                sm_scale=kern._INDEXER_SOFTMAX_SCALE,
+                scoring_precision=p,
+            )["scores"],
+            (q.float(), k.float(), w),
+            replays=3,
+            backward=False,
+            contention=True,
+            what=f"DSA indexer scoring {precision}",
+        )
+
+
 def test_dsa_kpool_chunked_selection_replays(monkeypatch):
     """Replay the fixed-memory KPool score and top-k path across query chunks."""
     from megatron.core.transformer.experimental_attention_variant import dsa

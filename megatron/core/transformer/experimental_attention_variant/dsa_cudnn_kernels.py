@@ -296,6 +296,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         tp_group=getattr(pg_collection, "tp", None),
+        scoring_precision=getattr(config, "dsa_indexer_scoring_precision", "bf16"),
         **packed_thd_kwargs,
     )
 
@@ -510,6 +511,84 @@ def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:
     )
 
 
+_FP8_E4M3_MAX = 448.0
+_FP8_SCALE_AMAX_FLOOR = 1.0e-4
+
+
+def _fp8_ue8m0_quantize_last_dim(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """Quantize the last dim to E4M3 with one UE8M0 (power-of-two) scale per vector.
+
+    Returns ``(quantized_e4m3, descale)`` where ``descale`` has ``x``'s shape without its
+    last dim. This is the quantization the stock cuDNN fp8 indexer path expects
+    (natural-descale convention).
+    """
+    xf = x.float()
+    amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(_FP8_SCALE_AMAX_FLOOR)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / _FP8_E4M3_MAX)))
+    quantized = (xf / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return quantized.contiguous(), scale.squeeze(-1).contiguous()
+
+
+def _fp8_roundtrip_last_dim(x: Tensor) -> Tensor:
+    """Round ``x`` through E4M3 (UE8M0 per-vector scale) and back to FP32.
+
+    Used by the pure-torch global-row score path so that, under ``scoring_precision='fp8'``,
+    it incurs the same quantization as the dense cuDNN fp8 path and selects the same top-k.
+    """
+    quantized, scale = _fp8_ue8m0_quantize_last_dim(x)
+    return quantized.float() * scale.unsqueeze(-1)
+
+
+def _indexer_forward(
+    index_q: Tensor,
+    index_k: Tensor,
+    weights: Tensor,
+    *,
+    ratio: int,
+    sm_scale: float,
+    scoring_precision: str = "bf16",
+    **kwargs,
+) -> dict:
+    """Dispatch the cuDNN indexer forward at the configured scoring precision.
+
+    This is the single choke point for every indexer scoring call so that the precision
+    contract lives in one place instead of a process-wide monkey-patch.
+
+    * ``"bf16"``: cast any FP32 carrier operands (produced by ``dsa_indexer_rope_fp32``)
+      back to BF16 and call the stock cuDNN path unchanged.
+    * ``"fp8"``: quantize the FP32 query/key to E4M3 with UE8M0 per-vector scales and call
+      cuDNN with ``precision="fp8"`` plus ``q_scale``/``k_scale`` (natural descale).
+      ``weights`` stays BF16.
+    """
+    if scoring_precision == "fp8":
+        q_fp8, q_scale = _fp8_ue8m0_quantize_last_dim(index_q)
+        k_fp8, k_scale = _fp8_ue8m0_quantize_last_dim(index_k)
+        return _cudnn_dsa.indexer_forward_wrapper(
+            q_fp8,
+            k_fp8,
+            weights.to(torch.bfloat16),
+            ratio=ratio,
+            sm_scale=sm_scale,
+            precision="fp8",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            **kwargs,
+        )
+    if scoring_precision != "bf16":
+        raise ValueError(
+            f"Unsupported DSA indexer scoring precision {scoring_precision!r}; "
+            "expected 'bf16' or 'fp8'."
+        )
+    return _cudnn_dsa.indexer_forward_wrapper(
+        index_q.to(torch.bfloat16),
+        index_k.to(torch.bfloat16),
+        weights.to(torch.bfloat16),
+        ratio=ratio,
+        sm_scale=sm_scale,
+        **kwargs,
+    )
+
+
 def _compute_indexer_scores_chunk_with_global_rows(
     q_chunk_bshd: Tensor,
     k_bshd: Tensor,
@@ -521,6 +600,7 @@ def _compute_indexer_scores_chunk_with_global_rows(
     seq_lens: Optional[Tensor] = None,
     k_bdk: Optional[Tensor] = None,
     key_positions: Optional[Tensor] = None,
+    scoring_precision: str = "bf16",
 ) -> Tensor:
     """Compute indexer scores for a query chunk using global causal row positions.
 
@@ -535,6 +615,26 @@ def _compute_indexer_scores_chunk_with_global_rows(
 
     b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
     sk = k_bshd.size(1)
+    if scoring_precision == "fp8":
+        # Match the dense cuDNN fp8 path: round q/k through E4M3 before the FP32 accumulate.
+        # Ignore any precomputed (non-fp8) ``k_bdk`` and rebuild it from the rounded key.
+        q_chunk_bshd = _fp8_roundtrip_last_dim(q_chunk_bshd)
+        k_bshd = _fp8_roundtrip_last_dim(k_bshd)
+        k_bdk = None
+    elif scoring_precision == "bf16":
+        # Match the dense _indexer_forward BF16 contract: round FP32 carriers (produced by
+        # dsa_indexer_rope_fp32) down to BF16 before the FP32 accumulate, so dense and
+        # global-row chunks score at the same precision. A precomputed FP32 ``k_bdk`` is
+        # stale once the key is rounded, so rebuild it from the rounded key.
+        q_chunk_bshd = q_chunk_bshd.to(torch.bfloat16)
+        if k_bshd.dtype != torch.bfloat16:
+            k_bshd = k_bshd.to(torch.bfloat16)
+            k_bdk = None
+    else:
+        raise ValueError(
+            f"Unsupported DSA indexer scoring precision {scoring_precision!r}; "
+            "expected 'bf16' or 'fp8'."
+        )
     scores_chunk = torch.zeros((b, sq, sk), dtype=torch.float32, device=q_chunk_bshd.device)
     if k_bdk is None:
         k_bdk = k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
@@ -578,6 +678,7 @@ def _indexer_topk_from_score_chunks(
     indexer_ratio: int = _INDEXER_RATIO,
     score_seq_lens: Optional[Tensor] = None,
     bottom_right_key_start: Optional[int] = None,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
@@ -612,15 +713,25 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
+            scores_chunk = _indexer_forward(
+                q_chunk,
+                score_k_bshd,
+                w_chunk,
+                ratio=indexer_ratio,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                scoring_precision=scoring_precision,
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
-                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
+            scores_chunk = _indexer_forward(
+                q_chunk,
+                k_bshd,
+                w_chunk,
+                ratio=indexer_ratio,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                scoring_precision=scoring_precision,
             )["scores"]
         else:
-            if global_rows_k_bdk is None:
+            if global_rows_k_bdk is None and scoring_precision != "fp8":
                 global_rows_k_bdk = (
                     k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
                 )
@@ -635,6 +746,7 @@ def _indexer_topk_from_score_chunks(
                 seq_lens=score_chunk_seq_lens,
                 k_bdk=global_rows_k_bdk,
                 key_positions=global_rows_key_positions,
+                scoring_precision=scoring_precision,
             )
         if starts is not None:
             scores_chunk = dsa_masking.apply_starts_ends_mask_to_scores(
@@ -709,6 +821,7 @@ def _indexer_topk_multi_packed_cp_thd(
     packed_max_seqlen_k: int,
     cp_size: int,
     cp_rank: int,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Run cuDNN's THD indexer on packed CP front/back query segments."""
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -738,12 +851,13 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
-    scores = _cudnn_dsa.indexer_forward_wrapper(
+    scores = _indexer_forward(
         q_bshd[0],
         segmented_k,
         w_bsh[0],
         ratio=_INDEXER_RATIO,
         sm_scale=_INDEXER_SOFTMAX_SCALE,
+        scoring_precision=scoring_precision,
         cu_seqlens_q=layout.segment_cu_q.to(dtype=torch.int32),
         cu_seqlens_k=layout.segment_cu_k.to(dtype=torch.int32),
         max_seqlen_q=max_segment_q,
@@ -792,6 +906,7 @@ def _indexer_topk_single_packed_cp_segments(
     local_packed_cp_rank: int,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Fast cuDNN top-k for one packed THD sequence split into CP front/back slices."""
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -851,6 +966,7 @@ def _indexer_topk_single_packed_cp_segments(
             segment_topk,
             return_topk_scores,
             bottom_right_key_start=key_start + rel_start,
+            scoring_precision=scoring_precision,
         )
         topk_indices, topk_scores = _pad_topk_result(topk_indices, topk_scores, topk_k)
         indices_chunks.append(topk_indices)
@@ -1093,6 +1209,7 @@ def _indexer_topk_bshd(
     packed_max_seqlen_q: Optional[int] = None,
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1145,11 +1262,22 @@ def _indexer_topk_bshd(
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
-                q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
+                q_bshd,
+                k_bshd,
+                w_bsh,
+                seq_lens,
+                topk_k,
+                return_topk_scores,
+                scoring_precision=scoring_precision,
             )
         else:
-            scores = _cudnn_dsa.indexer_forward_wrapper(
-                q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
+            scores = _indexer_forward(
+                q_bshd,
+                k_bshd,
+                w_bsh,
+                ratio=_INDEXER_RATIO,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                scoring_precision=scoring_precision,
             )[
                 "scores"
             ]  # (b, sq, sk) fp32, -inf on masked positions
@@ -1165,6 +1293,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_rank,
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
+                scoring_precision=scoring_precision,
             )
         elif (
             not return_scores
@@ -1188,6 +1317,7 @@ def _indexer_topk_bshd(
                 packed_max_seqlen_k,
                 packed_cp_size,
                 local_packed_cp_rank,
+                scoring_precision=scoring_precision,
             )
         elif not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
@@ -1202,6 +1332,7 @@ def _indexer_topk_bshd(
                 key_positions_i64=key_positions_i64,
                 indexer_ratio=_INDEXER_RATIO,
                 score_seq_lens=ends,
+                scoring_precision=scoring_precision,
             )
         else:
             # This branch runs only when ``starts`` is set; normalize_varlen_bounds then
@@ -1214,6 +1345,7 @@ def _indexer_topk_bshd(
                 indexer_ratio=_INDEXER_RATIO,
                 sm_scale=_INDEXER_SOFTMAX_SCALE,
                 seq_lens=ends,
+                scoring_precision=scoring_precision,
             )
             scores = dsa_masking.apply_starts_ends_mask_to_scores(
                 scores, starts, ends, key_positions_i64
@@ -1330,6 +1462,7 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    scoring_precision: str = "bf16",
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     _assert_supported_indexer_scoring(use_relu)
@@ -1369,6 +1502,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
+        scoring_precision=scoring_precision,
     )
     return topk_indices, topk_length
 
@@ -2146,6 +2280,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        scoring_precision: str = "bf16",
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2183,6 +2318,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            scoring_precision=scoring_precision,
         )
 
         prepared_topk_length = (
@@ -2345,13 +2481,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   use_local_indexer_varlen, single_packed_thd_sequence,
         #   local_packed_cp_rank, local_packed_cp_query_start,
         #   local_packed_cp_query_len, packed_cu_seqlens_q, packed_cu_seqlens_k,
-        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group.
+        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   scoring_precision.
         return (
             grad_query,
             grad_kv_full,
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -2640,6 +2778,7 @@ def fused_indexer_sparse_attn(
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
     tp_group=None,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Tensor]:
     """Fused DSv3.2 indexer, sparse attention, and optional indexer loss.
 
@@ -2689,6 +2828,7 @@ def fused_indexer_sparse_attn(
         packed_max_seqlen_k,
         packed_cp_size,
         tp_group,
+        scoring_precision,
     )
 
 
