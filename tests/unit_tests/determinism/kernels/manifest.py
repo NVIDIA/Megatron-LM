@@ -367,8 +367,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates.",
+        "router gating GEMM, TE fused permutation/router kernels (sparse and dense top-k "
+        "output), global-batch quantile histogram accumulation and bias updates.",
     ),
     KernelEntry(
         name="mok_route_adapter",
@@ -398,7 +398,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing; "
+        "InferenceTopKRouter's sinkhorn routing replays under InferenceMode.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",

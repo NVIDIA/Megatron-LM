@@ -38,7 +38,7 @@ except ImportError:
 
 from .barrier import symm_mem_sync
 from .kernel_config import SYMM_MEM_KERNEL_CONFIG
-from .multimem_asm import ld_64, ld_128, st_64, st_128
+from .multimem_asm import ld_32, ld_64, ld_128, st_32, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
 
 
@@ -407,7 +407,7 @@ def _multimem_all_gatherv_3tensor_kernel(
         HIDDEN_SIZE_0/1/2: hidden dimension (elements per token row) for each tensor (constexpr).
         BLOCK_SIZE: threads per block — max of the three per-tensor block sizes (constexpr).
         NUMEL_PER_THREAD_0/1/2: elements per thread per load/store for each tensor (constexpr).
-        BITS_0/1/2: load/store width in bits (128 or 64) for each tensor (constexpr).
+        BITS_0/1/2: load/store width in bits (128, 64 or 32) for each tensor (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
@@ -445,7 +445,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
                 x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
-            else:
+            elif BITS_0 == 64:
                 multicast_ptrs = (
                     multicast_ptr_0.to(tl.pointer_type(tl.uint64))
                     + output_byte_offset_0 // 8
@@ -454,6 +454,15 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets
                 x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
+            else:
+                multicast_ptrs = (
+                    multicast_ptr_0.to(tl.pointer_type(tl.uint32))
+                    + output_byte_offset_0 // 4
+                    + global_offsets
+                )
+                local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint32)) + local_offsets
+                (x,) = ld_32(local_ptrs, mask=mask)
+                st_32(multicast_ptrs, x, mask=mask, multicast_op=True)
 
         # --- Tensor 1 ---
         for channel_offset in range(0, numel_per_token_1, BLOCK_SIZE):
@@ -469,7 +478,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
                 x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
-            else:
+            elif BITS_1 == 64:
                 multicast_ptrs = (
                     multicast_ptr_1.to(tl.pointer_type(tl.uint64))
                     + output_byte_offset_1 // 8
@@ -478,6 +487,15 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets
                 x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
+            else:
+                multicast_ptrs = (
+                    multicast_ptr_1.to(tl.pointer_type(tl.uint32))
+                    + output_byte_offset_1 // 4
+                    + global_offsets
+                )
+                local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint32)) + local_offsets
+                (x,) = ld_32(local_ptrs, mask=mask)
+                st_32(multicast_ptrs, x, mask=mask, multicast_op=True)
 
         # --- Tensor 2 ---
         for channel_offset in range(0, numel_per_token_2, BLOCK_SIZE):
@@ -493,7 +511,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
                 x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
-            else:
+            elif BITS_2 == 64:
                 multicast_ptrs = (
                     multicast_ptr_2.to(tl.pointer_type(tl.uint64))
                     + output_byte_offset_2 // 8
@@ -502,6 +520,15 @@ def _multimem_all_gatherv_3tensor_kernel(
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets
                 x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
+            else:
+                multicast_ptrs = (
+                    multicast_ptr_2.to(tl.pointer_type(tl.uint32))
+                    + output_byte_offset_2 // 4
+                    + global_offsets
+                )
+                local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint32)) + local_offsets
+                (x,) = ld_32(local_ptrs, mask=mask)
+                st_32(multicast_ptrs, x, mask=mask, multicast_op=True)
 
     sync_threads()
     symm_mem_sync(
@@ -645,7 +672,7 @@ def multimem_all_gatherv_3tensor(
 
     All three input tensors must share the same local_tokens dimension (i.e. the same
     number of token rows per rank). Each tensor may have a different hidden_size and dtype.
-    The 128-bit or 64-bit NVLS path is selected independently per tensor based on row
+    The 128-, 64- or 32-bit NVLS path is selected independently per tensor based on row
     alignment.
 
     The barrier at the end of the kernel uses signal_pad_ptrs from symm_mem_hdl_0. Since
@@ -714,11 +741,12 @@ def multimem_all_gatherv_3tensor(
     def _tensor_params(inp):
         hidden_size = inp.shape[1]
         row_bytes = hidden_size * inp.element_size()
-        assert row_bytes % 8 == 0, (
+        assert row_bytes % 4 == 0, (
             f"Row size ({hidden_size} elements × {inp.element_size()} bytes) = "
-            f"{row_bytes} bytes is not 8-byte aligned; cannot use NVLS."
+            f"{row_bytes} bytes is not 4-byte aligned; cannot use NVLS."
         )
-        bits = 128 if row_bytes % 16 == 0 else 64
+        # Widest access the row alignment allows: fp32 probs with an odd top-k have 4-byte rows.
+        bits = 128 if row_bytes % 16 == 0 else 64 if row_bytes % 8 == 0 else 32
         numel_per_thread = bits // (inp.element_size() * 8)
         numel_per_token = (hidden_size + numel_per_thread - 1) // numel_per_thread
         block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
