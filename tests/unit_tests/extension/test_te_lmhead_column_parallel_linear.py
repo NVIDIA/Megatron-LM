@@ -160,3 +160,137 @@ class TestGPTModelOutputLayerSelection:
             max_sequence_length=8,
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
+
+
+def _te_ce_supports_grad_quantizer() -> bool:
+    if not HAVE_TE:
+        return False
+    from megatron.core.extensions import transformer_engine as te_ext
+
+    return getattr(te_ext, "_TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER", False)
+
+
+def _ce_mxfp8_grad_config(**overrides):
+    """Small MXFP8 GPT config with the MXFP8 LM head and TE's fused cross entropy."""
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_output_proj=True,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl="te",
+        cross_entropy_mxfp8_grad=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+class TestCrossEntropyMxfp8GradConfig:
+    """cross_entropy_mxfp8_grad validation."""
+
+    def test_requires_mxfp8_output_proj(self):
+        with pytest.raises(ValueError, match="requires fp8_output_proj"):
+            _ce_mxfp8_grad_config(fp8_output_proj=False)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [dict(cross_entropy_loss_fusion=False), dict(cross_entropy_fusion_impl="native")],
+        ids=["unfused", "native"],
+    )
+    def test_requires_te_fused_cross_entropy(self, overrides):
+        with pytest.raises(ValueError, match="cross_entropy_fusion_impl='te'"):
+            _ce_mxfp8_grad_config(**overrides)
+
+    def test_rejects_mup(self):
+        with pytest.raises(ValueError, match="use_mup"):
+            _ce_mxfp8_grad_config(use_mup=True)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
+)
+@pytest.mark.skipif(
+    not _te_ce_supports_grad_quantizer(),
+    reason="Transformer Engine's parallel_cross_entropy does not accept grad_quantizer",
+)
+class TestCrossEntropyMxfp8Grad:
+    """The LM head gets the MXFP8 gradient from the loss and computes the same gradients."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build(fp8, seq_len, cross_entropy_mxfp8_grad):
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        config = _ce_mxfp8_grad_config(fp8=fp8, cross_entropy_mxfp8_grad=cross_entropy_mxfp8_grad)
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=seq_len,
+        ).cuda()
+
+    @staticmethod
+    def _run(model, input_ids, labels):
+        """Loss, LM-head weight gradient, LM-head input gradient, type of the logits gradient."""
+        seen = {}
+
+        def hook(module, args, output):
+            args[0].register_hook(lambda grad: seen.__setitem__("dgrad", grad.detach().clone()))
+            output[0].register_hook(lambda grad: seen.__setitem__("logits_grad_type", type(grad)))
+
+        handle = model.output_layer.register_forward_hook(hook)
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(seq_len, device="cuda").repeat(input_ids.shape[0], 1)
+        attention_mask = torch.ones(
+            (input_ids.shape[0], 1, seq_len, seq_len), dtype=bool, device="cuda"
+        )
+        loss = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        loss.sum().backward()
+        handle.remove()
+        return (
+            loss.detach(),
+            model.output_layer.weight.grad.detach().clone(),
+            seen["dgrad"],
+            seen["logits_grad_type"],
+        )
+
+    @pytest.mark.parametrize("fp8", ["e4m3", "hybrid"])
+    @pytest.mark.parametrize(
+        "seq_len", [64, 48], ids=["written_by_loss_kernel", "quantized_after_loss_kernel"]
+    )
+    def test_matches_lm_head_quantization(self, fp8, seq_len):
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+        ref_model = self._build(fp8, seq_len, cross_entropy_mxfp8_grad=False)
+        model = self._build(fp8, seq_len, cross_entropy_mxfp8_grad=True)
+        model.load_state_dict(ref_model.state_dict())
+        expected_format = "e5m2" if fp8 == "hybrid" else "e4m3"
+        assert model.vocab_parallel_cross_entropy.keywords["grad_fp8_format"] == expected_format
+
+        input_ids = torch.randint(0, 256, (2, seq_len), device="cuda")
+        labels = torch.randint(0, 256, (2, seq_len), device="cuda")
+        ref = self._run(ref_model, input_ids, labels)
+        out = self._run(model, input_ids, labels)
+
+        assert ref[3] is torch.Tensor
+        assert issubclass(out[3], MXFP8Tensor)
+        for name, a, b in zip(("loss", "weight grad", "input grad"), out[:3], ref[:3]):
+            assert torch.equal(a, b), name
