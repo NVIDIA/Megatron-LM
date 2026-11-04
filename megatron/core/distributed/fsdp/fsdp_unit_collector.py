@@ -23,7 +23,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 def _recomputed(module: nn.Module, wrapper: nn.Module | None) -> bool:
-    """Whether mHC recomputation replays this module of the wrapped layer."""
+    """Whether recomputation replays this module before the wrapper's pre_backward()."""
     if not isinstance(wrapper, HyperConnectionHybridLayer):
         return False
     config = wrapper.config
@@ -59,8 +59,7 @@ class FsdpUnitCollector:
 
     def _should_shard(self, module: nn.Module, wrapper: nn.Module | None) -> bool:
         """Whether this module should be an independent FSDP unit."""
-        # mHC replays these modules before the wrapper's pre_backward().
-        # Their own hooks must gather parameters and reduce replay gradients.
+        # Replayed modules need their own hooks to gather parameters and reduce replay gradients.
         if _recomputed(module, wrapper) and next(module.parameters(), None) is not None:
             return True
 
