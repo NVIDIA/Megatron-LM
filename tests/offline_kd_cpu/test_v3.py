@@ -2381,7 +2381,7 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     assert indices[0, 1] == 65535
     logits = torch.linspace(-2, 2, 1 << 16).reshape(1, 1, -1).requires_grad_()
     actual = namespace["topk_kl_div"](
-        logits.clone(), values.unsqueeze(0), indices.unsqueeze(0), 1, 0, None, add_ghost_token=True
+        logits.clone(), values.unsqueeze(0), indices.unsqueeze(0), 1, 0, None
     )
     logprobs = logits.log_softmax(-1)
     p = logprobs[..., 0].exp()
@@ -2399,7 +2399,6 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
         1,
         0,
         None,
-        add_ghost_token=True,
         teacher_tail_logprobs=tail.unsqueeze(0),
     )
     assert torch.allclose(stored, expected.detach(), atol=1e-5)

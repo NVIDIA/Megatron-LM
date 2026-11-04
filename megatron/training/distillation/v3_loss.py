@@ -33,7 +33,6 @@ def paired_loss(loss_mask: Any, output_tensor: Any, model: Any, kd_batch: dict |
         mpu.get_tensor_model_parallel_world_size(),
         mpu.get_tensor_model_parallel_rank(),
         mpu.get_tensor_model_parallel_group(),
-        add_ghost_token=True,
         teacher_tail_logprobs=kd_batch["tail"],
     )
     alpha = get_args().logits_load_kd_loss_alpha

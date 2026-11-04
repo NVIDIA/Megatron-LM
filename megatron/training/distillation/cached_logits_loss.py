@@ -1073,13 +1073,12 @@ def topk_kl_div(
     tp_size: int,
     tp_rank: int,
     tp_group: dist.ProcessGroup,
-    add_ghost_token: bool = False,
     teacher_tail_logprobs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute the KL divergence between student and teacher's top-K log-probs.
+    """Compute sparse KL over the retained entries and a residual-mass ghost bucket.
 
-    With ``add_ghost_token``, the teacher's ghost bucket is ``teacher_tail_logprobs``
-    (``[S, B]``) when given, else derived from the retained log-probs.
+    The teacher's ghost bucket is ``teacher_tail_logprobs`` (``[S, B]``) when given,
+    else derived from the retained log-probs.
     """
     student_logits = student_logits.float()
     teacher_topk_logprobs = teacher_topk_logprobs.float()
@@ -1109,26 +1108,25 @@ def topk_kl_div(
     student_topk_logprobs = torch.gather(student_logprobs, -1, teacher_local_indices)
 
     # ---- Add a "ghost" token containing sum of non-top-K probabilities to both student and teacher ----
-    if add_ghost_token:
-        eps = 1e-8
-        student_topk_logprobs_exp = (
-            student_topk_logprobs.exp() * mask
-        )  # don't sum duplicate indices if any
-        student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
-        if tp_size > 1:
-            student_topk_exp_sum = dist_nn.functional.all_reduce(
-                student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
-            )
-        student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
-        if teacher_tail_logprobs is not None:
-            teacher_residual = teacher_tail_logprobs.float().unsqueeze(-1)
-        else:
-            teacher_residual = torch.log(
-                (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
-            )
-        student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
-        teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
-        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank == 0))], dim=-1)
+    eps = 1e-8
+    student_topk_logprobs_exp = (
+        student_topk_logprobs.exp() * mask
+    )  # don't sum duplicate indices if any
+    student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
+    if tp_size > 1:
+        student_topk_exp_sum = dist_nn.functional.all_reduce(
+            student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
+        )
+    student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
+    if teacher_tail_logprobs is not None:
+        teacher_residual = teacher_tail_logprobs.float().unsqueeze(-1)
+    else:
+        teacher_residual = torch.log(
+            (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
+        )
+    student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
+    teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
+    mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank == 0))], dim=-1)
 
     # ---- Sparse KL divergence (summed over top-K dimension) ----
     kl_div = teacher_topk_logprobs.exp() * (teacher_topk_logprobs - student_topk_logprobs)
@@ -1393,7 +1391,6 @@ class CachedLogitsKDLoss:
             self.tp_size,
             self.tp_rank,
             self.tp_group,
-            add_ghost_token=True,
         )
 
 
