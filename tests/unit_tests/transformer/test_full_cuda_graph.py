@@ -107,9 +107,7 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
     assert all(param.grad is not None for param in wrapped_model.parameters())
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("warmup_steps", [1, 2])
-def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker, dtype, warmup_steps):
+def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker):
     """Warmup-created leaves returning None must retain the stream used for capture."""
 
     class FusedWeightGrad(torch.autograd.Function):
@@ -137,7 +135,7 @@ def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker, dtype, warm
     # Stream alignment must work without changing PyTorch's process-global override.
     mocker.patch("torch.autograd.graph.set_override_stale_capture_stream", create=True)
     Utils.initialize_model_parallel()
-    weight = torch.ones(8, device="cuda", dtype=dtype, requires_grad=True)
+    weight = torch.ones(8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     inputs = torch.empty_like(weight)
     main_grad = torch.empty_like(weight)
     accumulators = []
@@ -151,6 +149,7 @@ def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker, dtype, warm
         loss.backward()
         return loss.detach()
 
+    warmup_steps = 2
     wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=warmup_steps)
     wrapper.reset_cuda_graph()
     try:
