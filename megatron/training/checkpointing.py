@@ -22,13 +22,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-
-try:
-    import yaml
-
-    HAVE_YAML = True
-except ImportError:
-    HAVE_YAML = False
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 try:
@@ -71,7 +64,6 @@ from megatron.training.argument_utils import (
     project_checkpoint_policy,
 )
 from megatron.training.config import CheckpointConfig, TokenizerConfig
-from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
@@ -185,27 +177,6 @@ def get_loaded_iteration():
 # ``load_checkpoint(load_dir=_UNSET)``: the run's load directory. ``None`` clears it (the
 # pretrained-checkpoint fallback then applies), a string names another directory.
 _UNSET = object()
-
-
-def _run_config_dict(run_config, **save_policy) -> dict:
-    """The run config as persisted with a checkpoint: the registered sections, with the values of
-    this save (``save``, ``ckpt_format``, ``verify_integrity``) in the checkpoint section, so the
-    saved metadata describes the file it sits next to (a converted checkpoint records the format
-    it was written in). A detached dict: nothing of the run is written."""
-    config_dict = run_config.to_dict()
-    config_dict['checkpoint'] = {**config_dict['checkpoint'], **save_policy}
-    return config_dict
-
-
-def _write_run_config_yaml(config_dict: dict, yaml_path: str) -> None:
-    if not HAVE_YAML:
-        raise ImportError(
-            'PyYAML is required to save the run config with a checkpoint. '
-            'Install via `pip install pyyaml`.'
-        )
-    with safe_yaml_representers():
-        with maybe_msc.open(yaml_path, 'w') as f:
-            yaml.safe_dump(config_dict, f, default_flow_style=False)
 
 
 def _checkpoint_dir(checkpoint_name: str, ckpt_type) -> str:
@@ -799,10 +770,14 @@ def save_checkpoint(
     cfg = get_run_config()
     args = get_args()
     checkpoint = cfg.checkpoint
-    # The values of this save; ``ckpt_format`` below is the format actually written.
+    # The values of this save; ``ckpt_format`` below is the format actually written. The run
+    # config persisted with the checkpoint carries them in its checkpoint section, so the saved
+    # metadata describes the file it sits next to (a converted checkpoint records the format it
+    # was written in); the registered section is not written.
     save_root = checkpoint.save if save is None else save
     save_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
     verify_integrity = checkpoint.verify_integrity if verify_integrity is None else verify_integrity
+    save_policy = dict(save=save_root, ckpt_format=save_format, verify_integrity=verify_integrity)
 
     if checkpoint.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -1140,12 +1115,7 @@ def save_checkpoint(
             )
             if ckpt_type == CheckpointType.LOCAL:
                 # Local checkpoints have no YAML sidecar; persist the full run config here.
-                state_dict['run_config'] = _run_config_dict(
-                    get_run_config(),
-                    save=save_root,
-                    ckpt_format=save_format,
-                    verify_integrity=verify_integrity,
-                )
+                state_dict['run_config'] = get_run_config().to_dict(checkpoint=save_policy)
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1296,15 +1266,7 @@ def save_checkpoint(
                         raise
                     warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
                 else:
-                    _write_run_config_yaml(
-                        _run_config_dict(
-                            run_config,
-                            save=save_root,
-                            ckpt_format=save_format,
-                            verify_integrity=verify_integrity,
-                        ),
-                        run_config_filename,
-                    )
+                    run_config.to_yaml(run_config_filename, checkpoint=save_policy)
 
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
                 train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)

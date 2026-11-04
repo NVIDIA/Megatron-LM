@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
-from typing import Any, Type, TypeVar
+from typing import Any, Mapping, Type, TypeVar
 
 try:
     import yaml
@@ -160,16 +160,28 @@ class ConfigContainerBase:
 
         return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
         """
         Convert the config container to a dictionary.
 
         Also converts any nested dataclasses (both ConfigContainer and regular dataclasses)
         to dictionaries recursively.
 
+        ``section_overrides`` map a section name to the fields whose values the result carries
+        in place of the section's (a checkpoint save records its own directory and format this
+        way). A shallow overlay of the section's own fields: the values are converted like the
+        rest, the section's ``_target_`` is kept, and neither the live config nor the mappings
+        are written. Unknown sections or fields and non-mapping overrides are rejected.
+
         Returns:
             Dictionary representation of this config
         """
+        sections = {f.name for f in dataclass_fields(self) if not f.name.startswith("_")}
+        unknown = set(section_overrides) - sections
+        if unknown:
+            raise ValueError(
+                f"{self.__class__.__qualname__} has no section named {sorted(unknown)}"
+            )
         result = {}
         result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
 
@@ -179,8 +191,30 @@ class ConfigContainerBase:
 
             value = getattr(self, f.name)
             result[f.name] = self._convert_value_to_dict(value)
+            if f.name in section_overrides:
+                result[f.name] = self._overlay_section(f.name, value, section_overrides[f.name])
 
         return result
+
+    @classmethod
+    def _overlay_section(cls, name: str, section: Any, overrides: Mapping[str, Any]) -> dict:
+        """The serialized ``section`` with ``overrides`` (field name to value) in place of its
+        own values."""
+        if not isinstance(overrides, Mapping):
+            raise TypeError(
+                f"overrides of section {name!r} must map field names to values, "
+                f"got {type(overrides).__name__}"
+            )
+        if not (is_dataclass(section) and not isinstance(section, type)):
+            raise TypeError(f"section {name!r} is not a dataclass; it takes no overrides")
+        unknown = set(overrides) - {item.name for item in dataclass_fields(section)}
+        if unknown:
+            raise ValueError(f"section {name!r} has no field named {sorted(unknown)}")
+        serialized = cls._convert_value_to_dict(section)
+        return {
+            **serialized,
+            **{field: cls._convert_value_to_dict(value) for field, value in overrides.items()},
+        }
 
     @classmethod
     def _convert_value_to_dict(cls, value: Any) -> Any:
@@ -232,12 +266,14 @@ class ConfigContainerBase:
         else:
             return value
 
-    def to_yaml(self, yaml_path: str) -> None:
+    def to_yaml(self, yaml_path: str, **section_overrides: Mapping[str, Any]) -> None:
         """
         Save the config container to a YAML file.
 
         Args:
             yaml_path: Path where to save the YAML file.
+            section_overrides: Passed to ``to_dict``: fields of the named sections whose values
+                the file carries in place of the section's.
         """
         if not HAVE_YAML:
             raise ImportError(
@@ -245,7 +281,7 @@ class ConfigContainerBase:
                 "Install via `pip install pyyaml`."
             )
 
-        config_dict = self.to_dict()
+        config_dict = self.to_dict(**section_overrides)
 
         with safe_yaml_representers():
             with maybe_msc.open(yaml_path, "w") as f:
