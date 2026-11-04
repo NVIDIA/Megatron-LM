@@ -144,8 +144,21 @@ class TestMtpKvCacheGating:
             {"mtp_layer_type_list": [Symbols.MAMBA, Symbols.MLP]},
             {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.ATTENTION]},
             {"mtp_layer_type_list": [Symbols.MAMBA]},
+            {"mtp_layer_type_list": [Symbols.KDA, Symbols.ATTENTION]},
+            {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.KDA]},
+            {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.CSA]},
         ],
-        ids=["no-drafts", "no-head", "per-depth", "recurrent-mlp", "two-attentions", "recurrent"],
+        ids=[
+            "no-drafts",
+            "no-head",
+            "per-depth",
+            "recurrent-mlp",
+            "two-attentions",
+            "recurrent",
+            "kda-attention",
+            "attention-kda",
+            "attention-dsv4",
+        ],
     )
     def test_unsupported_config_has_no_draft_kv_plane(self, kwargs):
         """Head patterns also gate attention-only backbones, which have no Mamba metadata."""
@@ -154,11 +167,14 @@ class TestMtpKvCacheGating:
         assert context.mtp_kv_layer_slot is None
         assert context.num_attention_layers == NUM_LAYERS
 
-    def test_enabled_for_hybrid_main_decoder_with_attention_mtp_head(self):
+    @pytest.mark.parametrize(
+        "mtp_layer_type_list",
+        [[Symbols.ATTENTION, Symbols.MLP], [Symbols.MOE, Symbols.ATTENTION]],
+        ids=["attention-mlp", "moe-attention"],
+    )
+    def test_enabled_for_hybrid_main_decoder_with_attention_mtp_head(self, mtp_layer_type_list):
         """The gate is on the MTP head, not the main decoder: a hybrid backbone is fine."""
-        context = _make_context(
-            is_hybrid_model=True, mtp_layer_type_list=[Symbols.ATTENTION, Symbols.MLP]
-        )
+        context = _make_context(is_hybrid_model=True, mtp_layer_type_list=mtp_layer_type_list)
         assert context.enable_mtp_kv_cache is True
 
 

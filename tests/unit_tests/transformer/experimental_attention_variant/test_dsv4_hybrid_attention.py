@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -718,6 +719,45 @@ class TestDSv4HybridAttentionForwardBackward:
             ).cuda()
             output, bias = attn(hidden_states=hidden, attention_mask=None)
             assert output.shape == (seq_len, batch_size, self.config.hidden_size)
+
+    @pytest.mark.parametrize("layer_number", [1, 2, 3], ids=["window", "csa", "hca"])
+    def test_single_token_sequences_match_each_token_alone(self, layer_number):
+        """Packed sequences of one token each, as an MTP draft step without an inference
+        context packs its requests, give every token the output it has as a sequence of its
+        own, without the fused packed backend."""
+        num_tokens = 6
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        attn.eval()
+
+        hidden = torch.randn(num_tokens, 1, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device=hidden.device)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+        )
+
+        with torch.no_grad():
+            alone = torch.cat(
+                [
+                    attn(hidden_states=hidden[i : i + 1], attention_mask=None)[0]
+                    for i in range(num_tokens)
+                ]
+            )
+            packed, _ = attn(
+                hidden_states=hidden, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+
+        # Batch size changes only the GEMM shapes, hence the bf16 rounding.
+        torch.testing.assert_close(packed, alone, rtol=0, atol=2e-2 * alone.abs().max().item())
 
 
 # ===========================================================================

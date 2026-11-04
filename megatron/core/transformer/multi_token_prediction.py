@@ -1946,10 +1946,23 @@ class MultiTokenPredictionLayer(MegatronModule):
             next_token_ids (Tensor): The correct next token IDs [B, N].
             position_ids (Tensor): Position IDs for the next tokens [B, N].
             embedding (Callable): The embedding module.
+            inference_context (Optional[BaseInferenceContext]): Context holding the MTP draft KV
+                and its per-request attention metadata. Without one, B must be 1 and each of the
+                N positions is processed as its own sequence.
 
         Returns:
             Tensor: MTP hidden states [N, B, H].
         """
+        if inference_context is None and packed_seq_params is None:
+            # The N positions belong to different requests and, without a context, have no draft
+            # history to attend over. Make each one its own sequence: as a single sequence,
+            # causal attention and recurrent layers would carry every request into the ones
+            # after it. Sequence mixers run such a pack without host syncs or per-sequence
+            # state (see PackedSeqParams.has_single_token_sequences).
+            assert next_token_ids.size(0) == 1, "positions without a context must have B == 1"
+            packed_seq_params = PackedSeqParams.single_token_sequences(
+                next_token_ids.size(1), device=next_token_ids.device
+            )
         decoder_input = embedding(input_ids=next_token_ids, position_ids=position_ids)
         hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=False, keep_graph=False

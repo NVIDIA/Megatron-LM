@@ -9,11 +9,13 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_config
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
@@ -22,6 +24,7 @@ from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
+from tests.unit_tests.ssm.gated_delta_net_test_utils import followed_by_nan
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -74,6 +77,20 @@ def _make_config(
     )
     settings.update(overrides)
     return KDALayerConfig(**settings)
+
+
+def _replay_in_cuda_graph(fn):
+    """Warm ``fn`` up, capture it in a CUDA graph, and return the output of a replay."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    graph.replay()
+    return output.clone()
 
 
 def _build_kda(config: KDALayerConfig) -> KimiDeltaAttention:
@@ -218,6 +235,106 @@ def test_kda_packed_matches_unpacked_cp1(two_stage_gates):
             unpacked_output.transpose(0, 1).reshape(-1, kda.config.hidden_size),
             atol=5e-3,
             rtol=5e-3,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("conv", ["fla", "fallback", "pad_alignment"])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_single_token_sequences_in_cuda_graph(monkeypatch, two_stage_gates, conv):
+    """In inference, packed sequences of one token each, as an MTP draft step without a context
+    packs its requests, run without host syncs, so a CUDA graph captures them, and give every
+    token the output it has as a sequence of its own. That holds with the fallback convolution
+    and with the packed-input conv padding, which single tokens do not need."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(_make_config(two_stage_gates=two_stage_gates))
+        if conv == "fallback":
+            monkeypatch.setattr("megatron.core.ssm.gated_delta_net.kda.causal_conv1d", None)
+        num_tokens = 6
+        hidden_states = torch.randn(
+            (num_tokens, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device=hidden_states.device)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+        )
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone_output = torch.cat(
+                [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
+            )
+            if conv == "pad_alignment":
+                # Applies to packed input only, so set after the unpacked reference.
+                monkeypatch.setattr(kda.config, "gdn_conv_pad_alignment", 64)
+            packed_output = _replay_in_cuda_graph(
+                lambda: kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
+            )
+        # The recurrent and chunked kernels round their bf16 intermediates differently.
+        torch.testing.assert_close(
+            packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_single_token_sequences_read_only_g(monkeypatch, two_stage_gates):
+    """FLA's recurrent KDA kernel tiles the head dim K to next_power_of_2(K) and reads each row of
+    g that wide. With K = 96 and g followed by NaN, every token of a single-token pack, as an MTP
+    draft step without a context packs its requests, still gets the output it has alone. FLA
+    before 0.6.0 reads the last row unmasked, past the end of g, and that head's output is NaN."""
+    head_dim = 96
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(
+            _make_config(
+                two_stage_gates=two_stage_gates,
+                kv_channels=head_dim,
+                linear_key_head_dim=head_dim,
+                linear_value_head_dim=head_dim,
+            )
+        )
+        num_tokens = 6
+        hidden_states = torch.randn(
+            (num_tokens, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = PackedSeqParams.single_token_sequences(
+            num_tokens, device=hidden_states.device
+        )
+        pre_gated_delta_rule = kda.pre_gated_delta_rule
+
+        def g_followed_by_nan(*args, **kwargs):
+            query, key, value, gate, beta, raw_g, A_log, dt_bias = pre_gated_delta_rule(
+                *args, **kwargs
+            )
+            raw_g = followed_by_nan(raw_g)
+            return query, key, value, gate, beta, raw_g, A_log, dt_bias
+
+        with torch.inference_mode(), InferenceMode.active():
+            alone_output = torch.cat(
+                [kda(hidden_states[i : i + 1], None)[0] for i in range(num_tokens)]
+            )
+            monkeypatch.setattr(kda, "pre_gated_delta_rule", g_followed_by_nan)
+            packed_output = kda(hidden_states, None, packed_seq_params=packed_seq_params)[0]
+        assert torch.isfinite(packed_output).all()
+        torch.testing.assert_close(
+            packed_output, alone_output, rtol=0, atol=2e-2 * alone_output.abs().max().item()
         )
     finally:
         Utils.destroy_model_parallel()

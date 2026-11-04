@@ -21,6 +21,8 @@ Each kernel is replayed in that mode, including with Triton's autotune cache ena
 import pytest
 import torch
 
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -439,8 +441,11 @@ def test_chunk_gated_delta_product_varlen_replays(M):
     )
 
 
+@pytest.mark.parametrize("with_state", [True, False], ids=["state", "stateless"])
 @pytest.mark.parametrize("gate_in_kernel", [False, True])
-def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
+def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel, with_state):
+    """Without a state, the recurrence starts from zero and stores nothing: the step GDP takes
+    for packed single-token sequences, as an MTP draft step without a context packs them."""
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
@@ -469,8 +474,8 @@ def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
             v,
             g=g,
             beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
+            initial_state=initial_state if with_state else None,
+            output_final_state=with_state,
             use_qk_l2norm_in_kernel=True,
             **gate_kwargs,
         )
@@ -819,6 +824,52 @@ def test_kda_fp8_opt_out_scope_is_replay_safe():
     assert not _kda_fp8_disabled(GDNLayerConfig.from_config(config))
 
 
+@pytest.mark.parametrize("variant", ["kda", "gdn2"])
+def test_fla_fused_recurrent_single_step_replays(variant):
+    """KDA and GDN2 run packed single-token sequences, as an MTP draft step without a context
+    packs them, as one step of FLA's recurrent kernel per sequence, from a zero state."""
+    seeded()
+    B, H, K, V = 64, 8, 128, 128
+    q = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, 1, H, V, device="cuda", dtype=torch.bfloat16)
+    if variant == "kda":
+        fused_recurrent_kda = pytest.importorskip("fla.ops.kda").fused_recurrent_kda
+        raw_g = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+        beta = torch.rand(B, 1, H, device="cuda")
+        A_log = torch.randn(H, device="cuda")
+        dt_bias = torch.randn(H * K, device="cuda")
+
+        def fn(q, k, v, raw_g, beta):
+            return fused_recurrent_kda(
+                q,
+                k,
+                v,
+                raw_g,
+                beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                lower_bound=-5.0,
+            )[0]
+
+        args = (q, k, v, raw_g, beta)
+    else:
+        fused_recurrent_gdn2 = pytest.importorskip("fla.ops.gdn2").fused_recurrent_gdn2
+        g = -torch.rand(B, 1, H, K, device="cuda") * 0.1
+        b = torch.rand(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+        w = torch.rand(B, 1, H, V, device="cuda", dtype=torch.bfloat16)
+
+        def fn(q, k, v, g, b, w):
+            return fused_recurrent_gdn2(q, k, v, g, b, w)[0]
+
+        args = (q, k, v, g, b, w)
+    assert_replays_bit_exact(
+        fn, args, replays=4, backward=False, what=f"fla fused_recurrent ({variant}, one step)"
+    )
+
+
 @pytest.mark.xfail(
     strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
 )
@@ -883,6 +934,39 @@ def test_unfused_mixer_applies_the_gate_exactly_once(monkeypatch, batch_invarian
             f"batch_invariant_mode={batch_invariant}: the gate went "
             f"{'into the scan' if gated_in_scan else 'into the norm'}"
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_deterministic_conv1d
+def test_single_token_sequences_unfused_mixer_replays_bit_exactly(monkeypatch):
+    """In inference, packed sequences of one token each (a context-free MTP draft step packs
+    its requests so) run one step each from a zero state: the conv over each token alone and
+    the chunked scan restarted at every token through ``seq_idx``. The forward replays bitwise."""
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
+    mixer = _build_mixer()
+    try:
+        num_tokens = 256
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+            seq_idx=cu_seqlens[:-1].unsqueeze(0),
+        )
+        hidden_states = torch.randn(num_tokens, 1, mixer.config.hidden_size, device="cuda")
+        with torch.no_grad(), InferenceMode.active():
+            assert_module_replays_bit_exact(
+                mixer,
+                dict(hidden_states=hidden_states, packed_seq_params=packed_seq_params),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="Mamba mixer on single-token sequences (_static_prefill)",
+            )
     finally:
         Utils.destroy_model_parallel()
 

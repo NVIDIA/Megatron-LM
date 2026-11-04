@@ -540,13 +540,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/wy_fast.py",
             "megatron/core/ssm/context_parallel/gdp.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_gdp_cp_kernels.py"),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
         "replayed both for one token per request and for a speculative step of several draft "
         "tokens, where the recurrence also writes per-draft-token state snapshots for rollback; "
-        "prefill-prepare is replayed for a single token and for a full 4096-token step.",
+        "prefill-prepare is replayed for a single token and for a full 4096-token step. "
+        "context_parallel/gdp.py launches FLA's CP summary and merge kernels directly; "
+        "test_gdp_cp_kernels.py replays them for BLH and varlen fragments and checks them against "
+        "FLA's chunk scans.",
     ),
     KernelEntry(
         name="gated_delta_net",
@@ -562,7 +565,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "In inference, KDA and GDN2 run packed single-token sequences (a context-free MTP draft "
+        "step) one step each from a zero state: on FLA's fused_recurrent_kda / "
+        "fused_recurrent_gdn2, replayed by test_fla_fused_recurrent_single_step_replays, or on "
+        "the chunked kernel of GDN2's torch backend.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -753,7 +760,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
         ),
         kind="dispatch",
-        notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
+        notes="In inference the unfused path (_static_prefill) runs packed single-token "
+        "sequences (a context-free MTP draft step) with the conv over each token alone and "
+        "seq_idx in mamba_chunk_scan_combined, replayed by "
+        "test_single_token_sequences_unfused_mixer_replays_bit_exactly. "
+        "Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
@@ -762,7 +773,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_gdp_cp_kernels.py"),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
@@ -770,7 +781,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "as outputs. Without state caches (packed single-token sequences in inference, as a "
+        "context-free MTP draft step packs them) ssm_decode runs the training path's conv "
+        "(causal_conv1d_fn or its fallback) over each token and the fused recurrence from a zero "
+        "state, replayed by the stateless case of "
+        "test_fused_recurrent_gated_delta_rule_update_replays. No module-level replay yet "
+        "(HYBRID_CONFIGS has no GDP cell).",
     ),
     KernelEntry(
         name="rope_dispatch",

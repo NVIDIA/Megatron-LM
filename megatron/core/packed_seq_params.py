@@ -72,6 +72,39 @@ class PackedSeqParams:
                 .unsqueeze(0)  # Add a batch dimension
             )
 
+    @classmethod
+    def single_token_sequences(cls, num_tokens: int, device: torch.device) -> "PackedSeqParams":
+        """Pack `num_tokens` tokens so that each one is its own sequence.
+
+        Args:
+            num_tokens (int): Number of packed tokens, i.e. of sequences.
+            device (torch.device): Device of the sequence-boundary tensors.
+
+        Returns:
+            PackedSeqParams: THD params with `cu_seqlens = [0, 1, ..., num_tokens]`.
+        """
+        cu_seqlens = torch.arange(num_tokens + 1, dtype=torch.int32, device=device)
+        return cls(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+            # Token i is sequence i. Set here so no consumer derives it with a host sync.
+            seq_idx=cu_seqlens[:-1].unsqueeze(0),
+            pad_between_seqs=False,
+        )
+
+    def has_single_token_sequences(self) -> bool:
+        """Whether every packed sequence holds at most one token.
+
+        The packed tokens are then a batch of length-1 sequences, which needs no varlen
+        kernels: core attention runs them as the sbhd batch `[1, t, ...]` (see
+        `Attention._runs_tokens_as_batch`), and a recurrent mixer as one step per sequence from
+        a zero state (see `megatron.core.ssm.ssm_inference.steps_from_zero_state`).
+        """
+        return self.qkv_format == "thd" and self.max_seqlen_q == 1 and self.max_seqlen_kv == 1
+
 
 def resolve_cp_group(
     static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
