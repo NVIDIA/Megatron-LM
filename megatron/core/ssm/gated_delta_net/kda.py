@@ -419,7 +419,10 @@ class KimiDeltaAttention(_GDNBase):
                 )
             else:
                 out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
+                    _checkpointed_compute,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    tp_group=self.pg_collection.tp,
                 )
         else:
             out, out_bias = self._forward_compute(
