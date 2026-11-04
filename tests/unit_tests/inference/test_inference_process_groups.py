@@ -37,7 +37,7 @@ _NOT_ACCESSORS = {
     "get_virtual_pipeline_model_parallel_rank",
     "get_virtual_pipeline_model_parallel_world_size",
 }
-# Pipeline-stage predicates also read the global grid; the checker does not count them.
+# Pipeline-stage predicates also read the global grid; the checker counts them as functions.
 _STAGE_PREDICATES = ("is_pipeline_first_stage", "is_pipeline_last_stage")
 
 

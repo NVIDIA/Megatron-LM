@@ -74,7 +74,7 @@ class TestForbidGlobalProcessGroups:
                     getattr(ps, name)()
             with pytest.raises(AssertionError, match="get_tensor_model_parallel_world_size"):
                 mpu.get_tensor_model_parallel_world_size()
-            # Not counted by the checker. get_all_ranks calls counted accessors itself.
+            # Not accessors, so not stubbed. get_all_ranks calls stubbed accessors itself.
             assert ps.is_initialized()
             assert ps.get_global_memory_buffer() is not None
             ps.get_virtual_pipeline_model_parallel_world_size()
