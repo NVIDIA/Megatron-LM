@@ -3,10 +3,11 @@
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
 import os
+import threading
 import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, ContextManager, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -15,7 +16,7 @@ from megatron.core import parallel_state
 # The fallbacks first warn in Megatron Core 0.21, so the N+2 policy in
 # docs/api-backwards-compatibility-check.md removes them in 0.23. These are the defaults; a
 # fallback that starts to warn in a later release passes its own versions to
-# warn_global_process_group_fallback or resolve_process_groups.
+# warn_global_process_group_fallback, global_process_group_fallback or resolve_process_groups.
 _FALLBACK_DEPRECATED_IN = "0.21"
 _FALLBACK_REMOVED_IN = "0.23"
 
@@ -31,6 +32,9 @@ _FALLBACK_WARNING_SKIP_PREFIXES = (
 # Fallbacks that have already warned in this process: (owner, argument) for a fallback to the
 # global grid, and (owner, argument, "uninitialized") for one that found the grid uninitialized.
 _warned_global_process_group_fallbacks: Set[Tuple[str, ...]] = set()
+
+# Fallbacks whose warning this thread is showing, in its "keys" attribute.
+_fallback_warnings_in_progress = threading.local()
 
 
 class ProcessGroupFallbackWarning(FutureWarning):
@@ -68,6 +72,10 @@ def warn_global_process_group_fallback(
     arguments of one owner hears about both. A warning that a filter turns into an error is not
     recorded, so under an ``error`` filter every fallback raises.
 
+    A fallback outside Megatron Core that then reads the deprecated ``parallel_state`` accessors
+    warns with ``global_process_group_fallback`` instead, which keeps those reads from emitting
+    a ``ParallelStateDeprecationWarning`` as well.
+
     Args:
         owner: Name of the class or function whose caller omitted ``argument``.
         argument: Name of the omitted process-group argument.
@@ -84,22 +92,70 @@ def warn_global_process_group_fallback(
     )
 
 
+def global_process_group_fallback(
+    owner: str,
+    argument: str = "pg_collection",
+    *,
+    deprecated_in: str = _FALLBACK_DEPRECATED_IN,
+    removed_in: str = _FALLBACK_REMOVED_IN,
+) -> ContextManager[None]:
+    """Warn that a missing argument uses the global grid, and return a block that reads it.
+
+    For a compatibility fallback outside Megatron Core that reads the ``parallel_state``
+    accessors for a caller that omitted ``argument``::
+
+        with global_process_group_fallback("my_function", "tp_group"):
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+
+    It emits the ``ProcessGroupFallbackWarning`` of ``warn_global_process_group_fallback``. That
+    warning reports the fallback, so the deprecated ``parallel_state`` functions called in the
+    returned block do not also emit a ``ParallelStateDeprecationWarning`` for each call. The
+    fallbacks in Megatron Core need no block: its calls of those functions do not warn.
+
+    Keep the block to the reads of the fallback: a deprecated function that anything else in
+    the block calls, at any depth, does not warn either. Under strict mode
+    (``enable_strict_process_group_fallbacks``) the warning raises before the block reads the
+    grid.
+
+    Args:
+        owner: Name of the class or function whose caller omitted ``argument``.
+        argument: Name of the omitted process-group argument.
+        deprecated_in: Megatron Core release in which this fallback started to warn.
+        removed_in: Megatron Core release that removes this fallback.
+
+    Returns:
+        A context manager whose block reads the grid without accessor warnings.
+    """
+    warn_global_process_group_fallback(
+        owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
+    )
+    return parallel_state._deprecated_calls_in_warned_fallback()
+
+
 def _warn_fallback_once(
     key: Tuple[str, ...], fallback: str, *, deprecated_in: str, removed_in: str
 ) -> None:
     """Emit a ``ProcessGroupFallbackWarning`` that describes ``fallback``, once per ``key``.
 
     A warning that a filter turns into an error is not recorded, so under an ``error`` filter
-    every fallback raises.
+    every fallback raises. A warning hook that reaches the same fallback while its warning is
+    shown, in the same thread, does not warn again, so it does not recurse.
     """
     if key in _warned_global_process_group_fallbacks:
         return
-    warnings.warn(
-        f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and will be "
-        f"removed in {removed_in}; pass the owning model's process groups explicitly.",
-        ProcessGroupFallbackWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
-    )
+    in_progress = vars(_fallback_warnings_in_progress).setdefault("keys", set())
+    if key in in_progress:
+        return
+    in_progress.add(key)
+    try:
+        warnings.warn(
+            f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and will "
+            f"be removed in {removed_in}; pass the owning model's process groups explicitly.",
+            ProcessGroupFallbackWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    finally:
+        in_progress.discard(key)
     _warned_global_process_group_fallbacks.add(key)
 
 
