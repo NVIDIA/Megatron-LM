@@ -127,7 +127,7 @@
       "_backfill_gtp_sharded_param_map:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/optimizer/qk_clip.py": [
-      "clip_qk:accessor:parallel_state.get_data_parallel_group"
+      "clip_qk:guarded:resolve_process_groups"
     ],
     "megatron/core/pipeline_parallel/schedules.py": [
       "_build_default_pg_collection:accessor:parallel_state.get_context_parallel_group",
