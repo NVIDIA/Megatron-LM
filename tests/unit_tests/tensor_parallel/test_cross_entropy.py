@@ -106,6 +106,51 @@ def test_language_module_loss_returns_argmax_of_the_cross_entropy():
         assert loss.shape == labels.shape
 
 
+def test_language_module_loss_on_gathered_logits_uses_full_vocab_cross_entropy():
+    """Gathered logits must not reach the vocab-parallel kernel (#7452, finding 2).
+
+    With the full vocabulary replicated on every TP rank, the vocab-parallel kernel
+    reads the last dimension as one shard and counts the softmax denominator TP
+    times, so the loss is off by log(TP) and the gradients are wrong."""
+    tp_group = _FakeTPGroup()
+
+    def fail_vocab_parallel_cross_entropy(*args, **kwargs):
+        raise AssertionError("gathered logits must bypass the vocab-parallel kernel")
+
+    module = SimpleNamespace(
+        tp_group=tp_group, vocab_parallel_cross_entropy=fail_vocab_parallel_cross_entropy
+    )
+    labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    logits = torch.randn(3, 2, 5, requires_grad=True)
+
+    loss = language_module_module.LanguageModule.compute_language_model_loss(
+        module, labels=labels, logits=logits, logits_are_gathered=True
+    )
+
+    expected_loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, 5), labels.transpose(0, 1).reshape(-1), reduction="none"
+    ).view(3, 2)
+    torch.testing.assert_close(loss, expected_loss.transpose(0, 1).contiguous())
+    loss.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_language_module_loss_on_gathered_logits_returns_full_vocab_argmax():
+    """With return_argmax on gathered logits, the argmax covers the full vocabulary."""
+    tp_group = _FakeTPGroup()
+    module = SimpleNamespace(tp_group=tp_group, vocab_parallel_cross_entropy=None)
+    labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    logits = torch.randn(3, 2, 5)
+    argmax = torch.argmax(logits, dim=-1)
+
+    loss, returned_argmax = language_module_module.LanguageModule.compute_language_model_loss(
+        module, labels=labels, logits=logits, return_argmax=True, logits_are_gathered=True
+    )
+
+    assert loss.shape == labels.shape
+    torch.testing.assert_close(returned_argmax, argmax)
+
+
 def test_vocab_parallel_cross_entropy():
     Utils.initialize_model_parallel(4, 2)
     vocab_parallel_logits = torch.range(0, 7).repeat(16, 4).cuda()
