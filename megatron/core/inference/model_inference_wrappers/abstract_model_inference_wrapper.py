@@ -69,6 +69,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # collection rather than an inference-specific one.
         pg_collection = self.inference_context.config.resolve_pg_collection()
 
+        # An unset group reads as None, which torch.distributed takes as the world group and the
+        # pipeline-stage helpers as the global pipeline stage.
+        missing = [name for name in ("tp", "pp") if vars(pg_collection).get(name) is None]
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__} needs the {', '.join(missing)} process group(s); set "
+                "them in InferenceConfig.pg_collection"
+            )
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
