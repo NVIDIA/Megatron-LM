@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
@@ -21,6 +22,7 @@ from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     StreamwiseSigmoidWideResidualRead,
     expand_wide_residual_stream,
+    retarget_legacy_residual_keys,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
@@ -953,3 +955,45 @@ class TestWideResidualLayerIntegration:
             ("mlp", "read"),
             ("mlp", "write"),
         ]
+
+
+def test_retarget_legacy_residual_keys_loads_pre_split_checkpoints():
+    """Sharded keys that a pre-split checkpoint lacks load from its residual_connection* keys."""
+    prefix = "language_model.module.module.decoder.layers."
+    current_to_legacy = {
+        f"{prefix}3.residual_read_mlp.read_map.logit": f"{prefix}3.residual_connection_mlp.read_map.logit",
+        f"{prefix}3.moe_layer.residual_write_mlp.retention.retention_logit": (
+            f"{prefix}3.moe_layer.residual_connection_mlp.retention.retention_logit"
+        ),
+        f"{prefix}5.compute_layer.residual_write.write_map.logit": (
+            f"{prefix}5.compute_layer.residual_connection.write_map.logit"
+        ),
+        f"{prefix}5.compute_layer.residual_read_self_attn.read_map.logit": (
+            f"{prefix}5.compute_layer.residual_connection_self_attn.read_map.logit"
+        ),
+        "optimizer.state.exp_avg.decoder.layers.7.residual_read.read_map.logit": (
+            "optimizer.state.exp_avg.decoder.layers.7.residual_connection.read_map.logit"
+        ),
+    }
+    unchanged = [
+        f"{prefix}4.shortcut_residual_read.read_map.logit",  # same name before and after
+        f"{prefix}6.residual_read.read_map.logit",  # already present under its current key
+        f"{prefix}8.residual_write.write_map.logit",  # no legacy key in the checkpoint either
+    ]
+    checkpoint_keys = set(current_to_legacy.values()) | set(unchanged[:2])
+    sharded_state_dict = {
+        "model": {
+            key: ShardedTensor.from_rank_offsets(key, torch.zeros(4))
+            for key in [*current_to_legacy, *unchanged]
+        },
+        "iteration": 500,
+    }
+
+    assert retarget_legacy_residual_keys(sharded_state_dict, checkpoint_keys) == len(
+        current_to_legacy
+    )
+    loaded = {name: tensor.key for name, tensor in sharded_state_dict["model"].items()}
+    for current, legacy in current_to_legacy.items():
+        assert loaded[current] == legacy
+    for key in unchanged:
+        assert loaded[key] == key

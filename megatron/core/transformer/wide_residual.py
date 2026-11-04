@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Iterable, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -380,6 +381,37 @@ def load_residual_state(
             if key.startswith(prefix + legacy):
                 state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
+
+
+def retarget_legacy_residual_keys(sharded_state_dict: dict, checkpoint_keys: Iterable[str]) -> int:
+    """Point wide-residual sharded keys that a checkpoint lacks at their legacy names.
+
+    The distributed-checkpoint counterpart of ``load_residual_state``: checkpoints saved before
+    the residual read/write split store ``residual_connection*`` keys. A sharded tensor whose
+    current key is absent from ``checkpoint_keys`` but whose legacy key is present is loaded from
+    the legacy key; checkpoints with current keys are unaffected.
+
+    Returns:
+        The number of retargeted entries.
+    """
+    checkpoint_keys = set(checkpoint_keys)
+    retargeted = 0
+    for value in nested_values(sharded_state_dict):
+        key = getattr(value, "key", None)
+        if not isinstance(key, str) or key in checkpoint_keys:
+            continue
+        for current, legacy in _RESIDUAL_STATE_PREFIXES:
+            if key.startswith(current):
+                legacy_key = legacy + key[len(current) :]
+            elif "." + current in key:
+                legacy_key = key.replace("." + current, "." + legacy, 1)
+            else:
+                continue
+            if legacy_key in checkpoint_keys:
+                value.key = legacy_key
+                retargeted += 1
+            break
+    return retargeted
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):

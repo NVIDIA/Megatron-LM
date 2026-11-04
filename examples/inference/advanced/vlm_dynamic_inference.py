@@ -218,10 +218,20 @@ def _enable_checkpoint_expert_bias(args):
     """Route with the trained router expert biases when the checkpoint carries them.
 
     Routing adds each MoE router's expert_bias to the scores when selecting experts. A checkpoint
-    can hold trained biases while its saved args disable them (e.g. quantile balancing that
-    estimates expert_bias from global-batch histograms), and --use-checkpoint-args would then
-    build routers without them.
+    can hold trained biases while its saved args disable them, and --use-checkpoint-args would
+    then build routers without them. Global-batch quantile balancing is the exception: its
+    routers register and load expert_bias on their own.
     """
+    load_balancing_types = getattr(args, 'moe_router_load_balancing_type', None)
+    if isinstance(load_balancing_types, str):
+        load_balancing_types = [load_balancing_types]
+    if (
+        'quantile_balancing' in (load_balancing_types or [])
+        and getattr(args, 'moe_router_quantile_balancing_estimation_scope', None) == 'global_batch'
+    ):
+        # Global-batch quantile balancing registers and routes with router.expert_bias itself,
+        # and the config rejects combining it with the DeepSeek-style expert-bias update.
+        return
     if any(key.endswith('router.expert_bias') for key in _checkpoint_tensor_keys(args)):
         if not args.moe_router_enable_expert_bias:
             print_rank_0(
