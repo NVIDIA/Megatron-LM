@@ -58,13 +58,15 @@ sends every other shape to FlashInfer, which mis-rotates NeoX shapes whose R/2 i
 of its vec (e.g. D 40, 48, 72, 80, 112; 128/40, 96/48, 96/24, 512/48; most D/4 rotary dims) and
 overlaps its stores past the rotary span of interleaved shapes whose R is not a multiple of 16
 (e.g. 40/40, 72/72, 80/40, 96/24). ``test_fused_rope_rotates_shapes_flashinfer_cannot`` holds
-exactly those shapes: it fails on main and passes with #8862, which rotates them in fp32. Every
-other test takes shapes main rotates correctly and passes on both.
+exactly those shapes: it fails on main and passes with #8862, which rotates them in fp32. The
+FlashInfer spy fails a call on any of them before the launch, because a misaligned store
+(D16 GPT-J on H100) poisons the CUDA context for every later test in the process. Every other
+test takes shapes main rotates correctly and passes on both.
 
 Memory: Q/K, the positions and the cache inside NaN guard bands (an out-of-range read turns an
 output NaN), positions past n poisoned, the in-place kernel on guard-banded buffers (an
-out-of-range write changes a guard), ``sanitizer`` cases on both kernels and on two shapes main
-mis-rotates; rows past ``2**31`` elements (``large``, opt-in).
+out-of-range write changes a guard), ``sanitizer`` cases on both kernels and on two shapes
+FlashInfer cannot rotate (#8862's fp32 path); rows past ``2**31`` elements (``large``, opt-in).
 
 Hardware: H100 (sm_90).
 """
@@ -280,7 +282,13 @@ class Case:
 
 
 class RopeSpy:
-    """Counts Megatron's calls of FlashInfer's cos/sin-cache RoPE."""
+    """Counts Megatron's calls of FlashInfer's cos/sin-cache RoPE; fails a call on a shape it
+    cannot rotate exactly (R08-F1) without launching it.
+
+    On those shapes FlashInfer's 16-byte loads and stores leave their lanes (on H100 D16 GPT-J
+    faults with a misaligned address), and such a fault poisons the CUDA context: every later test
+    in the process would fail, and CI runs the whole oracle directory in one process.
+    """
 
     def __init__(self, monkeypatch):
         self.calls = 0
@@ -288,6 +296,12 @@ class RopeSpy:
 
         def spied(*args, **kwargs):
             self.calls += 1
+            d, r = kwargs["head_size"], kwargs["cos_sin_cache"].shape[-1]
+            interleaved = not kwargs["is_neox"]
+            assert flashinfer_rotates_exactly(d, r, interleaved), (
+                f"{shape_id(d, r, interleaved)} sent to FlashInfer, which cannot rotate it exactly"
+                " (R08-F1); not launched"
+            )
             return original(*args, **kwargs)
 
         monkeypatch.setattr(flashinfer.rope, "apply_rope_with_cos_sin_cache", spied)
@@ -389,8 +403,9 @@ def test_fused_rope_rotates_shapes_flashinfer_cannot(
     Fails on main, which sends all of them to FlashInfer (wrong lanes, neighbor heads read,
     overlapping stores; D72 interleaved stores past the output); passes with PR #8862, which
     rotates them in fp32. NeoX D16, which main rotates itself, is
-    ``test_fused_rope_rotates_neox_head_dim_16``. The sanitizer cases show the out-of-bounds
-    stores under memcheck on main.
+    ``test_fused_rope_rotates_neox_head_dim_16``. On main ``RopeSpy`` fails each case at the
+    FlashInfer call, before the launch (R08-F1); the sanitizer cases check #8862's fp32 path
+    under memcheck.
     """
     hq, hk = (2, 1) if n >= 4096 else (6, 2)
     case = Case(d, r, interleaved, DTYPES[dtype], n, hq, hk, fused_qkv=n < 4096, max_len=max_len)
