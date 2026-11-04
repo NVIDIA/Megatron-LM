@@ -84,6 +84,7 @@ from megatron.core.optimizer import (
     get_mup_config_overrides,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -95,6 +96,7 @@ from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_indexer_lr_for_logging,
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
@@ -206,6 +208,7 @@ from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
+    get_model_to_optimizer_param_map,
     is_last_rank,
     logical_and_across_model_parallel_group,
     print_rank_0,
@@ -1502,7 +1505,12 @@ def num_floating_point_operations(
                 spec_parts.extend(_split_spec_part(part))
         if not spec_parts:
             return False
-        return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
+        return spec_parts[-1] in {
+            'gdp_stack_spec',
+            'gated_delta_product_stack_spec',
+            # DSA over GQA derived from the GDP stack: same GDP mixers, so the same FLOPs.
+            'gdp_dsa_stack_spec',
+        }
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
@@ -1653,6 +1661,349 @@ def _get_start_time_from_progress_log(save_dir: str, world_size: int):
     print_rank_0(f"megatron.training.get_start_time_from_progress_log: "
                  f"{start_time=}, {start_num_floating_point_operations=}")
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
+
+
+def _freeze_non_dsa_indexer_parameters(model):
+    """Freeze all parameters except those under DSA indexer submodules."""
+
+    indexer_param_count = 0
+    frozen_param_count = 0
+    indexer_element_count = 0
+    frozen_element_count = 0
+    frozen_expert_bias_count = 0
+
+    for model_module in model:
+        for name, param in model_module.named_parameters():
+            is_indexer_param = _is_dsa_indexer_param_name(name)
+            if is_indexer_param:
+                param.requires_grad_(True)
+                indexer_param_count += 1
+                indexer_element_count += param.nelement()
+            else:
+                param.requires_grad_(False)
+                frozen_param_count += 1
+                frozen_element_count += param.nelement()
+        # The MoE router's expert_bias is a buffer, not a parameter: finalize_model_grads
+        # rewrites it every step from the observed token counts, for load balancing. Clearing
+        # requires_grad does not reach it, so the backbone's routing would keep drifting while
+        # only the indexer is meant to train.
+        for module in model_module.modules():
+            if hasattr(module, 'frozen_expert_bias'):
+                module.frozen_expert_bias = True
+                frozen_expert_bias_count += 1
+
+    global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
+    if global_indexer_param_count == 0:
+        raise RuntimeError(
+            "--dsa-train-indexer-only was set, but no DSA indexer parameters were found. "
+            "Check that --experimental-attention-variant dsa is active and DSA layers are built."
+        )
+
+    print_rank_0(
+        f" > DSA train-indexer-only: froze {frozen_expert_bias_count} MoE router expert biases; "
+        "trainable indexer params "
+        f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
+        f"{indexer_element_count} local elements; "
+        f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
+    )
+
+
+def apply_dsa_param_freezing(model):
+    """Apply --dsa-train-indexer-only parameter freezing.
+
+    Must run before the model is wrapped for distributed training: DDP and the
+    optimizer capture ``requires_grad`` when they take the parameters, so freezing
+    afterwards silently does nothing.
+
+    Reached from two paths, because the two model-building paths do not share code:
+    directly from ``megatron.training.training.get_model`` (legacy), and via
+    ``_dsa_param_freezing_pre_wrap_hook`` on ``model_config.pre_wrap_hooks`` for the
+    GPT/Hybrid builders. Omitting the second is a silent correctness bug -- training
+    proceeds with every parameter trainable and only the loss curve reveals it.
+    """
+    args = get_args()
+    if getattr(args, "dsa_train_indexer_only", False):
+        if getattr(args, "experimental_attention_variant", None) != "dsa":
+            raise RuntimeError(
+                "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
+            )
+        if getattr(args, "overlap_param_gather", False):
+            raise RuntimeError(
+                "--dsa-train-indexer-only is not compatible with --overlap-param-gather. "
+                "DSA min-memory indexer paths use indexer parameter tensors directly, bypassing "
+                "the module forward pre-hooks that overlapped param gather depends on."
+            )
+        _freeze_non_dsa_indexer_parameters(model)
+
+
+def _is_dsa_indexer_param_name(name: str) -> bool:
+    """Return true when a parameter name belongs to a DSA indexer module."""
+    return name.startswith("indexer.") or ".indexer." in name
+
+
+def _is_dsa_indexer_module_name(name: str) -> bool:
+    """Return true when a module name is a DSA indexer module."""
+    return name == "indexer" or name.endswith(".indexer")
+
+
+def _reset_dsa_indexer_modules_with_current_rng(model) -> int:
+    """Reset DSA indexer modules using the current RNG state."""
+    if not isinstance(model, list):
+        model = [model]
+
+    reset_module_count = 0
+    for model_module in model:
+        config = get_model_config(model_module)
+        init_method = getattr(config, "init_method", None)
+        for module_name, module in model_module.named_modules():
+            if not _is_dsa_indexer_module_name(module_name):
+                continue
+            reset_module_count += 1
+            for _child_name, child in module.named_modules():
+                child_params = list(child.named_parameters(recurse=False))
+                if not child_params:
+                    continue
+                if any(param.ndim >= 2 for _, param in child_params):
+                    for param_name, param in child_params:
+                        if not param.requires_grad:
+                            continue
+                        with torch.no_grad():
+                            if param.ndim >= 2:
+                                if init_method is None:
+                                    raise RuntimeError(
+                                        "Cannot reset DSA indexer matrix parameter without "
+                                        "a model init_method."
+                                    )
+                                init_method(param)
+                            elif param_name == "bias":
+                                param.zero_()
+                elif hasattr(child, "reset_parameters"):
+                    child.reset_parameters()
+
+    return reset_module_count
+
+
+def _reset_dsa_indexer_modules(model, seed: int) -> int:
+    """Reset DSA indexer modules using the same RNG path as duplicated TE construction."""
+    cuda_available = torch.cuda.is_available()
+    cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
+    if cuda_available and cuda_rng_tracker.is_initialized():
+        rng_tracker_states = cuda_rng_tracker.get_states()
+        rng_tracker_name = tensor_parallel.get_data_parallel_rng_tracker_name()
+        try:
+            # The loaded module is normally CUDA-resident, but CPU initialization and
+            # offloaded parameters are valid too. Preserve and seed both RNG domains so an
+            # out-of-band reset neither perturbs the training RNG nor depends on residency.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed)
+                with cuda_rng_tracker.fork(rng_tracker_name):
+                    torch.cuda.manual_seed(seed)
+                    return _reset_dsa_indexer_modules_with_current_rng(model)
+        finally:
+            cuda_rng_tracker.set_states(rng_tracker_states)
+
+    cuda_devices = [torch.cuda.current_device()] if cuda_available else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(seed)
+        if cuda_available:
+            torch.cuda.manual_seed(seed)
+        return _reset_dsa_indexer_modules_with_current_rng(model)
+
+
+def _global_dsa_indexer_reset_count(local_reset_count: int) -> int:
+    """Sum reset modules across ranks so PP stages without DSA layers remain valid."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local_reset_count
+    backend = torch.distributed.get_backend()
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend == "nccl"
+        else torch.device("cpu")
+    )
+    count = torch.tensor(local_reset_count, device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+    return int(count.item())
+
+
+@torch.no_grad()
+def _broadcast_dsa_indexer_params(model) -> None:
+    """Restore the DDP parameter-replica invariant after an out-of-band reset."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    if not isinstance(model, list):
+        model = [model]
+    data_parallel_group = mpu.get_data_parallel_group()
+    if get_pg_size(data_parallel_group) == 1:
+        return
+    src_rank = torch.distributed.get_global_rank(data_parallel_group, 0)
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name):
+                continue
+            torch.distributed.broadcast(param.data, src=src_rank, group=data_parallel_group)
+
+
+def _get_dsa_indexer_reset_seed(args) -> int:
+    """Return the reset seed, following normal Megatron model-init seed derivation."""
+    seed = getattr(args, "seed", 1234)
+    seed += 100 * mpu.get_pipeline_model_parallel_rank()
+    if getattr(args, "data_parallel_random_init", False):
+        seed += 10 * mpu.get_data_parallel_rank()
+    return seed
+
+
+def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
+    """Clear optimizer state only for DSA indexer optimizer parameters."""
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return 0
+    if not isinstance(model, list):
+        model = [model]
+    if hasattr(optimizer, "chained_optimizers"):
+        return sum(
+            _clear_dsa_indexer_optimizer_state(model, child_optimizer)
+            for child_optimizer in optimizer.chained_optimizers
+        )
+
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
+    torch_optimizer = getattr(optimizer, "optimizer", None)
+    optimizer_state = getattr(torch_optimizer, "state", None)
+    if optimizer_state is None:
+        return 0
+
+    cleared = 0
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name):
+                continue
+            optim_param = param_to_optim_param.get(param)
+            if optim_param is not None and optim_param in optimizer_state:
+                optimizer_state.pop(optim_param, None)
+                cleared += 1
+    return cleared
+
+
+@torch.no_grad()
+def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
+    """Refresh only optimizer-owned indexer weights after an in-place model reset."""
+    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+        return 0
+    if not isinstance(model, list):
+        model = [model]
+    if hasattr(optimizer, "chained_optimizers"):
+        return sum(
+            _reload_dsa_indexer_optimizer_params(model, child_optimizer)
+            for child_optimizer in optimizer.chained_optimizers
+        )
+
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
+    precision_aware = getattr(
+        getattr(optimizer, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False
+    )
+    refreshed = 0
+    for model_chunk in model:
+        for name, model_param in model_chunk.named_parameters():
+            if not _is_dsa_indexer_param_name(name):
+                continue
+            optim_param = param_to_optim_param.get(model_param)
+            if optim_param is None:
+                # A distributed-optimizer rank need not own a shard of every model parameter.
+                continue
+
+            source = model_param.detach().reshape(-1)
+            if optim_param.numel() != source.numel():
+                get_range = getattr(optimizer, "_get_model_param_range_map", None)
+                if get_range is None:
+                    raise RuntimeError(
+                        "Cannot map a sharded DSA indexer parameter to its optimizer-owned shard."
+                    )
+                param_range = get_range(model_param)["param"]
+                source = source[param_range.start : param_range.end]
+
+            if precision_aware:
+                set_states = getattr(optimizer, "_set_main_param_and_optimizer_states", None)
+                if set_states is None:
+                    raise RuntimeError(
+                        "Precision-aware optimizer does not expose indexer master-parameter refresh."
+                    )
+                set_states(model_param, {"param": source.float()})
+            elif optim_param is not model_param:
+                optim_param.copy_(source.reshape_as(optim_param))
+            refreshed += 1
+    return refreshed
+
+
+def _should_reset_dsa_indexer_after_load(args) -> bool:
+    """Whether a checkpoint load should run the one-time DSA indexer initialization.
+
+    The flag converts a checkpoint that has no indexer into a DSA run, so it should fire
+    exactly when the loaded checkpoint carries no indexer to preserve. ``load_checkpoint``
+    records that as ``args.checkpoint_has_dsa_indexer``.
+
+    Testing the checkpoint rather than ``args.iteration`` decouples this from ``--finetune``.
+    The iteration is zero under ``--finetune`` and ``--pretrained-checkpoint`` and non-zero on
+    an ordinary resume, so it forced ``--finetune`` on anyone converting a dense checkpoint,
+    and it did not stop ``--finetune`` from re-initialising a checkpoint whose indexer was
+    already trained.
+    """
+    if not getattr(args, "dsa_reset_indexer_on_load", False):
+        return False
+    return not getattr(args, "checkpoint_has_dsa_indexer", False)
+
+
+def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):
+    """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
+    if getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False):
+        raise RuntimeError(
+            "DSA indexer reset-on-load currently supports DDP/distributed-optimizer models only."
+        )
+    if getattr(
+        getattr(optimizer, "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False
+    ):
+        raise RuntimeError(
+            "DSA indexer reset-on-load does not support precision-aware optimizer state."
+        )
+    optimizers_to_check = getattr(optimizer, "chained_optimizers", [optimizer])
+    if any(
+        isinstance(getattr(child_optimizer, "optimizer", None), HybridDeviceOptimizer)
+        for child_optimizer in optimizers_to_check
+    ):
+        raise RuntimeError("DSA indexer reset-on-load does not support optimizer CPU offload.")
+    seed = _get_dsa_indexer_reset_seed(args)
+    reset_count = _reset_dsa_indexer_modules(model, seed)
+    reset_description = f"with seed {seed}"
+    global_reset_count = _global_dsa_indexer_reset_count(reset_count)
+    if global_reset_count == 0:
+        raise RuntimeError(
+            "--dsa-reset-indexer-on-load was set, but no DSA indexer modules were found "
+            "on any distributed rank."
+        )
+    _broadcast_dsa_indexer_params(model)
+    refreshed_param_count = 0
+    optimizer_state_loaded = not getattr(args, "no_load_optim", False) and not getattr(
+        args, "finetune", False
+    )
+    optimizer_refresh_description = "no optimizer parameter copies"
+    if optimizer is not None and not getattr(optimizer, "is_stub_optimizer", False):
+        # load_checkpoint has already synchronized all optimizer-owned parameter copies when
+        # optimizer state was not loaded. Preserve backbone masters and refresh only the parameter
+        # changed by this out-of-band reset.
+        refreshed_param_count = _reload_dsa_indexer_optimizer_params(model, optimizer)
+        optimizer_refresh_description = (
+            f"{refreshed_param_count} local indexer optimizer parameter shards"
+        )
+    cleared_state_count = (
+        0 if not optimizer_state_loaded else _clear_dsa_indexer_optimizer_state(model, optimizer)
+    )
+    param_groups = getattr(optimizer, "param_groups", None)
+    indexer_lr = get_indexer_lr_for_logging(param_groups) if param_groups else None
+
+    print_rank_0(
+        " > DSA reset-indexer-on-load: reset "
+        f"{reset_count} local indexer modules ({global_reset_count} across ranks) "
+        f"{reset_description}; refreshed {optimizer_refresh_description}; "
+        "cleared optimizer state for "
+        f"{cleared_state_count} indexer tensors; indexer_lr={indexer_lr}."
+    )
 
 
 def preprocess_common_state_dict(common_state_dict):
@@ -2619,6 +2970,15 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
+def _dsa_param_freezing_pre_wrap_hook(model_list):
+    """Pre-wrap hook wrapper around apply_dsa_param_freezing.
+
+    Returns the chunk list because dist_utils treats a None return as "no hook ran".
+    """
+    apply_dsa_param_freezing(model_list)
+    return model_list
+
+
 def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
@@ -2629,6 +2989,13 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
+
+    # --dsa-train-indexer-only freezing has the same ordering requirement: requires_grad
+    # is captured when DDP/the optimizer take the parameters, so it must land before the
+    # wrap. Registering it here rather than inside the builder keeps the mechanism in one
+    # place and avoids a lazy import to dodge a circular dependency.
+    if _dsa_param_freezing_pre_wrap_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(_dsa_param_freezing_pre_wrap_hook)
 
 
 def _forward_backward_grad_context(args):
@@ -2730,6 +3097,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    apply_dsa_param_freezing(model)
 
     # Print number of parameters.
     num_parameters = sum(
@@ -3199,6 +3568,21 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        if _should_reset_dsa_indexer_after_load(args):
+            _reset_dsa_indexer_after_load(unwrapped_model, optimizer, opt_param_scheduler, args)
+        else:
+            if getattr(args, "dsa_reset_indexer_on_load", False):
+                # Resuming mid-run: the indexer was already initialized by the launch that
+                # started this run, and re-running a one-time initialization here would
+                # discard everything it has learned since. Say so, because the alternative
+                # reading -- that the flag was meant to apply and silently did not -- is the
+                # dangerous one.
+                print_rank_0(
+                    f'> skipping DSA indexer reset: resuming at iteration '
+                    f'{train_state.iteration}. '
+                    'Load with --finetune (or --pretrained-checkpoint) to initialize the '
+                    'indexer from a checkpoint that carries a non-zero iteration.'
+                )
     else:
         train_state.iteration = 0
         train_state.resume_iteration = 0
@@ -3795,10 +4179,42 @@ def train_step(
     )
 
 
+def _get_dsa_indexer_logging_layer_counts(args, tracker_layers: int) -> tuple[int, int]:
+    """Return tracker slots and the number of hybrid layers that own a DSA indexer.
+
+    The tracker is indexed by layer number, so it spans every decoder layer; only the attention
+    layers ever write to it. Reporting the mean therefore needs the count of layers that own an
+    indexer, not the tracker length -- an 8B stack with four attention layers in fifty-two would
+    otherwise divide by thirteen times too many.
+
+    A pattern may not mix ``*`` with ``D`` or ``+`` (hybrid_layer_allocation rejects it), so
+    whichever attention symbol appears is the one carrying the indexer and counting both is
+    unambiguous.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+    from megatron.core.models.hybrid.layers.utils import Symbols
+
+    def _count(pattern: Optional[str]) -> int:
+        if not pattern:
+            return 0
+        return sum(pattern.count(symbol) for symbol in (Symbols.ATTENTION, Symbols.DS_ATTENTION))
+
+    parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+    mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+    tracker_layers = args.num_layers + mtp_pattern_layers
+    mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+    indexer_layers = _count(parsed_pattern.main_pattern) + (
+        _count(parsed_pattern.mtp_pattern) * mtp_indexer_repeats
+    )
+    return tracker_layers, indexer_layers
+
+
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
     if args.csa_compress_ratios is None:
+        if args.experimental_attention_variant == 'dsa' and is_hybrid_model(args):
+            return _get_dsa_indexer_logging_layer_counts(args, tracker_layers)
         return tracker_layers, None
 
     ratios = args.csa_compress_ratios
@@ -3824,6 +4240,7 @@ def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate: float | None,
+    indexer_learning_rate: float | None,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -3941,6 +4358,9 @@ def training_log(
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
+    indexer_learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
+        indexer_learning_rate, group=_lr_mp_group
+    )
     # Tensorboard values.
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -3950,6 +4370,15 @@ def training_log(
             writer.add_scalar('learning-rate vs samples', learning_rate, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if indexer_learning_rate is not None:
+            writer.add_scalar('indexer-learning-rate', indexer_learning_rate, iteration)
+            writer.add_scalar(
+                'indexer-learning-rate vs samples',
+                indexer_learning_rate,
+                train_state.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log({'indexer-learning-rate': indexer_learning_rate}, iteration)
         if train_state.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
             if wandb_writer:
@@ -4101,7 +4530,7 @@ def training_log(
             # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
             # The core logger still receives explicit groups and does not read MPU globals.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
+                required_pgs=['pp', 'dp', 'gtp_remat']
             )
         assert isinstance(
             pg_collection, ProcessGroupCollection
@@ -4186,6 +4615,8 @@ def training_log(
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
+        if indexer_learning_rate is not None:
+            log_string += f' indexer learning rate: {indexer_learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
 
         # OTel: snapshot the accumulator state BEFORE it is torn down. The loop directly
@@ -4254,9 +4685,12 @@ def training_log(
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
                 batch_size * args.seq_length / elapsed_time_per_iteration
-                if elapsed_time_per_iteration > 0 else None
+                if elapsed_time_per_iteration > 0
+                else None
             )
-            _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
+            _mem_gb = (
+                torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else None
+            )
             record_training_metrics(
                 meter=_otel_telemetry_log.meter,
                 step_duration_ms=elapsed_time_per_iteration * 1000.0,
@@ -5517,8 +5951,10 @@ def train(
                     params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+                indexer_learning_rate = get_indexer_lr_for_logging(optimizer.param_groups)
             else:
                 learning_rate = None
+                indexer_learning_rate = None
             # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
             # uninstrumented per-iteration overhead outside the train_step span.
             with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):
@@ -5526,6 +5962,7 @@ def train(
                     loss_dict,
                     total_loss_dict,
                     learning_rate,
+                    indexer_learning_rate,
                     iteration,
                     loss_scale,
                     report_memory_flag,

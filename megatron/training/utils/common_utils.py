@@ -42,8 +42,12 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import (
+    param_is_not_gtp_duplicate,
+    param_is_not_tensor_parallel_duplicate,
+)
 from megatron.core.transformer.module import param_is_not_shared
+from megatron.core.optimizer.clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
     get_pg_rank,
@@ -382,6 +386,46 @@ def reduce_max_stat_across_model_parallel_group(
         return None
     else:
         return stat.item()
+
+
+
+
+def get_model_to_optimizer_param_map(optimizer) -> dict:
+    """Map model params to the optimizer params that own their gradients."""
+    param_map = {}
+
+    if hasattr(optimizer, "model_float16_groups"):
+        if optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            _add_param_group_mapping(param_map, optimizer.model_float16_groups, optimizer.shard_float16_groups)
+        else:
+            _add_param_group_mapping(
+                param_map, optimizer.model_float16_groups, optimizer.shard_fp32_from_float16_groups
+            )
+        _add_param_group_mapping(param_map, optimizer.model_fp32_groups, optimizer.shard_fp32_groups)
+        return param_map
+
+    for param in optimizer.get_parameters():
+        param_map[param] = param
+
+    for group in getattr(optimizer, "float16_groups", []):
+        for param in group:
+            main_param = getattr(param, "main_param", None)
+            if main_param is not None:
+                param_map[param] = main_param
+
+    for group in getattr(optimizer, "fp32_from_fp32_groups", []):
+        for param in group:
+            param_map[param] = param
+
+    return param_map
+
+
+
+def _add_param_group_mapping(param_map: dict, model_groups: list, optim_groups: list):
+    """Add aligned model-param to optimizer-param group mappings."""
+    for model_group, optim_group in zip(model_groups, optim_groups):
+        for model_param, optim_param in zip(model_group, optim_group):
+            param_map[model_param] = optim_param
 
 
 def logical_and_across_model_parallel_group(

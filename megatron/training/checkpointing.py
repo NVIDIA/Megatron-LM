@@ -134,6 +134,17 @@ _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_retention_max_forget', 0.10),
 )
 
+# Compared the same way as the wide-residual options rather than through _compare: a checkpoint
+# written before DSA existed has none of these attributes, and the correct substitute for an
+# absent one is None, which _compare reads as "no default was supplied".
+_DSA_ARG_DEFAULTS = (
+    ('experimental_attention_variant', None),
+    ('dsa_indexer_mode', 'standard'),
+    ('dsa_indexer_n_heads', None),
+    ('dsa_indexer_head_dim', None),
+    ('dsa_indexer_topk', None),
+)
+
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -182,7 +193,6 @@ def check_checkpoint_args(
     cfg = get_run_config()
     args = get_args()
     skip_args = skip_args or set()
-
     def _compare(arg_name, old_arg_name=None, default=None, *, config_section=None):
         """Prefer saved config values, falling back to args for older checkpoints."""
         if arg_name in skip_args:
@@ -229,6 +239,35 @@ def check_checkpoint_args(
                 f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
                 f'the input argument value ({args_value}).'
             )
+    # --dsa-reset-indexer-on-load exists to convert a checkpoint that has no indexer
+    # into a DSA run, re-initialising the indexer from the loaded weights. A dense
+    # checkpoint records experimental_attention_variant=None and no dsa_indexer_*
+    # values, so comparing them against the runtime's would reject exactly the
+    # conversion the flag requests. The indexer is being rebuilt, not resumed, so
+    # its geometry is not required to match. Every non-indexer comparison still runs.
+    if not args.dsa_reset_indexer_on_load:
+        for arg_name, default in _DSA_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
+    if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
+        def _dsa_trainability_mode(namespace):
+            if getattr(namespace, 'dsa_train_indexer_only', False):
+                return 'indexer-only'
+            return 'joint'
+
+        checkpoint_mode = _dsa_trainability_mode(checkpoint_args)
+        runtime_mode = _dsa_trainability_mode(args)
+        assert checkpoint_mode == runtime_mode, (
+            "DSA trainability mode changed from checkpoint "
+            f"({checkpoint_mode}) to runtime ({runtime_mode}) while loading optimizer state. "
+            "Use --no-load-optim when transitioning between joint and indexer-only training."
+        )
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -2413,7 +2452,13 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
             print_rank_0(f'Checkpoint did not provide arguments {arg_name}')
 
     # Model args.
-    _set_arg('num_layers')
+    # num_layers is derived from hybrid_layer_pattern in validate_args and must not be set
+    # alongside it, so only restore it for non-hybrid checkpoints.
+    if (
+        getattr(args, 'hybrid_layer_pattern', None) is None
+        and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None
+    ):
+        _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
@@ -2439,6 +2484,26 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    checkpoint_attention_variant = getattr(
+        checkpoint_args, 'experimental_attention_variant', None
+    )
+    # Preserve an explicit GQA-to-DSA conversion when a dense checkpoint records no experimental
+    # attention variant. Real experimental-attention checkpoints still own this model-defining arg.
+    if checkpoint_attention_variant is not None or getattr(
+        args, 'experimental_attention_variant', None
+    ) is None:
+        _set_arg('experimental_attention_variant', force=True)
+    # A GQA checkpoint produced by newer code still records the default "standard" DSA mode.
+    # Do not let that inert default overwrite an explicit GQA-to-simplified-DSA conversion.
+    checkpoint_is_dsa = checkpoint_attention_variant == 'dsa'
+    if checkpoint_is_dsa:
+        # These options were added after simplified DSA checkpoints already existed. Make the
+        # historical main-attention-K and normalized-input behavior explicit before force-restoring
+        # model arguments; otherwise an old checkpoint can retain runtime overrides accidentally.
+        _set_arg('dsa_indexer_mode', force=True)
+        _set_arg('dsa_indexer_n_heads', force=True)
+        _set_arg('dsa_indexer_head_dim', force=True)
+        _set_arg('dsa_indexer_topk', force=True)
 
     # Restore wide-residual architecture settings. The enabling argument has a None
     # default and remains command-line overridable; concrete-default controls follow
@@ -3181,6 +3246,15 @@ def load_checkpoint(
         num_floating_point_operations_so_far = ckpt_train_state.num_floating_point_operations_so_far
     else:
         num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
+
+    # Record whether the checkpoint carries a DSA indexer, before the --finetune guard below
+    # skips reading its arguments. --dsa-reset-indexer-on-load uses this to tell a conversion
+    # from a resume: a dense checkpoint has no indexer to preserve, a DSA one does.
+    checkpoint_args_for_dsa = state_dict.get('args')
+    args.checkpoint_has_dsa_indexer = (
+        checkpoint_args_for_dsa is not None
+        and getattr(checkpoint_args_for_dsa, 'experimental_attention_variant', None) == 'dsa'
+    )
 
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
