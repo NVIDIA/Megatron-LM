@@ -295,27 +295,34 @@ class TransformerLayerNode(ScheduleNode):
         way ``ScheduleNode``'s ``free_input`` path does corrupts that graph.
         """
         self.inputs = None
-        self.output = None
+        self._output_edges = None
         self.detached = tuple()
         self.before_detached = tuple()
 
     def detach(self, t):
-        """Detach a tensor and remember it for backward through the schedule node."""
-        detached = make_viewless(t).detach()
-        detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
+        """Detach a saved side output and retain only its producer gradient edge."""
+        t = make_viewless(t)
+        before_detached_edge = (
+            torch.autograd.graph.get_gradient_edge(t) if t.requires_grad else None
+        )
+        detached = t.detach()
+        detached.requires_grad_(t.requires_grad)
+        if before_detached_edge is not None:
+            self.before_detached = self.before_detached + (before_detached_edge,)
+            self.detached = self.detached + (detached,)
         return detached
 
     def forward_impl(self, *args):
         """Invoke the slot's submodule forward."""
         return self.submodule(self, *args)
 
-    def backward_impl(self, outputs, output_grad):
+    def backward_impl(self, output_edges, output_grads):
         """Run the slot's backward and return the input grads."""
-        detached_grad = tuple([e.grad for e in self.detached])
-        grads = output_grad + detached_grad
-        self.default_backward_func(outputs + self.before_detached, grads)
+        detached_grads = tuple(detached.grad for detached in self.detached)
+        grads = output_grads + detached_grads
+        self.default_backward_func(output_edges + self.before_detached, grads)
+        self.detached = tuple()
+        self.before_detached = tuple()
 
         return grads
 
