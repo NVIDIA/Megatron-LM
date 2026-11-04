@@ -475,9 +475,7 @@ class MambaBatchInvariantDecode:
         C = C.view(batch, 1, mixer.ngroups_local_tp, -1)
 
         A = -torch.exp(mixer.cp.get_A_log().float())
-        D = mixer.cp.get_D()
-        if mixer.D_has_hdim:
-            D = D.float().view(-1, mixer.headdim)
+        D = mixer.get_ssm_D(mixer.cp.get_D())
         dt_bias = mixer.cp.get_dt_bias().float()
 
         buffers = self._get_buffers(ssm_state.shape[0], x, B)

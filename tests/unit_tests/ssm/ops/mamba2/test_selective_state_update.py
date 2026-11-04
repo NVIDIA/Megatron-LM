@@ -75,3 +75,27 @@ class TestSelectiveStateUpdateInputPurity:
                 f"selective_state_update mutated input '{name}' when called "
                 f"without intermediate_ssm_states (dummy-pointer regression)"
             )
+
+
+class TestSelectiveStateUpdateShapeChecks:
+    """The kernel reads D only through its strides, so the launcher must reject a D that is not
+    (nheads, dim) instead of reading the wrong coefficients. The check runs before any launch,
+    so these tests need no GPU."""
+
+    @pytest.mark.parametrize("D_layout", ["per_head_broadcast", "flat"])
+    def test_rejects_per_channel_D_not_shaped_nheads_dim(self, D_layout):
+        batch, nheads, headdim, dstate = 2, 4, 8, 16
+        state = torch.randn(batch, nheads, headdim, dstate)
+        x = torch.randn(batch, 1, nheads, headdim)
+        dt = torch.randn(batch, 1, nheads).unsqueeze(-1).expand(batch, 1, nheads, headdim)
+        A = -torch.rand(nheads).view(nheads, 1, 1).expand(nheads, headdim, dstate)
+        B = torch.randn(batch, 1, 1, dstate)
+        C = torch.randn(batch, 1, 1, dstate)
+        D = torch.randn(nheads * headdim)  # one skip coefficient per channel
+        if D_layout == "per_head_broadcast":
+            # Broadcasting it like a per-head D gives (nheads * headdim, headdim) with strides
+            # (1, 0): head h would read D[h] for all of its channels.
+            D = D.unsqueeze(-1).expand(-1, headdim)
+
+        with pytest.raises(AssertionError, match=r"D must have shape \(nheads, dim\)"):
+            selective_state_update(state, x, dt, A, B, C, D, dt_softplus=True)

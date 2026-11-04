@@ -119,6 +119,7 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
 
         # Bind methods
+        self.mixer.get_ssm_D = MambaMixer.get_ssm_D.__get__(self.mixer, MambaMixer)
         self.mixer.ssm_prefill = MambaMixer.ssm_prefill.__get__(self.mixer, MambaMixer)
         self.mixer.ssm_decode = MambaMixer.ssm_decode.__get__(self.mixer, MambaMixer)
 
