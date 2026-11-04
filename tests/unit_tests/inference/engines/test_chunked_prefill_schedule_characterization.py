@@ -125,7 +125,7 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         parents = [0, *hashes[:-1]]
         allocator.register_kv_block_hashes(block_ids, hashes, parents)
         allocator.release_memory_blocks(blocks)
-        assert [allocator.kv_hash_to_block_id[value] for value in hashes] == block_ids
+        assert [allocator.registry.kv_hash_to_block_id[value] for value in hashes] == block_ids
         return block_ids
 
     @staticmethod
@@ -418,7 +418,7 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert context.mamba_metadata.request_to_mamba_state_idx[0].item() >= 0
         if prefix:
             assert state["finished"] % context.block_size_tokens == 0
-            assert context.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() == (
+            assert context.mamba_metadata._eos_cache_block_id_cpu[0].item() == (
                 context.request_last_kv_block_id[0].item()
             )
         else:
