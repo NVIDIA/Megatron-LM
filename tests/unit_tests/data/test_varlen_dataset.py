@@ -464,7 +464,7 @@ def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, sbhd=False):
         varlen_sbhd_validation=sbhd,
         data_parallel_size=dp,
         context_parallel_size=cp,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         sequence_parallel_size=sp,
     )
 
@@ -685,7 +685,7 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         num_workers=0,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,

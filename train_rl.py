@@ -11,25 +11,32 @@ from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
+    evaluate_rollouts,
     get_logprobs,
     get_rl_runtime_state,
     load_packed_data_by_index,
+    next_rollout_iterator,
+    rl_inference_interface_shutdown,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.global_vars import get_run_config, set_run_config
-from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.rl.training_setup import RLSetupCallback
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.utils import is_hybrid_model
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 
@@ -418,29 +425,63 @@ if __name__ == "__main__":
         "--reset-attention-mask is not supported in RL training: "
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
-    if args.batch_invariant_mode and args.rank == 0:
-        print(
-            "WARNING: batch-invariant mode is enabled, so logprobs are not computed vocab-parallel"
-        )
     if is_hybrid_model(args):
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    pretrain(
-        full_config,
-        None,  # we don't need to build any datasets for RL training
-        ModelType.encoder_or_decoder,
-        forward_step,
-        partial(model_provider, _model_builder),
-        callbacks=[
-            RLLoggingCallback(
-                full_config.rl,
-                micro_batch_size=full_config.train.micro_batch_size,
-                global_batch_size=full_config.train.global_batch_size,
-                save_dir=full_config.checkpoint.save,
-            ),
-            RLCheckpointCallback(),
-        ],
+    rl_cfg = full_config.rl
+    assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
+    rl_model_provider = partial(model_provider, _model_builder)
+
+    rl_setup = RLSetupCallback(
+        rl_cfg, model_provider=rl_model_provider, model_type=ModelType.encoder_or_decoder
     )
+
+    def next_train_iterator(iteration, current_iterator):
+        return next_rollout_iterator(
+            iteration,
+            current_iterator,
+            model=rl_setup.model,
+            inference_model=rl_setup.inference_model,
+            optimizer=rl_setup.optimizer,
+            ref_state_dict=rl_setup.ref_state_dict,
+            rl_config=rl_cfg,
+            train_config=full_config.train,
+        )
+
+    def run_eval(**kwargs):
+        evaluate_rollouts(
+            model=rl_setup.model,
+            inference_model=rl_setup.inference_model,
+            optimizer=rl_setup.optimizer,
+            **kwargs,
+        )
+
+    try:
+        pretrain(
+            full_config,
+            None,  # we don't need to build any datasets for RL training
+            ModelType.encoder_or_decoder,
+            forward_step,
+            rl_model_provider,
+            next_train_iterator=next_train_iterator,
+            run_eval=run_eval,
+            # --rl-rollout-only iterates the loop collecting rollouts without optimizer updates.
+            run_train_loop_without_updates=rl_cfg.rl_rollout_only,
+            suppress_microbatch_rampup_handling=rl_cfg.rl_use_sequence_packing,
+            callbacks=[
+                rl_setup,
+                RLLoggingCallback(
+                    rl_cfg,
+                    micro_batch_size=full_config.train.micro_batch_size,
+                    global_batch_size=full_config.train.global_batch_size,
+                    save_dir=full_config.checkpoint.save,
+                ),
+                RLCheckpointCallback(),
+            ],
+        )
+    # RL owns the inference-interface shutdown.
+    finally:
+        rl_inference_interface_shutdown()
