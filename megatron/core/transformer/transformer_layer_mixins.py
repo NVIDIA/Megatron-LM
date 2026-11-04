@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from inspect import signature
 from typing import Optional
 
 import torch
@@ -15,7 +16,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import is_te_min_version, log_single_rank
+from megatron.core.utils import is_te_min_version, is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,63 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
         # set in get_layer_static_inputs at capture, None when the graph has no such input.
         self._te_cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
+
+        # Check the compatibility of fine-grained activation offloading and cuda graph.
+        if self.config.fine_grained_activation_offloading:
+            cuda_graph_modules = self.config.cuda_graph_modules or []
+            if CudaGraphModule.attn in cuda_graph_modules:
+                self.offload_attn_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "attn_norm offloading is not supported with attn cudagraph. "
+                    "Disabling attn_norm offloading.",
+                )
+            mark_mlp_norm_offloading_not_supported = False
+            # For moe layer, mlp_norm offloading isn't supported with attn or moe_router cudagraph.
+            if self.is_moe_layer:
+                if (
+                    CudaGraphModule.attn in cuda_graph_modules
+                    or CudaGraphModule.moe_router in cuda_graph_modules
+                ):
+                    mark_mlp_norm_offloading_not_supported = True
+            # For non-moe layer, mlp_norm is the boundary of attn or mlp cudagraph.
+            # The only case where mlp_norm offloading is supported is when whole layer is captured.
+            elif (
+                CudaGraphModule.attn in cuda_graph_modules
+                and CudaGraphModule.mlp not in cuda_graph_modules
+            ) or (
+                CudaGraphModule.attn not in cuda_graph_modules
+                and CudaGraphModule.mlp in cuda_graph_modules
+            ):
+                mark_mlp_norm_offloading_not_supported = True
+            if mark_mlp_norm_offloading_not_supported:
+                self.offload_mlp_norm = False
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "mlp_norm offloading is not supported with the current cudagraph scope. "
+                    "Disabling mlp_norm offloading.",
+                )
+        # Set the offload module in cuda graph flag.
+        self.offload_module_in_cuda_graph = False
+        cuda_graph_modules = self.config.cuda_graph_modules or []
+        if CudaGraphModule.attn in cuda_graph_modules:
+            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
+                self.offload_module_in_cuda_graph = True
+        if not self.is_moe_layer and CudaGraphModule.mlp in cuda_graph_modules:
+            if self.offload_mlp_norm:
+                self.offload_module_in_cuda_graph = True
+        if self.offload_module_in_cuda_graph:
+            assert is_torch_min_version(
+                "2.9.0a0"
+            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
+            assert is_te_min_version(
+                "2.14.0"
+            ), "Offloading modules captured in cuda graph requires TE>=2.14.0."
+            assert (
+                self.config.cuda_graph_warmup_steps > 0
+            ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
         return self
 
     @staticmethod
@@ -75,6 +133,19 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             "Disabling pre_mlp_layernorm recompute.",
         )
         return False
+
+    def _forward_attention(self, *args, **kwargs):
+        """Observe the whole-layer mask for both normal and EP-overlap warmup calls."""
+        forward_attention = super()._forward_attention
+        if self.config.cuda_graph_impl == "transformer_engine":
+            padding_mask = kwargs.get("padding_mask")
+            if len(args) > 1:
+                # Preserve positional callers without hard-coding the mask's argument index.
+                padding_mask = (
+                    signature(forward_attention).bind(*args, **kwargs).arguments.get("padding_mask")
+                )
+            self._te_cuda_graph_record_padding_mask_shape(padding_mask)
+        return forward_attention(*args, **kwargs)
 
     def _te_cuda_graph_record_padding_mask_shape(self, padding_mask):
         if padding_mask is not None and self._te_cuda_graph_padding_mask_shape_seen is None:
