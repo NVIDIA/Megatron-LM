@@ -9,10 +9,10 @@ from typing import List, Optional, Sequence, Union
 
 import torch.distributed as dist
 
-from megatron.core import mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
+from megatron.core.utils import get_pg_size
 
 
 def build_inference_pg_collection(
@@ -24,6 +24,7 @@ def build_inference_pg_collection(
     expt_tp_size: Optional[int] = None,
     use_tp_pp_dp_mapping: bool = False,
     rank_offset: int = 0,
+    training_pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> ProcessGroupCollection:
     """Build a ProcessGroupCollection for one inference model.
 
@@ -45,6 +46,12 @@ def build_inference_pg_collection(
             collocated inference (shares ranks with training); use a non-zero
             offset for non-collocated setups where inference ranks are disjoint
             from training ranks.
+        training_pg_collection: Process groups of the training model. Each
+            size left as None is the size of the matching group here (``tp``,
+            ``pp``, ``cp``, ``ep`` or ``expt_tp``). If None while a size is
+            None, the sizes of the global groups in
+            ``megatron.core.parallel_state`` are used; that fallback is
+            deprecated.
 
     Returns:
         ProcessGroupCollection configured for the inference model. On ranks
@@ -55,16 +62,19 @@ def build_inference_pg_collection(
         :func:`build_inference_pg_collections_for_shards` for the right way to
         filter.
     """
-    if tp_size is None:
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-    if cp_size is None:
-        cp_size = mpu.get_context_parallel_world_size()
-    if pp_size is None:
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
-    if ep_size is None:
-        ep_size = mpu.get_expert_model_parallel_world_size()
-    if expt_tp_size is None:
-        expt_tp_size = mpu.get_expert_tensor_parallel_world_size()
+    sizes = {"tp": tp_size, "cp": cp_size, "pp": pp_size, "ep": ep_size, "expt_tp": expt_tp_size}
+    omitted = [name for name, size in sizes.items() if size is None]
+    if omitted:
+        training_pg_collection = resolve_process_groups(
+            training_pg_collection,
+            owner="build_inference_pg_collection",
+            required=omitted,
+            argument="training_pg_collection",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        sizes.update({name: get_pg_size(vars(training_pg_collection)[name]) for name in omitted})
+    tp_size, cp_size, pp_size, ep_size, expt_tp_size = sizes.values()
 
     # Dense layer DP size (world = tp * cp * dp * pp)
     dp_size = world_size // (tp_size * cp_size * pp_size)

@@ -4,13 +4,35 @@ from typing import List, Optional
 import torch
 from torch.distributed import ProcessGroup
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import resolve_process_groups
 
 
-def _warn_pp_group_fallback(owner: str) -> None:
-    """Warn, once per `owner`, that it was called without `pp_group` and uses the global group."""
-    warn_global_process_group_fallback(owner, "pp_group", deprecated_in="0.21", removed_in="0.23")
+def _resolve_group(
+    group: Optional[ProcessGroup], *, field: str, argument: str, owner: str
+) -> ProcessGroup:
+    """Return `group`, or the global `field` group when the caller of `owner` omitted `argument`.
+
+    The global fallback is deprecated: it warns once per `owner` with a
+    `ProcessGroupFallbackWarning` and reads the group from `megatron.core.parallel_state`.
+    """
+    if group is not None:
+        return group
+    pg_collection = resolve_process_groups(
+        None,
+        owner=owner,
+        required=(field,),
+        argument=argument,
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    group = vars(pg_collection)[field]
+    # torch.distributed treats a None group as the whole world.
+    if group is None:
+        raise ValueError(
+            f"{owner} was called without `{argument}`, and megatron.core.parallel_state has no "
+            f"`{field}` group to fall back to. Pass the model's process group."
+        )
+    return group
 
 
 def is_pipeline_first_stage(pp_group: Optional[ProcessGroup]):
@@ -20,12 +42,10 @@ def is_pipeline_first_stage(pp_group: Optional[ProcessGroup]):
         pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
             group is used; that fallback is deprecated.
     """
-    if pp_group is None:
-        _warn_pp_group_fallback("is_pipeline_first_stage")
-        # set ignore_virtual=True since vpp is not used in inference
-        return parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-    else:
-        return pp_group.rank() == 0
+    pp_group = _resolve_group(
+        pp_group, field="pp", argument="pp_group", owner="is_pipeline_first_stage"
+    )
+    return pp_group.rank() == 0
 
 
 def is_pipeline_last_stage(pp_group: Optional[ProcessGroup]):
@@ -35,12 +55,10 @@ def is_pipeline_last_stage(pp_group: Optional[ProcessGroup]):
         pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
             group is used; that fallback is deprecated.
     """
-    if pp_group is None:
-        _warn_pp_group_fallback("is_pipeline_last_stage")
-        # set ignore_virtual=True since vpp is not used in inference
-        return parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-    else:
-        return pp_group.rank() == pp_group.size() - 1
+    pp_group = _resolve_group(
+        pp_group, field="pp", argument="pp_group", owner="is_pipeline_last_stage"
+    )
+    return pp_group.rank() == pp_group.size() - 1
 
 
 def _is_cuda(tensor):
@@ -70,21 +88,15 @@ def broadcast_from_last_pipeline_stage(
         pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
             group is used; that fallback is deprecated.
     """
-    # Use custom process group or fall back to global state
-    if pp_group is None:
-        _warn_pp_group_fallback("broadcast_from_last_pipeline_stage")
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
-
-        # add ignore_virtual=True since vpp is not used in inference
-        is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-    else:
-        # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
-        last_rank = torch.distributed.get_process_group_ranks(pp_group)[pp_group.size() - 1]
-        is_last_stage = pp_group.rank() == pp_group.size() - 1
+    pp_group = _resolve_group(
+        pp_group, field="pp", argument="pp_group", owner="broadcast_from_last_pipeline_stage"
+    )
+    # Lists of ProcessGroups are used for multimodal inference but not supported here
+    assert isinstance(
+        pp_group, ProcessGroup
+    ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+    last_rank = torch.distributed.get_process_group_ranks(pp_group)[pp_group.size() - 1]
+    is_last_stage = pp_group.rank() == pp_group.size() - 1
 
     if is_last_stage:
         assert size == list(
@@ -110,18 +122,17 @@ def recv_from_prev_pipeline_rank_(
         pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
             group is used; that fallback is deprecated.
     """
+    pp_group = _resolve_group(
+        pp_group, field="pp", argument="pp_group", owner="recv_from_prev_pipeline_rank_"
+    )
+    # Lists of ProcessGroups are used for multimodal inference but not supported here
+    assert isinstance(
+        pp_group, ProcessGroup
+    ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
     # Determine previous rank
-    if pp_group is None:
-        _warn_pp_group_fallback("recv_from_prev_pipeline_rank_")
-        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
-    else:
-        # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
-        prev_rank = torch.distributed.get_process_group_ranks(pp_group)[
-            (pp_group.rank() - 1) % pp_group.size()
-        ]
+    prev_rank = torch.distributed.get_process_group_ranks(pp_group)[
+        (pp_group.rank() - 1) % pp_group.size()
+    ]
 
     # Create receive operation
     recv_prev_op = torch.distributed.P2POp(torch.distributed.irecv, recv_buffer, prev_rank)
@@ -143,18 +154,17 @@ def send_to_next_pipeline_rank(
         pp_group: Pipeline-parallel group of the model. If None, the global pipeline-parallel
             group is used; that fallback is deprecated.
     """
+    pp_group = _resolve_group(
+        pp_group, field="pp", argument="pp_group", owner="send_to_next_pipeline_rank"
+    )
+    # Lists of ProcessGroups are used for multimodal inference but not supported here
+    assert isinstance(
+        pp_group, ProcessGroup
+    ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
     # Determine next rank
-    if pp_group is None:
-        _warn_pp_group_fallback("send_to_next_pipeline_rank")
-        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-    else:
-        # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
-        next_rank = torch.distributed.get_process_group_ranks(pp_group)[
-            (pp_group.rank() + 1) % pp_group.size()
-        ]
+    next_rank = torch.distributed.get_process_group_ranks(pp_group)[
+        (pp_group.rank() + 1) % pp_group.size()
+    ]
 
     # Create send operation
     send_next_op = torch.distributed.P2POp(torch.distributed.isend, tensor, next_rank)
@@ -166,18 +176,21 @@ def send_to_next_pipeline_rank(
     torch.cuda.synchronize()
 
 
-def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
+def broadcast_tensor(
+    size, dtype, tensor=None, rank=0, data_parallel=False, mp_group: Optional[ProcessGroup] = None
+):
     """Given size and type of a tensor on all ranks and the tensor value
     only on a specific rank, broadcast from that rank to all other ranks.
 
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        mp_group: Model-parallel group of the model, used with `data_parallel`: the tensor is
+            broadcast within it from its first rank, and `rank` is ignored. If None, the global
+            model-parallel group is used; that fallback is deprecated.
     """
-    # Single compatibility boundary: the source rank is rank 0 of the model-parallel group, so
-    # both are derived from one lookup. See docs/developer/parallel-state-deprecation.md.
     group = None
     if data_parallel:
-        group = parallel_state.get_model_parallel_group()
+        group = _resolve_group(mp_group, field="mp", argument="mp_group", owner="broadcast_tensor")
         rank = torch.distributed.get_global_rank(group, 0)
 
     if torch.distributed.get_rank() == rank:
@@ -190,45 +203,76 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
     return tensor
 
 
-def broadcast_list(size, dtype, list_values=None, rank=0, data_parallel=False):
+def broadcast_list(
+    size,
+    dtype,
+    list_values=None,
+    rank=0,
+    data_parallel=False,
+    mp_group: Optional[ProcessGroup] = None,
+):
     """Broadcast a list of values with a given type.
 
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        mp_group: Model-parallel group of the model, used with `data_parallel`: the values are
+            broadcast within it from its first rank, and `rank` is ignored. If None, the global
+            model-parallel group is used; that fallback is deprecated.
     """
 
     tensor = None
 
     if data_parallel:
-        rank = parallel_state.get_model_parallel_src_rank()
+        mp_group = _resolve_group(mp_group, field="mp", argument="mp_group", owner="broadcast_list")
+        rank = torch.distributed.get_global_rank(mp_group, 0)
         if rank == torch.distributed.get_rank():
             tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
     else:
         if torch.distributed.get_rank() == rank:
             tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
 
-    return broadcast_tensor(size, dtype, tensor=tensor, rank=rank, data_parallel=data_parallel)
+    return broadcast_tensor(
+        size, dtype, tensor=tensor, rank=rank, data_parallel=data_parallel, mp_group=mp_group
+    )
 
 
-def broadcast_int_list(size, int_list=None, rank=0, data_parallel=False):
+def broadcast_int_list(
+    size, int_list=None, rank=0, data_parallel=False, mp_group: Optional[ProcessGroup] = None
+):
     """Broadcast a list of integer values.
 
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        mp_group: Model-parallel group of the model, used with `data_parallel`; see
+            `broadcast_list`.
     """
 
     return broadcast_list(
-        size, torch.int64, list_values=int_list, rank=rank, data_parallel=data_parallel
+        size,
+        torch.int64,
+        list_values=int_list,
+        rank=rank,
+        data_parallel=data_parallel,
+        mp_group=mp_group,
     )
 
 
-def broadcast_float_list(size, float_list=None, rank=0, data_parallel=False):
+def broadcast_float_list(
+    size, float_list=None, rank=0, data_parallel=False, mp_group: Optional[ProcessGroup] = None
+):
     """Broadcast a list of float values.
 
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        mp_group: Model-parallel group of the model, used with `data_parallel`; see
+            `broadcast_list`.
     """
 
     return broadcast_list(
-        size, torch.float32, list_values=float_list, rank=rank, data_parallel=data_parallel
+        size,
+        torch.float32,
+        list_values=float_list,
+        rank=rank,
+        data_parallel=data_parallel,
+        mp_group=mp_group,
     )
