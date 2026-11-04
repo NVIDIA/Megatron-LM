@@ -92,6 +92,7 @@ def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
         # Identity grouped output projection, so the output is the core's result.
         _apply_linear_o_group_proj=lambda x: x,
         linear_proj=lambda value: (value, None),
+        _post_o_group_proj=lambda attn_out, q_compressed: attn_out,
         get_query_key_value_tensors=lambda *args, **kwargs: (raw,) * 5,
         offload_core_attention=False,
         offload_attn_proj=False,
