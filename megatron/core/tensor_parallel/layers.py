@@ -1355,7 +1355,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
-        inference_tp_ag_barrier: bool = False,
+        inference_tp_ag_barrier: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1366,11 +1366,12 @@ class ColumnParallelLinear(torch.nn.Module):
                 weight tensor to use, compulsory when skip_weight_param_allocation is True.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `gather_output` arg in the constructor will be used.
-            inference_tp_ag_barrier (bool): Synchronizes consecutive AG launched via
-                ``multimem_all_gather`` for ``megatron.core.inference`` to prevent
-                AG multicast from overwriting the symmetric buffers before TP ranks
-                can copy-out the previous AG output. For more information, refer to
-                ``barrier_before`` in ``multimem_all_gather``
+            inference_tp_ag_barrier (bool): Barrier before the inference-optimized
+                all-gather of the output overwrites the shared symmetric buffer, so no TP
+                rank still reads what the buffer's previous operation left there. Pass False
+                only when a collective synchronized the TP group since that operation; with
+                sequence parallelism, this layer's own input all-gather does, so it is then
+                skipped anyway. See ``barrier_before`` in ``multimem_all_gather``
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
 
         Returns:
@@ -1455,8 +1456,11 @@ class ColumnParallelLinear(torch.nn.Module):
             gather_output = runtime_gather_output
 
         if gather_output:
+            # With sequence parallelism, _forward_impl all-gathered the input across the TP
+            # group with NCCL, which synchronizes the group after its earlier work.
+            input_was_gathered = self.sequence_parallel and not self.explicit_expert_comm
             output = self.gather_tensor_parallel_output(
-                output_parallel, barrier_before=inference_tp_ag_barrier
+                output_parallel, barrier_before=inference_tp_ag_barrier and not input_was_gathered
             )
         else:
             output = output_parallel
@@ -1464,15 +1468,15 @@ class ColumnParallelLinear(torch.nn.Module):
         return output, output_bias
 
     def gather_tensor_parallel_output(
-        self, output_parallel: torch.Tensor, barrier_before: bool = False
+        self, output_parallel: torch.Tensor, barrier_before: bool = True
     ) -> torch.Tensor:
         """All-gather a partitioned output along the last dimension.
 
         Args:
             output_parallel: This rank's partition of the output, [..., output_size_per_partition].
             barrier_before: Barrier before the inference-optimized all-gather overwrites the
-                shared symmetric buffer. Set it when this gather directly follows another
-                all-gather on that buffer. Ignored by the default NCCL all-gather.
+                shared symmetric buffer, as in ``forward``'s ``inference_tp_ag_barrier``.
+                Ignored by the default NCCL all-gather.
 
         Returns:
             The gathered output, [..., output_size].

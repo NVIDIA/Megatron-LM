@@ -182,26 +182,16 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
-        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
-        # default; a caller sets it True when this layer's input all-gather directly
-        # follows another all-gather on the shared symmetric buffer with no
-        # reduce-scatter in between (e.g. the MTP eh_proj projection).
-        self.barrier_before_all_gather = False
+        # Barrier before the input all-gather overwrites the shared "tp" symmetric buffer.
+        # Cleared only by code that proves it redundant (see
+        # megatron.core.inference.tp_buffer_order).
+        self.barrier_before_all_gather = True
 
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
-
-    def set_barrier_before_all_gather(self, value: bool = True) -> None:
-        """Request a barrier before this layer's input all-gather reuses the buffer.
-
-        Set by callers whose op sequence places another all-gather on the shared
-        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
-        eh_proj projection), so the kernel synchronizes ranks before overwriting.
-        """
-        self.barrier_before_all_gather = value
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -229,8 +219,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # do multimem all gather; barrier before reusing the buffer only when this
-            # all-gather follows another all-gather on it (see barrier_before_all_gather).
+            # do multimem all gather
             multimem_all_gather(
                 symm_mem_buffer["tensor"],
                 x,
@@ -332,20 +321,10 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
-        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
-        # default; a caller sets it True when this layer's input all-gather directly
-        # follows another all-gather on the shared symmetric buffer with no
-        # reduce-scatter in between (e.g. the MTP eh_proj projection).
-        self.barrier_before_all_gather = False
-
-    def set_barrier_before_all_gather(self, value: bool = True) -> None:
-        """Request a barrier before this layer's input all-gather reuses the buffer.
-
-        Set by callers whose op sequence places another all-gather on the shared
-        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
-        eh_proj projection), so the kernel synchronizes ranks before overwriting.
-        """
-        self.barrier_before_all_gather = value
+        # Barrier before the input all-gather overwrites the shared "tp" symmetric buffer.
+        # Cleared only by code that proves it redundant (see
+        # megatron.core.inference.tp_buffer_order).
+        self.barrier_before_all_gather = True
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -371,8 +350,6 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # Barrier before reusing the buffer only when this all-gather follows
-            # another all-gather on it (see barrier_before_all_gather).
             multimem_all_gather(
                 symm_mem_buffer["tensor"],
                 x,
@@ -384,19 +361,36 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def all_gather_input(self, x: torch.Tensor) -> torch.Tensor:
+        """All-gather this layer's sequence-parallel input across its TP group, as forward does.
+
+        Linears on the same TP group that read the same input can gather it once with this, then
+        each take the result with ``forward(..., input_is_gathered=True)``. With NVLS the result
+        lives in the shared symmetric buffer, so their forwards must run before the buffer's
+        next operation. Eval mode only: in training mode Transformer Engine gathers in forward.
+        """
+        assert not self.training, "all_gather_input runs only in eval mode"
+        if self.tp_size == 1:
+            return x
+        return self._all_gather(x, self._maybe_allocate_symmetric_buffer(x))
+
+    def forward(
+        self, x: torch.Tensor, input_is_gathered: bool = False
+    ) -> Tuple[torch.Tensor, None]:
         """
         Forward pass.
+
+        Args:
+            x: The input, sequence-parallel unless ``input_is_gathered``.
+            input_is_gathered: ``x`` is already all-gathered (see ``all_gather_input``), so
+                this skips the all-gather. Eval mode only.
         """
         if self.training:
+            assert not input_is_gathered, "input_is_gathered applies only in eval mode"
             return super().forward(x)
 
-        if self.tp_size == 1:
-            x = _apply_linear(x, self.weight, self.config)
-            return x, None
-
-        symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
-        x = self._all_gather(x, symm_mem_buffer)
+        if not input_is_gathered:
+            x = self.all_gather_input(x)
         x = _apply_linear(x, self.weight, self.config)
 
         return x, None
@@ -554,23 +548,11 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return x, None
 
 
-def is_inference_column_parallel_linear(module) -> bool:
-    """Whether ``module`` is an inference-optimized column-parallel linear.
-
-    These are the layers that perform a symmetric-memory all-gather and therefore
-    expose ``set_barrier_before_all_gather``. Returns ``False`` for anything else
-    (including ``None`` and non-inference linear implementations).
-    """
-    return isinstance(
-        module, (InferenceColumnParallelLinear, InferenceLayerNormColumnParallelLinear)
-    )
-
-
 def inference_all_gather_from_tensor_model_parallel_region(
     x: torch.Tensor,
     tp_group: torch.distributed.ProcessGroup,
     config: TransformerConfig,
-    barrier_before: bool = False,
+    barrier_before: bool = True,
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 
@@ -582,9 +564,8 @@ def inference_all_gather_from_tensor_model_parallel_region(
     semantics as `_gather_along_last_dim` but using hardware multicast when
     possible.
 
-    ``barrier_before`` is forwarded to `multimem_all_gather`: pass ``True`` when
-    this all-gather directly follows another all-gather on the shared symmetric
-    buffer so it barriers before overwriting the previous contents.
+    ``barrier_before`` is forwarded to `multimem_all_gather`, which says when ``False`` is
+    safe.
     """
     tp_size = dist.get_world_size(tp_group)
     if tp_size == 1:

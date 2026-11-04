@@ -224,6 +224,9 @@ def fused_multimem_rs_add_norm_ag(
     triton kernel. Writes out the output of the residual add to residual_output_tensor.
     The output of the full kernel is written in-place to the symmetric memory buffer.
     input_tensor must be a symmetric memory buffer.
+    It barriers on entry, as multimem_reduce_scatter does, and on exit, as multimem_all_gather
+    does; peers may then still be reading the gathered output, so a following all-gather on
+    the buffer needs its barrier.
     Args:
         residual_output_tensor: torch.Tensor to write the output of the residual add.
         input_tensor: torch.Tensor, symmetric memory buffer to read the input from.
