@@ -206,9 +206,7 @@ class FsdpContext:
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""
         if self._recording_execution_order:
-            # Completion before any compute must not end recording.
-            if self.execution_order.peek() is not None:
-                self._recording_execution_order = False
+            self._recording_execution_order = False
         elif self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
 
