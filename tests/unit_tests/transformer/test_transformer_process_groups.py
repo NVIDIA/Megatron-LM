@@ -148,7 +148,10 @@ class TestExplicitCollection:
     def test_pp_is_optional_without_pipeline_parallelism(self, pp):
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        # The linear layers read the GTP_remat axes, which are off here, from the collection.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'gtp_remat', 'expt_gtp_remat']
+        )
         if pp == "none":
             pg_collection.pp = None
         with warnings.catch_warnings():
