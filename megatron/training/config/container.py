@@ -91,6 +91,9 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
+        finalize_model = getattr(getattr(self, "model", None), "finalize", None)
+        if callable(finalize_model):
+            finalize_model()
 
     @classmethod
     def from_dict(
@@ -559,14 +562,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
-        finalize_model = getattr(self.model, "finalize", None)
-        if callable(finalize_model):
-            finalize_model()
         optimizer = self._optimizer_with_model_precision()
         changes = {
             name: (getattr(self.optimizer, name), getattr(optimizer, name))
             for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
             if getattr(self.optimizer, name) != getattr(optimizer, name)
+            and not (name == "fp8_recipe" and self.optimizer.fp8_recipe is None)
         }
         if changes:
             logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)

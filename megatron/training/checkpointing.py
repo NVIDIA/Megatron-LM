@@ -183,7 +183,7 @@ def _checkpoint_model_arg(model_config, arg_name):
     """
     if not model_config:
         return _MISSING_CONFIG_VALUE
-    transformer = model_config.get("transformer", {})
+    transformer = model_config.get("transformer") or {}
     if arg_name.startswith("wide_residual_"):
         wide_residual = transformer.get("wide_residual", _MISSING_CONFIG_VALUE)
         if wide_residual is _MISSING_CONFIG_VALUE:
@@ -245,7 +245,7 @@ def check_checkpoint_args(
             current_config = cfg
             for section in config_section.split("."):
                 current_config = getattr(current_config, section)
-                saved_config = (saved_config or {}).get(section, {})
+                saved_config = (saved_config or {}).get(section) or {}
         else:
             saved_config = {}
         if config_name in saved_config:
@@ -266,14 +266,9 @@ def check_checkpoint_args(
     _compare('hidden_size', config_section='model.transformer')
     _compare('num_attention_heads', config_section='model.transformer')
     _compare('gdp_num_householder', default=3, config_section='model.transformer')
-    legacy_position_type = (
-        'rope' if (
-            getattr(checkpoint_args, 'use_rotary_position_embeddings', False)
-            or not getattr(checkpoint_args, 'add_position_embedding', True)
-        ) else 'learned_absolute'
-    )
-    if hasattr(cfg.model, 'position_embedding_type'):
-        _compare('position_embedding_type', default=legacy_position_type, config_section='model')
+    # Preserve the existing load policy: changing RoPE to YaRN is supported.
+    # Exact position_embedding_type equality would introduce a new restriction.
+    _compare('add_position_embedding', default=True)
     if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):
@@ -296,7 +291,7 @@ def check_checkpoint_args(
         _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
         if not args.use_dist_ckpt:
-            _compare('padded_vocab_size', config_section='tokenizer')
+            _compare('padded_vocab_size')
         _compare('tokenizer_type')
     if cfg.rng.data_parallel_random_init:
         _compare('data_parallel_random_init', config_section='rng')
@@ -2636,6 +2631,8 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model, *, checkpoint_model=
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
     ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_layer_pattern')
+    if ckpt_pattern is _MISSING_CONFIG_VALUE or ckpt_pattern is None:
+        ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_override_pattern')
     if ckpt_pattern is _MISSING_CONFIG_VALUE:
         ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
             ckpt_args, 'hybrid_override_pattern', None
@@ -2810,9 +2807,10 @@ def load_checkpoint(
         )
 
     load_kwargs = {}
+    checkpoint_config_read = state_dict is not None
     checkpoint_config = (
         _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
-        if state_dict is not None else None
+        if checkpoint_config_read else None
     )
     checkpoint_model = (checkpoint_config or {}).get('model')
     ignore_rng_state = False
@@ -3222,7 +3220,6 @@ def load_checkpoint(
         state_dict['model'] = dtensor_state_dict
 
     ckpt_train_state = None
-    checkpoint_config = None
     if ckpt_type == CheckpointType.LOCAL:
         from megatron.training.state import TrainState
 
@@ -3232,26 +3229,21 @@ def load_checkpoint(
             ckpt_train_state = TrainState()
             ckpt_train_state.load_state_dict(state_dict['train_state_metadata'])
 
-        checkpoint_config = state_dict.get('run_config')
     else:
-        from megatron.training.utils.checkpoint_utils import (
-            get_checkpoint_run_config_filename,
-            read_run_config,
-        )
-
         # Legacy checkpoint_name points to an mp_rank_*/model_optim_rng.pt file.
         checkpoint_dir = (
             os.path.dirname(os.path.dirname(checkpoint_name))
             if ckpt_type == CheckpointType.LEGACY
             else checkpoint_name
         )
-        config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-        if maybe_msc.os.path.exists(config_filename):
-            checkpoint_config = read_run_config(config_filename)
-
         train_state_filename = get_checkpoint_train_state_filename(checkpoint_dir)
         if file_exists(train_state_filename):
             ckpt_train_state = read_train_state(train_state_filename)
+
+    # Legacy loads may only discover their checkpoint during the full load above.
+    # Reuse metadata already read for distributed checkpoint layout selection.
+    if not checkpoint_config_read:
+        checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
 
     # Set iteration.
     if args.finetune or release:

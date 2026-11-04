@@ -19,6 +19,7 @@ _TRANSFORMER_RUNTIME_FIELDS = frozenset(
     {
         "timers", "finalize_model_grads_func", "grad_scale_func", "moe_grad_scale_func",
         "mtp_grad_scale_func", "no_sync_func", "grad_sync_func", "param_sync_func",
+        "experimental_attention_variant_loss_scale_func",
     }
 )
 

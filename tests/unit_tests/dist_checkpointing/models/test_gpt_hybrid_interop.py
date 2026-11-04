@@ -65,6 +65,14 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestGPTCompatLayerMaps:
+    @pytest.mark.parametrize("canonical", [{}, {"hybrid_layer_pattern": None}])
+    def test_old_bridge_hybrid_config_uses_regular_load_path(self, canonical):
+        runtime_model = object.__new__(HybridModel)
+        checkpoint_model = {"hybrid_override_pattern": "M*-", **canonical}
+        assert _maybe_setup_gpt_to_hybrid_load(
+            mock.Mock(), SimpleNamespace(), [runtime_model], checkpoint_model=checkpoint_model
+        ) == (None, False)
+
     def test_metadata_less_bridge_checkpoint_uses_regular_load_path(self):
         runtime_model = object.__new__(HybridModel)
 

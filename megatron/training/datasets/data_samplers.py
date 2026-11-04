@@ -43,8 +43,6 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         # torch-compatible dataloader and define samplers, if needed.
         return dataset
 
-    cfg = get_run_config()
-
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size

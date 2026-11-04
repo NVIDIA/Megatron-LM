@@ -364,6 +364,7 @@ def setup_model_and_optimizer(
             ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -521,6 +522,7 @@ def setup_moe_model_and_optimizer(
             ),
         )
 
+    get_run_config().model.transformer = unwrap_model(model)[0].config
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,

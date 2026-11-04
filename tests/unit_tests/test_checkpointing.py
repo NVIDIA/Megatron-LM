@@ -30,6 +30,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     _maybe_setup_gpt_to_hybrid_load,
+    _read_checkpoint_run_config,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
@@ -591,7 +592,12 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
         vocab_size=128,
         **kwargs,
     )
-    args = SimpleNamespace(vocab_file=None, use_dist_ckpt=True, phase_transition_iterations=None)
+    args = SimpleNamespace(
+        vocab_file=None,
+        use_dist_ckpt=True,
+        phase_transition_iterations=None,
+        add_position_embedding=True,
+    )
     saved = run_config.to_dict()
     stale = SimpleNamespace(num_layers=99, hidden_size=99, num_attention_heads=99)
     with (
@@ -605,7 +611,32 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
 
 
 @pytest.mark.parametrize("saved_config", [False, True])
-def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_config):
+def test_checkpoint_allows_rope_to_yarn(run_config, saved_config):
+    args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        add_position_embedding=True,
+        vocab_file=None,
+        use_dist_ckpt=True,
+        phase_transition_iterations=None,
+    )
+    checkpoint_args = SimpleNamespace(**vars(args), position_embedding_type="rope")
+    run_config.model.position_embedding_type = "rope"
+    saved = run_config.to_dict() if saved_config else None
+    run_config.model.position_embedding_type = "yarn"
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        checkpoint_args.add_position_embedding = False
+        with pytest.raises(AssertionError, match="add_position_embedding"):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+
+
+@pytest.mark.parametrize("saved_config", [False, True])
+def test_checkpoint_padded_vocabulary_preserves_legacy_comparison(run_config, saved_config):
     run_config.tokenizer.padded_vocab_size = 512
     run_config.model.vocab_size = 640
     run_config.model.should_pad_vocab = False
@@ -615,6 +646,7 @@ def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_co
         phase_transition_iterations=None,
         tokenizer_type="NullTokenizer",
         padded_vocab_size=999,
+        add_position_embedding=True,
     )
     checkpoint_args = SimpleNamespace(
         num_layers=2,
@@ -623,19 +655,17 @@ def test_checkpoint_padded_vocabulary_uses_tokenizer_config(run_config, saved_co
         max_position_embeddings=16,
         make_vocab_size_divisible_by=128,
         tokenizer_type="NullTokenizer",
-        padded_vocab_size=512,
+        padded_vocab_size=999,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
     )
     saved = run_config.to_dict() if saved_config else None
-    if saved_config:
-        checkpoint_args.padded_vocab_size = 999
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=args),
         mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
     ):
         check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
-        run_config.tokenizer.padded_vocab_size = 768
+        args.padded_vocab_size = 768
         with pytest.raises(AssertionError, match='padded_vocab_size value from checkpoint'):
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
         check_checkpoint_args(
@@ -699,7 +729,8 @@ def test_checkpoint_args_restore_preserves_mlm_policy(restore_parallelism):
     [("train", "global_batch_size", 8, 16), ("rng", "data_parallel_random_init", True, False)],
 )
 @pytest.mark.parametrize(
-    "saved_source", ["legacy", "missing_section", "missing_field", "config", "config_only"]
+    "saved_source",
+    ["legacy", "missing_section", "null_section", "missing_field", "config", "config_only"],
 )
 def test_check_checkpoint_args_uses_config_owner(
     monkeypatch, run_config, section, name, current, other, saved_source
@@ -728,6 +759,8 @@ def test_check_checkpoint_args_uses_config_owner(
     checkpoint_config = None
     if saved_source != "legacy":
         checkpoint_config = {} if saved_source == "missing_section" else {section: {}}
+        if saved_source == "null_section":
+            checkpoint_config[section] = None
     if saved_source in ("config", "config_only"):
         saved_owner = checkpoint_config[section]
         saved_owner[name] = current
@@ -1410,6 +1443,10 @@ def test_checkpoint_load_without_microbatch_calculator(
             for name in ("global_batch_size", "micro_batch_size"):
                 delattr(args, name)
         unset_num_microbatches_calculator()
+        read_config = mock.Mock(wraps=_read_checkpoint_run_config)
+        monkeypatch.setattr(
+            'megatron.training.checkpointing._read_checkpoint_run_config', read_config
+        )
         if is_inference or load_mode == "converter":
             from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -1436,6 +1473,7 @@ def test_checkpoint_load_without_microbatch_calculator(
             assert train_state.iteration == expected_iteration
             assert train_state.consumed_train_samples == expected_iteration * args.global_batch_size
         assert metadata == (7 if load_mode == "override" else 123, 456)
+        read_config.assert_called_once()
         for expected, actual in zip(model.parameters(), restored.parameters()):
             assert torch.equal(expected, actual)
         assert torch.equal(torch.get_rng_state(), before_load_rng if no_load_rng else saved_rng)

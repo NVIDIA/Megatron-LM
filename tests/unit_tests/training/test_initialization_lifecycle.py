@@ -330,6 +330,18 @@ def test_explicit_inference_bootstrap_preserves_sparse_args(monkeypatch, isolate
         global_vars.set_global_variables(args, cfg)
 
 
+def test_inference_can_defer_model_even_with_dimensions(monkeypatch):
+    args = _runtime_args()
+    args.num_layers = 2
+    args.hidden_size = 32
+    args.num_attention_heads = 4
+    builder = Mock(side_effect=AssertionError("model discovery has not finished"))
+    monkeypatch.setattr("megatron.training.argument_utils.model_config_from_args", builder)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    assert cfg.model is None
+    builder.assert_not_called()
+
+
 def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_globals, run_config):
     args = _runtime_args()
     cfg = run_config
@@ -1672,6 +1684,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     pretrain.assert_called_once()
     assert pretrain.call_args.args[0] is cfg
     assert pretrain.call_args.args[1] is None  # RL builds no datasets
+    assert pretrain.call_args.args[4] is None  # Training uses the native model config builder.
     kwargs = pretrain.call_args.kwargs
     assert [type(callback) for callback in kwargs["callbacks"]] == [
         RLSetupCallback,

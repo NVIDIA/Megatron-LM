@@ -1089,9 +1089,6 @@ def num_floating_point_operations(
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
-        # Group Query Attention.
-        if not group_query_attention:
-            transformer.num_query_groups = transformer.num_attention_heads
         # MoE.
         if transformer.num_moe_experts is None:
             # Every Transformer MLP is dense.
@@ -5977,7 +5974,7 @@ def get_train_valid_test_num_samples():
         cfg.train,
         cfg.validation,
         phase_transition_iterations=args.phase_transition_iterations,
-        iteration=train_state.iteration,
+        iteration=train_state.iteration if train_state is not None else 0,
     )
 
 

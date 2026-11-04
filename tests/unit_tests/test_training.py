@@ -60,6 +60,20 @@ def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
 
 
+@pytest.mark.parametrize("state", [None, SimpleNamespace(iteration=0)])
+def test_sample_counts_before_training_state(monkeypatch, run_config, state):
+    run_config.train.train_iters = 10
+    run_config.train.train_samples = 80
+    run_config.train.global_batch_size = 8
+    run_config.validation.eval_iters = 2
+    run_config.validation.eval_interval = 5
+    monkeypatch.setattr(
+        training, "get_args", lambda: SimpleNamespace(phase_transition_iterations=None)
+    )
+    monkeypatch.setattr(training, "get_train_state", lambda: state)
+    assert training.get_train_valid_test_num_samples() == (80, 48, 16)
+
+
 class _LenDataloader:
     """Fake dataloader with __len__ (required by the full_validation path)
     and __iter__ (consumed via cyclic_iter)."""

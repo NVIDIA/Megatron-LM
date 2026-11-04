@@ -65,6 +65,8 @@ def test_validation_is_read_only_and_finalization_runs_once(
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     rng_finalize = Mock(wraps=cfg.rng.finalize_model_config)
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
+    model_finalize = Mock(wraps=model.finalize)
+    monkeypatch.setattr(model, "finalize", model_finalize)
     cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker is (transformer_impl == "transformer_engine")
@@ -76,6 +78,7 @@ def test_validation_is_read_only_and_finalization_runs_once(
     cfg.finalize()
     assert cfg.to_dict() == after
     rng_finalize.assert_called_once_with(model)
+    model_finalize.assert_called_once_with()
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 
@@ -138,6 +141,16 @@ def test_optimizer_precision_override_is_reported(run_config, caplog):
     caplog.clear()
     run_config.finalize()
     assert not caplog.records
+
+
+@pytest.mark.parametrize("old_recipe", [None, "tensorwise"])
+def test_optimizer_recipe_warning_only_for_conflicts(run_config, caplog, old_recipe):
+    run_config.train.micro_batch_size = 1
+    run_config.optimizer.fp8_recipe = old_recipe
+    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
+        run_config.finalize()
+    assert run_config.optimizer.fp8_recipe == run_config.model.transformer.fp8_recipe == "delayed"
+    assert ("fp8_recipe" in caplog.text) == (old_recipe is not None)
 
 
 @pytest.mark.parametrize(
@@ -286,9 +299,15 @@ def test_serialization_starts_a_new_lifecycle(
     transformer.timers = object()
     transformer.grad_scale_func = lambda value: value
     transformer.no_sync_func = [lambda: None]
+    transformer.experimental_attention_variant_loss_scale_func = lambda value: value
     serialized = run_config.to_dict()
     assert "_finalized" not in serialized
-    for name in ("timers", "grad_scale_func", "no_sync_func"):
+    for name in (
+        "timers",
+        "grad_scale_func",
+        "no_sync_func",
+        "experimental_attention_variant_loss_scale_func",
+    ):
         assert name not in serialized["model"]["transformer"]
     if storage == "yaml":
         path = tmp_path / "run_config.yaml"

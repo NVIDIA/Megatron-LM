@@ -307,23 +307,12 @@ def _set_train_state():
 
 def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
-    from megatron.training.models import (
-        BertModelConfig,
-        GPTModelConfig,
-        HybridModelConfig,
-        LLaVAModelConfig,
-        MimoBuildConfig,
-        T5ModelConfig,
-    )
     from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
 
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
 
-    if isinstance(
-        cfg.model,
-        (GPTModelConfig, HybridModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoBuildConfig),
-    ):
+    if cfg.model is not None:
         make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
         tp_size = cfg.model.transformer.tensor_model_parallel_size
     else:

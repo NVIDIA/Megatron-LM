@@ -363,7 +363,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     args = get_args()
     if model_config is None:
         # Direct inference/bootstrap callers have not constructed a training model config.
-        cfg = get_run_config()
         model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
 
     device_count = torch.cuda.device_count()

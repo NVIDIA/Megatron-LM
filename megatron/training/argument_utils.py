@@ -754,7 +754,6 @@ def hybrid_config_from_args(
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
-    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -1137,16 +1136,10 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        build_model_config: If False, allow model_cfg=None for callers without model
-            inputs. Callers with model dimensions still receive a typed model config;
-            application-specific families pass model_cfg explicitly.
+        build_model_config: If False, leave model_cfg=None until the caller resolves
+            its model inputs. Application-specific families pass model_cfg explicitly.
     """
     if model_cfg is None and build_model_config:
-        model_cfg = model_config_from_args(args)
-    elif model_cfg is None and all(
-        getattr(args, name, None) is not None
-        for name in ("num_layers", "hidden_size", "num_attention_heads")
-    ):
         model_cfg = model_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
