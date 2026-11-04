@@ -19,6 +19,9 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from megatron.core.ops.attention.dsa import KPoolScorePostprocess
+from megatron.core.ops.attention.dsa.backends import select_kpool_score_postprocess
+from megatron.core.ops.attention.dsa.reference import torch_kpool_score_postprocess
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
@@ -1067,6 +1070,7 @@ def _kpool_topk_from_score_chunks(
     pool_token_base: torch.Tensor,
     sk: int,
     use_relu: bool,
+    score_postprocess: KPoolScorePostprocess = torch_kpool_score_postprocess,
 ) -> torch.Tensor:
     """Compute KPool scores and selection in query chunks.
 
@@ -1089,10 +1093,7 @@ def _kpool_topk_from_score_chunks(
     for start in range(0, sq, chunk_size):
         end = min(start + chunk_size, sq)
         scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
-        if use_relu:
-            scores.relu_()
-        scores.mul_(weights[start:end].unsqueeze(-1))
-        score_chunk = scores.sum(dim=2).transpose(0, 1)
+        score_chunk = score_postprocess(scores, weights[start:end], use_relu).transpose(0, 1)
         del scores
 
         if varlen_starts is not None:
@@ -1146,6 +1147,7 @@ def fused_qk_topk_kpool(
     fp8_indexer: bool = False,
     rotate_activation_enabled: bool = False,
     return_index_scores: bool = True,
+    score_postprocess: KPoolScorePostprocess = torch_kpool_score_postprocess,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -1239,6 +1241,7 @@ def fused_qk_topk_kpool(
             pool_token_base=pool_token_base,
             sk=sk,
             use_relu=use_relu,
+            score_postprocess=score_postprocess,
         )
 
     # Expand [batch * queries, pools] to a fixed token budget.
@@ -2048,6 +2051,16 @@ def _dsa_weights_projection_fp32(x: torch.Tensor, indexer: torch.nn.Module) -> t
 def _validate_dsa_kpool_config(config: TransformerConfig) -> None:
     """Validate KPool invariants for direct Python API construction as well as config parsing."""
     pool_size = getattr(config, "dsa_indexer_kpool", 1)
+    score_backend = getattr(config, "dsa_indexer_kpool_score_backend", "torch")
+    if score_backend not in ("torch", "triton"):
+        raise ValueError("dsa_indexer_kpool_score_backend must be torch or triton")
+    if score_backend == "triton":
+        if pool_size <= 1 or config.dsa_indexer_n_heads != 32:
+            raise ValueError("Triton KPool score postprocessing requires KPool > 1 and 32 heads")
+        if config.dsa_indexer_weights_proj_output_dtype != "fp32":
+            raise ValueError("Triton KPool score postprocessing requires FP32 weights output")
+        if (config.dsa_indexer_loss_coeff or 0.0) != 0.0:
+            raise ValueError("Triton KPool score postprocessing requires disabled indexer loss")
     if pool_size < 1:
         raise ValueError(f"dsa_indexer_kpool must be positive, got {pool_size}.")
     if pool_size == 1:
@@ -2104,6 +2117,9 @@ class DSAIndexer(MegatronModule):
         """
         super().__init__(config=config)
         _validate_dsa_kpool_config(config)
+        self._kpool_score_postprocess = select_kpool_score_postprocess(
+            getattr(config, "dsa_indexer_kpool_score_backend", "torch"), config.dsa_indexer_n_heads
+        )
         self.hidden_size = self.config.hidden_size
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
@@ -2478,6 +2494,7 @@ class DSAIndexer(MegatronModule):
                 fp8_indexer=self.index_kpool_use_quantization,
                 rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                 return_index_scores=return_index_scores,
+                score_postprocess=self._kpool_score_postprocess,
             )
             self._kpool_gate_score = None
         else:
@@ -3351,6 +3368,7 @@ class DSAttention(MegatronModule):
                         fp8_indexer=self.indexer.index_kpool_use_quantization,
                         rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                         return_index_scores=False,
+                        score_postprocess=self.indexer._kpool_score_postprocess,
                     )
                     del _index_scores
                     self.indexer._kpool_gate_score = None
