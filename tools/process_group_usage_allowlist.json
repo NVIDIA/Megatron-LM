@@ -180,7 +180,7 @@
       "MegatronModule.sharded_state_dict:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
     "megatron/core/transformer/moe/batch_invariant.py": [
-      "unpermute:accessor:parallel_state.get_expert_model_parallel_world_size"
+      "unpermute:guarded:resolve_process_groups"
     ],
     "megatron/core/transformer/moe/moe_logging.py": [
       "MoEMetricsTracker._sync_metrics:accessor:parallel_state.get_data_parallel_group",
