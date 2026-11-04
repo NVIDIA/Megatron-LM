@@ -217,27 +217,68 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
         device=distributed_setup.device,
     )
     tensor_view = buffer.get_tensor_view(0)
-    sharded_view = buffer.view([RowAtomic()])
-    separate = DBuffer(mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
-    assert buffer.is_alias_of(sharded_view)
-    assert sharded_view.is_alias_of(buffer)
-    assert not buffer.is_alias_of(separate)
 
     buffer.release_storage()
-    separate.release_storage()
     assert buffer.local_buffer.untyped_storage().nbytes() == 0
-    # Released buffers have null data pointers but retain distinct Storage objects.
-    assert buffer.is_alias_of(sharded_view)
-    assert not buffer.is_alias_of(separate)
 
     buffer.reallocate_storage()
-    assert buffer.is_alias_of(sharded_view)
     assert (
         buffer.local_buffer.untyped_storage().nbytes()
         == buffer.local_buffer.numel() * buffer.local_buffer.element_size()
     )
     buffer.local_buffer.fill_(7.0)
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
+
+
+def test_is_alias_of(distributed_setup):
+    """Views share storage identity even after release; independent buffers never alias."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=[torch.Size((4, 4))],
+        dtype=torch.float32,
+        device=distributed_setup.device,
+    )
+    view = buffer.view([RowAtomic()])
+    separate = DBuffer(mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
+
+    assert buffer.is_alias_of(view)
+    assert view.is_alias_of(buffer)
+    assert not buffer.is_alias_of(separate)
+
+    buffer.release_storage()
+    separate.release_storage()
+    # Both data pointers are now null, but the underlying storage identities differ.
+    assert buffer.is_alias_of(view)
+    assert not buffer.is_alias_of(separate)
+
+    buffer.reallocate_storage()
+    assert buffer.is_alias_of(view)
+    assert not buffer.is_alias_of(separate)
+
+
+@pytest.mark.parametrize("mesh_axis", ["dp", "local"])
+def test_can_redistribute_locally(distributed_setup, mesh_axis):
+    """Replication can be sliced locally; gathering shards requires a singleton mesh."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )[mesh_axis]
+    buffer = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=[torch.Size((4, 4))],
+        dtype=torch.float32,
+        device=distributed_setup.device,
+    )
+    view = buffer.view([RowAtomic()])
+
+    assert buffer.can_redistribute_locally([Replicate()])
+    assert buffer.can_redistribute_locally([RowAtomic()])
+    assert view.can_redistribute_locally([RowAtomic()])
+    assert view.can_redistribute_locally([Replicate()]) == (mesh.size() == 1)
 
 
 def test_is_allocated_follows_storage_release(distributed_setup):
@@ -298,7 +339,6 @@ def test_view_rejects_non_aliasing_placement_change(distributed_setup):
 
     with pytest.raises(ValueError, match="DBuffer.view"):
         buffer.view([Replicate()])
-    assert not buffer.can_redistribute_locally([Replicate()])
 
 
 def test_replicate_get_tensor_view_and_dtensor(distributed_setup):
@@ -417,7 +457,6 @@ def test_replicate_view_round_trip(distributed_setup, shard_layout):
         tensors, mesh, [Replicate()], layout=_row_atomic_layout(tensors, mesh, shard_layout)
     )
     sharded_buffer = replicated_buffer.view([RowAtomic()])
-    assert replicated_buffer.can_redistribute_locally([RowAtomic()])
     redistribute_destination = DBuffer.empty(
         mesh=mesh,
         placements=[RowAtomic()],
