@@ -310,11 +310,18 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
+        self.use_rope = (
+            not bool(self.config.no_rope_freq[self.layer_number - 1])
+            if self.config.no_rope_freq
+            else True
+        )
+
         # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8.
         # The q_layernorm is absorbed into the fusion so that MXFP8 is produced in one step
         # from the norm's FP32 accumulator, as TELayerNormColumnParallelLinear does; that
         # requires the norm to exist and to be an RMSNorm (because currently it is only
-        # tested with DSv3 which uses RMSNorm)
+        # tested with DSv3 which uses RMSNorm). The kernel also applies RoPE, so NoPE
+        # layers never take it.
         self._use_fused_q_uproj = (
             getattr(self.config, "use_fused_mla_q_uproj", False)
             and FusedMLAQUpProjRopeQuant is not None
@@ -322,10 +329,11 @@ class MultiLatentAttention(Attention):
             and get_pg_size(self.tp_group) == 1
             and self.config.qk_layernorm
             and self.config.normalization == "RMSNorm"
+            and self.use_rope
         )
         # Key/value split, key RoPE and MXFP8 quantization in one TE kernel, for the head
         # dimensions it supports; q, k and v then reach the attention pre-quantized, as on the
-        # fused Q up-projection path.
+        # fused Q up-projection path. The kernel applies RoPE, so NoPE layers never take it.
         self._use_fused_kv_rope_quant = (
             getattr(self.config, "use_fused_mla_kv_rope_quant", False)
             and fused_mla_kv_rope_mxfp8 is not None
@@ -337,6 +345,7 @@ class MultiLatentAttention(Attention):
             and self.config.qk_head_dim == 128
             and self.config.qk_pos_emb_head_dim == 64
             and self.config.v_head_dim == 128
+            and self.use_rope
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
@@ -350,8 +359,13 @@ class MultiLatentAttention(Attention):
             )
         )
         self.cache_mla_latents = self.config.cache_mla_latents
+        assert (
+            self.use_rope or not self.cache_mla_latents
+        ), "Caching MLA latents is not supported for layers without RoPE."
 
-        if self.config.rope_type == "rope":
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -973,17 +987,24 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
+        if not self.use_rope and inference_context is not None:
+            raise NotImplementedError("MLA no_rope_freq currently supports training only.")
+        rotary_seq_len = None
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        use_fused_rope = should_use_fused_mla_rope(self.config)
-        if use_fused_rope:
+        use_fused_rope = self.use_rope and should_use_fused_mla_rope(self.config)
+        if not self.use_rope:
+            rotary_pos_emb = None
+        elif use_fused_rope:
+            assert rotary_seq_len is not None
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
             )
@@ -993,8 +1014,10 @@ class MLASelfAttention(MultiLatentAttention):
                 fused_apply_mla_rope_for_q is not None and fused_apply_mla_rope_for_kv is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self.config.rope_type == "rope":
+            assert rotary_seq_len is not None
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
+            assert rotary_seq_len is not None
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -1084,7 +1107,7 @@ class MLASelfAttention(MultiLatentAttention):
                 q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
             )
 
-            # Dynamic batching: use inference context methods
+            # Cached MLA latents require RoPE; use the dynamic batching inference context methods.
             q_pos_emb = inference_context.apply_rotary_emb_query(
                 q_pos_emb,
                 rotary_pos_emb,
@@ -1246,7 +1269,16 @@ class MLASelfAttention(MultiLatentAttention):
                 return quantized_query, key, value
 
             # todo add assert about fusions and caching
-            if use_fused_rope:
+            if not self.use_rope:
+                # K3 keeps the positional projection channels (and the original
+                # attention scale), but does not rotate them. Dropping those
+                # channels would change the architecture and checkpoint shapes.
+                query = q
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+                key = torch.cat([k_no_pe, k_pos_emb.expand(*k_no_pe.shape[:-1], -1)], dim=-1)
+            elif use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 if not use_fused_q_uproj:
@@ -1277,6 +1309,7 @@ class MLASelfAttention(MultiLatentAttention):
                     key, value = _QuantizeKVForFusedAttn.apply(key, value)
                     mxfp8_transpose_swizzle([query, key, value], "sbhd")
             else:
+                # Apply unfused rope.
                 q_len = q.size()[0]
                 if inference_context is not None:
                     # add offset to the sequence start for inference
