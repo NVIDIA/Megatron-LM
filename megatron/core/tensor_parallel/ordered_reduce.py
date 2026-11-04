@@ -26,8 +26,8 @@ Paths:
     GEMM output). One kernel stores each peer's rows into that peer's fixed-size symmetric
     staging buffer (chunked, double-buffered, one block-level barrier per chunk) and folds
     the staged partials in rank order. No receive buffer of the input's size, no NCCL.
-    Falls back to all-to-all + fold for inputs above 64 MiB (where the push is not
-    faster) or without symmetric memory (e.g. a TP group spanning NVLink domains).
+    Falls back to all-to-all + fold only without symmetric memory (e.g. a TP group
+    spanning NVLink domains).
   * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
     buffer; one kernel barriers through the signal pad, reads the owned slice from every
     peer with plain loads (not multimem, whose in-switch reduction order is unspecified)
@@ -456,9 +456,6 @@ def ordered_fold(
 # Push staging: 16 warps, PUSH_VECS 16-byte vectors per thread and peer, two slots per block.
 _PUSH_WARPS = 16
 _PUSH_MAX_VECS = 4
-# Above this input size the push (one barrier per staging chunk) is not faster than NCCL
-# all-to-all + fold on GB200 TP4; both give the same bits, so the threshold is speed-only.
-PUSH_MAX_INPUT_BYTES = 64 << 20
 
 
 def _push_staging_bytes(world_size: int, num_parts: int = 1) -> int:
@@ -494,20 +491,14 @@ def _allocate_push_staging(group, num_parts: int) -> str:
     return key
 
 
-def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
+def _push_staging(group, num_parts: int = 1):
     """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
 
     The staging is fixed-size: 2 x max_num_blocks x TP x num_parts x 32 KiB per rank (32 MiB
     at TP 4 with one partial, 64 MiB at TP 8), independent of the message size (see
     :func:`prepare_ordered_reduce`). None (no symmetric memory for the group, e.g. TP across
-    NVLink domains, or a message above PUSH_MAX_INPUT_BYTES) makes
-    :func:`ordered_reduce_scatter_shards` take the all-to-all path instead.
+    NVLink domains) makes :func:`ordered_reduce_scatter_shards` take the all-to-all path.
     """
-    # The input-size cap only affects speed (PUSH_MAX_INPUT_BYTES). With several shard
-    # partials per rank the push beat the all-to-all at every measured size (GB200,
-    # TP2/TP4, up to 16k x 8192), so the cap applies only to one partial per rank.
-    if num_parts == 1 and tensor.numel() * tensor.element_size() > PUSH_MAX_INPUT_BYTES:
-        return None
     hdl = SymmetricMemoryManager.get_buffer(_allocate_push_staging(group, num_parts)).symm_mem_hdl
     if hdl is None or hdl.world_size != group.size():
         return None
@@ -775,7 +766,7 @@ def ordered_reduce_scatter_shards(
     parts = parts.contiguous()
     if output is None:
         output = parts.new_empty((rows, *rest))
-    staging = _push_staging(group, parts, num_parts=c)
+    staging = _push_staging(group, num_parts=c)
     if staging is not None:
         return _launch_push_fold(parts, output, staging, exact, num_parts=c)
     # all_to_all_single sends dim-0 slice d to rank d, so lay the partials out

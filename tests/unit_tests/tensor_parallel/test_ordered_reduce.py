@@ -170,7 +170,7 @@ class TestOrderedReduce:
 
         Sizes span one to several staging iterations per block and a ragged tail.
         """
-        if orr._push_staging(self.group, torch.empty(1, device="cuda")) is None:
+        if orr._push_staging(self.group) is None:
             pytest.skip("symmetric memory is not available")
         for dtype in (torch.bfloat16, torch.float32):
             for rows, hidden in ((4, 2688), (12, 1000), (2048, 8192), (8192, 4096)):
@@ -341,7 +341,7 @@ def test_tp3_symmetric_memory_paths():
         x = _partials((96, 1024), torch.bfloat16, seed=31)
         rank = group.rank()
         ref = _left_fold(_all_partials(x, group))[rank * 32 : (rank + 1) * 32]
-        assert orr._push_staging(group, x) is not None
+        assert orr._push_staging(group) is not None
         assert torch.equal(_bits(orr.ordered_reduce_scatter(x, group)), _bits(ref))
 
         symm = SymmetricMemoryManager.get_buffer("tp3_test", process_group=group)
