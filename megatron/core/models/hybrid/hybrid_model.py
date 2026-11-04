@@ -579,7 +579,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
+                skip_weight_param_allocation=(self.pre_process or self.mtp_process)
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
                 output_dtype=self.logit_dtype,
