@@ -605,6 +605,98 @@ def test_sanitize_messages_flattens_content_to_a_string(
         assert sanitized["content"] == expected
 
 
+# The content-list loop of the Nemotron 3.5 Super VL HF chat template (chat_template.jinja),
+# rendering each image as <image> and each video as <video>.
+_NEMOTRON_VL_CONTENT_TEMPLATE = """
+{%- set counters = namespace(images=0) -%}
+{%- for part in content -%}
+    {%- if part['type'] == 'image_url' -%}{%- set counters.images = counters.images + 1 -%}{%- endif -%}
+{%- endfor -%}
+{%- set content_ns = namespace(val='') -%}
+{%- set render_ns = namespace(image_index=0, after_text=false) -%}
+{%- for part in content -%}
+    {%- set sep = '\n' if render_ns.after_text and not content_ns.val.endswith('\n') else '' -%}
+    {%- if part['type'] == 'image_url' -%}
+        {%- set render_ns.image_index = render_ns.image_index + 1 -%}
+        {%- if counters.images > 1 -%}
+            {%- set content_ns.val = content_ns.val + sep
+                + '<image ' + render_ns.image_index|string + '><image>' -%}
+        {%- else -%}
+            {%- set content_ns.val = content_ns.val + sep + '<image>' -%}
+        {%- endif -%}
+        {%- set render_ns.after_text = false -%}
+    {%- elif part['type'] == 'video_url' -%}
+        {%- set content_ns.val = content_ns.val + sep + '<video>' -%}
+        {%- set render_ns.after_text = false -%}
+    {%- elif part['type'] == 'text' -%}
+        {%- set content_ns.val = content_ns.val + (part['text'] | default('', true)) -%}
+        {%- if part['text'] | default('', true) -%}
+            {%- set render_ns.after_text = true -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{{- content_ns.val -}}
+"""
+
+
+def _text(text):
+    return {"type": "text", "text": text}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param([_media_block("image", 0), _text("Describe it.")], id="image-then-text"),
+        pytest.param([_text("Describe it."), _media_block("image", 0)], id="text-then-image"),
+        pytest.param([_text("Look:\n"), _media_block("image", 0)], id="text-ending-in-newline"),
+        pytest.param(
+            [_text(""), _media_block("image", 0), _text("Describe it.")],
+            id="empty-text-before-image",
+        ),
+        pytest.param(
+            [_media_block("image", 0), _media_block("image", 1), _text("Compare them.")],
+            id="two-leading-images",
+        ),
+        pytest.param(
+            [
+                _text("Compare these."),
+                _media_block("image", 0),
+                _text("First."),
+                _media_block("image", 1),
+                _text("Second."),
+            ],
+            id="interleaved-images",
+        ),
+        pytest.param(
+            [_text("Describe it."), _media_block("video", 0), _text("Be brief.")],
+            id="text-video-text",
+        ),
+        pytest.param(
+            [_media_block("video", 0), _media_block("video", 1), _text("Compare them.")],
+            id="two-videos-are-not-labeled",
+        ),
+    ],
+)
+def test_nemotron_vl_rendering_matches_hf_chat_template(content):
+    jinja2 = pytest.importorskip("jinja2")
+    expected = (
+        jinja2.Environment().from_string(_NEMOTRON_VL_CONTENT_TEMPLATE).render(content=content)
+    )
+    prompt_config = replace(
+        NemotronOmniInferenceWrapper.multimodal_prompt_config, content_rendering="nemotron_vl"
+    )
+
+    messages, _images, _videos, media_slots = _extract_multimodal_from_messages(
+        [_user(content)], prompt_config
+    )
+    (sanitized,) = _sanitize_messages_for_template(messages, media_slots, prompt_config)
+
+    rendered = sanitized["content"]
+    for sentinel, modality, _message_index in media_slots:
+        rendered = rendered.replace(sentinel, f"<{modality}>")
+    assert rendered == expected
+
+
 def test_sanitize_messages_coerces_tool_call_arguments_to_mappings():
     calls = [
         {"function": {"name": "a", "arguments": '{"x": 1}'}},
@@ -852,6 +944,35 @@ def test_endpoint_places_media_by_content_part_order(
     )
 
     assert tokens == expected_tokens
+
+
+def test_endpoint_renders_images_like_the_nemotron_vl_template():
+    """No newline after an image, and <image N> labels when a message has several images."""
+    prompt_config = replace(
+        NemotronOmniInferenceWrapper.multimodal_prompt_config, content_rendering="nemotron_vl"
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare these."},
+                _media_block("image", 0),
+                {"type": "text", "text": "First."},
+                _media_block("image", 1),
+                {"type": "text", "text": "Second."},
+            ],
+        }
+    ]
+
+    tokens = _endpoint_prompt_tokens(messages, prompt_config)
+
+    assert tokens == [
+        "<user>Compare these.\n<image 1>",
+        *("<img>", 99, "</img>"),
+        "First.\n<image 2>",
+        *("<img>", 99, "</img>"),
+        "Second.",
+    ]
 
 
 @pytest.mark.parametrize(

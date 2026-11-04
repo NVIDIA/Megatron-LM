@@ -427,6 +427,35 @@ def _extract_multimodal_from_messages(
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
+def _render_nemotron_vl_content(chunks, modality_by_sentinel):
+    """Join content parts the way the Nemotron VL chat template renders a content list.
+
+    Parts keep their order. A media item is preceded by a newline only when it follows text
+    and the rendered content does not already end with one; with more than one image in the
+    message each image is labeled ``<image N>`` (1-based). Text is appended as is.
+    """
+    num_images = sum(1 for chunk in chunks if modality_by_sentinel.get(chunk) == "image")
+    rendered = ""
+    after_text = False
+    image_index = 0
+    for chunk in chunks:
+        modality = modality_by_sentinel.get(chunk)
+        if modality is None:
+            rendered += chunk
+            if chunk:
+                after_text = True
+            continue
+        separator = "\n" if after_text and not rendered.endswith("\n") else ""
+        label = ""
+        if modality == "image":
+            image_index += 1
+            if num_images > 1:
+                label = f"<image {image_index}>"
+        rendered += separator + label + chunk
+        after_text = False
+    return rendered
+
+
 def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
@@ -448,9 +477,11 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
     sanitized = []
     media_modalities_by_message = {}
     media_sentinels_by_message = {}
+    modality_by_sentinel = {}
     for _sentinel, modality, message_index in media_slots:
         media_modalities_by_message.setdefault(message_index, set()).add(modality)
         media_sentinels_by_message.setdefault(message_index, set()).add(_sentinel)
+        modality_by_sentinel[_sentinel] = modality
 
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -470,6 +501,16 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
+            # The Nemotron VL chat template renders parts in their original order, so this
+            # mode ignores content_part_order.
+            if (
+                prompt_config is not None
+                and prompt_config.content_rendering == "nemotron_vl"
+                and media_modalities_by_message.get(message_index)
+            ):
+                msg_copy["content"] = _render_nemotron_vl_content(text_chunks, modality_by_sentinel)
+                sanitized.append(msg_copy)
+                continue
             if prompt_config is not None and prompt_config.content_part_order == "media_first":
                 media_sentinels = media_sentinels_by_message.get(message_index, set())
                 media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
