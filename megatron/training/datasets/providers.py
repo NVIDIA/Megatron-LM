@@ -20,6 +20,7 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    global_process_group_fallback,
     warn_global_process_group_fallback,
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -65,10 +66,10 @@ def is_dataset_built_on_rank_explicit(
         return True
     if vp_size is None and vp_stage is not None:
         # Compatibility for direct callers; is_dataset_built_on_rank passes the model's size.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "is_dataset_built_on_rank", "vp_size", deprecated_in="0.21", removed_in="0.23"
-        )
-        vp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+        ):
+            vp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
     return is_first_or_last_pipeline_stage(
         vp_stage, pp_group=pg_collection.pp, vp_size=vp_size
     ) or mtp_on_this_rank(

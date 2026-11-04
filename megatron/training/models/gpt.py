@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
@@ -96,10 +96,10 @@ def default_layer_spec(
         else:
             from megatron.core import parallel_state
 
-            warn_global_process_group_fallback(
+            with global_process_group_fallback(
                 "default_layer_spec", deprecated_in="0.21", removed_in="0.23"
-            )
-            use_arbitrary_attention_mask = parallel_state.get_context_parallel_world_size() == 1
+            ):
+                use_arbitrary_attention_mask = parallel_state.get_context_parallel_world_size() == 1
         return get_gpt_modelopt_spec(
             config=config.transformer,
             local_core_attention=False,
