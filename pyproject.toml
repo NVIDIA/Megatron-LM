@@ -307,6 +307,18 @@ filterwarnings = [
     # Tests set up and read the global parallel grid on purpose; the deprecation of its
     # parallel_state accessors is aimed at library and training code.
     "ignore::megatron.core.parallel_state.ParallelStateDeprecationWarning",
+    # The code of this repository outside the tests calls them only in a warned fallback or in
+    # bootstrap code that ignores the warning, so the first such call of a test fails it unless
+    # another filter, such as pytest.warns(), catches it. The warning names the module of the
+    # caller, which these regular expressions match from its start; a later line takes precedence
+    # over an earlier one. They match the packages of this repository and its top-level scripts;
+    # __main__ is a script that a test runs with runpy, and test code must not run as __main__.
+    # A module that a test imports under another name, through sys.path or a file location,
+    # stays ignored, and so do other packages.
+    "error::megatron.core.parallel_state.ParallelStateDeprecationWarning:(megatron|examples|tools|tasks|scripts)\\.",
+    "error::megatron.core.parallel_state.ParallelStateDeprecationWarning:(pretrain_(gpt|hybrid|mamba|vlm)|train_rl|(gpt|hybrid|mamba)_builders|model_provider|__main__)$",
+    # The megatron namespace packages of other projects.
+    "ignore::megatron.core.parallel_state.ParallelStateDeprecationWarning:megatron\\.(energon|bridge)(\\.|$)",
 ]
 
 [tool.coverage.run]

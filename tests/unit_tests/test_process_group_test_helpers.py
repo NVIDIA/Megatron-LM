@@ -72,6 +72,9 @@ class TestForbidGlobalProcessGroups:
             for name in names:
                 with pytest.raises(AssertionError, match=re.escape(f"parallel_state.{name}()")):
                     getattr(ps, name)()
+            # Not deprecated, but it returns the same global groups.
+            with pytest.raises(AssertionError, match="get_registered_process_groups"):
+                ps.get_registered_process_groups()
             with pytest.raises(AssertionError, match="get_tensor_model_parallel_world_size"):
                 mpu.get_tensor_model_parallel_world_size()
             # Not accessors, so not stubbed. get_all_ranks calls stubbed accessors itself.
@@ -126,12 +129,14 @@ class TestForbidGlobalProcessGroups:
         tp_group = ps.get_tensor_model_parallel_group()
         pp_group = ps.get_pipeline_model_parallel_group()
         first_stage = ps.is_pipeline_first_stage()
+        registered = ps.get_registered_process_groups()
         with forbid_global_process_groups(
-            allow=["get_tensor_model_parallel_group"],
+            allow=["get_tensor_model_parallel_group", "get_registered_process_groups"],
             forbid_shim=False,
             forbid_stage_predicates=False,
         ):
             assert ps.get_tensor_model_parallel_group() is tp_group
+            assert ps.get_registered_process_groups() is registered
             with pytest.raises(AssertionError, match="get_tensor_model_parallel_world_size"):
                 ps.get_tensor_model_parallel_world_size()
             assert ps.is_pipeline_first_stage() == first_stage
