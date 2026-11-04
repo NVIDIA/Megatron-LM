@@ -1,0 +1,65 @@
+From cdf824fa593a7df35067c28a774f3804e3d44727 Mon Sep 17 00:00:00 2001
+From: tongliu <tongliu@nvidia.com>
+Date: Thu, 22 Oct 2026 21:00:28 -0700
+Subject: [PATCH] Fix HybridEP metadata scan forward progress with cooperative
+ launch
+
+Signed-off-by: tongliu <tongliu@nvidia.com>
+Source: https://github.com/deepseek-ai/DeepEP/pull/792
+Revision: cdf824fa593a7df35067c28a774f3804e3d44727
+Original file: csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
+SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved
+License: MIT (upstream notice reproduced below).
+
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+ csrc/hybrid_ep/backend/hybrid_ep_backend.cuh | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh b/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
+index 55b6a7ffe..0da0d9334 100644
+--- a/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
++++ b/csrc/hybrid_ep/backend/hybrid_ep_backend.cuh
+@@ -5890,11 +5890,15 @@ public:
+     CUDA_CHECK(cudaMemsetAsync(preprocessing_local_experts_tmp, 0, preprocessing_local_experts_tmp_sz, stream));
+ #endif
+
+-    // Launch the preprocessing kernel to process the global routing map.
+-    scan<NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, LOCAL_EXPERTS_PADDING_SIZE, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_EXPERTS_PER_RANK, TOPK>
+-    <<<NUM_OF_BLOCKS, NUM_THREADS_PER_BLOCK, 0, stream>>>
+-    (input_routing_data, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map,
+-    dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank);
++    // Cooperative launch guarantees forward progress while blocks poll each other's partial sums.
++    cudaLaunchAttribute attr{};
++    attr.id = cudaLaunchAttributeCooperative;
++    attr.val.cooperative = 1;
++    cudaLaunchConfig_t cfg = {dim3(NUM_OF_BLOCKS), dim3(NUM_THREADS_PER_BLOCK), 0, stream, &attr, 1};
++    CUDA_CHECK(cudaLaunchKernelEx(&cfg,
++      scan<NUM_THREADS_PER_BLOCK, NUM_OF_BLOCKS, LOCAL_EXPERTS_PADDING_SIZE, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_TOKENS_PER_CHUNK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_EXPERTS_PER_RANK, TOPK>,
++      input_routing_data, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map,
++      dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank));
+
+     // Check if there is any CUDA error.
+     CUDA_CHECK(cudaGetLastError());
