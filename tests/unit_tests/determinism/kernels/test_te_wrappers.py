@@ -910,6 +910,7 @@ def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
         te_supports_batch_invariant_attention,
     )
     from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.utils import set_attention_backend
 
     try:
         from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
@@ -921,9 +922,17 @@ def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
         pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
 
     clear_nvte_env_vars()
-    monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
-    monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
-    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    # set_attention_backend writes os.environ directly; registering the names here lets
+    # monkeypatch restore them after the test.
+    for name in (
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+        "NVTE_FLASH_ATTN_V2",
+        "NVTE_FLASH_ATTN_V3",
+        "NVTE_FLASH_ATTN_V4",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     from transformer_engine.pytorch.attention.dot_product_attention import (
         dot_product_attention as te_dpa,
@@ -946,6 +955,9 @@ def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
             context_parallel_size=cp_size,
             cp_comm_type="a2a",
         )
+        # The FA version flags come from the config only through set_attention_backend; without
+        # it TE picks FA3 over FA4 when both are installed.
+        set_attention_backend(config)
         module = TEDotProductAttention(
             config,
             layer_number=1,
@@ -961,13 +973,16 @@ def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
         tokens = sum(lengths) // cp_size
         if qkv_format == "thd":
             cu_seqlens = torch.tensor((0,) + lengths, device="cuda").cumsum(0).int()
-            # Equal but distinct K/V boundaries take the value comparison, not identity.
+            # Equal but distinct K/V boundaries take the value comparison, not identity. TE reads
+            # padded boundaries that are not the unpadded tensor itself as padding between
+            # sequences and then disables FA4, so each pair shares one tensor.
+            cu_seqlens_kv = cu_seqlens.clone()
             packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
                 cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens.clone(),
+                cu_seqlens_kv=cu_seqlens_kv,
                 cu_seqlens_q_padded=cu_seqlens,
-                cu_seqlens_kv_padded=cu_seqlens.clone(),
+                cu_seqlens_kv_padded=cu_seqlens_kv,
                 max_seqlen_q=max(lengths),
                 max_seqlen_kv=max(lengths),
             )
@@ -998,6 +1013,8 @@ def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
         assert len(grads) == 3  # Replay covers dQ, dK, and dV.
         for tensor in list(out.values()) + list(grads.values()):
             assert torch.isfinite(tensor).all()
+        assert te_dpa._attention_backends["use_flash_attention"]
+        assert te_dpa._attention_backends["flash_attention_backend"].major == 4
 
         if qkv_format == "thd":
             cross_attention = PackedSeqParams(
