@@ -251,6 +251,96 @@ def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     assert attention.linear_o_group_proj.device.type == "cpu"
 
 
+def _einsum_grouped_output_projection(x, weight, groups):
+    """Reference: the einsum formulation the copy-free projection replaces."""
+    x4 = x.view(x.size(0), x.size(1), groups, -1)
+    w3 = weight.view(groups, -1, x4.size(-1))
+    y = torch.einsum("...gd,grd->...gr", x4, w3)
+    return y.reshape(*y.shape[:-2], -1)
+
+
+def _grouped_output_projection_and_grads(fn, x, weight, grad_y, groups):
+    x = x.detach().clone().requires_grad_()
+    weight = weight.detach().clone().requires_grad_()
+    y = fn(x, weight, groups)
+    y.backward(grad_y)
+    return y.detach(), x.grad, weight.grad
+
+
+@pytest.mark.parametrize("contiguous_x", [True, False])
+@pytest.mark.parametrize("contiguous_grad", [True, False])
+def test_grouped_output_projection_matches_einsum(contiguous_x, contiguous_grad):
+    """Output and both gradients match the einsum path, including strided inputs."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    _GroupedOutputProjection = dsv4_attention._GroupedOutputProjection
+
+    s, b, groups, d, r = 6, 2, 4, 5, 3
+    gen = torch.Generator().manual_seed(0)
+    if contiguous_x:
+        x = torch.randn(s, b, groups * d, dtype=torch.float64, generator=gen)
+    else:
+        x = torch.randn(b, s, groups * d, dtype=torch.float64, generator=gen).transpose(0, 1)
+    weight = torch.randn(groups * r, d, dtype=torch.float64, generator=gen)
+    if contiguous_grad:
+        grad_y = torch.randn(s, b, groups * r, dtype=torch.float64, generator=gen)
+    else:
+        grad_y = torch.randn(b, s, groups * r, dtype=torch.float64, generator=gen).transpose(0, 1)
+
+    ref = _grouped_output_projection_and_grads(
+        _einsum_grouped_output_projection, x, weight, grad_y, groups
+    )
+    out = _grouped_output_projection_and_grads(
+        _GroupedOutputProjection.apply, x, weight, grad_y, groups
+    )
+    for name, got, want in zip(("y", "grad_x", "grad_w"), out, ref):
+        assert got.shape == want.shape, name
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grouped_output_projection_bf16_cuda_accuracy_and_determinism():
+    """BF16 GEMMs on GPU: as accurate as einsum against FP32, and bit-identical across runs."""
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+
+    _GroupedOutputProjection = dsv4_attention._GroupedOutputProjection
+
+    s, b, groups, d, r = 256, 1, 8, 512, 128
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(s, b, groups * d, device="cuda", generator=gen).to(torch.bfloat16)
+    weight = (torch.randn(groups * r, d, device="cuda", generator=gen) * d**-0.5).to(torch.bfloat16)
+    grad_y = torch.randn(s, b, groups * r, device="cuda", generator=gen).to(torch.bfloat16)
+
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        fp32 = _grouped_output_projection_and_grads(
+            _einsum_grouped_output_projection, x.float(), weight.float(), grad_y.float(), groups
+        )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    ref = _grouped_output_projection_and_grads(
+        _einsum_grouped_output_projection, x, weight, grad_y, groups
+    )
+    out = _grouped_output_projection_and_grads(
+        _GroupedOutputProjection.apply, x, weight, grad_y, groups
+    )
+    again = _grouped_output_projection_and_grads(
+        _GroupedOutputProjection.apply, x, weight, grad_y, groups
+    )
+
+    def rel_err(a, want):
+        return ((a.float() - want).norm() / want.norm()).item()
+
+    for name, got, base, want, rerun in zip(("y", "grad_x", "grad_w"), out, ref, fp32, again):
+        assert torch.equal(got, rerun), f"{name} is not deterministic"
+        assert rel_err(got, want) <= 1.05 * rel_err(base, want) + 1e-6, name
+
+
 def test_config_includes_mtp_ratio_and_derives_dimensions():
     """DSv4 config should account for MTP and derive its shared Q/KV content width."""
     config = _make_config(num_layers=2, mtp_num_layers=1, csa_compress_ratios=[0, 4, 128])
