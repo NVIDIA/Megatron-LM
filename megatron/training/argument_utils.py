@@ -792,12 +792,6 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     return ProfilingConfig(**deepcopy(kwargs))
 
 
-_MISSING = object()
-_CHECKPOINT_ALIASED_FIELDS = frozenset(
-    ("save_optim", "save_rng", "load_optim", "load_rng", "fully_parallel_save", "fully_parallel_load")
-)
-
-
 def checkpoint_config_from_args(args: Namespace) -> CheckpointConfig:
     """Build the checkpoint section from the argparse namespace.
 
@@ -825,7 +819,16 @@ def project_checkpoint_policy(
 
     Used for the argument namespace persisted in a checkpoint, so that saved arguments describe
     the policy that produced the file; neither the live namespace nor the section is written.
+
+    This reverse projection exists for two reasons, and goes when they do: six argument dests
+    differ from their field names (the ``--no-*`` flags and the ``ckpt_fully_parallel_*`` dests),
+    and checkpoints still persist ``args``, which this loader (for checkpoints without a saved
+    section), older trees and Megatron-Bridge's compatibility reader consult.
     """
+    missing = object()
+    aliased_fields = frozenset(
+        ("save_optim", "save_rng", "load_optim", "load_rng", "fully_parallel_save", "fully_parallel_load")
+    )
     unknown = set(overrides) - {item.name for item in fields(CheckpointConfig)}
     if unknown:
         raise TypeError(f"not checkpoint fields: {sorted(unknown)}")
@@ -835,7 +838,7 @@ def project_checkpoint_policy(
     defaults = {item.name: item.default for item in fields(CheckpointConfig)}
     for item in fields(CheckpointConfig):
         value = values[item.name]
-        if item.name in _CHECKPOINT_ALIASED_FIELDS:
+        if item.name in aliased_fields:
             # A namespace built in Python may carry the canonical name; it follows the policy.
             # The CLI spellings are handled below.
             if hasattr(args, item.name):
@@ -863,7 +866,7 @@ def project_checkpoint_policy(
         elif not hasattr(args, name) and value != defaults[name]:
             setattr(projected, alias, value)
     use_dist_ckpt = values["ckpt_format"] != "torch"
-    if getattr(args, "use_dist_ckpt", _MISSING) != use_dist_ckpt:
+    if getattr(args, "use_dist_ckpt", missing) != use_dist_ckpt:
         projected.use_dist_ckpt = use_dist_ckpt
     return projected
 

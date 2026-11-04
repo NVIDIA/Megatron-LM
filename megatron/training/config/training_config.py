@@ -802,10 +802,10 @@ class CheckpointConfig:
     def validate(self) -> None:
         """Checks that need no other section. Raises only; it neither mutates nor warns.
 
-        Run by ``ConfigContainerBase.validate()`` for the training and the inference container,
-        and by ``validate_args`` right after the entry point's defaults are applied, so a CLI run
-        fails at parse time with the same messages. Megatron-Bridge's subclass runs it from its
-        own ``finalize()``, after its Bridge-only checks: this is the one set of checkpoint rules.
+        Run by ``ConfigContainerBase.validate()`` for the training and the inference container
+        (every CLI entry point validates the container it builds before any service starts).
+        Megatron-Bridge's subclass runs it from its own ``finalize()``, after its Bridge-only
+        checks: this is the one set of checkpoint rules.
         """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 

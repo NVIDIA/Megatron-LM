@@ -585,11 +585,6 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
-    # Checkpoint settings are owned by CheckpointConfig: run its checks here, on the arguments as
-    # the entry point defaulted them, so a CLI run fails before any container is built. The
-    # containers run the same checks again, and the cross-section ones, when they are validated.
-    checkpoint_config_from_args(args).validate()
-
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
         warn_rank_0('Please specify --split when using --data-path. Using legacy default value '
@@ -1194,7 +1189,8 @@ def validate_args(args, defaults={}):
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.save is not None and args.save_params_interval is not None:
-        assert not args.overlap_param_gather
+        assert not args.overlap_param_gather, \
+            '--save-params-interval is not supported with --overlap-param-gather'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1644,7 +1640,11 @@ def validate_args(args, defaults={}):
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.
-            assert args.use_dist_ckpt
+            assert args.use_dist_ckpt, (
+                '--use-distributed-optimizer without Gloo process groups requires a distributed '
+                'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
+                'torch format gathers the optimizer state through Gloo.'
+            )
 
             if args.dist_ckpt_optim_fully_reshardable:
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \

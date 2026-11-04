@@ -2788,7 +2788,6 @@ def load_checkpoint(
     ddp_model,
     optimizer,
     opt_param_scheduler,
-    load_arg='load',
     strict=True,
     checkpointing_context=None,
     skip_load_to_model_and_opt=False,
@@ -2831,10 +2830,9 @@ def load_checkpoint(
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     checkpoint_group: Ranks that collectively form one complete checkpoint
         view (default: None, uses the global process group)
-    load_dir: The directory this load reads. Omitted: the run's ``load`` (or the argument
-        ``load_arg`` names). ``None`` clears it, so the pretrained-checkpoint fallback applies
-        (the reference weights of RL). A string names another directory (the distillation
-        teacher's).
+    load_dir: The directory this load reads. Omitted: the run's ``load``. ``None`` clears it, so
+        the pretrained-checkpoint fallback applies (the reference weights of RL). A string names
+        another directory (the distillation teacher's).
     finetune, load_optim, load_rng, ckpt_format: The policy of this load where it differs from
         the run's checkpoint section (a weights-only load of the teacher or of RL's reference
         weights; the pretrained load of the finetune tasks without its RNG state). Everything
@@ -2847,8 +2845,7 @@ def load_checkpoint(
     # Two derivations below may turn the load into a weights-only one; they stay local to this
     # call, and the primary load records the outcome on the train state (``record_finetune``).
     if load_dir is _UNSET:
-        # ``load_arg`` names an argument other than --load (the distillation teacher's directory).
-        load_dir = checkpoint.load if load_arg == 'load' else getattr(args, load_arg)
+        load_dir = checkpoint.load
     finetune = checkpoint.finetune if finetune is None else finetune
     load_optim = checkpoint.load_optim if load_optim is None else load_optim
     load_rng = checkpoint.load_rng if load_rng is None else load_rng

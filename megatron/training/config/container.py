@@ -464,12 +464,17 @@ class PretrainConfigContainer(ConfigContainerBase):
             # Legacy checkpointing uses Gloo process groups to collect the full distributed
             # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
             # the layer-wise path at finalize and save their state separately on each rank.
-            assert checkpoint.use_dist_ckpt
+            assert checkpoint.use_dist_ckpt, (
+                '--use-distributed-optimizer without Gloo process groups requires a distributed '
+                'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
+                'torch format gathers the optimizer state through Gloo.'
+            )
             if checkpoint.dist_ckpt_optim_fully_reshardable:
                 assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
         if ddp.overlap_param_gather and checkpoint.save is not None:
-            assert checkpoint.save_params_interval is None
+            assert checkpoint.save_params_interval is None, \
+                '--save-params-interval is not supported with --overlap-param-gather'
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""

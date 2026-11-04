@@ -202,11 +202,16 @@ def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias
         (["--verify-integrity", "--ckpt-format", "torch"], "only supported with torch_dist"),
     ],
 )
-def test_validate_args_and_the_section_reject_the_same_inputs(argv, match):
+def test_the_section_rejects_what_validate_args_rejected(argv, match):
+    """The checkpoint rules validate_args used to assert belong to CheckpointConfig.validate():
+    validate_args accepts these inputs, the section and the container a CLI run builds reject
+    them with the legacy messages (every entry point validates its container before any service
+    starts)."""
+    args = _validated(*argv)
     with pytest.raises(AssertionError, match=match):
-        _validated(*argv)
+        checkpoint_config_from_args(args).validate()
     with pytest.raises(AssertionError, match=match):
-        checkpoint_config_from_args(_parsed(*argv)).validate()
+        inference_cfg_container_from_args(args, build_model_config=False).validate()
 
 
 def test_validation_accepts_what_validate_args_accepted():
@@ -232,8 +237,9 @@ def test_inference_defaults_apply_before_the_checkpoint_checks():
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
     cfg.validate()
     assert cfg.checkpoint.load_optim is False and cfg.checkpoint.stream_ckpt_dequant is True
+    without_defaults = _validated("--stream-ckpt-dequant", "--load", "/ckpt")
     with pytest.raises(AssertionError, match="requires --no-load-optim"):
-        _validated("--stream-ckpt-dequant", "--load", "/ckpt")
+        inference_cfg_container_from_args(without_defaults, build_model_config=False).validate()
 
 
 @pytest.mark.parametrize("supported", [False, True])
