@@ -3,8 +3,8 @@
 """Model and data parallel groups.
 
 .. warning::
-    **This module is being deprecated.** It holds the process groups for a single, global
-    parallel grid. Megatron-Core is migrating to explicit process-group passing via
+    **The accessors of this module are deprecated.** It holds the process groups for a single,
+    global parallel grid. Megatron-Core is migrating to explicit process-group passing via
     :class:`~megatron.core.process_groups_config.ProcessGroupCollection`.
 
     The group / rank / world-size accessors here read that global grid. A model using an
@@ -21,11 +21,14 @@
       in its own change, not bundled into a fix.
     * ``ProcessGroupCollection.use_mpu_process_groups()`` is **not** a migration target. It is a
       backward-compatibility shim that reads this same global state, so swapping a direct
-      accessor for it preserves the global dependency. Bootstrap code and explicitly commented
-      migration fallbacks may still use it during the transition.
+      accessor for it preserves the global dependency. Bootstrap code may still use it during
+      the transition. A compatibility fallback uses ``resolve_process_groups()`` in Megatron
+      Core, or a ``global_process_group_fallback()`` block outside it.
 
-    ``initialize_model_parallel`` / ``destroy_model_parallel`` / ``is_initialized`` are not
-    deprecated by this migration.
+    Bootstrap, teardown and the registry are not deprecated: ``initialize_model_parallel``,
+    ``build_process_group_collection``, ``destroy_model_parallel``, ``is_initialized``,
+    ``model_parallel_is_initialized``, ``register_process_groups`` and
+    ``get_registered_process_groups``.
 
     See ``docs/developer/parallel-state-deprecation.md``.
 """
@@ -3252,6 +3255,9 @@ def get_pipeline_model_parallel_last_rank():
 def get_pipeline_model_parallel_next_rank():
     """Return the global rank that follows the caller in the pipeline.
 
+    It wraps around: on the last stage, it returns the first stage's rank. The replacement,
+    ``get_pp_next_rank(pg_collection.pp)``, returns None there instead.
+
     Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
     caller-provided pp group; preserve pipeline ordering. See
     docs/developer/parallel-state-deprecation.md for migration details and optional-group
@@ -3271,6 +3277,9 @@ def get_pipeline_model_parallel_next_rank():
 )
 def get_pipeline_model_parallel_prev_rank():
     """Return the global rank that precedes the caller in the pipeline.
+
+    It wraps around: on the first stage, it returns the last stage's rank. The replacement,
+    ``get_pp_prev_rank(pg_collection.pp)``, returns None there instead.
 
     Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
     caller-provided pp group; preserve pipeline ordering. See

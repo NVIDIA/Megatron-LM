@@ -436,8 +436,10 @@ class ProcessGroupCollection:
             It does not construct or select an independent model's parallel grid.
 
             New model components should accept a ``ProcessGroupCollection`` from their caller.
-            Keep this shim at bootstrap boundaries or in explicitly commented migration
-            fallbacks for existing callers. See ``docs/developer/parallel-state-deprecation.md``.
+            Keep this shim at bootstrap boundaries. A fallback for existing callers uses
+            ``resolve_process_groups()`` in Megatron Core, or a
+            ``global_process_group_fallback()`` block outside it. See
+            ``docs/developer/parallel-state-deprecation.md``.
 
         These are the groups registered with parallel_state.register_process_groups(), which
         initialize_model_parallel() calls. Each call returns a new collection; dp_cp_ag and
