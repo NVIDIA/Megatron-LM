@@ -4276,12 +4276,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
             ]
 
+            # Request 4's 11th token is a near-tie of the exponential-race sampler under the
+            # fp32 head (on GB300: 73 at p/q 0.86136 against 35 at 0.86035, a relative margin
+            # of 1.2e-3; every other race of the run has a margin of 9e-3 or more), and the
+            # GPU classes land on different sides of it: Hopper (the dgx_h100 CI) samples 35,
+            # Blackwell 73. Keyed by the compute capability, as the repository keys its other
+            # platform-dependent expectations.
+            hybrid_near_tie_token = 73 if torch.cuda.get_device_capability()[0] >= 10 else 35
             mamba_expected_generated_tokens = [
                 [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
                 [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
                 [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
                 [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, hybrid_near_tie_token, 20, 49, 28, 34, 81],
                 [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
                 [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
