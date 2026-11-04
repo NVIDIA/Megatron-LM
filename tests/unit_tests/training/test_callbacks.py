@@ -34,6 +34,7 @@ class TestCallbackContext:
 
         assert ctx.optimizer is None
         assert ctx.scheduler is None
+        assert ctx.train_state is None
         assert ctx.loss_dict is None
         assert ctx.grad_norm is None
         assert ctx.skipped_iter is None
@@ -43,6 +44,7 @@ class TestCallbackContext:
         """Optional fields are accessible when explicitly provided."""
         mock_optimizer = Mock()
         mock_scheduler = Mock()
+        mock_train_state = Mock()
         mock_loss_dict = {"loss": Mock()}
 
         ctx = CallbackContext(
@@ -50,6 +52,7 @@ class TestCallbackContext:
             user_state={},
             optimizer=mock_optimizer,
             scheduler=mock_scheduler,
+            train_state=mock_train_state,
             loss_dict=mock_loss_dict,
             grad_norm=1.5,
             skipped_iter=False,
@@ -57,6 +60,7 @@ class TestCallbackContext:
 
         assert ctx.optimizer is mock_optimizer
         assert ctx.scheduler is mock_scheduler
+        assert ctx.train_state is mock_train_state
         assert ctx.loss_dict is mock_loss_dict
         assert ctx.grad_norm == 1.5
         assert ctx.skipped_iter is False
