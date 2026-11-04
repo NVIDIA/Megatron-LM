@@ -43,8 +43,7 @@ def clip_qk(model, log_max_only=False) -> float:
                     if not log_max_only:
                         transformer_layer.self_attention.clip_qk()
                     else:
-                        transformer_layer.self_attention.core_attention.current_max_attn_logits.fill_(
-                            float("-inf")
-                        )
+                        core_attention = transformer_layer.self_attention.core_attention
+                        core_attention.current_max_attn_logits.fill_(float("-inf"))
 
     return log_max_attention_logit
