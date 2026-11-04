@@ -149,6 +149,7 @@ class KimiDeltaAttention(_GDNBase):
                         skip_bias_add=False,
                         skip_weight_param_allocation=False,
                         parallel_mode="duplicated",
+                        tp_group=self.pg_collection.tp,
                         name=f"{name}.{a_name}" if name is not None else None,
                     ),
                 )
