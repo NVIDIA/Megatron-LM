@@ -6,7 +6,10 @@ from itertools import combinations, product
 
 import pytest
 
-from tests.unit_tests.ssm.gdn_test_matrix import POST_FUSION_DISTRIBUTED_CASES
+from tests.unit_tests.ssm.gdn_test_matrix import (
+    POST_FUSION_DISTRIBUTED_CASES,
+    POST_FUSION_DISTRIBUTED_VARIANT_CASES,
+)
 from tests.unit_tests.ssm.test_gdn_gated_output_norm_fusion import (
     _check_post_fusion_distributed_layout,
 )
@@ -54,4 +57,35 @@ def test_post_fusion_distributed_layout(
         pre_fusion=pre_fusion,
         recompute=recompute,
         value_heads=value_heads,
+    )
+
+
+@pytest.mark.parametrize(
+    "variant,linear_cp_mode,tp,cp,sequence_parallel,batch,packed,pre_fusion,recompute,value_heads",
+    POST_FUSION_DISTRIBUTED_VARIANT_CASES,
+)
+def test_post_fusion_distributed_layout_variants(
+    variant,
+    linear_cp_mode,
+    tp,
+    cp,
+    sequence_parallel,
+    batch,
+    packed,
+    pre_fusion,
+    recompute,
+    value_heads,
+):
+    """Cover KDA's sigmoid gate and packed chunkwise CP through the same distributed path."""
+    _check_post_fusion_distributed_layout(
+        tp=tp,
+        cp=cp,
+        sequence_parallel=sequence_parallel,
+        batch=batch,
+        packed=packed,
+        pre_fusion=pre_fusion,
+        recompute=recompute,
+        value_heads=value_heads,
+        variant=variant,
+        linear_cp_mode=linear_cp_mode,
     )
