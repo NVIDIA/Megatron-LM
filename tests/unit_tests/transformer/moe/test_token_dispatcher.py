@@ -1066,6 +1066,7 @@ def test_alltoall_combine_postprocess_releases_router_probs():
     dispatcher.config = SimpleNamespace(moe_permute_fusion=False)
     dispatcher.drop_and_pad = False
     dispatcher.batch_invariant_inverse_permutation_mapping = None
+    dispatcher.ep_size = 1
     dispatcher.shared_experts = None
     num_tokens, hidden, topk, num_experts = 3, 4, 2, 2
     dispatcher.hidden_shape = torch.Size([num_tokens, 1, hidden])
