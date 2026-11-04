@@ -2611,20 +2611,20 @@ class TestTEGroupedMLP:
     CLAMP_HIDDEN, CLAMP_FFN, CLAMP_EXPERTS, CLAMP_PER_EXPERT = 128, 256, 2, 32
 
     @staticmethod
-    def _skip_unless_clamped_fusion_available(tanh_clamp_scale):
+    def _skip_unless_clamped_fusion_available(request, tanh_clamp_scale):
         if torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("Fused cuDSL grouped MLP requires SM100+")
-        if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-            pytest.skip("NVTE_CUTEDSL_FUSED_GROUPED_MLP is unset")
         try:
             from transformer_engine.pytorch.ops.fused import grouped_mlp as te_grouped_mlp
         except ImportError:
             pytest.skip("TE fused grouped MLP module not available")
         fused_cls = getattr(te_grouped_mlp, "GroupedMLP_CuTeGEMMUnary", None)
-        if fused_cls is None or not fused_cls.is_supported():
-            pytest.skip("TE fused unary grouped MLP unsupported here")
+        if fused_cls is None:
+            pytest.skip("Installed TE has no fused unary grouped MLP")
         if tanh_clamp_scale is not None and not experts_module._te_supports_scaled_tanh_srelu():
             pytest.skip("Installed TE has no ScaledTanhSReLU")
+        # A successful capability probe does not restore an import-time fusion registration.
+        request.getfixturevalue("require_te_fused_srelu_mlp")
 
     def _build_clamp_experts(self, tanh_clamp_scale, use_op_fuser):
         tf_config = TransformerConfig(
@@ -2702,9 +2702,9 @@ class TestTEGroupedMLP:
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("tanh_clamp_scale", [None, 2.0])
-    def test_gpu_fused_clamp_matches_unfused_reference(self, tanh_clamp_scale):
+    def test_gpu_fused_clamp_matches_unfused_reference(self, request, tanh_clamp_scale):
         """Fused cuDNN epilogue vs MCore's unfused path: forward and both gradients, MXFP8."""
-        self._skip_unless_clamped_fusion_available(tanh_clamp_scale)
+        self._skip_unless_clamped_fusion_available(request, tanh_clamp_scale)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
 
@@ -2736,10 +2736,10 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    def test_gpu_clamp_scale_reaches_the_kernel(self):
+    def test_gpu_clamp_scale_reaches_the_kernel(self, request):
         """Saturated, the output scales as s^2: s=8 vs s=1 gives ~64x. An ignored scale gives
         ~1x and a scale applied without the square ~8x."""
-        self._skip_unless_clamped_fusion_available(2.0)
+        self._skip_unless_clamped_fusion_available(request, 2.0)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
 
@@ -2755,6 +2755,8 @@ class TestTEGroupedMLP:
             return out.float().abs().max()
 
         ratio = (peak(tight) / peak(loose).clamp_min(1e-6)).item()
+        self._assert_fused_op_selected(loose)
+        self._assert_fused_op_selected(tight)
         assert 16.0 < ratio < 256.0, ratio
 
 
