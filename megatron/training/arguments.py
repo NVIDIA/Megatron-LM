@@ -4303,22 +4303,19 @@ def _add_distributed_args(parser):
         help='Megatron-FSDP implementation version. Defaults to 1.',
     )
     group.add_argument(
-        '--layer-wise-param-layout',
+        '--emerging-optimizer-grad-collective',
         type=str,
-        default=None,
-        choices=['padded', 'compact'],
-        help='Data-parallel layout of the Muon-managed matrices when '
-        '--use-distributed-optimizer selects the layer-wise distributed '
-        'optimizer. padded (default): shard-aligned padded buffers with '
-        'gradient reduce-scatter and fixed-size parameter all-gather. '
-        'compact: unpadded buffers with gradient all-reduce, whole-matrix '
-        'owners and uneven parameter all-gather. In both, the other '
-        'parameters (embeddings, biases, norms) are sharded by a separate '
-        'distributed optimizer, and torch_dist checkpoints load with either '
-        'layout. The layouts reduce gradients in different orders, so loss '
-        'curves need not match bit-for-bit across layouts. The legacy layout '
-        '(--no-use-layer-wise-param-layout) was removed; see '
-        'docs/user-guide/features/dist_optimizer.md.',
+        default='reduce-scatter',
+        choices=['reduce-scatter', 'all-reduce'],
+        help='Data-parallel gradient collective for the parameters that an '
+        'emerging optimizer with --use-distributed-optimizer (e.g. Muon) '
+        'updates whole on one rank. reduce-scatter (default): those tensors '
+        'stay whole inside padded, equal-size shards. all-reduce: no padding, '
+        'twice the gradient traffic and an uneven all-gather of whole tensors; '
+        'needed for blockwise FP8 params and Muon chunked optimizer-state '
+        'offload. Other parameters always use reduce-scatter, and torch_dist '
+        'checkpoints load with either. The legacy layer-wise layout was '
+        'removed; see docs/user-guide/features/dist_optimizer.md.',
     )
     group.add_argument(
         '--use-nccl-ub',

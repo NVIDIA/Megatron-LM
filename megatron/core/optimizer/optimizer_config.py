@@ -402,8 +402,19 @@ class OptimizerConfig:
     An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
     :func:`resolve_layer_wise_distributed_optimizer`); the training arguments layer sets it and
     resets ``use_distributed_optimizer`` to False so that the standard distributed-optimizer
-    path is not triggered. The data-parallel layout of the layer-wise optimizer is
-    ``DistributedDataParallelConfig.layer_wise_param_layout``."""
+    path is not triggered."""
+
+    emerging_optimizer_grad_collective: str = "reduce-scatter"
+    """Data-parallel gradient collective for the parameters that an emerging optimizer with
+    ``use_distributed_optimizer`` (e.g. Muon) updates whole on one rank.
+
+    - ``"reduce-scatter"``: each tensor stays whole inside one rank's shard of a padded buffer;
+      gradients are reduce-scattered and the equal-size shards all-gathered.
+    - ``"all-reduce"``: no padding; gradients are all-reduced and every owner all-gathers its
+      whole tensors (uneven sizes), which sends twice the gradient bytes.
+
+    Other parameters always use reduce-scatter. Both store the same optimizer state, so a
+    ``torch_dist`` checkpoint saved with one loads with the other."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -549,8 +560,6 @@ class OptimizerConfig:
                 )
 
             if self.optimizer == 'muon':
-                # LayerWiseDistributedOptimizer also requires the compact layout
-                # (DistributedDataParallelConfig.layer_wise_param_layout='compact').
                 assert (
                     self.use_layer_wise_distributed_optimizer or self.use_distributed_optimizer
                 ), "Muon optimizer state offload requires LayerWiseDistributedOptimizer"
@@ -597,6 +606,24 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.emerging_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
+            raise ValueError(
+                "emerging_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
+                f"got {self.emerging_optimizer_grad_collective!r}."
+            )
+        _, will_be_layer_wise = resolve_layer_wise_distributed_optimizer(
+            self.optimizer,
+            self.use_distributed_optimizer,
+            self.use_layer_wise_distributed_optimizer,
+        )
+        if self.emerging_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
+            raise ValueError(
+                "emerging_optimizer_grad_collective='all-reduce' applies to emerging optimizers "
+                "(e.g. Muon) with use_distributed_optimizer=True; got "
+                f"optimizer={self.optimizer!r}, "
+                f"use_distributed_optimizer={self.use_distributed_optimizer}."
+            )
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

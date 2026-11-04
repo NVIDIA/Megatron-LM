@@ -89,18 +89,18 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
 
 
 @pytest.mark.parametrize(
-    "flags, layout",
+    "flags, collective",
     [
-        ([], None),
-        (["--layer-wise-param-layout", "padded"], "padded"),
-        (["--layer-wise-param-layout", "compact"], "compact"),
+        ([], "reduce-scatter"),
+        (["--emerging-optimizer-grad-collective", "reduce-scatter"], "reduce-scatter"),
+        (["--emerging-optimizer-grad-collective", "all-reduce"], "all-reduce"),
     ],
 )
-def test_layer_wise_layout_cli_defaults_to_padded(flags, layout):
+def test_emerging_optimizer_grad_collective_cli_defaults_to_reduce_scatter(flags, collective):
     parser = add_megatron_arguments(ArgumentParser())
     args = parser.parse_args(flags)
-    kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
-    assert kwargs["layer_wise_param_layout"] == layout
+    kwargs = _default_config_from_args(OptimizerConfig, args, return_instance=False)
+    assert kwargs["emerging_optimizer_grad_collective"] == collective
 
 
 @pytest.mark.parametrize("count", [2, 3])

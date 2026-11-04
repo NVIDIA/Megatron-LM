@@ -102,7 +102,7 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         clip_grad=0.0,
         global_batch_size=4,
         tensor_parallel_num_weight_shards=num_weight_shards,
-        layer_wise_param_layout="padded",
+        emerging_optimizer_grad_collective="reduce-scatter",
         untie_embeddings_and_output_weights=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -137,7 +137,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         return matches[0]
 
     def _on_model_built(self, model_chunks, optimizer, args):
-        assert args.layer_wise_param_layout == "padded"
+        assert args.emerging_optimizer_grad_collective == "reduce-scatter"
         assert args.expert_gtp_weight_remat_size == 1
         gtp_enabled = args.gtp_weight_remat_size > 1
         native_mxfp8 = args.fp8_param_gather
@@ -546,14 +546,14 @@ class TestGTPFp8ParamGather:
                 tp_size=1,
                 recipe="mxfp8",
                 fp8_param_gather=True,
-                layer_wise_param_layout="compact",
+                emerging_optimizer_grad_collective="all-reduce",
                 **common,
             )
             loss_padded = harness._run_test_helper(
                 tp_size=1,
                 recipe="mxfp8",
                 fp8_param_gather=True,
-                layer_wise_param_layout="padded",
+                emerging_optimizer_grad_collective="reduce-scatter",
                 **common,
             )
 
@@ -634,7 +634,7 @@ class TestGTPFp8ParamGather:
                 lr=1e-3,
                 clip_grad=0.0,
                 tensor_parallel_num_weight_shards=1,
-                layer_wise_param_layout="padded",
+                emerging_optimizer_grad_collective="reduce-scatter",
                 untie_embeddings_and_output_weights=True,
                 hidden_dropout=0.0,
                 attention_dropout=0.0,

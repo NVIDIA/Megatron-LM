@@ -151,9 +151,7 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         model.config = SimpleNamespace(num_attention_heads=1, num_query_groups=1, kv_channels=4)
         # A model wrapped for the compact LayerWise layout: every weight is a LayerWise matrix.
         model.ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True,
-            layer_wise_param_layout='compact',
-            overlap_param_gather=False,
+            use_distributed_optimizer=True, overlap_param_gather=False
         )
         model.weights = torch.nn.ParameterList(
             [_parameter(device='cuda') for _ in range(2 * torch.distributed.get_world_size())]
@@ -166,6 +164,7 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
             lr=0.01,
             bf16=True,
             use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective='all-reduce',
             muon_split_qkv=False,
             clip_grad=0.0,
         )

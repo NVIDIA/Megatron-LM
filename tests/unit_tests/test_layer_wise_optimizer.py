@@ -329,18 +329,20 @@ class TestLayerWiseOptimizer:
 
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
+        grad_collective = (
+            'all-reduce' if use_layer_wise and use_param_layout == 'compact' else 'reduce-scatter'
+        )
 
         if use_layer_wise:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig(
-                layer_wise_param_layout='compact' if use_param_layout == 'compact' else None
-            )
+            ddp_config = DistributedDataParallelConfig()
             model = wrap_model_chunks_with_ddp(
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
                 ddp_config,
                 use_layer_wise_distributed_optimizer=use_layer_wise,
+                emerging_optimizer_grad_collective=grad_collective,
             )[0]
         else:
             ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
@@ -364,6 +366,7 @@ class TestLayerWiseOptimizer:
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
             optimizer_state_offload_fraction=optimizer_state_offload_fraction,
+            emerging_optimizer_grad_collective=grad_collective,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -422,18 +425,19 @@ class TestLayerWiseOptimizer:
 
         from megatron.training.training import wrap_model_chunks_with_ddp
 
+        grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
         ddp_config = DistributedDataParallelConfig(
             overlap_param_gather=overlap_param_gather,
             overlap_grad_reduce=overlap_grad_reduce,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
             bucket_size=bucket_size,
-            layer_wise_param_layout='compact' if use_param_layout == 'compact' else None,
         )
         model = wrap_model_chunks_with_ddp(
             [model],
             TransformerConfig(num_attention_heads=1, num_layers=1),
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective=grad_collective,
         )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
@@ -453,6 +457,7 @@ class TestLayerWiseOptimizer:
             overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective=grad_collective,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -669,13 +674,13 @@ class TestLayerWiseOptimizer:
 
         model = SimpleModel().bfloat16().cuda()
         model.requires_grad_(False)
+        grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
         model = wrap_model_chunks_with_ddp(
             [model],
             TransformerConfig(num_attention_heads=1, num_layers=1),
-            DistributedDataParallelConfig(
-                layer_wise_param_layout='compact' if use_param_layout == 'compact' else None
-            ),
+            DistributedDataParallelConfig(),
             use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective=grad_collective,
         )[0]
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         optimizer = get_megatron_optimizer(
@@ -685,6 +690,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 muon_tp_mode="duplicated",
                 use_layer_wise_distributed_optimizer=True,
+                emerging_optimizer_grad_collective=grad_collective,
             ),
             [model],
             pg_collection=pg_collection,

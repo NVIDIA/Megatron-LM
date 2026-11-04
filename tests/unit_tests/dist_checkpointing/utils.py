@@ -281,7 +281,9 @@ def setup_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # use_param_layout selects the LayerWise layout: 'compact', or the padded layout otherwise.
+    # use_param_layout='compact' selects the all-reduce grad collective (the compact LayerWise
+    # layout); anything else the reduce-scatter one (the padded layout).
+    grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
     ddp_use_dist_opt = dist_opt
     ddp_use_layer_wise = use_layer_wise
 
@@ -316,8 +318,7 @@ def setup_model_and_optimizer(
         mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
-        # use_param_layout='compact' selects the compact LayerWise layout; True the padded one.
-        mock_args.layer_wise_param_layout = 'compact' if use_param_layout == 'compact' else None
+        mock_args.emerging_optimizer_grad_collective = grad_collective
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         model = get_model(
@@ -340,6 +341,7 @@ def setup_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        emerging_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
         chunked_optimizer_state_offload=chunked_optimizer_state_offload,
         optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
@@ -447,6 +449,7 @@ def setup_moe_model_and_optimizer(
         use_layer_wise = True
 
     # See setup_model_and_optimizer for the use_param_layout semantics.
+    grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
     ddp_use_dist_opt = dist_opt
     ddp_use_layer_wise = use_layer_wise
 
@@ -455,8 +458,7 @@ def setup_moe_model_and_optimizer(
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
-        # use_param_layout='compact' selects the compact LayerWise layout; True the padded one.
-        mock_args.layer_wise_param_layout = 'compact' if use_param_layout == 'compact' else None
+        mock_args.emerging_optimizer_grad_collective = grad_collective
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         model = get_model(
@@ -480,6 +482,7 @@ def setup_moe_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        emerging_optimizer_grad_collective=grad_collective,
         optimizer=optimizer,
     )
 

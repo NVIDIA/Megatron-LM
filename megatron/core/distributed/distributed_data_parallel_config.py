@@ -11,26 +11,6 @@ from ..utils import is_torch_min_version
 # buffer than the last. Both data-parallel axes take a value from this set.
 _SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
 
-# Data-parallel layouts for the parameters owned by LayerWiseDistributedOptimizer. See
-# DistributedDataParallelConfig.layer_wise_param_layout.
-LAYER_WISE_PARAM_LAYOUTS = ("padded", "compact")
-
-
-def resolve_layer_wise_param_layout(layer_wise_param_layout: Optional[str] = None) -> str:
-    """Return the LayerWise layout named by ``layer_wise_param_layout``; ``None`` is ``"padded"``.
-
-    Raises:
-        ValueError: If the layout is not one of ``LAYER_WISE_PARAM_LAYOUTS``.
-    """
-    if layer_wise_param_layout is None:
-        return "padded"
-    if layer_wise_param_layout not in LAYER_WISE_PARAM_LAYOUTS:
-        raise ValueError(
-            f"layer_wise_param_layout must be one of {list(LAYER_WISE_PARAM_LAYOUTS)}, "
-            f"got {layer_wise_param_layout!r}."
-        )
-    return layer_wise_param_layout
-
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -58,24 +38,6 @@ class DistributedDataParallelConfig:
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
-    """
-
-    layer_wise_param_layout: Optional[str] = None
-    """Data-parallel layout of the parameters that LayerWiseDistributedOptimizer owns (the
-       Muon-managed matrices). Only read when the model is wrapped for the layer-wise
-       distributed optimizer. ``None`` means ``"padded"``.
-
-       - ``"padded"``: each matrix stays whole inside one rank's shard of a padded,
-         shard-aligned buffer. Gradients are reduce-scattered and parameters are all-gathered
-         from the parameter buffer. Other parameters are sharded byte-wise by a separate
-         DistributedOptimizer.
-       - ``"compact"``: LayerWise buffers are unpadded and not sharded. Gradients are
-         all-reduced, every matrix has one owner rank chosen identically on all ranks, and
-         owners all-gather the updated matrices with uneven sizes. Other parameters are still
-         sharded byte-wise by a separate DistributedOptimizer.
-
-       The two layouts store the same optimizer state, so a ``torch_dist`` checkpoint saved
-       with one loads with the other.
     """
 
     check_for_nan_in_grad: bool = False
@@ -376,12 +338,13 @@ class DistributedDataParallelConfig:
 
         - No gather is needed because every DP rank runs the same optimizer update.
         - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens for the ``"compact"`` layout when parameter-gather overlap and MXFP8
-          grad-buffer reuse are disabled. Each rank updates only its assigned parameters,
-          then the optimizer calls ``allgather_params()`` synchronously after the step.
+          happens for the compact layout (``emerging_optimizer_grad_collective="all-reduce"``)
+          when parameter-gather overlap and MXFP8 grad-buffer reuse are disabled. Each rank
+          updates only its assigned parameters, then the optimizer calls ``allgather_params()``
+          synchronously after the step.
 
-        Under the ``"compact"`` layout, DDP evaluates this property on the per-buffer config of
-        the LayerWise buffers, which has ``use_distributed_optimizer=False``.
+        Under the compact layout, DDP evaluates this property on the per-buffer config of the
+        LayerWise buffers, which has ``use_distributed_optimizer=False``.
         """
         if self.use_distributed_optimizer:
             return True
@@ -412,14 +375,6 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
-        if (
-            self.layer_wise_param_layout is not None
-            and self.layer_wise_param_layout not in LAYER_WISE_PARAM_LAYOUTS
-        ):
-            raise ValueError(
-                f"layer_wise_param_layout must be one of {list(LAYER_WISE_PARAM_LAYOUTS)}, "
-                f"got {self.layer_wise_param_layout!r}."
-            )
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

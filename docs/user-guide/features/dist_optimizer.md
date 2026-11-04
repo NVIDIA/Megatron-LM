@@ -64,16 +64,16 @@ The following figures show the sharding scheme and the main steps of the paramet
 
 Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer muon --use-distributed-optimizer`, Megatron uses the layer-wise distributed optimizer: one data-parallel rank updates each Muon-managed matrix and then all-gathers it to the other ranks. A regular distributed optimizer next to it shards the remaining parameters (embeddings, output layer, biases, norms) as described above.
 
-`--layer-wise-param-layout` selects how the Muon-managed matrices are laid out across data-parallel ranks:
+`--emerging-optimizer-grad-collective` selects how the gradients of these matrices are reduced across data-parallel ranks, and with it how the matrices are laid out:
 
-| Layout | Gradient reduction | Parameter gather | Buffers |
-| ------ | ------ | ------ | ------ |
-| `padded` (default) | reduce-scatter | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
-| `compact` | all-reduce | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. |
+| `--emerging-optimizer-grad-collective` | Parameter gather | Buffers |
+| ------ | ------ | ------ |
+| `reduce-scatter` (default) | fixed-size all-gather from the parameter buffer | Each matrix lies whole inside one rank's shard; shards are padded to equal size. |
+| `all-reduce` | all-gather of whole matrices with uneven sizes | No padding; every rank chooses the same owner rank for each matrix. Twice the gradient traffic. |
 
-Both layouts store the same optimizer state, so a `torch_dist` checkpoint saved with one layout loads with the other. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
+Both store the same optimizer state, so a `torch_dist` checkpoint saved with one collective loads with the other. The other parameters always use reduce-scatter. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
 
-With `--fp8-param-gather`, the padded layout gathers the FP8 bytes of each shard and supports MXFP8 only together with `--reuse-grad-buf-for-mxfp8-param-ag`, which stages BF16 values and requantizes them on every rank. Use the compact layout for blockwise FP8 parameters; it gathers BF16 values and requantizes them on every rank.
+With `--fp8-param-gather`, `reduce-scatter` gathers the FP8 bytes of each shard and supports MXFP8 only together with `--reuse-grad-buf-for-mxfp8-param-ag`, which stages BF16 values and requantizes them on every rank. Use `all-reduce` for blockwise FP8 parameters; it gathers BF16 values and requantizes them on every rank.
 
 ### Checkpoints of the removed legacy layout
 

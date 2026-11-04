@@ -3554,6 +3554,7 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
+    emerging_optimizer_grad_collective="reduce-scatter",
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -3567,9 +3568,10 @@ def wrap_model_chunks_with_ddp(
     For standard DDP, :func:`configure_ddp_for_layer_wise_optimizer` decides the layout
     (mutating ``ddp_config`` in place):
 
-    - ``use_layer_wise_distributed_optimizer=True`` with the ``"padded"`` or ``"compact"``
-      LayerWise layout forces ``ddp_config.use_distributed_optimizer=True`` and computes
-      per-chunk layouts via :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`.
+    - ``use_layer_wise_distributed_optimizer=True`` forces
+      ``ddp_config.use_distributed_optimizer=True`` and computes per-chunk layouts via
+      :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout` for
+      ``emerging_optimizer_grad_collective``.
     - Non-layerwise with ``ddp_config.use_distributed_optimizer=True`` computes per-chunk
       byte-level layouts via :meth:`DistributedOptimizer.compute_full_param_layout`.
     - Otherwise no layouts are computed.
@@ -3584,6 +3586,7 @@ def wrap_model_chunks_with_ddp(
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
             ``use_layer_wise_distributed_optimizer=True``.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        emerging_optimizer_grad_collective: ``OptimizerConfig.emerging_optimizer_grad_collective``.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -3610,6 +3613,7 @@ def wrap_model_chunks_with_ddp(
             model_chunks,
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
         )
         if compute_layout is not None:
             layout_pgs = (
@@ -3960,6 +3964,9 @@ def get_model(
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
+                emerging_optimizer_grad_collective=getattr(
+                    args, 'emerging_optimizer_grad_collective', 'reduce-scatter'
+                ),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
@@ -4137,6 +4144,7 @@ def setup_model_and_optimizer(
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+                emerging_optimizer_grad_collective=cfg.optimizer.emerging_optimizer_grad_collective,
             )
         else:
             assert (

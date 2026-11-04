@@ -39,7 +39,7 @@ prioritizes bundles that actually include a separate master before state-only bu
 precision-aware FusedAdam can own a separate master for native FP32 DistributedOptimizer shards
 too.
 Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with the compact
-`LayerWiseDistributedOptimizer` layout (`--layer-wise-param-layout compact`); BF16 and FP8
+`LayerWiseDistributedOptimizer` layout (`--emerging-optimizer-grad-collective all-reduce`); BF16 and FP8
 parameter gather are supported. Full-iteration and
 optimizer CUDA graphs are not supported while the fraction is nonzero. When optimizer state is
 saved, async distributed-checkpoint save is rejected: its background writer can retain references
