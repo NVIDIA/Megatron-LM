@@ -81,8 +81,7 @@ _DV = 128
 # Fewer warps do not help: with ten warps two sub-partitions hold three warps
 # and ptxas caps every thread at 168 registers.
 _THREADS = 384
-_CH_REGISTERS = 232
-_TK_REGISTERS = 232
+_CM_REGISTERS = 232
 _OTHER_REGISTERS = 40
 _CH_WARPS = (0, 1, 2, 3)
 _TK_WARPS = (4, 5, 6, 7)
@@ -722,47 +721,11 @@ class FusedKdaBwdKernel:
         chunk_base = chunk_offsets[sequence]
         num_chunks = chunk_offsets[sequence + 1] - chunk_base
 
-        if warp < 4:
-            cute.arch.setmaxregister_increase(_CH_REGISTERS)
-            self.run_ch(
-                tidx,
-                warp,
-                part,
-                head,
-                sequence,
-                seq_start,
-                seq_len,
-                chunk_base,
-                num_chunks,
-                smem,
-                edges,
-                ring_full,
-                ring_empty,
-                tmem,
-                s_beta,
-                s_dbeta,
-                s_xchg,
-                s_suffix,
-                q,
-                k,
-                gc,
-                dht,
-                dq,
-                dk,
-                dg,
-                dh0,
-                debug_out,
-                trace_out,
-                scale,
-                canonical.token_direct,
-                canonical.square_direct,
-                canonical.state_direct,
-                mma_sq_kk,
-            )
-        elif warp < 8:
-            cute.arch.setmaxregister_increase(_TK_REGISTERS)
-            self.run_tk(
-                tidx - 128,
+        if warp < 8:
+            cute.arch.setmaxregister_increase(_CM_REGISTERS)
+            self.run_cm(
+                warp // 4,
+                tidx % 128,
                 warp,
                 part,
                 head,
@@ -790,6 +753,7 @@ class FusedKdaBwdKernel:
                 dv,
                 dg,
                 dbeta,
+                dh0,
                 debug_out,
                 trace_out,
                 scale,
@@ -859,7 +823,7 @@ class FusedKdaBwdKernel:
         cute.arch.mbarrier_wait(edges + edge, iteration & 1)
 
     @cute.jit
-    def _arrive(self, edges, edge: cutlass.Constexpr, barrier_id: cutlass.Constexpr, local_tidx):
+    def _arrive(self, edges, edge: cutlass.Constexpr, barrier_id, local_tidx):
         """All warpgroup threads publish; one elected thread arrives."""
         cute.arch.fence_view_async_shared()
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
@@ -867,12 +831,14 @@ class FusedKdaBwdKernel:
             cute.arch.mbarrier_arrive(edges + edge)
 
     @cute.jit
-    def _stamp(self, trace, role: cutlass.Constexpr, slot: cutlass.Constexpr, iteration):
-        """Record %globaltimer for CTA 0, first thread of ``role``, first 8 chunks."""
+    def _stamp(self, trace, role, slot: cutlass.Constexpr, iteration):
+        """Record %globaltimer for CTA 0, first thread of ``role``, first 8 chunks.
+
+        Roles: 0 CH and 1 TK (first threads 0 and 128), 2 MMA (256), 3 TMA (288)."""
         if cutlass.const_expr(self.trace):
             tidx, _, _ = cute.arch.thread_idx()
             block, _, _ = cute.arch.block_idx()
-            if block == 0 and tidx == (0, 128, 256, 288)[role] and iteration < 8:
+            if block == 0 and tidx == role * 128 - (role // 3) * 96 and iteration < 8:
                 trace[role, iteration, slot] = _globaltimer()
 
     @cute.jit
@@ -1302,8 +1268,9 @@ class FusedKdaBwdKernel:
     # ----------------------------------------------------------------- TK
 
     @cute.jit
-    def run_tk(
+    def run_cm(
         self,
+        half,
         ttidx,
         warp,
         part,
@@ -1332,6 +1299,7 @@ class FusedKdaBwdKernel:
         dv,
         dg,
         dbeta,
+        dh0,
         debug_out,
         trace,
         scale,
@@ -1341,47 +1309,12 @@ class FusedKdaBwdKernel:
         mma_x,
         mma_sq_kk,
     ):
-        """Token-major warpgroup (value side, squares, dv/dbeta) plus the
-        channel-major work for tokens 32..63 (``half=1``)."""
-        s_do = _mn_view(_view(smem.do, l_token))
-        s_v = _mn_view(_view(smem.v, l_token))
-        s_t21 = _mn_view(_view(smem.t21, l_token))
-        s_kb = _mn_view(_view(smem.kb, l_token))
-        s_aqk = _mn_view(_view(smem.aqk, l_square))
-        s_akk = _mn_view(_view(smem.akk, l_square))
-        s_sq = _mn_view(_view(smem.sq, l_square))
-        slot_a = self._acc(tmem, tmem_offset("slot_a"), mma_x, (_BT, _DV))
-        slot_b = self._acc(tmem, tmem_offset("slot_b"), mma_x, (_BT, _DV))
-        sq_dakk = self._acc(tmem, tmem_offset("dk_minus"), mma_sq_kk, (_BT, _BT))
-        tok_copy, tok_a, tok_crd = self._token_tile_copy(slot_a, ttidx, (_BT, _DV))
-        _, tok_b, _ = self._token_tile_copy(slot_b, ttidx, (_BT, _DV))
-        sq_copy, sq_src_dakk, sq_crd = self._token_tile_copy(sq_dakk, ttidx, (_BT, _BT))
-        regs = cute.make_rmem_tensor_like(tok_crd, self.acc_dtype)
-        sregs = cute.make_rmem_tensor_like(sq_crd, self.acc_dtype)
-        sq_out, t_sq_out, w_sq = self._square_stmatrix(sq_copy, sregs, ttidx, smem.sq, l_square)
-        # Vectorized shared access in the TMEM-load fragment layout (as GDR):
-        # stmatrix for register -> shared, 32-bit LDS for shared -> register.
-        staged_token = self._plan.canonical_staged.token_direct
-        r_out = cute.make_rmem_tensor_like(regs, self.io_dtype)
-        tiled_r2s = cute.make_tiled_copy_D(
-            cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices=4, transpose=False), self.io_dtype
-            ),
-            tok_copy,
-        )
-        thr_r2s = tiled_r2s.get_slice(ttidx)
-        t_r_out = tiled_r2s.retile(r_out)
-        w_v = thr_r2s.partition_D(_mn_view(_view(smem.v, staged_token)))
-        w_t21 = thr_r2s.partition_D(_mn_view(_view(smem.t21, staged_token)))
-        w_kb = thr_r2s.partition_D(_mn_view(_view(smem.kb, staged_token)))
-        r_in = cute.make_rmem_tensor_like(regs, self.io_dtype)
-        tiled_s2r = cute.make_tiled_copy_D(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.io_dtype, num_bits_per_copy=32),
-            tok_copy,
-        )
-        thr_s2r = tiled_s2r.get_slice(ttidx)
-        t_r_in = tiled_s2r.retile(r_in)
-        rd_v = thr_s2r.partition_S(_mn_view(_view(smem.v, staged_token)))
+        """Both consumer warpgroups: channel-major work for the tokens of
+        ``half`` (CH: 0..31, TK: 32..63), plus the token-major value side,
+        squares and dv/dbeta on TK (``half == 1``) and dh0 and the dL square on
+        CH.  The channel-major code exists once, for a runtime ``half``, so the
+        two warpgroups share its instructions."""
+        bar = _BAR_CH + half
         # gate, two scratch columns, dbeta partials, upper/lower anchors
         cm = (
             cute.make_rmem_tensor((32,), cutlass.Float32),
@@ -1393,9 +1326,11 @@ class FusedKdaBwdKernel:
             cute.make_rmem_tensor((32,), cutlass.Float32),
         )
         lane_base = cutlass.Int32(tmem.toint()) + ((warp % 4) * 32 << 16)
-        # Rows owned by this thread in the Ld16x256b layout of an M=64 tile.
-        row0 = (ttidx // 32) * 16 + (ttidx % 32) // 4
-
+        if cutlass.const_expr(not self.tape):
+            if half == 0 and num_chunks == 0 and part == 0:
+                # An empty sequence passes its final-state gradient through.
+                for c in cutlass.range_constexpr(_DV):
+                    dh0[sequence, head, ttidx, c] = dht[sequence, head, ttidx, c]
         for j in cutlass.range((num_chunks - part + self._ways - 1) // self._ways):
             # This CTA's chunks; j indexes them for the one-shot edges.
             it = part + j * self._ways
@@ -1403,30 +1338,29 @@ class FusedKdaBwdKernel:
             tok0 = seq_start + chunk * _BT
             valid = cutlass.min(_BT, seq_len - chunk * _BT)
             gchunk = chunk_base + chunk
-            owned = True
-            # Scalars assigned only on owned chunks keep one type across the dynamic branches.
-            t_o, col_o = cutlass.Int32(0), cutlass.Int32(0)
-            x_o, delta_o, d_o, contrib_o = (cutlass.Float32(0.0),) * 4
             # Phase A: beta, tails and triangular masks; Akk * diag(beta).
-            if ttidx < _BT:
-                s_beta[ttidx] = (
-                    beta[0, tok0 + ttidx, head] if ttidx < valid else cutlass.Float32(0.0)
-                )
+            if half == 1:
+                if ttidx < _BT:
+                    s_beta[ttidx] = (
+                        beta[0, tok0 + ttidx, head] if ttidx < valid else cutlass.Float32(0.0)
+                    )
             # The gate column and the state seed do not read q, k or Aqk, so
             # they run before the late loads land (inside _cm_phase_a).
-            self._load_gate_column(1, gc, tok0, valid, head, ttidx, cm)
+            self._load_gate_column(half, gc, tok0, valid, head, ttidx, cm)
             self._wait(edges, _E_LOAD_EARLY, j)
-            self._stamp(trace, 1, 0, j)
-            cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
-            if valid < _BT:
-                for idx in cutlass.range(ttidx, _BT * _DV, 128):
-                    t = idx // _DV
-                    if t >= valid:
-                        s_do[t, idx % _DV] = self.io_dtype(0.0)
-            # Akk mask and Akk * diag(beta); the CH warpgroup masks Aqk.
-            self._mask_square(1, ttidx, valid, smem, s_beta)
+            self._stamp(trace, half, 0, j)
+            if half == 1:
+                cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
+                if valid < _BT:
+                    s_do = _mn_view(_view(smem.do, l_token))
+                    for idx in cutlass.range(ttidx, _BT * _DV, 128):
+                        t = idx // _DV
+                        if t >= valid:
+                            s_do[t, idx % _DV] = self.io_dtype(0.0)
+                # Akk mask and Akk * diag(beta); the CH warpgroup masks Aqk.
+                self._mask_square(1, ttidx, valid, smem, s_beta)
             dg_part = self._cm_phase_a(
-                1,
+                half,
                 j,
                 it,
                 ttidx,
@@ -1448,115 +1382,56 @@ class FusedKdaBwdKernel:
                 s_beta,
                 trace,
             )
-            self._arrive(edges, _E_READY_A, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 1, j)
+            self._arrive(edges, _E_READY_A, bar, ttidx)
+            self._stamp(trace, half, 1, j)
 
-            # Phase B: Delta = v - X (in place), dvn -> sT21; -(k beta G) rows 32..63.
+            # Phase B: Delta = v - X (in place), dvn -> sT21 on TK; -(k beta G)
+            # rows of each half (CH publishes them with READY_B, TK with READY_C).
             self._wait(edges, _E_DONE_A, j)
-            self._stamp(trace, 1, 2, j)
-            # Delta feeds only vn, dAkk and dbeta, which the chunk's owner computes.
-            for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                if owned:
-                    cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
-                    cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
-                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                        t_o, col_o = tok_crd[e, 0, sub]
-                        x_o = regs[e, 0, sub]
-                        if cutlass.const_expr(self.debug):
-                            debug_out[gchunk, head, 0, t_o, col_o] = x_o
-                        delta_o = r_in[e, 0, sub].to(self.acc_dtype) - x_o
-                        r_out[e, 0, sub] = (delta_o if t_o < valid else cutlass.Float32(0.0)).to(
-                            self.io_dtype
-                        )
-                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
-                if cutlass.const_expr(not self.tape):
-                    cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
-                    if cutlass.const_expr(self.debug):
-                        for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                            t_o, col_o = tok_crd[e, 0, sub]
-                            debug_out[gchunk, head, 1, t_o, col_o] = regs[e, 0, sub]
-                    r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
-                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
-            cute.arch.fence_view_async_tmem_load()
-            self._arrive(edges, _E_READY_B, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 3, j)
-            # MMA B does not read sKA; -(k beta G) is published with READY_C.
-            self._cm_phase_b(1, ttidx, head, tok0, valid, smem, gc, s_beta)
-            if not owned:
-                self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
+            self._stamp(trace, half, 2, j)
+            if half == 1:
+                self._tk_value_b(
+                    ttidx, gchunk, head, valid, smem, edges, tmem, debug_out, l_token, mma_x
+                )
+            self._cm_phase_b(half, ttidx, head, tok0, valid, smem, gc, s_beta)
+            if half == 0:
+                self._arrive(edges, _E_READY_B, _BAR_CH, ttidx)
+            self._stamp(trace, half, 3, j)
 
-            # Phase C: vn -> sT21; D -> dv, dbeta(row), sKB; dAkk -> sSq.
-            self._wait(edges, _E_DONE_B, j)
-            self._stamp(trace, 1, 4, j)
-            part0 = cutlass.Float32(0.0)
-            part1 = cutlass.Float32(0.0)
-            for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                if owned:
-                    cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
-                    if cutlass.const_expr(self.debug):
-                        for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                            t_o, col_o = tok_crd[e, 0, sub]
-                            debug_out[gchunk, head, 2, t_o, col_o] = regs[e, 0, sub]
-                    r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
-                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
-                cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
-                if owned:
-                    cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
-                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
-                        t_o, col_o = tok_crd[e, 0, sub]
-                        d_o = regs[e, 0, sub]
-                        if cutlass.const_expr(self.debug):
-                            debug_out[gchunk, head, 3, t_o, col_o] = d_o
-                        contrib_o = (
-                            d_o * r_in[e, 0, sub].to(self.acc_dtype)
-                            if t_o < valid
-                            else cutlass.Float32(0.0)
-                        )
-                        if t_o == row0:
-                            part0 += contrib_o
-                        else:
-                            part1 += contrib_o
-                        r_in[e, 0, sub] = (s_beta[t_o] * d_o).to(self.io_dtype)
-                r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
-                cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_kb[None, 0, sub, 0])
-            if owned:
-                for sub in cutlass.range_constexpr(cute.size(sregs, mode=[2])):
-                    cute.copy(sq_copy, sq_src_dakk[None, 0, sub, 0], sregs[None, 0, sub])
-                    for e in cutlass.range_constexpr(cute.size(sregs, mode=[0])):
-                        row_i, col_j = sq_crd[e, 0, sub]
-                        value = sregs[e, 0, sub] * s_beta[col_j]
-                        keep = (col_j < row_i) and (row_i < valid)
-                        if cutlass.const_expr(self.debug):
-                            debug_out[gchunk, head, 5, row_i, col_j] = (
-                                value if keep else cutlass.Float32(0.0)
-                            )
-                        sq_out[e, 0, sub] = (value if keep else cutlass.Float32(0.0)).to(
-                            self.io_dtype
-                        )
-                    cute.copy(t_sq_out[0], t_sq_out[1][None, 0, sub], w_sq[None, 0, sub])
-            cute.arch.fence_view_async_tmem_load()
-            self._arrive(edges, _E_READY_C, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 5, j)
-            # Off the MMA path: stage dv = beta * D in sV (Delta is consumed;
-            # the next v load waits READY_D), store whole rows, and seed dbeta
-            # with the row sums (each row spread over one aligned quad).
-            if owned:
-                for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
-                    r_out[None, 0, sub].store(r_in[None, 0, sub].load())
-                    cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
-                part0 = cute.arch.warp_reduction_sum(part0, threads_in_group=4)
-                part1 = cute.arch.warp_reduction_sum(part1, threads_in_group=4)
-                if ttidx % 4 == 0:
-                    s_dbeta[row0] = part0
-                    s_dbeta[row0 + 8] = part1
-                cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
-                self._store_rows(dv, smem.v, ttidx, head, tok0, valid)
-
-            # Phase D: T = Akk^T dAkk -> sSq (the only operand MMA D waits for).
+            # Phase C (TK): vn -> sT21; D -> dv, dbeta(row), sKB; dAkk -> sSq.
+            if half == 1:
+                self._wait(edges, _E_DONE_B, j)
+                self._stamp(trace, half, 4, j)
+                self._tk_value_c(
+                    ttidx,
+                    gchunk,
+                    head,
+                    tok0,
+                    valid,
+                    smem,
+                    edges,
+                    tmem,
+                    s_beta,
+                    s_dbeta,
+                    dv,
+                    debug_out,
+                    l_token,
+                    l_square,
+                    mma_x,
+                    mma_sq_kk,
+                )
             self._wait(edges, _E_DONE_C, j)
-            self._send_ds(1, ttidx, it, num_chunks, lane_base)
-            self._stamp(trace, 1, 6, j)
-            if owned:
+            self._send_ds(half, ttidx, it, num_chunks, lane_base)
+            self._stamp(trace, half, 5, j)
+            if cutlass.const_expr(not self.tape):
+                if half == 0 and it == num_chunks - 1:
+                    buf = cm[1]
+                    for quarter in cutlass.range_constexpr(_DV // 32):
+                        _tmem_ld32(lane_base + tmem_offset("dh") + quarter * 32, buf)
+                        for c in cutlass.range_constexpr(32):
+                            dh0[sequence, head, ttidx, quarter * 32 + c] = buf[c]
+            # Phase D (TK): T = Akk^T dAkk -> sSq (the only operand MMA D waits for).
+            if half == 1:
                 self._square_to_smem(
                     0,
                     ttidx,
@@ -1570,27 +1445,27 @@ class FusedKdaBwdKernel:
                     gchunk,
                     head,
                 )
-            self._arrive(edges, _E_READY_D, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 7, j)
-            if owned:
-                # Channel-major state-path scaling and anchored tiles, tokens 32..63.
-                self._cm_phase_c(
-                    1,
-                    gchunk,
-                    ttidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    smem,
-                    gc,
-                    s_beta,
-                    debug_out,
-                    scale,
-                    l_token,
-                    cm,
-                )
-                self._stamp(trace, 1, 8, j)
+                self._arrive(edges, _E_READY_D, _BAR_TK, ttidx)
+            self._stamp(trace, half, 6, j)
+            # Channel-major anchored tiles of this half.
+            self._cm_phase_c(
+                half,
+                gchunk,
+                ttidx,
+                head,
+                tok0,
+                valid,
+                lane_base,
+                smem,
+                gc,
+                s_beta,
+                debug_out,
+                scale,
+                l_token,
+                cm,
+            )
+            self._stamp(trace, half, 7, j)
+            if half == 1:
                 # dAqk -> sAqk (read only by the intra ring; the CH warpgroup writes dL).
                 self._square_to_smem(
                     1,
@@ -1605,187 +1480,12 @@ class FusedKdaBwdKernel:
                     gchunk,
                     head,
                 )
-            self._arrive(edges, _E_READY_E, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 9, j)
-
-            if owned:
-                dg_part += self._cm_fold(
-                    1,
-                    j,
-                    ttidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    smem,
-                    ring_full,
-                    ring_empty,
-                    gc,
-                    s_beta,
-                    s_dbeta,
-                    l_token,
-                    l_square,
-                    cm,
-                    scale,
-                    debug_out,
-                    gchunk,
-                )
-                self._cm_epilogue(
-                    1,
-                    ttidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    dg_part,
-                    s_xchg,
-                    s_suffix,
-                    smem,
-                    q,
-                    k,
-                    dq,
-                    dk,
-                    dg,
-                    l_token,
-                    cm,
-                    trace,
-                    j,
-                )
-                if ttidx < valid:
-                    dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
-            if owned:
-                self._arrive(edges, _E_FREE, _BAR_TK, ttidx)
-            self._stamp(trace, 1, 10, j)
-
-    # ----------------------------------------------------------------- CH
-
-    @cute.jit
-    def run_ch(
-        self,
-        tidx,
-        warp,
-        part,
-        head,
-        sequence,
-        seq_start,
-        seq_len,
-        chunk_base,
-        num_chunks,
-        smem,
-        edges,
-        ring_full,
-        ring_empty,
-        tmem,
-        s_beta,
-        s_dbeta,
-        s_xchg,
-        s_suffix,
-        q,
-        k,
-        gc,
-        dht,
-        dq,
-        dk,
-        dg,
-        dh0,
-        debug_out,
-        trace,
-        scale,
-        l_token,
-        l_square,
-        l_state,
-        mma_sq_kk,
-    ):
-        """Channel-major warpgroup for tokens 0..31 (``half=0``); also stores
-        dh0 and the strictly lower dL square for the intra ring."""
-        # gate, two scratch columns, dbeta partials, upper/lower anchors
-        cm = (
-            cute.make_rmem_tensor((32,), cutlass.Float32),
-            cute.make_rmem_tensor((32,), cutlass.Float32),
-            cute.make_rmem_tensor((32,), cutlass.Float32),
-            cute.make_rmem_tensor((32,), cutlass.Float32),
-            cute.make_rmem_tensor((4,), cutlass.Float32),
-            cute.make_rmem_tensor((4,), cutlass.Float32),
-            cute.make_rmem_tensor((32,), cutlass.Float32),
-        )
-        lane_base = cutlass.Int32(tmem.toint()) + ((warp % 4) * 32 << 16)
-        for j in cutlass.range((num_chunks - part + self._ways - 1) // self._ways):
-            # This CTA's chunks; j indexes them for the one-shot edges.
-            it = part + j * self._ways
-            chunk = num_chunks - 1 - it
-            tok0 = seq_start + chunk * _BT
-            valid = cutlass.min(_BT, seq_len - chunk * _BT)
-            gchunk = chunk_base + chunk
-            owned = True
-            self._load_gate_column(0, gc, tok0, valid, head, tidx, cm)
-            self._wait(edges, _E_LOAD_EARLY, j)
-            self._stamp(trace, 0, 0, j)
-            dg_part = self._cm_phase_a(
-                0,
-                j,
-                it,
-                tidx,
-                sequence,
-                head,
-                tok0,
-                valid,
-                lane_base,
-                smem,
-                edges,
-                q,
-                k,
-                gc,
-                dht,
-                scale,
-                l_token,
-                l_state,
-                cm,
-                s_beta,
-                trace,
-            )
-            self._arrive(edges, _E_READY_A, _BAR_CH, tidx)
-            self._stamp(trace, 0, 2, j)
-            self._wait(edges, _E_DONE_A, j)
-            self._stamp(trace, 0, 3, j)
-            self._cm_phase_b(0, tidx, head, tok0, valid, smem, gc, s_beta)
-            self._arrive(edges, _E_READY_B, _BAR_CH, tidx)
-            if not owned:
-                # q, k and Aqk are not read again on a chunk this CTA does not own.
-                self._arrive(edges, _E_FREE, _BAR_CH, tidx)
-            self._stamp(trace, 0, 4, j)
-            self._wait(edges, _E_DONE_C, j)
-            self._send_ds(0, tidx, it, num_chunks, lane_base)
-            self._stamp(trace, 0, 5, j)
-            if cutlass.const_expr(self.tape):
-                pass  # the recurrence that produced the tape also produced dh0
-            elif it == num_chunks - 1:
-                buf = cm[1]
-                for part in cutlass.range_constexpr(_DV // 32):
-                    _tmem_ld32(lane_base + tmem_offset("dh") + part * 32, buf)
-                    for c in cutlass.range_constexpr(32):
-                        dh0[sequence, head, tidx, part * 32 + c] = buf[c]
-            if owned:
-                self._cm_phase_c(
-                    0,
-                    gchunk,
-                    tidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    smem,
-                    gc,
-                    s_beta,
-                    debug_out,
-                    scale,
-                    l_token,
-                    cm,
-                )
+            else:
                 # Phase E: dL = -(T Akk^T), strictly lower and valid -> sSq.
                 self._wait(edges, _E_DONE_D, j)
                 self._square_to_smem(
                     2,
-                    tidx,
+                    ttidx,
                     valid,
                     tmem,
                     mma_sq_kk,
@@ -1796,56 +1496,213 @@ class FusedKdaBwdKernel:
                     gchunk,
                     head,
                 )
-            self._arrive(edges, _E_READY_E, _BAR_CH, tidx)
-            self._stamp(trace, 0, 6, j)
-            if owned:
-                dg_part += self._cm_fold(
-                    0,
-                    j,
-                    tidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    smem,
-                    ring_full,
-                    ring_empty,
-                    gc,
-                    s_beta,
-                    s_dbeta,
-                    l_token,
-                    l_square,
-                    cm,
-                    scale,
-                    debug_out,
-                    gchunk,
-                )
-                self._stamp(trace, 0, 7, j)
+            self._arrive(edges, _E_READY_E, bar, ttidx)
+            self._stamp(trace, half, 8, j)
 
-                self._cm_epilogue(
-                    0,
-                    tidx,
-                    head,
-                    tok0,
-                    valid,
-                    lane_base,
-                    dg_part,
-                    s_xchg,
-                    s_suffix,
-                    smem,
-                    q,
-                    k,
-                    dq,
-                    dk,
-                    dg,
-                    l_token,
-                    cm,
-                    trace,
-                    j,
+            dg_part += self._cm_fold(
+                half,
+                j,
+                ttidx,
+                head,
+                tok0,
+                valid,
+                lane_base,
+                smem,
+                ring_full,
+                ring_empty,
+                gc,
+                s_beta,
+                s_dbeta,
+                l_token,
+                l_square,
+                cm,
+                scale,
+                debug_out,
+                gchunk,
+            )
+            self._stamp(trace, half, 9, j)
+            self._cm_epilogue(
+                half,
+                ttidx,
+                head,
+                tok0,
+                valid,
+                lane_base,
+                dg_part,
+                s_xchg,
+                s_suffix,
+                smem,
+                q,
+                k,
+                dq,
+                dk,
+                dg,
+                l_token,
+                cm,
+                trace,
+                j,
+            )
+            if half == 1:
+                if ttidx < valid:
+                    dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
+            self._arrive(edges, _E_FREE, bar, ttidx)
+            self._stamp(trace, half, 10, j)
+
+    @cute.jit
+    def _tk_value_b(self, ttidx, gchunk, head, valid, smem, edges, tmem, debug_out, l_token, mma_x):
+        """TK phase B: Delta = v - X (in place in sV), dv_new -> sT21 without a
+        tape; publishes READY_B."""
+        slot_a = self._acc(tmem, tmem_offset("slot_a"), mma_x, (_BT, _DV))
+        slot_b = self._acc(tmem, tmem_offset("slot_b"), mma_x, (_BT, _DV))
+        tok_copy, tok_a, tok_crd = self._token_tile_copy(slot_a, ttidx, (_BT, _DV))
+        _, tok_b, _ = self._token_tile_copy(slot_b, ttidx, (_BT, _DV))
+        regs = cute.make_rmem_tensor_like(tok_crd, self.acc_dtype)
+        r_out, t_r_out, (tiled_r2s, thr_r2s) = self._token_stmatrix(tok_copy, regs, ttidx)
+        r_in, t_r_in, (tiled_s2r, thr_s2r) = self._token_lds(tok_copy, regs, ttidx)
+        staged_token = self._plan.canonical_staged.token_direct
+        w_v = thr_r2s.partition_D(_mn_view(_view(smem.v, staged_token)))
+        w_t21 = thr_r2s.partition_D(_mn_view(_view(smem.t21, staged_token)))
+        rd_v = thr_s2r.partition_S(_mn_view(_view(smem.v, staged_token)))
+        for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
+            cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
+            cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
+            for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                t_o, col_o = tok_crd[e, 0, sub]
+                x_o = regs[e, 0, sub]
+                if cutlass.const_expr(self.debug):
+                    debug_out[gchunk, head, 0, t_o, col_o] = x_o
+                delta_o = r_in[e, 0, sub].to(self.acc_dtype) - x_o
+                r_out[e, 0, sub] = (delta_o if t_o < valid else cutlass.Float32(0.0)).to(
+                    self.io_dtype
                 )
-            if owned:
-                self._arrive(edges, _E_FREE, _BAR_CH, tidx)
-            self._stamp(trace, 0, 8, j)
+            cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
+            if cutlass.const_expr(not self.tape):
+                cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
+                if cutlass.const_expr(self.debug):
+                    for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                        t_o, col_o = tok_crd[e, 0, sub]
+                        debug_out[gchunk, head, 1, t_o, col_o] = regs[e, 0, sub]
+                r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
+                cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
+        cute.arch.fence_view_async_tmem_load()
+        self._arrive(edges, _E_READY_B, _BAR_TK, ttidx)
+
+    @cute.jit
+    def _tk_value_c(
+        self,
+        ttidx,
+        gchunk,
+        head,
+        tok0,
+        valid,
+        smem,
+        edges,
+        tmem,
+        s_beta,
+        s_dbeta,
+        dv,
+        debug_out,
+        l_token,
+        l_square,
+        mma_x,
+        mma_sq_kk,
+    ):
+        """TK phase C: vn -> sT21; D -> dv, the dbeta row sums and sKB; dAkk ->
+        sSq; publishes READY_C, then stores dv."""
+        slot_a = self._acc(tmem, tmem_offset("slot_a"), mma_x, (_BT, _DV))
+        slot_b = self._acc(tmem, tmem_offset("slot_b"), mma_x, (_BT, _DV))
+        sq_dakk = self._acc(tmem, tmem_offset("dk_minus"), mma_sq_kk, (_BT, _BT))
+        tok_copy, tok_a, tok_crd = self._token_tile_copy(slot_a, ttidx, (_BT, _DV))
+        _, tok_b, _ = self._token_tile_copy(slot_b, ttidx, (_BT, _DV))
+        sq_copy, sq_src_dakk, sq_crd = self._token_tile_copy(sq_dakk, ttidx, (_BT, _BT))
+        regs = cute.make_rmem_tensor_like(tok_crd, self.acc_dtype)
+        sregs = cute.make_rmem_tensor_like(sq_crd, self.acc_dtype)
+        sq_out, t_sq_out, w_sq = self._square_stmatrix(sq_copy, sregs, ttidx, smem.sq, l_square)
+        r_out, t_r_out, (tiled_r2s, thr_r2s) = self._token_stmatrix(tok_copy, regs, ttidx)
+        r_in, t_r_in, (tiled_s2r, thr_s2r) = self._token_lds(tok_copy, regs, ttidx)
+        staged_token = self._plan.canonical_staged.token_direct
+        w_v = thr_r2s.partition_D(_mn_view(_view(smem.v, staged_token)))
+        w_t21 = thr_r2s.partition_D(_mn_view(_view(smem.t21, staged_token)))
+        w_kb = thr_r2s.partition_D(_mn_view(_view(smem.kb, staged_token)))
+        rd_v = thr_s2r.partition_S(_mn_view(_view(smem.v, staged_token)))
+        # Rows owned by this thread in the Ld16x256b layout of an M=64 tile.
+        row0 = (ttidx // 32) * 16 + (ttidx % 32) // 4
+        part0 = cutlass.Float32(0.0)
+        part1 = cutlass.Float32(0.0)
+        for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
+            cute.copy(tok_copy, tok_a[None, 0, sub, 0], regs[None, 0, sub])
+            if cutlass.const_expr(self.debug):
+                for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                    t_o, col_o = tok_crd[e, 0, sub]
+                    debug_out[gchunk, head, 2, t_o, col_o] = regs[e, 0, sub]
+            r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
+            cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_t21[None, 0, sub, 0])
+            cute.copy(tok_copy, tok_b[None, 0, sub, 0], regs[None, 0, sub])
+            cute.copy(tiled_s2r, rd_v[None, 0, sub, 0], t_r_in[None, 0, sub])
+            for e in cutlass.range_constexpr(cute.size(regs, mode=[0])):
+                t_o, col_o = tok_crd[e, 0, sub]
+                d_o = regs[e, 0, sub]
+                if cutlass.const_expr(self.debug):
+                    debug_out[gchunk, head, 3, t_o, col_o] = d_o
+                contrib_o = (
+                    d_o * r_in[e, 0, sub].to(self.acc_dtype)
+                    if t_o < valid
+                    else cutlass.Float32(0.0)
+                )
+                if t_o == row0:
+                    part0 += contrib_o
+                else:
+                    part1 += contrib_o
+                r_in[e, 0, sub] = (s_beta[t_o] * d_o).to(self.io_dtype)
+            r_out[None, 0, sub].store(regs[None, 0, sub].load().to(self.io_dtype))
+            cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_kb[None, 0, sub, 0])
+        for sub in cutlass.range_constexpr(cute.size(sregs, mode=[2])):
+            cute.copy(sq_copy, sq_src_dakk[None, 0, sub, 0], sregs[None, 0, sub])
+            for e in cutlass.range_constexpr(cute.size(sregs, mode=[0])):
+                row_i, col_j = sq_crd[e, 0, sub]
+                value = sregs[e, 0, sub] * s_beta[col_j]
+                keep = (col_j < row_i) and (row_i < valid)
+                if cutlass.const_expr(self.debug):
+                    debug_out[gchunk, head, 5, row_i, col_j] = (
+                        value if keep else cutlass.Float32(0.0)
+                    )
+                sq_out[e, 0, sub] = (value if keep else cutlass.Float32(0.0)).to(self.io_dtype)
+            cute.copy(t_sq_out[0], t_sq_out[1][None, 0, sub], w_sq[None, 0, sub])
+        cute.arch.fence_view_async_tmem_load()
+        self._arrive(edges, _E_READY_C, _BAR_TK, ttidx)
+        # Off the MMA path: stage dv = beta * D in sV (Delta is consumed; the
+        # next v load waits READY_D), store whole rows, and seed dbeta with the
+        # row sums (each row spread over one aligned quad).
+        for sub in cutlass.range_constexpr(cute.size(regs, mode=[2])):
+            r_out[None, 0, sub].store(r_in[None, 0, sub].load())
+            cute.copy(tiled_r2s, t_r_out[None, 0, sub], w_v[None, 0, sub, 0])
+        part0 = cute.arch.warp_reduction_sum(part0, threads_in_group=4)
+        part1 = cute.arch.warp_reduction_sum(part1, threads_in_group=4)
+        if ttidx % 4 == 0:
+            s_dbeta[row0] = part0
+            s_dbeta[row0 + 8] = part1
+        cute.arch.barrier(barrier_id=_BAR_TK, number_of_threads=128)
+        self._store_rows(dv, smem.v, ttidx, head, tok0, valid)
+
+    def _token_stmatrix(self, tok_copy, regs, ttidx):
+        """stmatrix staging of a 64x128 token tile in the TMEM-load fragment layout."""
+        r_out = cute.make_rmem_tensor_like(regs, self.io_dtype)
+        tiled = cute.make_tiled_copy_D(
+            cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices=4, transpose=False), self.io_dtype
+            ),
+            tok_copy,
+        )
+        return r_out, tiled.retile(r_out), (tiled, tiled.get_slice(ttidx))
+
+    def _token_lds(self, tok_copy, regs, ttidx):
+        """32-bit shared loads of a 64x128 BF16 token tile in the TMEM-load fragment layout."""
+        r_in = cute.make_rmem_tensor_like(regs, self.io_dtype)
+        tiled = cute.make_tiled_copy_D(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.io_dtype, num_bits_per_copy=32),
+            tok_copy,
+        )
+        return r_in, tiled.retile(r_in), (tiled, tiled.get_slice(ttidx))
 
     # ------------------------------------------------- channel-major halves
 
@@ -1949,17 +1806,7 @@ class FusedKdaBwdKernel:
 
     @cute.jit
     def _row_tiles(
-        self,
-        kind: cutlass.Constexpr,
-        half: cutlass.Constexpr,
-        u,
-        head,
-        tok0,
-        valid,
-        smem,
-        gc,
-        s_beta,
-        scale,
+        self, kind: cutlass.Constexpr, half, u, head, tok0, valid, smem, gc, s_beta, scale
     ):
         """Gate-scaled operand tiles in a token-row mapping (8 channels per vector).
 
@@ -2054,7 +1901,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def _cm_phase_a(
         self,
-        half: cutlass.Constexpr,
+        half,
         j,
         it,
         d,
@@ -2089,7 +1936,7 @@ class FusedKdaBwdKernel:
         # these buffers).
         self._wait(edges, _E_LOAD, j)
         self._row_tiles(0, half, d, head, tok0, valid, smem, gc, s_beta, scale)
-        if cutlass.const_expr(half == 0):
+        if half == 0:
             self._mask_square(0, d, valid, smem, s_beta)
         self._stamp(trace, half, 11, j)
         g_last = lo[3]
@@ -2151,7 +1998,7 @@ class FusedKdaBwdKernel:
         return dot * gamma_last
 
     @cute.jit
-    def _send_ds(self, half: cutlass.Constexpr, d, it, num_chunks, lane_base):
+    def _send_ds(self, half, d, it, num_chunks, lane_base):
         """With two CTAs, hand the next chunk's dS (TMEM dh after phase C, FP32)
         to the other CTA through the global scratch rows of this CTA and its
         DS_READY barrier."""
@@ -2173,14 +2020,12 @@ class FusedKdaBwdKernel:
                     for c in cutlass.range_constexpr(32):
                         _stg_f32(slot + (quarter * 32 + c) * _DK * 4, buf[c])
                 cute.arch.fence_acq_rel_cluster()
-                cute.arch.barrier(
-                    barrier_id=_BAR_CH if half == 0 else _BAR_TK, number_of_threads=128
-                )
+                cute.arch.barrier(barrier_id=_BAR_CH + half, number_of_threads=128)
                 if d == 0:
                     cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=peer_rank)
 
     @cute.jit
-    def _load_gate_column(self, half: cutlass.Constexpr, gc, tok0, valid, head, d, cm):
+    def _load_gate_column(self, half, gc, tok0, valid, head, d, cm):
         """Load this half's gate column of channel ``d`` (tokens clamped to the
         chunk tail) and the four blocks' first/last gates into ``cm``."""
         gbuf, _, _, _, up, lo, _ = cm
@@ -2196,14 +2041,14 @@ class FusedKdaBwdKernel:
             lo[b] = _ldg_f32(g_base + cutlass.min(b * _BC + _BC - 1, valid - 1) * g_row)
 
     @cute.jit
-    def _cm_phase_b(self, half: cutlass.Constexpr, d, head, tok0, valid, smem, gc, s_beta):
+    def _cm_phase_b(self, half, d, head, tok0, valid, smem, gc, s_beta):
         """kG -> -(k beta G) for dh_k once x_state has consumed kG."""
         self._row_tiles(1, half, d, head, tok0, valid, smem, gc, s_beta, cutlass.Float32(0.0))
 
     @cute.jit
     def _cm_phase_c(
         self,
-        half: cutlass.Constexpr,
+        half,
         gchunk,
         d,
         head,
@@ -2226,7 +2071,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def _cm_fold(
         self,
-        half: cutlass.Constexpr,
+        half,
         j,
         d,
         head,
@@ -2268,44 +2113,51 @@ class FusedKdaBwdKernel:
         s_sq = _mn_view(_view(smem.sq, l_square))
         base_aqk = cutlass.Int32(smem.aqk.toint())
         base_sq = cutlass.Int32(smem.sq.toint())
+        # Gates of this half's two token blocks (tb = 2 half + b2).
+        up_t0 = up[2] if half == 1 else up[0]
+        up_t1 = up[3] if half == 1 else up[1]
+        lo_t0 = lo[2] if half == 1 else lo[0]
+        lo_t1 = lo[3] if half == 1 else lo[1]
         for r in cutlass.range_constexpr(12):
             slot = r % 2
             use = j * 6 + r // 2
             block = r % 4
             lower = r < 8
-            touches = ((col + 31) // _BC >= block) if lower else (col // _BC <= block)
             if cutlass.const_expr(block == 0):
                 for c in cutlass.range_constexpr(32):
                     acc[c] = cutlass.Float32(0.0)
             cute.arch.mbarrier_wait(ring_full + slot, use & 1)
-            if cutlass.const_expr(touches):
+            # Blocks this half's tokens do not see contribute zero factors.
+            touches = (half * 2 + 1 >= block) if lower else (half * 2 <= block)
+            if touches:
                 _tmem_ld32_async(lane_base + tmem_offset("ring") + slot * 64 + col, buf)
                 # Per-slot scalars for the two token blocks of this half.
-                f0 = cutlass.Float32(0.0)
-                f1 = cutlass.Float32(0.0)
-                for b2 in cutlass.range_constexpr(2):
-                    tb = half * 2 + b2
-                    if cutlass.const_expr((tb >= block) if lower else (tb <= block)):
-                        if cutlass.const_expr(lower):
-                            f = cute.math.exp2(up[tb] - lo[block], fastmath=True)
-                        else:
-                            f = cute.math.exp2(up[block] - lo[tb], fastmath=True)
-                        if cutlass.const_expr(tb == block):
-                            # Exact channels are recomputed in _cm_fold_target.
-                            f = (
-                                cutlass.Float32(0.0)
-                                if up[block] - lo[block] >= DIAG_SPAN_LIMIT
-                                else f
-                            )
-                        if cutlass.const_expr(b2 == 0):
-                            f0 = f
-                        else:
-                            f1 = f
+                exact = up[block] - lo[block] >= DIAG_SPAN_LIMIT
+                if cutlass.const_expr(lower):
+                    f0 = cute.math.exp2(up_t0 - lo[block], fastmath=True)
+                    f1 = cute.math.exp2(up_t1 - lo[block], fastmath=True)
+                else:
+                    f0 = cute.math.exp2(up[block] - lo_t0, fastmath=True)
+                    f1 = cute.math.exp2(up[block] - lo_t1, fastmath=True)
+                tb0 = half * 2
+                # Exact channels of the diagonal block are recomputed in _cm_fold_target.
+                if cutlass.const_expr(lower):
+                    f0 = f0 if tb0 > block or (tb0 == block and not exact) else cutlass.Float32(0.0)
+                    f1 = (
+                        f1
+                        if tb0 + 1 > block or (tb0 + 1 == block and not exact)
+                        else cutlass.Float32(0.0)
+                    )
+                else:
+                    f0 = f0 if tb0 < block or (tb0 == block and not exact) else cutlass.Float32(0.0)
+                    f1 = (
+                        f1
+                        if tb0 + 1 < block or (tb0 + 1 == block and not exact)
+                        else cutlass.Float32(0.0)
+                    )
                 _tmem_wait_ld()
                 for c in cutlass.range_constexpr(32):
-                    tb = (col + c) // _BC
-                    if cutlass.const_expr((tb >= block) if lower else (tb <= block)):
-                        acc[c] = acc[c] + (f0 if tb == half * 2 else f1) * buf[c]
+                    acc[c] = acc[c] + (f0 if c < _BC else f1) * buf[c]
                 cute.arch.fence_view_async_tmem_load()
             # Each warp releases the slot once its own TMEM loads completed.
             cute.arch.sync_warp()
@@ -2342,7 +2194,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def _cm_fold_target(
         self,
-        half: cutlass.Constexpr,
+        half,
         kind: cutlass.Constexpr,
         d,
         valid,
@@ -2379,12 +2231,16 @@ class FusedKdaBwdKernel:
             else (tmem_offset("dk_plus") if kind == 1 else tmem_offset("dk_minus"))
         )
         _tmem_ld32(lane_base + tmem_offset("gate") + col, gbuf)
+        anchors = (
+            (up[2] if half == 1 else up[0], up[3] if half == 1 else up[1])
+            if kind < 2
+            else (lo[2] if half == 1 else lo[0], lo[3] if half == 1 else lo[1])
+        )
         for c in cutlass.range_constexpr(32):
-            tb = (col + c) // _BC
             if cutlass.const_expr(kind < 2):
-                factor = cute.math.exp2(gbuf[c] - up[tb], fastmath=True)
+                factor = cute.math.exp2(gbuf[c] - anchors[c // _BC], fastmath=True)
             else:
-                factor = cute.math.exp2(lo[tb] - gbuf[c], fastmath=True)
+                factor = cute.math.exp2(anchors[c // _BC] - gbuf[c], fastmath=True)
             acc[c] = acc[c] * factor
         dg_term = self._fold_store(
             kind,
@@ -2408,7 +2264,9 @@ class FusedKdaBwdKernel:
         )
         for b2 in cutlass.range_constexpr(2):
             block = half * 2 + b2
-            exact = up[block] - lo[block] >= DIAG_SPAN_LIMIT
+            g_first = up[b2 + 2] if half == 1 else up[b2]
+            g_last = lo[b2 + 2] if half == 1 else lo[b2]
+            exact = g_first - g_last >= DIAG_SPAN_LIMIT
             # Rare path: exact diagonal block for channels with a large span.
             if cute.arch.vote_any_sync(exact):
                 g = cute.make_rmem_tensor((32,), cutlass.Float32)
@@ -2419,7 +2277,8 @@ class FusedKdaBwdKernel:
                     total[c] = cutlass.Float32(0.0)
                 _tmem_ld32(lane_base + tmem_offset("gate") + col, g)
                 self._exact_block(
-                    kind * 4 + block,
+                    kind,
+                    b2,
                     block,
                     exact,
                     d,
@@ -2432,8 +2291,8 @@ class FusedKdaBwdKernel:
                     s_beta,
                     g,
                     total,
-                    up[block],
-                    lo[block],
+                    g_first,
+                    g_last,
                     base_aqk,
                     base_sq,
                 )
@@ -2463,7 +2322,7 @@ class FusedKdaBwdKernel:
     def _fold_store(
         self,
         kind: cutlass.Constexpr,
-        col: cutlass.Constexpr,
+        col,
         state: cutlass.Constexpr,
         d,
         valid,
@@ -2508,10 +2367,10 @@ class FusedKdaBwdKernel:
                     if cutlass.const_expr(self.debug):
                         debug_out[gchunk, head, 8, t, d] = value
                     if t < valid:
-                        dg_term += _lds_bf16(k_col[t % 8] + t * 128) * value
+                        dg_term += _lds_bf16(k_col[c % 8] + t * 128) * value
             if cutlass.const_expr(kind == 1):
                 pk[c] = (
-                    _lds_bf16(k_col[t % 8] + t * 128) * acc[c]
+                    _lds_bf16(k_col[c % 8] + t * 128) * acc[c]
                     if t < valid
                     else cutlass.Float32(0.0)
                 )
@@ -2531,7 +2390,7 @@ class FusedKdaBwdKernel:
     @cute.jit
     def _cm_epilogue(
         self,
-        half: cutlass.Constexpr,
+        half,
         d,
         head,
         tok0,
@@ -2585,8 +2444,8 @@ class FusedKdaBwdKernel:
                 t = g0 + e
                 dg_value = cutlass.Float32(0.0)
                 if t < valid:
-                    k_value = _lds_bf16(k_col[t % 8] + t * 128)
-                    q_value = _lds_bf16(q_col[t % 8] + t * 128)
+                    k_value = _lds_bf16(k_col[e] + t * 128)
+                    q_value = _lds_bf16(q_col[e] + t * 128)
                     dg_value = q_value * dqv[e] + k_value * (dkp[e] - dkm[e])
                     if t == valid - 1:
                         dg_value += dg_last
@@ -2596,7 +2455,7 @@ class FusedKdaBwdKernel:
                 dqv[e] = running
             # dq of these tokens is stored; its columns now hold the suffix sums.
             _tmem_stn(lane_base + tmem_offset("dq") + g0, dqv, 8)
-        if cutlass.const_expr(half == 1):
+        if half == 1:
             s_suffix[d] = running
         cute.arch.fence_view_async_tmem_store()
         self._stamp(trace, half, 13, it)
@@ -2613,7 +2472,7 @@ class FusedKdaBwdKernel:
                     _stg_f32(dg_base + t * row_f32, dqv[c] + carry)
 
     @cute.jit
-    def _reduce_dbeta(self, pk, s_dbeta, first_token: cutlass.Constexpr, tidx):
+    def _reduce_dbeta(self, pk, s_dbeta, first_token, tidx):
         """Add sum over the 128 channels of pk[c] to dbeta[first_token + c].
 
         A butterfly transpose-reduce (31 shuffles): after it, lane l holds the
@@ -2631,8 +2490,9 @@ class FusedKdaBwdKernel:
     @cute.jit
     def _exact_block(
         self,
-        r: cutlass.Constexpr,
-        block: cutlass.Constexpr,
+        kind: cutlass.Constexpr,
+        b2: cutlass.Constexpr,
+        block,
         exact,
         d,
         gate_address,
@@ -2658,7 +2518,8 @@ class FusedKdaBwdKernel:
         factors come from the register gate column, square rows from 128-bit
         shared loads, and each unmasked term is one FMA.  Wider spans evaluate
         2^(G_late - G_early) per term in ``_exact_terms``."""
-        offset = (block % 2) * _BC
+        r = kind * 4  # r < 4: dq (Aqk), r < 8: dk_plus (dL), else dk_minus
+        offset = b2 * _BC
         first = block * _BC
         g_mid = gbuf[offset + _BC // 2]
         split = (g_first - g_mid < DIAG_HALF_SPAN_LIMIT) and (g_mid - g_last < DIAG_HALF_SPAN_LIMIT)
