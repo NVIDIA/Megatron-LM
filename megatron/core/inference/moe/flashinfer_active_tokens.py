@@ -108,7 +108,7 @@ def _finalize_routed_rows_kernel(
                 values = tl.load(
                     gemm2_ptr + src64 * gemm2_stride + offs, mask=col_mask & is_local, other=0.0
                 ).to(tl.float32)
-                acc += values * weight
+                acc = tl.fma(values, tl.broadcast_to(weight, [BLOCK_H]), acc)
             tl.store(out_ptr + row64 * hidden + offs, acc, mask=col_mask)
 
 
