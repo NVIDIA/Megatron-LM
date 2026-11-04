@@ -100,21 +100,21 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
-def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
-    """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
-    from megatron.training.training import get_megatron_ddp_config
+def test_no_megatron_fsdp_padded_shards_flag_reaches_fsdp_config():
+    """--no-megatron-fsdp-padded-shards should disable padded shards in the FSDP config."""
+    from megatron.training.training import get_megatron_data_parallel_config
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
 
-    default_args = parser.parse_args([])
+    default_args = parser.parse_args(["--use-megatron-fsdp"])
     assert default_args.megatron_fsdp_padded_shards is True
-    assert get_megatron_ddp_config(default_args, use_torch_fsdp2=False).megatron_fsdp_padded_shards
+    assert get_megatron_data_parallel_config(default_args, use_torch_fsdp2=False).padded_shards
 
-    disabled_args = parser.parse_args(["--no-megatron-fsdp-padded-shards"])
+    disabled_args = parser.parse_args(["--use-megatron-fsdp", "--no-megatron-fsdp-padded-shards"])
     assert disabled_args.megatron_fsdp_padded_shards is False
-    ddp_config = get_megatron_ddp_config(disabled_args, use_torch_fsdp2=False)
-    assert ddp_config.megatron_fsdp_padded_shards is False
+    ddp_config = get_megatron_data_parallel_config(disabled_args, use_torch_fsdp2=False)
+    assert ddp_config.padded_shards is False
 
 
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
@@ -1405,7 +1405,9 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
+    with patch(
+        "megatron.training.training.get_megatron_data_parallel_config", return_value=mock_ddp_config
+    ):
         yield
 
 
@@ -1416,15 +1418,15 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.training.get_megatron_data_parallel_config")
     def test_ddp_config_comes_from_helper(self, mock_ddp):
-        """Test that ddp config comes from get_megatron_ddp_config."""
+        """Test that ddp config comes from get_megatron_data_parallel_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
         mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
-        assert result.ddp is mock_ddp_instance
+        assert result.data_parallel is mock_ddp_instance
 
     @pytest.mark.parametrize("enabled", [False, True])
     def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
@@ -1435,7 +1437,9 @@ class TestPretrainContainerFromArgsStructure:
         cfg = pretrain_cfg_container_from_args(args)
 
         assert args.use_megatron_fsdp is enabled
-        assert cfg.ddp.use_megatron_fsdp is enabled
+        from megatron.core.distributed import FullyShardedDataParallelConfig
+
+        assert isinstance(cfg.data_parallel, FullyShardedDataParallelConfig) is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
 

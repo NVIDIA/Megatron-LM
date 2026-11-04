@@ -223,12 +223,10 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
     model = FullyShardedDataParallel(
         config=model.config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
+        fsdp_config=FullyShardedDataParallelConfig(
+            version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
+            all_gather_in_start_param_sync=False,
         ),
         module=model,
         pg_collection=process_group_collection,

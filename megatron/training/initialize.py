@@ -102,16 +102,17 @@ def initialize_megatron(
     from megatron.core.distributed import FullyShardedDataParallelConfig
 
     data_parallel_config = getattr(cfg, "data_parallel_config", None)
+    if data_parallel_config is not None:
+        args.use_megatron_fsdp = isinstance(data_parallel_config, FullyShardedDataParallelConfig)
     if isinstance(data_parallel_config, FullyShardedDataParallelConfig):
         from dataclasses import fields
 
-        from megatron.core.distributed.fully_sharded_data_parallel_config import _LEGACY_NAMES
+        from megatron.training.config.data_parallel_config import FSDP_ARGUMENT_NAMES
 
         resolved_config = data_parallel_config.resolved()
         for config_field in fields(resolved_config):
-            legacy_name = _LEGACY_NAMES.get(config_field.name, config_field.name)
+            legacy_name = FSDP_ARGUMENT_NAMES.get(config_field.name, config_field.name)
             setattr(args, legacy_name, getattr(resolved_config, config_field.name))
-        args.use_megatron_fsdp = True
     transformer_config = getattr(cfg.model, "transformer", None)
     # Legacy model-provider entrypoints do not construct a model config yet.
     tp_comm_overlap = (

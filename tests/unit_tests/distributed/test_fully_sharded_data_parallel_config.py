@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Independent FSDP configuration, explicit conversion, and strict constructor inputs."""
+"""Independent data-parallel schemas, validation, and strict constructor inputs."""
 
 from dataclasses import asdict
 
@@ -34,50 +34,19 @@ def test_independent_config_and_read_only_resolution():
     assert resolved.double_buffer
 
 
-@pytest.mark.parametrize("version", [1, 2])
-def test_legacy_conversion_preserves_precision_and_sharding(version):
-    legacy = DistributedDataParallelConfig(
-        use_megatron_fsdp=True,
-        megatron_fsdp_version=version,
-        megatron_fsdp_padded_shards=False,
-        data_parallel_sharding_strategy="optim_grads_params",
-        expert_data_parallel_sharding_strategy="optim",
-        outer_dp_sharding_strategy="optim",
-        expert_outer_dp_sharding_strategy="no_shard",
-        num_distributed_optimizer_instances=2,
-        megatron_fsdp_main_params_dtype=torch.float32,
-        megatron_fsdp_main_grads_dtype=torch.float32,
-        megatron_fsdp_grad_comm_dtype=torch.bfloat16,
-        suggested_communication_unit_size=4096,
-    )
-    before = asdict(legacy)
-    config = FullyShardedDataParallelConfig.from_ddp_config(legacy)
-    assert asdict(legacy) == before
-    assert config.version == version
-    assert not config.padded_shards
-    assert config.expert_data_parallel_sharding_strategy == "optim"
-    assert config.expert_outer_dp_sharding_strategy == "no_shard"
-    assert config.num_distributed_optimizer_instances == 2
-    assert config.main_params_dtype == torch.float32
-    assert config.main_grads_dtype == torch.float32
-    assert config.grad_comm_dtype == torch.bfloat16
-    assert config.suggested_communication_unit_size == 4096
-
-
-def test_already_resolved_legacy_bucket_count():
-    legacy = DistributedDataParallelConfig(num_buckets=4)
-    legacy.bucket_size = 1024  # Training derives this after DDPConfig construction.
-    config = FullyShardedDataParallelConfig.from_ddp_config(legacy)
-    assert config.bucket_size == 1024
-    assert config.num_buckets is None
-    assert legacy.num_buckets == 4
+def test_ddp_rejects_fsdp_settings():
+    with pytest.raises(TypeError, match="use_megatron_fsdp"):
+        DistributedDataParallelConfig(use_megatron_fsdp=True)
+    with pytest.raises(TypeError, match="data_parallel_sharding_strategy"):
+        DistributedDataParallelConfig(data_parallel_sharding_strategy="optim_grads_params")
+    assert not hasattr(FullyShardedDataParallelConfig, "from_ddp_config")
 
 
 @pytest.mark.parametrize(
     "wrapper", [FullyShardedDataParallel, FullyShardedDataParallelV1, FullyShardedDataParallelV2]
 )
 def test_wrappers_require_native_config(wrapper):
-    legacy = DistributedDataParallelConfig(use_megatron_fsdp=True)
+    legacy = DistributedDataParallelConfig()
     with pytest.raises(TypeError, match="ddp_config"):
         wrapper(config=None, module=None, ddp_config=legacy)
     with pytest.raises(TypeError, match="FullyShardedDataParallelConfig"):

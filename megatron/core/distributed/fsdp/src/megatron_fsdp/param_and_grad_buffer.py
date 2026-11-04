@@ -4865,7 +4865,7 @@ class AllGatherPipeline:
         """Record the buckets whose row-wise weights a recomputed forward re-gathered.
         Buckets without a transpose buffer use the same weights in forward and backward.
         Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
-        if self.buffer.ddp_config.fsdp_double_buffer:
+        if self.buffer.fsdp_config.double_buffer:
             return
         parameter_groups = self.buffer.parameter_groups
         self.recompute_buckets.update(

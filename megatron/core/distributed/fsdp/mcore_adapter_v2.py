@@ -201,7 +201,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ]
 
         log_single_rank(
-            logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", fsdp_config
+            logger,
+            logging.INFO,
+            "Setting up FullyShardedDataParallelV2 with config %s",
+            fsdp_config,
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=fsdp_config.main_params_dtype,
@@ -261,9 +264,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
             shard_layout=(
-                ShardLayout.PADDED
-                if fsdp_config.padded_shards
-                else ShardLayout.UNPADDED
+                ShardLayout.PADDED if fsdp_config.padded_shards else ShardLayout.UNPADDED
             ),
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
@@ -464,9 +465,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if fsdp_config.use_decoupled_grad:
             raise ValueError("MFSDP v2 does not support use_decoupled_grad.")
         if fsdp_config.enable_fine_grained_param_gather:
-            raise ValueError(
-                "MFSDP v2 does not support enable_fine_grained_param_gather."
-            )
+            raise ValueError("MFSDP v2 does not support enable_fine_grained_param_gather.")
         if fsdp_config.max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support max_pool_double_buffer.")
 

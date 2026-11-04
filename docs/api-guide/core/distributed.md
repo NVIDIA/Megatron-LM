@@ -55,16 +55,21 @@ type selects the wrapper. Pass process groups explicitly; streams and other
 runtime state remain owned by the FSDP context.
 
 The FSDP factory and V1/V2 constructors require `fsdp_config`; they do not accept
-`ddp_config` or a DDP config in the positional config slot. Migrate direct callers
-to the native config. To convert a saved legacy config explicitly:
+`ddp_config` or a DDP config in the positional config slot. Model builders and
+`get_model` take `data_parallel_config`; training containers use `data_parallel`.
+`DistributedDataParallelConfig` no longer accepts FSDP settings, and there is no
+`from_ddp_config` method. Migrate Python callers to construct the native config.
 
-```python
-fsdp_config = FullyShardedDataParallelConfig.from_ddp_config(old_ddp_config)
-```
+Existing CLI flags construct the selected config directly through
+`get_megatron_data_parallel_config`. Loading a saved training container through
+`PretrainConfigContainer.from_dict` or `from_yaml` translates the old `ddp` key
+and its FSDP-prefixed fields before constructing any dataclass. Saving it again
+emits the native `data_parallel` schema. Known inactive fields from the old union
+schema are discarded; unknown fields remain subject to the loader's strict or
+lenient validation mode. Loading arbitrary old DDP objects directly is not supported.
 
-The training boundary performs this conversion for existing CLI flags and
-serialized `ddp` training payloads. The FSDP engine and adapters consume only the
-native config and expose it as `wrapped_model.fsdp_config`; the former
+The FSDP engine and adapters consume only the native config and expose it as
+`wrapped_model.fsdp_config`; the former
 `wrapped_model.ddp_config` attribute is removed. Update integrations that read it
 to use `fsdp_config` and the unprefixed field names.
 

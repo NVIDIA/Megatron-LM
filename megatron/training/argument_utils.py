@@ -985,7 +985,7 @@ def pretrain_cfg_container_from_args(
     settings only, for entry points whose datasets are built by their own callbacks (nothing
     dataset-related is validated, bound or read for them).
     """
-    from megatron.training.training import get_megatron_ddp_config
+    from megatron.training.training import get_megatron_data_parallel_config
 
     if data_cfg is None:
         data_cfg = DataConfig(dataloader=dataloader_config_from_args(args))
@@ -1025,7 +1025,7 @@ def pretrain_cfg_container_from_args(
                 args, "virtual_pipeline_model_parallel_size", None
             ),
         )
-    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
+    data_parallel_config = get_megatron_data_parallel_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
@@ -1034,7 +1034,7 @@ def pretrain_cfg_container_from_args(
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         data=data_cfg,
-        ddp=ddp_config,
+        data_parallel=data_parallel_config,
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),

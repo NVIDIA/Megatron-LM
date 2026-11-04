@@ -332,12 +332,12 @@ def test_validate_run_at_every_call_site():
 
     offload_container = container(rl_offload_optimizer_during_inference=True)
     offload_container.validate()
-    assert not offload_container.ddp.grad_buffer_offload
+    assert not offload_container.data_parallel.grad_buffer_offload
     offload_container.rl.rl_offload_optimizer_during_inference = False
     offload_container.validate()
-    assert not offload_container.ddp.grad_buffer_offload
+    assert not offload_container.data_parallel.grad_buffer_offload
     offload_container.rl.rl_offload_optimizer_during_inference = True
-    offload_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    offload_container.data_parallel.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         offload_container.validate()
 
@@ -345,15 +345,15 @@ def test_validate_run_at_every_call_site():
         rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
     )
     cuda_graph_container.validate()
-    assert not cuda_graph_container.ddp.grad_buffer_offload
-    cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.ddp)
-    assert not cuda_graph_container.ddp.grad_buffer_offload
+    assert not cuda_graph_container.data_parallel.grad_buffer_offload
+    cuda_graph_container.rl.finalize_ddp_config(cuda_graph_container.data_parallel)
+    assert not cuda_graph_container.data_parallel.grad_buffer_offload
     explicit_layout_container = container(rl=RLConfig())
-    explicit_layout_container.ddp.grad_buffer_offload = True
+    explicit_layout_container.data_parallel.grad_buffer_offload = True
     explicit_layout_container.validate()
-    assert explicit_layout_container.ddp.grad_buffer_offload
-    explicit_layout_container.ddp.fp8_param_gather = True
-    explicit_layout_container.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    assert explicit_layout_container.data_parallel.grad_buffer_offload
+    explicit_layout_container.data_parallel.fp8_param_gather = True
+    explicit_layout_container.data_parallel.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         explicit_layout_container.validate()
     container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
@@ -498,7 +498,7 @@ def test_model_setup_uses_owned_ddp_config(
     run_config.rl = RLConfig(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )
-    ddp = run_config.ddp
+    ddp = run_config.data_parallel
     finalize = Mock(wraps=run_config.rl.finalize_ddp_config)
     monkeypatch.setattr(run_config.rl, "finalize_ddp_config", finalize)
     monkeypatch.setattr(training, "get_args", lambda: args)
@@ -513,9 +513,9 @@ def test_model_setup_uses_owned_ddp_config(
         pass
 
     def construct(*unused_args, **kwargs):
-        assert kwargs["ddp_config"] is ddp
+        assert kwargs["data_parallel_config"] is ddp
         assert ddp.grad_buffer_offload is perform_rl_step
-        assert run_config.ddp is ddp
+        assert run_config.data_parallel is ddp
         if perform_rl_step:
             finalize.assert_called_once_with(ddp)
         else:

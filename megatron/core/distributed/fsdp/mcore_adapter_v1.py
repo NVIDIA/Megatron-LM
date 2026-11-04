@@ -258,6 +258,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 ),
             ),
         )
+        self.fsdp_config = self.module.fsdp_config
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
         self.no_sync = self.module.no_sync
         self.start_param_sync = self.module.start_param_sync
@@ -352,7 +353,6 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 return "replicated"
 
         return None
-
 
     def _annotate_tensor_parallelism(self, root_module: nn.Module) -> None:
         """Annotate parameters under root_module with inferred tensor-parallel metadata.

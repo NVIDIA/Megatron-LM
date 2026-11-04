@@ -274,7 +274,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
     def build_distributed_models(
         self,
         pg_collection: ProcessGroupCollection,
-        ddp_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
+        data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
         overlap_param_gather_with_optimizer_step: bool = False,
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
@@ -286,17 +286,13 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
-        *,
-        data_parallel_config: (
-            DistributedDataParallelConfig | FullyShardedDataParallelConfig | None
-        ) = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
         Args:
             pg_collection: Model communication process groups.
             data_parallel_config: DDP or FSDP configuration; its type selects the backend.
-            ddp_config: Legacy configuration input, mutually exclusive with data_parallel_config.
+
             overlap_param_gather_with_optimizer_step: Whether to overlap parameter gather with optimizer step
             use_megatron_fsdp: Whether to use Megatron FSDP
             use_torch_fsdp2: Whether to use Torch FSDP 2.0

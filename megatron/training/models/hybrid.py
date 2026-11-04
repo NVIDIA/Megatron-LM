@@ -227,7 +227,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     def build_distributed_models(
         self,
         pg_collection: ProcessGroupCollection,
-        ddp_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
+        data_parallel_config: DistributedDataParallelConfig | FullyShardedDataParallelConfig | None = None,
         overlap_param_gather_with_optimizer_step: bool = False,
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
@@ -239,17 +239,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
-        *,
-        data_parallel_config: (
-            DistributedDataParallelConfig | FullyShardedDataParallelConfig | None
-        ) = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
         Args:
             pg_collection: Model communication process groups.
             data_parallel_config: DDP or FSDP configuration; its type selects the backend.
-            ddp_config: Legacy configuration input, mutually exclusive with data_parallel_config.
+
             overlap_param_gather_with_optimizer_step: Whether to overlap parameter
                 gather with optimizer step.
             use_megatron_fsdp: Whether to use Megatron FSDP
@@ -271,7 +267,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             self.build_model,
             transformer_config,
             pg_collection,
-            ddp_config,
+            data_parallel_config,
             overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp,
             use_torch_fsdp2,
@@ -282,7 +278,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
-            data_parallel_config=data_parallel_config,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

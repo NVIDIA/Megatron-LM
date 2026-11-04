@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Independent Megatron-FSDP configuration and explicit legacy conversion."""
+"""Configuration for Megatron-FSDP, independent of DDP."""
 
 import os
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -11,23 +11,6 @@ import torch
 from ..utils import is_torch_min_version
 
 _SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
-
-# Only the compatibility boundary knows the historical field names.
-_LEGACY_NAMES = {
-    "version": "megatron_fsdp_version",
-    "padded_shards": "megatron_fsdp_padded_shards",
-    "double_buffer": "fsdp_double_buffer",
-    "db_use_persist_buf_on_alloc_fail": "fsdp_db_use_persist_buf_on_alloc_fail",
-    "all_gather_in_start_param_sync": "fsdp_all_gather_in_start_param_sync",
-    "manual_registration": "fsdp_manual_registration",
-    "main_params_dtype": "megatron_fsdp_main_params_dtype",
-    "main_grads_dtype": "megatron_fsdp_main_grads_dtype",
-    "grad_comm_dtype": "megatron_fsdp_grad_comm_dtype",
-    "use_decoupled_grad": "megatron_fsdp_use_decoupled_grad",
-    "cuda_graph_mode": "megatron_fsdp_cuda_graph_mode",
-    "enable_fine_grained_param_gather": "megatron_fsdp_enable_fine_grained_param_gather",
-    "max_pool_double_buffer": "megatron_fsdp_max_pool_double_buffer",
-}
 
 
 @dataclass
@@ -41,6 +24,9 @@ class FullyShardedDataParallelConfig:
 
     version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
+
+    overlap_outer_communication: bool = False
+    """Overlap inner and outer collectives in Megatron-FSDP v2."""
 
     padded_shards: bool = True
     """For v2, pad parameter groups to equal shard sizes. False uses row-aligned,
@@ -285,6 +271,8 @@ class FullyShardedDataParallelConfig:
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "").split(","):
                 raise ValueError("expandable_segments:True is not supported with nccl_ub")
+        if self.overlap_outer_communication and self.version != 2:
+            raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
         if self.version == 2:
             for name in (
                 "db_use_persist_buf_on_alloc_fail",
@@ -328,23 +316,3 @@ class FullyShardedDataParallelConfig:
             ),
             double_buffer=self.double_buffer or self.max_pool_double_buffer,
         )
-
-    @classmethod
-    def from_ddp_config(cls, ddp_config) -> "FullyShardedDataParallelConfig":
-        """Convert legacy FSDP settings without changing the supplied DDP config."""
-        from .distributed_data_parallel_config import DistributedDataParallelConfig
-
-        if not isinstance(ddp_config, DistributedDataParallelConfig):
-            raise TypeError("ddp_config must be a DistributedDataParallelConfig")
-        kwargs = {
-            f.name: getattr(ddp_config, _LEGACY_NAMES.get(f.name, f.name)) for f in fields(cls)
-        }
-        # Legacy training resolves a bucket count into bucket_size in place. Its
-        # constructor already checked mutual exclusion before this derivation.
-        if kwargs["num_buckets"] is not None and kwargs["bucket_size"] is not None:
-            if kwargs["version"] == 1:
-                kwargs["num_buckets"] = None
-            else:
-                # Preserve the unsupported v2 request for the adapter to reject.
-                kwargs["bucket_size"] = None
-        return cls(**kwargs)

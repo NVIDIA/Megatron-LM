@@ -39,11 +39,7 @@ def FullyShardedDataParallel(
     device: Optional[torch.device] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> _BaseDataParallel:
-    """Construct Megatron-FSDP using its independent config.
-
-    Convert legacy DDP configurations explicitly with
-    ``FullyShardedDataParallelConfig.from_ddp_config`` before calling this factory.
-    """
+    """Construct Megatron-FSDP using its independent config."""
     if not isinstance(fsdp_config, FullyShardedDataParallelConfig):
         raise TypeError("fsdp_config must be a FullyShardedDataParallelConfig")
     fsdp_class = (

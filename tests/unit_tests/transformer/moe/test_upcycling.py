@@ -234,7 +234,7 @@ class TestGPTModel:
         builder = builder_cls(model_cfg)
         moe_model = builder.build_distributed_models(
             pg_collection=pg_collection,
-            ddp_config=cfg_container.ddp,
+            data_parallel_config=cfg_container.data_parallel,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
         )
 
@@ -377,7 +377,7 @@ class TestGPTModel:
         builder = builder_cls(model_cfg)
         moe_model = builder.build_distributed_models(
             pg_collection=pg_collection,
-            ddp_config=cfg_container.ddp,
+            data_parallel_config=cfg_container.data_parallel,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
         )
 

@@ -3,22 +3,12 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import torch
-
 from ..utils import is_torch_min_version
-
-# Sharding strategy names, ordered as the ZeRO ladder: each level shards one more
-# buffer than the last. Both data-parallel axes take a value from this set.
-_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
 
 
 @dataclass
 class DistributedDataParallelConfig:
-    """Configuration for DistributedDataParallel.
-
-    Legacy FSDP fields remain for loading and explicitly converting saved configs.
-    FSDP constructors require ``FullyShardedDataParallelConfig`` instead.
-    """
+    """Configuration for DistributedDataParallel and its distributed optimizer."""
 
     grad_reduce_in_fp32: bool = False
     """If true, reduce grads in fp32."""
@@ -95,51 +85,6 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
-    use_megatron_fsdp: bool = False
-    """If true, use the FSDP code path for DDP."""
-
-    megatron_fsdp_version: int = 1
-    """Megatron-FSDP implementation version. Valid values are 1 and 2."""
-
-    overlap_outer_communication: bool = False
-    """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
-    reductions on a separate CUDA stream."""
-
-    use_custom_fsdp: bool = False
-    """
-    NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
-    Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
-    Future updates will drop support for `use_custom_fsdp` to avoid confusion.
-    """
-
-    data_parallel_sharding_strategy: str = 'no_shard'
-    """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
-      'optim_grads', 'optim_grads_params'."""
-
-    expert_data_parallel_sharding_strategy: Optional[str] = None
-    """Sharding strategy applied to expert (MoE) parameters on DP-Shard. Valid values are
-      'no_shard', 'optim', 'optim_grads', 'optim_grads_params'. When set,
-      `data_parallel_sharding_strategy` only applies to non-expert parameters, which allows
-      trading DP-Shard communication against memory separately for the two parameter classes
-      (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
-      already sharded over a narrower DP group than non-expert parameters when expert
-      parallelism is enabled, so the two classes have very different traffic-per-byte.
-      None is replaced with `data_parallel_sharding_strategy` during initialization."""
-
-    gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion."""
-
-    suggested_communication_unit_size: int = None
-    """Specifies the number of elements to communicate at once during
-      FSDP (Fully Sharded Data Parallel) operations. 
-      This flag also affects FSDP all-gather prefetch behavior. Setting a larger
-      value increases the communication buffer size, while a smaller value
-      disables prefetching and may degrade performance. Adjust this value
-      based on your system's memory and performance requirements."""
-
-    keep_fp8_transpose_cache: bool = False
-    """If true, keep the fp8 transpose cache when using Megatron FSDP."""
-
     nccl_ub: bool = False
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
       This flag enables SM efficient nccl algorithm that could improve the performance
@@ -165,141 +110,14 @@ class DistributedDataParallelConfig:
     again without disturbing persistent parameter storage.
     """
 
-    fsdp_double_buffer: bool = False
-    """If true, use persistently allocated double buffers for the 
-      temporary memory needed in the Megatron FSDP communications.
-      This option will cause additional memory overhead, however, it is necessary for
-      to register user buffer (nccl_ub=True) for the Megatron FSDP. 
-      This option will be automatically set to True when nccl_ub=True.
-    """
-
-    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
-    """Whether to fall back to persistent buffer when a bucket does not
-       fit FSDP double buffer size. If true, FSDP will use the persistently 
-       allocated buffer for the bucket that does not fit, it will enable NCCL 
-       user buffer with the cost of more memory usage. If false, FSDP will use
-       Dynamic memory allocator, NCCL user buffer won't not enabled, which 
-       usually leads to low performance.
-    """
-
-    fsdp_all_gather_in_start_param_sync: bool = True
-    """
-    If True, use all-gather during the initial Megatron-FSDP parameter
-    synchronization step. This can increase overlap between the first
-    parameter all-gather and computation, helping to better hide the
-    initial communication cost. Should be deactivated when using
-    full-iteration CG, or partial CG if AG/RS is launched beyond the
-    CG capture scope but is waited on during the capture scope.
-    """
-
-    outer_dp_sharding_strategy: str = 'no_shard'
-    """
-    Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
-    Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
-    """
-
-    expert_outer_dp_sharding_strategy: Optional[str] = None
-    """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
-    Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
-    ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during initialization.
-    """
-
     disable_symmetric_registration: bool = False
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
       This option will force to use conventional (local) userbuffer registration 
       when nccl_ub is set.
     """
 
-    fsdp_manual_registration: bool = False
-    """If true, manually register the FSDP communication buffers to NCCL user buffer.
-      This option is only effective when use_megatron_fsdp and nccl_ub is set.
-      For symmetric registration with large models, the registration itself can take 
-      a significant amount of time. This option minimizes the number of registration calls
-      to minimize the registration time.
-    """
-
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
-
-    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
-    """Data type for the main weight buffer utilized for distributed optimization
-      and quantization with Megatron-FSDP. If set to None, the model compute weight
-      buffer will take the role of the main weights, or when no sharding is applied,
-      the native model weights become the main weights. Defaults to torch.float32.
-    """
-
-    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
-    """Data type for the main gradient buffer utilized for distributed optimization with
-      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
-      compute parameters specified by the user model. Defaults to None.
-    """
-
-    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
-    """Data type for gradient gather / scatter communications. Can be utilized to reduce
-      communication latency, but adds overhead for type-casting and copy operations.
-      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
-      depending on the network domain (NVLink or IB), and can enable mixed-precision
-      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
-      `FP32` reduction even though we have `BF16` input and output communication buffers.
-      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
-      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
-      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
-      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
-      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
-    """
-
-    megatron_fsdp_use_decoupled_grad: bool = False
-    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
-      gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
-      main gradients to parameter dtype for `.grad`.
-    """
-
-    megatron_fsdp_cuda_graph_mode: bool = False
-    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
-    not dereferencing `param.grad` after the optimizer step to preserve references for
-    CUDA graph replay. Can affect memory utilization in some cases, such as when the
-    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
-    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
-    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
-    recommended to avoid casting the gradient to the parameter precision and creating
-    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
-    """
-
-    megatron_fsdp_enable_fine_grained_param_gather: bool = False
-    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
-      This feature increases the overlap between parameter all-gather and forward computation,
-      at the cost of more frequent communication calls.
-      For MXFP8, this approach helps save memory during fine-grained activation
-      recomputation, because MXFP8 forward and backward passes use different
-      parameter representations (rowwise data for forward, colwise data for backward).
-      In this mode, only the rowwise parameters of modules involved in recomputation
-      will be unsharded.
-    """
-
-    megatron_fsdp_padded_shards: bool = True
-    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
-    gets an equal shard. If false, pack the group without padding and split it into
-    generally unequal per-rank shards at row boundaries (32-row block boundaries for
-    MXFP8), which saves the padding memory and communication but is incompatible with
-    nccl_ub (symmetric memory).
-    """
-
-    megatron_fsdp_max_pool_double_buffer: bool = False
-    """
-    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
-    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
-    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
-    user buffer registration and CUDA graph replay for models with asymmetrical
-    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
-    """
-
-    hfsdp_param_gather_overlap: bool = False
-    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
-    communication domains. DP-Inner retains its size-based prefetch policy, while
-    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
-    Only effective with ``outer_dp_sharding_strategy='optim'``.
-    """
 
     @property
     def param_sync_via_bucket_group(self) -> bool:
@@ -333,30 +151,6 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        if self.expert_data_parallel_sharding_strategy is None:
-            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
-        if self.expert_outer_dp_sharding_strategy is None:
-            self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
-
-        for name in (
-            "data_parallel_sharding_strategy",
-            "expert_data_parallel_sharding_strategy",
-            "outer_dp_sharding_strategy",
-            "expert_outer_dp_sharding_strategy",
-        ):
-            value = getattr(self, name)
-            if value not in _SHARDING_STRATEGIES:
-                raise ValueError(
-                    f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
-                )
-        if self.megatron_fsdp_version not in (1, 2):
-            raise ValueError("megatron_fsdp_version must be either 1 or 2")
-        if self.overlap_outer_communication:
-            if not self.use_megatron_fsdp:
-                raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
-            if self.megatron_fsdp_version != 2:
-                raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
-
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
@@ -382,7 +176,3 @@ class DistributedDataParallelConfig:
         if self.num_buckets is not None:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
-
-        if self.megatron_fsdp_max_pool_double_buffer:
-            # MaxPoolAllocator is a type of double-buffer allocator.
-            self.fsdp_double_buffer = True

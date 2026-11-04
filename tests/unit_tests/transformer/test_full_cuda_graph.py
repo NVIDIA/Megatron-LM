@@ -75,7 +75,7 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
         wrapped_model = _ddp_wrap(
             [model],
             data_parallel_random_init=False,
-            ddp_config=ddp_config,
+            data_parallel_config=ddp_config,
             overlap_param_gather_with_optimizer_step=False,
             pg_collection=process_groups,
         )[0]
