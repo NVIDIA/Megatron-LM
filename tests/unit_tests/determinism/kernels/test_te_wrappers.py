@@ -308,6 +308,47 @@ class TestTEWrappers:
         if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
             assert head.weight.grad._is_zerotensor()
 
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell")
+    @pytest.mark.parametrize("fp8_param", [False, True], ids=["bf16-param", "mxfp8-param"])
+    def test_fp4_dense_mxfp8_linear_replays(self, fp8_param):
+        """A non-expert linear of an FP4 model with fp4_dense_mxfp8, which runs it in MXFP8
+        inside the NVFP4 autocast."""
+        from megatron.core.fp4_utils import get_fp4_context
+
+        seeded()
+        config = _config(
+            fp4="e2m1", fp4_param=fp8_param, fp4_dense_mxfp8=True, fp4_dense_mxfp8_param=fp8_param
+        )
+        with get_fp4_context(config, is_init=True):
+            module = TELayerNormColumnParallelLinear(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+            ).cuda()
+        assert is_mxfp8tensor(module.weight) is fp8_param
+
+        class UnderFp4Autocast(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = module
+
+            def forward(self, x):
+                with get_fp4_context(config):
+                    return self.linear(x)[0]
+
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            UnderFp4Autocast(), (x,), replays=3, contention=True, what="fp4_dense_mxfp8 linear"
+        )
+        assert module.fp8_meta["recipe"].mxfp8()
+
     @pytest.mark.parametrize(
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
