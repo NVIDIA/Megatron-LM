@@ -2069,6 +2069,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
                 : self.padded_active_token_count
             ]
+            # Padding tokens just wrote their latents, which can be non-finite, into the dummy
+            # block. Block tables fill unused entries with it, and decode kernels that load KV
+            # in 128-token tiles (FlashInfer's TRTLLM-GEN MLA) read it past a request's last
+            # page when the request has an odd number of pages, multiplying its rows by masked
+            # (zero) probabilities. Keep it zero so that those products are zero.
+            self.memory_buffer[attention_layer_number, self.kv_block_allocator.dummy_block_idx] = 0
         else:
             self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
                 : self.padded_active_token_count

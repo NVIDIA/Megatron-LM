@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import functools
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -36,7 +38,12 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention, LinearProjBuilder
+from megatron.core.transformer.attention import (
+    Attention,
+    LinearProjBuilder,
+    prepare_flashinfer_mla_decode,
+    resolve_absorbed_mla_decode_kernel,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -47,6 +54,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
     is_te_min_version,
+    log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
 )
 
@@ -123,6 +131,20 @@ else:
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_unabsorbed_decode(reason: str) -> None:
+    """Warn, once per reason, that MLA layers decode without an absorbed kernel."""
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Dynamic MLA decode steps run unabsorbed: {reason}. Each decode step up-projects "
+        "the layer's whole latent cache to keys and values and runs FlashAttention over them, "
+        "as a mixed step does, which makes decoding much slower.",
+    )
 
 
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
@@ -340,6 +362,19 @@ class MultiLatentAttention(Attention):
             )
         )
         self.cache_mla_latents = self.config.cache_mla_latents
+        # The kernel for absorbed decode over the cached latents on this device, or None if
+        # none covers this layer (see _absorbs_cached_latents).
+        self.absorbed_decode_kernel = None
+        if self.cache_mla_latents:
+            self.absorbed_decode_kernel, reason = resolve_absorbed_mla_decode_kernel(
+                self.config, self.num_attention_heads_per_partition
+            )
+            if self.absorbed_decode_kernel is None and not self.batch_invariant_mode:
+                _warn_unabsorbed_decode(reason)
+        if self.absorbed_decode_kernel == "flashinfer":
+            # Before the KV cache and any CUDA-graph capture, so a failure shows here and not
+            # at the first decode step.
+            prepare_flashinfer_mla_decode(torch.cuda.current_device())
 
         if self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
@@ -457,6 +492,23 @@ class MultiLatentAttention(Attention):
                 self.core_attention.hidden_size_per_attention_head_v = orig_v_head_dim
 
         return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
+
+    def _absorbs_cached_latents(self, inference_context: BaseInferenceContext) -> bool:
+        """Whether this step attends over the cached latents with absorbed attention.
+
+        Only decode-only steps absorb, and only on devices with a decode kernel for this layer
+        (``absorbed_decode_kernel``: FlashMLA on SM90, FlashInfer on SM100 and SM103). Every
+        other step up-projects the cached latents and runs unabsorbed attention, the math
+        training uses. Batch-invariant mode never absorbs: the decode kernels derive their
+        split-KV schedule from the whole batch, and absorbed and unabsorbed attention round
+        differently, so a request's output would depend on its co-batch.
+        """
+        return (
+            self.cache_mla_latents
+            and self.absorbed_decode_kernel is not None
+            and not self.batch_invariant_mode
+            and inference_context.is_decode_only()
+        )
 
     def forward(
         self,
@@ -592,6 +644,9 @@ class MultiLatentAttention(Attention):
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                # Absorbed steps run the device's MLA decode kernel over the latents; all others
+                # run the varlen kernel over the up-projected keys and values.
+                absorbed = self._absorbs_cached_latents(inference_context)
 
                 core_attn_out = self.flash_decode_and_prefill(
                     q,
@@ -603,10 +658,11 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
-                    inference_context.is_decode_only(),
+                    absorbed,
+                    softmax_offset=self._get_inference_softmax_offset(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
+                if not absorbed:
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
             forced = [
@@ -619,7 +675,7 @@ class MultiLatentAttention(Attention):
             )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if self._absorbs_cached_latents(inference_context):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -1017,13 +1073,8 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
 
-            # Flag for whether to use absorption. We only use absorption
-            # when caching the latents and in decode-only mode
-            use_absorption = (
-                self.config.cache_mla_latents
-                and inference_context
-                and inference_context.is_decode_only()
-            )
+            # Flag for whether to use absorption (see _absorbs_cached_latents).
+            use_absorption = inference_context and self._absorbs_cached_latents(inference_context)
             # Compute query components. Multiply by up k if absorbing
             q_content = (
                 torch.einsum("sbhd,hdk->sbhk", q_no_pe, self.up_k_weight)

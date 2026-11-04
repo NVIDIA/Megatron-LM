@@ -20,6 +20,11 @@ constraints = [
 ]
 overrides = [
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "sys_platform == 'never'", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'never'", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "sys_platform == 'never'", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'never'", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'never'", index = "https://flashinfer.ai/whl/cu130" },
     { name = "tilelang", specifier = "==0.1.12" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
@@ -1522,6 +1527,85 @@ version = "1.0.0+9edee0c"
 source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev#b7643bd54521f563b839b98289b5cd048c062ba2" }
 
 [[package]]
+name = "flashinfer-cubin"
+version = "0.7.2.post1"
+source = { registry = "https://flashinfer.ai/whl" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_cubin-0.7.2.post1-py3-none-any.whl", hash = "sha256:1998c7006bcc06ee5dd3208a682af247382c6710d6b370a961381262c04c11f0" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+dependencies = [
+    { name = "flashinfer-jit-cache-sm100a" },
+    { name = "flashinfer-jit-cache-sm103a" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "sys_platform == 'never'" },
+    { name = "flashinfer-jit-cache-sm120f", marker = "sys_platform == 'never'" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "sys_platform == 'never'" },
+    { name = "flashinfer-jit-cache-sm80", marker = "sys_platform == 'never'" },
+    { name = "flashinfer-jit-cache-sm89", marker = "sys_platform == 'never'" },
+    { name = "flashinfer-jit-cache-sm90a" },
+]
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8449156043036d240f3581c25e6883810f7ea6d656f56e78183b39eee9066877" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5a0a92ce56e11c19cec31948a4828b245314377eb587fe17307730b096225500" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm100a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ed6c128c4033de6fb6edbd1743a008ee70d9a3d4c8d1b60b45d821bd7e4143a2" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:2d118fdb9a4a403ae22c08192830885eb27aba6d363ffa9c88758c7a51d1c126" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm103a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8883759aaf289b8d494f714bb28766c9bef2e84fe6115d439d10e2417a8c7ae3" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c9c8430cd8c49d80edc44af820d4817c1c1b99cbe738c40034b41a44403ec5c7" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm110a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+
+[[package]]
+name = "flashinfer-jit-cache-sm120f"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+
+[[package]]
+name = "flashinfer-jit-cache-sm121a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+
+[[package]]
+name = "flashinfer-jit-cache-sm80"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+
+[[package]]
+name = "flashinfer-jit-cache-sm89"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+
+[[package]]
+name = "flashinfer-jit-cache-sm90a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:3bd375e978255d3215ee69da3434ca4b9dcce7a2d655c5d3445cd048fcc62096" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:52e5cc064b52290dad2f8889ee0eb5cd59621dfac8351841e4b3987d42d034a3" },
+]
+
+[[package]]
 name = "flashinfer-python"
 version = "0.7.2.post1"
 source = { registry = "https://pypi.org/simple" }
@@ -2699,6 +2783,14 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+flashinfer-kernels = [
+    { name = "flashinfer-cubin" },
+    { name = "flashinfer-jit-cache" },
+    { name = "flashinfer-jit-cache-sm100a" },
+    { name = "flashinfer-jit-cache-sm103a" },
+    { name = "flashinfer-jit-cache-sm90a" },
+    { name = "flashinfer-python" },
+]
 linting = [
     { name = "black" },
     { name = "flake8" },
@@ -2809,6 +2901,14 @@ docs = [
     { name = "sphinx-autobuild" },
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
+]
+flashinfer-kernels = [
+    { name = "flashinfer-cubin", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl" },
+    { name = "flashinfer-jit-cache", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm100a", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm103a", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm90a", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-python", specifier = "==0.7.2.post1" },
 ]
 linting = [
     { name = "black", specifier = "==26.3.0" },

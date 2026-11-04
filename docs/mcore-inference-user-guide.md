@@ -95,7 +95,7 @@ the configurations they have been exercised in.
 | Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature; primary optimization target to date |
 | GPT-style dense | TP, PP; chunked prefill, prefix caching, CUDA graphs, speculative decoding | Mature |
 | MoE | TP with EP; expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
-| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
+| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` (Hopper) or FlashInfer (Blackwell) | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
 | Gated Delta Net and Gated Delta Product | Dynamic batching only | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 | Vision-language | Image inputs only, `PP=1` | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 
@@ -164,6 +164,14 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
+>
+> MLA models with `cache_mla_latents` (required for dynamic batching) are
+> supported, with `flash_attention_version` 3 or 4 as above. Their decode-only
+> steps then skip the absorbed decode kernel (FlashMLA or FlashInfer), whose
+> split-KV schedule depends on the whole batch.
+> Like mixed steps and training, they run unabsorbed attention: each layer
+> up-projects the latent cache to keys and values and runs FlashAttention with
+> one KV split. A decode step therefore costs about as much as a mixed step.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
@@ -1065,8 +1073,19 @@ is the opposite of the `MegatronLLM` constructor default.
   inference also requires `PP=1` (pipeline and virtual pipeline parallelism both
   raise), and in-core static-tiling preprocessing was removed — clients needing
   static tiling must submit a preprocessed tensor payload.
-- **MLA requires a specific configuration.** `cache_mla_latents=True`, a KV block
-  size of exactly 64, and the `flash_mla` package. RoPE fusion, sliding-window
+- **MLA requires a specific configuration.** `cache_mla_latents=True` and a KV block
+  size of exactly 64. Decode-only steps run absorbed attention over the latent
+  cache: FlashMLA (the `flash_mla` package) on Hopper, FlashInfer's TRTLLM-GEN
+  MLA decode on Blackwell (SM100 and SM103, bf16, up to 64 or a multiple of 64
+  heads per tensor-parallel rank), both for a latent rank of 512 plus a 64-dim
+  RoPE part. On Blackwell, FlashInfer's prebuilt kernels must also be installed
+  at FlashInfer's version (`flashinfer-cubin` and the `flashinfer-jit-cache`
+  provider of the GPU, which `uv sync --group flashinfer_kernels` or
+  `flashinfer download-kernels` installs), so that no decode step downloads
+  cubins or compiles. Batch-invariant mode skips absorption, and so do layers
+  neither kernel covers, with a warning when the model is built: each decode step
+  up-projects the layer's whole latent cache and runs FlashAttention 3 or 4, as in
+  mixed steps, which makes decoding much slower. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all
   incompatible with the latent cache.
 - **GDN2 is not supported.** `experimental_attention_variant='gdn2'` raises

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -13,7 +14,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.contexts.zero_padding_rows_kernel import zero_padding_rows
+from megatron.core.inference.utils import InferenceMode, missing_flashinfer_prebuilt_kernels
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -108,6 +110,15 @@ except ImportError:
     flash_mla_with_kvcache = None
     get_mla_metadata = None
     HAVE_FMLA = False
+
+try:
+    from flashinfer.mla import get_trtllm_gen_fmha_module, trtllm_batch_decode_with_kv_cache_mla
+
+    HAVE_FLASHINFER_MLA = True
+except ImportError:
+    get_trtllm_gen_fmha_module = None
+    trtllm_batch_decode_with_kv_cache_mla = None
+    HAVE_FLASHINFER_MLA = False
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
@@ -283,6 +294,122 @@ class CrossAttentionSubmodules:
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: LinearProjBuilder
+
+
+def _missing_flashinfer_mla_kernels() -> Optional[str]:
+    """What FlashInfer lacks to run its TRTLLM-GEN MLA decode from prebuilt kernels, or None.
+
+    That decode runs the TRTLLM-GEN FMHA cubins (flashinfer-cubin) through a compiled launcher,
+    the ``fmha_gen`` module (flashinfer-jit-cache). Without them, FlashInfer downloads the cubins
+    and nvcc-compiles the launcher at its first call, inside CUDA-graph warmup: that fails
+    without network access and otherwise stalls for minutes.
+    """
+    try:
+        from flashinfer.artifacts import ArtifactPath
+
+        return missing_flashinfer_prebuilt_kernels(
+            aot_modules=("fmha_gen",), cubin_dirs=(ArtifactPath.TRTLLM_GEN_FMHA,)
+        )
+    except (ImportError, AttributeError):
+        return "this FlashInfer version does not lay out its prebuilt kernels as 0.7 does"
+
+
+def resolve_absorbed_mla_decode_kernel(
+    config: MLATransformerConfig, num_attention_heads: int
+) -> Tuple[Optional[str], str]:
+    """The kernel get_absorbed_mla_decode_kernel returns, and why none covers the layer when it
+    returns None."""
+    if (config.kv_lora_rank, config.qk_pos_emb_head_dim) != (512, 64):
+        return None, (
+            "the MLA decode kernels take kv_lora_rank 512 with a 64-dim RoPE part, not "
+            f"{config.kv_lora_rank} with {config.qk_pos_emb_head_dim}"
+        )
+    if not torch.cuda.is_available():
+        return None, "CUDA is not available"
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) == (9, 0):
+        return ("flash_mla", "") if HAVE_FMLA else (None, "flash_mla is not installed")
+    if major != 10:
+        return None, f"no MLA decode kernel runs on compute capability {major}.{minor}"
+    if not HAVE_FLASHINFER_MLA:
+        return None, "FlashInfer is not installed"
+    if config.params_dtype != torch.bfloat16:
+        return None, f"FlashInfer's MLA decode is bf16-only, not {config.params_dtype}"
+    if not (num_attention_heads <= 64 or num_attention_heads % 64 == 0):
+        return None, (
+            f"FlashInfer's TRTLLM-GEN MLA decode has no kernel for {num_attention_heads} heads "
+            "per rank, only for up to 64 and for multiples of 64"
+        )
+    missing = _missing_flashinfer_mla_kernels()
+    if missing is not None:
+        return None, (
+            f"FlashInfer's prebuilt kernels are missing: {missing} (`flashinfer download-kernels`, "
+            "or `uv sync --group flashinfer_kernels`, installs them)"
+        )
+    return "flashinfer", ""
+
+
+def get_absorbed_mla_decode_kernel(
+    config: MLATransformerConfig, num_attention_heads: int
+) -> Optional[str]:
+    """Return the kernel that runs absorbed MLA decode over the cached latents on this device.
+
+    ``"flash_mla"`` is FlashMLA's dense decode, which exists only for SM90. ``"flashinfer"`` is
+    FlashInfer's TRTLLM-GEN MLA decode for SM100 and SM103. It takes the same 64-token latent
+    pages, in bf16 only, and tiles heads by up to 64: it has kernels for up to 64 heads per rank
+    and for multiples of 64. It is picked only when FlashInfer's prebuilt kernel wheels are
+    installed, so a decode step never downloads cubins or compiles. Both need DeepSeek's latent
+    shape (``kv_lora_rank`` 512 plus a 64-dim RoPE part). Returns None when no kernel covers the
+    layer on this device: its decode steps then up-project the cached latents like every other
+    step.
+    """
+    return resolve_absorbed_mla_decode_kernel(config, num_attention_heads)[0]
+
+
+@functools.lru_cache(maxsize=None)
+def get_flashinfer_mla_workspace(device: int) -> Tensor:
+    """FlashInfer's MLA decode workspace for ``device``, which holds the partial results of its
+    split-KV launches. Layers run one at a time, so all of them share it."""
+    return torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+
+def prepare_flashinfer_mla_decode(device: int) -> None:
+    """Allocate FlashInfer's MLA decode workspace on ``device`` and load its TRTLLM-GEN module.
+
+    get_absorbed_mla_decode_kernel picks FlashInfer only when its prebuilt kernels are installed,
+    so loading the module reads them from disk and neither downloads nor compiles anything.
+    """
+    get_flashinfer_mla_workspace(device)
+    get_trtllm_gen_fmha_module()
+
+
+# Per device, the semaphore buffers handed to FlashInfer's MLA decode, the largest last. Smaller,
+# earlier ones stay referenced, since CUDA graphs captured with them keep their addresses.
+_flashinfer_mla_counter_buffers: Dict[int, List[Tensor]] = {}
+
+
+def get_flashinfer_mla_counter_buffer(
+    device: torch.device, num_requests: int, num_heads: int
+) -> Optional[Tensor]:
+    """Zeroed semaphores for the split-KV reduction of FlashInfer's TRTLLM-GEN MLA decode: one
+    int32 per request and head, at least one per SM, rounded up to 8.
+
+    The kernel resets the semaphores after each launch, so a buffer zeroed once serves every
+    later call on the device, where FlashInfer would allocate and zero one per call. A larger
+    buffer is allocated only outside CUDA-graph capture, so its zeroing has run before any
+    kernel reads it; a call captured before one exists gets None, and FlashInfer then zeroes
+    its own inside the graph.
+    """
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    num_bytes = 4 * (-(-max(num_requests * num_heads, sm_count) // 8) * 8)
+    buffers = _flashinfer_mla_counter_buffers.setdefault(device.index, [])
+    if buffers and buffers[-1].numel() >= num_bytes:
+        return buffers[-1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    # Round up so that slowly growing batches allocate rarely.
+    buffers.append(torch.zeros(1 << (num_bytes - 1).bit_length(), dtype=torch.uint8, device=device))
+    return buffers[-1]
 
 
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
@@ -740,11 +867,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            if (
-                getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
-            ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+            cache_mla_latents = getattr(self.config, "cache_mla_latents", None)
+            if cache_mla_latents and not self._absorbs_cached_latents(inference_context):
+                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode, and
+                # every step in batch-invariant mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
@@ -1105,7 +1231,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 the attention probabilities match
                 ``exp(qk_i) / (exp(softmax_offset) + sum_j exp(qk_j))`` —
                 the same denominator-with-sink formulation used by the
-                static-inference path (TE / DotProductAttention).
+                static-inference path (TE / DotProductAttention). FlashInfer's
+                MLA decode kernel takes the sink itself.
         Return:
             (Tensor) Attention output.
         """
@@ -1234,51 +1361,87 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 tokens_per_request = q.shape[0] // num_requests
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
-            # If using MLA we use the FlashMLA kernel
+            # MLA layers run the absorbed decode kernel chosen for this device
+            # (get_absorbed_mla_decode_kernel) over the cached latents.
             # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
             # standard Attention.
             if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
-                # FlashMLA does not currently support sliding window attention.
+                # The MLA decode kernels do not support sliding window attention.
                 assert window_size == (-1, -1), (
-                    "FlashMLA decode kernel does not support sliding window attention. "
+                    "MLA decode kernels do not support sliding window attention. "
                     "Set config.window_size = None or use a non-MLA attention layer."
                 )
                 assert self.config.attn_logit_softcapping is None, (
-                    "FlashMLA decode kernel does not support attention logit softcapping. "
+                    "MLA decode kernels do not support attention logit softcapping. "
                     "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
                 softmax_scale = self.softmax_scale
                 assert softmax_scale is not None
 
-                num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = tokens_per_request
-                num_heads_q = self.num_attention_heads_per_partition
-                num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
-
-                cache_seqlens = seqlens_k
-                tile_scheduler_metadata, num_splits = get_mla_metadata(
-                    cache_seqlens,  # cumulative key-lengths
-                    num_heads_per_head_k,  # decode-only lengths
-                    num_heads_k,  # per-head dim of V
-                )
-                head_dim_v = self.config.kv_lora_rank
-                kv_cache = k.unsqueeze(-2)
-                output_total, softmax_lse = flash_mla_with_kvcache(
-                    q,
-                    kv_cache,
-                    block_table,
-                    cache_seqlens,
-                    head_dim_v,
-                    tile_scheduler_metadata,
-                    num_splits,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                )
-                if need_lse:
-                    # output_total: (B, S, H, D_v); softmax_lse: (B, H, S)
-                    output_total = self._apply_sink_softmax_correction_bshd(
-                        output_total, softmax_lse, softmax_offset
+                if self.absorbed_decode_kernel == "flashinfer":
+                    # TRTLLM-GEN explicitly: "auto" also weighs a CuTe DSL kernel and then
+                    # requires the block table to span a multiple of 128 tokens, which MTP's
+                    # lookahead block can break.
+                    output_total = trtllm_batch_decode_with_kv_cache_mla(
+                        query=q,
+                        kv_cache=k,
+                        workspace_buffer=get_flashinfer_mla_workspace(q.device.index),
+                        qk_nope_head_dim=self.config.qk_head_dim,
+                        kv_lora_rank=self.config.kv_lora_rank,
+                        qk_rope_head_dim=self.config.qk_pos_emb_head_dim,
+                        block_tables=block_table,
+                        seq_lens=seqlens_k,
+                        # The KV split is planned from max_seq_len, which must bound every
+                        # request's KV length (MTP lookahead can pass max_sequence_length). The
+                        # block table's capacity does, and stays fixed across CUDA-graph replays.
+                        max_seq_len=block_table.shape[1] * k.shape[1],
+                        bmm1_scale=softmax_scale,
+                        # The kernel adds exp(sink) to each head's softmax denominator.
+                        sinks=None if softmax_offset is None else softmax_offset.float(),
+                        backend="trtllm-gen",
+                        multi_ctas_kv_counter_buffer=get_flashinfer_mla_counter_buffer(
+                            q.device, q.shape[0], q.shape[2]
+                        ),
                     )
+                else:
+                    num_heads_k = 1  # Only a single head for MLA Flash
+                    seq_len_q = tokens_per_request
+                    num_heads_q = self.num_attention_heads_per_partition
+                    num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
+
+                    cache_seqlens = seqlens_k
+                    tile_scheduler_metadata, num_splits = get_mla_metadata(
+                        cache_seqlens,  # cumulative key-lengths
+                        num_heads_per_head_k,  # decode-only lengths
+                        num_heads_k,  # per-head dim of V
+                    )
+                    head_dim_v = self.config.kv_lora_rank
+                    kv_cache = k.unsqueeze(-2)
+                    output_total, softmax_lse = flash_mla_with_kvcache(
+                        q,
+                        kv_cache,
+                        block_table,
+                        cache_seqlens,
+                        head_dim_v,
+                        tile_scheduler_metadata,
+                        num_splits,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                    )
+                    if need_lse:
+                        # output_total: (B, S, H, D_v); softmax_lse: (B, H, S)
+                        output_total = self._apply_sink_softmax_correction_bshd(
+                            output_total, softmax_lse, softmax_offset
+                        )
+                # Padding requests (KV length 0) come last and have no query rows in
+                # cu_seqlens_q. The decode kernels can leave their output rows non-finite
+                # (TRTLLM-GEN does at 48 heads or fewer), and those rows flow on into later
+                # norms and MoE routing, so zero every row from cu_seqlens_q[-1] on. The count
+                # is read on device: no host sync, and it follows each CUDA-graph replay.
+                zero_padding_rows(
+                    output_total.view(output_total.shape[0] * output_total.shape[1], -1),
+                    cu_seqlens_q[-1:],
+                )
             else:
                 if use_fa4:
                     softmax_scale = self.get_softmax_scale(q)

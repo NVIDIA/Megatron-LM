@@ -194,6 +194,18 @@ linting = [
 ci = ["python-gitlab", "slack-sdk", "pandas"]
 batch_invariant = ["deep_gemm"]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
+# FlashInfer's prebuilt kernels, which Blackwell MLA decode needs so that it never downloads cubins
+# or compiles at a decode step: the TRTLLM-GEN cubins, and the compiled launchers of the CI GPUs
+# (SM90, SM100, SM103). They must match flashinfer-python exactly, so bump all six together. They
+# are not on PyPI; the indexes are pinned in [tool.uv.sources].
+flashinfer_kernels = [
+    "flashinfer-python==0.7.2.post1",
+    "flashinfer-cubin==0.7.2.post1",
+    "flashinfer-jit-cache==0.7.2.post1",
+    "flashinfer-jit-cache-sm90a==0.7.2.post1",
+    "flashinfer-jit-cache-sm100a==0.7.2.post1",
+    "flashinfer-jit-cache-sm103a==0.7.2.post1",
+]
 
 [tool.uv]
 managed = true
@@ -223,6 +235,13 @@ override-dependencies = [
     "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
+    # flashinfer-jit-cache requires a launcher wheel per GPU architecture (more on aarch64);
+    # keep only those of the CI GPUs (see the flashinfer_kernels group).
+    "flashinfer-jit-cache-sm80; sys_platform == 'never'",
+    "flashinfer-jit-cache-sm89; sys_platform == 'never'",
+    "flashinfer-jit-cache-sm110a; sys_platform == 'never'",
+    "flashinfer-jit-cache-sm120f; sys_platform == 'never'",
+    "flashinfer-jit-cache-sm121a; sys_platform == 'never'",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -253,6 +272,18 @@ name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
+# FlashInfer's kernel wheels (flashinfer_kernels group): explicit, so only the packages pinned to
+# them in [tool.uv.sources] come from these indexes.
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
 [tool.uv.sources]
 
 flash_mla = [
@@ -266,6 +297,17 @@ fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-tr
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
 torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
+flashinfer-cubin = { index = "flashinfer" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# The launcher wheels, including those overridden away: uv resolves an override's source too.
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

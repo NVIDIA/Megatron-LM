@@ -152,9 +152,15 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     if [ -n "${NVTE_BUILD_THREADS_PER_JOB:-}" ]; then
         export NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-$(( (${MAX_JOBS:-$(nproc)} + NVTE_BUILD_THREADS_PER_JOB - 1) / NVTE_BUILD_THREADS_PER_JOB ))}"
     fi
+    # FlashInfer's prebuilt kernels (flashinfer_kernels group, locked with their hashes), which
+    # Blackwell MLA decode needs to pick FlashInfer. The LTS image has no FlashInfer from the lock.
+    FLASHINFER_KERNELS_GROUP=""
+    if [ "$IMAGE_TYPE" != "lts" ]; then
+        FLASHINFER_KERNELS_GROUP="--group flashinfer_kernels"
+    fi
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
-        --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} ${FLASHINFER_KERNELS_GROUP} --link-mode copy --locked \
         --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
