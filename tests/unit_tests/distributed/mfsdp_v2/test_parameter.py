@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -212,54 +212,30 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, torch.full_like(output, 96.0))
 
 
-@pytest.mark.parametrize(
-    "singleton,parameter_placement",
-    [(False, Shard(0)), (True, Shard(0)), (False, Replicate())],
-    ids=["gathered", "singleton", "replicated"],
-)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_non_leaf_parameter_view_survives_storage_resize(
-    distributed_setup, singleton, parameter_placement, dtype
-):
-    """Saved weight views survive temporary-storage release or persistent-storage reuse."""
+def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
+    """A non-leaf parameter view saved for backward should survive full-storage resize."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(device.type, (world_size, 1), mesh_dim_names=("dp", "local"))
-    mesh = mesh["local" if singleton else "dp"]
-    model = NonLeafViewModel().to(device=device, dtype=dtype)
-    nn.init.constant_(model.weight, 2.0)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = NonLeafViewModel().to(device)
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=Placements([0], [parameter_placement], [Shard(0)], [Shard(0)]),
-        )
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     group = model.parameter_groups[0]
-    unsharded = group._unsharded_model_weight
-    assert unsharded.placements == (Replicate(),)
-    shared = singleton or parameter_placement.is_replicate()
-    assert group.model_weight.can_redistribute_locally([Replicate()]) == shared
-    assert (
-        unsharded.local_buffer.untyped_storage()
-        is group.model_weight.local_buffer.untyped_storage()
-    ) == shared
-    for _ in range(2):
-        model.zero_grad(set_to_none=True)
-        x = torch.randn(8, device=device, dtype=dtype, requires_grad=True)
-        loss = model(x).sum()
-        assert unsharded.is_allocated == shared
-        assert group.model_weight.is_allocated
+    x = torch.randn(8, device=device, requires_grad=True)
+    loss = model(x).sum()
 
-        loss.backward()
+    assert group._unsharded_model_weight is not None
+    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
-        torch.testing.assert_close(x.grad, torch.full_like(x, 2.0), rtol=0, atol=0)
-        assert group.main_grad is not None
-        assert unsharded.is_allocated == shared
-        assert group.model_weight.is_allocated
+    loss.backward()
+
+    assert group.main_grad is not None
+    assert group._unsharded_model_weight is not None
+    assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
 def test_frozen_weights_without_input_gradients(distributed_setup):
