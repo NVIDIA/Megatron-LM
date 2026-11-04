@@ -4316,8 +4316,8 @@ class TestMultiTokenPredictionHybrid:
             assert stack.residual_stream_readout is None
             assert len(stack.layers) == 2
             attention, moe = stack.layers
-            assert attention._get_self_attention_residual_connection(operation="read") is None
-            assert moe._get_mlp_residual_connection(operation="read") is None
+            assert attention._get_residual_connection_for_self_attention(operation="read") is None
+            assert moe._get_residual_connection_for_mlp(operation="read") is None
             assert list(moe.pre_mlp_layernorm.parameters()), "MTP must retain its MoE norm"
             calls = {"attention": [], "norm": []}
             recordings.append((moe, calls))
