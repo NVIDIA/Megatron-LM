@@ -11,12 +11,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.tensor_parallel import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    gather_from_sequence_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
-)
+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 
@@ -967,13 +962,27 @@ if HAVE_TE:
         2. Run the original forward pass
         3. Unpad outputs to original sequence length
 
+        With sequence parallelism, the module itself all-gathers its input (column-parallel)
+        or reduce-scatters its output (row-parallel) along the sequence, one chunk per
+        tensor-parallel rank. Each chunk is then padded separately, so that the chunk
+        boundaries stay aligned with the ranks and the module's communication is unchanged.
+
         Args:
             module: A Transformer Engine linear layer (TELinear, TEColumnParallelLinear, etc.)
         """
         if module in _fp8_inference_wrapped_modules:
             return
-        _pad_func = Fp8Padding(1)
-        _unpad_func = Fp8Unpadding(1)
+
+        # Number of per-rank sequence chunks in the input and the output with sequence
+        # parallelism: a column-parallel module gathers its input chunks into TP output
+        # chunks, and a row-parallel module scatters TP input chunks into one output chunk.
+        # TE's parallel_mode is what selects the collective, so it decides the chunks.
+        parallel_mode = getattr(module, "parallel_mode", None)
+        tp_size = getattr(module, "tp_size", 1)
+        sp_input_chunks = tp_size if parallel_mode == "row" else 1
+        sp_output_chunks = tp_size if parallel_mode == "column" else 1
+        _pad_funcs = {n: Fp8Padding(n) for n in {1, sp_input_chunks}}
+        _unpad_funcs = {n: Fp8Unpadding(n) for n in {1, sp_output_chunks}}
 
         original_forward = module.forward
 
@@ -988,24 +997,23 @@ if HAVE_TE:
             if not module_uses_quant:
                 return original_forward(input_tensor, *args, **kwargs)
 
-            # With sequence parallelism we need to all-gather before padding
-            # and reduce-scatter after unpadding
-            if is_sequence_parallel := getattr(module, "sequence_parallel", False):
-                if is_column_parallel_linear(module):
-                    input_tensor = gather_from_sequence_parallel_region(
-                        input_tensor, group=module.tp_group
-                    )
-
-                # Disable sequence parallelism on the module because we are handling the
-                # all-gather and reduce-scatter externally
-                module.sequence_parallel = False
+            if getattr(module, "sequence_parallel", False):
+                input_chunks, output_chunks = sp_input_chunks, sp_output_chunks
+            else:
+                input_chunks, output_chunks = 1, 1
 
             seq_len, batch_size, hidden_size = input_tensor.shape
+            assert seq_len % input_chunks == 0, (
+                f"Sequence length {seq_len} is not divisible by the {input_chunks} "
+                f"tensor-parallel ranks that {type(module).__name__} reduce-scatters it to"
+            )
+            chunk_len = seq_len // input_chunks
             # Reshape to (S, B*H) to pad sequence dimension
             input_2d = input_tensor.reshape(seq_len, -1)
-            # Pad the sequence dimension
-            padded_input_2d, _ = _pad_func(input_2d, [seq_len])
+            # Pad each chunk of the sequence dimension
+            padded_input_2d, _ = _pad_funcs[input_chunks](input_2d, [chunk_len] * input_chunks)
             padded_seq_len = padded_input_2d.shape[0]
+            padded_chunk_len = padded_seq_len // input_chunks
 
             # Reshape back to (padded_S, B, H)
             padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)
@@ -1019,21 +1027,13 @@ if HAVE_TE:
                 output_tensor = output
                 other_outputs = ()
 
-            # Unpad output - reshape to 2D, unpad, reshape back
+            # Unpad output - reshape to 2D, unpad each chunk, reshape back
             _, _, output_hidden_size = output_tensor.shape
-            output_2d = output_tensor.reshape(padded_seq_len, -1)
-            unpadded_output_2d = _unpad_func(output_2d, [seq_len])
-            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
-
-            if is_sequence_parallel:
-                # Reduce-scatter after unpadding
-                if is_row_parallel_linear(module):
-                    unpadded_output = reduce_scatter_to_sequence_parallel_region(
-                        unpadded_output, group=module.tp_group
-                    )
-
-                # Reset sequence parallelism flag on the module
-                module.sequence_parallel = True
+            output_2d = output_tensor.reshape(padded_chunk_len * output_chunks, -1)
+            unpadded_output_2d = _unpad_funcs[output_chunks](output_2d, [chunk_len] * output_chunks)
+            unpadded_output = unpadded_output_2d.reshape(
+                chunk_len * output_chunks, batch_size, output_hidden_size
+            )
 
             if other_outputs:
                 return (unpadded_output,) + other_outputs
