@@ -38,6 +38,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
 
 
 def _reset_vision_flops_accumulator():
@@ -1428,6 +1429,43 @@ class TestVisionFlopsAccumulator:
             consume_vision_model_flops_stats(True)
         # ...and the error does not leak into the next iteration.
         assert consume_vision_model_flops_stats(True) == (None, None, None)
+
+
+class TestSchedulerSeededStats:
+    """Scheduler-seeded global statistics are authoritative for the iteration.
+
+    ``train_step`` seeds the exact global-batch sums with
+    ``set_seqlen_stats_in_iteration`` when a sequence-packing scheduler is active. The
+    scheduler's ``ContextParallelBatch`` still carries ``cu_seqlens``, so the entrypoints'
+    per-micro-batch ``update_*`` calls run on every rank as well; they must not be added
+    on top of the seed (that flipped the accumulator back to per-rank mode and inflated
+    the reported TFLOP/s by 2-9x on packed hybrid runs).
+    """
+
+    def setup_method(self):
+        _reset_seqlen_accumulator()
+
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+
+    def test_per_microbatch_updates_do_not_change_seeded_stats(self):
+        set_seqlen_stats_in_iteration(1000.0, 250000.0)
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100, 300], dtype=torch.int32))
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 50], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (1000.0, 250000.0)
+
+    def test_seed_does_not_leak_into_the_next_iteration(self):
+        set_seqlen_stats_in_iteration(1000.0, 250000.0)
+        assert consume_seqlen_stats_in_iteration() == (1000.0, 250000.0)
+        # No seed in the next iteration: per-micro-batch accounting resumes.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100, 300], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (300.0, 100.0**2 + 200.0**2)
+
+    def test_seed_after_updates_replaces_them(self):
+        # Seeding is a hard reset of whatever was accumulated before it.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 7], dtype=torch.int32))
+        set_seqlen_stats_in_iteration(1000.0, 250000.0)
+        assert consume_seqlen_stats_in_iteration() == (1000.0, 250000.0)
 
 
 class TestAccumulatorDistributed:
