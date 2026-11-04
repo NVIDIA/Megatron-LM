@@ -12,6 +12,10 @@ from megatron.core.fusions import fused_cross_entropy
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import kernel_warmup
 from megatron.training.kernel_warmup import _warmup_training_kernels
@@ -288,7 +292,7 @@ def test_config_activation_storage_reuses_warmed_backward(tp_group, add_bias, fp
 def pretrain_until_warmup(monkeypatch):
     from megatron.training import training
 
-    class WarmupReached(Exception):
+    class WarmupFinished(Exception):
         pass
 
     monkeypatch.setattr(training, "_STARTUP_TIMESTAMPS", {})
@@ -297,13 +301,17 @@ def pretrain_until_warmup(monkeypatch):
     monkeypatch.setattr(training, "get_timers", lambda: None)
     monkeypatch.setattr(training, "set_jit_fusion_options", lambda **kwargs: None)
 
-    def invoke(args, model_config, tp_group):
+    def after_warmup(*unused):
+        raise WarmupFinished
+
+    monkeypatch.setattr(training, "_start_otel_job_spans", after_warmup)
+
+    def invoke(args, model_config, pg_collection):
         monkeypatch.setattr(training, "get_args", lambda: args)
         calls = []
 
         def observe(config, group, **inputs):
             calls.append((config, group, inputs))
-            raise WarmupReached
 
         monkeypatch.setattr(kernel_warmup, "_warmup_training_kernels", observe)
         # Only what pretrain() touches before the warmup call; validate() is a no-op here.
@@ -313,9 +321,9 @@ def pretrain_until_warmup(monkeypatch):
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
         )
-        with pytest.raises(WarmupReached):
-            training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))
-        return calls[0]
+        with pytest.raises(WarmupFinished):
+            training.pretrain(cfg, None, None, None, pg_collection=pg_collection)
+        return calls
 
     return invoke
 
@@ -324,9 +332,12 @@ def pretrain_until_warmup(monkeypatch):
     "model_cls, pad_vocab",
     [(GPTModelConfig, False), (GPTModelConfig, True), (HybridModelConfig, True)],
 )
+@pytest.mark.parametrize("collection_kind", ["plain", "global", "language_only", "colocated"])
 def test_pretrain_passes_model_config_and_runtime_batch(
-    tp_group, model_cls, pad_vocab, pretrain_until_warmup
+    tp_group, model_cls, pad_vocab, collection_kind, pretrain_until_warmup, monkeypatch
 ):
+    from megatron.training import training
+
     config, _ = configuration(tp_group, torch.bfloat16)
     config.context_parallel_size = 2
     config.activation_func_fp8_input_store = True
@@ -345,7 +356,29 @@ def test_pretrain_passes_model_config_and_runtime_batch(
         fine_grained_activation_offloading=False,
         tensor_model_parallel_size=tp_group.size(),
     )
-    passed_config, passed_group, inputs = pretrain_until_warmup(args, model_config, tp_group)
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = tp_group
+    if collection_kind == "global":
+        pg_collection = None
+    elif collection_kind in ("language_only", "colocated"):
+        modules = {}
+        if collection_kind == "colocated":
+            encoder_pg = ProcessGroupCollection()
+            encoder_pg.tp = object()
+            modules["encoder"] = encoder_pg
+        modules["decoder"] = pg_collection
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs=modules, language_model_module_name="decoder"
+        )
+
+    def global_tp_group():
+        assert collection_kind == "global", "Explicit collections must not use the global TP group"
+        return tp_group
+
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_group", global_tp_group)
+    calls = pretrain_until_warmup(args, model_config, pg_collection)
+    assert len(calls) == 1
+    passed_config, passed_group, inputs = calls[0]
     multiple = 128 * tp_group.size()
     padded_vocab = ((129 + multiple - 1) // multiple) * multiple if pad_vocab else multiple
     assert passed_config is config
@@ -353,6 +386,30 @@ def test_pretrain_passes_model_config_and_runtime_batch(
     assert inputs == dict(
         seq_length=16, micro_batch_size=9, padded_vocab_size=padded_vocab, logit_dtype=torch.float32
     )
+
+
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, HybridModelConfig])
+@pytest.mark.parametrize("num_encoders", [1, 2])
+def test_pretrain_skips_language_kernel_warmup_on_encoder_only_ranks(
+    tp_group, model_cls, num_encoders, pretrain_until_warmup
+):
+    config, _ = configuration(tp_group)
+    model_config = model_cls(transformer=config, seq_length=8, vocab_size=128 * tp_group.size())
+    modules = {}
+    for index in range(num_encoders):
+        encoder_pg = ProcessGroupCollection()
+        encoder_pg.tp = tp_group
+        modules[f"encoder_{index}"] = encoder_pg
+    pg_collection = MultiModuleProcessGroupCollection(module_pgs=modules)
+    args = Namespace(
+        seq_length=8,
+        fine_grained_activation_offloading=False,
+        tensor_model_parallel_size=tp_group.size(),
+    )
+
+    # A language-model config may be shared across roles, but its kernels do not
+    # run on encoder-only ranks. Startup must continue without entering warmup.
+    assert pretrain_until_warmup(args, model_config, pg_collection) == []
 
 
 def test_warmup_skips_without_model_config(tp_group, monkeypatch, caplog):
