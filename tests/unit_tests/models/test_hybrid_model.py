@@ -68,20 +68,22 @@ def test_hybrid_logging_process_groups_are_paired():
     tp_group = object()
     dp_cp_group = object()
 
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace()) == {}
-    assert _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=dp_cp_group)) == {
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=None)) == {}
+    assert _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=dp_cp_group)) == {
         'tp_group': tp_group,
         'dp_cp_group': dp_cp_group,
     }
 
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(dp_cp=dp_cp_group))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=None))
-    with pytest.raises(ValueError, match="tp.*dp_cp"):
-        _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
+    # A field the collection never set reads as None through ProcessGroupCollection, so it must
+    # raise instead of passing for an axis that is off.
+    for groups in ({}, {'tp': tp_group}, {'dp_cp': dp_cp_group}):
+        with pytest.raises(ValueError, match="HybridModel requires pg_collection to set"):
+            _hybrid_logging_pg_kwargs(ProcessGroupCollection(**groups))
+
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=tp_group, dp_cp=None))
+    with pytest.raises(ValueError, match="tp and pg_collection.dp_cp must both be"):
+        _hybrid_logging_pg_kwargs(ProcessGroupCollection(tp=None, dp_cp=dp_cp_group))
 
 
 @pytest.fixture
@@ -94,7 +96,7 @@ def config_list_model_boundary(monkeypatch):
     def init_language_module(model, config, pg_collection=None):
         torch.nn.Module.__init__(model)
         model.config = config
-        model.pg_collection = SimpleNamespace(pp=None)
+        model.pg_collection = SimpleNamespace(pp=None, tp=None, dp_cp=None)
 
     def allocation_reached(*args, **kwargs):
         raise AllocationReached()
