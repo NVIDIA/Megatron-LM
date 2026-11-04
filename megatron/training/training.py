@@ -2119,6 +2119,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.train_state = train_state
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
