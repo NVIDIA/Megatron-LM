@@ -9,7 +9,7 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,9 @@ if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 else:
     is_gtp_param = None
+
+if TYPE_CHECKING:
+    from megatron.core.ssm.mamba_shared_prefix import MambaSharedPrefixCall
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -531,9 +534,26 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        shared_prefix_call: Optional["MambaSharedPrefixCall"] = None,
     ):
-        """Run the input projection/SSM phase followed by the output projection."""
+        """Run the input projection/SSM phase followed by the output projection.
+
+        ``shared_prefix_call`` is a per-call shared-prefix request from
+        ``forward_mamba_layer_shared_prefix``. When set, the shared-prefix scan replaces the
+        dense one. Dispatching here rather than in ``MambaLayer.forward`` keeps this module's own
+        hooks on the shared-prefix path, such as Megatron FSDP's fine-grained gather of the
+        parameters the mixer owns.
+        """
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if shared_prefix_call is not None:
+            if inference_context is not None or packed_seq_params is not None:
+                raise NotImplementedError(
+                    "shared-prefix Mamba only supports static, unpacked training forwards"
+                )
+            # Imported here: mamba_shared_prefix imports this module.
+            from megatron.core.ssm.mamba_shared_prefix import forward_mamba_mixer_shared_prefix
+
+            return forward_mamba_mixer_shared_prefix(self, hidden_states, shared_prefix_call)
         in_inference_mode = InferenceMode.is_active()
 
         _, batch, _ = hidden_states.shape

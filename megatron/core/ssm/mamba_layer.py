@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -33,6 +33,9 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
+
+if TYPE_CHECKING:
+    from megatron.core.ssm.mamba_shared_prefix import MambaSharedPrefixCall
 
 
 @dataclass
@@ -263,6 +266,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+        shared_prefix_call: Optional["MambaSharedPrefixCall"] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -281,6 +285,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                 packed-sequence metadata for chunkwise CP.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for a configured residual connection.
+            shared_prefix_call (MambaSharedPrefixCall, optional): Per-call shared-prefix request
+                from ``forward_mamba_layer_shared_prefix``, passed to the mixer, which runs the
+                shared-prefix scan in place of its dense one.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -303,19 +310,19 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                if packed_sequence_cp_metadata is None:
-                    mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    )
+                # Optional per-call inputs reach the mixer only when set, so mixers that do not
+                # take them keep their signatures.
+                mixer_kwargs = {}
+                if packed_sequence_cp_metadata is not None:
+                    mixer_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+                if shared_prefix_call is not None:
+                    mixer_kwargs["shared_prefix_call"] = shared_prefix_call
+                mixer_out_with_bias = self.mixer(
+                    prepared.branch_input,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    **mixer_kwargs,
+                )
 
             hidden_states = self._apply_mixer_update(
                 mixer_out_with_bias, prepared.state, recompute_context=recompute_context
