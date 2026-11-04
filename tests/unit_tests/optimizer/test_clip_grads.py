@@ -35,6 +35,7 @@ def test_default_grad_norm_skip_threshold_does_not_compare_grad_norm():
         def __init__(self):
             self.config = OptimizerConfig(clip_grad=0.0)
             self.param = torch.nn.Parameter(torch.ones(1))
+            self.param_groups = [{'params': [self.param]}]
             self.is_stub_optimizer = False
             self.step_called = False
 

@@ -1276,7 +1276,8 @@ def _dsv4_hybrid_self_attention_flops(
 
     ``csa_dense_mode`` makes ``r==4`` layers attend to every compressed key
     (an ``L^2`` term) with no indexer. ``seq_length`` caps the learned top-k;
-    the hybrid path passes the token-weighted mean real sequence length.
+    the hybrid path passes the token-weighted mean real sequence length when DSv4
+    is detected from the layer pattern alone.
 
     Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
     expansion factors -- the caller applies those. Multiply ``token_linear`` by
@@ -2598,11 +2599,25 @@ def num_floating_point_operations(
         num_mlp_layers = layer_counts[Symbols.MLP]
         num_moe_layers = layer_counts[Symbols.MOE]
 
+        # Prefer the canonical DSv4 output-projection names. validate_args mirrors them
+        # onto the legacy o_groups / o_lora_rank aliases, but not every caller runs it.
+        dsv4_o_groups = getattr(args, "output_projection_groups", None)
+        if dsv4_o_groups is None:
+            dsv4_o_groups = getattr(args, "o_groups", None)
+        dsv4_o_lora_rank = getattr(args, "output_projection_lora_rank", None)
+        if dsv4_o_lora_rank is None:
+            dsv4_o_lora_rank = getattr(args, "o_lora_rank", None)
+
         # The static C/H/W specs select DSv4 even when the CLI variant is inferred
         # only on the layer config (argument_utils writes it into the config kwargs,
-        # never back onto ``args``), so key off the layer pattern as well.
+        # never back onto ``args``), so key off the layer pattern as well. Pattern-only
+        # detection also needs the DSv4 output-projection dims; callers that leave them
+        # unset (for example, args built without validate_args) keep the dense-MLA
+        # estimate for C/H/W layers instead of failing inside the DSv4 attention helper.
         has_dsv4_layers = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
-        is_dsv4_hybrid = args.experimental_attention_variant == "dsv4_hybrid" or has_dsv4_layers
+        is_dsv4_hybrid = args.experimental_attention_variant == "dsv4_hybrid" or (
+            has_dsv4_layers and dsv4_o_groups is not None and dsv4_o_lora_rank is not None
+        )
 
         # DSv4 D/C/H/W layers are MLA variants, but their
         # sparse attention FLOPs are handled by the DSv4 branch.
@@ -2651,21 +2666,17 @@ def num_floating_point_operations(
         if is_dsv4_hybrid:
             # The pattern owns the DSv4 MTP depth; args.mtp_num_layers may be unset.
             mtp_num_layers = parse_hybrid_pattern(args.hybrid_layer_pattern).mtp_num_depths
-        # Prefer the canonical DSv4 output-projection names. validate_args mirrors them
-        # onto the legacy o_groups / o_lora_rank aliases, but not every caller runs it.
-        dsv4_o_groups = getattr(args, "output_projection_groups", None)
-        if dsv4_o_groups is None:
-            dsv4_o_groups = getattr(args, "o_groups", None)
-        dsv4_o_lora_rank = getattr(args, "output_projection_lora_rank", None)
-        if dsv4_o_lora_rank is None:
-            dsv4_o_lora_rank = getattr(args, "o_lora_rank", None)
-        # CSA top-k saturation depends on the real sequence length. Packed statistics keep
-        # no per-document lengths, so use the token-weighted mean (llm_seq_length for BSHD).
-        dsv4_seq_length = (
-            seqlen_squared_sum_in_batch / total_real_tokens_in_batch
-            if total_real_tokens_in_batch
-            else llm_seq_length
-        )
+        # CSA top-k saturation depends on the real sequence length. An explicit dsv4_hybrid
+        # variant keeps the standard-model estimate, which caps top-k with args.seq_length,
+        # so the two paths stay bit-identical. DSv4 detected from the static C/H/W pattern
+        # alone uses the token-weighted mean real length because packed statistics keep no
+        # per-document lengths (llm_seq_length for BSHD).
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            dsv4_seq_length = args.seq_length
+        elif total_real_tokens_in_batch:
+            dsv4_seq_length = seqlen_squared_sum_in_batch / total_real_tokens_in_batch
+        else:
+            dsv4_seq_length = llm_seq_length
 
         # Compute hybrid decoder FLOPs.
         total_floating_point_operations = hybrid_flops(

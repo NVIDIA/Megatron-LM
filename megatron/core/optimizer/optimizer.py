@@ -40,7 +40,7 @@ except ImportError:
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..dist_checkpointing.mapping import ShardedStateDict
+from ..dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
@@ -1637,6 +1637,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 state_dict['fp32_from_fp16_params'], float16_param_ids_per_group, strict=True
             )
         ]
+        # Key the groups by index and keep empty ones out of the checkpoint. Param groups are
+        # aligned across ranks (see ``_get_param_groups``), so a group can be empty here and
+        # populated elsewhere, e.g. the DSA indexer groups on a pipeline stage without indexer
+        # layers. An empty list would be saved as common state, which only rank 0 writes and
+        # every rank loads, and splitting a list into sharded and common values drops element
+        # positions, so a list mixing empty and populated groups cannot be merged back on load.
+        state_dict['fp32_from_fp16_params'] = {
+            group_index: group if group else LocalNonpersistentObject(group)
+            for group_index, group in enumerate(state_dict['fp32_from_fp16_params'])
+        }
 
         step = self._extract_common_per_param_step(state_dict['optimizer'])
 
@@ -1692,8 +1702,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
+        saved_groups = state_dict[fp32_from_float16_params_key]
+        if isinstance(saved_groups, dict):
+            # Sharded checkpoints key the groups by index; see ``sharded_state_dict``.
+            saved_groups = [saved_groups[i] for i in range(len(self.fp32_from_float16_groups))]
         for group_index, (current_group, saved_group) in enumerate(
-            zip(self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key])
+            zip(self.fp32_from_float16_groups, saved_groups)
         ):
             if len(saved_group) == len(current_group):
                 for current_param, saved_param in zip(current_group, saved_group):

@@ -37,6 +37,17 @@ def debug_rank(message):
         print(message)
 
 
+def _capturing_graph_task_id() -> Optional[int]:
+    """Return the autograd GraphTask id of a backward pass being captured, if any.
+
+    TE captures every callable's backward with its own ``autograd.backward()``, so one
+    GraphTask belongs to exactly one CUDA graph capture.
+    """
+    if not is_graph_capturing() or not torch.cuda.is_current_stream_capturing():
+        return None
+    return torch._C._current_graph_task_id()
+
+
 def _te_do_not_offload(tensor):
     """Return whether TE marked a tensor-like object as non-offloadable."""
     if getattr(tensor, "_TE_do_not_offload", False):
@@ -464,6 +475,9 @@ class OffloadTensorGroup:
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
+        # GraphTask that captured the latest reload event, or None when it was recorded
+        # eagerly. A captured event can only be awaited by the same capture.
+        self._reload_graph_task_id = None
         self.offload = True
         # Margin groups stay resident to provide compute time for the first reloads.
         self.is_offload_margin = False
@@ -1296,6 +1310,7 @@ class ChunkOffloadHandler:
                     debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
+        group_to_reload._reload_graph_task_id = _capturing_graph_task_id()
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
         self._reloading_group.append(group_to_reload)
@@ -1423,11 +1438,22 @@ class ChunkOffloadHandler:
             PipelineOffloadManager.get_instance().pop_backward_chunk(name)
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         assert cur_backward_chunk is self, f"Chunk mismatch {cur_backward_chunk} {self}"
-        # Wait for reload to complete before using tensors
-        if not is_graph_capturing() and len(self._reloading_group) > 0:
+        # Wait for reload to complete before using tensors. During CUDA graph capture, a
+        # reload captured by an earlier callable is ordered by that graph's tail H2D join
+        # and its event cannot be awaited here. Reload slots can also place a reload and
+        # its consumer in the same captured backward (e.g. GPU-resident groups consuming
+        # slots on the last pipeline stage); that graph has no H2D join before the consumer,
+        # so the reload event must still be awaited.
+        if len(self._reloading_group) > 0:
+            capturing = is_graph_capturing()
+            graph_task_id = _capturing_graph_task_id() if capturing else None
             for reloading_group in self._reloading_group:
                 if reloading_group._name == name:
-                    reloading_group.wait_reload_event(torch.cuda.current_stream())
+                    if not capturing or (
+                        graph_task_id is not None
+                        and reloading_group._reload_graph_task_id == graph_task_id
+                    ):
+                        reloading_group.wait_reload_event(torch.cuda.current_stream())
                     self._reloading_group.remove(reloading_group)
                     break
 

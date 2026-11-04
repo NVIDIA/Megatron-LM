@@ -174,6 +174,9 @@ def test_static_packed_graph_prerequisites_are_preserved(
         dynamic_context_parallel=False,
         sequence_packing_scheduler="dp_balanced",
         cuda_graph_impl="transformer_engine",
+        # Dev requires fixed padded token capacity for every THD CUDA graph. Satisfy that
+        # guard so the scheduler's static-packing prerequisites are what this test reaches.
+        pad_packed_seq_alignment="max",
         use_varlen_dataset=use_varlen_dataset,
         micro_batch_size=micro_batch_size,
         global_batch_size=4,

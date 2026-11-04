@@ -1934,7 +1934,9 @@ class TestHybridTECudaGraphDiscovery:
                 return 8
 
             @staticmethod
-            def __call__(_seq_length):
+            def __call__(_seq_length, offset=0, packed_seq=False, cp_group=None):
+                # Mirror RotaryEmbedding.forward so unexpected keywords still fail.
+                del offset, packed_seq, cp_group
                 return rotary_pos_emb
 
         chunk = SimpleNamespace(
