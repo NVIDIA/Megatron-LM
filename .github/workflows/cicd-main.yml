@@ -21,9 +21,14 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      testmon_cache_generation:
+        description: "Export existing Testmon caches only (RUN_ID-ATTEMPT); leave empty for CI"
+        type: string
+        default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}-${{ inputs.testmon_cache_generation || 'ci' }}
   cancel-in-progress: true
 
 permissions:
@@ -41,6 +46,7 @@ env:
 
 jobs:
   ephemeral-runner-routing:
+    if: inputs.testmon_cache_generation == ''
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
     with:
       lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
@@ -51,7 +57,7 @@ jobs:
   is-not-external-contributor:
     needs: [ephemeral-runner-routing]
     runs-on: ubuntu-latest
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: inputs.testmon_cache_generation == '' && (github.repository == 'NVIDIA/Megatron-LM')
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
@@ -181,7 +187,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: inputs.testmon_cache_generation == '' && (github.repository == 'NVIDIA/Megatron-LM')
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
       workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
@@ -193,7 +199,7 @@ jobs:
   configure:
     runs-on: ubuntu-latest
     needs: [pre-flight, is-not-external-contributor, ephemeral-runner-routing]
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: inputs.testmon_cache_generation == '' && (github.repository == 'NVIDIA/Megatron-LM')
     outputs:
       scope:          ${{ steps.configure.outputs.scope }}
       n_repeat:       ${{ steps.configure.outputs.n_repeat }}
@@ -614,6 +620,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [pre-flight]
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       (
         needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -621,6 +629,7 @@ jobs:
         needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
+      )
       )
     steps:
       - name: Checkout
@@ -722,10 +731,13 @@ jobs:
     needs: [pre-flight, linting]
     environment: "test"
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
+      )
     steps:
       - name: Running CI tests
         run: |
@@ -739,6 +751,8 @@ jobs:
       - configure
       - cicd-wait-in-queue
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -749,6 +763,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     outputs:
       mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
@@ -771,6 +786,8 @@ jobs:
     # "Run MBridge tests" label — all three cases set
     # configure.outputs.run_mbridge == 'true'.
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -787,6 +804,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     timeout-minutes: 300
     steps:
       - name: Checkout Megatron-LM
@@ -807,8 +825,11 @@ jobs:
     # Notify on both success and failure of the MBridge downstream tests.
     # Skipped/cancelled runs are intentionally not announced.
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       always()
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
+      )
     steps:
       - name: Send Slack alert
         uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
@@ -830,6 +851,8 @@ jobs:
     # Skip downstream NeMo RL testing for docs-only and merge queue changes.
     # PR authors opt in with the "Run NeMoRL tests" label.
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -842,6 +865,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      )
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -901,8 +925,11 @@ jobs:
     # Notify on both success and failure of the NeMo RL downstream tests.
     # Skipped/cancelled runs are intentionally not announced.
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       always()
       && (needs.cicd-nemo-rl-testing.result == 'success' || needs.cicd-nemo-rl-testing.result == 'failure')
+      )
     steps:
       - name: Send Slack alert
         uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
@@ -920,6 +947,8 @@ jobs:
       id-token: write
       pull-requests: read
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -930,6 +959,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
+      )
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
@@ -950,6 +980,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -961,6 +993,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -982,6 +1015,8 @@ jobs:
       - cicd-parse-unit-tests
     name: Unit tests (H100)
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
@@ -995,6 +1030,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     uses: ./.github/workflows/_unit-tests.yml
     with:
       buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
@@ -1017,6 +1053,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -1030,6 +1068,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1051,6 +1090,8 @@ jobs:
       - cicd-parse-unit-tests-gb200
     name: Unit tests (GB200)
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
@@ -1066,6 +1107,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+      )
     uses: ./.github/workflows/_unit-tests.yml
     with:
       buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
@@ -1097,12 +1139,15 @@ jobs:
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
       && !cancelled()
+      )
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       should_run_gb200: ${{ steps.gate.outputs.should_run_gb200 }}
@@ -1158,8 +1203,11 @@ jobs:
       - configure
       - cicd-integration-gate
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
+      )
     outputs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
@@ -1224,9 +1272,12 @@ jobs:
       PIP_DEFAULT_TIMEOUT: 120
       PIP_RETRIES: 5
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
       && needs.cicd-parse-integration-tests-h100.result == 'success'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1254,10 +1305,13 @@ jobs:
       - configure
       - cicd-integration-gate
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
+      )
     outputs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
@@ -1322,11 +1376,14 @@ jobs:
       PIP_DEFAULT_TIMEOUT: 120
       PIP_RETRIES: 5
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run_gb200 == 'true'
       && needs.cicd-parse-integration-tests-gb200.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1359,6 +1416,8 @@ jobs:
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
@@ -1368,6 +1427,7 @@ jobs:
       )
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
+      )
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -1480,6 +1540,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
@@ -1487,6 +1549,7 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
+      )
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -1514,11 +1577,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
     if: |
+      inputs.testmon_cache_generation == '' &&
+      (
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
       && needs.pre-flight.outputs.docs_only != 'true'
       && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
+      )
     strategy:
       matrix:
         flag: [unit-test]
@@ -1647,7 +1713,7 @@ jobs:
 
   merge-queue-notification:
     runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group'
+    if: inputs.testmon_cache_generation == '' && (github.event_name == 'merge_group')
     permissions:
       pull-requests: write
     steps:
@@ -1683,7 +1749,113 @@ jobs:
 
   DCO_merge_group:
     name: DCO
-    if: github.event_name == 'merge_group'
+    if: inputs.testmon_cache_generation == '' && (github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     steps:
       - run: echo "The real DCO check happens on PRs only. This is a placeholder for the merge queue to keep the DCO check as a required status check."
+
+  list-testmon-caches:
+    if: github.event_name == 'workflow_dispatch' && inputs.testmon_cache_generation != '' && github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      keys: ${{ steps.list.outputs.keys }}
+      source_sha: ${{ steps.list.outputs.source_sha }}
+    steps:
+      - name: Find the exact main cache generation
+        id: list
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          GENERATION: ${{ inputs.testmon_cache_generation }}
+        with:
+          script: |
+            const generation = process.env.GENERATION;
+            if (!/^[1-9][0-9]*-[1-9][0-9]*$/.test(generation)) {
+              throw new Error('Expected cache generation RUN_ID-ATTEMPT');
+            }
+            const [runId, attempt] = generation.split('-');
+            const {data: run} = await github.rest.actions.getWorkflowRunAttempt({
+              ...context.repo, run_id: Number(runId), attempt_number: Number(attempt)
+            });
+            if (run.head_branch !== 'main') throw new Error('Expected a main baseline run');
+            const caches = await github.paginate(github.rest.actions.getActionsCacheList, {
+              ...context.repo, ref: 'refs/heads/main', per_page: 100
+            });
+            const keys = caches.map(cache => cache.key).filter(key =>
+              /^unit-testmon-v1-main-dgx_(h100|gb200)-[0-9a-f]{16}-/.test(key)
+              && key.endsWith(`-${generation}`)
+            ).sort();
+            if (!keys.length) throw new Error('No caches remain for this generation');
+            core.setOutput('keys', JSON.stringify(keys));
+            core.setOutput('source_sha', run.head_sha);
+            core.info(`Exporting ${keys.length} caches from ${run.head_sha}`);
+
+  export-testmon-caches:
+    needs: list-testmon-caches
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        key: ${{ fromJSON(needs.list-testmon-caches.outputs.keys) }}
+    steps:
+      - name: Match gzip cache version
+        id: compression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_bin=$(mktemp -d "$RUNNER_TEMP/testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$cache_bin/zstd"
+          chmod +x "$cache_bin/zstd"
+          printf 'path=%s:%s\n' "$cache_bin" "$PATH" >> "$GITHUB_OUTPUT"
+      - name: Restore exact cache generation
+        id: restore
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684
+        env:
+          PATH: ${{ steps.compression.outputs.path }}
+        with:
+          path: assets_dir/testmon
+          key: ${{ matrix.key }}
+          fail-on-cache-miss: true
+      - name: Verify identity and database integrity
+        env:
+          GENERATION: ${{ inputs.testmon_cache_generation }}
+          SOURCE_SHA: ${{ needs.list-testmon-caches.outputs.source_sha }}
+          EXPECTED_KEY: ${{ matrix.key }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'CHECK'
+          import hashlib, json, os, sqlite3
+          from contextlib import closing
+          from pathlib import Path
+          root = Path('assets_dir/testmon')
+          assert os.environ['EXPECTED_KEY'] == os.environ['MATCHED_KEY']
+          m = json.loads((root / 'manifest.json').read_text())
+          assert m['generation'] == os.environ['GENERATION']
+          assert m['source_sha'] == os.environ['SOURCE_SHA']
+          for phase in ('prod', 'experimental'):
+              db = root / phase / '.testmondata'
+              meta = json.loads((db.parent / 'metadata.json').read_text())
+              assert meta['complete'] is True
+              assert meta['database_sha256'] == hashlib.sha256(db.read_bytes()).hexdigest()
+              wal = db.with_name(db.name + '-wal')
+              assert not wal.exists() or wal.stat().st_size == 0
+              with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)) as c:
+                  assert c.execute('PRAGMA user_version').fetchone() == (14,)
+                  assert c.execute('PRAGMA quick_check').fetchall() == [('ok',)]
+          print(json.dumps({'key': os.environ['EXPECTED_KEY'], 'manifest': m}))
+          CHECK
+      - name: Export databases and manifests
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: export-${{ matrix.key }}
+          path: assets_dir/testmon
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
