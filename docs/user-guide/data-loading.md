@@ -132,10 +132,51 @@ and stdout/TensorBoard contained no DCP metrics.
 
 This dev baseline already handles aligned eager THD padding metadata. It rejects
 DCP with `--deterministic-mode`, so that flag was omitted; the observed equality
-is not a guarantee of determinism for other runs. The timing results below are
-historical and were not rerun on the rebased DCP V2 source.
+is not a guarantee of determinism for other runs. The current-source timing and
+DP2 logging-window results are recorded below.
 [Rebase records and replay commands](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/evidence/dcp-stats-rebase-20261103/validation/dcp-stats-rebase-20261103)
 retain the source/checkpoint hashes, environment, tests, training logs and audits.
+
+### Current-source timing and DP2 logging windows (2026-11-03)
+
+The same runtime source (`79bf7b6bc` on dev `7b66fcc08`) also passed a
+four-GPU DP2×CP2 off/on comparison with TP1/PP1. This topology has **four DP×CP
+ranks**. Nine updates used varying sequence lengths, microbatch counts and CP
+fractions, with `--log-interval 3 --eval-interval 3 --eval-iters 1`.
+Schedules, losses, gradients and parameter updates matched bitwise. Independent
+recalculation verified per-microbatch work conservation, global counts and window
+weighting. The logged window balances were 0.952381, 1.000000 and 0.798995 at
+iterations 3, 6 and 9. Evaluation left the accumulator unchanged; completed windows
+reset, and the final partial window was not emitted. The existing first-iteration
+stdout report at resumed iteration 2 did not reset the window or add a TensorBoard
+event. The focused four-rank regression again passed 134 tests per rank.
+
+The current-source benchmark used two A6000 GPUs, the existing training interval
+timer, stdout/TensorBoard at interval 1, and 2,560 effective tokens per update.
+Each arm restored the same checkpoint and ran 100 updates, discarding ten warmups.
+Three repetitions rotated the fixed-CP/DCP-off/DCP-on order. Correctness hashing
+and CPU profiling were disabled for these timing runs.
+
+| Arm | Mean step ± between-run std (ms) | Mean effective tokens/s |
+|---|---:|---:|
+| Fixed CP2 | 142.42 ± 0.40 | 17,975 |
+| DCP, metrics off | 117.61 ± 5.39 | 21,796 |
+| DCP, metrics on | 116.66 ± 2.25 | 21,949 |
+
+The mean on/off step-time change was −0.81%, with paired changes from −3.79% to
++1.20%. Shared-host variation prevents resolving small overhead; this does not
+establish zero overhead or a speedup from enabling metrics. Separate CPU
+diagnostics measured statistics at 40–41 µs/step and accumulator updates at
+13 µs/step; those runs are excluded from the benchmark. Disabled diagnostic runs
+made no statistics or accumulator-update calls.
+
+[Current-source benchmark and DP2 replay records](https://github.com/WEIXILIN0307/Megatron-LM/tree/c9ccb11527135f1ee6351e84447cecd1f64ea855/validation/dcp-stats-acceptance-20261103)
+include commands, environment/source/checkpoint hashes, raw logs and TensorBoard
+events, independent verifiers, GPU telemetry and a SHA256 manifest. They also
+retain the invalid initial checkpoint-mount attempts, explicitly excluded from
+all reported results. The later publication changes documentation only; the
+runtime code is the tested source above. A repository functional-test recipe and
+upstream CI remain separate from these manual acceptance runs.
 
 ### Historical A6000 acceptance (2026-10-22)
 
