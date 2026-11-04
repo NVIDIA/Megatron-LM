@@ -728,6 +728,18 @@ def finalize_model_grads(
 
         wait_for_gtp_grad_reduction_on_current_stream()
 
+    # All local pipeline chunks have finished backward. Complete each shared
+    # MFSDP context once; per-microbatch weight cleanup has already run.
+    from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+
+    completed_contexts = set()
+    for model_chunk in model:
+        if isinstance(model_chunk, FullyShardedDataParallelV2):
+            context = model_chunk.module.context
+            if context not in completed_contexts:
+                context.post_backward()
+                completed_contexts.add(context)
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)

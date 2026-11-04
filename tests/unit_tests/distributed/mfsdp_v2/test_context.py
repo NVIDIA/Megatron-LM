@@ -112,8 +112,10 @@ def test_recorded_execution_order(distributed_setup, caller_managed_grad_sync):
     with fully_shard_context(
         FsdpContext(
             device=device,
-            prefetch_order=PrefetchOrder.RECORDED,
-            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+            runtime_policy=RuntimePolicy(
+                prefetch_order=PrefetchOrder.RECORDED,
+                caller_managed_grad_sync=caller_managed_grad_sync,
+            ),
         )
     ) as context:
         for layer in model.children():
@@ -127,7 +129,7 @@ def test_recorded_execution_order(distributed_setup, caller_managed_grad_sync):
     model(inputs).sum().backward()
     if caller_managed_grad_sync:
         assert context.is_recording_execution_order
-        context.finish_grad_sync()
+        context.post_backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
@@ -155,8 +157,10 @@ def test_recorded_execution_order(distributed_setup, caller_managed_grad_sync):
         output = model(inputs)
         if caller_managed_grad_sync:
             with pytest.raises(RuntimeError, match="before the recorded order was complete"):
-                context.finish_grad_sync()
+                context.post_backward()
         output.sum().backward()
+        if caller_managed_grad_sync:
+            context.post_backward()
         context.finish_grad_sync()
         assert context.execution_order.position == 0
 
@@ -169,8 +173,9 @@ def test_combined_hooks_record_repeated_owner_calls(distributed_setup):
     with fully_shard_context(
         FsdpContext(
             device=device,
-            prefetch_order=PrefetchOrder.RECORDED,
-            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+            runtime_policy=RuntimePolicy(
+                prefetch_order=PrefetchOrder.RECORDED, caller_managed_grad_sync=True
+            ),
         )
     ) as context:
         fully_shard(
@@ -185,6 +190,8 @@ def test_combined_hooks_record_repeated_owner_calls(distributed_setup):
         model.zero_grad(set_to_none=True)
         model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
         assert context.is_recording_execution_order is (iteration == 0)
+        context.run_delayed_post_backward()
+        context.post_backward()
         context.finish_grad_sync()
         assert list(context.execution_order) == expected
         assert context.execution_order.position == 0
@@ -344,6 +351,7 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
 
     if caller_managed_grad_sync:
         finish_grad_sync.assert_not_called()
+        context.post_backward()
         context.finish_grad_sync()
     finish_grad_sync.assert_called_once_with()
 

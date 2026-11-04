@@ -14,12 +14,14 @@ share the same ``FsdpContext``.
 
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import PrefetchOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
@@ -42,6 +44,8 @@ class _VirtualPipelineChunk(nn.Module):
     def __init__(self, dim: int = 16) -> None:
         super().__init__()
         self.fc = nn.Linear(dim, dim, bias=False)
+        self.pre_process = False
+        self.share_embeddings_and_output_weights = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
@@ -74,7 +78,7 @@ class TestMfsdpV2PipelineSharedContext:
     @pytest.mark.parametrize("num_chunks", [1, 2], ids=["pp", "vpp"])
     @pytest.mark.parametrize("schedule", ["grouped", "interleaved"])
     def test_pipeline_chunks_record_and_replay_prefetch(
-        self, distributed_setup, num_chunks, schedule
+        self, distributed_setup, monkeypatch, num_chunks, schedule
     ):
         """PP and VPP preserve prefetch through repeated forward and backward calls."""
         device = distributed_setup.device
@@ -146,6 +150,8 @@ class TestMfsdpV2PipelineSharedContext:
                 pending_chunks.append(chunk)
             calls.extend((chunk, Phase.BACKWARD) for chunk in pending_chunks)
         expected = [ExecutionEvent(chunk.module, phase) for chunk, phase in calls]
+        post_backward = Mock(wraps=first_context.post_backward)
+        monkeypatch.setattr(first_context, "post_backward", post_backward)
         cross_phase_prefetch_checks = 0
         for iteration in range(3):
             outputs = {chunk: deque() for chunk in wrapped_chunks}
@@ -165,7 +171,9 @@ class TestMfsdpV2PipelineSharedContext:
                     assert first_context.is_recording_execution_order is (iteration == 0)
                     if iteration and index < len(calls) - 1:
                         assert first_context.execution_order.position != 0
-            first_context.finish_grad_sync()
+            assert post_backward.call_count == iteration
+            finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
+            assert post_backward.call_count == iteration + 1
             assert not first_context.is_recording_execution_order
             assert first_context.execution_order.position == 0
             assert list(first_context.execution_order) == expected

@@ -14,7 +14,6 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -23,14 +22,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import RuntimePolicy
-
-
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
-
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
+from .runtime_policy import PrefetchOrder, RuntimePolicy
 
 
 class FsdpContext:
@@ -62,27 +54,19 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation, stream, and gradient-synchronization
+            runtime_policy: Communication, prefetch, and gradient-synchronization
                 settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. With caller-managed
-                gradient synchronization, recording spans the full schedule until
-                ``finish_grad_sync()`` instead. Subsequent
-                schedules must repeat the trace consistently across data-parallel ranks.
-                Discard the context if recording fails.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -94,9 +78,9 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
-        self.prefetch_order = prefetch_order
+        self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
-        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
+        self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -218,37 +202,37 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        if self.caller_managed_grad_sync:
-            self._finish_execution_order()
 
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""
         if self._recording_execution_order:
-            # A synchronization before any compute must not end recording.
+            # Completion before any compute must not end recording.
             if self.execution_order.peek() is not None:
                 self._recording_execution_order = False
         elif self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
 
     def post_backward(self) -> None:
-        """Finish backward cleanup and automatically synchronize the last microbatch."""
-        self._run_delayed_post_backward_callbacks()
+        """Complete the execution order after all backwards in this schedule."""
+        self._finish_execution_order()
+        # Standalone training can step immediately after the last backward.
+        # MCore owns the gradient wait after all producers, including delayed wgrad.
         if not self.caller_managed_grad_sync:
-            self._finish_execution_order()
-        # Standalone training can call optimizer.step() immediately after backward.
-        # Wait for reductions on the last microbatch; earlier microbatches keep
-        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
-        # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.is_last_microbatch:
             self.finish_grad_sync()
-        self._post_backward_hook_registered = False
 
-    def _run_delayed_post_backward_callbacks(self) -> None:
-        """Run deferred module completion callbacks once."""
+    def run_delayed_post_backward(self) -> None:
+        """Release deferred module weights after each microbatch backward."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
+
+    def _post_autograd_backward(self) -> None:
+        """Clean up this backward; caller-managed schedules complete explicitly."""
+        self.run_delayed_post_backward()
+        self._post_backward_hook_registered = False
+        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+            self.post_backward()
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
@@ -267,7 +251,7 @@ class FsdpContext:
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
-        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+        torch.autograd.Variable._execution_engine.queue_callback(self._post_autograd_backward)
 
 
 def _collect_backward_order(

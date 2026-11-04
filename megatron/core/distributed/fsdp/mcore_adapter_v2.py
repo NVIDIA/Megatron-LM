@@ -268,8 +268,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
-                    prefetch_order=prefetch_order,
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=prefetch_order,
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
@@ -288,7 +288,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ):
                 raise ValueError(
                     "PP/VPP and EP-overlap MFSDP v2 schedules require "
-                    "FsdpContext(prefetch_order=PrefetchOrder.RECORDED)."
+                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
