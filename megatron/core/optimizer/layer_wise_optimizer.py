@@ -7,38 +7,27 @@ from itertools import chain
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
-from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.dist_checkpointing.mapping import (LocalNonpersistentObject,
+                                                      ShardedStateDict)
+from megatron.core.distributed.param_and_grad_buffer import \
+    group_params_for_buffers
 from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import (get_model_config, get_pg_rank, get_pg_size,
+                                 log_single_rank)
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
-    is_float8tensor,
-    post_all_gather_processing,
-)
+from ..fp8_utils import (_stage_param_to_bf16,
+                         copy_back_gathered_bf16_into_fp8_param,
+                         is_float8tensor, post_all_gather_processing)
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
-from .optimizer import (
-    ChainedOptimizer,
-    Float16OptimizerWithFloat16Params,
-    FP32Optimizer,
-    MegatronOptimizer,
-    _get_param_grad_norm_group,
-    _validate_grad_norm_group,
-)
+from .optimizer import (ChainedOptimizer, Float16OptimizerWithFloat16Params,
+                        FP32Optimizer, MegatronOptimizer,
+                        _get_param_grad_norm_group, _validate_grad_norm_group)
 from .optimizer_config import OptimizerConfig
-from .param_layout import (
-    FullParamLayout,
-    PerBufferParamLayout,
-    bucket_end_divisor,
-    pad_param_start,
-    pad_to_divisor,
-)
+from .param_layout import (FullParamLayout, PerBufferParamLayout,
+                           bucket_end_divisor, pad_param_start, pad_to_divisor)
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +125,8 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     """
     gtp_fold: Dict[str, Tuple[int, int]] = {}
     try:
-        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+        from megatron.core.tensor_parallel.gtp_api import (HAVE_GTP,
+                                                           is_gtp_param)
     except ImportError:
         return gtp_fold
     if not HAVE_GTP:
@@ -560,7 +550,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
-        from ..distributed.param_and_grad_buffer import _compute_default_per_buffer_param_layout
+        from ..distributed.param_and_grad_buffer import \
+            _compute_default_per_buffer_param_layout
         from .distrib_optimizer import DistributedOptimizer
 
         # Decoupled layout (use_layer_wise_param_layout=False): LayerWise (Muon) buffers use a
@@ -761,8 +752,28 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     and not config.optimizer_cpu_offload
                 ):
                     wrapper = GraphedGradCopyFloat16Optimizer
+                wrapper_kwargs = {}
+                if config.chunked_optimizer_main_params:
+                    # Decide residency before the wrapper allocates any FP32 masters.
+                    from .cpu_offloading.chunked_optimizer_state_offload import \
+                        ChunkedOptimizerStateOffloader
+                    from .emerging_optimizers import TensorParallelMuon
+
+                    if type(opt) is not TensorParallelMuon:
+                        raise ValueError('CPU master initialization requires ordinary Muon')
+                    if self.use_fp8_param_sync or any(
+                        param.dtype != torch.bfloat16 or is_float8tensor(param)
+                        for group in opt.param_groups for param in group['params']
+                    ):
+                        raise ValueError('CPU master initialization requires ordinary BF16 parameters')
+                    wrapper_kwargs['cpu_main_param_ids'] = (
+                        ChunkedOptimizerStateOffloader.cpu_initial_master_param_ids(
+                            opt, config.optimizer_state_offload_fraction
+                        )
+                    )
                 optimizers[i] = wrapper(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None,
+                    **wrapper_kwargs,
                 )
                 # Non-DistOpt LayerWise child has no byte-shard param buffer, so tag it to route
                 # step_with_ready_grads to copy fp32 master straight into model ``param.data`` even
@@ -805,6 +816,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     f"TensorParallelMuon child; got {len(offload_children)}"
                 )
                 for optimizer, master_params in offload_children:
+                    if config.chunked_optimizer_main_params:
+                        if self.use_fp8_param_sync or any(
+                            param.dtype != torch.bfloat16 or is_float8tensor(param)
+                            for group in optimizer.float16_groups for param in group
+                        ):
+                            raise ValueError('Chunked main params currently require BF16 parameters without FP8 gather')
                     optimizer.enable_chunked_optimizer_state_offload(
                         master_params=master_params, state_dtypes=state_dtypes
                     )
@@ -897,7 +914,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         collective: this code runs with rank-local inventory, which differs across
         pipeline and multimodal stages.
         """
-        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+        from megatron.core.optimizer.layer_sharded_muon import (
+            LayerShardedMuon, ParamShardSpec)
 
         dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
         expert_axes = (
