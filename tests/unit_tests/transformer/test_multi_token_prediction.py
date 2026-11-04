@@ -3313,6 +3313,85 @@ class TestMultiTokenPrediction:
         for sharded, gathered in zip(results[False], results[True]):
             torch.testing.assert_close(gathered, sharded)
 
+    @pytest.mark.parametrize("tp", [1, 2])
+    @pytest.mark.parametrize("early_backward", [False, True])
+    def test_process_mtp_loss_chunking_matches_dense(self, tp, early_backward, monkeypatch):
+        """Chunked MTP loss matches dense loss and gradients with sequence parallelism."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        tp_group = get_tensor_model_parallel_group()
+        local_sequence_length, vocab_size = 7, 256
+        sequence_length = local_sequence_length * tp
+        base_config = dict(
+            hidden_size=64,
+            num_layers=2,
+            num_attention_heads=4,
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            mtp_loss_early_backward=early_backward,
+            sequence_parallel=tp > 1,
+            tensor_model_parallel_size=tp,
+            use_cpu_initialization=True,
+        )
+        hidden_states = torch.randn(
+            2 * local_sequence_length, self.micro_batch_size, base_config["hidden_size"]
+        ).cuda()
+        labels = torch.randint(
+            0, vocab_size, (self.micro_batch_size, sequence_length), device="cuda"
+        )
+        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+
+        def compute_language_model_loss(labels, logits):
+            loss = vocab_parallel_cross_entropy(
+                logits, labels.transpose(0, 1).contiguous(), tp_group=tp_group
+            )
+            return loss.transpose(0, 1).contiguous()
+
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        results = []
+        reference_state = None
+        for chunk_size in (None, 3):
+            config = TransformerConfig(mtp_loss_chunk_size=chunk_size, **base_config)
+            output_layer = ColumnParallelLinear(
+                config.hidden_size,
+                vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+                tp_group=tp_group,
+            ).cuda()
+            if reference_state is None:
+                reference_state = output_layer.state_dict()
+            else:
+                output_layer.load_state_dict(reference_state)
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            hidden = hidden_states.clone().requires_grad_(True)
+            process_mtp_loss(
+                hidden_states=hidden,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=output_layer,
+                output_weight=None,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                tp_group=tp_group,
+            ).sum().backward()
+            metrics = torch.cat(
+                [
+                    MTPLossLoggingHelper.tracker[key]
+                    for key in ("loss_values", "correct_values", "total_values")
+                ]
+            )
+            results.append((metrics, output_layer.weight.grad, hidden.grad))
+
+        for dense, chunked in zip(*results):
+            torch.testing.assert_close(chunked, dense, rtol=1e-5, atol=1e-6)
+
     def test_process_mtp_loss_counts_with_argmax_from_loss(self, monkeypatch):
         """When the loss returns the argmax of the logits, the acceptance counts use it."""
         captured = {}
