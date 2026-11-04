@@ -915,38 +915,35 @@ def validate_args(args, defaults={}):
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
     )
 
+    # The general --overlap-param-gather preconditions live on OptimizerConfig, which also
+    # accepts use_layer_wise_distributed_optimizer; only the DSA-specific one belongs here.
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer or args.use_megatron_fsdp \
-            or args.optimizer == 'dist_muon', \
-            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
-        assert args.overlap_grad_reduce, \
-            'Must use --overlap-param-gather with --overlap-grad-reduce'
-        assert not getattr(args, 'dsa_train_indexer_only', False), \
+        assert not args.dsa_train_indexer_only, \
             '--dsa-train-indexer-only is not compatible with --overlap-param-gather'
 
-    if getattr(args, 'dsa_indexer_clip_grad', None) is not None:
+    if args.dsa_indexer_clip_grad is not None:
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-indexer-clip-grad requires --experimental-attention-variant dsa'
         assert args.dsa_indexer_clip_grad >= 0.0, \
             '--dsa-indexer-clip-grad must be non-negative'
 
-    if getattr(args, 'dsa_train_indexer_only', False):
+    if args.dsa_train_indexer_only:
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-train-indexer-only requires --experimental-attention-variant dsa'
-        assert (getattr(args, 'dsa_indexer_loss_coeff', None) or 0.0) > 0.0, \
+        assert (args.dsa_indexer_loss_coeff or 0.0) > 0.0, \
             '--dsa-train-indexer-only requires --dsa-indexer-loss-coeff > 0'
 
-    if getattr(args, 'dsa_reset_indexer_on_load', False):
+    if args.dsa_reset_indexer_on_load:
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-reset-indexer-on-load requires --experimental-attention-variant dsa'
         assert args.load is not None or args.pretrained_checkpoint is not None, \
             '--dsa-reset-indexer-on-load requires --load or --pretrained-checkpoint'
-        assert not getattr(args, 'use_precision_aware_optimizer', False), \
+        assert not args.use_precision_aware_optimizer, \
             '--dsa-reset-indexer-on-load does not support --use-precision-aware-optimizer'
-        assert not getattr(args, 'use_torch_fsdp2', False) and not getattr(
-            args, 'use_megatron_fsdp', False
-        ), '--dsa-reset-indexer-on-load currently supports DDP/distributed-optimizer models only'
-    if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
+        assert not args.use_torch_fsdp2 and not args.use_megatron_fsdp, \
+            '--dsa-reset-indexer-on-load currently supports DDP/distributed-optimizer models only'
+
+    if args.dsa_indexer_mode == 'simplified':
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-indexer-mode simplified requires --experimental-attention-variant dsa'
 
@@ -1218,13 +1215,11 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
-        assert getattr(args, 'dsa_indexer_n_heads', None) in (None, 1), (
+    if args.dsa_indexer_mode == 'simplified':
+        assert args.dsa_indexer_n_heads in (None, 1), \
             'simplified DSA requires --dsa-indexer-n-heads 1 when explicitly set'
-        )
-        assert getattr(args, 'dsa_indexer_head_dim', None) is None or (
-            args.dsa_indexer_head_dim > 0
-        ), '--dsa-indexer-head-dim must be positive when explicitly set'
+        assert args.dsa_indexer_head_dim is None or args.dsa_indexer_head_dim > 0, \
+            '--dsa-indexer-head-dim must be positive when explicitly set'
         args.dsa_indexer_n_heads = 1
         if args.dsa_indexer_head_dim is None:
             args.dsa_indexer_head_dim = args.kv_channels
