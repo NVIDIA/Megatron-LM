@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -23,7 +23,7 @@ from megatron.core.transformer.utils import (
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
-from megatron.core.utils import divide
+from megatron.core.utils import divide, get_global_memory_buffer
 
 
 class DotProductAttention(MegatronModule):
@@ -196,7 +196,7 @@ class DotProductAttention(MegatronModule):
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+        matmul_input_buffer = get_global_memory_buffer().get_tensor(
             (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
         )
 

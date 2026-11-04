@@ -14,6 +14,7 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_global_memory_buffer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -22,6 +23,17 @@ def _own_tensor_parallel_group(tp_size):
     if Utils.world_size % tp_size != 0:
         pytest.skip(f"needs a world size divisible by {tp_size}")
     return HyperCommGrid([tp_size, Utils.world_size // tp_size], ["tp", "dp"]).create_pg("tp")
+
+
+@pytest.fixture
+def parallel_state_buffer_forbidden(monkeypatch):
+    """Make parallel_state's buffer aliases raise, so callers must use megatron.core.utils."""
+
+    def forbidden(*args, **kwargs):
+        raise RuntimeError("the global memory buffer was taken from parallel_state")
+
+    monkeypatch.setattr(parallel_state, "get_global_memory_buffer", forbidden)
+    monkeypatch.setattr(parallel_state, "_set_global_memory_buffer", forbidden)
 
 
 def _small_integers(generator, *shape, low=-2, high=3):
@@ -39,6 +51,7 @@ class TestGlobalMemoryBuffer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.usefixtures("parallel_state_buffer_forbidden")
     @pytest.mark.parametrize("tp_size", [2, 4])
     def test_sequence_parallel_linears_on_their_own_group(self, tp_size):
         """Sequence-parallel linears run on an explicit group without initialize_model_parallel."""
@@ -94,7 +107,9 @@ class TestGlobalMemoryBuffer:
         torch.testing.assert_close(x_shard.grad, x_ref.grad[tokens], **exact)
         torch.testing.assert_close(fc1.weight.grad, w1_ref.grad[features], **exact)
         torch.testing.assert_close(fc2.weight.grad, w2_ref.grad[:, features], **exact)
+        assert ("mpu", torch.float32) in get_global_memory_buffer().buffer
 
+    @pytest.mark.usefixtures("parallel_state_buffer_forbidden")
     def test_gather_into_the_buffer_on_its_own_group(self):
         """The all-gather into the global buffer (MoE allgather dispatcher) runs without the grid."""
         tp_size = 2
@@ -107,7 +122,9 @@ class TestGlobalMemoryBuffer:
 
         expected = torch.arange(tp_size, dtype=torch.float32, device="cuda").repeat_interleave(2)
         torch.testing.assert_close(gathered, expected[:, None].expand(-1, 3))
+        assert ("mpu", torch.float32) in get_global_memory_buffer().buffer
 
+    @pytest.mark.usefixtures("parallel_state_buffer_forbidden")
     def test_local_attention_on_its_own_group(self):
         """The local DotProductAttention runs on an explicit group without the global grid."""
         tp_size = 2
@@ -143,6 +160,7 @@ class TestGlobalMemoryBuffer:
         probs = scores.masked_fill(future, float("-inf")).softmax(dim=-1)
         expected = torch.einsum("bnst,tbnh->sbnh", probs, value).reshape(seq_length, batch, -1)
         torch.testing.assert_close(output, expected)
+        assert ("mpu", torch.float64) in get_global_memory_buffer().buffer
 
     def test_buffer_is_created_on_first_use_and_reset_by_destroy(self):
         from megatron.core import utils
