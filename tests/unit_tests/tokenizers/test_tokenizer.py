@@ -198,6 +198,25 @@ def test_hf_detokenize_skip_special_tokens(skip_special_tokens):
         ), f"Expected EOS preserved when skip_special_tokens=False. Got: {text!r}"
 
 
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_tokenizer_additional_special_tokens_none(tmp_path):
+    """additional_special_tokens=None should behave like no extra tokens instead of raising."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {"[UNK]": 0, "x": 1, "y": 2, "<eos>": 3}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", eos_token="<eos>"
+    ).save_pretrained(tmp_path)
+
+    tokenizer = HuggingFaceTokenizer(str(tmp_path), additional_special_tokens=None)
+
+    assert tokenizer.additional_special_tokens_ids == []
+    assert tokenizer.text_to_ids("x y") == [1, 2]
+
+
 def test_megatron_tokenizer():
     # Load tokenizer with additional special tokens
     special_tokens = {}

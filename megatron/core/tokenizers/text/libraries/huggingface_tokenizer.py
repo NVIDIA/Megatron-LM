@@ -192,7 +192,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         for token in [mask_token, bos_token, eos_token, pad_token, sep_token, cls_token, unk_token]:
             if token is not None and token not in self.tokenizer.get_vocab():
                 new_tokens_in_vocab.append(token)
-        for token in additional_special_tokens:
+        for token in additional_special_tokens or []:
             if token is not None and token not in self.tokenizer.get_vocab():
                 new_tokens_in_vocab.append(token)
 
