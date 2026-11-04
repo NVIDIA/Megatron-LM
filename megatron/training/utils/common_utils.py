@@ -579,10 +579,17 @@ def warn_rank_0(message, rank=None):
 
 
 def setup_multi_storage_client(enable_msc: bool) -> None:
-    """Apply the run's MSC policy (``CheckpointConfig.enable_msc``) to the process-wide feature
-    flag: enable it when requested, disable it otherwise (a process does not inherit the flag
-    from an earlier run in the same interpreter), and fail early when it is requested but the
-    package is missing. Warns once, when the flag turns on."""
+    """Apply the process-wide Multi-Storage Client policy: enable the feature flag when
+    requested, disable it otherwise (a process does not inherit the flag from an earlier run in
+    the same interpreter), and fail early when it is requested but the package is missing.
+    Warns once, when the flag turns on.
+
+    ``parse_args`` calls it for ``--enable-msc``; a script or entry point that enables MSC itself
+    calls it before any path is read (a configuration YAML loaded from an ``msc://`` path
+    included). MSC applies to datasets, tokenizers and configuration files as much as to
+    checkpoints, which is why it is not a setting of any one config section; consumers ask
+    ``MultiStorageClientFeature.is_enabled()``.
+    """
     if not enable_msc:
         MultiStorageClientFeature.disable()
         return
@@ -591,8 +598,9 @@ def setup_multi_storage_client(enable_msc: bool) -> None:
     if not MultiStorageClientFeature.is_enabled():
         MultiStorageClientFeature.disable()
         raise RuntimeError(
-            "--enable-msc (CheckpointConfig.enable_msc) was requested but the multistorageclient "
-            "package is not installed. Install it with `pip install multi-storage-client`."
+            "MSC was requested (--enable-msc or setup_multi_storage_client(True)) but the "
+            "multistorageclient package is not installed. Install it with "
+            "`pip install multi-storage-client`."
         )
     if not was_enabled:
         warn_rank_0('The MSC feature is enabled.')

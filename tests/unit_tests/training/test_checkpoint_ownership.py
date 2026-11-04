@@ -582,7 +582,7 @@ def test_the_cli_gloo_check_sees_the_rewritten_distributed_optimizer(monkeypatch
         _validated(*argv)
 
 
-# ---- the MSC policy is the section's, applied for every entry point ----
+# ---- MSC is process-wide: the CLI applies it at parse time, a script through the same helper ----
 
 
 @pytest.fixture
@@ -600,37 +600,35 @@ def msc_installed(monkeypatch):
     [([], False), (["--enable-msc"], True), (["--enable-msc", "--disable-msc"], False)],
 )
 def test_the_cli_applies_the_msc_policy_it_parses(msc_installed, argv, enabled):
-    """``--enable-msc`` fills the field and turns the flag on at parse time; the deprecated
-    ``--disable-msc`` still wins."""
+    """``--enable-msc`` turns the process-wide flag on at parse time; the deprecated
+    ``--disable-msc`` still wins. The checkpoint section carries no MSC setting."""
     with patch("megatron.training.arguments.warn_rank_0"):
         args = _validated(*argv)
-    assert checkpoint_config_from_args(args).enable_msc is enabled
+    assert args.enable_msc is enabled
     assert msc_installed.is_enabled() is enabled
+    assert not hasattr(checkpoint_config_from_args(args), "enable_msc")
 
 
-def test_the_runtime_services_apply_the_sections_msc_policy(monkeypatch, msc_installed):
-    """A native container turns MSC on when its services are initialized, before the tokenizer
-    or a checkpoint path is read; applying the same policy again is silent, and a run without
-    MSC turns the flag off."""
-    args = _validated()
-    cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    cfg.checkpoint.enable_msc = True
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG"):
-        monkeypatch.setattr(global_vars, name, None)
-    global_vars.set_args(args)
-    global_vars.set_run_config(cfg)
-    for name in ("_set_wandb_writer", "_set_telemetry"):
-        monkeypatch.setattr(global_vars, name, Mock())
+def test_a_script_keeps_msc_through_fault_tolerance_setup(monkeypatch, msc_installed):
+    """A script that enables MSC itself (through the helper, before any path is read) keeps it on
+    through pretrain()'s fault-tolerance setup, which reads the registered arguments instead of
+    re-parsing the command line (that used to re-apply the parser's default and switch MSC off);
+    the helper turns it off again for a run without MSC, silently."""
+    from megatron.training import ft_integration
+    from megatron.training.utils import setup_multi_storage_client
+
+    args = _validated()  # the entry point's arguments: no --enable-msc, no --enable-ft-package
     assert msc_installed.is_enabled() is False  # parse_args applied the CLI's value: off
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     with patch("megatron.training.utils.common_utils.warn_rank_0") as warn:
-        global_vars.initialize_runtime_services(args, build_tokenizer=False)
-    assert msc_installed.is_enabled() is True
+        setup_multi_storage_client(True)
+        setup_multi_storage_client(True)
     warn.assert_called_once()
+    assert msc_installed.is_enabled() is True
+    ft_integration.setup()
+    assert msc_installed.is_enabled() is True
     with patch("megatron.training.utils.common_utils.warn_rank_0") as warn:
-        global_vars.initialize_runtime_services(args, build_tokenizer=False)
-        assert msc_installed.is_enabled() is True
-        cfg.checkpoint.enable_msc = False
-        global_vars.initialize_runtime_services(args, build_tokenizer=False)
+        setup_multi_storage_client(False)
     warn.assert_not_called()
     assert msc_installed.is_enabled() is False
 

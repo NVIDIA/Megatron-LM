@@ -45,7 +45,7 @@ from typing import Any, Optional
 
 import torch
 
-from . import arguments, global_vars
+from . import global_vars
 from .utils import is_rank0, print_rank_0
 
 _GLOBAL_RANK_MONITOR_CLIENT = None
@@ -85,7 +85,10 @@ def get_rank_monitor_client() -> Optional[Any]:
 
 def setup() -> None:
     """Initialize fault tolerance before initialize_megatron"""
-    args = arguments.parse_args(ignore_unknown_args=True)
+    # The entry point registered the arguments before pretrain(); re-parsing the command line
+    # here replayed the parser's side effects (the MSC policy among them) on a run that had set
+    # them up itself.
+    args = global_vars.get_args()
     if not args.enable_ft_package:
         return
 

@@ -178,8 +178,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         # Preserve legacy semantics: --disable-msc forces MSC off, even if
         # --enable-msc was also passed.
         args.enable_msc = False
-    # Applied here, before any path is read; the runtime-services setup applies the checkpoint
-    # section's value again for every entry point (a no-op for a CLI run).
+    # Applied here, before any path is read. MSC is a process-wide storage feature (datasets,
+    # tokenizers, YAMLs, checkpoints), not a config setting: a script that enables it itself calls
+    # the same helper before any path is read.
     setup_multi_storage_client(args.enable_msc)
 
     return args
@@ -2851,8 +2852,7 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    # --enable-msc keeps its own group (_add_msc_args) next to the deprecated --disable-msc.
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng", "enable_msc"])
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,

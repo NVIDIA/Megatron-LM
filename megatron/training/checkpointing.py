@@ -1091,7 +1091,7 @@ def save_checkpoint(
                 fs_storage_writer = FileSystemWriterAsync(
                     checkpoint_name,
                     thread_count=checkpoint.dist_ckpt_workers,
-                    use_msc=checkpoint.enable_msc,
+                    use_msc=MultiStorageClientFeature.is_enabled(),
                     **_writer_kwargs,
                 )
 
