@@ -93,7 +93,8 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
     x = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
     model(x).float().sum().backward()
 
-    assert allocated_dtypes == [expected_comm_dtype], allocated_dtypes
+    expected_dtypes = [expected_comm_dtype] if distributed_setup.world_size > 1 else []
+    assert allocated_dtypes == expected_dtypes, allocated_dtypes
     for name, parameter in model.named_parameters():
         assert parameter.grad.dtype == (main_grads_dtype or torch.bfloat16), name
 
@@ -157,8 +158,9 @@ def test_mxfp8_partial_grad_buffer_follows_grad_comm_dtype(
         output = model(x)
     output.float().sum().backward()
 
-    # One partial buffer per group (weight group and bias group).
-    assert allocated_dtypes == [expected_comm_dtype] * 2, allocated_dtypes
+    # Communicating meshes pack both groups; singleton meshes accumulate locally.
+    expected_dtypes = [expected_comm_dtype] * 2 if distributed_setup.world_size > 1 else []
+    assert allocated_dtypes == expected_dtypes, allocated_dtypes
 
 
 @pytest.mark.parametrize(

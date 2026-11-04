@@ -650,10 +650,10 @@ class FsdpParameterGroup:
             fsdp_parameter.unsharded.grad = None
 
     def accumulate_local_gradients(self) -> None:
-        """Accumulate on the caller's stream, retaining source gradients for caller cleanup.
+        """Accumulate on compute, retaining source gradients for caller cleanup.
 
-        The caller must wait for gradient production before this call and order
-        compute after accumulation before clearing the source .grad references.
+        The caller clears the source .grad references on the same stream after
+        this call and orders any outer reduction after the accumulation.
         """
         assert self.main_grad is not None
         for fsdp_parameter in self.fsdp_parameters:

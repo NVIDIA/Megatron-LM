@@ -146,7 +146,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
 
 
 def test_local_accumulation_captures_full_iteration(distributed_setup):
-    """Replay training with singleton-inner accumulation and a separate outer-reduction stream."""
+    """Graph replay matches eager training with singleton-inner accumulation and outer overlap."""
     device = distributed_setup.device
     if distributed_setup.world_size < 2:
         pytest.skip("Requires a nontrivial outer data-parallel axis.")
@@ -156,18 +156,24 @@ def test_local_accumulation_captures_full_iteration(distributed_setup):
     )
     torch.manual_seed(1234)
     model = NestedModel(dim=16, num_children=2).to(device)
-    with fully_shard_context(
-        FsdpContext(device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=True))
-    ):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements)
-        fully_shard(model, mesh=mesh, placements=placements)
+    reference_model = NestedModel(dim=16, num_children=2).to(device)
+    reference_model.load_state_dict(model.state_dict())
+    for candidate in (model, reference_model):
+        with fully_shard_context(
+            FsdpContext(
+                device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
+            )
+        ):
+            for layer in candidate.layers:
+                fully_shard(layer, mesh=mesh, placements=placements)
+            fully_shard(candidate, mesh=mesh, placements=placements)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=0.25, foreach=False)
     static_input = torch.eye(16, device=device)
     static_target = torch.zeros_like(static_input)
 
-    def train_iteration() -> torch.Tensor:
+    def train_iteration(model, optimizer) -> torch.Tensor:
         optimizer.zero_grad(set_to_none=False)
         loss = torch.nn.functional.mse_loss(model(static_input), static_target)
         loss.backward()
@@ -179,17 +185,24 @@ def test_local_accumulation_captures_full_iteration(distributed_setup):
     # Warm up on the capture stream to establish reusable gradient storage.
     with torch.cuda.stream(capture_stream):
         for _ in range(3):
-            train_iteration()
+            train_iteration(model, optimizer)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        static_loss = train_iteration()
+        static_loss = train_iteration(model, optimizer)
     torch.cuda.current_stream().wait_stream(capture_stream)
 
+    # Capture records kernels without executing them; only warmup advanced the model.
+    for _ in range(3):
+        train_iteration(reference_model, reference_optimizer)
+
     losses = []
+    reference_losses = []
     for _ in range(5):
         graph.replay()
         # Preserve each replay's loss before the next replay overwrites it.
         losses.append(static_loss.clone())
-    loss_values = torch.stack(losses).tolist()
-    assert loss_values[-1] < loss_values[0], loss_values
+        reference_losses.append(train_iteration(reference_model, reference_optimizer))
+    torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
+    for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
+        torch.testing.assert_close(parameter.to_local(), reference_parameter.to_local())
