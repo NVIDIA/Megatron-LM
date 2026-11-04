@@ -13,7 +13,7 @@ OUT=$(realpath "$OUT_ARG")
 for MODE in det nondet; do
   DETERMINISM_PERF_MODE=$MODE \
     nsys profile -t cuda,nvtx -f true \
-      --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+      --capture-range=cudaProfilerApi --capture-range-end=stop \
       -o "$OUT/nsys-$MODE" "$@"
   nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
 done
