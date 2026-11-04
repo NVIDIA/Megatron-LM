@@ -47,11 +47,7 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
 
     assert output is hidden and bias is None
     layer.route.assert_called_once_with(
-        hidden,
-        padding_mask,
-        input_ids,
-        packed_seq_params=packed,
-        replay_topk_idx=replay_topk_idx,
+        hidden, padding_mask, input_ids, packed_seq_params=packed, replay_topk_idx=replay_topk_idx
     )
     layer.megakernel_experts.forward.assert_called_once_with(hidden, probs, routes)
     assert checkpoint.call_count == int(recompute)
