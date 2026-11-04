@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="csa_output_rope_reconstruction",
+        sources=("megatron/core/ops/attention/csa/output_rope.py",),
+        tests=(K + "test_csa_output_rope.py",),
+        kind="triton",
+        notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -398,13 +405,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/moe/token_dispatcher.py",
             "megatron/core/transformer/moe/moe_layer.py",
+            "megatron/core/transformer/moe/training_matches_inference.py",
         ),
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "HybridEP dispatch/combine on the static receive budget replays (EP=4), including the "
-        "CUDA-graph case that skips setup_metadata.",
+        "CUDA-graph case that skips setup_metadata; "
+        "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
+        "backward, and its MXFP8 training-stack quantization.",
     ),
     KernelEntry(
         name="moe_experts",
@@ -661,6 +671,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
+            "megatron/core/inference/moe/sigmoid_topk.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",

@@ -44,6 +44,9 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
+from megatron.core.transformer.moe.training_matches_inference import (
+    training_matches_inference_forward,
+)
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -836,8 +839,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
@@ -856,6 +858,11 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
+            return training_matches_inference_forward(
+                self, custom_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
+            )
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
