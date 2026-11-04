@@ -2285,8 +2285,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
+                        # Filter out nonpersistent step state if present, avoiding overwriting
+                        # the true Adam step counter restored from param_groups.
+                        filtered_src_tensors = {
+                            k: v for k, v in src_tensors.items() if k != "step"
+                        }
                         # Main param & optimizer states.
-                        self._set_main_param_and_optimizer_states(model_param, src_tensors)
+                        self._set_main_param_and_optimizer_states(model_param, filtered_src_tensors)
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):
