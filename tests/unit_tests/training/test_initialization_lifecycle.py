@@ -863,6 +863,9 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
     monkeypatch.setattr(training, "unwrap_model", lambda model: model)
     monkeypatch.setattr(training, "checkpoint_exists", lambda path: False)
+    # This setup stub builds no process groups for the new startup memory reports.
+    monkeypatch.setattr(training, "_get_model_pg_collection", lambda model_chunk: None)
+    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.distributed, "barrier", Mock())
     built_configs = []
 
