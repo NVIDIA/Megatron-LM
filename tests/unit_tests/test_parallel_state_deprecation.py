@@ -690,6 +690,55 @@ def test_pretrain_builds_its_collection_from_the_registered_grid_without_a_warni
 
 
 @pytest.mark.usefixtures("run_config")
+def test_finetuning_builds_its_model_on_the_collection_of_the_registered_grid(monkeypatch):
+    """finetune() builds its model and optimizer on the collection that pretrain() builds from the
+    registered grid, so setup_model_and_optimizer() does not fall back to the global grid."""
+    registered = _register_data_parallel_groups(monkeypatch)
+    args = SimpleNamespace(epochs=0, create_all_gather_group=False, pretrained_checkpoint=None)
+    monkeypatch.setattr(finetune_utils, "get_args", lambda: args)
+    monkeypatch.setattr(finetune_utils, "get_train_state", lambda: SimpleNamespace(iteration=1))
+    monkeypatch.setattr(finetune_utils, "get_timers", Mock)
+    setup = Mock(return_value=(Mock(), Mock(), Mock()))
+    monkeypatch.setattr(finetune_utils, "setup_model_and_optimizer", setup)
+    model_provider = Mock()
+
+    with _recorded_warnings() as record:
+        enable_strict_process_group_fallbacks()
+        finetune_utils.finetune(Mock(), model_provider)
+
+    assert setup.call_args.args[1] is model_provider
+    pg_collection = setup.call_args.kwargs["pg_collection"]
+    assert pg_collection is not registered
+    assert all(getattr(pg_collection, name) is group for name, group in vars(registered).items())
+    assert _deprecated_calls(record) == []
+    assert _fallbacks(record) == []
+
+
+@pytest.mark.usefixtures("run_config")
+def test_finetuning_on_an_unregistered_grid_warns_as_setup_model_and_optimizer_did(monkeypatch):
+    """On a grid set up without registering a collection, finetune() builds its model on the
+    global grid with the single warning that setup_model_and_optimizer() gave before: finetune()
+    takes no pg_collection, so a warning that named it would point at an argument it lacks."""
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", None)
+    global_groups = ProcessGroupCollection(dp=Mock())
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
+    )
+    args = SimpleNamespace(epochs=0, create_all_gather_group=False, pretrained_checkpoint=None)
+    monkeypatch.setattr(finetune_utils, "get_args", lambda: args)
+    monkeypatch.setattr(finetune_utils, "get_train_state", lambda: SimpleNamespace(iteration=1))
+    monkeypatch.setattr(finetune_utils, "get_timers", Mock)
+    setup = Mock(return_value=(Mock(), Mock(), Mock()))
+    monkeypatch.setattr(finetune_utils, "setup_model_and_optimizer", setup)
+
+    with _recorded_warnings() as record:
+        finetune_utils.finetune(Mock(), Mock())
+
+    assert setup.call_args.kwargs["pg_collection"] is global_groups
+    assert _fallbacks(record) == [("setup_model_and_optimizer", "pg_collection")]
+
+
+@pytest.mark.usefixtures("run_config")
 def test_initialization_reads_a_grid_set_up_before_it_without_a_warning(monkeypatch):
     """initialize_megatron() seeds from the groups that its caller registered, read at
     bootstrap."""

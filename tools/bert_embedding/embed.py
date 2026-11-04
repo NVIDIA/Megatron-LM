@@ -17,7 +17,10 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_attr_wrapped_model
-from megatron.training.training import setup_model_and_optimizer
+from megatron.training.training import (
+    _build_pg_collection_from_parallel_state,
+    setup_model_and_optimizer,
+)
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 
 from .dataset import BertEmbeddingDataset
@@ -369,9 +372,16 @@ class BertEmbedder:
 
         assert args.output_bert_embeddings
 
-        self.models, optimizer, opt_param_scheduler = \
-            setup_model_and_optimizer(ModelType.encoder_or_decoder,
-                                      model_provider)
+        # Build the model on the grid that initialize_megatron() registered, in the collection
+        # that pretrain() builds from it. The embedder takes no collection, so a grid set up
+        # without registering one warns, as before, that setup_model_and_optimizer() falls back
+        # to the global grid.
+        pg_collection = _build_pg_collection_from_parallel_state(
+            args, owner="setup_model_and_optimizer"
+        )
+        self.models, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, model_provider, pg_collection=pg_collection
+        )
         self.batch_size = batch_size
         self.max_bert_seq_length = max_bert_seq_length
 
