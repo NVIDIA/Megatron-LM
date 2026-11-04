@@ -1561,7 +1561,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        # FP32 is excluded alongside FP64: TE's general_gemm computes TF32 even
+        # with FP32 operands (bitwise-identical to a tf32 torch.mm, in both the
+        # forward and grad paths), so the FP32 router contract is only honored
+        # via torch.mm. See #8126.
+        if te_general_gemm is not None and router_dtype not in (torch.float32, torch.float64):
             # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
             # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
             # small bias vector before passing it to TE.
@@ -1597,7 +1601,10 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        # Same exclusion as forward: the grad GEMM is TF32-grade regardless of
+        # operand casts (bitwise-identical to a tf32 torch.mm; ~680x the error
+        # of true FP32 vs an FP64 reference). See #8126.
+        if te_general_gemm is not None and ctx.router_dtype not in (torch.float32, torch.float64):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
