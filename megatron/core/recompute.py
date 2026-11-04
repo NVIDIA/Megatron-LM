@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
@@ -12,7 +12,7 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import precision_aware_checkpoint, validate_extra_layer_kwargs
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -33,6 +33,7 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    extra_layer_kwargs: Optional[Dict[str, Optional[Tensor]]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -46,6 +47,9 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        extra_layer_kwargs (Dict[str, Optional[Tensor]], optional): Extra Tensor kwargs
+            forwarded to every layer. Values are passed as checkpoint inputs so their
+            gradients are preserved under recompute.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -60,6 +64,12 @@ def checkpointed_forward(
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
 
+    # Pass extra layer kwargs positionally (in a fixed key order) so the checkpoint
+    # function treats them as inputs and propagates their gradients.
+    extra_layer_kwargs = validate_extra_layer_kwargs(extra_layer_kwargs)
+    extra_keys = tuple(sorted(extra_layer_kwargs))
+    extra_values = tuple(extra_layer_kwargs[k] for k in extra_keys)
+
     def custom(start: int, end: int):
         def custom_forward(
             hidden_states,
@@ -70,6 +80,7 @@ def checkpointed_forward(
             rotary_pos_emb_global,
             padding_mask=None,
             input_ids=None,
+            *extra_layer_values,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -124,13 +135,14 @@ def checkpointed_forward(
                     packed_seq_params=layer_packed_seq_params,
                     padding_mask=layer_padding_mask,
                 )
+                extra_kwargs = dict(zip(extra_keys, extra_layer_values))
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
                     layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(**layer_kwargs, **extra_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata
                         # consumed by wrapped MoE layers, but not cross-attention kwargs
@@ -142,7 +154,7 @@ def checkpointed_forward(
                             layer_kwargs["packed_sequence_cp_metadata"] = (
                                 packed_sequence_cp_metadata
                             )
-                        hidden_states, context = layer(**layer_kwargs)
+                        hidden_states, context = layer(**layer_kwargs, **extra_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
                             "context",
@@ -160,7 +172,7 @@ def checkpointed_forward(
                             layer_kwargs["packed_sequence_cp_metadata"] = (
                                 packed_sequence_cp_metadata
                             )
-                        hidden_states = layer(**layer_kwargs)
+                        hidden_states = layer(**layer_kwargs, **extra_kwargs)
                         context = None
 
                 # Some layer paths may still return a tuple (defensive).
@@ -192,6 +204,7 @@ def checkpointed_forward(
             *rotary_pos_emb,
             padding_mask,
             input_ids,
+            *extra_values,
         )
         if use_checkpoint:
             hidden_states, context = precision_aware_checkpoint(
