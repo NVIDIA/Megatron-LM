@@ -1361,7 +1361,6 @@ class TestMultiTokenPredictionLayer:
             loss_mask=torch.ones(1, seq_len),
             output_layer=lambda hidden, **kwargs: (hidden, None),
             output_weight=None,
-            runtime_gather_output=None,
             is_training=False,
             compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
             config=config,
