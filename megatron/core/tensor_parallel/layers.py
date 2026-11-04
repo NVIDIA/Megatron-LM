@@ -878,8 +878,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             if wgrad_compute:
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
+                    # A weight used twice in one backward (e.g. output layer + MTP head) must add
+                    # its second wgrad; the unshard before that use resets grad_added_to_main_grad.
+                    accumulate = getattr(weight, "_fsdp_wgrad_written", False) or not getattr(
+                        weight, "overwrite_main_grad", True
+                    )
                     weight.main_grad = weight.get_main_grad()
-                    _wgrad_gemm(weight.main_grad, grad_output, total_input)
+                    _wgrad_gemm(weight.main_grad, grad_output, total_input, accumulate=accumulate)
+                    weight._fsdp_wgrad_written = True
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
