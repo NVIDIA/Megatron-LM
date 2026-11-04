@@ -928,6 +928,31 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_checkpoint_model_load_errors_propagate(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, strict
+):
+    """Non-strict keys do not make checkpoint loading errors recoverable."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = False
+    args.fp16 = False
+    args.bf16 = False
+    with TempNamedDir(tmp_path_dist_ckpt / "load_error", sync=True) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+        model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+        save_checkpoint(0, [model], None, None, 0)
+        error = RuntimeError("checkpoint extra state could not be loaded")
+        with mock.patch.object(model, "load_state_dict", side_effect=error):
+            with pytest.raises(RuntimeError) as caught:
+                load_checkpoint([model], None, None, strict=strict, restore_training_state=False)
+        assert caught.value is error
+
+
 def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
     """The streaming dequantize load is weights-only (inference): the loaded state dict holds
     the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before

@@ -931,6 +931,9 @@ jobs:
       )
       && !cancelled()
     uses: ./.github/workflows/_build_ci_container.yml
+    secrets:
+      NGC_API_USER: ${{ secrets.NGC_API_USER }}
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
       selected-runner: ${{ needs.configure.outputs.h100_build_runner }}

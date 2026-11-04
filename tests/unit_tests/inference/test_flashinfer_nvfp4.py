@@ -836,13 +836,22 @@ class TestNVFP4MoELayer:
         self._assert_close_to_bf16(refreshed, training_output, activation)
 
     @pytest.mark.parametrize("activation", _ACTIVATIONS)
-    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize(
+        "dispatcher,local_tokens",
+        [
+            pytest.param("nccl", 32, id="nccl"),
+            pytest.param("nvls", None, id="nvls"),
+            pytest.param("nvls", 64, id="nvls-64"),
+        ],
+    )
     def test_nvfp4_moe_layer_cuda_graph_replay_tracks_inputs_and_refresh(
-        self, dispatcher, activation
+        self, dispatcher, activation, local_tokens
     ):
         """A captured layer replays like eager, and an in-place refresh reaches the graph."""
         layer = self._make_layer(dispatcher, activation)
-        local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
+        # Cover both uneven EP input and the 64-token bucket where warmup stalled.
+        if local_tokens is None:
+            local_tokens = 17 + torch.distributed.get_rank()
         hidden_size = layer.config.hidden_size
         static_hidden = self._hidden_states(local_tokens, hidden_size)
 
