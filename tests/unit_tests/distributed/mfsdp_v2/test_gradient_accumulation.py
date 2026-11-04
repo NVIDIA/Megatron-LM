@@ -260,12 +260,9 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
         grad_comm_dtype = torch.bfloat16
 
     torch.manual_seed(1234)
-    model = nn.Linear(
-        8, 8 * setup.world_size, bias=False, device=setup.device, dtype=torch.bfloat16
-    )
+    model = nn.Linear(8, 8 * setup.world_size, bias=False, device=setup.device)
     reference = nn.Linear(8, 8 * setup.world_size, bias=False, device=setup.device)
     reference.load_state_dict(model.state_dict())
-    scale = 1 / 3
     context = FsdpContext(
         device=setup.device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
     )
@@ -277,37 +274,33 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
             mixed_precision_policy=MixedPrecisionPolicy(
                 main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
             ),
-            grad_scale=scale,
         )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
     generator = torch.Generator(device=setup.device).manual_seed(5678 + setup.rank)
+    num_microbatches = 2
+    inputs = torch.randn(num_microbatches, 4, 8, device=setup.device, generator=generator)
+    targets = torch.randn(
+        num_microbatches, 4, 8 * setup.world_size, device=setup.device, generator=generator
+    )
+    microbatches = tuple(zip(inputs.unbind(), targets.unbind()))
 
-    for _ in range(2):
-        optimizer.zero_grad(set_to_none=set_to_none)
-        expected_grad = torch.zeros_like(reference.weight)
-        for index in range(2):
-            inputs = torch.randn(
-                4, 8, device=setup.device, dtype=torch.bfloat16, generator=generator
-            )
-            reference_optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(setup.device.type, dtype=torch.bfloat16):
-                expected_output = reference(inputs)
-            expected_loss = expected_output.float().square().mean()
-            expected_loss.backward()
-            expected_grad.add_(reference.weight.grad * scale)
+    def train(model, optimizer, *, reduce_grads: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad(set_to_none=set_to_none)
+            for index, (inputs, targets) in enumerate(microbatches):
+                with microbatch(context, is_last=index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(inputs), targets)
+                    losses.append(loss.detach())
+                    (loss / num_microbatches).backward()
+            if reduce_grads:
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
 
-            with microbatch(context, is_last=index == 1):
-                loss = model(inputs).float().square().mean()
-                loss.backward()
-            torch.testing.assert_close(loss, expected_loss)
-
-        context.finish_grad_sync()
-        dist.all_reduce(expected_grad, op=dist.ReduceOp.AVG)
-        actual_grad = model.weight.grad.full_tensor()
-        torch.testing.assert_close(actual_grad, expected_grad)
-        reference.weight.grad = expected_grad
-        optimizer.step()
-        reference_optimizer.step()
-        torch.testing.assert_close(model.weight.full_tensor(), reference.weight)
+    actual_losses = train(model, optimizer, reduce_grads=False)
+    expected_losses = train(reference, reference_optimizer, reduce_grads=True)
+    torch.testing.assert_close(torch.stack(actual_losses), torch.stack(expected_losses))
