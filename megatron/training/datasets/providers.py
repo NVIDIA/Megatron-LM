@@ -21,7 +21,6 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     global_process_group_fallback,
-    warn_global_process_group_fallback,
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.utils import get_pg_rank
@@ -52,10 +51,10 @@ def is_dataset_built_on_rank_explicit(
     from megatron.training.utils import is_first_or_last_pipeline_stage
 
     if pg_collection is None:
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "is_dataset_built_on_rank", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
     for group_name in ("tp", "pp"):
         if vars(pg_collection).get(group_name) is None:
             raise ValueError(f"is_dataset_built_on_rank requires pg_collection.{group_name}")

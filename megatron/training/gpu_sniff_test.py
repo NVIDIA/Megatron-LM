@@ -423,15 +423,15 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
     if pg_collection is None:
         from megatron.core.process_groups_config import (
             ProcessGroupCollection,
-            warn_global_process_group_fallback,
+            global_process_group_fallback,
         )
 
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "run_gpu_sniff_test", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['ep', 'dp', 'tp'],
-        )
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['ep', 'dp', 'tp']
+            )
 
     ffn_shapes = _get_ffn_gemm_shapes()
 
