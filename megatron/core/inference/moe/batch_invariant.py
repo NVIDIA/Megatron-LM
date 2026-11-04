@@ -14,6 +14,12 @@ from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     grouped_gemm_batch_invariant,
     grouped_gemm_batch_invariant_alignment,
@@ -303,6 +309,131 @@ def squared_relu_with_probs(
         NUM_BLOCKS=num_blocks,
     )
     return out
+
+
+@triton.jit
+def _squared_relu_with_probs_quantize_kernel(
+    input_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    probs_ptr,
+    K,
+    n_col_blocks,
+    max_rows,
+    clamp_scale,
+    CLAMP: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """``_squared_relu_with_probs_kernel`` followed by MXFP8 quantization, in one pass.
+
+    Each live row runs the activation's statements (FP32 square and probability multiply,
+    one BF16 round) and then ``_mxfp8_quant_swizzle_row``'s statements on the BF16 values,
+    so data and scales are bitwise those of the two-kernel sequence. Alignment-padding rows
+    (permutation map -1) quantize a zero row, as the unfused path quantizes the zeros the
+    activation writes there. Rows at or beyond n_used are not touched.
+    """
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    col_offs = tl.arange(0, BLOCK_GROUPS)
+    col_mask = col_offs < REAL_GROUPS
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
+        if row < n_used:
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
+                value = tl.load(input_ptr + row_i64 * K + offs, mask=mask, other=0.0).to(tl.float32)
+                value = tl.maximum(value, 0.0)
+                if CLAMP:
+                    value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                value = value * value
+                # The unfused path stores this BF16 value and the quantizer reloads it.
+                x = (value * prob).to(tl.bfloat16).to(tl.float32)
+            else:
+                x = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+            # _mxfp8_quant_swizzle_row on x.
+            x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+            max_vals = tl.max(tl.abs(x_grouped), axis=1)
+            dequant_scale = max_vals / 448.0
+            dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+            dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+            quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+            quantized = tl.reshape(x_grouped * quant_scale[:, None], [BLOCK_K])
+            tl.store(out_fp8_ptr + row_i64 * K + offs, quantized.to(tl.float8e4nv), mask=mask)
+
+            scale_exp = (dequant_exp >> 23).to(tl.uint8)
+            local_row = row_i64 % 128
+            tile_idx = (row_i64 // 128) * n_col_blocks + col_offs // 4
+            swizzled_offs = tile_idx * 512 + (local_row % 32) * 16 + (local_row // 32) * 4
+            swizzled_offs += col_offs % 4
+            tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+
+def squared_relu_with_probs_quantize_mxfp8(
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    clamp_scale: Optional[float] = None,
+):
+    """``squared_relu_with_probs(..., zero_padding=True)`` then MXFP8 quantization of the
+    first ``n_used`` rows, fused into one kernel with bitwise identical data and scales.
+
+    Args:
+        x: [M, K] BF16 FC1 output in expert-grouped order.
+        permutation_map: [M] int32, source token of each row or -1 for alignment padding.
+        n_used: 1-element CUDA tensor, rows [0, n_used) feed the FC2 grouped GEMM.
+        probs: [M] FP32 routing probability of each row.
+        clamp_scale: config.activation_func_tanh_clamp_scale, if set.
+
+    Returns:
+        MXFP8Tensor; data rows at or beyond n_used are uninitialized and their scales zero.
+    """
+    num_rows, hidden_size = x.shape
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    scale_cols = hidden_size // MXFP8_BLOCK_SIZE
+    n_col_blocks = triton.cdiv(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = (
+        triton.cdiv(num_rows, MXFP8_SCALE_ROW_BLOCK)
+        * n_col_blocks
+        * MXFP8_SCALE_ROW_BLOCK
+        * MXFP8_SCALE_COL_BLOCK
+    )
+    out_data = torch.empty(num_rows, hidden_size, dtype=torch.float8_e4m3fn, device=x.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
+    block_k = triton.next_power_of_2(hidden_size)
+    num_blocks = max(1, min(num_rows, 512))
+    _squared_relu_with_probs_quantize_kernel[(num_blocks,)](
+        x,
+        out_data,
+        out_scale,
+        permutation_map,
+        n_used,
+        probs,
+        hidden_size,
+        n_col_blocks,
+        num_rows,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=block_k,
+        BLOCK_GROUPS=block_k // MXFP8_BLOCK_SIZE,
+        NUM_BLOCKS=num_blocks,
+    )
+    return MXFP8Tensor(
+        data=out_data, scale=ensure_mxfp8_scale_dtype(out_scale), backend="triton", dtype=x.dtype
+    )
 
 
 @triton.jit
