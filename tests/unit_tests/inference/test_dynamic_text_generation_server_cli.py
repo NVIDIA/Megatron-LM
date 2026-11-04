@@ -148,12 +148,7 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
     )
 
     monkeypatch.setattr(legacy_server.torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(
-        legacy_server,
-        "args",
-        Namespace(parsers=["json"], inference_text_gen_server_logging=True),
-        raising=False,
-    )
+    monkeypatch.setattr(legacy_server, "get_args", lambda: Namespace())
     monkeypatch.setattr(
         legacy_server, "start_text_gen_server", lambda **kwargs: captured.update(kwargs)
     )
@@ -166,6 +161,8 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
         coordinator_port=5555,
         server_port=4321,
         hostname="127.0.0.1",
+        parsers=["json"],
+        verbose=True,
         chat_template="template",
         default_temperature=0.4,
         default_top_p=0.8,
