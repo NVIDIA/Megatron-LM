@@ -112,18 +112,24 @@ def test_renormalizes_the_top_k(vocab):
     so.assert_renormalized(out, probs, refs, what=f"{KERNEL} V={vocab}")
 
 
-@so.XFAIL_O4A_N1
-@pytest.mark.parametrize("vocab", so.RADIX_SMEM_LIMIT_VOCABS)
+@pytest.mark.parametrize(
+    "vocab",
+    [
+        v if v in so.RADIX_RENORM_LAUNCHABLE_VOCABS else pytest.param(v, marks=so.XFAIL_O4A_N1)
+        for v in so.RADIX_SMEM_LIMIT_VOCABS
+    ],
+)
 def test_vocabularies_at_the_shared_memory_limit(vocab):
     """Rows whose radix CTA chunk ends at or just below the 57592-token shared-memory limit.
 
     Finding O4a-N1: FlashInfer gives each CTA ``2080 + 4 * chunk`` bytes of dynamic shared
     memory, up to the full 227 KiB opt-in limit, and the kernel's static shared memory (two cub
-    block-reduction scratch buffers, 328-332 bytes) on top. On H100 every size here with less
+    block-reduction scratch buffers, 333-336 bytes) on top. On H100 every size here with less
     headroom fails with ``invalid argument`` (pdx 7849977, dfw 21223592: 57591, 57592, 115072,
-    115183, 115184, 172672, 230272, 287744, 287872), and so do the edge probes 57509-57511,
-    115016 and 115018 (pdx 7852166; ``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``). No Megatron
-    change can fix it: every case is a strict xfail up to the FlashInfer the CI image pins
+    115183, 115184, 172672, 230272, 287744, 287872), and so do the edge probes 57509-57511 and
+    115018 (pdx 7852166); the probe 115016, with 336 bytes, runs (pdx 7876398;
+    ``sampling_oracle.RADIX_SMEM_LIMIT_VOCABS``). No Megatron change can fix it: every failing
+    case is a strict xfail up to the FlashInfer the CI image pins
     (``sampling_oracle.XFAIL_O4A_N1``); the Megatron call site is
     ``test_log_probs_kernel_at_the_shared_memory_limit`` (#8572).
     """

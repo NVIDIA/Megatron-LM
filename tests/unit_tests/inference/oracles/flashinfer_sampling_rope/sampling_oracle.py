@@ -106,9 +106,10 @@ RADIX_VOCAB_SIZES = sorted({57472, 57593, 114944, 115185, *PRODUCTION_VOCABS})
 # for the multi-CTA top_k_mask_logits the flag alone. Measured on H100 (pdx 7849977, dfw
 # 21223592): the renorm fails at 0-224 bytes of headroom (all sizes below but the edge probes),
 # runs at 480 (57472, 114944); the mask fails only at 0. Edge probes for the renorm's 328/332
-# bytes: 57509 and 57510 (332, 328 bytes), 57511 (324), 115016 (336), 115018 (328). The first,
-# 57509, already fails (pdx 7852166, dfw 21230145), so the static part exceeds 332 bytes and
-# the renorm fails at every size here; the mask at RADIX_MASK_UNLAUNCHABLE_VOCABS.
+# bytes: 57509 and 57510 (332, 328 bytes), 57511 (324), 115016 (336), 115018 (328). 57509 fails
+# (pdx 7852166, dfw 21230145) and 115016 runs (pdx 7876398; its earlier failures were the previous
+# case's pending launch error), so the static part is 333-336 bytes: the renorm fails at every
+# size here but RADIX_RENORM_LAUNCHABLE_VOCABS, the mask at RADIX_MASK_UNLAUNCHABLE_VOCABS.
 RADIX_SMEM_LIMIT_VOCABS = (
     57509,
     57510,
@@ -127,6 +128,8 @@ RADIX_SMEM_LIMIT_VOCABS = (
 )
 # The sizes whose multi-CTA top_k_mask_logits chunk is the full 57592 tokens (0 bytes of headroom).
 RADIX_MASK_UNLAUNCHABLE_VOCABS = (115183, 115184)
+# The size whose top_k_renorm_probs chunk leaves room for the static part (336 bytes).
+RADIX_RENORM_LAUNCHABLE_VOCABS = (115016,)
 
 # FlashInfer's bugs here (O4a-N1, O4a-N2) have no Megatron fix: their cases are strict xfails up
 # to the FlashInfer the CI image pins (flashinfer-python in uv.lock), with the drafted patches.
