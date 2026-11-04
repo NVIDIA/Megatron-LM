@@ -17,7 +17,8 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
-from megatron.training.training import get_model
+from megatron.training.global_vars import get_run_config, is_run_config_initialized
+from megatron.training.training import get_megatron_ddp_config, get_model
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -66,6 +67,67 @@ def initialize_gpt_model(
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
+    return model
+
+
+def initialize_quantized_gpt_model(
+    pre_process=True, post_process=True, seed=0, precision='fp8', recipe='delayed', **config_kwargs
+):
+    """Small Transformer Engine GPT model whose GEMM weights keep quantized storage.
+
+    ``precision='fp8'`` uses ``fp8_param`` (Float8Tensor / MXFP8Tensor depending on ``recipe``),
+    ``precision='fp4'`` uses ``fp4_param`` (NVFP4Tensor). Both are stored as torch.uint8 by the
+    DDP buffers, next to the bf16 buffer holding embeddings, norms and other non-GEMM params.
+    Quantized params are left at their init values: an in-place ``random_`` would replace the
+    quantized storage. Dims are multiples of 64 so every quantized block constraint holds.
+    """
+    from megatron.core.fp8_utils import is_float8tensor
+
+    try:
+        from megatron.core.fp4_utils import is_nvfp4tensor
+    except ImportError:  # pragma: no cover - older trees without NVFP4 support
+
+        def is_nvfp4tensor(tensor):
+            return False
+
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    if precision == 'fp8':
+        quantization_kwargs = dict(fp8='e4m3', fp8_recipe=recipe, fp8_param=True)
+    elif precision == 'fp4':
+        quantization_kwargs = dict(fp4='e2m1', fp4_recipe=recipe, fp4_param=True)
+    else:
+        raise ValueError(f'Unsupported precision {precision!r}')
+    default_config_kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=8,
+        kv_channels=16,
+        ffn_hidden_size=256,
+        use_cpu_initialization=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        add_bias_linear=False,
+        **quantization_kwargs,
+    )
+    default_config_kwargs.update(**config_kwargs)
+    transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=True)
+    model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+    )
+    with torch.no_grad():
+        for p in model.parameters():
+            if not (is_float8tensor(p) or is_nvfp4tensor(p)):
+                p.random_()
     return model
 
 
@@ -186,6 +248,17 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
         raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
 
+def _sync_run_config_optimizer_flags(use_distributed_optimizer, use_layer_wise):
+    """Make the run config describe the optimizer the test is about to build.
+
+    Checkpoint saving derives the optimizer sharding metadata from the run config, not from args.
+    """
+    if is_run_config_initialized():
+        optimizer_cfg = get_run_config().optimizer
+        optimizer_cfg.use_distributed_optimizer = use_distributed_optimizer
+        optimizer_cfg.use_layer_wise_distributed_optimizer = use_layer_wise
+
+
 def setup_model_and_optimizer(
     seed,
     tp,
@@ -202,6 +275,10 @@ def setup_model_and_optimizer(
     use_megatron_fsdp=False,
     ddp_num_buckets=None,
     ddp_pad_buckets_for_high_nccl_busbw=False,
+    grad_reduce_in_fp32=False,
+    fp8_param_gather=False,
+    fp4_param_gather=False,
+    reuse_grad_buf_for_mxfp8_param_ag=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -222,6 +299,12 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
+        mock_args.fp8_param_gather = fp8_param_gather
+        mock_args.fp4_param_gather = fp4_param_gather
+        # MXFP8 params cannot be re-pointed into the grad buffer (TE has no replace_raw_data for
+        # MXFP8Tensor); production keeps them out of it with this flag.
+        mock_args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf_for_mxfp8_param_ag
         if ddp_num_buckets is not None:
             # resolve_ddp_bucket_size() forces a single bucket unless grad reduction
             # overlaps, so both knobs are needed to actually split the grad buffer.
@@ -246,6 +329,9 @@ def setup_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -257,7 +343,10 @@ def setup_model_and_optimizer(
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     config = OptimizerConfig(
@@ -277,6 +366,7 @@ def setup_model_and_optimizer(
         config.lr = 0.0
     elif optimizer_type == 'lion':
         config.lr = 1e-4
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -381,6 +471,9 @@ def setup_moe_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -394,7 +487,10 @@ def setup_moe_model_and_optimizer(
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
-            )
+            ),
+            ddp_config=get_megatron_ddp_config(
+                mock_args, use_torch_fsdp2=mock_args.use_torch_fsdp2
+            ),
         )
 
     config = OptimizerConfig(
@@ -407,6 +503,7 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)

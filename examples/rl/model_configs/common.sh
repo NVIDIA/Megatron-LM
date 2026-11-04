@@ -38,5 +38,5 @@ else
 fi
 
 if [ ${ENABLE_CUDA_GRAPH:-true} == true ]; then
-    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local --rl-persist-cuda-graphs"
+    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local --inference-static-kv-memory-pointers"
 fi

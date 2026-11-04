@@ -33,6 +33,8 @@ for ARG in "$@"; do
     export "$KEY"="$VAL"
 done
 
+export NVTE_FLASH_ATTN_V4=0
+
 : "${CONFIG_PATH:?CONFIG_PATH (path to model_config.yaml) is required}"
 : "${CHECKPOINT_LOAD_PATH:?CHECKPOINT_LOAD_PATH is required}"
 : "${RESULTS_ROOT:?RESULTS_ROOT is required}"
@@ -135,6 +137,7 @@ MODEL_ARGS+=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
     --expert-model-parallel-size "$EP"
+    --flash-attention-version 2
 )
 
 # ── Make image-bundled extras (mamba-ssm) visible to the cog venv ─────────────

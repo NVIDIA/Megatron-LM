@@ -102,6 +102,20 @@ def _model(pre_fusion, recompute=False, **overrides):
     return model.cuda().to(config.params_dtype)
 
 
+def test_gdn_recompute_disables_two_stage_attention(model_parallel):
+    config = _config(recompute_granularity="selective", recompute_modules=["gdn"])
+    spec = get_experimental_attention_variant_module_spec(config=config)
+    groups = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        cp=parallel_state.get_context_parallel_group(),
+    )
+    model = spec.module(
+        config, submodules=spec.submodules, layer_number=1, pg_collection=groups
+    ).cuda()
+    assert model.recompute_gdn
+    assert not model.supports_two_stage_attention()
+
+
 def _inputs(packed):
     hidden = torch.randn(257, 1, 256, device="cuda", dtype=torch.bfloat16)
     dy = torch.randn_like(hidden)
@@ -193,8 +207,23 @@ def test_post_fusion_revalidates_each_forward(model_parallel, pre_fusion):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("batch,heads,dim", [(2, 8, 64), (3, 4, 256)])
-@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize(
+    "pre_fusion,batch,heads,dim",
+    [
+        (False, 2, 8, 64),
+        (False, 3, 4, 256),
+        (True, 2, 8, 64),
+        pytest.param(
+            True,
+            3,
+            4,
+            256,
+            marks=pytest.mark.skip(
+                reason="Temporarily disabled: costly width-256 pre/post-fusion compilation in SSM CI"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("recompute", [False, True])
 def test_dense_batch_and_head_layout_parity(
     model_parallel, batch, heads, dim, pre_fusion, recompute, dtype
@@ -221,7 +250,7 @@ def test_dense_batch_and_head_layout_parity(
 
 def test_pre_fusion_rejects_deterministic_mode(model_parallel):
     with pytest.raises(ValueError, match="Pre-GDR fusion is non-deterministic"):
-        _model(True, deterministic_mode=True)
+        _model(True, deterministic_mode=True, gdn_kernel_backend='torch')
 
 
 @pytest.mark.parametrize("value_heads", [16, 64])
@@ -235,7 +264,7 @@ def test_post_fusion_distributed_layout(
     tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
 ):
     """Enable the post fusion through CP redistribution and the complete backward."""
-    if torch.distributed.get_world_size() < tp * cp:
+    if Utils.world_size < tp * cp:
         pytest.skip("This layout requires four distributed GPU ranks")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp

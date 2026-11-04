@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
@@ -209,7 +210,8 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        set_global_variables(args)
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        set_global_variables(args, cfg)
 
         # Random seed.
         torch.manual_seed(123)
@@ -813,7 +815,8 @@ class LLaVAPipeline(Pipeline):
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        set_global_variables(args)
+        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        set_global_variables(args, cfg)
 
         # Random seed.
         torch.manual_seed(123)

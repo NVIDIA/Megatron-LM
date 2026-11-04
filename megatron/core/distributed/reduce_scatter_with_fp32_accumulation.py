@@ -39,6 +39,13 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         self.output_tensor.copy_(output_tensor_in_fp32.view(self.output_tensor.shape))
 
 
+class _CompletedWorkHandle:
+    """Work handle for a reduce-scatter that finished synchronously (single-rank group)."""
+
+    def wait(self):
+        """Nothing to wait for."""
+
+
 def reduce_scatter_with_fp32_accumulation(
     output_tensor: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -74,6 +81,12 @@ def reduce_scatter_with_fp32_accumulation(
 
     # Make sure input_tensor size is divisible by world size.
     assert input_tensor.numel() % world_size == 0
+
+    # A single-rank reduce-scatter is the identity: no all-to-all, FP32 sum or downcast.
+    if world_size == 1:
+        if output_tensor.data_ptr() != input_tensor.data_ptr():
+            output_tensor.copy_(input_tensor.view(output_tensor.shape))
+        return _CompletedWorkHandle() if async_op else None
 
     # Call all_to_all (every rank should have their respective gradient shards collected from
     # all ranks). We also create a tensor for the all-to-all output (the all-to-all collective

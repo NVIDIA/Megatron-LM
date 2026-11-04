@@ -51,6 +51,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
+from megatron.training.global_vars import get_run_config
 
 
 def _compute_norm_2(params_list):
@@ -68,15 +69,14 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
     """Extract the appropriate data tensor from a param for norm computation.
 
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
-    a sharded main_param from the distributed optimizer.
+    a DP-sharded optimizer main_param. Non-owners may have no main_param attribute.
     """
     if bf16:
-        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+        if not force_create_fp32_copy:
             if getattr(param, 'main_param_sharded', False):
-                if param.main_param is not None:
-                    return param.main_param, True
-                return None, True
-            return param.main_param, False
+                return getattr(param, 'main_param', None), True
+            if hasattr(param, 'main_param'):
+                return param.main_param, False
         return param.data.float(), False
     return param.data, False
 
@@ -409,14 +409,14 @@ def report_memory(name, process_group=None):
     process_group: optional data-parallel group to gate the rank-0 print on; None falls back
         to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
     """
-    args = get_args()
+    cfg = get_run_config()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
     string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
     string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
+    if cfg.logger.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     is_dp_rank_0 = (
         get_pg_rank(process_group) == 0

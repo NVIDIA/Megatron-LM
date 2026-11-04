@@ -23,6 +23,8 @@ from megatron.core.inference.config import MultimodalPromptConfig, PrefixCaching
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
+from .endpoints.common import apply_optional_sampling_default
+
 logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
@@ -57,9 +59,9 @@ async def _run_text_gen_server(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
@@ -110,9 +112,12 @@ async def _run_text_gen_server(
         app.config['multimodal_prompt_config'] = (
             multimodal_prompt_config or MultimodalPromptConfig()
         )
-        app.config['default_temperature'] = default_temperature
-        app.config['default_top_p'] = default_top_p
-        app.config['default_top_k'] = default_top_k
+        # Only set when the operator actually configured a value -- see
+        # apply_optional_sampling_default's docstring for why unconditional
+        # assignment here would break resolve_sampling_default's precedence.
+        apply_optional_sampling_default(app.config, 'default_temperature', default_temperature)
+        apply_optional_sampling_default(app.config, 'default_top_p', default_top_p)
+        apply_optional_sampling_default(app.config, 'default_top_k', default_top_k)
         app.config['eval_mode'] = eval_mode
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
@@ -171,9 +176,9 @@ def _server_process_worker(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
@@ -256,9 +261,9 @@ def start_text_gen_server(
     sock: Optional[socket.socket] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,

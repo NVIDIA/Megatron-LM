@@ -43,6 +43,7 @@ established here.
 # Subdesigns
 
 - [Optimizer](optimizer.md)
+- [Muon](muon.md)
 - [Runtime schedule](runtime_schedule.md)
 
 # API
@@ -124,7 +125,7 @@ axis.
 - `Shard(0)`. Torch's public dim-0 sharding placement. MFSDP specializes it to an
   internal per-unit DBuffer layout. Only dim-0 `Shard` placements are currently
   supported.
-  - `Flat`. The default row-atomic internal layout, good for elementwise optimizers.
+  - `RowAtomic`. The default row-atomic internal layout, good for elementwise optimizers.
   - `BlockAtomic(block_size)`. An internal `Shard` subclass that doesn’t cut a block of
     `block_size` rows. Simplifies blockwise quantization support. Currently, a 32x1
     mxfp8 block may be sharded across ranks. This introduces complex host-side logic and
@@ -266,9 +267,30 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-- Created by `fully_shard_context` and shared by every `FsdpModule` constructed in that
-  scope. On exit, it identifies FSDP roots and finalizes the static forward and backward
-  prefetch orders.
+Context-wide options are grouped in an immutable `RuntimePolicy`:
+
+```python
+context = FsdpContext(
+    device=device,
+    runtime_policy=RuntimePolicy(
+        use_symmetric_memory=True,
+        overlap_allgather_reduction=False,
+        caller_managed_grad_sync=True,
+    ),
+)
+with fully_shard_context(context):
+    fully_shard(model, mesh=mesh, placements=placements)
+```
+
+`device` and the construction-only `parameter_to_owner` map remain separate
+`FsdpContext` arguments. Runtime-policy flags default to `False`, except
+`overlap_allgather_reduction`, which defaults to `True`. When the caller manages
+gradient synchronization, call `context.finish_grad_sync()` after all backward
+work and before consuming gradients.
+
+- Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
+  `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
+  and static forward and backward prefetch orders.
 - Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
   current stream.
 - Last-microbatch state for HSDP/HFSDP gradient accumulation.
@@ -316,7 +338,7 @@ one contiguous local buffer.
   local range.
 - `redistribute(new_placements)`, with `allgather`, `allreduce`, `reduce_scatter`, and
   `scatter` convenience operations. Redistributing between sharded placements preserves
-  the global layout; [the optimizer subdesign](optimizer.md) converts between `Flat` and
+  the global layout; [the optimizer subdesign](optimizer.md) converts between `RowAtomic` and
   `TensorAtomic` this way.
 - `get_tensor_view(index)`: the local view for one logical tensor.
 - `get_dtensor(index)`: the corresponding DTensor, used by the optimizer and distributed

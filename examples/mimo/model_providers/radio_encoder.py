@@ -5,24 +5,23 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 from copy import deepcopy
 from typing import Optional
 
 import torch
 
 from megatron.core.activations import fast_gelu
-from megatron.core.models.multimodal.llava_model import pixel_shuffle
-from megatron.core.models.vision.radio import RADIOViTModel
+
+# Keep the example import paths compatible for downstream providers.
+from megatron.core.models.mimo.submodules.radio_encoder import (
+    RADIO_ENCODER_MODULE_NAME,
+    RADIOEncoderWrapper,
+    _pixel_shuffle_dynamic_res,
+)
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import sharded_state_dict_default
-
-# Canonical RADIO encoder module name (shared by the provider key + topology default).
-RADIO_ENCODER_MODULE_NAME = "radio_encoder"
 
 
 def add_radio_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -71,7 +70,7 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
-    """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
+    """Strip language-only architecture and precision settings from the base config."""
     config.activation_func_tanh_clamp_scale = None
     config.activation_func_tanh_clamp_scale_linear = None
     # FP32 residual accumulation is a language-model policy. Preserve the pretrained
@@ -92,13 +91,17 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.use_fused_weighted_squared_relu = False
     if config.recompute_modules is not None:
         config.recompute_modules = [
-            module
-            for module in config.recompute_modules
-            if module != "shortcut_pre_mlp_layernorm"
+            module for module in config.recompute_modules if module != "shortcut_pre_mlp_layernorm"
         ]
     if getattr(config, "offload_modules", None) is not None:
         config.offload_modules = [
             module for module in config.offload_modules if module != "shortcut_post_norm"
+        ]
+    config.wide_residual = None
+    config.residual_stream_recompute_num_layers = None
+    if config.recompute_modules is not None:
+        config.recompute_modules = [
+            module for module in config.recompute_modules if module != "residual_stream"
         ]
 
 
@@ -106,6 +109,7 @@ def _disable_gtp(config: TransformerConfig) -> None:
     """Keep this module replicated across any LLM GTP axes."""
     config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
     config.gtp_weight_remat_size = 1
+    config.tensor_parallel_num_sequence_shards = None
     expert_tp = config.expert_tensor_parallel_size or config.tensor_model_parallel_size
     config.expert_tensor_parallel_num_weight_shards = expert_tp
     config.expert_gtp_weight_remat_size = 1

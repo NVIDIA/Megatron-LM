@@ -502,7 +502,10 @@ class TestVLMTextGenerationController:
 
         inference_wrapped_model = VLMInferenceWrapper(self.model, inference_context)
 
+        # Set before construction: __init__ reads `tokenizer.eod`, an int per the
+        # tokenizer interface, and a bare Mock yields a Mock.
         self.mock_tokenizer = mock.Mock()
+        self.mock_tokenizer.eod = self.language_vocab_size - 1
 
         self.text_generation_controller = VLMTextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer

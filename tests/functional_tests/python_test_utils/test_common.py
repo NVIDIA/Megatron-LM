@@ -436,3 +436,173 @@ class TestPipelineMultipleMetrics:
                 {"loss": [DeterministicTest()], "num-zeros": [DeterministicTest()]},
             )
         assert "num-zeros" in str(exc_info.value)
+
+
+class TestGoldenErrorDiagnostics:
+    def test_reports_absolute_and_relative_extrema_at_their_own_steps(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        golden = make_metric({10: 4.0, 30: -0.01, 60: 0.0}, value_precision=ValuePrecision.FULL)
+        # The observed samples are deliberately stored in a different order.
+        actual = make_metric({60: 0.0, 30: -0.02, 10: 5.0})
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+        assert "2/3 samples outside tolerance" in caplog.text
+        assert "max_absolute_error at 10: golden=4, actual=5, absolute_error=1" in caplog.text
+        assert "relative_error=0.25 (25%)" in caplog.text
+        assert "max_relative_error at 30:" in caplog.text
+        assert "absolute_error=0.01, relative_error=1 (100%)" in caplog.text
+        assert "allowed_absolute_error=0" in caplog.text
+        assert "first_outside_tolerance" not in caplog.text
+
+    def test_reports_small_difference_that_passes_tolerance(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        run(
+            {"loss": make_metric({5: 1.0})},
+            {"loss": make_metric({5: 1.04})},
+            {"loss": [ApproximateTest(rtol=0.05)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED; 0/1 samples outside tolerance" in caplog.text
+        assert "absolute_error=0.04, relative_error=0.04 (4%)" in caplog.text
+        assert "allowed_absolute_error=0.05" in caplog.text
+
+    @pytest.mark.parametrize("atol,passes", [(1.0, True), (0.25, False)])
+    def test_zero_golden_uses_absolute_tolerance(self, atol, passes, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        args = (
+            {"loss": make_metric({5: 0.0})},
+            {"loss": make_metric({5: 0.5})},
+            {"loss": [ApproximateTest(atol=atol, rtol=0.05)]},
+        )
+        if passes:
+            run(*args)
+        else:
+            with pytest.raises(AssertionError, match="loss"):
+                run(*args)
+
+        assert "absolute_error=0.5, relative_error=n/a (zero golden)" in caplog.text
+        assert "max_relative_error" not in caplog.text
+
+    def test_near_zero_golden_reports_large_relative_error_within_atol(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        run(
+            {"loss": make_metric({5: 0.00001})},
+            {"loss": make_metric({5: 0.00002})},
+            {"loss": [ApproximateTest(atol=0.001, rtol=0)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED" in caplog.text
+        assert "absolute_error=1e-05, relative_error=1 (100%)" in caplog.text
+        assert "allowed_absolute_error=0.001" in caplog.text
+
+    @pytest.mark.parametrize("actual_value", ["nan", float("nan"), float("inf")])
+    def test_nonfinite_values_have_undefined_errors(self, actual_value, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0})},
+                {"loss": make_metric({5: actual_value})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "first_outside_tolerance at 5:" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+        assert "max_absolute_error" not in caplog.text
+
+    def test_missing_sample_is_identified_even_with_finite_extrema(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0, 10: 1.0})},
+                {"loss": make_metric({10: 1.25})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "max_absolute_error, max_relative_error at 10:" in caplog.text
+        assert "first_outside_tolerance at 5:" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+
+    def test_single_sample_extrema_share_one_precision_appropriate_row(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: 10.83456})},
+                {"loss": make_metric({5: 10.83457})},
+                {"loss": [ApproximateTest(atol=0, rtol=0)]},
+            )
+        assert caplog.text.count(" at 5: golden=") == 1
+        assert "max_absolute_error, max_relative_error at 5:" in caplog.text
+        assert "golden=10.83456, actual=10.83457," in caplog.text
+        assert "Actual values: [10.83457]" in caplog.text
+        assert "Golden values: [10.83456]" in caplog.text
+
+    def test_legacy_golden_placeholder_retains_undefined_diagnostics(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: "nan", 10: 1.0})},
+                {"loss": make_metric({5: 0.9, 10: 1.0})},
+                {"loss": [DeterministicTest()]},
+            )
+        assert "first_outside_tolerance at 5: golden=inf" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+
+    def test_full_precision_error_is_not_rounded_away(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 0.5}, value_precision=ValuePrecision.FULL)},
+                {"loss": make_metric({5: 0.5 + 2**-24})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "precision=full" in caplog.text
+        assert "absolute_error=5.96046448e-08" in caplog.text
+
+    def test_reports_both_exact_failure_and_approximate_success(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0}, value_precision=ValuePrecision.FULL)},
+                {"loss": make_metric({5: 1.01})},
+                {"loss": [DeterministicTest(), ApproximateTest(rtol=0.05)]},
+            )
+
+        assert "[DETERMINISTIC]: FAILED" in caplog.text
+        assert "[APPROXIMATE]: PASSED" in caplog.text
+
+    def test_approximate_failure_budget_is_visible(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        values = {step: 1.0 for step in range(1, 101)}
+        run(
+            {"loss": make_metric(values)},
+            {"loss": make_metric({**values, 100: 999.0})},
+            {"loss": [ApproximateTest(rtol=0.05)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED; 1/100 samples outside tolerance" in caplog.text
+        assert "max_absolute_error, max_relative_error at 100:" in caplog.text
+
+    def test_timing_error_is_labelled_as_a_median(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="iteration-time"):
+            run(
+                {"iteration-time": make_metric({5: 0.25, 10: 0.25, 15: 0.25})},
+                {"iteration-time": make_metric({5: 0.5, 10: 0.5, 15: 0.5})},
+                {"iteration-time": [ApproximateTest(rtol=0.05)]},
+            )
+
+        assert (
+            "max_absolute_error, max_relative_error at median over steps 5, 10, 15:" in caplog.text
+        )
+        assert "absolute_error=0.25, relative_error=1 (100%)" in caplog.text
+        assert "precision=full" in caplog.text
+
+    def test_matching_values_do_not_emit_error_diagnostics(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        metric = make_metric({1: 0.0, 5: 1.0})
+        run({"loss": metric}, {"loss": metric}, {"loss": [DeterministicTest()]})
+
+        assert "Golden comparison" not in caplog.text

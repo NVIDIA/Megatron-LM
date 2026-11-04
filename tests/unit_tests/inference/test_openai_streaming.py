@@ -455,6 +455,54 @@ def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
     assert streamed_text == "ab"
 
 
+def _with_chat_markers(eos_marker=None):
+    """A byte-level tokenizer whose chat markers are added tokens flagged `special` but kept out
+    of the special-tokens map, as in chat tokenizers that mark reasoning and tool calls."""
+    from tokenizers import AddedToken
+
+    tokenizer = _make_byte_level_fast_tokenizer()
+    huggingface_tokenizer = tokenizer._tokenizer.tokenizer
+    markers = ["<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_end|>"]
+    huggingface_tokenizer.add_tokens([AddedToken(marker, special=True) for marker in markers])
+    if eos_marker is not None:
+        tokenizer.eod = huggingface_tokenizer.convert_tokens_to_ids(eos_marker)
+    return tokenizer, huggingface_tokenizer
+
+
+def _non_streaming_text(huggingface_tokenizer, token_ids):
+    """What the non-streaming response decodes: the special-tokens map is removed, nothing else."""
+    tokens = huggingface_tokenizer.convert_ids_to_tokens(token_ids)
+    kept = [token for token in tokens if token not in huggingface_tokenizer.all_special_tokens]
+    return huggingface_tokenizer.convert_tokens_to_string(kept)
+
+
+def test_huggingface_fast_incremental_detokenizer_keeps_chat_markers():
+    tokenizer, huggingface_tokenizer = _with_chat_markers()
+    text = "<think>plan</think>answer<tool_call>call</tool_call>"
+    token_ids = huggingface_tokenizer.encode(text, add_special_tokens=False)
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [])
+
+    streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
+
+    # The reasoning and tool parsers see their markers, as they do without streaming.
+    assert streamed_text == text
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, token_ids)
+
+
+def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_tokens():
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode(
+        "<think>x</think>a<special>b<|im_end|>", add_special_tokens=False
+    )
+    prompt_ids = huggingface_tokenizer.encode("<special>hi<|im_end|>", add_special_tokens=False)
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_ids)
+
+    streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
+
+    assert streamed_text == "<think>x</think>ab"
+
+
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
     with pytest.raises(
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"
@@ -527,3 +575,29 @@ def test_json_safe_helpers_clamp_only_non_finite():
     orjson = pytest.importorskip("orjson")
     assert orjson.dumps(NEG_INF) == b"null"
     assert orjson.loads(orjson.dumps(json_safe_logprob(NEG_INF))) == floor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_stream_preserves_engine_finish_reason_at_budget(reason):
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1, 2],
+                "generated_log_probs": [-0.1, -0.2],
+                "finish_reason": reason,
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False, return_log_probs=False
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+    assert payloads[-1]["choices"][0]["finish_reason"] == reason

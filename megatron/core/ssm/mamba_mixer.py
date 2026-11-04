@@ -434,6 +434,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.weight.is_rmsnorm_weight = True
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
             self.norm.tp_group = self.pg_collection.tp
@@ -689,7 +690,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            z=z if not self.rmsnorm else None,
+            # ssm_prefill, MambaBatchInvariantDecode and the fused path this method
+            # replaces all gate inside the scan; gating in self.norm afterwards is
+            # the same algebra at different precision.
+            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
             dt_bias=self.cp.get_dt_bias().float(),
             dt_softplus=True,
             return_final_states=ssm_state is not None,
@@ -707,7 +711,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            # Already consumed by the scan above when batch-invariant.
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -804,14 +809,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         Returns:
             Output tensor of shape (l, b, d). Intermediate states (if any) are written
-            directly into the slot-allocator buffers held by `context`.
+            directly into the scratch buffers of `context.mamba_metadata`.
         """
         assert (
             self.cp.cp_size == 1
         ), "Context parallel is not supported for MambaMixer dynamic inference prefill"
 
         metadata = context.mamba_metadata
-        slot_allocator = context.mamba_slot_allocator
 
         seq_idx = metadata.seq_idx
         cu_seqlens = metadata.cu_seqlens
@@ -825,14 +829,15 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         conv_seq_idx = metadata.conv_seq_idx
         conv_seq_start = metadata.conv_seq_start
 
-        # Wire the per-layer intermediate extraction buffers (prefix caching) when a
-        # slot allocator is present; otherwise extraction is disabled below.
+        # Wire the per-layer intermediate extraction buffers (prefix caching). They live
+        # on the metadata and are non-None only for `PrefixCachedMambaMetadata`;
+        # otherwise extraction is disabled below.
         intermediate_ssm_out = None
         intermediate_conv_out = None
-        if slot_allocator is not None:
+        if metadata.intermediate_ssm_out is not None:
             mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
-            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
+            intermediate_ssm_out = metadata.intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = metadata.intermediate_conv_out[mamba_layer_idx]
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -977,10 +982,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         # the caller. When enabled, the chunk scan returns its raw states so
         # our Triton kernels do a fused gather+conditional-scatter directly,
         # skipping the dense intermediate tensor and the padded-slot writes.
+        # Batch-invariant mode also caches these complete-chunk FP32 states.
+        # Restoring one does not require the partial-tail decode replay buffers:
+        # the suffix prefill seeds those buffers at the same aligned boundary.
         extract_intermediates = (
-            not self.config.batch_invariant_mode
-            and intermediate_chunk_indices is not None
-            and intermediate_ssm_out is not None
+            intermediate_chunk_indices is not None and intermediate_ssm_out is not None
         )
         ssm_varlen_result = mamba_chunk_scan_combined_varlen(
             x=x,
@@ -1027,14 +1033,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         tensor_masked_update(ssm_state, batch_indices, cache_states)
         if self.config.batch_invariant_mode:
             self._get_batch_invariant_decoder().seed(
-                x,
-                z.squeeze(0),
-                dt,
-                B,
-                C,
-                cu_seqlens,
-                batch_indices,
-                max_requests=ssm_state.shape[0],
+                x, dt, B, C, cu_seqlens, batch_indices, max_requests=ssm_state.shape[0]
             )
 
         if extract_intermediates:
