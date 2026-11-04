@@ -172,6 +172,14 @@ class TestParallelMLAAttention:
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
+    def test_rejects_shared_prefix_forest(self):
+        """MLA has no forest-attention path, so it must not run dense attention over a forest."""
+        hidden_states = torch.zeros(4, 1, self.transformer_config.hidden_size)
+        with pytest.raises(NotImplementedError, match="multi-latent attention"):
+            self.parallel_attention(
+                hidden_states=hidden_states, attention_mask=None, shared_prefix_forest=object()
+            )
+
     @pytest.mark.parametrize("is_decode_only", [False, True])
     def test_dynamic_inference_forwards_decode_only_to_flash_attention(self, is_decode_only):
         """Test that MLA forwards the dynamic context's decode-only state."""
