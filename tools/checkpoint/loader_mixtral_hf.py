@@ -10,7 +10,11 @@ import transformers
 from packaging.version import Version
 from tqdm import tqdm
 
-from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
+from tools.checkpoint.utils import (
+    build_checkpoint_converter_process_groups,
+    initialize_checkpoint_converter_distributed,
+    register_checkpoint_converter_process_groups,
+)
 
 
 def add_arguments(parser):
@@ -140,8 +144,14 @@ def set_layer_state(args, model, hf_model, layer_idx):
     layer.self_attention.linear_qkv.layer_norm_weight.data.copy_(hf_layer.input_layernorm.weight)
     layer.pre_mlp_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
 
-def load_checkpoint_to_model(args):
-    '''Set model params.'''
+def load_checkpoint_to_model(args, pg_collection=None):
+    '''Set model params.
+
+    Args:
+        args: Megatron arguments of the model.
+        pg_collection: Process groups to build the model on. Without them, the model resolves
+            the global process groups of parallel_state.
+    '''
 
     from transformers import MixtralConfig, MixtralForCausalLM
 
@@ -153,7 +163,9 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
+    model = model_provider(
+        gpt_builder, pre_process=True, post_process=True, pg_collection=pg_collection
+    ).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -250,17 +262,14 @@ def _load_checkpoint(queue, args):
 
     cfg = inference_cfg_container_from_args(margs, build_model_config=False)
     set_global_variables(margs, cfg, build_tokenizer=False)
-    mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
-    mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
-    mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
-    mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
-    
-    initialize_checkpoint_converter_fake_process_groups(
-        mpu,
+    initialize_checkpoint_converter_distributed()
+    pg_collection = build_checkpoint_converter_process_groups(
         margs.tensor_model_parallel_size,
         margs.pipeline_model_parallel_size,
         margs.expert_model_parallel_size,
     )
+    # Code that reads the global groups instead of a collection sees the same groups.
+    register_checkpoint_converter_process_groups(mpu, pg_collection)
 
     # Metadata.
     md = types.SimpleNamespace()
@@ -289,11 +298,8 @@ def _load_checkpoint(queue, args):
     md.consumed_valid_samples = 0
     md.num_experts = margs.num_experts
 
-    # Get first pipe stage.
-    mpu.set_tensor_model_parallel_rank(0)
-    mpu.set_pipeline_model_parallel_rank(0)
-    mpu.set_expert_model_parallel_rank(0)
-    model = load_checkpoint_to_model(margs)
+    # Build the model of the first rank of every parallel group.
+    model = load_checkpoint_to_model(margs, pg_collection)
 
     queue.put(md)
 
