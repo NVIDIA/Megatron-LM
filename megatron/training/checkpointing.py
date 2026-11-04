@@ -2040,7 +2040,9 @@ def _load_global_dist_base_checkpoint(
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
-        state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
+        state_dict = dist_checkpointing.load_common_state_dict(
+            checkpoint_name, cache_metadata=args.ckpt_assume_constant_structure
+        )
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
     if sharded_state_dict is None:

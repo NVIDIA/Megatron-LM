@@ -160,7 +160,9 @@ def load(
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
     # torch_dist checkpoint (current format) or in a legacy common.pt.
-    common_state_dict = load_common_state_dict(checkpoint_dir)
+    common_state_dict = load_common_state_dict(
+        checkpoint_dir, cache_metadata=getattr(sharded_strategy, "cache_metadata", False)
+    )
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -209,7 +211,9 @@ def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
     return maybe_msc.Path(path).exists()
 
 
-def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
+def load_common_state_dict(
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False
+) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
 
     Supports both checkpoint formats transparently:
@@ -219,6 +223,9 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
 
     Args:
         checkpoint_dir (str): checkpoint directory
+        cache_metadata (bool): if True, read the torch_dist checkpoint metadata through
+            the process-wide metadata cache, so that later loads of the same checkpoint
+            directory with caching enabled do not re-read it from storage.
 
     Returns:
         StateDict: state dict with non-sharded objects from the checkpoint
@@ -233,7 +240,9 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
     pyt_state_dict = {unique_key: io.BytesIO()}
     torch.distributed.checkpoint.load(
-        pyt_state_dict, storage_reader=_get_filesystem_reader(checkpoint_dir), no_dist=True
+        pyt_state_dict,
+        storage_reader=_get_filesystem_reader(checkpoint_dir, cache_metadata=cache_metadata),
+        no_dist=True,
     )
 
     loaded = pyt_state_dict[unique_key]
