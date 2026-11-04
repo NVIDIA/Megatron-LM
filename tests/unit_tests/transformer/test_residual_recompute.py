@@ -573,7 +573,7 @@ class TestWideResidualHybridConstruction:
             "moe_layer",
         ):
             layer_spec = getattr(wide, name)
-            if layer_spec is not IdentityOp:
+            if layer_spec is not None:
                 assert layer_spec.module is WideResidualTransformerLayer
 
     def test_ordinary_mamba_layer_rejects_wide_config(self):
