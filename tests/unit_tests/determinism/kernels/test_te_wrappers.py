@@ -105,7 +105,8 @@ def _config(**overrides):
 @pytest.mark.skipif(not _IS_BLACKWELL, reason='TE MXFP8 needs Blackwell')
 @pytest.mark.parametrize('width', [32, 256])
 @pytest.mark.parametrize('needs_wgrad', [False, True])
-def test_engram_mxfp8_fused_payload_replays(width, needs_wgrad):
+@pytest.mark.parametrize('deduplicated', [False, True])
+def test_engram_mxfp8_fused_payload_replays(width, needs_wgrad, deduplicated):
     """Replay all fused payload/activation bytes, including TE's scale padding."""
     pytest.importorskip('triton')
     seeded(123)
@@ -113,12 +114,23 @@ def test_engram_mxfp8_fused_payload_replays(width, needs_wgrad):
     rows = 257 * 3
     requests = torch.randint(0, 128, (rows, 2), device='cuda')
     requests[:5, 1] = 0
-    order = torch.randperm(rows, device='cuda')
+    order = (
+        torch.randint(0, 128, (rows,), device='cuda')
+        if deduplicated
+        else torch.randperm(rows, device='cuda')
+    )
+    if deduplicated:
+        requests = torch.arange(128, device='cuda').unsqueeze(-1).expand(-1, 2)
 
     def lookup(row_ids, owner_order):
-        packed = _mxfp8_pack_lookup([weight], row_ids, None, [rows], width)
+        packed = _mxfp8_pack_lookup([weight], row_ids, None, [row_ids.numel()], width)
         activation = _mxfp8_lookup_activation(
-            packed, width, width * 3, torch.bfloat16, needs_wgrad, owner_order
+            packed,
+            width,
+            width * 3,
+            torch.bfloat16,
+            needs_wgrad,
+            **({"inverse": owner_order} if deduplicated else {"order": owner_order}),
         )
         return (
             packed,

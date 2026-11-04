@@ -58,12 +58,20 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        parallel_domain: Optional replica-domain name registered in ProcessGroupCollection.
+            None preserves the legacy dense/expert buffer identity.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    parallel_domain: Optional[str] = None
+
+    @property
+    def domain(self) -> str:
+        """Stable replica-domain key; old dense/expert layouts retain their identity."""
+        return self.parallel_domain or ('expert' if self.is_expert_parallel else 'dense')
 
 
 @dataclass

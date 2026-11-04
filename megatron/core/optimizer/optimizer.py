@@ -149,6 +149,7 @@ param_group_identifier_keys = (
     *_param_group_override_keys(),
     # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
     'is_expert_parallel',
+    'parallel_domain',
     'is_decoupled_lr',
 )
 MTP_GRAD_NORM_GROUP = 'mtp'
@@ -187,6 +188,7 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
     for name in (
+        'parallel_domain',
         'row_shard_group',
         'row_shard_global_rows',
         'row_shard_start',
@@ -1822,8 +1824,10 @@ class ChainedOptimizer(MegatronOptimizer):
             # Defer every synchronous DistOpt until all shared-buffer owners have stepped.
             optimizer._defer_param_sync = True
             for model_chunk in optimizer.model_chunks:
-                for bucket_group in (
-                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                for bucket_group in getattr(
+                    model_chunk,
+                    'all_bucket_groups',
+                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups,
                 ):
                     if not bucket_group.buckets:
                         continue

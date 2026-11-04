@@ -319,6 +319,16 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
+    if DP is not DistributedDataParallel and (
+        pg_collection.parameter_replica_groups
+        or any(
+            getattr(param, 'deferred_grad_producer', None) is not None
+            for chunk in model
+            for param in chunk.parameters()
+        )
+    ):
+        raise ValueError('Additional parameter domains and deferred gradients require standard DDP')
+
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
             num_parameters = sum(
@@ -432,6 +442,12 @@ def _ddp_wrap(
                             if intra_expt_dp_group is not None
                             else pg_collection.expt_dp
                         ).size(),
+                        parallel_group_sizes={
+                            name: group.size()
+                            for name, group in (
+                                pg_collection.parameter_replica_groups or {}
+                            ).items()
+                        },
                     )
 
                 wrapped_chunk = DP(

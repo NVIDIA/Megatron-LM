@@ -44,16 +44,36 @@ class EngramConfig:
     """Learning-rate multiplier for the lookup tables, excluding projections and norms."""
 
     communication_backend: str = "nccl"
-    """EP lookup transport: nccl or hybridep, independently of the MoE dispatcher."""
+    """Embedding lookup transport, independently of the MoE dispatcher."""
 
     hybridep_chunk_size: int = 4096
     """Maximum queries sent per rank per HybridEP dispatch; bounds communication workspace."""
 
+    parallel_size: int | None = None
+    """Row-sharding size within a physical pipeline stage; None preserves the EP topology."""
+
+    prefetch: bool = False
+    """Prefetch table rows before the consuming microbatch enters the model."""
+
+    defer_grad_transfer: bool = False
+    """Buffer row gradients and complete their delivery before replica gradient reduction."""
+
+    buffer_budget_mb: int = 1024
+    """MiB available for prefetched rows and pending row gradients, shared by local tables."""
+
     def __post_init__(self):
+        if self.parallel_size is not None and (
+            type(self.parallel_size) is not int or self.parallel_size <= 0
+        ):
+            raise ValueError('Engram parallel_size must be a positive integer or None')
+        if type(self.prefetch) is not bool or type(self.defer_grad_transfer) is not bool:
+            raise ValueError('Engram prefetch and defer_grad_transfer must be booleans')
+        if type(self.buffer_budget_mb) is not int or self.buffer_budget_mb <= 0:
+            raise ValueError('Engram buffer_budget_mb must be a positive integer')
         if not math.isfinite(self.embedding_lr_multiplier) or self.embedding_lr_multiplier <= 0:
             raise ValueError("Engram embedding_lr_multiplier must be finite and positive")
-        if self.communication_backend not in ("nccl", "hybridep"):
-            raise ValueError("Engram communication_backend must be nccl or hybridep")
+        if self.communication_backend not in ("nccl", "hybridep", "symmetric"):
+            raise ValueError("Engram communication_backend must be nccl, hybridep or symmetric")
         if self.hybridep_chunk_size <= 0 or self.hybridep_chunk_size % 64:
             raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
 

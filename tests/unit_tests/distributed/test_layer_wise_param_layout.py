@@ -21,6 +21,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     tag_params_for_buffer_routing,
 )
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,7 +118,7 @@ class TestLayerwiseParameterRouting:
 def test_checkpoint_metadata_uses_owning_module_group(is_expert, group_name, group_size):
     dp_cp = mock.Mock()
     expt_dp = mock.Mock()
-    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp)
+    pg_collection = ProcessGroupCollection(dp_cp=dp_cp, expt_dp=expt_dp)
     param_group = {"is_expert_parallel": is_expert, "params": True}
     expected_group = getattr(pg_collection, group_name)
 

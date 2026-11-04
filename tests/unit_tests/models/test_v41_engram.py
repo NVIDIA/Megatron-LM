@@ -402,13 +402,17 @@ def test_mxfp8_table_conversion_preserves_metadata(cpu_initialization):
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not _IS_BLACKWELL, reason='MXFP8 needs Blackwell')
 @pytest.mark.parametrize('use_layout', [False, True])
-def test_mxfp8_lookup_overlapped_param_gather(use_layout):
+@pytest.mark.parametrize('communication_backend', ['nccl', 'symmetric'])
+def test_mxfp8_lookup_overlapped_param_gather(use_layout, communication_backend):
     """EP2 x replica-DP2 lookup must publish updated masters before reading FP8 bytes."""
     pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    if communication_backend == 'symmetric':
+        pytest.importorskip('nccl.core.device.cute', exc_type=ImportError)
     Utils.initialize_distributed()
     if dist.get_world_size() < 4 or dist.get_world_size() % 2:
         pytest.skip('requires EP2 and at least two expert-DP replicas')
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    runtime = None
     try:
         torch.manual_seed(123)
         pg = ProcessGroupCollection.use_mpu_process_groups()
@@ -426,13 +430,36 @@ def test_mxfp8_lookup_overlapped_param_gather(use_layout):
         )
         # These row counts produce different physical shard sizes on the two EP ranks.
         model = EPShardedMultiTableEmbedding(
-            config, (129, 65), 32, config.init_method, pg.ep, pg.tp, pg.expt_dp, fp8_storage=True
+            config,
+            (129, 65),
+            32,
+            config.init_method,
+            pg.ep,
+            pg.tp,
+            pg.expt_dp,
+            fp8_storage=True,
+            communication_backend=communication_backend,
         ).cuda()
         convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
         weights = [table.weight for table in model.tables]
         for weight in weights:
             assert weight.row_shard_group is pg.ep and not weight.allreduce
             weight.lr_mult = 5.0
+        if communication_backend == 'symmetric':
+            # Keep real TE tensors/quantization, but force unaligned allocator
+            # suballocations for both bytes and scales before optimizer/DDP setup.
+            for weight in weights:
+                for name in ('_rowwise_data', '_rowwise_scale_inv'):
+                    original = getattr(weight, name)
+                    parent = torch.empty(original.numel() + 4096, dtype=torch.uint8, device='cuda')
+                    start = (512 - parent.data_ptr()) % 4096
+                    replacement = torch.from_dlpack(parent[start : start + original.numel()])
+                    replacement = replacement.view_as(original)
+                    replacement.copy_(original)
+                    setattr(weight, name, replacement)
+                    assert replacement.untyped_storage().data_ptr() % 4096 == 512
+            runtime = embedding_impl.EngramRuntime(8, defer_grad_transfer=True)
+            runtime.attach(model)
         tag_params_for_buffer_routing([model], use_sinkhorn_for_embeddings=True)
         optimizer_config = OptimizerConfig(
             optimizer='muon',
@@ -483,6 +510,8 @@ def test_mxfp8_lookup_overlapped_param_gather(use_layout):
         for _ in range(3):
             ddp.zero_grad_buffer()
             optimizer.zero_grad()
+            if runtime is not None:
+                runtime.reset()
             optimizer.prepare_model_params_for_param_sync()
             references = []
             for index, table in enumerate(model.tables):
@@ -504,7 +533,12 @@ def test_mxfp8_lookup_overlapped_param_gather(use_layout):
                 dist.all_reduce(reference, group=pg.ep)
                 references.append(reference[hashes[:, index]])
             # Engram's FP8 path never calls table.forward(), where DDP installs its hooks.
-            actual = model.lookup_quantized(hashes, 64).dequantize()[:129]
+            activation = (
+                runtime.consume(runtime.prefetch(model, hashes), 64)
+                if runtime is not None
+                else model.lookup_quantized(hashes, 64)
+            )
+            actual = activation.dequantize()[:129]
             expected = torch.cat(references, dim=-1)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             if previous is not None:
@@ -516,6 +550,8 @@ def test_mxfp8_lookup_overlapped_param_gather(use_layout):
             assert optimizer.step_with_ready_grads()
             assert all(weight._columnwise_data is None for weight in weights)
     finally:
+        if runtime is not None:
+            runtime.close()
         Utils.destroy_model_parallel()
 
 
@@ -1261,3 +1297,411 @@ def test_engram_hybridep_single_rank_needs_no_extension():
     output.sum().backward()
     torch.testing.assert_close(model.tables[0].weight.grad[0], torch.full((3,), 2.0))
     assert model.communication.buffer is None
+
+
+@pytest.mark.parametrize('defer', [False, True])
+@pytest.mark.parametrize('tables', [(13,), (13, 7)])
+def test_prefetch_duplicate_rows_and_deferred_gradients(defer, tables):
+    """Reordered microbatch backwards match dense lookup, without dense per-lookup wgrad."""
+    torch.manual_seed(91)
+    model = EPShardedMultiTableEmbedding(_config(), tables, 4, _config().init_method)
+    reference = [table.weight.detach().clone().requires_grad_() for table in model.tables]
+    runtime = embedding_impl.EngramRuntime(1, defer_grad_transfer=defer)
+    runtime.attach(model)
+    ids = torch.tensor([[0, 1, 1, 0, 2, 1], [3, 3, 0, 1, 3, 3]])[..., None].expand(
+        -1, -1, len(tables)
+    )
+    tickets = [runtime.prefetch(model, ids), runtime.prefetch(model, ids.flip(1))]
+    outputs = [runtime.consume(ticket) for ticket in tickets]
+    for i in (1, 0):
+        addresses = ids if i == 0 else ids.flip(1)
+        expected = torch.stack(
+            [weight[addresses[..., j]] for j, weight in enumerate(reference)], -2
+        )
+        torch.testing.assert_close(outputs[i], expected, rtol=0, atol=0)
+        grad = torch.randn_like(expected)
+        outputs[i].backward(grad)
+        expected.backward(grad)
+    if defer:
+        assert all(table.weight.grad is None for table in model.tables)
+        runtime.finish_deferred_gradients()
+    for table, ref in zip(model.tables, reference):
+        torch.testing.assert_close(table.weight.grad, ref.grad, rtol=1e-6, atol=2e-6)
+    assert runtime.used == 0
+    with pytest.raises(RuntimeError, match='already been consumed'):
+        runtime.consume(tickets[0])
+
+
+def test_parameter_domains_have_stable_optimizer_groups(monkeypatch):
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+    from megatron.core.process_groups_config import get_parameter_parallel_domain
+
+    monkeypatch.setattr(dist, 'get_world_size', lambda **kwargs: 1)
+    monkeypatch.setattr(
+        dist, 'all_gather_object', lambda out, value, **kwargs: out.__setitem__(0, value)
+    )
+    ordered = []
+    for names in (['dense', 'engram'], ['engram', 'dense']):
+        model = torch.nn.Module()
+        for name in names:
+            param = torch.nn.Parameter(torch.ones(2, 2))
+            if name == 'engram':
+                param.parallel_domain = name
+                param.allreduce = False
+            model.register_parameter(name, param)
+        ordered.append(_get_param_groups([model], OptimizerConfig(lr=0.1), {}))
+    assert [get_parameter_parallel_domain(group) for group in ordered[0]] == ['dense', 'engram']
+    assert [get_parameter_parallel_domain(group) for group in ordered[1]] == ['dense', 'engram']
+    saved = [
+        {**group, '_tag': get_parameter_parallel_domain(group)} for group in reversed(ordered[0])
+    ]
+    restored = MegatronOptimizer._filter_and_reorder_param_groups(ordered[1], saved)
+    assert [group['_tag'] for group in restored] == ['dense', 'engram']
+
+
+def test_prefetch_eviction_and_main_grad_accumulation():
+    model = EPShardedMultiTableEmbedding(_config(), (19,), 4, _config().init_method)
+    runtime = embedding_impl.EngramRuntime(1, defer_grad_transfer=True)
+    runtime.attach(model)
+    param = model.tables[0].weight
+    param.main_grad = torch.zeros_like(param)
+    ids = torch.tensor([[1], [1], [3]])
+    first = runtime.prefetch(model, ids)
+    runtime.budget = first.capacity
+    second = runtime.prefetch(model, ids + 1)
+    assert first.payload is not None and second.payload is None
+    runtime.consume(first).sum().backward()
+    assert second.payload is None
+    runtime.consume(second).sum().backward()
+    runtime.finish_deferred_gradients()
+    expected = torch.zeros_like(param)
+    expected[1:5] = torch.tensor([2.0, 2.0, 1.0, 1.0])[:, None]
+    torch.testing.assert_close(param.main_grad, expected)
+    assert param.grad is None and runtime.used == 0
+    assert runtime.peak <= runtime.budget
+    stale = runtime.prefetch(model, ids)
+    runtime.reset()
+    with pytest.raises(RuntimeError, match='earlier training step'):
+        runtime.consume(stale)
+
+
+@pytest.mark.parametrize(
+    'field,value',
+    [
+        ('parallel_size', 0),
+        ('parallel_size', True),
+        ('prefetch', 1),
+        ('defer_grad_transfer', 'true'),
+        ('buffer_budget_mb', 0),
+    ],
+)
+def test_engram_runtime_config_rejects_invalid_values(field, value):
+    from dataclasses import asdict
+
+    options = asdict(EngramConfig([0], [11], 2, 11, 1, 4, 0, 20))
+    options[field] = value
+    with pytest.raises(ValueError):
+        EngramConfig(**options)
+
+
+def _independent_engram_worker(rank, path, use_layout):
+    from megatron.core.process_groups_config import create_row_parallel_groups
+    from megatron.core.utils import check_param_hashes_across_dp_replicas
+    from megatron.training.utils import common_utils
+
+    dist.init_process_group('gloo', init_method='file://' + path, rank=rank, world_size=4)
+    try:
+        world = dist.group.WORLD
+        shard, replicas = create_row_parallel_groups(
+            world, 2, world_group=world, name='ENGRAM_TEST'
+        )
+        for member in range(4):
+            group = dist.new_group([member], backend='gloo')
+            if rank == member:
+                local = group
+        assert dist.get_process_group_ranks(shard) == [2 * (rank // 2), 2 * (rank // 2) + 1]
+        assert dist.get_process_group_ranks(replicas) == [rank % 2, rank % 2 + 2]
+        groups = ProcessGroupCollection(
+            dp_cp=world,
+            expt_dp=world,
+            tp=local,
+            expt_tp=local,
+            mp=local,
+            tp_ep_pp=local,
+            gtp_remat=local,
+            expt_gtp_remat=local,
+            engram=shard,
+            engram_dp=replicas,
+            parameter_replica_groups={'engram': replicas},
+        )
+        model = EPShardedMultiTableEmbedding(
+            _config(), (17,), 4, _config().init_method, ep_group=shard, expt_dp_group=replicas
+        )
+        weight = model.tables[0].weight
+        weight.parallel_domain = 'engram'
+        weight.is_managed_by_layer_wise_optimizer = True
+        weight.use_sinkhorn = True
+        weight.optimizer_owner_index = 0
+        full = torch.arange(68, dtype=torch.float32).view(17, 4).div(100).requires_grad_()
+        start, end = model.tables[0].row_start, model.tables[0].row_end
+        weight.data.copy_(full[start:end])
+        weight.main_grad = torch.zeros_like(weight)
+        runtime = embedding_impl.EngramRuntime(1, defer_grad_transfer=True)
+        runtime.attach(model)
+
+        # Empty requester, duplicate rows, and uneven ownership in the same exchange.
+        def addresses(peer, microbatch):
+            return torch.tensor(
+                [] if peer == 0 else [peer, peer, 16, (peer + microbatch) % 17], dtype=torch.long
+            ).view(-1, 1)
+
+        tickets = [runtime.prefetch(model, addresses(rank, mb)) for mb in range(2)]
+        for mb in (1, 0):
+            result = runtime.consume(tickets[mb])
+            torch.testing.assert_close(result, full[addresses(rank, mb)], rtol=0, atol=0)
+            result.sum().backward()
+        runtime.finish_deferred_gradients()
+        dist.all_reduce(weight.main_grad, group=replicas)
+        for peer in range(4):
+            for mb in range(2):
+                full[addresses(peer, mb)].sum().backward()
+        torch.testing.assert_close(weight.main_grad, full.grad[start:end], rtol=0, atol=0)
+        config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_layout, use_layer_wise_param_layout=use_layout
+        )
+        layout = LayerWiseDistributedOptimizer.compute_full_param_layout(
+            [weight],
+            None,
+            4,
+            config,
+            expert_data_parallel_world_size=4,
+            parallel_group_sizes={'engram': 2},
+        )
+        key, buffer = next(iter(layout.layouts.items()))
+        assert key.domain == 'engram' and not key.is_expert_parallel
+        if use_layout:
+            assert buffer.num_optimizer_shards == 2
+        optimizer = object.__new__(LayerWiseDistributedOptimizer)
+        optimizer.pg_collection, optimizer.dp_cp, optimizer.expt_dp = groups, world, world
+        inner = torch.optim.SGD(
+            [{'params': [weight], 'parallel_domain': 'engram', 'is_expert_parallel': False}], lr=0.1
+        )
+        optimizer.shard_params([inner], [layout] if use_layout else None)
+        assert bool(inner.param_groups[0]['params']) == (replicas.rank() == 0)
+        weight.grad = weight.main_grad
+        inner.step()
+        DistributedDataParallel.broadcast_params(
+            SimpleNamespace(module=model, parameter_replica_groups={'engram': replicas})
+        )
+        torch.testing.assert_close(weight, (full - 0.1 * full.grad)[start:end])
+        assert check_param_hashes_across_dp_replicas([model], True, pg_collection=groups)
+
+        # Norm logging counts each row shard once, also when only one replica
+        # owns its FP32 master. Use CPU math in place of the CUDA norm kernel.
+        def norm_squared(tensors):
+            return sum((tensor.float().square().sum() for tensor in tensors), torch.zeros(()))
+
+        for master in (False, True):
+            if master:
+                weight.main_param_sharded = True
+                weight.main_param = weight.detach().clone() if replicas.rank() == 0 else None
+            with (
+                patch.object(common_utils, 'get_args', return_value=SimpleNamespace(bf16=master)),
+                patch.object(common_utils, '_compute_norm_2', side_effect=norm_squared),
+            ):
+                norm = common_utils.calc_params_l2_norm(model, pg_collection=groups)
+            assert norm == pytest.approx((full - 0.1 * full.grad).norm().item(), rel=1e-6)
+        with torch.no_grad():
+            weight.add_(replicas.rank())
+        assert not check_param_hashes_across_dp_replicas([model], True, pg_collection=groups)
+        checkpoint = model.sharded_state_dict()
+        saved = checkpoint['tables.0.weight']
+        assert saved.global_offset[0] == start
+        assert saved.replica_id[-1] == replicas.rank()
+        # Every rank must reject invalid geometry before starting any new group.
+        with pytest.raises(ValueError, match='positive divisor'):
+            create_row_parallel_groups(world, 3, world_group=world, name='INVALID')
+        with pytest.raises(ValueError, match='agree on all ranks'):
+            create_row_parallel_groups(
+                world, 1 if rank == 0 else 2, world_group=world, name='MISMATCH'
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('use_layout', [False, True])
+def test_independent_engram_groups_lookup_gradients_and_optimizer_owners(use_layout):
+    with tempfile.TemporaryDirectory() as directory:
+        mp.spawn(_independent_engram_worker, args=(directory + '/rendezvous', use_layout), nprocs=4)
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='MXFP8 needs Blackwell')
+@pytest.mark.parametrize('communication_backend', ['nccl', 'hybridep', 'symmetric'])
+def test_prefetched_mxfp8_deferred_gradient_ddp(communication_backend):
+    """Real FP8 storage, independent shards and DDP's external gradient readiness."""
+    from megatron.core.process_groups_config import create_row_parallel_groups
+
+    Utils.initialize_distributed()
+    if dist.get_world_size() != 4:
+        pytest.skip('Requires four GPUs: row-shards 2, replicas 2, MoE EP4')
+    if communication_backend == 'hybridep':
+        pytest.importorskip('deep_ep')
+    if communication_backend == 'symmetric':
+        pytest.importorskip('nccl.core.device.cute', exc_type=ImportError)
+    Utils.initialize_model_parallel(expert_model_parallel_size=4)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        pg.engram, pg.engram_dp = create_row_parallel_groups(
+            pg.dp_cp, 2, world_group=dist.group.WORLD, name='ENGRAM_RUNTIME_TEST'
+        )
+        pg.parameter_replica_groups = {'engram': pg.engram_dp}
+        model = _cuda_mxfp8_engram(pg, communication_backend=communication_backend)
+        embedding, weight = model.embed, model.embed.tables[0].weight
+        runtime = embedding_impl.EngramRuntime(8, defer_grad_transfer=True)
+        runtime.attach(embedding)
+        ddp = DistributedDataParallel(
+            model.config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, grad_reduce_in_fp32=True),
+            embedding,
+            pg_collection=pg,
+        )
+        assert ddp.buffers == [] and ddp.expert_parallel_buffers == []
+        ddp.zero_grad_buffer()
+        ids = torch.tensor([[[0], [0], [197], [dist.get_rank()]]], device='cuda')
+        ticket = runtime.prefetch(embedding, ids)
+        consumer = torch.cuda.Stream()
+        consumer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(consumer):
+            activation = runtime.consume(ticket, 64)
+            activation.dequantize()[:2].sum().backward()
+        assert weight.grad is None and torch.count_nonzero(weight.main_grad) == 0
+        ddp.start_grad_sync()
+        for bucket in ddp.bucket_groups_by_domain['engram']:
+            assert bucket.grad_reduce_handle is None
+        ddp.finish_grad_sync()
+        full_grad = torch.zeros(198, 32, device='cuda')
+        full_grad[0] += 2
+        full_grad[197] += 1
+        full_grad[:4] += 0.25
+        table = embedding.tables[0]
+        torch.testing.assert_close(
+            weight.main_grad[: table.local_num_embeddings],
+            full_grad[table.row_start : table.row_end],
+            rtol=0,
+            atol=0,
+        )
+        assert torch.count_nonzero(weight.main_grad[table.local_num_embeddings :]) == 0
+        assert runtime.used == runtime.resident
+        runtime.close()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_deferred_producer_finishes_before_ddp_reduction():
+    from unittest.mock import Mock
+
+    events = []
+    parameter = torch.nn.Parameter(torch.ones(2, 2))
+    producer = Mock()
+    producer.finish_deferred_gradients.side_effect = lambda: events.append('produce')
+    bucket = Mock()
+    bucket.register_grad_ready.side_effect = lambda *args: events.append('ready')
+    bucket.finish_grad_sync.side_effect = lambda **kwargs: events.append('reduce')
+    ddp = object.__new__(DistributedDataParallel)
+    torch.nn.Module.__init__(ddp)
+    ddp.ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True)
+    ddp.force_all_reduce = False
+    ddp.deferred_grad_producers = (producer,)
+    ddp.deferred_grad_params = [parameter]
+    ddp.deferred_bucket_groups = {bucket}
+    ddp._deferred_grads_finished = False
+    ddp.param_to_bucket_group = {parameter: bucket}
+    ddp.bucket_groups_by_domain = {'memory': [bucket]}
+    ddp.start_grad_sync()
+    bucket.start_grad_sync.assert_not_called()
+    ddp.finish_grad_sync()
+    assert events == ['produce', 'ready', 'reduce']
+    ddp.finish_deferred_gradients()
+    producer.finish_deferred_gradients.assert_called_once()
+
+
+class _ReferenceDeviceTransport:
+    """CPU reference for the runtime's local-request/ID-plus-gradient contract."""
+
+    def __init__(self, group):
+        self.group = group
+
+    def exchange(self, source, recv, send, plan, workspace_bytes):
+        output = source.new_empty((sum(recv), *source.shape[1:]))
+        dist.all_to_all_single(output, source.contiguous(), recv, send, group=self.group)
+        return output
+
+    def lookup(self, key, data, scales, requests, send, recv, plans, workspace_bytes):
+        assert not scales
+        received = self.exchange(requests, recv, send, plans[0], workspace_bytes)
+        result = data[0].new_empty((sum(recv), data[0].shape[1]))
+        for table, weight in enumerate(data):
+            mask = received[:, 0] == table
+            result[mask] = weight[received[mask, 1]]
+        return self.exchange(result, send, recv, plans[1], workspace_bytes).view(torch.uint8)
+
+    def close(self):
+        pass
+
+
+def _direct_request_runtime_worker(rank, path, defer):
+    dist.init_process_group('gloo', init_method='file://' + path, rank=rank, world_size=4)
+    try:
+        with patch.object(
+            embedding_impl,
+            'require',
+            return_value=SimpleNamespace(EngramDeviceTransport=_ReferenceDeviceTransport),
+        ):
+            model = EPShardedMultiTableEmbedding(
+                _config(),
+                (7, 2),
+                4,
+                _config().init_method,
+                ep_group=dist.group.WORLD,
+                communication_backend='symmetric',
+            )
+        reference = [torch.arange(size * 4).reshape(size, 4).float() / 13 for size in (7, 2)]
+        for table, full in zip(model.tables, reference):
+            with torch.no_grad():
+                table.weight.copy_(full[table.row_start : table.row_end])
+        runtime = embedding_impl.EngramRuntime(1, defer_grad_transfer=defer)
+        runtime.attach(model)
+        tickets, expected, gradients = [], [], []
+        full_grad = [torch.zeros_like(full) for full in reference]
+        for step in range(3):
+            # Rank 0 asks for no rows; the smaller table has two empty owners.
+            rows = torch.arange(0 if rank == 0 else 11 + rank)
+            ids = torch.stack(((rows + step) % 7, rows % 2), dim=-1)
+            ticket = runtime.prefetch(model, ids)
+            assert ticket.requests.shape[0] == sum(ticket.send_splits)
+            tickets.append(ticket)
+            expected.append(torch.stack([full[ids[:, i]] for i, full in enumerate(reference)], 1))
+            grad = torch.arange(ids.numel() * 4).reshape(*ids.shape, 4).float() / 31
+            gradients.append(grad)
+            for i in range(2):
+                full_grad[i].index_add_(0, ids[:, i], grad[:, i])
+        for step in (1, 0, 2):
+            output = runtime.consume(tickets[step])
+            torch.testing.assert_close(output, expected[step], rtol=0, atol=0)
+            output.backward(gradients[step])
+        runtime.finish_deferred_gradients()
+        for table, full in zip(model.tables, full_grad):
+            dist.all_reduce(full)
+            torch.testing.assert_close(table.weight.grad, full[table.row_start : table.row_end])
+        runtime.close()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('defer', [False, True])
+def test_direct_request_runtime_gradient_packets(defer):
+    with tempfile.TemporaryDirectory() as directory:
+        mp.spawn(_direct_request_runtime_worker, args=(directory + '/rendezvous', defer), nprocs=4)

@@ -40,7 +40,11 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+    resolve_gtp_remat_group,
+)
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -355,13 +359,14 @@ def _get_param_groups(
             else:
                 param_override = None
 
-            is_expert_parallel = not getattr(param, 'allreduce', True)
+            domain = get_parameter_parallel_domain(param)
+            is_expert_parallel = domain == 'expert'
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, domain)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -378,9 +383,10 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
-    # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+    # Sort keys, None first; break equal-override ties by replica domain so PP
+    # stages with different local parameters still build identical group order.
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0], x[1], x[2])):
+        param_override_tuple, is_expert_parallel, domain = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -417,6 +423,8 @@ def _get_param_groups(
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
+        if domain not in ('dense', 'expert'):
+            param_group['parallel_domain'] = domain
         param_groups.append(param_group)
 
     return param_groups
@@ -838,6 +846,9 @@ def _get_megatron_emerging_optimizer(
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+    if pg_collection.parameter_replica_groups and not use_layer_wise:
+        raise ValueError('Emerging optimizers with additional parameter domains require LayerWise')
+
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
     # Tag parameters with optimizer-specific attributes (use_sinkhorn, expert_tp, is_qkv).
@@ -964,8 +975,12 @@ def _get_megatron_emerging_optimizer(
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        domain = get_parameter_parallel_domain(group)
+        # Matrix optimizers share the LayerWise owner assignment; scalar fallbacks
+        # need one DistributedOptimizer per replica domain.
+        if use_layer_wise and opt_name in (eopt_name, 'sinkhorn'):
+            domain = 'dense'
+        grouped_param_groups[(opt_name, domain)].append(group)
 
     # Sinkhorn is a companion matrix optimizer, not a scalar fallback: its row/column
     # normalizations require the same whole-parameter ownership as Muon.
@@ -1003,30 +1018,17 @@ def _get_megatron_emerging_optimizer(
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
         )
-        # DistOpt only manages scalar-fallback buffers. Muon and Sinkhorn buffers
-        # are owned by LayerWiseDistributedOptimizer.
-        distopt_per_model_buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, Muon and Sinkhorn groups feed into LayerWise; scalar
     # fallbacks use a separate DistributedOptimizer with byte-level sharding.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, domain), groups in grouped_param_groups.items():
         if not groups:
             continue
 
+        is_expert = domain == 'expert'
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
         # The primary optimizer and Sinkhorn use whole matrices. Scalar optimizers that
@@ -1057,15 +1059,18 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
-                # (byte-level sharding) instead of stuffing them inside LayerWise.
-                for group in groups:
-                    assert not group['is_expert_parallel'], (
-                        "Non-emerging expert-parallel param groups are not yet "
-                        "supported on the layer-wise + DistributedOptimizer "
-                        "path: they need a separate DistOpt instance with the "
-                        "expert-DP process group, which is not wired up yet."
-                    )
+                replica_group = pg_collection.get_parameter_replica_group(domain)
+                distopt_per_model_buffers = {
+                    i: [
+                        buffer
+                        for buffer in chunk.buffers_by_domain.get(domain, [])
+                        if buffer.params
+                        and not getattr(
+                            buffer.params[0], 'is_managed_by_layer_wise_optimizer', False
+                        )
+                    ]
+                    for i, chunk in enumerate(model_chunks)
+                }
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -1073,9 +1078,13 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                    data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
+                    data_parallel_group=replica_group,
+                    data_parallel_group_gloo=None,
+                    data_parallel_group_idx=(
+                        get_pg_rank(distopt_process_groups['mp_group'])
+                        if domain == 'dense'
+                        else torch.distributed.get_global_rank(replica_group, 0)
+                    ),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
@@ -1189,6 +1198,16 @@ def get_megatron_optimizer(
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
+
+    if pg_collection is None:
+        owner = model_chunks[0]
+        while hasattr(owner, 'module'):
+            owner = owner.module
+        model_groups = getattr(owner, 'pg_collection', None)
+        if model_groups is not None and getattr(model_groups, 'parameter_replica_groups', None):
+            # Additional domains are materialized by the model builder, not MPU.
+            pg_collection = model_groups
+            use_gloo_process_groups = False
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
@@ -1350,7 +1369,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: get_parameter_parallel_domain(g) == 'dense',
             buffer_name='buffers',
             process_group=param_group_process_group,
         )
@@ -1382,6 +1401,43 @@ def get_megatron_optimizer(
             )
         )
         model_chunk_offset += 1
+
+    for domain, replica_group in (
+        getattr(pg_collection, 'parameter_replica_groups', None) or {}
+    ).items():
+        if not config.use_distributed_optimizer:
+            raise ValueError('Additional parameter domains require a distributed optimizer')
+        param_groups = [
+            group
+            for group in _get_param_groups(
+                model_chunks, config, config_overrides, param_group_process_group
+            )
+            if get_parameter_parallel_domain(group) == domain
+        ]
+        buffers = {
+            i: chunk.buffers_by_domain.get(domain, []) for i, chunk in enumerate(model_chunks)
+        }
+        if dump_param_to_param_group_map is not None:
+            for param_group in param_groups:
+                for param in param_group['params']:
+                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_to_param_group[param_name] = param_group_id
+                param_group_id += 1
+        optimizers.append(
+            _get_megatron_optimizer_based_on_param_groups(
+                config=config,
+                model_chunks=model_chunks,
+                param_groups=param_groups,
+                per_model_buffers=buffers,
+                model_parallel_group=mp_group,
+                data_parallel_group=replica_group,
+                data_parallel_group_gloo=None,
+                data_parallel_group_idx=torch.distributed.get_global_rank(replica_group, 0),
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=0,
+                pg_collection=pg_collection,
+            )
+        )
 
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,

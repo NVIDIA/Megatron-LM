@@ -15,7 +15,10 @@ from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
@@ -1028,7 +1031,9 @@ def group_params_for_buffers(
         if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
-        is_expert_parallel = not getattr(param, 'allreduce', True)
+        domain = get_parameter_parallel_domain(param)
+        is_expert_parallel = domain == 'expert'
+        parallel_domain = domain if domain not in ('dense', 'expert') else None
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
@@ -1043,7 +1048,11 @@ def group_params_for_buffers(
             param_dtype = param.dtype
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            parallel_domain,
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -1052,7 +1061,11 @@ def group_params_for_buffers(
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
         offset_key = BufferKey(
-            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param.dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            parallel_domain,
         )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1

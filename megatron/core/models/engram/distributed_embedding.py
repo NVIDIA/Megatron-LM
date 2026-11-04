@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Differentiable EP-sharded embedding lookup for Engram.
+"""Differentiable row-sharded embedding lookup for Engram.
 
 Adapted from NVIDIA/Megatron-LM#7231 by BestJuly, including uneven logical
 checkpoint shapes and rank-local initialization that preserves replicated RNG.
@@ -8,6 +8,8 @@ checkpoint shapes and rank-local initialization that preserves replicated RNG.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from types import MethodType
 from typing import Callable, NamedTuple, Optional
 
@@ -25,6 +27,7 @@ from megatron.core.fp8_utils import (
     dequantize_fp8_tensor,
     is_mxfp8tensor,
 )
+from megatron.core.ops._backends import require
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import (
     ensure_params_ready,
@@ -44,6 +47,47 @@ except ImportError:
 
 
 if HAVE_TRITON:
+
+    @triton.jit
+    def _engram_accumulate_rows_kernel(
+        target,
+        rows,
+        order,
+        gradients,
+        N,
+        D: tl.constexpr,
+        TARGET_STRIDE: tl.constexpr,
+        GRAD_STRIDE: tl.constexpr,
+        ROW_STRIDE: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+    ):
+        """One writer per sorted segment; sum duplicates in FP32 without atomics."""
+        first = tl.program_id(0)
+        source = tl.load(order + first)
+        row = tl.load(rows + source * ROW_STRIDE)
+        previous = tl.load(order + first - 1, first > 0, other=0)
+        previous_row = tl.load(rows + previous * ROW_STRIDE)
+        if (first == 0) | (row != previous_row):
+            cols = tl.arange(0, BLOCK_D)
+            values = tl.full((BLOCK_D,), 0, tl.float32)
+            more = True
+            start = first
+            while more:
+                positions = start + tl.arange(0, BLOCK_ROWS)
+                indices = tl.load(order + positions, positions < N, other=0)
+                ids = tl.load(rows + indices * ROW_STRIDE, positions < N, other=-1)
+                valid = (positions < N) & (ids == row)
+                chunk = tl.load(
+                    gradients + indices[:, None] * GRAD_STRIDE + cols[None, :],
+                    valid[:, None] & (cols[None, :] < D),
+                    other=0,
+                ).to(tl.float32)
+                values += tl.sum(chunk, axis=0)
+                start += BLOCK_ROWS
+                more = (start < N) & (tl.sum(valid.to(tl.int32), axis=0) == BLOCK_ROWS)
+            old = tl.load(target + row * TARGET_STRIDE + cols, cols < D, other=0).to(tl.float32)
+            tl.store(target + row * TARGET_STRIDE + cols, old + values, cols < D)
 
     @triton.jit
     def _mxfp8_gather_pack_kernel(
@@ -212,10 +256,21 @@ def _mxfp8_quantizer():
 
 
 def _mxfp8_lookup_activation(
-    packed, embedding_dim, output_width, dtype, needs_wgrad, order=None, *, use_fused=True
+    packed,
+    embedding_dim,
+    output_width,
+    dtype,
+    needs_wgrad,
+    order=None,
+    *,
+    use_fused=True,
+    inverse=None,
 ):
     """Repack retrieved bytes for GEMM; only the batch needs a columnwise representation."""
-    tokens = packed.shape[0] * embedding_dim // output_width
+    if order is not None and inverse is not None:
+        raise ValueError("Specify either request order or an explicit inverse map")
+    rows = packed.shape[0] if inverse is None else inverse.numel()
+    tokens = rows * embedding_dim // output_width
     # An empty requester still participates in EP and backward; give GEMM a valid tile.
     padded_tokens = max(32, (tokens + 31) // 32 * 32)
     quantizer = _mxfp8_quantizer()
@@ -224,7 +279,6 @@ def _mxfp8_lookup_activation(
         output = quantizer.make_empty(
             (padded_tokens, output_width), dtype=dtype, device=packed.device
         )
-        inverse = None
         if order is not None and order.numel():
             inverse = torch.empty_like(order)
             _engram_inverse_permutation_kernel[(triton.cdiv(order.numel(), 1024),)](
@@ -251,6 +305,8 @@ def _mxfp8_lookup_activation(
         )
         return output
 
+    if inverse is not None:
+        packed = packed.index_select(0, inverse)
     if order is not None:
         ordered = torch.empty_like(packed)
         ordered.index_copy_(0, order, packed)
@@ -296,17 +352,24 @@ class _EngramExchangePlan(NamedTuple):
     recv_rows: tuple[int, ...]
 
 
+class _EngramRowExchangePlan(NamedTuple):
+    """Global peer counts for coalesced one-sided transfers, in source order."""
+
+    max_rows: int
+    peer_counts: Tensor
+
+
 class _EngramAllToAll:
     """Exact variable-split exchanges, independent of the MoE dispatcher and its buffers.
 
-    HybridEP dispatch treats each row as a top-1 token and each EP rank as an expert.
+    HybridEP dispatch treats each row as a top-1 token and each shard rank as an expert.
     Packets contain an integer ordering key followed by opaque bytes. Dispatch copies
     UINT16 words without arithmetic; combine would sum BF16 values and corrupt integer
     IDs and MXFP8 data/scales, so the return and gradient paths also use dispatch.
     """
 
     def __init__(self, group, backend="nccl", chunk_size=4096, max_row_bytes=16):
-        if backend not in ("nccl", "hybridep"):
+        if backend not in ("nccl", "hybridep", "symmetric"):
             raise ValueError(f"Unknown Engram communication backend: {backend}")
         if chunk_size <= 0 or chunk_size % 64:
             raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
@@ -316,10 +379,18 @@ class _EngramAllToAll:
         # HybridEP's UINT16 TMA path requires a multiple of 16 channels (32 bytes).
         self.max_packet_bytes = (max(16, max_row_bytes) + 8 + 31) // 32 * 32
         self.buffer = None
+        self.workspace_bytes = 64 * 1024**2
+        self.device_transport = (
+            require(
+                "megatron.core.ops.engram", "EngramDeviceTransport", needed_by="Engram symmetric"
+            ).EngramDeviceTransport(group)
+            if backend == "symmetric"
+            else None
+        )
 
-    def exchange_counts(self, send_counts):
+    def exchange_counts(self, send_counts, *, global_counts=False):
         """Return peer splits, owner table counts, and forward/reverse exchange plans."""
-        if self.backend == "nccl":
+        if self.backend == "nccl" and not global_counts:
             recv_counts = torch.empty_like(send_counts)
             torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.group)
             sent, received = torch.stack((send_counts, recv_counts)).view(2, self.size, -1).cpu()
@@ -333,7 +404,16 @@ class _EngramAllToAll:
             counts = gathered.view(self.size, self.size, -1).cpu()
             sent, received = counts[self.rank], counts[:, self.rank]
             peer_counts = counts.sum(dim=-1)
-            plans = (self._hybridep_plan(peer_counts), self._hybridep_plan(peer_counts.T))
+            plans = (
+                (self._hybridep_plan(peer_counts), self._hybridep_plan(peer_counts.T))
+                if self.backend == 'hybridep' and not global_counts
+                else (
+                    _EngramRowExchangePlan(int(peer_counts.sum(1).max()), peer_counts),
+                    _EngramRowExchangePlan(
+                        int(peer_counts.sum(0).max()), peer_counts.T.contiguous()
+                    ),
+                )
+            )
         return (
             sent.sum(dim=1).tolist(),
             received.sum(dim=1).tolist(),
@@ -368,9 +448,47 @@ class _EngramAllToAll:
                 group=self.group,
             )
             return output
+        if self.backend == 'symmetric':
+            return self._symmetric_exchange(input_, output_splits, input_splits, plan)
         return self._hybridep_exchange(input_, output_splits, input_splits, plan)
 
+    def _symmetric_exchange(self, input_, output_splits, input_splits, plan):
+        if not isinstance(plan, _EngramRowExchangePlan):
+            raise ValueError("Engram symmetric requires a lookup-local row exchange plan")
+        return self.device_transport.exchange(
+            input_, output_splits, input_splits, plan, self.workspace_bytes
+        )
+
+    def lookup(self, module, ticket):
+        """Read local-domain tables directly; GIN services only remote-domain rows."""
+        data, scales = [], []
+        for table in module.tables:
+            weight = table.weight
+            if table.fp8_storage:
+                if not is_mxfp8tensor(weight):
+                    raise RuntimeError("Move Engram FP8 tables to CUDA before performing lookups")
+                storage = weight if hasattr(weight, "_rowwise_data") else weight.data
+                if getattr(storage, "_with_gemm_swizzled_scales", False):
+                    raise ValueError("Engram FP8 lookup requires unswizzled rowwise scales")
+                data.append(storage._rowwise_data)
+                scales.append(storage._rowwise_scale_inv)
+            else:
+                data.append(weight)
+        payload = self.device_transport.lookup(
+            module,
+            data,
+            scales,
+            ticket.requests,
+            ticket.send_splits,
+            ticket.recv_splits,
+            ticket.plans,
+            self.workspace_bytes,
+        )
+        return payload if scales else payload.view(module.tables[0].weight.dtype)
+
     def _hybridep_exchange(self, input_, output_splits, input_splits, plan):
+        if isinstance(plan, _EngramRowExchangePlan):
+            plan = self._hybridep_plan(plan.peer_counts)
         if not input_.is_cuda:
             raise ValueError("Engram HybridEP communication requires CUDA tensors")
         if self.size > 8192:
@@ -976,13 +1094,21 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             .expand(original_shape)
             .reshape(-1)
         )
+        return self._route_rows(rows, table_ids)
+
+    def _route_rows(self, rows, table_ids, *, global_counts=False, exchange_requests=True):
+        """Route arbitrary (table,row) requests, including deduplicated requests."""
         if self.ep_size == 1:
             return (
                 torch.stack((table_ids, rows), dim=-1),
                 torch.arange(rows.numel(), device=rows.device),
                 [rows.numel()],
                 [rows.numel()],
-                [rows.numel() // len(self.tables)] * len(self.tables),
+                (
+                    [rows.numel()]
+                    if len(self.tables) == 1
+                    else torch.bincount(table_ids, minlength=len(self.tables)).cpu().tolist()
+                ),
                 (None, None),
             )
 
@@ -1021,7 +1147,7 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         nvtx_range_push(message)
         try:
             send_splits, recv_splits, table_counts, plans = self.communication.exchange_counts(
-                send_counts
+                send_counts, global_counts=global_counts
             )
         finally:
             nvtx_range_pop(message)
@@ -1029,10 +1155,437 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         message = "engram.lookup.request-a2a"
         nvtx_range_push(message)
         try:
-            received_requests = self.communication.exchange(
-                requests, recv_splits, send_splits, plans[0]
+            received_requests = (
+                self.communication.exchange(requests, recv_splits, send_splits, plans[0])
+                if exchange_requests
+                else requests
             )
         finally:
             nvtx_range_pop(message)
 
         return received_requests, owner_order, send_splits, recv_splits, table_counts, plans
+
+
+@dataclass
+class EngramLookupTicket:
+    """One request route; payload ownership ends at lookup consumption.
+
+    ``requests`` holds requester-local IDs for direct table reads with the
+    symmetric backend, and owner-received IDs for the other transports.
+    """
+
+    module: object
+    shape: tuple
+    inverse: Tensor
+    requests: Tensor
+    order: Tensor
+    send_splits: list
+    recv_splits: list
+    table_counts: list
+    plans: tuple
+    capacity: int
+    generation: int
+    payload: Tensor | None = None
+    ready: object = None
+    gradient_ready: object = None
+    consumed: bool = False
+
+
+class EngramRuntime:
+    """Bounded stage-local row prefetch and gradient delivery.
+
+    Parameters remain owned by the modules and DDP. This object owns only request
+    routes, prefetched rows and deferred row gradients. Budget accounting uses
+    group-wide upper bounds, so every shard makes the same eviction/flush choice.
+    Model activations, DDP buffers and opaque backend workspaces are not charged
+    to this budget. A single stream serializes reusable transport workspaces.
+    """
+
+    def __init__(self, buffer_budget_mb=1024, *, defer_grad_transfer=False):
+        self.budget = buffer_budget_mb * 1024**2
+        self.defer_grad_transfer = defer_grad_transfer
+        self.stream = None
+        self.cached = []
+        self.pending = []
+        self.used = 0
+        self.resident = 0
+        self.generation = 0
+        self.peak = 0
+        self.communications = {}
+
+    def attach(self, module):
+        """Share transport workspace between tables with the same row format/group."""
+        transport = module.communication
+        # Duplicate gradients are summed before communication, in at least FP32.
+        # The legacy lookup sends model-dtype gradients and sized its workspace
+        # accordingly; enlarge it before HybridEP allocates its first buffer.
+        grad_bytes = module.embedding_dim * max(4, module.tables[0].weight.dtype.itemsize)
+        packet_bytes = (max(16, grad_bytes) + 8 + 31) // 32 * 32
+        if packet_bytes > transport.max_packet_bytes:
+            if transport.buffer is not None:
+                raise RuntimeError('Attach the Engram runtime before the first lookup')
+            transport.max_packet_bytes = packet_bytes
+        key = (transport.group, transport.backend, transport.chunk_size, transport.max_packet_bytes)
+        if key not in self.communications and transport.backend == 'symmetric':
+            transport.workspace_bytes = self.budget // 4
+            self.resident += transport.workspace_bytes
+            if self.resident >= self.budget:
+                raise ValueError('Engram runtime budget cannot hold all transport workspaces')
+            self.used += transport.workspace_bytes
+        module.communication = self.communications.setdefault(key, transport)
+        module.runtime = self
+        if self.defer_grad_transfer:
+            for table in module.tables:
+                table.weight.deferred_grad_producer = self
+
+    def _stream_context(self, device):
+        if device.type != 'cuda':
+            return nullcontext()
+        if self.stream is None:
+            self.stream = torch.cuda.Stream(device=device)
+        self.stream.wait_stream(torch.cuda.current_stream(device))
+        return torch.cuda.stream(self.stream)
+
+    def _reserve(self, size):
+        if size + self.resident > self.budget:
+            raise RuntimeError(
+                f'Engram lookup needs {size / 1024**2:.1f} MiB of runtime buffers; '
+                f'increase buffer_budget_mb (currently {self.budget // 1024**2})'
+            )
+        if self.used + size > self.budget:
+            self.finish_deferred_gradients()
+        while self.used + size > self.budget and self.cached:
+            # Only optional prefetch payloads are evicted. Routes remain valid and
+            # can fetch the same parameter version when their consumer arrives.
+            old = self.cached.pop()
+            if old.payload is not None:
+                self._release_payload(old)
+        if self.used + size > self.budget:
+            raise RuntimeError('Engram runtime has unreleased buffers')
+        self.used += size
+        self.peak = max(self.peak, self.used)
+
+    @torch.no_grad()
+    def prefetch(self, module, hash_ids):
+        """Deduplicate requests and fetch rows before the hidden-state consumer."""
+        weights = tuple(table.weight for table in module.tables)
+        ensure_params_ready(weights)
+        if hash_ids.shape[-1] != len(weights):
+            raise ValueError('Engram prefetch expects one final dimension per table')
+        # Encode (table,row) without materializing an [N, num_shards] comparison.
+        stride = max(module.table_sizes)
+        tables = (
+            torch.arange(len(weights), device=hash_ids.device).expand(hash_ids.shape).reshape(-1)
+        )
+        unique, inverse = torch.unique(
+            hash_ids.reshape(-1).long() + tables * stride, sorted=True, return_inverse=True
+        )
+        with self._stream_context(hash_ids.device):
+            if unique.is_cuda:
+                unique.record_stream(self.stream)
+            requests, order, send, recv, counts, plans = module._route_rows(
+                unique % stride,
+                unique // stride,
+                global_counts=True,
+                exchange_requests=module.communication.backend != "symmetric",
+            )
+        max_send = plans[0].max_rows if module.ep_size > 1 else unique.numel()
+        max_recv = plans[1].max_rows if module.ep_size > 1 else unique.numel()
+        # Covers both payload directions and FP32 unique-row gradients. The route
+        # itself survives in autograd, like the old lookup's saved row IDs.
+        grad_bytes = module.embedding_dim * max(4, weights[0].dtype.itemsize)
+        capacity = (max_send + max_recv) * (grad_bytes + 16)
+        if module.communication.backend == "symmetric":
+            # The gradient and its opaque (row ID, gradient) packet coexist.
+            capacity += (max_send + max_recv) * grad_bytes
+        ticket = EngramLookupTicket(
+            module,
+            tuple(hash_ids.shape),
+            inverse,
+            requests,
+            order,
+            send,
+            recv,
+            counts,
+            plans,
+            capacity,
+            self.generation,
+        )
+        self._materialize(ticket, required=False)
+        return ticket
+
+    @torch.no_grad()
+    def _materialize(self, ticket, *, required=True):
+        # Lookahead must not evict a nearer consumer just to prefetch a later
+        # microbatch. Keep the route and fetch its payload at consumption instead.
+        if not required and self.used + ticket.capacity > self.budget:
+            return
+        self._reserve(ticket.capacity)
+        module = ticket.module
+        weights = tuple(table.weight for table in module.tables)
+        ensure_params_ready(weights)
+        with self._stream_context(ticket.requests.device):
+            if module.communication.backend == "symmetric":
+                payload = module.communication.lookup(module, ticket)
+            elif module.tables[0].fp8_storage:
+                order = (
+                    torch.argsort(ticket.requests[:, 0], stable=True) if len(weights) > 1 else None
+                )
+                rows = ticket.requests[:, 1]
+                if order is not None:
+                    rows = rows.index_select(0, order)
+                payload = _mxfp8_pack_lookup(
+                    weights, rows, order, ticket.table_counts, module.embedding_dim
+                )
+            else:
+                payload = module._lookup_received_requests(ticket.requests, ticket.table_counts)
+            if module.ep_size > 1 and module.communication.backend != "symmetric":
+                payload = module.communication.exchange(
+                    payload, ticket.send_splits, ticket.recv_splits, ticket.plans[1]
+                )
+            ticket.payload = payload
+            if payload.is_cuda:
+                ticket.ready = torch.cuda.Event()
+                ticket.ready.record(self.stream)
+        self.cached.append(ticket)
+
+    def _release_payload(self, ticket):
+        if ticket.payload is not None:
+            if ticket.payload.is_cuda:
+                ticket.payload.record_stream(torch.cuda.current_stream(ticket.payload.device))
+            ticket.payload = None
+            self.used -= ticket.capacity
+
+    def consume(self, ticket, output_width=None, *, needs_wgrad=True):
+        """Attach the table-gradient edge exactly once, outside recompute/capture."""
+        if ticket.generation != self.generation:
+            raise RuntimeError('Engram lookup ticket belongs to an earlier training step')
+        if ticket.consumed:
+            raise RuntimeError('Engram lookup ticket has already been consumed')
+        if ticket.payload is None:
+            self._materialize(ticket)
+        if ticket.ready is not None:
+            consumer = torch.cuda.current_stream(ticket.payload.device)
+            consumer.wait_event(ticket.ready)
+            # Forward-only execution may release the ticket immediately after
+            # launching the inverse permutation on the consumer stream.
+            ticket.order.record_stream(consumer)
+            ticket.inverse.record_stream(consumer)
+        weights = tuple(table.weight for table in ticket.module.tables)
+        output = _PrefetchedEngramLookup.apply(
+            self, ticket, output_width, torch.is_grad_enabled() and needs_wgrad, *weights
+        )
+        ticket.consumed = True
+        self.cached = [entry for entry in self.cached if entry is not ticket]
+        self._release_payload(ticket)
+        return output
+
+    def enqueue(self, ticket, gradient):
+        """Retain unique-row gradients until pressure or gradient finalization."""
+        self._reserve(ticket.capacity)
+        if gradient.is_cuda:
+            ticket.gradient_ready = torch.cuda.Event()
+            ticket.gradient_ready.record(torch.cuda.current_stream(gradient.device))
+        self.pending.append((ticket, gradient))
+
+    @torch.no_grad()
+    def _deliver(self, ticket, gradient, *, accumulate):
+        module = ticket.module
+        requests = ticket.requests
+        if module.ep_size > 1:
+            if module.communication.backend == "symmetric":
+                # Direct LSA lookup never sent IDs to the owner. Send each ID
+                # together with its already locally reduced FP32 gradient.
+                raw = gradient.contiguous().view(torch.uint8)
+                packet = torch.cat((requests.contiguous().view(torch.uint8), raw), dim=1)
+                received = module.communication.exchange(
+                    packet, ticket.recv_splits, ticket.send_splits, ticket.plans[0]
+                )
+                requests = received[:, :16].contiguous().view(torch.int64)
+                gradient = received[:, 16:].contiguous().view(gradient.dtype)
+            else:
+                gradient = module.communication.exchange(
+                    gradient, ticket.recv_splits, ticket.send_splits, ticket.plans[0]
+                )
+        rows = requests[:, 1]
+        if len(module.tables) > 1:
+            table_order = torch.argsort(requests[:, 0], stable=True)
+            rows = rows.index_select(0, table_order)
+            gradient = gradient.index_select(0, table_order)
+        result, start = [], 0
+        for table, count in zip(module.tables, ticket.table_counts):
+            weight = table.weight
+            local_rows, local_grad = rows[start : start + count], gradient[start : start + count]
+            if accumulate:
+                target = getattr(weight, 'main_grad', None)
+                if target is None:
+                    if weight.grad is None:
+                        weight.grad = torch.zeros(
+                            weight.shape, dtype=weight.dtype, device=weight.device
+                        )
+                    target = weight.grad
+                _accumulate_embedding_rows(target, local_rows, local_grad)
+                weight.grad_added_to_main_grad = True
+            else:
+                result.append(
+                    _embedding_row_gradients(local_rows, local_grad, weight.shape, weight.dtype)
+                )
+            start += count
+        return result
+
+    @torch.no_grad()
+    def _deliver_batch(self, entries):
+        """Coalesce queued microbatches into one gradient exchange per table module."""
+        if len(entries) == 1:
+            return self._deliver(*entries[0], accumulate=True)
+        module = entries[0][0].module
+        size = module.ep_size
+        send = [sum(ticket.send_splits[peer] for ticket, _ in entries) for peer in range(size)]
+        recv = [sum(ticket.recv_splits[peer] for ticket, _ in entries) for peer in range(size)]
+        send_parts = [gradient.split(ticket.send_splits) for ticket, gradient in entries]
+        recv_parts = [
+            ticket.requests.split(
+                ticket.send_splits
+                if module.communication.backend == "symmetric"
+                else ticket.recv_splits
+            )
+            for ticket, _ in entries
+        ]
+        gradient = torch.cat([parts[peer] for peer in range(size) for parts in send_parts])
+        requests = torch.cat([parts[peer] for peer in range(size) for parts in recv_parts])
+        plan = None
+        if size > 1:
+            counts = sum(ticket.plans[0].peer_counts for ticket, _ in entries)
+            plan = _EngramRowExchangePlan(int(counts.sum(1).max()), counts)
+        ticket = replace(
+            entries[0][0],
+            requests=requests,
+            send_splits=send,
+            recv_splits=recv,
+            plans=(plan, None),
+            table_counts=[
+                sum(ticket.table_counts[i] for ticket, _ in entries)
+                for i in range(len(module.tables))
+            ],
+        )
+        return self._deliver(ticket, gradient, accumulate=True)
+
+    def finish_deferred_gradients(self):
+        """Deliver all row gradients before DDP reduction, clipping or optimizer step."""
+        pending, self.pending = self.pending, []
+        by_module = {}
+        for ticket, gradient in pending:
+            by_module.setdefault(ticket.module, []).append((ticket, gradient))
+        for entries in by_module.values():
+            with self._stream_context(entries[0][1].device):
+                for ticket, _ in entries:
+                    if ticket.gradient_ready is not None:
+                        self.stream.wait_event(ticket.gradient_ready)
+                self._deliver_batch(entries)
+                for ticket, gradient in entries:
+                    if gradient.is_cuda:
+                        gradient.record_stream(self.stream)
+                    self.used -= ticket.capacity
+        # Pressure may already have flushed the last pending entry on a backward
+        # stream. DDP must still join that work before publishing main_grad.
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+
+    def reset(self):
+        """Discard the prior schedule's tickets on the training loop's zero-grad boundary."""
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        for ticket in self.cached:
+            ticket.payload = None
+        self.cached.clear()
+        self.pending.clear()
+        self.used = self.resident
+        self.generation += 1
+
+    def close(self):
+        """Finish queued gradients and release device transports before group teardown."""
+        self.finish_deferred_gradients()
+        if self.stream is not None:
+            self.stream.synchronize()
+        for transport in self.communications.values():
+            if transport.device_transport is not None:
+                transport.device_transport.close()
+
+
+def _accumulate_embedding_rows(target, rows, gradients):
+    """Deterministically sum duplicates in FP32 and add only touched rows to main_grad."""
+    if not rows.numel():
+        return
+    order = torch.argsort(rows, stable=True)
+    if (
+        HAVE_TRITON
+        and target.is_cuda
+        and target.dtype != torch.float64
+        and gradients.dtype != torch.float64
+        and target.stride(1) == gradients.stride(1) == 1
+    ):
+        _engram_accumulate_rows_kernel[(rows.numel(),)](
+            target,
+            rows,
+            order,
+            gradients,
+            rows.numel(),
+            target.shape[1],
+            target.stride(0),
+            gradients.stride(0),
+            rows.stride(0),
+            triton.next_power_of_2(target.shape[1]),
+            16,
+        )
+        return
+    ids, counts = torch.unique_consecutive(rows[order], return_counts=True)
+    values = gradients[order].to(torch.float64 if target.dtype == torch.float64 else torch.float32)
+    values = torch.segment_reduce(values, 'sum', lengths=counts)
+    target.index_copy_(0, ids, (target.index_select(0, ids) + values).to(target.dtype))
+
+
+class _PrefetchedEngramLookup(torch.autograd.Function):
+    """Bridge a no-grad row fetch to the owning table parameters."""
+
+    @staticmethod
+    def forward(ctx, runtime, ticket, output_width, needs_wgrad, *weights):
+        inverse_order = torch.empty_like(ticket.order)
+        inverse_order[ticket.order] = torch.arange(ticket.order.numel(), device=ticket.order.device)
+        mapping = inverse_order[ticket.inverse]
+        ctx.runtime, ctx.ticket = runtime, ticket
+        ctx.save_for_backward(mapping)
+        module = ticket.module
+        if output_width is not None:
+            return _mxfp8_lookup_activation(
+                ticket.payload,
+                module.embedding_dim,
+                output_width,
+                weights[0].dtype,
+                needs_wgrad,
+                inverse=mapping,
+            )
+        return ticket.payload.index_select(0, mapping).view(*ticket.shape, module.embedding_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ticket, module = ctx.ticket, ctx.ticket.module
+        (mapping,) = ctx.saved_tensors
+        count, width = mapping.numel(), module.embedding_dim
+        grad = grad_output.reshape(-1)[: count * width].view(count, width)
+        dtype = torch.float64 if grad.dtype == torch.float64 else torch.float32
+        unique_grad = torch.zeros((ticket.order.numel(), width), device=grad.device, dtype=dtype)
+        _accumulate_embedding_rows(unique_grad, mapping, grad)
+        if ctx.runtime.defer_grad_transfer:
+            ctx.runtime.enqueue(ticket, unique_grad)
+            gradients = [None] * len(module.tables)
+        else:
+            with ctx.runtime._stream_context(grad.device):
+                gradients = ctx.runtime._deliver(ticket, unique_grad, accumulate=False)
+                if unique_grad.is_cuda:
+                    unique_grad.record_stream(ctx.runtime.stream)
+            if unique_grad.is_cuda:
+                consumer = torch.cuda.current_stream(grad.device)
+                consumer.wait_stream(ctx.runtime.stream)
+                for gradient in gradients:
+                    gradient.record_stream(consumer)
+        return None, None, None, None, *gradients

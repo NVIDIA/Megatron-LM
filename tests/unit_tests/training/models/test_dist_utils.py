@@ -40,6 +40,7 @@ def _make_pg():
     # GTP axis leaves this unset. Mock would otherwise auto-create a group whose rank is
     # a Mock rather than an int.
     pg.gtp_remat = None
+    pg.parameter_replica_groups = {}
     return pg
 
 
@@ -736,6 +737,7 @@ class TestDdpWrapFullParamLayout:
     def _make_chunk_with_params(self):
         p = Mock()
         p.requires_grad = True
+        p.deferred_grad_producer = None
         chunk = Mock()
         chunk.parameters.return_value = [p]
         chunk.modules.return_value = []
@@ -764,6 +766,25 @@ class TestDdpWrapFullParamLayout:
         assert layout_args.args[2] == 4  # dp world size
         assert layout_args.args[3] is ddp_config
         assert layout_args.kwargs["expert_data_parallel_world_size"] == 2
+
+    @pytest.mark.parametrize('replicas', [1, 8])
+    @patch('megatron.training.models.dist_utils.DistributedDataParallel')
+    @patch('megatron.training.models.dist_utils.get_model_config')
+    @patch('torch.cuda.stream', new_callable=MagicMock)
+    @patch('torch.cuda.current_stream')
+    @patch('torch.cuda.Stream')
+    def test_independent_domain_sizes_reach_layout_and_ddp(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp, replicas
+    ):
+        group = Mock()
+        group.size.return_value = replicas
+        self.pg.parameter_replica_groups = {'memory': group}
+        chunk, _ = self._make_chunk_with_params()
+        _ddp_wrap([chunk], False, self._ddp_config(), False, pg_collection=self.pg)
+        assert self._opt.compute_full_param_layout.call_args.kwargs['parallel_group_sizes'] == {
+            'memory': replicas
+        }
+        assert mock_ddp.call_args.kwargs['pg_collection'] is self.pg
 
     @pytest.mark.parametrize("layout", [False, True])
     @pytest.mark.parametrize("num_buckets", [None, 2])

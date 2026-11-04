@@ -2357,6 +2357,15 @@ def wrap_model_chunks_with_ddp(
         List of DDP-wrapped chunks.
     """
 
+    if DP is not DDP and (
+        (pg_collection is not None and pg_collection.parameter_replica_groups)
+        or any(
+            getattr(param, 'deferred_grad_producer', None) is not None
+            for chunk in model_chunks
+            for param in chunk.parameters()
+        )
+    ):
+        raise ValueError('Additional parameter domains and deferred gradients require standard DDP')
     n = len(model_chunks)
     if bucket_sizes is None:
         bucket_sizes = [ddp_config.bucket_size] * n
@@ -2413,6 +2422,10 @@ def wrap_model_chunks_with_ddp(
                     data_parallel_world_size,
                     ddp_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    parallel_group_sizes={
+                        name: group.size()
+                        for name, group in (layout_pgs.parameter_replica_groups or {}).items()
+                    },
                 )
 
     # Wrap each chunk.
@@ -2587,7 +2600,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.model_type = model_type
         return model
 
-
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
@@ -2711,12 +2723,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
-                use_layer_wise_param_layout=getattr(
-                    args, 'use_layer_wise_param_layout', True
-                ),
+                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
                 use_sinkhorn_for_embeddings=getattr(args, 'muon_use_sinkhorn', False),
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=(
+                    pg_collection
+                    if args.use_megatron_fsdp or pg_collection.parameter_replica_groups
+                    else None
+                ),
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -5560,7 +5574,7 @@ def train(
 
         for model_module in model:
             if isinstance(model_module, DDP):
-                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                for buf in model_module.all_buffers:
                     buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

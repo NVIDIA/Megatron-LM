@@ -115,7 +115,11 @@ class PipelineDataIterator:
     """
 
     def __init__(
-        self, batches: Iterable[Any] | Callable[[], Any], plan: PipelinePayloadPlan
+        self,
+        batches: Iterable[Any] | Callable[[], Any],
+        plan: PipelinePayloadPlan,
+        *,
+        prepare_batch: Callable[[int], dict] | None = None,
     ) -> None:
         self._batches = deque() if callable(batches) else deque(batches)
         if not callable(batches) and len(self._batches) != len(plan.incoming):
@@ -123,16 +127,33 @@ class PipelineDataIterator:
         self._load_batch = batches if callable(batches) else self._batches.popleft
         self._remaining = len(plan.incoming)
         self.pipeline_payload_plan = plan
+        self._prepare_batch = prepare_batch
+        self._index = 0
+        self._next_kwargs = (
+            prepare_batch(0) if prepare_batch is not None and self._remaining else {}
+        )
 
     def __iter__(self) -> "PipelineDataIterator":
         return self
 
     def __next__(self) -> Any:
+        batch, _ = self.next_with_model_kwargs()
+        return batch
+
+    def next_with_model_kwargs(self) -> tuple[Any, dict]:
+        """Consume this batch's prepared inputs and prefetch the next batch."""
         if self._remaining == 0:
             raise StopIteration
         batch = self._load_batch()
+        kwargs = self._next_kwargs
+        self._index += 1
         self._remaining -= 1
-        return batch
+        self._next_kwargs = (
+            self._prepare_batch(self._index)
+            if self._prepare_batch is not None and self._remaining
+            else {}
+        )
+        return batch, kwargs
 
 
 @dataclass

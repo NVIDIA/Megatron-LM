@@ -34,6 +34,7 @@ class V41ForwardContext(HybridStackForwardContext):
     codec: V41StateCodec | None = None
     values: dict = field(default_factory=dict)
     hashes: torch.Tensor | None = None
+    engram_tickets: dict = field(default_factory=dict)
     hasher: nn.Module | None = None
     capture: dict | None = None
 
@@ -55,7 +56,7 @@ class _LayerRegion(nn.Module):
             engram = getattr(self.layer, 'engram', None)
             if engram is not None:
                 mask = csa.thd_layout.valid_tokens.unsqueeze(0) if packed is not None else None
-                hidden = engram(hidden, values['hashes'], mask)
+                hidden = engram(hidden, token_mask=mask, embeddings=values[f'engram_{boundary}'])
             hidden, _ = self.layer(
                 hidden_states=hidden,
                 cross_layer_state=csa,
@@ -79,11 +80,12 @@ class _LayerGroupRegion(nn.Module):
 
     def forward(self, hidden, values):
         """Keep intermediate producers live inside the group, exporting only its boundary."""
-        hashes = values.get('hashes')
+        embeddings = {key: value for key, value in values.items() if key.startswith('engram_')}
         objectives = {}
         for region in self.regions:
             if getattr(region.layer, 'engram', None) is not None:
-                values = {**values, 'hashes': hashes}
+                key = f'engram_{region.layer.layer_number - 1}'
+                values = {**values, key: embeddings[key]}
             accumulator = hidden
             hidden, values = region(hidden, values)
             observe_layer_residuals(region.layer, accumulator, hidden)
@@ -218,12 +220,12 @@ class DeepSeekV41Adapter:
         )
         inputs = context.codec.schema(boundary).fields
         if getattr(layer, 'engram', None) is not None:
-            values['hashes'] = context.hashes
+            key = f'engram_{boundary}'
+            embeddings = self._lookup_engram(layer, context)
+            values[key] = embeddings
             inputs = (
                 *inputs,
-                TensorField(
-                    'hashes', tuple(context.hashes.shape), torch.int64, 'contiguous', False
-                ),
+                TensorField(key, tuple(embeddings.shape), embeddings.dtype, 'contiguous', True),
             )
         region = _LayerRegion(layer, context.codec, kwargs, loss)
         return (
@@ -238,6 +240,13 @@ class DeepSeekV41Adapter:
             and torch.is_grad_enabled()
             and (self.config.dsa_indexer_loss_coeff or 0) > 0
         )
+
+    def _lookup_engram(self, layer, context):
+        ticket = context.engram_tickets.pop(layer.layer_number - 1, None)
+        if ticket is not None:
+            return layer.engram.lookup(ticket=ticket)
+        self._prepare_hashes(context)
+        return layer.engram.lookup(context.hashes)
 
     def _prepare_hashes(self, context):
         if context.hashes is not None:
@@ -411,13 +420,17 @@ class DeepSeekV41Adapter:
                 context.cross_layer_state, context.mhc_state, context.values, first
             )
             inputs = codec.schema(first).fields
-            if any(getattr(layer, 'engram', None) is not None for layer in group):
-                self._prepare_hashes(context)
-                values['hashes'] = context.hashes
-                inputs = (
-                    *inputs,
-                    TensorField('hashes', tuple(context.hashes.shape), torch.int64, 'contiguous'),
-                )
+            for layer in group:
+                if getattr(layer, 'engram', None) is not None:
+                    key = f'engram_{layer.layer_number - 1}'
+                    embeddings = self._lookup_engram(layer, context)
+                    values[key] = embeddings
+                    inputs = (
+                        *inputs,
+                        TensorField(
+                            key, tuple(embeddings.shape), embeddings.dtype, 'contiguous', True
+                        ),
+                    )
             loss_layers = tuple(
                 layer.layer_number - 1 for layer in group if self._has_indexer_loss(layer)
             )
@@ -456,8 +469,6 @@ class DeepSeekV41Adapter:
         c, codec, csa = self.config, context.codec, context.cross_layer_state
         layer_id = layer.layer_number - 1
         loss = self._has_indexer_loss(layer)
-        if getattr(layer, 'engram', None) is not None:
-            self._prepare_hashes(context)
         if recompute is None:
             recompute = layer.training and c.recompute_granularity == 'full'
         graph_key = (layer_id, codec.shape, loss, layer.training, torch.is_grad_enabled())
@@ -495,8 +506,8 @@ class DeepSeekV41Adapter:
                 layout = csa.thd_layout
                 hidden_states = engram(
                     hidden_states,
-                    context.hashes,
-                    None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    token_mask=None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    embeddings=self._lookup_engram(layer, context),
                 )
             hidden_states, objective = self._run_consumer_graph(
                 layer,
@@ -534,8 +545,8 @@ class DeepSeekV41Adapter:
                 layout = csa.thd_layout
                 hidden_states = layer.engram(
                     hidden_states,
-                    context.hashes,
-                    None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    token_mask=None if layout is None else layout.valid_tokens.unsqueeze(0),
+                    embeddings=self._lookup_engram(layer, context),
                 )
             hidden_states, _ = layer(
                 hidden_states=hidden_states,

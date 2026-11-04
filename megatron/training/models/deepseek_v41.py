@@ -10,8 +10,10 @@ import torch
 
 from megatron.core.models.deepseek_v41.config import EngramConfig
 from megatron.core.models.deepseek_v41.model import DeepSeekV41Model
+from megatron.core.models.engram.distributed_embedding import EngramRuntime
 from megatron.core.pipeline_parallel.typed_p2p_communication import create_pipeline_control_group
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import create_row_parallel_groups
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -84,6 +86,59 @@ class DeepSeekV41ModelBuilder(HybridModelBuilder):
             if c.engram_token_map is not None
             else None
         )
+        options = c.transformer.engram_config
+        if (
+            options is not None
+            and options.parallel_size is not None
+            and pg_collection.engram is None
+        ):
+            if pg_collection.tp.size() != 1 or any(
+                group is not None and group.size() > 1
+                for group in (pg_collection.gtp_remat, pg_collection.expt_gtp_remat)
+            ):
+                raise ValueError(
+                    'Independent Engram parallelism requires TP=1 and no GTP remapping'
+                )
+            pg_collection.engram, pg_collection.engram_dp = create_row_parallel_groups(
+                pg_collection.dp_cp,
+                options.parallel_size,
+                world_group=torch.distributed.group.WORLD,
+                name='ENGRAM',
+            )
+            pg_collection.parameter_replica_groups = {
+                **(pg_collection.parameter_replica_groups or {}),
+                'engram': pg_collection.engram_dp,
+            }
+        if not hasattr(self, '_engram_input_cache'):
+            if options is not None and torch.distributed.get_rank() == 0:
+                shards = (
+                    pg_collection.engram if pg_collection.engram is not None else pg_collection.ep
+                )
+                replicas = (
+                    pg_collection.engram_dp
+                    if pg_collection.engram_dp is not None
+                    else pg_collection.expt_dp
+                )
+                print(
+                    f'Engram: shards={shards.size()}, replicas={replicas.size()}, '
+                    f'backend={options.communication_backend}, prefetch={options.prefetch}, '
+                    f'defer_grad_transfer={options.defer_grad_transfer}, '
+                    f'buffer_budget_mb={options.buffer_budget_mb}',
+                    flush=True,
+                )
+            self._engram_input_cache = {}
+            self._engram_runtime = (
+                EngramRuntime(
+                    options.buffer_budget_mb, defer_grad_transfer=options.defer_grad_transfer
+                )
+                if options is not None
+                and (
+                    options.prefetch
+                    or options.defer_grad_transfer
+                    or options.communication_backend == 'symmetric'
+                )
+                else None
+            )
         return DeepSeekV41Model(
             config=c.transformer,
             vocab_size=vocab,
@@ -100,6 +155,8 @@ class DeepSeekV41ModelBuilder(HybridModelBuilder):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
             pipeline_control_group=self._pipeline_control_group,
+            engram_runtime=self._engram_runtime,
+            engram_input_cache=self._engram_input_cache,
         )
 
 

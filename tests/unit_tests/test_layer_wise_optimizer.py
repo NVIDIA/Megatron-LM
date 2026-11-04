@@ -96,6 +96,7 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
     optimizer.dp_cp_params_list = None
     optimizer.expt_dp_params_list = None
+    optimizer.params_by_domain = {'dense': [params], 'expert': [[]]}
 
     optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
 

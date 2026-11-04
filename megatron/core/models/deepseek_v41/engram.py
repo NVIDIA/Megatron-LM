@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Trainable conditional memory, sharded over the explicit expert parallel group."""
+"""Trainable conditional memory with explicit row-shard and replica groups."""
 
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -98,13 +98,24 @@ class EngramEmbedding(EPShardedMultiTableEmbedding):
             (rows,),
             width,
             config.init_method,
-            ep_group=pg_collection.ep,
+            ep_group=(
+                pg_collection.engram
+                if getattr(pg_collection, 'engram', None) is not None
+                else pg_collection.ep
+            ),
             tp_group=pg_collection.tp,
-            expt_dp_group=pg_collection.expt_dp,
+            expt_dp_group=(
+                pg_collection.engram_dp
+                if getattr(pg_collection, 'engram_dp', None) is not None
+                else pg_collection.expt_dp
+            ),
             fp8_storage=fp8_storage,
             communication_backend=getattr(options, "communication_backend", "nccl"),
             hybridep_chunk_size=getattr(options, "hybridep_chunk_size", 4096),
         )
+        if getattr(pg_collection, 'engram', None) is not None:
+            for table in self.tables:
+                table.weight.parallel_domain = 'engram'
         self.tp_group = pg_collection.tp
 
     def forward(self, ids):
@@ -171,22 +182,34 @@ class Engram(MegatronModule):
         if config.perform_initialization and not self.fp8_projection:
             config.init_method(self.wkv.weight)
 
-    def forward(self, hidden_states, hash_ids, token_mask=None):
-        """Preserve FP32 gating arithmetic and the reference signed-square-root gate."""
-        addresses = hash_ids[:, :, self.hash_index]
+    def lookup(self, hash_ids=None, *, ticket=None):
+        """Retrieve the differentiable input once, before entering recompute regions."""
+        runtime = getattr(self.embed, 'runtime', None)
+        if ticket is None:
+            addresses = hash_ids[:, :, self.hash_index]
+            if runtime is not None:
+                ticket = runtime.prefetch(self.embed, addresses.unsqueeze(-1))
+        if ticket is not None:
+            width = (self.embed.embedding_dim * ticket.shape[-2]) if self.fp8_lookup else None
+            embeddings = runtime.consume(ticket, width, needs_wgrad=self.wkv.weight.requires_grad)
+            return embeddings if self.fp8_lookup else embeddings.squeeze(-2).flatten(-2)
         if self.fp8_lookup:
-            embeddings = self.embed.lookup_quantized(
+            return self.embed.lookup_quantized(
                 addresses.unsqueeze(-1),
                 addresses.shape[-1] * self.embed.embedding_dim,
                 needs_wgrad=self.wkv.weight.requires_grad,
             )
-        else:
-            embeddings = self.embed(addresses).flatten(-2)
+        return self.embed(addresses).flatten(-2)
+
+    def forward(self, hidden_states, hash_ids=None, token_mask=None, *, embeddings=None):
+        """Preserve FP32 gating arithmetic and the reference signed-square-root gate."""
+        if embeddings is None:
+            embeddings = self.lookup(hash_ids)
         kv = self.wkv(embeddings)
         if self.fp8_projection:
             kv = kv[0]
         if self.fp8_lookup:
-            batch, length = addresses.shape[:2]
+            length, batch = hidden_states.shape[:2]
             kv = kv[: batch * length].view(batch, length, (self.n + 1) * self.hidden_size)
         kv = kv.transpose(0, 1)
         key, value = kv.split([self.n * self.hidden_size, self.hidden_size], dim=-1)

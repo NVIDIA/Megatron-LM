@@ -333,8 +333,10 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = (next(data_iterator) if isinstance(data_iterator, PipelineDataIterator)
-                    else get_batch(data_iterator, vp_stage))
+        if isinstance(data_iterator, PipelineDataIterator):
+            cp_batch, model_kwargs = data_iterator.next_with_model_kwargs()
+        else:
+            cp_batch, model_kwargs = get_batch(data_iterator, vp_stage), {}
         if getattr(get_args(), 'dsv4_version', 'v4') == 'v4.1':
             from megatron.training.datasets.v41_pipeline import normalize_v41_batch
 
@@ -364,6 +366,7 @@ def forward_step(data_iterator, model: HybridModel):
             loss_mask=loss_mask,
             padding_mask=padding_mask,
             cp_batch=cp_batch,
+            **model_kwargs,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

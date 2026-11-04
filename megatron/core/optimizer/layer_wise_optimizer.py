@@ -14,7 +14,10 @@ from megatron.core.distributed.param_and_grad_buffer import (
     _compute_default_per_buffer_param_layout,
     group_params_for_buffers,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+)
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from ..fp8_utils import uses_grad_buffer_for_fp8_param_gather
@@ -123,10 +126,8 @@ def tag_params_for_buffer_routing(model_chunks, *, use_sinkhorn_for_embeddings=F
 
 def _all_gather_param_group_metadata(param_group, pg_collection):
     """Gather optimizer-group metadata within the group that owns the parameters."""
-    process_group = (
-        pg_collection.expt_dp
-        if param_group.get('is_expert_parallel', False)
-        else pg_collection.dp_cp
+    process_group = pg_collection.get_parameter_replica_group(
+        get_parameter_parallel_domain(param_group)
     )
     assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
     all_rank_groups = [None for _ in range(get_pg_size(process_group))]
@@ -538,6 +539,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
+        parallel_group_sizes: Optional[Dict[str, int]] = None,
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
@@ -566,7 +568,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                if not parallel_group_sizes or buffer_key.domain not in parallel_group_sizes:
+                    raise ValueError(f"Missing replica size for {buffer_key.domain!r}")
+                dp_world_size = parallel_group_sizes[buffer_key.domain]
+            elif buffer_key.is_expert_parallel:
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None
@@ -876,28 +882,31 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # Simplify when dp_cp group size is 1.
-        dp_cp_size = get_pg_size(self.dp_cp)
-        if dp_cp_size == 1:
-            self.dp_cp_params_list = None
-            self.expt_dp_params_list = None
-            return
-
-        expt_dp_size = get_pg_size(self.expt_dp)
-
+        self.replica_groups = {
+            'dense': self.dp_cp,
+            'expert': self.expt_dp,
+            **(getattr(self.pg_collection, 'parameter_replica_groups', None) or {}),
+        }
+        self.params_by_domain = {
+            name: [[] for _ in range(get_pg_size(group))]
+            for name, group in self.replica_groups.items()
+        }
         if full_param_layouts is not None:
-            self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
+            self._shard_params_from_layout(optimizers, full_param_layouts)
         else:
-            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
+            self._shard_params_ping_pong(optimizers)
+        # Keep the public legacy views for callers that only inspect dense/expert ownership.
+        self.dp_cp_params_list = (
+            self.params_by_domain['dense'] if get_pg_size(self.dp_cp) > 1 else None
+        )
+        self.expt_dp_params_list = (
+            self.params_by_domain['expert']
+            if get_pg_size(self.expt_dp) > 1 and any(self.params_by_domain['expert'])
+            else None
+        )
 
-    def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
+    def _shard_params_from_layout(self, optimizers, full_param_layouts):
         """Derive shard assignments from the param layout."""
-        dp_cp_rank = get_pg_rank(self.dp_cp)
-        expt_dp_rank = get_pg_rank(self.expt_dp)
-
-        self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
-        self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
-
         # Map each param to its shard index.
         param_to_shard: Dict[torch.nn.Parameter, int] = {}
         for full_layout in full_param_layouts:
@@ -935,9 +944,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         param_groups_this_rank = [[] for _ in param_groups]
 
         for group_index, group in enumerate(param_groups):
-            is_expert = group.get("is_expert_parallel", False)
-            local_rank = expt_dp_rank if is_expert else dp_cp_rank
-            params_list = self.expt_dp_params_list if is_expert else self.dp_cp_params_list
+            domain = get_parameter_parallel_domain(group)
+            local_rank = get_pg_rank(self.replica_groups[domain])
+            params_list = self.params_by_domain[domain]
 
             for param in group["params"]:
                 assert param in param_to_shard, (
@@ -954,70 +963,34 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for group, local_params in zip(param_groups, param_groups_this_rank):
             group["params"] = local_params
 
-        # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
-            self.expt_dp_params_list = None
-
-    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size):
-        """Legacy ping-pong-by-numel shard assignment (no layout available).
-
-        Legacy: this method is a fallback for when no ``full_param_layout``
-        is provided.  Once all call sites supply a layout, this can be removed
-        in favor of :meth:`_shard_params_from_layout`.
-
-        List of parameters are sorted by numel and assigned to ranks in ping-pong style.
-        Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
-        will be [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
-        """
-        dp_cp_idx, expt_dp_idx = 0, 0
-        # Create ping-pong style loop so memory is more balanced.
-        dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
-        expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
-        self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
-        self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
-        # Get all param groups.
-        param_groups = []
-        for optimizer in optimizers:
-            param_groups += optimizer.param_groups
-
-        # Sort param in all groups by param numel and assign to each rank evenly.
-        param_list = []
-        for group_index, group in enumerate(param_groups):
-            for p in group["params"]:
-                param_list.append((p, group_index))
-        param_list.sort(key=lambda x: x[0].numel())
-        param_groups_this_rank = [[] for g in param_groups]
-
-        # Assign params to rank in ping-pong style loop.
-        for p, group_index in param_list:
-            if param_groups[group_index].get("is_expert_parallel", False):
-                owner_index = getattr(p, 'optimizer_owner_index', None)
-                owner = (
-                    owner_index % expt_dp_size
-                    if owner_index is not None
-                    else expt_dp_loop[expt_dp_idx]
-                )
-                if owner == get_pg_rank(self.expt_dp):
-                    param_groups_this_rank[group_index].append(p)
-                self.expt_dp_params_list[owner].append(p)
-                expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
-            else:
-                owner_index = getattr(p, 'optimizer_owner_index', None)
-                owner = (
-                    owner_index % dp_cp_size if owner_index is not None else dp_cp_loop[dp_cp_idx]
-                )
-                if owner == get_pg_rank(self.dp_cp):
-                    param_groups_this_rank[group_index].append(p)
-                self.dp_cp_params_list[owner].append(p)
-                dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
-
-        # Now we modify the group to only handle local params.
-        for groups, params in zip(param_groups, param_groups_this_rank):
-            groups["params"] = params
-
-        # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
-            self.expt_dp_params_list = None
+    def _shard_params_ping_pong(self, optimizers):
+        """Assign whole matrices to owners within each independent replica group."""
+        indices = dict.fromkeys(self.replica_groups, 0)
+        loops = {
+            name: list(range(get_pg_size(group))) + list(reversed(range(get_pg_size(group))))
+            for name, group in self.replica_groups.items()
+        }
+        param_groups = [group for optimizer in optimizers for group in optimizer.param_groups]
+        params = sorted(
+            [(param, i) for i, group in enumerate(param_groups) for param in group['params']],
+            key=lambda item: item[0].numel(),
+        )
+        local_params = [[] for _ in param_groups]
+        for param, index in params:
+            domain = get_parameter_parallel_domain(param_groups[index])
+            replicas = self.replica_groups[domain]
+            owner_index = getattr(param, 'optimizer_owner_index', None)
+            owner = (
+                owner_index % get_pg_size(replicas)
+                if owner_index is not None
+                else loops[domain][indices[domain]]
+            )
+            self.params_by_domain[domain][owner].append(param)
+            if owner == get_pg_rank(replicas):
+                local_params[index].append(param)
+            indices[domain] = (indices[domain] + 1) % len(loops[domain])
+        for group, params in zip(param_groups, local_params):
+            group['params'] = params
 
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
@@ -1035,41 +1008,25 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_chunks: DDP-wrapped model chunks with bucket_groups.
         """
         for model_chunk in model_chunks:
-            for group in model_chunk.bucket_groups:
-                for bucket in group.buckets:
-                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
-                        continue
-                    if self.dp_cp_params_list is not None:
-                        bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
-                        for bucket_list, full_params_list in zip(
-                            bucket_params_list, self.dp_cp_params_list
-                        ):
-                            for param in full_params_list:
-                                if param in bucket.params:
-                                    bucket_list.append(param)
-                    else:
-                        # dp_cp_size == 1: single rank owns all params, no
-                        # all-gather needed but data structures must be initialized.
-                        bucket_params_list = [list(bucket.params_list)]
-                    bucket.set_layerwise_params_list(bucket_params_list)
-            # Do the same for expert parallel bucket groups.
-            for group in model_chunk.expert_parallel_bucket_groups:
-                for bucket in group.buckets:
-                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
-                        continue
-                    if self.expt_dp_params_list is not None:
-                        bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
-                        for bucket_list, full_params_list in zip(
-                            bucket_params_list, self.expt_dp_params_list
-                        ):
-                            for param in full_params_list:
-                                if param in bucket.params:
-                                    bucket_list.append(param)
-                    else:
-                        # expt_dp_size == 1: single rank owns all params, no
-                        # all-gather needed but data structures must be initialized.
-                        bucket_params_list = [list(bucket.params_list)]
-                    bucket.set_layerwise_params_list(bucket_params_list)
+            groups_by_domain = getattr(
+                model_chunk,
+                'bucket_groups_by_domain',
+                {
+                    'dense': model_chunk.bucket_groups,
+                    'expert': model_chunk.expert_parallel_bucket_groups,
+                },
+            )
+            for domain, groups in groups_by_domain.items():
+                for group in groups:
+                    for bucket in group.buckets:
+                        if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                            continue
+                        bucket.set_layerwise_params_list(
+                            [
+                                [param for param in params if param in bucket.params]
+                                for params in self.params_by_domain[domain]
+                            ]
+                        )
 
     @torch.no_grad()
     def allgather_params(self) -> None:
@@ -1133,27 +1090,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     group,
                 )
 
-        if self.dp_cp_params_list:
-            gather_by_dtype(self.dp_cp_params_list, self.dp_cp)
-        if self.expt_dp_params_list:
-            gather_by_dtype(self.expt_dp_params_list, self.expt_dp)
+        for domain, params in self.params_by_domain.items():
+            if len(params) > 1 and any(params):
+                gather_by_dtype(params, self.replica_groups[domain])
 
     @torch.no_grad()
     def broadcast_params(self):
-        """All rank broadcast updated local params."""
-        # Broadcast linear layer weights to all other ranks. Kept as reference test.
-        if self.dp_cp_params_list is None:
-            return
-        for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
-        if self.expt_dp_params_list is None:
-            return
-        for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.expt_dp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.expt_dp)
+        """Broadcast whole updated matrices within their replica domain."""
+        for domain, per_rank_params in self.params_by_domain.items():
+            group = self.replica_groups[domain]
+            if get_pg_size(group) == 1:
+                continue
+            for rank, params in enumerate(per_rank_params):
+                src = torch.distributed.get_global_rank(group, rank)
+                for param in params:
+                    torch.distributed.broadcast(param, src, group)
 
     @torch.no_grad()
     def get_grad_norm(self):
@@ -1229,8 +1180,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         post-all-gather processing (and MXFP8 copy) still runs.
         """
         for model_chunk in self.model_chunks:
-            for bucket_group in (
-                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            for bucket_group in getattr(
+                model_chunk,
+                'all_bucket_groups',
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups,
             ):
                 if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
                     bucket_group.buckets[0]

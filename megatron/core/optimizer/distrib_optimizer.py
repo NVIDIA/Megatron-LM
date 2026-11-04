@@ -713,6 +713,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
+        parallel_group_sizes: Optional[Dict[str, int]] = None,
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
@@ -739,7 +740,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                if not parallel_group_sizes or buffer_key.domain not in parallel_group_sizes:
+                    raise ValueError(f"Missing replica size for {buffer_key.domain!r}")
+                dp_world_size = parallel_group_sizes[buffer_key.domain]
+            elif buffer_key.is_expert_parallel:
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None
@@ -3381,8 +3386,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
         for model_chunk in self.model_chunks:
-            for bucket_group in (
-                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            for bucket_group in getattr(
+                model_chunk,
+                'all_bucket_groups',
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups,
             ):
                 if not bucket_group.buckets:
                     continue

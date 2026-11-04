@@ -58,10 +58,17 @@ def prepare_v41_pipeline_inputs(
     iterator, model, num_microbatches, *, args, get_batch, forward_only=False
 ):
     """Stage variable shapes before P2P; keep fixed SBHD batches lazy."""
+    config = get_attr_wrapped_model(model, 'config')
+    options = getattr(config, 'engram_config', None)
+    prefetch = options is not None and options.prefetch
+    if not prefetch and getattr(config, 'pipeline_model_parallel_size', None) == 1:
+        # The no-pipeline schedule only needs lookahead for an enabled prefetcher.
+        # Preserve lazy batch loading (including packed batches) otherwise.
+        return iterator
     describe = get_attr_wrapped_model(model, 'pipeline_payload_spec')
     vp_stage = get_attr_wrapped_model(model, 'vp_stage')
     load = partial(get_batch, iterator, vp_stage)
-    if not (
+    if not prefetch and not (
         args.sft
         or args.dataloader_inter_document_masking
         or getattr(args, 'sequence_packing_scheduler', None) is not None
@@ -78,4 +85,11 @@ def prepare_v41_pipeline_inputs(
         batches.append(batch)
         incoming.append(recv)
         outgoing.append(send)
-    return PipelineDataIterator(batches, PipelinePayloadPlan(tuple(incoming), tuple(outgoing)))
+    prepare_batch = None
+    if prefetch:
+        stage_inputs = get_attr_wrapped_model(model, 'stage_engram_inputs')
+        stage_inputs(batches)
+        prepare_batch = get_attr_wrapped_model(model, 'prefetch_engram_batch')
+    return PipelineDataIterator(
+        batches, PipelinePayloadPlan(tuple(incoming), tuple(outgoing)), prepare_batch=prepare_batch
+    )

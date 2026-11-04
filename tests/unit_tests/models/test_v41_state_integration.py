@@ -1067,3 +1067,54 @@ def test_hybrid_stack_checkpoint_and_pipeline_owner_gradients(setup, method, num
         for i, layer in enumerate(stage.layers):
             for ref, split in zip(full.layers[offset + i].parameters(), layer.parameters()):
                 torch.testing.assert_close(split.grad, ref.grad)
+
+
+@pytest.mark.parametrize('method,num_layers', [('uniform', 4), ('block', 3)])
+@pytest.mark.parametrize('defer', [False, True])
+def test_engram_lookup_is_not_repeated_by_full_recompute(
+    setup, monkeypatch, method, num_layers, defer
+):
+    from megatron.core.models.deepseek_v41.config import EngramConfig
+    from megatron.core.models.deepseek_v41.engram import Engram
+    from megatron.core.models.engram.distributed_embedding import EngramRuntime
+    from tests.unit_tests.models.test_v41_engram import _hasher
+
+    cfg, spec, groups = setup
+    hasher = _hasher()
+    cfg.engram_config = EngramConfig([0], list(hasher.layout.num_embeddings), 4, 11, 2, 3, 0, 20)
+    full = _stack(cfg, spec, groups)
+    full.layers[0].engram = Engram(cfg, hasher.layout, 0, groups)
+    checkpointed = copy.deepcopy(full)
+    checkpointed.config.recompute_granularity = 'full'
+    checkpointed.config.recompute_method = method
+    checkpointed.config.recompute_num_layers = num_layers
+    runtime = EngramRuntime(1, defer_grad_transfer=defer)
+    runtime.attach(checkpointed.layers[0].engram.embed)
+    calls = []
+    original = runtime.prefetch
+
+    def tracked(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, 'prefetch', tracked)
+    tokens = torch.randint(0, 20, (2, 8))
+    x = torch.randn(8, 2, cfg.hidden_size)
+    expected, _ = _run(
+        full, x.clone().requires_grad_(), cfg, groups, {'tokens': tokens}, hasher=hasher
+    )
+    actual, _ = _run(
+        checkpointed,
+        x.clone().requires_grad_(),
+        checkpointed.config,
+        groups,
+        {'tokens': tokens},
+        hasher=hasher,
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.square().mean().backward()
+    expected.square().mean().backward()
+    runtime.finish_deferred_gradients()
+    assert calls == [1]
+    for ref, param in zip(full.parameters(), checkpointed.parameters()):
+        torch.testing.assert_close(param.grad, ref.grad, rtol=2e-5, atol=2e-6)

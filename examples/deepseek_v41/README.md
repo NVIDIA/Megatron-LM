@@ -46,9 +46,88 @@ IDs**. `map.pt` must contain the int64 tensor produced from the exact released
 tokenizer by `build_compressed_token_map`; an identity map is not a substitute.
 The table counts must match the released distinct-prime layout.
 
+The same JSON controls row parallelism and the optional lookup runtime. For a
+128-rank physical stage (TP1), the following fields shard Engram over all 128
+ranks independently of MoE EP64:
+
+```json
+{
+  "parallel_size": 128,
+  "prefetch": true,
+  "defer_grad_transfer": true,
+  "buffer_budget_mb": 1024,
+  "communication_backend": "hybridep",
+  "hybridep_chunk_size": 32768
+}
+```
+
+Merge these fields into the existing architecture JSON. `parallel_size` must
+divide the physical stage's DP×CP size; the remaining factor is the number of
+table replicas. The builder creates the groups once, and the parameter domain
+carries them through DDP, optimizer ownership, Sinkhorn statistics and checkpoint
+replica metadata. Independent row parallelism currently requires TP1, no GTP
+remapping, standard Megatron DDP and one distributed optimizer instance. Use
+LayerWise for Muon/Sinkhorn, or DistributedOptimizer for Adam/SGD. When changing
+from the legacy expert optimizer domain to the new `engram` domain, load model
+weights with a fresh optimizer; automatic migration of legacy optimizer groups
+is not implemented.
+
+Omitting `parallel_size` preserves the existing EP/expert-DP partition and
+optimizer domain. `prefetch` and `defer_grad_transfer` default to false and can
+be enabled independently. The original lookup remains available when both are
+off with the NCCL or HybridEP backend. Prefetch stages token/THD metadata before
+the PP schedule, shares it across VPP chunks, deduplicates each batch's requests,
+and carries a ticket to the matching consumer. Lookup runs outside full
+recomputation and partial CUDA graphs; projection and gating retain their normal
+recompute behavior. Deferred backward coalesces queued microbatches per table,
+delivers row gradients to their owners, then lets DDP reduce replicas.
+
+`buffer_budget_mb` bounds the runtime's reserved row-payload/gradient capacity,
+shared across local tables and VPP chunks. Pressure flushes pending gradients
+and evicts optional prefetch payloads, which can be fetched again. It does not
+bound model activations, saved request routes, transient tensor operations,
+DDP/optimizer storage or opaque NCCL/HybridEP allocations. A single lookup that
+cannot fit raises an error requesting a larger budget; rows are never dropped.
+
+The experimental `communication_backend: "symmetric"` binds NCCL4Py + CuTe DSL.
+Within an NCCL LSA domain it reads registered table rows directly. Cross-domain
+requests, packed FP8 bytes/scales and gradients use GIN. Two receive slots per
+sender bound staging memory; GPU completion signals protect slot reuse, without
+per-chunk host launches or collectives. The existing Triton activation repack is
+reused; sorted duplicate gradients are accumulated by one Triton writer per row.
+Count planning and table-registration metadata still use host collectives per
+lookup. Registration is reused while parameter storage is unchanged,
+and collectively refreshed if an optimizer/DDP operation replaces an allocation.
+
+This requires `nccl4py >= 0.6.0`, CuTe DSL, and matching NCCL headers/runtime/device
+bitcode. Prefer CuTe DSL 4.8.1: its
+[release notes](https://github.com/NVIDIA/cutlass/blob/main/CHANGELOG.md#481-2026-10-15)
+confirm the fix for zero-argument `cute.extern` calls across compilations.
+Unmodified 4.8.0 can fail repeated NCCL barrier compilation with an MLIR context
+mismatch. The isolated extern recompilation check passes with unmodified 4.8.1.
+Four-GPU B300 smoke tests have passed with CuTe DSL 4.7.0,
+NCCL4Py 0.6.0 and NCCL 2.32.3.
+If setting `NCCL_HOME`, it must identify that same NCCL installation with
+`lib/libnccl_device.bc`.
+Cross-domain operation requires full-peer GIN connectivity; LSA-only groups do
+not require GIN. Table allocations must be registerable CUDA VMM memory, e.g.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; tables are never shadow-copied.
+PyTorch storage starts need not be 4-KiB aligned. Window registration queries the
+underlying CUDA mapping, registers from its base, and records each table's full
+offset from that window so LSA reads handle different suballocations on peers.
+The borrowed window buffer retains the original storage;
+allocation queries and registration are cached until storage changes.
+Workspace is included in `buffer_budget_mb`; NCCL's internal allocations are not.
+Use `EngramRuntime.close()` before destroying the row groups when explicitly
+tearing down a model. Single-node LSA exchange, direct reads, storage replacement,
+and MXFP8 prefetch/deferred-gradient/DDP integration have GPU smoke coverage.
+Cross-domain GIN, larger shard groups, and performance still need qualification
+in the target image.
+
 For PP/VPP, insert `|` at explicit stage/chunk boundaries. The builder creates
 one typed pipeline control group per replica and reuses it for virtual chunks.
-Packed batches are staged before P2P; ordinary CP1 batches remain lazy. CP uses
+Packed batches are staged before P2P; ordinary CP1 batches remain lazy unless
+Engram prefetch is enabled. CP uses
 `--attention-cp-layout contiguous --linear-cp-layout contiguous` and an existing
 SFT packed loader, `--dataloader-inter-document-masking`, or static varlen
 scheduling with `--use-varlen-dataset --sequence-packing-scheduler dp_balanced`.
