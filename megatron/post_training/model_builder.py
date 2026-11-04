@@ -324,6 +324,8 @@ def modelopt_gpt_hybrid_builder(
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
+    if config.use_liger:
+        raise ValueError("use_liger is not supported by ModelOpt GPT or Hybrid specs.")
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:

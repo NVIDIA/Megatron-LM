@@ -349,6 +349,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_liger: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -360,16 +361,22 @@ def get_gpt_layer_local_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_liger (bool, optional): Use Liger for RMSNorm slots. Requires
+            normalization="RMSNorm" and use_kitchen=False. Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
+
+    if use_liger and (normalization != "RMSNorm" or use_kitchen):
+        raise ValueError("use_liger requires normalization='RMSNorm' and use_kitchen=False.")
 
     backend = get_backend(
         "local",
         use_kitchen=use_kitchen,
         use_kitchen_attention=use_kitchen_attention,
         kitchen_attention_backend=kitchen_attention_backend,
+        use_liger=use_liger,
     )
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
@@ -620,6 +627,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=config.use_liger,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -631,6 +639,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=config.use_liger,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

@@ -40,7 +40,9 @@ class QKNormConfigResolver:
         self.is_dsa = config.experimental_attention_variant == "dsa"
         self.variant_str = "DSA" if self.is_dsa else "MLA"
 
-        backend = get_backend(config.transformer_impl)
+        backend = get_backend(
+            config.transformer_impl, use_liger=getattr(config, "use_liger", False)
+        )
         self.qk_norm_impl = backend.layer_norm(
             rms_norm=config.normalization == "RMSNorm", for_qk=True
         )
