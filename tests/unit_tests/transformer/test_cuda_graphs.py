@@ -11,7 +11,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -31,7 +31,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -1607,6 +1607,7 @@ class TestTECudaGraphHelper:
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             optimizers=[],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Call _get_cuda_graph_input_data (which internally calls _get_sample_arguments)
@@ -1977,6 +1978,7 @@ class TestPartialCudaGraph:
                 seq_length=self.seq_length,
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         loss_list = []
@@ -2346,7 +2348,11 @@ class TestCheckpointParameterDiscovery:
         module.load_state_dict(reference.state_dict())
 
         manager = CudaGraphManager(
-            config, base_module=module, function_name="my_op", need_backward=True
+            config,
+            base_module=module,
+            function_name="my_op",
+            need_backward=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
         ddp_model = DistributedDataParallel(
             config,
@@ -2432,7 +2438,11 @@ class TestRepeatedParameterCapture:
         module.load_state_dict(reference.state_dict())
 
         manager = CudaGraphManager(
-            config, base_module=module, function_name="project", need_backward=True
+            config,
+            base_module=module,
+            function_name="project",
+            need_backward=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
         ddp_model = DistributedDataParallel(
             config,
@@ -2532,6 +2542,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         # First call captures, second replays
@@ -2555,6 +2566,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2575,6 +2587,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2607,6 +2620,7 @@ class TestInlineCaptureManager:
             inline_capture=True,
             num_warmup_steps=0,
             need_backward=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["pp"]),
         )
 
         x = torch.randn(4, config.hidden_size, device="cuda")
@@ -2690,7 +2704,10 @@ class TestCudaGraphManagerProcessGroups:
             module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
         assert manager.reuse_cudagraphs is (global_pp == 2)
 
-    def test_function_manager_without_module_pipeline_group_uses_global_grid(self):
+    def test_function_manager_without_module_pipeline_group_warns_and_uses_global_grid(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
         self._model_pipeline_group(global_pp=2)
         config = TransformerConfig(
             num_layers=1,
@@ -2703,7 +2720,11 @@ class TestCudaGraphManagerProcessGroups:
         manager = CudaGraphManager(
             config, base_module=module, function_name="my_op", need_backward=False
         )
-        module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
+        with pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="CudaGraphManager was called without `pg_collection.pp`",
+        ):
+            module.my_op(torch.randn(4, config.hidden_size, device="cuda"))
         assert manager.reuse_cudagraphs is False
 
     @pytest.mark.parametrize("global_pp", [1, 2])

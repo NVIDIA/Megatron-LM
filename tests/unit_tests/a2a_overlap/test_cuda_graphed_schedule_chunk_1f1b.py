@@ -284,6 +284,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 seq_length=self.seq_length,
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         num_iters = cuda_graph_warmup_steps + 2
