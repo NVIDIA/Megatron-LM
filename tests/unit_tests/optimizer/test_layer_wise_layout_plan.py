@@ -2,8 +2,9 @@
 
 """CPU tests for how the layer-wise distributed optimizer plan is resolved.
 
-Covers the LayerWise data-parallel layout (padded, compact), the optimizer intent, the DDP
-wrapping decision and the rank-independent whole-parameter owners of the compact layout.
+Covers the gradient collective (reduce-scatter -> padded layout, all-reduce -> compact
+layout), the optimizer intent, the DDP wrapping decision and the rank-independent
+whole-parameter owners of the compact layout.
 """
 
 import random
@@ -14,15 +15,15 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.distributed.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-    resolve_layer_wise_param_layout,
-)
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     configure_ddp_for_layer_wise_optimizer,
 )
-from megatron.core.optimizer.optimizer_config import resolve_layer_wise_distributed_optimizer
+from megatron.core.optimizer.optimizer_config import (
+    OptimizerConfig,
+    resolve_layer_wise_distributed_optimizer,
+)
 
 
 def _param(shape, **attrs):
@@ -49,19 +50,28 @@ def _model():
 
 
 @pytest.mark.parametrize(
-    ("layout", "expected"), [(None, "padded"), ("padded", "padded"), ("compact", "compact")]
+    ("optimizer", "use_distopt", "collective", "error"),
+    [
+        ("muon", True, "reduce-scatter", None),
+        ("muon", True, "all-reduce", None),
+        ("adam", True, "reduce-scatter", None),
+        ("muon", True, "ragged", "must be"),
+        # all-reduce only changes the parameters an emerging optimizer owns whole; anywhere
+        # else it would silently do nothing, so it is rejected.
+        ("adam", True, "all-reduce", "applies to emerging optimizers"),
+        ("muon", False, "all-reduce", "applies to emerging optimizers"),
+    ],
 )
-def test_resolve_layer_wise_param_layout(layout, expected):
-    assert resolve_layer_wise_param_layout(layout) == expected
-
-
-@pytest.mark.parametrize("layout", ["legacy", "ragged"])
-def test_resolve_layer_wise_param_layout_rejects_unknown_layouts(layout):
-    # The legacy layout was removed; naming it is an error, not a silent fallback.
-    with pytest.raises(ValueError):
-        resolve_layer_wise_param_layout(layout)
-    with pytest.raises(ValueError):
-        DistributedDataParallelConfig(layer_wise_param_layout=layout)
+def test_emerging_optimizer_grad_collective_validation(optimizer, use_distopt, collective, error):
+    with nullcontext() if error is None else pytest.raises(ValueError, match=error):
+        config = OptimizerConfig(
+            optimizer=optimizer,
+            use_distributed_optimizer=use_distopt,
+            emerging_optimizer_grad_collective=collective,
+        )
+        # Depending on the branch, OptimizerConfig checks at construction or in validate().
+        if hasattr(config, "validate"):
+            config.validate()
 
 
 @pytest.mark.parametrize(
@@ -89,52 +99,71 @@ def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_la
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("layout", [None, "padded", "compact"])
-def test_configure_ddp_for_sharded_layer_wise_layouts(layout):
+@pytest.mark.parametrize(
+    ("collective", "layout"),
+    [(None, "padded"), ("reduce-scatter", "padded"), ("all-reduce", "compact")],
+)
+def test_configure_ddp_for_layer_wise_optimizer(collective, layout):
     model = _model()
     # The container clears use_distributed_optimizer for the layer-wise optimizer.
-    ddp_config = DistributedDataParallelConfig(layer_wise_param_layout=layout)
+    ddp_config = DistributedDataParallelConfig()
+    kwargs = {} if collective is None else {"emerging_optimizer_grad_collective": collective}
     fn = configure_ddp_for_layer_wise_optimizer(
-        [model], ddp_config, use_layer_wise_distributed_optimizer=True
+        [model], ddp_config, use_layer_wise_distributed_optimizer=True, **kwargs
     )
-    assert fn == LayerWiseDistributedOptimizer.compute_full_param_layout
+    assert fn.func == LayerWiseDistributedOptimizer.compute_full_param_layout
+    assert fn.keywords == {"param_layout": layout}
     assert ddp_config.use_distributed_optimizer
-    assert ddp_config.layer_wise_param_layout == (layout or "padded")
     assert model.fc1.is_managed_by_layer_wise_optimizer
     assert model.fc2.is_managed_by_layer_wise_optimizer
     for name in ("embedding", "fc1_bias", "router"):
         assert not getattr(model, name).is_managed_by_layer_wise_optimizer
 
-    # Resolving again (e.g. a second wrap of the same config) is stable.
-    assert (
+    with pytest.raises(ValueError, match="must be one of"):
         configure_ddp_for_layer_wise_optimizer(
-            [model], ddp_config, use_layer_wise_distributed_optimizer=True
+            [model],
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective="ragged",
         )
-        == fn
-    )
-    assert ddp_config.layer_wise_param_layout == (layout or "padded")
 
 
-def test_layer_wise_rejects_chunks_without_a_layer_wise_layout():
-    # Chunks wrapped without a LayerWise layout (the removed legacy layout) are rejected.
-    with pytest.raises(ValueError, match="padded or compact"):
-        LayerWiseDistributedOptimizer._resolve_param_layout(
-            DistributedDataParallelConfig(use_distributed_optimizer=False), None
-        )
+def _full_layout(sharded):
+    """A full layout whose only LayerWise buffer is sharded (padded) or not (compact)."""
+    key = type("BufferKey", (), {"is_managed_by_layer_wise_optimizer": True})()
+    return SimpleNamespace(layouts={key: SimpleNamespace(uses_distributed_optimizer=sharded)})
+
+
+def test_resolve_param_layout_follows_the_grad_collective():
+    resolve = LayerWiseDistributedOptimizer._resolve_param_layout
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    padded = SimpleNamespace(emerging_optimizer_grad_collective="reduce-scatter")
+    compact = SimpleNamespace(emerging_optimizer_grad_collective="all-reduce")
+    assert resolve(padded, ddp_config, [_full_layout(True)]) == "padded"
+    assert resolve(compact, ddp_config, [_full_layout(False)]) == "compact"
+    # DDP buffers built for one collective cannot be driven with the other.
+    with pytest.raises(ValueError, match="does not match"):
+        resolve(compact, ddp_config, [_full_layout(True)])
+    # Chunks not wrapped for the layer-wise optimizer (e.g. the removed legacy layout).
+    with pytest.raises(ValueError, match="wrapped for it"):
+        resolve(padded, DistributedDataParallelConfig(use_distributed_optimizer=False), None)
     # Direct construction without DDP-wrapped chunks owns and gathers whole params.
-    assert LayerWiseDistributedOptimizer._resolve_param_layout(None, None) == "compact"
+    assert resolve(padded, None, None) == "compact"
 
 
 @pytest.mark.parametrize(
-    ("kind", "reuse_grad_buf", "allowed"),
+    ("kind", "reuse_grad_buf", "error"),
     [
-        ("bf16", False, True),
-        ("mxfp8", True, True),
-        ("mxfp8", False, False),
-        ("blockwise", True, False),
+        ("bf16", False, None),
+        ("mxfp8", True, None),
+        # Recipes the all-reduce collective can publish point there ...
+        ("mxfp8", False, "all-reduce"),
+        ("blockwise", True, "all-reduce"),
+        # ... and the others, which no LayerWise gather publishes, to another recipe.
+        ("tensorwise", True, "mxfp8 or blockwise recipe"),
     ],
 )
-def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_grad_buf, allowed):
+def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_grad_buf, error):
     # The padded gather moves raw bytes; only MXFP8 staged through the grad buffer is
     # requantized on every rank, so other FP8 params would keep stale scales off-owner.
     optimizer = SimpleNamespace(param_groups=[{"params": [_param((8, 8))]}])
@@ -142,7 +171,8 @@ def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_gr
     with (
         mock.patch(f"{module}._param_uses_quantized_storage", return_value=kind != "bf16"),
         mock.patch(f"{module}.is_mxfp8tensor", return_value=kind == "mxfp8"),
-        nullcontext() if allowed else pytest.raises(ValueError, match="compact"),
+        mock.patch(f"{module}.is_blockwise_float8tensor", return_value=kind == "blockwise"),
+        nullcontext() if error is None else pytest.raises(ValueError, match=error),
     ):
         LayerWiseDistributedOptimizer._check_padded_param_gather_storage(
             [optimizer], SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf)

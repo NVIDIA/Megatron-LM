@@ -940,8 +940,8 @@ def _get_megatron_emerging_optimizer(
         if ddp_config is None or not ddp_config.use_distributed_optimizer:
             raise ValueError(
                 f"optimizer={config.optimizer!r} resolves to the layer-wise distributed "
-                "optimizer, which needs model chunks wrapped with the padded or compact "
-                "LayerWise layout. Wrap them with use_layer_wise_distributed_optimizer=True "
+                "optimizer, which needs model chunks wrapped for it. Wrap them with "
+                "use_layer_wise_distributed_optimizer=True "
                 "(see configure_ddp_for_layer_wise_optimizer)."
             )
         assert ddp_config.num_distributed_optimizer_instances == 1, (

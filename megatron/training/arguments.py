@@ -3085,19 +3085,16 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")
-    group.add_argument('--layer-wise-param-layout', type=str, default=None,
-                       choices=['padded', 'compact'],
-                       help='Data-parallel layout of the Muon-managed matrices when '
-                       '--use-distributed-optimizer selects the layer-wise distributed '
-                       'optimizer. padded (default): shard-aligned padded buffers with '
-                       'gradient reduce-scatter and fixed-size parameter all-gather. '
-                       'compact: unpadded buffers with gradient all-reduce, whole-matrix '
-                       'owners and uneven parameter all-gather. In both, the other '
-                       'parameters (embeddings, biases, norms) are sharded by a separate '
-                       'distributed optimizer, and torch_dist checkpoints load with either '
-                       'layout. The layouts reduce gradients in different orders, so loss '
-                       'curves need not match bit-for-bit across layouts. The legacy layout '
-                       '(--no-use-layer-wise-param-layout) was removed; see '
+    group.add_argument('--emerging-optimizer-grad-collective', type=str,
+                       default='reduce-scatter', choices=['reduce-scatter', 'all-reduce'],
+                       help='Data-parallel gradient collective for the parameters that an '
+                       'emerging optimizer with --use-distributed-optimizer (e.g. Muon) '
+                       'updates whole on one rank. reduce-scatter (default): those tensors '
+                       'stay whole inside padded, equal-size shards. all-reduce: no padding, '
+                       'twice the gradient traffic and an uneven all-gather of whole tensors; '
+                       'needed for blockwise FP8 params. Other parameters always use '
+                       'reduce-scatter, and torch_dist checkpoints load with either. The '
+                       'legacy layer-wise layout was removed; see '
                        'docs/user-guide/features/dist_optimizer.md.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'

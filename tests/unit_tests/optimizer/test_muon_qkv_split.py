@@ -119,8 +119,9 @@ def _mla_model_and_optimizer(**optimizer_kwargs):
     ddp = wrap_model_chunks_with_ddp(
         [model],
         model.config,
-        DistributedDataParallelConfig(layer_wise_param_layout="compact"),
+        DistributedDataParallelConfig(),
         use_layer_wise_distributed_optimizer=True,
+        emerging_optimizer_grad_collective="all-reduce",
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
@@ -128,6 +129,7 @@ def _mla_model_and_optimizer(**optimizer_kwargs):
             lr=0.01,
             bf16=True,
             use_distributed_optimizer=True,
+            emerging_optimizer_grad_collective="all-reduce",
             muon_tp_mode='duplicated',
             **optimizer_kwargs,
         ),

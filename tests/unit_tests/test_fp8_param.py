@@ -318,10 +318,10 @@ class TestFP8Param:
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if cfg_container.optimizer.use_layer_wise_distributed_optimizer:
             has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            requested_layout = gpt_model[0].ddp_config.layer_wise_param_layout
+            requested = cfg_container.optimizer.emerging_optimizer_grad_collective
             assert has_param_layout, (
                 "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={requested_layout}, actual={has_param_layout}"
+                f"requested={requested}, actual={has_param_layout}"
             )
         self._on_model_built(gpt_model, optimizer, args)
 
@@ -633,17 +633,15 @@ class TestFP8Param:
     )
     @pytest.mark.parametrize("tp_size", [2])
     @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
-    @pytest.mark.parametrize("layer_wise_param_layout", ["compact", "padded"])
+    @pytest.mark.parametrize("grad_collective", ["all-reduce", "reduce-scatter"])
     @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
-    def test_muon_layer_wise_fp8_param_gather(
-        self, tp_size, recipe, layer_wise_param_layout, dp_overlap
-    ):
-        """Muon on each LayerWise layout trains FP8 params like BF16 params.
+    def test_muon_layer_wise_fp8_param_gather(self, tp_size, recipe, grad_collective, dp_overlap):
+        """Muon with either grad collective trains FP8 params like BF16 params.
 
-        The compact layout gathers whole params as BF16 staged from the owners' FP32
-        masters and requantizes on every rank, so the FP8-param run must follow the
-        BF16-param run (FP8 compute in both). The padded layout keeps main's MXFP8 path
-        through the reused grad buffer and rejects blockwise FP8 param gather.
+        All-reduce (the compact layout) gathers whole params as BF16 staged from the owners'
+        FP32 masters and requantizes on every rank, so the FP8-param run must follow the
+        BF16-param run (FP8 compute in both). Reduce-scatter (the padded layout) keeps main's
+        MXFP8 path through the reused grad buffer and rejects blockwise FP8 param gather.
 
         dp_overlap: (overlap_param_gather, overlap_grad_reduce)
         """
@@ -652,12 +650,12 @@ class TestFP8Param:
             pytest.skip("blockwise is only supported on Hopper architecture")
         if recipe == "mxfp8" and arch < 10:
             pytest.skip("MXFP8 is supported since Blackwell architecture")
-        if recipe == "blockwise" and layer_wise_param_layout == "padded":
-            pytest.skip("The padded LayerWise layout rejects blockwise FP8 param gather")
+        if recipe == "blockwise" and grad_collective == "reduce-scatter":
+            pytest.skip("Reduce-scatter rejects blockwise FP8 param gather")
         kwargs = {
             "optimizer": "muon",
             "muon_tp_mode": "duplicated",
-            "layer_wise_param_layout": layer_wise_param_layout,
+            "emerging_optimizer_grad_collective": grad_collective,
             "overlap_param_gather": dp_overlap[0],
             "overlap_grad_reduce": dp_overlap[1],
             "num_steps": 20,

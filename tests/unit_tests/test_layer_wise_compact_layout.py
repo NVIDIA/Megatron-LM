@@ -102,18 +102,19 @@ def _build(
     torch.manual_seed(seed)
     model = _DenseAndExpertModel(with_experts=with_experts).bfloat16().cuda()
     reference = layout == "reference"
+    grad_collective = "all-reduce" if layout == "compact" else "reduce-scatter"
     ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=overlap,
         overlap_param_gather=overlap and not reference,
         grad_reduce_in_fp32=grad_reduce_in_fp32,
         bucket_size=bucket_size,
-        layer_wise_param_layout=None if reference else layout,
     )
     model = wrap_model_chunks_with_ddp(
         [model],
         TransformerConfig(num_attention_heads=1, num_layers=1),
         ddp_config,
         use_layer_wise_distributed_optimizer=not reference,
+        emerging_optimizer_grad_collective=grad_collective,
     )[0]
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
@@ -125,6 +126,7 @@ def _build(
             muon_tp_mode='duplicated',
             # Muon + distributed optimizer is the layer-wise distributed Muon.
             use_distributed_optimizer=not reference,
+            emerging_optimizer_grad_collective=grad_collective,
         ),
         [model],
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
@@ -192,7 +194,6 @@ class TestCompactLayerWiseLayout:
         assert layer_wise.layerwise_param_sync_via_bucket_group == overlap
         # The model-level config keeps DistOpt for the sibling optimizer.
         assert model.ddp_config.use_distributed_optimizer
-        assert model.ddp_config.layer_wise_param_layout == "compact"
 
         layer_wise_buffers = 0
         for buffer in model.buffers + model.expert_parallel_buffers:

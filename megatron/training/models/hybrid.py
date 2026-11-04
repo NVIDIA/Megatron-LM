@@ -235,6 +235,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        emerging_optimizer_grad_collective: str = "reduce-scatter",
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -250,6 +251,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            emerging_optimizer_grad_collective: ``OptimizerConfig.emerging_optimizer_grad_collective``.
 
         Returns:
             List of model stages.
@@ -270,6 +272,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            emerging_optimizer_grad_collective=emerging_optimizer_grad_collective,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

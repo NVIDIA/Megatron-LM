@@ -421,8 +421,19 @@ class OptimizerConfig:
     An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
     :func:`resolve_layer_wise_distributed_optimizer`); :meth:`finalize_optimizer_config` then
     sets it and resets ``use_distributed_optimizer`` to False so that the standard
-    distributed-optimizer path is not triggered. The data-parallel layout of the layer-wise
-    optimizer is ``DistributedDataParallelConfig.layer_wise_param_layout``."""
+    distributed-optimizer path is not triggered."""
+
+    emerging_optimizer_grad_collective: str = "reduce-scatter"
+    """Data-parallel gradient collective for the parameters that an emerging optimizer with
+    ``use_distributed_optimizer`` (e.g. Muon) updates whole on one rank.
+
+    - ``"reduce-scatter"``: each tensor stays whole inside one rank's shard of a padded buffer;
+      gradients are reduce-scattered and the equal-size shards all-gathered.
+    - ``"all-reduce"``: no padding; gradients are all-reduced and every owner all-gathers its
+      whole tensors (uneven sizes), which sends twice the gradient bytes.
+
+    Other parameters always use reduce-scatter. Both store the same optimizer state, so a
+    ``torch_dist`` checkpoint saved with one loads with the other."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -551,6 +562,19 @@ class OptimizerConfig:
         # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
         # value it will produce, not only the pre-finalize flag.
         will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
+
+        if self.emerging_optimizer_grad_collective not in ("reduce-scatter", "all-reduce"):
+            raise ValueError(
+                "emerging_optimizer_grad_collective must be 'reduce-scatter' or 'all-reduce', "
+                f"got {self.emerging_optimizer_grad_collective!r}."
+            )
+        if self.emerging_optimizer_grad_collective == "all-reduce" and not will_be_layer_wise:
+            raise ValueError(
+                "emerging_optimizer_grad_collective='all-reduce' applies to emerging optimizers "
+                "(e.g. Muon) with use_distributed_optimizer=True; got "
+                f"optimizer={self.optimizer!r}, "
+                f"use_distributed_optimizer={self.use_distributed_optimizer}."
+            )
 
         if self.muon_split_qkv_per_head and not self.muon_split_qkv:
             raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True.")

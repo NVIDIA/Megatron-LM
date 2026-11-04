@@ -146,7 +146,6 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
         # A model wrapped for the compact LayerWise layout: every weight is a LayerWise matrix.
         model.ddp_config = SimpleNamespace(
             use_distributed_optimizer=True,
-            layer_wise_param_layout='compact',
             num_distributed_optimizer_instances=1,
             overlap_param_gather=False,
             reuse_grad_buf_for_mxfp8_param_ag=False,
@@ -163,6 +162,7 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
             lr=0.01,
             bf16=True,
             use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective='all-reduce',
             muon_split_qkv=False,
             clip_grad=0.0,
         )
