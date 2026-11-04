@@ -423,7 +423,7 @@ class TestBatchInvariantA2AContextParallel:
         mismatched = []
         for name, reference_grad in reference_grads.items():
             error = (grads[name] - reference_grad).norm() / reference_grad.norm().clamp_min(1e-12)
-            if error > 1e-2:
+            if not torch.isfinite(error) or error > 1e-2:
                 mismatched.append(f"{name}: relative error {error.item():.3e}")
         assert (
             not mismatched
