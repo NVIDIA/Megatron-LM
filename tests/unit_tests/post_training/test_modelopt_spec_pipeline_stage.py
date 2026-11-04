@@ -7,11 +7,11 @@ from argparse import Namespace
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -85,10 +85,12 @@ def test_modelopt_spec_keeps_the_layers_of_the_given_stage(
 
 
 def test_modelopt_spec_without_pp_rank_uses_the_global_pipeline_rank(monkeypatch):
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", lambda: 1)
     config = _moe_config(**UNEVEN_SPLIT)
 
-    block_spec = get_gpt_modelopt_spec(config)
+    with pytest.warns(ProcessGroupFallbackWarning, match="called without `pp_rank`"):
+        block_spec = get_gpt_modelopt_spec(config)
 
     assert [_is_moe(layer_spec) for layer_spec in block_spec.layer_specs] == [False, True]
 

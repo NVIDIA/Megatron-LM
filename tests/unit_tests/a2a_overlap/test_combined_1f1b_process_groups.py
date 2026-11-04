@@ -188,7 +188,10 @@ class TestCombined1F1BProcessGroups:
                 GPTModel(
                     config=config,
                     transformer_layer_spec=get_gpt_decoder_block_spec(
-                        config=config, use_transformer_engine=True, vp_stage=vp_stage
+                        config=config,
+                        use_transformer_engine=True,
+                        vp_stage=vp_stage,
+                        pp_rank=pp_group.rank(),
                     ),
                     vocab_size=VOCAB_SIZE,
                     max_sequence_length=300,
