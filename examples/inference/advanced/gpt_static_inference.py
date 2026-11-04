@@ -18,7 +18,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 
 sys.path.append(
@@ -55,7 +54,7 @@ def add_static_inference_args(parser):
     return parser
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
+def get_inference_engine(args: Namespace, model: MegatronModule, tokenizer) -> StaticInferenceEngine:
     """Utility to get the relevant backend for running inference
 
     This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
@@ -67,7 +66,6 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     Returns:
         AbstractBackend: The chosen backend
     """
-    tokenizer = build_tokenizer(args)
     inference_context = StaticInferenceContext(
         args.inference_max_requests, args.inference_max_seq_length
     )
@@ -137,8 +135,9 @@ def main():
     initialize_megatron()
 
     model = get_model_for_inference()
+    tokenizer = get_tokenizer()
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(args, model, tokenizer)
 
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -148,9 +147,6 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         top_n_logprobs=args.top_n_logprobs,
     )
-
-    # Build tokenizer
-    tokenizer = build_tokenizer(args)
 
     requests = build_requests(args, tokenizer)
     prompts = [r.prompt_text for r in requests]
