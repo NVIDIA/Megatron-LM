@@ -241,8 +241,9 @@ def test_grad_comm_dtype_losses_match_baseline(distributed_setup, grad_comm_dtyp
 
 @pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])
 @pytest.mark.parametrize("set_to_none", [False, True])
-def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none):
-    """Singleton-inner DP matches dense training, with replicated DP as a reduction control."""
+@pytest.mark.parametrize("grad_scale", [1.0, 0.5, 1 / 3])
+def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none, grad_scale):
+    """Scaled singleton-inner accumulation matches dense training, with replicated DP as a control."""
     setup = distributed_setup
     if setup.world_size < 2:
         pytest.skip("Requires different contributions from at least two ranks.")
@@ -276,6 +277,7 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
             mixed_precision_policy=MixedPrecisionPolicy(
                 main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
             ),
+            grad_scale=grad_scale,
         )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -296,7 +298,10 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
                 with microbatch(context, is_last=index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(inputs), targets)
                     losses.append(loss.detach())
-                    (loss / num_microbatches).backward()
+                    backward_loss = loss / num_microbatches
+                    if reduce_grads:
+                        backward_loss = backward_loss * grad_scale
+                    backward_loss.backward()
             if reduce_grads:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
