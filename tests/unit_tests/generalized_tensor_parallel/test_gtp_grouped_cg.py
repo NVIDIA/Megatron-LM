@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Regression coverage for #6057's grouped-expert chains under CUDA graphs."""
+"""Regression coverage for grouped-expert CUDA graphs and asynchronous gather completion."""
 
 import pytest
 import torch
@@ -34,6 +34,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
+    _make_gtp_linear,
     _requires_mxfp8,
     _torchrun_dist_init,
     reset_fp8_state,
@@ -353,12 +354,15 @@ def test_grouped_local_graph_replay(expert_group):
 
 
 @pytest.mark.parametrize("captured", [False, True])
-def test_grouped_consumer_does_not_wait_for_later_gather(expert_group, captured):
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_consumer_does_not_wait_for_later_gather(expert_group, captured, grouped, recompute):
     group = expert_group
-    model = _Block(group)
+    model = _Block(group) if grouped else _make_gtp_linear(128, 128, group)
     gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration" if captured else "none")
     gtp.classify_gtp_chains(torch.nn.Sequential(model))
-    param = model.mlp.experts.linear_fc2.weight0
+    param = model.mlp.experts.linear_fc2.weight0 if grouped else model.weight
+    event = param._recompute_ag_event if recompute else param.ag_event
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     ready = torch.cuda.Event(enable_timing=True, external=True)
@@ -366,19 +370,25 @@ def test_grouped_consumer_does_not_wait_for_later_gather(expert_group, captured)
     ag_stream = gtp.get_ag_stream(param.chain_id, group)
 
     def run():
-        _, handle = param._all_gather_weight(async_op=True, fwd=True)
-        param._prefetch_handle = handle
+        _, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
+        if recompute:
+            param._recompute_prefetch_handle = handle
+        else:
+            param._prefetch_handle = handle
         with torch.cuda.stream(ag_stream):
-            # Stand in for the later, unrelated FC1 prefetch on the shared AG stream.
+            # Stand in for unrelated work queued after this gather on the AG stream.
             torch.cuda._sleep(100_000_000)
             tail.record()
-        param._wait_param_gather()
-        param.ag_event.wait()
+        if recompute:
+            param._wait_recompute_param_gather()
+        else:
+            param._wait_param_gather()
+        event.wait()
         ready.record()
         torch.cuda.current_stream().wait_stream(ag_stream)
 
     with torch.cuda.stream(stream):
-        param._all_gather_weight(async_op=False, fwd=True)
+        param._all_gather_weight(async_op=False, fwd=True, recompute=recompute)
     torch.cuda.synchronize()
     if captured:
         graph = torch.cuda.CUDAGraph()
@@ -397,13 +407,18 @@ def test_grouped_consumer_does_not_wait_for_later_gather(expert_group, captured)
 
 
 @pytest.mark.parametrize("recompute", [False, True])
-def test_grouped_sync_fallback_records_completion(expert_group, monkeypatch, recompute):
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+def test_sync_fallback_records_completion(expert_group, monkeypatch, recompute, grouped):
     group = expert_group
-    op = te.ops.GroupedLinear(1, 128, 128, bias=False, device="cuda", dtype=torch.bfloat16)
-    op.gtp_remat_size = group.size()
-    wrap_module_params_gtp(op, ["weight0"], group, is_grouped=True)
-    param = op.weight0
-    param.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+    if grouped:
+        op = te.ops.GroupedLinear(1, 128, 128, bias=False, device="cuda", dtype=torch.bfloat16)
+        op.gtp_remat_size = group.size()
+        wrap_module_params_gtp(op, ["weight0"], group, is_grouped=True)
+        param = op.weight0
+        param.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+    else:
+        op = _make_gtp_linear(128, 128, group)
+        param = op.weight
     original_gather = gtp.gather_along_first_dim
     calls = []
 
@@ -417,8 +432,8 @@ def test_grouped_sync_fallback_records_completion(expert_group, monkeypatch, rec
 
     monkeypatch.setattr(gtp, "gather_along_first_dim", synchronous_fallback)
     result, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
-    assert calls == [True]  # One local expert takes the non-coalesced gather path.
-    assert handle.completion_recorded
+    assert calls == [True]  # Dense and single-expert weights use the non-coalesced path.
+    assert handle.handle is None
     if recompute:
         param._recompute_prefetch_handle = handle
         param._wait_recompute_param_gather()
@@ -430,4 +445,4 @@ def test_grouped_sync_fallback_records_completion(expert_group, monkeypatch, rec
     event.wait()
     torch.cuda.synchronize()
     assert event.query()
-    assert result[0].shape == (128, 128)
+    assert (result[0] if grouped else result).shape == (128, 128)
