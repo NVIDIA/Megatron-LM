@@ -22,6 +22,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.optimizer.utils import clip_output_grad_hook
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -330,6 +331,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
+            if self.config.apply_per_token_grad_clipping:
+                self.output_layer.register_backward_hook(clip_output_grad_hook)
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
