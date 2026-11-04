@@ -107,6 +107,84 @@ class TestMambaMixer:
                 assert output.shape[2] == mixer.config.hidden_size
                 assert output.dtype == torch.float32
 
+    @staticmethod
+    def _ssm_decode_one_request_at_a_time(mixer, zxBCdt, conv_state, ssm_state):
+        """Decode a batch-first (b, 1, proj) input with one single-request ssm_decode call per
+        request, updating that request's slot of the conv/SSM states in place."""
+        return torch.cat(
+            [
+                mixer.ssm_decode(
+                    zxBCdt[i : i + 1],
+                    conv_state=conv_state[i : i + 1],
+                    ssm_state=ssm_state[i : i + 1],
+                )
+                for i in range(zxBCdt.shape[0])
+            ]
+        )
+
+    def test_ssm_decode_is_batch_separable(self):
+        """ssm_decode on a batch-first input decodes each request on its own state slot."""
+        mixer = self.get_mixer()
+        batch_size = 2
+        zxBCdt = torch.randn(batch_size, 1, mixer.in_proj.weight.shape[0], device="cuda")
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        conv_state = torch.randn(batch_size, *conv_shape, device="cuda")
+        ssm_state = torch.randn(batch_size, *ssm_shape, device="cuda")
+        conv_ref, ssm_ref = conv_state.clone(), ssm_state.clone()
+
+        with torch.no_grad(), InferenceMode.active():
+            y = mixer.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y_ref = self._ssm_decode_one_request_at_a_time(mixer, zxBCdt, conv_ref, ssm_ref)
+
+        torch.testing.assert_close(y, y_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(conv_state, conv_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(ssm_state, ssm_ref, atol=1e-5, rtol=1e-5)
+
+    def test_ssm_decode_rejects_sequence_first_input(self):
+        """Without batch_indices, a (1, b, proj) input would decode b requests on one slot."""
+        mixer = self.get_mixer()
+        batch_size = 2
+        zxBCdt = torch.randn(1, batch_size, mixer.in_proj.weight.shape[0], device="cuda")
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        conv_state = torch.zeros(batch_size, *conv_shape, device="cuda")
+        ssm_state = torch.zeros(batch_size, *ssm_shape, device="cuda")
+
+        with torch.no_grad(), InferenceMode.active():
+            with pytest.raises(AssertionError, match="one state slot per request"):
+                mixer.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_static_decode_is_per_request(self, batch_size):
+        """A static-batching decode step advances each request on its own state slot."""
+        mixer = self.get_mixer()
+        inference_context = StaticInferenceContext(
+            max_batch_size=batch_size, max_sequence_length=16
+        )
+        # Allocate the static state cache and give each request distinct states, as a prefill
+        # of `batch_size` requests would.
+        conv_state, ssm_state = mixer._get_states_from_cache(inference_context, batch_size)
+        conv_state.normal_()
+        ssm_state.normal_()
+        conv_ref, ssm_ref = conv_state.clone(), ssm_state.clone()
+
+        inference_context.sequence_len_offset = 8
+        inference_context.max_seqlen = inference_context.max_sequence_length
+        inference_context.seqlen_offset = inference_context.sequence_len_offset
+        hidden_states = torch.randn(1, batch_size, mixer.config.hidden_size, device="cuda")
+        with torch.no_grad(), InferenceMode.active():
+            output, _ = mixer(hidden_states, inference_context=inference_context)
+
+            # Reference: the same projections around one single-request decode per state slot.
+            zxBCdt, _ = mixer.in_proj(hidden_states)
+            y_ref = self._ssm_decode_one_request_at_a_time(
+                mixer, zxBCdt.transpose(0, 1), conv_ref, ssm_ref
+            )
+            output_ref, _ = mixer.out_proj(y_ref.transpose(0, 1))
+
+        torch.testing.assert_close(output, output_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(conv_state, conv_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(ssm_state, ssm_ref, atol=1e-5, rtol=1e-5)
+
     @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
     def test_refreshes_decode_cache_in_place(self, refresh_on_eval):
         mixer = self.get_mixer()
