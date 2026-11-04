@@ -2747,6 +2747,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             "thd",
         ), f"Batch-invariant context parallelism does not support qkv_format={qkv_format!r}."
         is_thd = qkv_format == "thd"
+        if is_thd:
+
+            def same_boundaries(q: Optional[Tensor], kv: Optional[Tensor]) -> bool:
+                if q is kv:
+                    return True
+                if q is None or kv is None:
+                    return False
+                return torch.cuda.is_current_stream_capturing() or torch.equal(q, kv)
+
+            # K/V are reordered with the query boundaries below.
+            assert same_boundaries(
+                packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv
+            ) and same_boundaries(
+                packed_seq_params.cu_seqlens_q_padded, packed_seq_params.cu_seqlens_kv_padded
+            ), (
+                "Batch-invariant context parallelism requires identical query and key/value "
+                "packed sequence boundaries (self-attention)."
+            )
         reorder_params = packed_seq_params if is_thd else None
         cp_group = self._a2a_cp_group
         cp_size = cp_group.size()

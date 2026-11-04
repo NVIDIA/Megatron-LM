@@ -896,6 +896,125 @@ class TestTEWrappers:
         assert not bytes_equal(default[0]["out"], scaled[0]["out"])
 
 
+# --- batch-invariant all-to-all context parallelism -------------------------------------------
+
+
+# 8 query heads: 8 K/V groups are split across CP2 and CP4; 1 and 2 groups are gathered.
+@pytest.mark.parametrize("cp_size,num_query_groups", [(2, 8), (4, 8), (2, 1), (4, 2)])
+@pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
+def test_te_dot_product_attention_batch_invariant_a2a_cp_replays(
+    cp_size, num_query_groups, qkv_format, monkeypatch
+):
+    """The sequence-to-head exchange around TE's CP=1 FA4 call replays at a fixed CP size."""
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        te_supports_batch_invariant_attention,
+    )
+    from megatron.core.transformer.enums import AttnBackend
+
+    try:
+        from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+    except ImportError:
+        pytest.skip("requires FlashAttention-4")
+    if not te_supports_batch_invariant_attention():
+        pytest.skip("requires TE batch-invariant attention")
+    if Utils.world_size < cp_size:
+        pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
+
+    clear_nvte_env_vars()
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", dict(te_dpa._attention_backends, attention_params=None)
+    )
+    Utils.initialize_model_parallel(context_parallel_size=cp_size)
+    try:
+        seeded()
+        heads, head_dim = 8, 128
+        config = _config(
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=num_query_groups,
+            batch_invariant_mode=True,
+            flash_attention_version=4,
+            attention_backend=AttnBackend.flash,
+            context_parallel_size=cp_size,
+            cp_comm_type="a2a",
+        )
+        module = TEDotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            cp_comm_type="a2a",
+        ).cuda()
+        assert module._a2a_cp_group.size() == cp_size
+        assert module._a2a_cp_split_kv == (num_query_groups % cp_size == 0)
+
+        # Each rank holds its load-balanced share of the sequence for every head.
+        lengths = (768, 256, 512, 512)  # Each divisible by 2 * CP4.
+        tokens = sum(lengths) // cp_size
+        if qkv_format == "thd":
+            cu_seqlens = torch.tensor((0,) + lengths, device="cuda").cumsum(0).int()
+            # Equal but distinct K/V boundaries take the value comparison, not identity.
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens.clone(),
+                cu_seqlens_q_padded=cu_seqlens,
+                cu_seqlens_kv_padded=cu_seqlens.clone(),
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+            )
+            q_shape, kv_shape = (tokens, heads, head_dim), (tokens, num_query_groups, head_dim)
+        else:
+            packed_seq_params = None
+            q_shape, kv_shape = (tokens, 2, heads, head_dim), (
+                tokens,
+                2,
+                num_query_groups,
+                head_dim,
+            )
+        q, k, v = (
+            torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for shape in (q_shape, kv_shape, kv_shape)
+        )
+
+        def fn(q, k, v):
+            return module(q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params)
+
+        out, grads = assert_replays_bit_exact(
+            fn,
+            (q, k, v),
+            replays=3,
+            contention=True,
+            what=f"batch-invariant a2a CP{cp_size}[groups={num_query_groups},{qkv_format}]",
+        )
+        assert len(grads) == 3  # Replay covers dQ, dK, and dV.
+        for tensor in list(out.values()) + list(grads.values()):
+            assert torch.isfinite(tensor).all()
+
+        if qkv_format == "thd":
+            cross_attention = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens.flip(0).neg().add(cu_seqlens[-1]),
+                cu_seqlens_q_padded=cu_seqlens,
+                cu_seqlens_kv_padded=cu_seqlens.flip(0).neg().add(cu_seqlens[-1]),
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+            )
+            with pytest.raises(AssertionError, match="packed sequence boundaries"):
+                module(q, k, v, None, AttnMaskType.causal, packed_seq_params=cross_attention)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 # --- fused RoPE --------------------------------------------------------------------------------
 
 
