@@ -941,8 +941,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
-        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
-        "GEMM path and mxfp8_quantize_only are not replayed.",
+        "softmax_scale MultiLatentAttention hands to its core attention. NoPE layers "
+        "(no_rope_freq) build no rotary embedding and bypass every RoPE kernel; such a layer's "
+        "forward/backward is replayed in test_te_wrappers.py with the RoPE entry points stubbed "
+        "out. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
