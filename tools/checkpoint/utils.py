@@ -70,6 +70,19 @@ class _ConverterFakeProcessGroup:
         self._size = size
 
 
+def initialize_checkpoint_converter_distributed():
+    """Initialize a single-process gloo group unless torch.distributed is already initialized.
+
+    Model construction reads ranks and sizes from the fake process groups through
+    ``get_pg_rank`` and ``get_pg_size``, which ignore a group until torch.distributed is
+    initialized. The in-process store needs no port, so it does not clash with the saver process.
+    """
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend='gloo', store=torch.distributed.HashStore(), rank=0, world_size=1
+        )
+
+
 def initialize_checkpoint_converter_fake_process_groups(
     parallel_state, tensor_parallel_size, pipeline_parallel_size, expert_parallel_size
 ):
