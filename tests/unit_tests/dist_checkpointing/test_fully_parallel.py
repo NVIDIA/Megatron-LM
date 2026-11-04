@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed
+from torch.distributed.checkpoint import FileSystemReader
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -27,6 +28,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
+from megatron.core.dist_checkpointing.serialization import load, load_common_state_dict, save
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -442,6 +444,49 @@ class TestFullyParallelSaveAndLoad:
 
             # since each rank only loaded their Obj they were broadcasted
             assert set(sharded_state_dict.keys()) == set(loaded_state_dict.keys())
+
+    def test_cached_metadata_read_from_storage_once(self, tmp_path_dist_ckpt):
+        """With `cache_metadata`, a fully parallel torch_dist load reads `.metadata` once."""
+        cached_reader_cls = pytest.importorskip(
+            'nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader'
+        ).CachedMetadataFileSystemReader
+        Utils.initialize_model_parallel(1, 1)
+
+        def get_sharded_state_dict():
+            return {
+                'sharded': ShardedTensor.from_rank_offsets(
+                    'sharded',
+                    torch.full((4,), Utils.rank, device='cuda'),
+                    (0, Utils.rank, Utils.world_size),
+                ),
+                'replicated': ShardedTensor.from_rank_offsets(
+                    'replicated', torch.ones(4, device='cuda'), replica_id=Utils.rank
+                ),
+            }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_cached_metadata_read_once') as ckpt_dir:
+            save(get_sharded_state_dict(), ckpt_dir)
+
+            load_strategy = FullyParallelLoadStrategyWrapper(
+                TorchDistLoadShardedStrategy(cache_metadata=True),
+                parallel_state.get_data_parallel_group(),
+            )
+            read_metadata = FileSystemReader.read_metadata
+            cached_reader_cls.clear_metadata_cache()
+            try:
+                with mock.patch.object(
+                    FileSystemReader, 'read_metadata', autospec=True, side_effect=read_metadata
+                ) as storage_reads:
+                    # Same sequence as a training load: common-state pre-pass, then full load.
+                    load_common_state_dict(ckpt_dir, cache_metadata=True)
+                    loaded_state_dict = load(get_sharded_state_dict(), ckpt_dir, load_strategy)
+            finally:
+                cached_reader_cls.clear_metadata_cache()
+
+            assert storage_reads.call_count == 1
+            assert torch.equal(loaded_state_dict['sharded'].cpu(), torch.full((4,), Utils.rank))
+
+        Utils.destroy_model_parallel()
 
 
 class TestCrossRanksReads:
