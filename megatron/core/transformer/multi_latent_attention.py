@@ -475,8 +475,13 @@ class MultiLatentAttention(Attention):
         *,
         inference_params: BaseInferenceContext | None = None,
         packed_sequence_cp_metadata=None,
+        shared_prefix_forest=None,
     ):
         """Forward pass for multi-latent attention"""
+        if shared_prefix_forest is not None:
+            raise NotImplementedError(
+                "shared-prefix forest attention does not support multi-latent attention"
+            )
         assert (
             packed_sequence_cp_metadata is None
         ), "MLA does not support packed-sequence chunkwise CP metadata."
