@@ -300,6 +300,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_early_backward": False,
     "mtp_loss_scaling_factor": 0.1,
+    "mtp_normalize_loss_by_main_tokens": False,
     "mtp_num_layers": None,
     "mtp_standalone": False,
     "mtp_use_repeated_layer": False,
