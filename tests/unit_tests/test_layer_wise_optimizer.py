@@ -14,6 +14,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
 from tests.unit_tests.test_utilities import Utils
@@ -105,6 +106,114 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
 
     assert bucket.layerwise_params_list == [params]
     assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
+
+
+@pytest.mark.parametrize('use_param_layout', [False, True])
+@pytest.mark.parametrize('tp_divisor,etp_divisor', [(1, 2), (1, 1), (2, 2), (2, 1)])
+def test_dense_and_expert_dp_ownership(tp_divisor, etp_divisor, use_param_layout):
+    """Check independent owners, clipping and replica updates with real DDP buffers."""
+    world_size = Utils.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("Requires an even world size of at least four")
+    tp, etp = world_size // tp_divisor, world_size // etp_divisor
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, expert_tensor_parallel_size=etp)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32 * world_size,
+            num_attention_heads=world_size,
+            tensor_model_parallel_size=tp,
+            expert_tensor_parallel_size=etp,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        model = nn.Module()
+        params = [
+            nn.Parameter(torch.full((32, 32), float(i + 1), dtype=torch.bfloat16, device='cuda'))
+            for i in range(4)
+        ]
+        replica_groups = [pg.dp_cp, pg.dp_cp, pg.expt_dp, pg.expt_dp]
+        for index, param in enumerate(params):
+            model.register_parameter(f'weight_{index}', param)
+            param.allreduce = index < 2
+            param.is_managed_by_layer_wise_optimizer = True
+            set_tensor_model_parallel_attributes(param, True, 0, 1)
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_param_layout, grad_reduce_in_fp32=True
+        )
+        layout = None
+        if use_param_layout:
+            layout = LayerWiseDistributedOptimizer.compute_full_param_layout(
+                params, None, get_pg_size(pg.dp_cp), ddp_config, get_pg_size(pg.expt_dp)
+            )
+        model = DistributedDataParallel(
+            config, ddp_config, model, pg_collection=pg, full_param_layout=layout
+        )
+        optimizer = LayerWiseDistributedOptimizer(
+            [
+                torch.optim.Adam(
+                    [
+                        {'params': params[:2], 'is_expert_parallel': False},
+                        {'params': params[2:], 'is_expert_parallel': True},
+                    ],
+                    lr=0.02,
+                )
+            ],
+            OptimizerConfig(bf16=True, lr=0.02, clip_grad=1.0, log_num_zeros_in_grad=True),
+            pg,
+            model_chunks=[model],
+        )
+        owned = {
+            id(param)
+            for leaf in optimizer.chained_optimizers
+            for group in leaf.float16_groups
+            for param in group
+        }
+        for param, group in zip(params, replica_groups):
+            owner_count = torch.tensor(int(id(param) in owned), device='cuda')
+            torch.distributed.all_reduce(owner_count, group=group)
+            assert owner_count.item() == 1
+
+        reference = [nn.Parameter(param.detach().float()) for param in params]
+        reference_optimizer = torch.optim.Adam(reference, lr=0.02)
+        for step in range(3):
+            model.zero_grad_buffer()
+            expected_square_sum = 0.0
+            for index, (param, ref, group) in enumerate(zip(params, reference, replica_groups)):
+                param.main_grad.fill_((step + 1) * (index + 1) + 2**Utils.rank)
+                ranks = torch.distributed.get_process_group_ranks(group)
+                # DDP sums each replica group and normalizes by dense DP size.
+                expected_grad = sum(
+                    (step + 1) * (index + 1) + 2**rank for rank in ranks
+                ) / get_pg_size(pg.dp_cp)
+                ref.grad = torch.full_like(ref, expected_grad)
+                if Utils.rank == min(ranks):
+                    expected_square_sum += param.numel() * expected_grad**2
+            model.finish_grad_sync()
+            squared = torch.tensor(expected_square_sum, device='cuda', dtype=torch.float64)
+            torch.distributed.all_reduce(squared)
+            expected_norm = squared.sqrt().item()
+            for ref in reference:
+                ref.grad.mul_(1.0 / (expected_norm + 1e-6))
+            reference_optimizer.step()
+
+            success, norm, zeros = optimizer.step()
+            assert success and zeros == 0
+            assert float(norm) == pytest.approx(expected_norm, rel=1e-5)
+            for param, ref in zip(params, reference):
+                torch.testing.assert_close(param, ref.to(torch.bfloat16), rtol=0, atol=0)
+
+        # The reference broadcast path must also sync experts when dense DP is one.
+        with torch.no_grad():
+            for param in params:
+                if id(param) not in owned:
+                    param.fill_(-1)
+        optimizer.broadcast_params()
+        for param, ref in zip(params, reference):
+            torch.testing.assert_close(param, ref.to(torch.bfloat16), rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class MuonExcludedMatrixModel(nn.Module):
