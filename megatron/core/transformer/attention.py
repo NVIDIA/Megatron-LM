@@ -45,7 +45,6 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
-    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -1771,10 +1770,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                    # Clear the outputs for padding tokens when using quantization scales
-                    # to avoid corrupting amax calculations
-                    if is_using_quantization_scales(self.config):
-                        inference_context.zero_padding_tokens(core_attn_out)
+                    # Varlen attention can leave token-only padding unwritten. Clear it
+                    # before projection and MoE routing, as well as amax calculations.
+                    inference_context.zero_padding_tokens(core_attn_out)
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
