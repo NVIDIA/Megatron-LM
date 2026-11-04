@@ -39,7 +39,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import ProfilingConfig
+from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
 from megatron.training.global_vars import set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -954,10 +954,10 @@ def test_load_checkpoint_override_opt_param_scheduler(
     args.use_distributed_optimizer = False
     args.use_dist_ckpt = ckpt_format != "torch"
     run_config.scheduler.override_opt_param_scheduler = True
-    args.lr = 1.0
-    args.min_lr = 0.1
-    args.decoupled_lr = 0.5
-    args.decoupled_min_lr = 0.05
+    run_config.optimizer.lr = 1.0
+    run_config.optimizer.min_lr = 0.1
+    run_config.optimizer.decoupled_lr = 0.5
+    run_config.optimizer.decoupled_min_lr = 0.05
     train_state = TrainState(consumed_train_samples=42)
 
     with (
@@ -1015,10 +1015,10 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
-        assert new_optimizer.param_groups[0]["max_lr"] == args.lr
-        assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
-        assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
-        assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
+        assert new_optimizer.param_groups[0]["max_lr"] == run_config.optimizer.lr
+        assert new_optimizer.param_groups[0]["min_lr"] == run_config.optimizer.min_lr
+        assert new_optimizer.param_groups[1]["max_lr"] == run_config.optimizer.decoupled_lr
+        assert new_optimizer.param_groups[1]["min_lr"] == run_config.optimizer.decoupled_min_lr
         assert new_opt_param_scheduler.num_steps == train_state.consumed_train_samples == 42
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
@@ -1305,15 +1305,17 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
 
 def _make_metadata_args(
+    run_config,
     use_distributed_optimizer=False,
     use_layer_wise_distributed_optimizer=False,
     ckpt_format='torch_dist',
     dist_ckpt_optim_fully_reshardable=False,
     distrib_optim_fully_reshardable_mem_efficient=False,
 ):
+    # The metadata builder reads the optimizer flags from the run config, the rest from args.
+    run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
+    run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
     args = SimpleNamespace()
-    args.use_distributed_optimizer = use_distributed_optimizer
-    args.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
     args.ckpt_format = ckpt_format
     args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
     args.distrib_optim_fully_reshardable_mem_efficient = (
@@ -1333,40 +1335,60 @@ class TestBuildShardedStateDictMetadata:
 
     DUMMY_GROUP = object()
 
-    def test_distributed_optimizer_sets_dp_reshardable_default(self):
-        args = _make_metadata_args(use_distributed_optimizer=True)
+    @pytest.mark.parametrize('ckpt_format', ['torch_dist', 'fsdp_dtensor'])
+    def test_inference_container_keeps_shared_metadata(self, monkeypatch, run_config, ckpt_format):
+        cfg = InferenceConfigContainer(
+            model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
+        )
+        monkeypatch.setattr('megatron.training.checkpointing.get_run_config', lambda: cfg)
+        args = SimpleNamespace(ckpt_format=ckpt_format)
+
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+
+        assert metadata == {
+            'singleton_local_shards': False,
+            'chained_optim_avoid_prefix': True,
+            'dp_cp_group': self.DUMMY_GROUP,
+        }
+
+    def test_distributed_optimizer_sets_dp_reshardable_default(self, run_config):
+        args = _make_metadata_args(run_config, use_distributed_optimizer=True)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
-    def test_distributed_optimizer_fully_reshardable_flag(self):
+    def test_distributed_optimizer_fully_reshardable_flag(self, run_config):
         args = _make_metadata_args(
-            use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            run_config, use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
-    def test_distributed_optimizer_fsdp_dtensor(self):
-        args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
+    def test_distributed_optimizer_fsdp_dtensor(self, run_config):
+        args = _make_metadata_args(
+            run_config, use_distributed_optimizer=True, ckpt_format='fsdp_dtensor'
+        )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
-    def test_layer_wise_only_still_sets_sharding_type(self):
+    def test_layer_wise_only_still_sets_sharding_type(self, run_config):
         # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
-        args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
+        args = _make_metadata_args(run_config, use_layer_wise_distributed_optimizer=True)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
-    def test_layer_wise_with_fully_reshardable(self):
+    def test_layer_wise_with_fully_reshardable(self, run_config):
         args = _make_metadata_args(
-            use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            run_config,
+            use_layer_wise_distributed_optimizer=True,
+            dist_ckpt_optim_fully_reshardable=True,
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
-    def test_no_distributed_optimizer_no_sharding_type(self):
-        args = _make_metadata_args()
+    def test_no_distributed_optimizer_no_sharding_type(self, run_config):
+        args = _make_metadata_args(run_config)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata

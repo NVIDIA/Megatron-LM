@@ -48,7 +48,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
     steps:
-      # All selection runs here. GPU jobs only execute the resulting plan.
+      # CPU planning skips empty buckets; GPU jobs select individual tests.
       - name: Checkout
         id: checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -162,7 +162,6 @@ jobs:
           container-image: ${{ inputs.container-image }}
           platform: ${{ inputs.platform }}
           sha: ${{ inputs.sha }}
-          unit_testmon_mode: ${{ matrix.mode || 'full' }}
+          unit_testmon_mode: ${{ inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
-          unit_testmon_plan_artifact: ${{ matrix.plan_artifact }}
           unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
