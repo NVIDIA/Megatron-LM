@@ -268,6 +268,26 @@ def _ldg_f32x8(address, dst):
 
 
 @cute.jit
+def _wait_flag(address, target):
+    """Spin until the int32 at ``address`` (gpu-scope acquire) reaches ``target``,
+    then order the following bulk (async-proxy) loads after it."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(address).ir_value(), cutlass.Int32(target).ir_value()],
+        "{ .reg .pred p; .reg .b32 v;\n"
+        "WAIT_${:uid}: ld.acquire.gpu.global.b32 v, [$0];\n"
+        "setp.lt.s32 p, v, $1;\n"
+        "@p nanosleep.u32 32;\n"
+        "@p bra.uni WAIT_${:uid};\n"
+        "fence.proxy.async.global; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def _ld_f32(address):
     """One FP32 from global memory, coherent (written by another CTA in this kernel)."""
     bits = llvm.inline_asm(
@@ -428,6 +448,7 @@ class FusedKdaBwdKernel:
         heads: int,
         split: int = 1,
         tape: bool = False,
+        signal: bool = False,
         debug: bool = False,
         trace: bool = False,
     ):
@@ -439,8 +460,11 @@ class FusedKdaBwdKernel:
         self.split = split
         # tape: dS per chunk and dv_new come from a separate recurrence, so the
         # chunks are independent and a runtime number of CTAs (``ways``) shares
-        # each (sequence, head); ``split`` is then unused.
+        # each (sequence, head); ``split`` is then unused.  With ``signal`` the
+        # kernel is launched as a programmatic dependent of the recurrence and
+        # waits for each chunk's ready flag before loading its tape rows.
         self.tape = tape
+        self.signal = signal
         self.debug = debug
         self.trace = trace
         self.io_dtype = cutlass.BFloat16
@@ -500,6 +524,7 @@ class FusedKdaBwdKernel:
         dbeta: cute.Tensor,
         dh0: cute.Tensor,
         xfer: cute.Tensor,
+        flags: cute.Tensor,
         debug_out: cute.Tensor,
         trace_out: cute.Tensor,
         scale: cutlass.Float32,
@@ -565,6 +590,7 @@ class FusedKdaBwdKernel:
             dbeta,
             dh0,
             xfer,
+            flags,
             debug_out,
             trace_out,
             scale,
@@ -601,6 +627,7 @@ class FusedKdaBwdKernel:
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.signal,
         )
 
     # ---------------------------------------------------------------- device
@@ -624,6 +651,7 @@ class FusedKdaBwdKernel:
         dbeta,
         dh0,
         xfer,
+        flags,
         debug_out,
         trace_out,
         scale,
@@ -674,6 +702,7 @@ class FusedKdaBwdKernel:
         self._tma_dh = tma_dh
         self._tma_dvn = tma_dvn
         self._xfer = xfer
+        self._flags = flags
         self._pair = block // self._ways
         self._cpart = part
         s_beta = storage.beta.get_tensor(cute.make_layout((_BT,)))
@@ -972,6 +1001,14 @@ class FusedKdaBwdKernel:
             self._tma(info, tile, mma_token, (_BT, _DK), row, group, bar)
         self._tma(tma_aqk, s_aqk, mma_square, (_BT, _BT), row, group, bar)
         if cutlass.const_expr(self.tape):
+            if cutlass.const_expr(self.signal):
+                # Both producer warpgroups of the recurrence have written this chunk.
+                flags = self._flags
+                _wait_flag(
+                    cutlass.Int64(flags.iterator.toint())
+                    + cutlass.Int64(gchunk * self.heads + group[1]) * 4,
+                    2,
+                )
             # dS of this chunk (the state-tape row) and dv_new: both buffers are
             # read by the previous chunk's intra MMAs, so they wait for FREE too.
             self._tma(

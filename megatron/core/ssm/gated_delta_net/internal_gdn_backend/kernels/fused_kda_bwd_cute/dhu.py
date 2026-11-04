@@ -25,6 +25,12 @@ and dv^T are issued while the state warps update dS.
 
 Ragged tails: rows of the first (partial) chunk past the sequence end are
 zeroed in dv2 and in the dO tile, so they contribute nothing.
+
+With ``signal``, the kernel lets the gradient kernel that follows it in the
+stream launch at once (programmatic dependent launch) and, once a chunk's tape
+row and dv2 rows are written, adds one per producer warpgroup to that chunk's
+int32 ready flag (two in total), so the gradients of early chunks run while
+the recurrence continues.
 """
 
 import cuda.bindings.driver as cuda
@@ -157,11 +163,40 @@ def _stg_f32(address, value):
     )
 
 
+@cute.jit
+def _signal(address):
+    """Add one to a chunk's ready flag with gpu-scope release semantics, after
+    this thread's completed bulk (async-proxy) and generic stores."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(address).ir_value()],
+        "{ fence.proxy.async.global; red.release.gpu.global.add.s32 [$0], 1; }",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _fence_gpu():
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acq_rel.gpu;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 class KdaDhuKernel:
     """dS tape for the KDA backward: one CTA per (sequence, head)."""
 
-    def __init__(self, *, heads: int, trace: bool = False):
+    def __init__(self, *, heads: int, signal: bool = False, trace: bool = False):
         self.heads = heads
+        self.signal = signal
         self.trace = trace
         self.io_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -210,6 +245,7 @@ class KdaDhuKernel:
         dh: cute.Tensor,
         dv2: cute.Tensor,
         dh0: cute.Tensor,
+        flags: cute.Tensor,
         trace_out: cute.Tensor,
         scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -256,6 +292,7 @@ class KdaDhuKernel:
             dh,
             dv2,
             dh0,
+            flags,
             trace_out,
             scale,
             tma[0],
@@ -291,6 +328,7 @@ class KdaDhuKernel:
         dh,
         dv2,
         dh0,
+        flags,
         trace_out,
         scale,
         tma_kg,
@@ -310,6 +348,9 @@ class KdaDhuKernel:
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         block, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.signal):
+            # The gradient kernel may start now; it waits on the chunk flags.
+            cute.arch.griddepcontrol_launch_dependents()
         self._plan = build_kda_layout_plan(self.io_dtype, self.acc_dtype)
         sequence = block // self.heads
         head = block % self.heads
@@ -339,6 +380,12 @@ class KdaDhuKernel:
         s_s = storage.sS.data_ptr()
         s_dv2 = storage.sDv2.data_ptr()
         s_out = storage.sOut.data_ptr()
+        # This (sequence, head)'s ready flag of chunk c is at flag_base + c * flag_stride.
+        flag_base = (
+            cutlass.Int64(flags.iterator.toint())
+            + cutlass.Int64(chunk_base * self.heads + head) * 4
+        )
+        flag_stride = self.heads * 4
 
         if warp < 4:
             cute.arch.setmaxregister_increase(_STATE_REGISTERS)
@@ -360,6 +407,8 @@ class KdaDhuKernel:
                 dh0,
                 scale,
                 tma_tape,
+                flag_base,
+                flag_stride,
             )
         elif warp < 8:
             cute.arch.setmaxregister_decrease(_VALUE_REGISTERS)
@@ -377,6 +426,8 @@ class KdaDhuKernel:
                 dv2,
                 scale,
                 tma_dv2,
+                flag_base,
+                flag_stride,
             )
         else:
             cute.arch.setmaxregister_decrease(_OTHER_REGISTERS)
@@ -627,6 +678,8 @@ class KdaDhuKernel:
         dh0,
         scale,
         tma_tape,
+        flag_base,
+        flag_stride,
     ):
         """Warps 0-3: thread = key channel; dS row in registers."""
         heads = self.heads
@@ -655,7 +708,13 @@ class KdaDhuKernel:
                 self._publish(ds, out8, base_s, tidx, 0, _DV)
             else:
                 # The previous tape row must be out of sS before it is overwritten.
+                # With a signal, the row before it (long written by now) raises its
+                # flag, so the chain never waits for a store to land.
                 if tidx == 0:
+                    if cutlass.const_expr(self.signal):
+                        if j >= 2:
+                            cute.arch.cp_async_bulk_wait_group(1)
+                            _signal(flag_base + (chunk + 2) * flag_stride)
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.barrier(barrier_id=_BAR_STATE, number_of_threads=128)
                 self._update(
@@ -690,6 +749,11 @@ class KdaDhuKernel:
             )
         if tidx == 0:
             cute.arch.cp_async_bulk_wait_group(0)
+            if cutlass.const_expr(self.signal):
+                if num_chunks >= 2:
+                    _signal(flag_base + flag_stride)
+                if num_chunks >= 1:
+                    _signal(flag_base)
         if num_chunks > 0:
             self._update(
                 warp,
@@ -772,6 +836,8 @@ class KdaDhuKernel:
         dv2,
         scale,
         tma_dv2,
+        flag_base,
+        flag_stride,
     ):
         """Warps 4-7: thread = value channel; the dv2 rows of one chunk."""
         heads = self.heads
@@ -785,6 +851,7 @@ class KdaDhuKernel:
         # Column vtidx of the dv2 output tile: element (row, vtidx) is at
         # bases[row % 8] + row * 128.
         bases = _column_bases(cutlass.Int32(s_out.toint()), vtidx)
+        valid0 = seq_len - (num_chunks - 1) * _BT
         for j in cutlass.range(num_chunks):
             chunk = num_chunks - 1 - j
             tok0 = seq_start + chunk * _BT
@@ -814,6 +881,13 @@ class KdaDhuKernel:
             cute.arch.barrier(barrier_id=_BAR_VALUE, number_of_threads=128)
             if vtidx == 0:
                 cute.arch.mbarrier_arrive(bars + _B_DV2_READY)
+            if cutlass.const_expr(self.signal):
+                # The previous chunk's bulk store has landed long ago: raise its
+                # flag (a partial chunk, always the first, raised its own).
+                if vtidx == 0 and j > 0:
+                    if j >= 2 or valid0 == _BT:
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        _signal(flag_base + (chunk + 1) * flag_stride)
             # dv2 rows out: one bulk store for a full chunk; a partial chunk
             # must not touch the next sequence's rows.  The tile is rewritten
             # only after the barrier below.
@@ -832,4 +906,14 @@ class KdaDhuKernel:
                             _swz_token(tile_base, row, col),
                             out_base + cutlass.Int64(tok0 + row) * token_stride + col * 2,
                         )
+                if cutlass.const_expr(self.signal):
+                    _fence_gpu()
             cute.arch.barrier(barrier_id=_BAR_VALUE, number_of_threads=128)
+            if cutlass.const_expr(self.signal):
+                if vtidx == 0 and valid < _BT:
+                    _signal(flag_base + chunk * flag_stride)
+        if cutlass.const_expr(self.signal):
+            # The last (first in the sequence) chunk, if full, after its store landed.
+            if vtidx == 0 and num_chunks > 0 and seq_len >= _BT:
+                cute.arch.cp_async_bulk_wait_group(0)
+                _signal(flag_base)

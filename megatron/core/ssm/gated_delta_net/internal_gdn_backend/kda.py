@@ -238,10 +238,11 @@ def _call_fused_kda_bwd(
     """Run the fused KDA backward on FLA's residuals; returns ``dq, dk, dv, dg, dbeta``.
 
     ``g`` is FLA's chunk-local log2 gate cumsum and ``h`` the chunk-start states.
-    With few (sequence, head) pairs the dS recurrence runs first (``kda_dhu``)
-    and writes every chunk's dS and dv_new, and the gradient kernel then
-    processes all chunks in parallel; otherwise one fused kernel runs the
-    recurrence and the gradients per (sequence, head). The returned ``dg``
+    Up to a few (sequence, head) pairs per SM, the dS recurrence (``kda_dhu``)
+    writes every chunk's dS and dv_new, and the gradient kernel, launched while
+    it runs, processes the chunks in parallel as they become ready; with more
+    pairs, one fused kernel runs the recurrence and the gradients per
+    (sequence, head). The returned ``dg``
     already includes FLA's chunk-local reverse cumsum.
     """
     global _fused_kda_bwd_launches
@@ -277,8 +278,11 @@ def _call_fused_kda_bwd(
     h = h.detach().reshape(1, -1, heads, dim, dim).to(torch.bfloat16).contiguous()
     dht = dht.detach().reshape(num_sequences, heads, dim, dim).to(torch.float32).contiguous()
     chunk_offsets = chunk_offsets_for(cu_seqlens)
-    tape = None
+    tape = flags = None
     if prefer_tape(num_sequences, heads, q.device):
+        # The gradient kernel starts on each chunk as soon as the recurrence
+        # has written it (chunk ready flags; nothing is enqueued in between).
+        flags = torch.zeros(h.shape[1] * heads, dtype=torch.int32, device=q.device)
         dh, _dh0, dv_new = kda_dhu(
             q,
             k,
@@ -292,6 +296,7 @@ def _call_fused_kda_bwd(
             scale,
             chunk_offsets=chunk_offsets,
             num_chunks=h.shape[1],
+            flags=flags,
         )
         tape = (dh, dv_new)
     dq, dk, dv, dg, db, _ = fused_kda_bwd(
@@ -309,6 +314,7 @@ def _call_fused_kda_bwd(
         scale,
         chunk_offsets=chunk_offsets,
         tape=tape,
+        flags=flags,
     )
     _fused_kda_bwd_launches += 1
     shape = (batch, seq_len, heads, dim)
