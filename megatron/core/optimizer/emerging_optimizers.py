@@ -37,8 +37,9 @@ try:
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
 
     # It is necessary to import optimizers for the registry to work.
-    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
+    # isort: split
     from emerging_optimizers.legacy_soap import SOAP  # pylint: disable=unused-import
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
