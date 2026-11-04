@@ -271,6 +271,8 @@ class MultiLatentAttention(Attention):
         is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
+        if config.context_parallel_size > 1 and config.attention_cp_layout == "contiguous":
+            raise ValueError("MultiLatentAttention does not support contiguous attention CP.")
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
         # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
         super().__init__(
