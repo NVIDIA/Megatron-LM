@@ -2086,6 +2086,102 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestAsyncScheduleOverlapPrepareHostSync(_DynamicInferenceEngineTestBase):
+    """The overlap prepare runs while the previous forward is in flight, so it must never
+    wait on the GPU, including when a decode row acquires a new KV block."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        _reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @classmethod
+    def _run_with_strict_prepare(cls, prompt_length, num_tokens_to_generate):
+        """Generate for two requests, raising on any host sync inside `prepare_requests`.
+
+        Only the overlap step calls `prepare_requests`. Returns the number of KV blocks each
+        call acquired.
+        """
+        env = cls._build_test_env(
+            _DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=num_tokens_to_generate,
+                context_block_size_tokens=256,
+                context_max_requests=4,
+                sampling_backend="torch",
+            )
+        )
+        context = env.engine.context
+        allocator = context.kv_block_allocator
+        allocate_memory_blocks = allocator.allocate_memory_blocks
+        prepare_requests = context.prepare_requests
+        blocks_per_prepare = []
+
+        def counting_allocate(num_blocks):
+            blocks_per_prepare[-1] += num_blocks
+            return allocate_memory_blocks(num_blocks)
+
+        def strict_prepare():
+            blocks_per_prepare.append(0)
+            previous_mode = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            allocator.allocate_memory_blocks = counting_allocate
+            try:
+                prepare_requests()
+            finally:
+                allocator.allocate_memory_blocks = allocate_memory_blocks
+                torch.cuda.set_sync_debug_mode(previous_mode)
+
+        context.prepare_requests = strict_prepare
+        for request_id in range(2):
+            prompt = (torch.arange(prompt_length, device="cuda") + request_id) % 90 + 1
+            env.engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=num_tokens_to_generate, termination_id=-1
+                    ),
+                )
+            )
+        for _ in range(4 * num_tokens_to_generate):
+            if not env.engine.has_unfinished_requests():
+                break
+            env.engine.step_modern()
+        assert not env.engine.has_unfinished_requests()
+        assert blocks_per_prepare, "no async overlap step ran"
+        return blocks_per_prepare
+
+    @torch.inference_mode()
+    def test_overlap_prepare_without_new_block_does_not_sync(self):
+        # Positions 2..9 stay in block 0.
+        blocks_per_prepare = self._run_with_strict_prepare(
+            prompt_length=2, num_tokens_to_generate=8
+        )
+        assert sum(blocks_per_prepare) == 0
+
+    @torch.inference_mode()
+    def test_overlap_prepare_with_new_block_does_not_sync(self):
+        # Position 256, the 7th decoded token, starts block 1.
+        blocks_per_prepare = self._run_with_strict_prepare(
+            prompt_length=250, num_tokens_to_generate=12
+        )
+        assert any(blocks > 0 for blocks in blocks_per_prepare)
+
+
 def _controller_with_pending_logits():
     controller = TextGenerationController.__new__(TextGenerationController)
     controller._async_sched_forward = AsyncScheduleForwardState()

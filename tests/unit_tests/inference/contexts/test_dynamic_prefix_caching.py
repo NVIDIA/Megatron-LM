@@ -543,6 +543,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[s1].item() == 0
         assert alloc.block_ref_counts[sx].item() == 0
         untouched_block_id = next(iter(set(range(alloc.pool_size - 1)) - {s0, s1, sx}))
+        # Publish, as ahead of the forward that wrote these pages, then stand in for its writes.
+        ctx.transfer_bookkeeping_to_gpu()
         ctx.memory_buffer[1, :, s0] = 1
         ctx.memory_buffer[1, :, s1] = 2
         ctx.memory_buffer[1, :, sx] = float("nan")
@@ -572,6 +574,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_hashes[s0].item() == h0
         assert alloc.block_hashes[s1].item() == h1
         assert alloc.block_hashes[sx].item() == h2
+        # The publish ahead of the next forward zeroes only the newly acquired page.
+        ctx.transfer_bookkeeping_to_gpu()
         assert torch.all(ctx.memory_buffer[1, :, s0] == 1)
         assert torch.all(ctx.memory_buffer[1, :, s1] == 2)
         assert torch.count_nonzero(ctx.memory_buffer[1, :, sx]) == 0
@@ -685,6 +689,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         untouched_block_id = next(
             iter(set(range(alloc.pool_size - 1)) - {original_block_id, cached_block_id})
         )
+        # Publish, as ahead of the forward that wrote these pages, then stand in for its writes.
+        ctx.transfer_bookkeeping_to_gpu()
         ctx.memory_buffer[1, :, original_block_id] = 2
         ctx.memory_buffer[1, :, cached_block_id] = float("nan")
         ctx.memory_buffer[1, :, untouched_block_id] = 4
@@ -704,6 +710,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert new_block_id != original_block_id
         assert cached_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[new_block_id].item() == -1
+        # The publish ahead of the next forward zeroes only the newly acquired page.
+        ctx.transfer_bookkeeping_to_gpu()
         assert torch.all(ctx.memory_buffer[1, :, original_block_id] == 2)
         assert torch.count_nonzero(ctx.memory_buffer[1, :, new_block_id]) == 0
         assert torch.all(ctx.memory_buffer[1, :, untouched_block_id] == 4)

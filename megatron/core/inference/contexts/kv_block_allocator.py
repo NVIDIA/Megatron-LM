@@ -100,6 +100,11 @@ class KVBlockAllocator:
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
         self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
 
+        # Times each block has returned to the free pool. Work deferred on behalf of a block's
+        # owner (e.g. the context's queued page zeroing) records the generation and is dropped
+        # once it changes, so it can never act on the block's next owner.
+        self.block_generation = torch.zeros((self.pool_size,), dtype=torch.int64, device='cpu')
+
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
             self.block_hashes = torch.full((self.pool_size,), -1, dtype=torch.int64, device='cpu')
@@ -298,14 +303,20 @@ class KVBlockAllocator:
                 # leaked.
                 unreg_mask = (remaining_ref_counts == 0) & (self.block_hashes[unique_blocks] == -1)
                 if unreg_mask.any():
-                    unreg_blocks = unique_blocks[unreg_mask]
-                    num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.pool_avail : self.pool_avail + num_unreg] = unreg_blocks
-                    self.pool_avail += num_unreg
+                    self._return_to_free_pool(unique_blocks[unreg_mask])
         else:
-            num_blocks = blocks.numel()
-            self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
-            self.pool_avail += num_blocks
+            self._return_to_free_pool(blocks)
+
+    def _return_to_free_pool(self, block_ids: Tensor) -> None:
+        """Push unowned blocks onto the free pool and end their owners' generation.
+
+        Args:
+            block_ids (Tensor): Distinct block IDs that no request references.
+        """
+        num_blocks = block_ids.numel()
+        self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
+        self.pool_avail += num_blocks
+        self.block_generation[block_ids] += 1
 
     def retain_memory_blocks(self, block_ids: list[int]) -> None:
         """Add one prefix-cache reference to each block.
@@ -342,6 +353,7 @@ class KVBlockAllocator:
         torch.arange(self.pool_size, out=self.block_bag)
 
         self.pool_avail = self.pool_size - 1
+        self.block_generation += 1
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -523,9 +535,7 @@ class KVBlockAllocator:
         for bid in block_ids_list:
             self.block_prompt_logprobs.pop(bid, None)
 
-        # Return blocks to free pool
-        self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
-        self.pool_avail += num_blocks
+        self._return_to_free_pool(block_ids)
 
         # Notify dependent allocators and external observers only after KV allocator
         # bookkeeping commits, so callback failures cannot leave this allocator partial.

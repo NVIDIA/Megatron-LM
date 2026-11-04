@@ -983,7 +983,8 @@ class InferenceStateHandoffMixin:
         allocated_blocks = [int(block) for block in allocated_blocks_tensor.tolist()]
         imported_blocks = allocated_blocks[:num_blocks_to_import]
         continuation_blocks = allocated_blocks[num_blocks_to_import:]
-        self.context._initialize_mha_value_pages(continuation_blocks)
+        # The transfer writes the imported blocks; only the decode continuation needs zeroing.
+        self.context._queue_kv_page_zeroing(continuation_blocks)
         local_blocks = cached_blocks + imported_blocks
         owned_blocks_tensor = torch.tensor(
             local_blocks + continuation_blocks, dtype=torch.int32, device="cpu"

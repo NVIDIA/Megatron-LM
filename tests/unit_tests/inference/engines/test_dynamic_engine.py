@@ -6750,6 +6750,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.memory_buffer[1, :, next_block_id] = float("nan")
             context.add_request(env.requests[0])
             assert context.request_last_kv_block_id[0].item() == next_block_id
+            # The publish ahead of the first forward zeroes the newly acquired page.
+            context.transfer_bookkeeping_to_gpu()
             assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
 
     @pytest.mark.skipif(

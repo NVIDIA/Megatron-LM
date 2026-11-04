@@ -26,7 +26,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
@@ -49,6 +49,17 @@ def rounder_override(n):
     finally:
         DynamicInferenceContext.TOKEN_ROUNDER = original_token_rounder
         DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
+
+
+@contextlib.contextmanager
+def _no_host_sync():
+    """Raise on any CUDA call that synchronizes the host with the device."""
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
 
 
 @pytest.mark.parametrize(
@@ -1444,9 +1455,13 @@ class TestDynamicContext:
             last_block_offsets=last_offsets,
         )
         original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
+        ctx._zero_pending_kv_pages()  # the previous step's publish (the reset queued the dummy)
         ctx.memory_buffer[1].fill_(5)
 
-        ctx.prepare_requests()
+        # Prepare overlaps the previous forward, so it must not wait on the GPU, even when a
+        # row acquires a new KV block.
+        with _no_host_sync():
+            ctx.prepare_requests()
 
         assert ctx.active_token_count == active_request_count
         assert torch.equal(
@@ -1465,9 +1480,109 @@ class TestDynamicContext:
         if last_offsets and last_offsets[0] == ctx.block_size_tokens - 1:
             assert ctx.request_kv_block_counts[0] == 2
             assert ctx.token_to_block_idx[0] == ctx.request_last_kv_block_id[0]
+            # The async publish ahead of the forward zeroes the new page, without waiting either.
+            with _no_host_sync():
+                done_event = ctx.transfer_bookkeeping_to_gpu(
+                    skip_token_input_ids=True, record_done_event=True
+                )
+            done_event.synchronize()
             new_value_page = ctx.memory_buffer[1, :, ctx.request_last_kv_block_id[0].item()]
             assert torch.count_nonzero(new_value_page) == 0
             assert torch.count_nonzero(ctx.memory_buffer[1] != 5) == new_value_page.numel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("cache_mla_latents", [False, True], ids=["mha", "mla_latents"])
+    def test_new_kv_pages_are_zeroed_for_every_layout(self, cache_mla_latents):
+        """Pages handed to a request are zero before the forward that first writes them.
+
+        Paged attention multiplies the masked (zero) probabilities of a request's last page
+        by that page's unwritten rows, so a stale NaN there reaches the output. MLA latent
+        pages hold the values too and need the same initialization as MHA value pages. The
+        dummy block, which padding rows point at, is never acquired and is zeroed after the
+        pool is reset.
+        """
+        model_config_kwargs = dict(params_dtype=torch.float32, num_layers=2)
+        if cache_mla_latents:
+            model_config = MLATransformerConfig(
+                hidden_size=64,
+                num_attention_heads=2,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=16,
+                qk_pos_emb_head_dim=16,
+                v_head_dim=16,
+                cache_mla_latents=True,
+                **model_config_kwargs,
+            )
+        else:
+            model_config = TransformerConfig(
+                kv_channels=8, num_attention_heads=2, **model_config_kwargs
+            )
+        ctx = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                buffer_size_gb=0.01,
+                block_size_tokens=64,  # the latent cache requires 64
+                max_tokens=256,
+                max_requests=8,
+                unified_memory_level=0,
+            ),
+        )
+        assert ctx.cache_mla_latent == cache_mla_latents
+        # Pages written by the forward: MHA values, or whole MLA latents.
+        pages = ctx.memory_buffer if cache_mla_latents else ctx.memory_buffer[1]
+        pages.fill_(float("nan"))
+
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(70, device="cpu"),  # one full page and a partial one
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+        ctx.initialize_attention_state()
+
+        block_ids = ctx.request_to_kv_block_ids[0, : ctx.request_kv_block_counts[0]].long()
+        assert block_ids.numel() == 2
+        new_pages = pages[:, block_ids.to(pages.device)]
+        assert torch.count_nonzero(new_pages) == 0
+        dummy_page = pages[:, ctx.kv_block_allocator.dummy_block_idx]
+        assert torch.count_nonzero(dummy_page) == 0
+        # Only these pages are initialized; the rest of the pool is untouched.
+        assert torch.count_nonzero(~torch.isnan(pages)) == new_pages.numel() + dummy_page.numel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_kv_page_zeroing_is_dropped_when_its_block_is_released(self):
+        """Zeroing queued for a block is dropped if the block returns to the free pool first.
+
+        The block's next owner may write it outside a forward (a disaggregated KV import),
+        so the publish must not zero it on the previous owner's behalf. Releasing and
+        acquiring a block more times than the pool holds blocks still fits the staging
+        buffers.
+        """
+        ctx = self._get_async_sched_context()
+        allocator = ctx.kv_block_allocator
+        ctx._zero_pending_kv_pages()  # the previous step's publish (the reset queued the dummy)
+        ctx.memory_buffer[1].fill_(float("nan"))
+        for _ in range(allocator.pool_size):
+            block_ids = allocator.allocate_memory_blocks(1)
+            ctx._queue_kv_page_zeroing(block_ids)
+            allocator.release_memory_blocks(block_ids)
+        # The block's last owner imports its KV; another request's new page is queued.
+        imported = allocator.allocate_memory_blocks(1).item()
+        ctx.memory_buffer[1, :, imported] = 3.0
+        written = allocator.allocate_memory_blocks(1).item()
+        ctx._queue_kv_page_zeroing([written])
+
+        ctx.transfer_bookkeeping_to_gpu()
+
+        assert torch.all(ctx.memory_buffer[1, :, imported] == 3.0)
+        assert torch.count_nonzero(ctx.memory_buffer[1, :, written]) == 0
+        page_numel = ctx.memory_buffer[1, :, written].numel()
+        assert torch.count_nonzero(~torch.isnan(ctx.memory_buffer[1])) == 2 * page_numel
 
     @pytest.mark.internal
     @rounder_override(8)

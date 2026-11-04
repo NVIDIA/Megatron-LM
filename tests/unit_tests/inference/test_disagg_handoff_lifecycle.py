@@ -92,6 +92,7 @@ class _KvAllocator:
         self.releases = []
         self.registered_parent_hashes = []
         self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
+        self.block_generation = torch.zeros(256, dtype=torch.int64)
         self.kv_hash_to_block_id = {}
 
     def is_memory_available(self, _count, potential_matched_count=0):
@@ -175,10 +176,16 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
             memory_buffer=torch.full((2, 1, 256, 4, 1, 1), 7.0),
             cache_mla_latent=False,
+            _pending_kv_pages=[],
+            _kv_page_ids_cpu=torch.empty(256, dtype=torch.int64),
+            _kv_page_ids_gpu=torch.empty(256, dtype=torch.int64),
         )
-        self.context._initialize_mha_value_pages = partial(
-            DynamicInferenceContext._initialize_mha_value_pages, self.context
-        )
+        for method in ("_queue_kv_page_zeroing", "_zero_pending_kv_pages"):
+            setattr(
+                self.context,
+                method,
+                partial(getattr(DynamicInferenceContext, method), self.context),
+            )
         self._kv_transfer_agent = _TransferAgent()
         if hybrid:
             self._ssm_transfer_agents = {"conv": _TransferAgent(), "recurrent": _TransferAgent()}
@@ -1620,6 +1627,8 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine._kv_transfer_agent.calls == [(kv_meta, [102], [12])]
     assert pending.local_blocks == [10, 11, 12]
     assert pending.cached_prefix_block_count == 2
+    # The continuation pages are zeroed by the publish ahead of the next forward.
+    engine.context._zero_pending_kv_pages()
     values = engine.context.memory_buffer[1, :, pending.continuation_blocks]
     assert pending.continuation_blocks == [13] and torch.count_nonzero(values) == 0
     assert torch.count_nonzero(engine.context.memory_buffer != 7) == values.numel()
@@ -1636,6 +1645,44 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     admit.assert_called_once_with(
         engine.context, engine.get_request(5), [10, 11, 12], [13], [99], ssm_state_idx=None
     )
+
+
+def test_released_continuation_block_keeps_a_later_imports_kv(handoff_loop):
+    """Zeroing queued for an aborted import's block must not reach the next owner's import.
+
+    Nothing publishes on an idle decode engine, so A's continuation block is still queued for
+    zeroing when A is aborted. The allocator hands it back to B as B's last imported block,
+    and the publish ahead of B's first decode must keep the KV the transfer wrote there.
+    """
+    engine = _HandoffHarness(handoff_loop)
+    allocator = KVBlockAllocator(
+        engine.context, pool_size=16, paused_limit=0, enable_prefix_caching=True
+    )
+    engine.context.kv_block_allocator = allocator
+    engine._notify_request_aborted = mock.Mock()
+    params = SamplingParams(num_tokens_to_generate=2)
+
+    # A's prompt fills its block, so its first decode token needs a continuation block.
+    engine.add_request_with_kv_handoff(7, [1, 2, 3, 4], params, {"resume_tokens": [99]}, [100])
+    (continuation_block,) = engine._pending_kv_imports[0].continuation_blocks
+    assert engine.abort_kv_handoff(7)
+    engine._handoff_completion_notifications[7] = (False, True)
+    engine._admit_pending_kv_imports()
+    assert not engine._pending_kv_imports and allocator.get_total_used() == 0
+
+    # B's partial last block holds its first decode token, so B only imports.
+    engine.add_request_with_kv_handoff(
+        8, [5, 6, 7, 8, 9, 10, 11], params, {"resume_tokens": [99]}, [200, 201]
+    )
+    pending = engine._pending_kv_imports[0]
+    assert pending.continuation_blocks == [] and pending.local_blocks[-1] == continuation_block
+    for block in pending.local_blocks:  # the transfer writes B's prompt KV
+        engine.context.memory_buffer[:, :, block] = 3.0
+
+    engine.context._zero_pending_kv_pages()
+
+    assert torch.all(engine.context.memory_buffer[:, :, pending.local_blocks] == 3.0)
+    _drain_loop(handoff_loop)
 
 
 def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
