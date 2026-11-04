@@ -124,9 +124,8 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
-    monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
-    # The inference model's default sizes come from the model's groups.
-    pg_collection = SimpleNamespace()
+    # The inference model's default sizes and the calculator come from the model's groups.
+    pg_collection = SimpleNamespace(dp_gtp_remat=SimpleNamespace(size=lambda: 4), dp=None)
     monkeypatch.setattr(
         training_setup,
         "get_attr_wrapped_model",
