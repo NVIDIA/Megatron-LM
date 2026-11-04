@@ -182,7 +182,7 @@ class TransformerConfig(ModelParallelConfig):
     flash_attention_version: Optional[Literal[2, 3, 4]] = None
     """Pin the FlashAttention generation (2, 3, or 4) used by both the training
     (TransformerEngine) and inference (mcore dynamic-batching) attention paths. When
-    None, each path selects a version automatically based on what is installed. Pinning
+    None, each path selects a version automatically from what is installed and the GPU. Pinning
     is required for batch-invariant mode: the training-side logprob recompute and the
     inference engine must run the same kernel, since different FlashAttention
     generations use different tile sizes and softmax accumulation orders and therefore

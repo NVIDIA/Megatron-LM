@@ -447,6 +447,38 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 inference_config.block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
+        # A pinned FlashAttention-2 must be able to read the paged KV cache of the layers that run
+        # it: a plain transformer's, or a hybrid's attention and MLA layers (DSA layers and other
+        # attention variants use their own kernels). Attention checks again where FA2 runs, which
+        # also covers automatic selection.
+        hybrid_layer_types = (
+            inference_config.mamba_inference_state_config.layer_type_list
+            if inference_config.mamba_inference_state_config is not None
+            else None
+        )
+        if hybrid_layer_types is not None:
+            runs_flash_attention = bool(
+                {Symbols.ATTENTION, Symbols.MLA}.intersection(hybrid_layer_types)
+            )
+        else:
+            runs_flash_attention = model_config.experimental_attention_variant is None
+        if model_config.flash_attention_version == 2 and runs_flash_attention:
+            from megatron.core.transformer.attention import check_flash_attn_2_paged_kv
+
+            if self.cache_mla_latent:
+                # Prefill attends over the up-projected latents.
+                qk_head_dim = model_config.qk_head_dim + model_config.qk_pos_emb_head_dim
+                v_head_dim = model_config.v_head_dim
+            else:
+                qk_head_dim = v_head_dim = model_config.kv_channels
+            check_flash_attn_2_paged_kv(
+                inference_config.block_size_tokens,
+                qk_head_dim,
+                v_head_dim,
+                self.cache_mla_latent,
+                torch.cuda.current_device() if torch.cuda.is_available() else None,
+            )
+
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads

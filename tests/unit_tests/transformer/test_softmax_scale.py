@@ -88,14 +88,19 @@ def _make_mla(softmax_scale=None, rotary_scaling_factor=40.0, mscale_all_dim=0.0
     return config, attention
 
 
+# Paged KV block size; FlashAttention-2 reads paged KV only in multiples of 256 tokens.
+_PAGE = 256
+
+
 def _prefill_inputs(num_heads, head_dim):
     """Inputs for flash_decode_and_prefill with two 1-token prefills."""
     device, dtype = 'cuda', torch.float16
     return dict(
         # q: [total_tokens, 1, num_heads, head_dim] — squeezed to [total, heads, head_dim]
         q=torch.randn(2, 1, num_heads, head_dim, device=device, dtype=dtype),
-        k=torch.randn(2, num_heads, head_dim, device=device, dtype=dtype),
-        v=torch.randn(2, num_heads, head_dim, device=device, dtype=dtype),
+        # k, v: [num_pages, page_size, num_heads, head_dim]
+        k=torch.randn(2, _PAGE, num_heads, head_dim, device=device, dtype=dtype),
+        v=torch.randn(2, _PAGE, num_heads, head_dim, device=device, dtype=dtype),
         cu_seqlens_q=torch.tensor([0, 1, 2], device=device, dtype=torch.int32),
         cu_seqlens_k=torch.tensor([0, 1, 2], device=device, dtype=torch.int32),
         seqlens_k=torch.tensor([1, 1], device=device, dtype=torch.int32),
@@ -111,8 +116,8 @@ def _decode_inputs(num_heads, head_dim, num_requests=2, cache_len=8):
     return dict(
         # q: [num_requests * tokens_per_request, 1, num_heads, head_dim]
         q=torch.randn(num_requests, 1, num_heads, head_dim, device=device, dtype=dtype),
-        k=torch.randn(num_requests, cache_len, num_heads, head_dim, device=device, dtype=dtype),
-        v=torch.randn(num_requests, cache_len, num_heads, head_dim, device=device, dtype=dtype),
+        k=torch.randn(num_requests, _PAGE, num_heads, head_dim, device=device, dtype=dtype),
+        v=torch.randn(num_requests, _PAGE, num_heads, head_dim, device=device, dtype=dtype),
         cu_seqlens_q=torch.tensor([0, 1, 2], device=device, dtype=torch.int32),
         cu_seqlens_k=torch.tensor([0, cache_len, 2 * cache_len], device=device, dtype=torch.int32),
         seqlens_k=torch.full((num_requests,), cache_len, device=device, dtype=torch.int32),
@@ -201,6 +206,7 @@ class TestPrefillKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_prefill_fa4_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 4  # Auto selection depends on the device.
         head_dim = attn.config.kv_channels
         num_heads = attn.config.num_attention_heads
         captured = {}
@@ -223,6 +229,7 @@ class TestPrefillKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_prefill_fa3_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 3  # Auto selection depends on the device.
         head_dim = attn.config.kv_channels
         num_heads = attn.config.num_attention_heads
         captured = {}
@@ -290,6 +297,7 @@ class TestDecodeKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_decode_fa3_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 3  # Auto selection depends on the device.
 
         def patches(fake_kernel):
             return (
@@ -302,6 +310,7 @@ class TestDecodeKernelsSoftmaxScale(_GpuTestFixtureBase):
 
     def test_decode_fa4_uses_config_softmax_scale(self):
         attn = _make_self_attention(softmax_scale=0.042)
+        attn.flash_attention_version = 4  # Auto selection depends on the device.
 
         def patches(fake_kernel):
             return (

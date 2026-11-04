@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
+import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -133,6 +136,72 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+# Kernel support by compute-capability major, read from flash-attn-4 4.0.0b36
+# (flash_attn/cute/interface.py): FA4 runs paged KV, which dynamic batching uses, on SM90/SM100/
+# SM110 but not SM80/SM120, and splits the KV sequence across CTAs only on SM100/SM110 (SM80/SM90
+# assert against it, SM120 forces one split). FA3 builds target SM90 only.
+_FA4_PAGED_KV_MAJORS = (9, 10, 11)
+_FA4_SPLIT_KV_MAJORS = (10, 11)
+
+
+@functools.lru_cache(maxsize=None)
+def _flash_attn_majors(device_index: Optional[int]) -> Tuple[int, int]:
+    """Compute-capability major of a device, and the major whose kernels FA4 runs on it.
+
+    FA4's ``FLASH_ATTENTION_ARCH`` override (e.g. ``sm_90``) selects its kernel path
+    independently of the device. Both are 0 without CUDA. Cached per device, so the attention
+    forward does not query the device.
+    """
+    if not torch.cuda.is_available():
+        return 0, 0
+    major = torch.cuda.get_device_capability(device_index)[0]
+    fa4_arch = re.fullmatch(
+        r"(?:sm_?)?(\d+)\d[af]?", os.environ.get("FLASH_ATTENTION_ARCH", ""), re.IGNORECASE
+    )
+    fa4_major = int(fa4_arch.group(1)) if fa4_arch else major
+    return major, fa4_major
+
+
+def check_flash_attn_2_paged_kv(
+    block_size: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    mla_latent_cache: bool,
+    device_index: Optional[int],
+) -> None:
+    """Raise ValueError if FlashAttention-2 cannot read a paged KV cache of this shape.
+
+    FA2 reads paged KV only in blocks of a multiple of 256 tokens, and only with value heads as
+    wide as query/key heads (flash-attn 2.8.3, csrc/flash_attn/flash_api.cpp); FA3 and FA4 have
+    neither limit. MLA's latent cache fixes its blocks at 64 tokens. The message names what runs
+    the cache on the device instead.
+    """
+    if block_size % 256 == 0 and qk_head_dim == v_head_dim:
+        return
+    major, fa4_major = _flash_attn_majors(device_index)
+    remedies = [
+        kernel
+        for kernel, runs in (
+            ("FlashAttention-3", major == 9),
+            ("FlashAttention-4", fa4_major in _FA4_PAGED_KV_MAJORS),
+        )
+        if runs or major == 0  # Without CUDA the device is unknown.
+    ]
+    if not mla_latent_cache and qk_head_dim == v_head_dim:
+        remedies.append("a block size that is a multiple of 256")
+    raise ValueError(
+        "FlashAttention-2 cannot read this dynamic-batching KV cache: it reads paged KV only in "
+        "blocks of a multiple of 256 tokens, with value heads as wide as query/key heads, but the "
+        f"blocks hold {block_size} tokens and the query/key and value heads are {qk_head_dim} and "
+        f"{v_head_dim} wide. "
+        + (
+            f"Use {' or '.join(remedies)}."
+            if remedies
+            else "No FlashAttention kernel reads it on this GPU."
+        )
+    )
 
 
 class LinearQkvInterface(Protocol):
@@ -320,6 +389,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
         self.flash_attention_version = config.flash_attention_version
+        if torch.cuda.is_available():
+            # Read the device for FlashAttention selection here, off the forward path.
+            _flash_attn_majors(torch.cuda.current_device())
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -1048,11 +1120,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         )
         return output_total, softmax_lse
 
-    def _resolve_flash_version(self) -> Tuple[bool, bool]:
-        """Resolve which FlashAttention generation this attention should run.
+    def _resolve_flash_version(self, device: torch.device) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run on ``device``.
 
-        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
-        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        Honors ``config.flash_attention_version`` when pinned. Otherwise picks the first
+        installed generation that runs paged KV on the device: FA3 (Hopper only, where FA4
+        cannot split the KV sequence), then FA4, then FA2. Returns ``(use_fa4, use_fa3)``;
         when both are False the FA2 kernel is used.
         """
         pinned = self.flash_attention_version
@@ -1068,8 +1141,19 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             return False, True
         if pinned == 2:
             return False, False
-        # Auto: prefer the newest available generation.
-        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+        major, fa4_major = _flash_attn_majors(device.index)
+        use_fa3 = HAVE_FA3 and major == 9
+        use_fa4 = not use_fa3 and HAVE_FA4 and fa4_major in _FA4_PAGED_KV_MAJORS
+        return use_fa4, use_fa3
+
+    def _fa4_num_splits(self, device: torch.device) -> int:
+        """``num_splits`` for FlashAttention-4: 0 lets its heuristic split the KV sequence.
+
+        Split-KV stays off (1) in batch-invariant mode, which needs a fixed reduction order,
+        and where FA4 cannot split KV.
+        """
+        split_kv = _flash_attn_majors(device.index)[1] in _FA4_SPLIT_KV_MAJORS
+        return 0 if split_kv and not self.batch_invariant_mode else 1
 
     def flash_decode_and_prefill(
         self,
@@ -1129,7 +1213,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # the sink (off-by-one / learnable) softmax correction post-hoc.
         need_lse = softmax_offset is not None
 
-        use_fa4, use_fa3 = self._resolve_flash_version()
+        use_fa4, use_fa3 = self._resolve_flash_version(q.device)
 
         # Flash attn kernel.
         if not is_decode_only:
@@ -1150,7 +1234,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=self._fa4_num_splits(q.device),
                     return_lse=need_lse,
                     **softcap_kwargs,
                 )
@@ -1179,6 +1263,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                # Pinned or automatically selected, FA2 must be able to read the cache.
+                check_flash_attn_2_paged_kv(
+                    k.shape[1],
+                    q.shape[-1],
+                    v.shape[-1],
+                    isinstance(self.config, MLATransformerConfig),
+                    q.device.index,
+                )
                 # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
                 # accordingly under GQA, which requires total_q == num_seqs.
                 assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
@@ -1298,7 +1390,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        num_splits=self._fa4_num_splits(q.device),
                         return_lse=need_lse,
                         **softcap_kwargs,
                     )
@@ -1335,6 +1427,13 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         assert (
                             not self.batch_invariant_mode
                         ), "Batch invariant mode is not supported for flash attention 2"
+                        check_flash_attn_2_paged_kv(
+                            k.shape[1],
+                            q.shape[-1],
+                            v.shape[-1],
+                            isinstance(self.config, MLATransformerConfig),
+                            q.device.index,
+                        )
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
                         # FA3 may append kernel metadata after (out, softmax_lse),
