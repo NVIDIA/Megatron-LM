@@ -27,7 +27,10 @@ from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
@@ -117,7 +120,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         vp_stage: Virtual pipeline stage of the model chunk.
         pg_collection: Process groups of the model. The batch is read on the first rank of
             its tensor-parallel group, broadcast over that group and sharded over its
-            context-parallel group. None builds the groups from the global parallel state.
+            context-parallel group. Omitting it is deprecated: the groups are built from the
+            global parallel state, with a ProcessGroupFallbackWarning.
     """
 
     args = get_args()
@@ -125,6 +129,9 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
 
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
+        warn_global_process_group_fallback(
+            "pretrain_hybrid.get_batch", deprecated_in="0.21", removed_in="0.23"
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
         )
@@ -403,15 +410,20 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, pg_collection=None
+):
     """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
     The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
     ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
-    predicate.
+    predicate on ``pg_collection``, the process groups of the run, which decide the ranks that
+    build the datasets (see is_dataset_built_on_rank).
     """
     return build_gpt_datasets(
-        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
+        train_val_test_num_samples,
+        vp_stage,
+        built_on_rank=partial(is_dataset_built_on_rank, pg_collection=pg_collection),
     )
 
 

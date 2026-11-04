@@ -11,6 +11,7 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from megatron.training import get_args
@@ -26,7 +27,8 @@ def build_pretraining_data_loader(dataset, consumed_samples, pg_collection=None)
         consumed_samples: Number of samples consumed so far, across data-parallel ranks.
         pg_collection: Process groups of the run. The samplers shard samples over its
             data-parallel group, including the GTP weight-remat axis whose ranks consume
-            distinct samples. None shards over the global data-parallel group.
+            distinct samples. Omitting it is deprecated: the samples are sharded over the
+            global data-parallel group, with a ProcessGroupFallbackWarning.
     """
 
     if dataset is None:
@@ -53,6 +55,9 @@ def build_pretraining_data_loader(dataset, consumed_samples, pg_collection=None)
         return dataset
 
     if pg_collection is None:
+        warn_global_process_group_fallback(
+            "build_pretraining_data_loader", deprecated_in="0.21", removed_in="0.23"
+        )
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_size = mpu.get_data_parallel_world_size()
     else:
