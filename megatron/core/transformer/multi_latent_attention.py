@@ -603,10 +603,12 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
-                    inference_context.is_decode_only(),
+                    (inference_context.is_decode_only() and not self.config.batch_invariant_mode),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
+                if not (
+                    inference_context.is_decode_only() and not self.config.batch_invariant_mode
+                ):
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
             forced = [
@@ -619,7 +621,9 @@ class MultiLatentAttention(Attention):
             )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if self.cache_mla_latents and (
+            inference_context.is_decode_only() and not self.config.batch_invariant_mode
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -1017,12 +1021,12 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
 
-            # Flag for whether to use absorption. We only use absorption
-            # when caching the latents and in decode-only mode
+            # Absorption changes floating-point evaluation order. Batch-invariant
+            # decode must use the same path as mixed prefill/decode batches.
             use_absorption = (
                 self.config.cache_mla_latents
                 and inference_context
-                and inference_context.is_decode_only()
+                and (inference_context.is_decode_only() and not self.config.batch_invariant_mode)
             )
             # Compute query components. Multiply by up k if absorbing
             q_content = (

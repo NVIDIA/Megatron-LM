@@ -740,15 +740,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            if (
-                getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
+            if getattr(self.config, "cache_mla_latents", None) and (
+                not inference_context.is_decode_only() or self.config.batch_invariant_mode
             ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                # Unabsorbed MLA also handles decode in batch-invariant mode.
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
-                # Uncompress the KV cache for prefill/mixed mode
+                # Uncompress the KV cache for unabsorbed attention.
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
