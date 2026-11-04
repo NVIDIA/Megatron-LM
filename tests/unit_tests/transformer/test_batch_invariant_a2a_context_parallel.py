@@ -72,12 +72,14 @@ SHAPES = {
 }
 
 
-def _config(context_parallel_size: int, shape: str, num_query_groups=None) -> TransformerConfig:
+def _config(cp_size: int, shape: str, num_query_groups=None, tp_size=1) -> TransformerConfig:
     kwargs = dict(SHAPES[shape]["config"])
     if num_query_groups is not None:
         kwargs["num_query_groups"] = num_query_groups
     config = TransformerConfig(
         num_layers=3,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=tp_size > 1,
         use_cpu_initialization=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -86,7 +88,7 @@ def _config(context_parallel_size: int, shape: str, num_query_groups=None) -> Tr
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
-        context_parallel_size=context_parallel_size,
+        context_parallel_size=cp_size,
         cp_comm_type="a2a",
         is_hybrid_model=True,
         **kwargs,
@@ -95,8 +97,8 @@ def _config(context_parallel_size: int, shape: str, num_query_groups=None) -> Tr
     return config
 
 
-def _build_model(context_parallel_size: int, shape: str, num_query_groups=None):
-    config = _config(context_parallel_size, shape, num_query_groups)
+def _build_model(cp_size: int, shape: str, num_query_groups=None, tp_size=1):
+    config = _config(cp_size, shape, num_query_groups, tp_size)
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
@@ -154,19 +156,42 @@ def _forward(model, input_ids, position_ids, packed_seq_params, grad=False):
         ).float()
 
 
-def _run_reference_then_build_cp(run_reference, cp_size, shape, num_query_groups=None):
+def _is_tp_sharded(param) -> bool:
+    return getattr(param, "tensor_model_parallel", False) or not getattr(param, "allreduce", True)
+
+
+def _sync_weights(model):
+    """Gives every rank holding the same TP shard the same weights.
+
+    CPU initialization draws from each rank's CPU RNG, so ranks start with different weights.
+    TP-sharded parameters are shared within their data-parallel group, keeping each TP rank's
+    own shard; everything else is shared from rank 0, so replicated weights agree across TP.
+    """
+    from megatron.core import parallel_state
+
+    dp_group = parallel_state.get_data_parallel_group()
+    dp_src = torch.distributed.get_process_group_ranks(dp_group)[0]
+    sharded = {id(p) for p in model.parameters() if _is_tp_sharded(p)}
+    for value in list(model.parameters()) + list(model.buffers()):
+        if not value.is_cuda:
+            continue
+        if id(value) in sharded:
+            torch.distributed.broadcast(value.data, src=dp_src, group=dp_group)
+        else:
+            torch.distributed.broadcast(value.data, src=0)
+
+
+def _run_reference_then_build_cp(run_reference, cp_size, shape, num_query_groups=None, tp_size=1):
     """Runs run_reference on a CP=1 model, then returns a CP=cp_size model with its weights.
 
-    The reference runs before the CP parallel state exists, so nothing it reads from the
-    global process groups can see CP.
+    Both models use the same TP size, and a global rank has the same TP rank in both. The
+    reference runs before the CP parallel state exists, so nothing it reads from the global
+    process groups can see CP.
     """
-    Utils.initialize_model_parallel(1, 1)
+    Utils.initialize_model_parallel(tp_size, 1)
     model_parallel_cuda_manual_seed(123)
-    reference_model = _build_model(1, shape, num_query_groups)
-    # CPU initialization draws from each rank's CPU RNG, so ranks start with different weights.
-    for value in reference_model.state_dict().values():
-        if isinstance(value, torch.Tensor) and value.is_cuda:
-            torch.distributed.broadcast(value, src=0)
+    reference_model = _build_model(1, shape, num_query_groups, tp_size)
+    _sync_weights(reference_model)
     reference = run_reference(reference_model)
     state_dict = {
         k: v.clone() if isinstance(v, torch.Tensor) else v
@@ -175,9 +200,9 @@ def _run_reference_then_build_cp(run_reference, cp_size, shape, num_query_groups
     del reference_model
     Utils.destroy_model_parallel()
 
-    Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+    Utils.initialize_model_parallel(tp_size, 1, context_parallel_size=cp_size)
     model_parallel_cuda_manual_seed(123)
-    model = _build_model(cp_size, shape, num_query_groups)
+    model = _build_model(cp_size, shape, num_query_groups, tp_size)
     model.load_state_dict(state_dict)
     return reference, model
 
@@ -206,6 +231,15 @@ def _forward_with_layer_outputs(model, input_ids, position_ids, packed_seq_param
         for handle in handles:
             handle.remove()
     return logits, layer_outputs
+
+
+def _gather_sp(x, tp_group):
+    """Undoes sequence parallelism: concatenates the TP ranks' sequence chunks along dim 0."""
+    if tp_group.size() == 1:
+        return x
+    chunks = [torch.empty_like(x) for _ in range(tp_group.size())]
+    torch.distributed.all_gather(chunks, x.contiguous(), group=tp_group)
+    return torch.cat(chunks)
 
 
 def _gather_cp(shard, reference, seq_dim, qkv_format, packed_seq_params, cp_group):
@@ -249,14 +283,20 @@ class TestBatchInvariantA2AContextParallel:
     # Small model: 8 query groups split across CP ranks; 2 split at CP=2 and are gathered at
     # CP=4; 1 (Nano's one K/V head per TP rank at TP2) is always gathered.
     # Nano at TP1xCP4: 8 query heads per CP rank sharing a gathered K/V head; 16 Mamba heads.
+    # TP2xCP2 (sequence parallel): small with 8 groups splits 4 K/V heads per TP rank across
+    # CP; small with 2 groups and Nano have one K/V head per TP rank, gathered.
     @pytest.mark.parametrize(
-        "shape,num_query_groups,cp_size",
-        [("small", g, cp) for g in (8, 2, 1) for cp in (2, 4)] + [("nano", None, 4)],
+        "shape,num_query_groups,cp_size,tp_size",
+        [("small", g, cp, 1) for g in (8, 2, 1) for cp in (2, 4)]
+        + [("nano", None, 4, 1)]
+        + [("small", 8, 2, 2), ("small", 2, 2, 2), ("nano", None, 2, 2)],
     )
     @pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
-    def test_forward_matches_cp1_bitwise(self, shape, num_query_groups, cp_size, qkv_format):
-        if Utils.world_size < cp_size:
-            pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
+    def test_forward_matches_cp1_bitwise(
+        self, shape, num_query_groups, cp_size, tp_size, qkv_format
+    ):
+        if Utils.world_size < cp_size * tp_size:
+            pytest.skip(f"requires {cp_size * tp_size} ranks, got {Utils.world_size}")
         input_ids, position_ids, packed_seq_params = _inputs(qkv_format)
 
         (reference, reference_layers), model = _run_reference_then_build_cp(
@@ -264,11 +304,13 @@ class TestBatchInvariantA2AContextParallel:
             cp_size,
             shape,
             num_query_groups,
+            tp_size,
         )
 
         from megatron.core import parallel_state
 
         cp_group = parallel_state.get_context_parallel_group()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
         index = _cp_token_index(qkv_format, packed_seq_params, cp_size, cp_group.rank())
         logits, layers = _forward_with_layer_outputs(
             model, input_ids[:, index], position_ids[:, index], packed_seq_params
@@ -277,6 +319,7 @@ class TestBatchInvariantA2AContextParallel:
         def gather(shard, full, seq_dim):
             return _gather_cp(shard, full, seq_dim, qkv_format, packed_seq_params, cp_group)
 
+        # Logits are split over the vocabulary across TP, the same way in both models.
         gathered = gather(logits, reference, 1)
 
         # Name the first diverging stage so a failure points at attention, Mamba, MoE, the
@@ -284,7 +327,8 @@ class TestBatchInvariantA2AContextParallel:
         first_diverging_stage = "output_layer"
         stage_names = [name for name, _ in _decoder_stages(model)]
         for name, layer_out, reference_out in zip(stage_names, layers, reference_layers):
-            gathered_out = gather(layer_out, reference_out, 0)
+            reference_out = _gather_sp(reference_out, tp_group)
+            gathered_out = gather(_gather_sp(layer_out, tp_group), reference_out, 0)
             if not torch.equal(gathered_out, reference_out):
                 diff = (gathered_out.float() - reference_out.float()).abs().max().item()
                 positions = (gathered_out != reference_out).any(dim=-1).sum().item()
@@ -292,7 +336,11 @@ class TestBatchInvariantA2AContextParallel:
                     f"{name}: {positions} token positions, max abs diff {diff:.3e}"
                 )
                 break
-        if first_diverging_stage == "output_layer" and not torch.equal(gathered, reference):
+        if (
+            first_diverging_stage == "output_layer"
+            and tp_size == 1
+            and not torch.equal(gathered, reference)
+        ):
             # Same final hidden states in, so check the output GEMM's batch invariance alone:
             # this rank's rows computed within the full sequence and on their own.
             final_hidden = reference_layers[-1]
@@ -308,23 +356,45 @@ class TestBatchInvariantA2AContextParallel:
 
         mismatched = (gathered != reference).any(dim=-1).sum().item()
         assert torch.equal(gathered, reference), (
-            f"CP={cp_size} a2a forward differs from CP=1 at {mismatched} token positions; "
+            f"TP{tp_size}xCP{cp_size} a2a forward differs from TP{tp_size}xCP1 at {mismatched} "
+            "token positions; "
             f"first diverging stage: {first_diverging_stage}"
         )
 
+    @pytest.mark.parametrize("cp_size,tp_size", [(4, 1), (2, 2)])
     @pytest.mark.parametrize("qkv_format", ["sbhd", "thd"])
-    def test_nano_cp4_grads_match_cp1(self, qkv_format):
-        """CP ranks' parameter gradients summed over CP must match the CP=1 gradients.
+    def test_nano_grads_match_cp1(self, cp_size, tp_size, qkv_format):
+        """Parameter gradients reduced over CP must match the CP=1 gradients at the same TP.
 
-        The backward reduces in a different order under CP, so this is a closeness check,
-        not a bitwise one.
+        Gradients of weights replicated across TP are also summed over TP in both models, since
+        sequence parallelism leaves each TP rank a partial sum. The backward reduces in a
+        different order under CP, so this is a closeness check, not a bitwise one.
         """
-        cp_size = 4
-        if Utils.world_size < cp_size:
-            pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
+        if Utils.world_size < cp_size * tp_size:
+            pytest.skip(f"requires {cp_size * tp_size} ranks, got {Utils.world_size}")
         input_ids, position_ids, packed_seq_params = _inputs(qkv_format)
         generator = torch.Generator(device="cuda").manual_seed(4321)
         loss_weights = torch.randn(*input_ids.shape, VOCAB_SIZE, device="cuda", generator=generator)
+        # Logits are split over the vocabulary across TP.
+        vocab_per_tp_rank = VOCAB_SIZE // tp_size
+        tp_rank = Utils.rank % tp_size
+        loss_weights = loss_weights[
+            ..., tp_rank * vocab_per_tp_rank : (tp_rank + 1) * vocab_per_tp_rank
+        ]
+
+        def reduced_grads(model, groups):
+            from megatron.core import parallel_state
+
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            grads = {}
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                grad = p.grad.float().clone()
+                for group in groups + ([] if _is_tp_sharded(p) else [tp_group]):
+                    torch.distributed.all_reduce(grad, group=group)
+                grads[name] = grad
+            return grads
 
         def run_reference(reference_model):
             reference_model.train()
@@ -332,13 +402,11 @@ class TestBatchInvariantA2AContextParallel:
                 reference_model, input_ids, position_ids, packed_seq_params, grad=True
             )
             (logits * loss_weights).sum().backward()
-            return {
-                name: p.grad.float().clone()
-                for name, p in reference_model.named_parameters()
-                if p.grad is not None
-            }
+            return reduced_grads(reference_model, [])
 
-        reference_grads, model = _run_reference_then_build_cp(run_reference, cp_size, "nano")
+        reference_grads, model = _run_reference_then_build_cp(
+            run_reference, cp_size, "nano", tp_size=tp_size
+        )
         model.train()
 
         from megatron.core import parallel_state
@@ -349,13 +417,7 @@ class TestBatchInvariantA2AContextParallel:
             model, input_ids[:, index], position_ids[:, index], packed_seq_params, grad=True
         )
         (logits * loss_weights[:, index]).sum().backward()
-
-        grads = {}
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                grad = p.grad.float()
-                torch.distributed.all_reduce(grad, group=cp_group)
-                grads[name] = grad
+        grads = reduced_grads(model, [cp_group])
         assert grads.keys() == reference_grads.keys()
 
         mismatched = []
@@ -363,7 +425,11 @@ class TestBatchInvariantA2AContextParallel:
             error = (grads[name] - reference_grad).norm() / reference_grad.norm().clamp_min(1e-12)
             if error > 1e-2:
                 mismatched.append(f"{name}: relative error {error.item():.3e}")
-        assert not mismatched, "CP=4 gradients differ from CP=1:\n" + "\n".join(mismatched)
+        assert (
+            not mismatched
+        ), f"TP{tp_size}xCP{cp_size} gradients differ from TP{tp_size}xCP1:\n" + "\n".join(
+            mismatched
+        )
 
 
 class TestBatchInvariantContextParallelConfig:
