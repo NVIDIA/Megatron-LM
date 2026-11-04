@@ -783,7 +783,7 @@ def save_checkpoint(
     start_ckpt = time()
     cfg = get_run_config()
     args = get_args()
-    checkpoint = get_run_config().checkpoint
+    checkpoint = cfg.checkpoint
     # The values of this save; ``ckpt_format`` below is the format actually written.
     save_root = checkpoint.save if save is None else save
     save_format = checkpoint.ckpt_format if ckpt_format is None else ckpt_format
