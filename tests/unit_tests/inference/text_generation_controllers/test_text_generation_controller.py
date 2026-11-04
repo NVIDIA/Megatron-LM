@@ -328,6 +328,9 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     context.get_committed_kv_block_counts = lambda rows: (
         DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
     )
+    context.get_committed_kv_block_ids = lambda row: (
+        DynamicInferenceContext.get_committed_kv_block_ids(context, row)
+    )
     # Bind the real flags so the fake exercises the production no-op-filter gate.
     context.active_sampling_filter_flags = lambda count=None: (
         DynamicInferenceContext.active_sampling_filter_flags(context, count)
@@ -3707,8 +3710,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
-        ctx.kv_block_allocator.block_ref_counts[20] = 2
-        ctx.kv_block_allocator.block_ref_counts[10] = 1
+        ctx.kv_block_allocator.pc_state.block_ref_counts[20] = 2
+        ctx.kv_block_allocator.pc_state.block_ref_counts[10] = 1
 
         initial_avail = ctx.kv_block_allocator.pool_avail
 
@@ -3722,9 +3725,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
 
         # Req 1 should have released block 20 (ref count decremented).
-        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[20].item() == 1
         # Block 10 should be untouched.
-        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[10].item() == 1
 
     @pytest.mark.internal
     def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):

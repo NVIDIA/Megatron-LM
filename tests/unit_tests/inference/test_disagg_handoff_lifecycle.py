@@ -18,6 +18,8 @@ from megatron.core import parallel_state
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -39,7 +41,11 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -80,15 +86,19 @@ class _TransferAgent:
 
 
 class _KvAllocator:
+    """Fake of the KV allocator's handoff surface over the extracted state objects."""
+
     enable_prefix_caching = True
 
-    def __init__(self):
+    def __init__(self, registry):
         self.next_block = 10
         self.capacity_available = True
         self.releases = []
         self.registered_parent_hashes = []
-        self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
-        self.kv_hash_to_block_id = {}
+        # Production reads ref counts through `pc_state` and cached hashes through the
+        # context's shared registry; keep the fake's views on those same objects.
+        self.pc_state = SimpleNamespace(block_ref_counts=torch.zeros(256, dtype=torch.int32))
+        self.registry = registry
 
     def is_memory_available(self, _count, potential_matched_count=0):
         assert potential_matched_count >= 0
@@ -97,20 +107,20 @@ class _KvAllocator:
     def allocate_memory_blocks(self, count):
         blocks = torch.arange(self.next_block, self.next_block + count, dtype=torch.int32)
         self.next_block += count
-        self.block_ref_counts[blocks] = 1
+        self.pc_state.block_ref_counts[blocks] = 1
         return blocks
 
     def release_memory_blocks(self, blocks):
-        assert torch.all(self.block_ref_counts[blocks] > 0)
-        self.block_ref_counts[blocks] -= 1
+        assert torch.all(self.pc_state.block_ref_counts[blocks] > 0)
+        self.pc_state.block_ref_counts[blocks] -= 1
         self.releases.append(blocks.tolist())
 
     def retain_memory_blocks(self, block_ids):
         if block_ids:
-            self.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
+            self.pc_state.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
 
     def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        self.registry.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
         self.registered_parent_hashes.extend(parent_hashes or [])
 
     def update_timestamps(self, block_ids):
@@ -142,7 +152,7 @@ class _SchedulerHarness:
             return
         request_id = self.waiting_request_ids[0]
         block_ids = torch.tensor(self.blocks_to_bind[request_id], dtype=torch.int32)
-        self.context.kv_block_allocator.block_ref_counts[block_ids] += 1
+        self.context.kv_block_allocator.pc_state.block_ref_counts[block_ids] += 1
         if request_id in self.partial_admissions:
             self.get_request(request_id).finished_chunk_token_count += 4
         else:
@@ -156,6 +166,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         # generation_config `[2, 11]`. Empty is the single-eos case.
         self._extra_eos_token_id_set = frozenset(extra_eos_token_id_set)
         self._initialize_disaggregation_state()
+        registry = PrefixCacheRegistry()
         self.context = SimpleNamespace(
             block_size_tokens=4,
             num_speculative_tokens=0,
@@ -166,7 +177,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             active_token_count=0,
             max_tokens=8,
             is_hybrid_model=hybrid,
-            kv_block_allocator=_KvAllocator(),
+            kv_block_allocator=_KvAllocator(registry),
+            prefix_cache_registry=registry,
             mamba_slot_allocator=None,
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
             memory_buffer=torch.full((2, 1, 256, 4, 1, 1), 7.0),
@@ -541,7 +553,7 @@ def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop)
     engine = _HandoffHarness(handoff_loop)
     prompt = [1, 2, 3, 4]
     stale_hashes = compute_block_hashes_batched(torch.tensor(prompt), 4)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[stale_hashes[0]] = 4
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[stale_hashes[0]] = 4
     engine.add_request_with_kv_handoff(
         7,
         prompt,
@@ -590,6 +602,8 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
     prefill.local_metadata_ledger = {}
     prefill.payload_stager = mock.Mock()
     prefill.socket_for_receiving_requests = mock.Mock()
+    prefill.finished_request_count = 0
+    prefill.context = mock.Mock()
     source = DynamicInferenceRequest(
         request_id=7,
         uid="chatcmpl-source",
@@ -611,7 +625,7 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
         "kv_meta": {"resume_tokens": [99]},
     }
     entry = RequestEntry(record=record, future=handoff_loop.create_future())
-    finalized = record.merge() if already_finalized else None
+    finalized = prefill._finalize_request(entry) if already_finalized else None
     with mock.patch.object(record, "merge", wraps=record.merge) as merge:
         if already_finalized:
             completed = prefill._complete_request(entry, finalized)
@@ -770,8 +784,8 @@ def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
         context,
         pool_size=16,
         paused_limit=0,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        pc_state=PrefixCacheBlockState(16, PrefixCachingEvictionPolicy.REF_ZERO),
+        prefix_cache_registry=context.prefix_cache_registry,
     )
     context.kv_block_allocator = allocator
     engine.add_request_with_kv_handoff(
@@ -797,7 +811,7 @@ def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
     context.check_availability = mock.Mock(return_value=(True, True, True))
     context.add_request = mock.Mock(
         side_effect=lambda _: allocator.retain_memory_blocks(
-            [allocator.kv_hash_to_block_id[block_hash]]
+            [allocator.registry.kv_hash_to_block_id[block_hash]]
         )
     )
     schedule = (
@@ -817,10 +831,10 @@ def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
     schedule(engine)
     context.add_request.assert_called_once_with(request)
     assert not engine.waiting_request_ids
-    assert int(allocator.block_ref_counts[imported_block]) == 2
+    assert int(allocator.pc_state.block_ref_counts[imported_block]) == 2
     allocator.release_memory_blocks(torch.tensor([imported_block], dtype=torch.int32))
-    assert allocator.kv_hash_to_block_id[block_hash] == imported_block
-    assert int(allocator.block_ref_counts[imported_block]) == 1
+    assert allocator.registry.kv_hash_to_block_id[block_hash] == imported_block
+    assert int(allocator.pc_state.block_ref_counts[imported_block]) == 1
 
 
 @pytest.mark.parametrize("prefills, chunked_id", [(1, -1), (0, 8)])
@@ -1084,8 +1098,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
         engine.context,
         pool_size=7,
         paused_limit=0,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        pc_state=PrefixCacheBlockState(7, PrefixCachingEvictionPolicy.LRU),
+        prefix_cache_registry=engine.context.prefix_cache_registry,
     )
     engine.context.kv_block_allocator = allocator
     baseline_capacity = allocator.get_allocatable_count()
@@ -1102,7 +1116,7 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
         allocator.release_memory_blocks(torch.tensor(request_blocks, dtype=torch.int32))
         engine._pinned_handoff_blocks[request_id] = request_blocks
 
-    assert allocator.block_ref_counts[blocks].tolist() == [1, 1, 1, 1]
+    assert allocator.pc_state.block_ref_counts[blocks].tolist() == [1, 1, 1, 1]
     assert int(allocator.get_evictable_block_count()) == 0
     assert allocator.get_allocatable_count() == baseline_capacity - 4
     assert allocator.evict_lru_blocks(1) is False
@@ -1110,8 +1124,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
 
     engine.release_handoff_blocks(11)
     assert allocator.get_allocatable_count() == baseline_capacity - 2
-    assert allocator.block_ref_counts[first_handoff].tolist() == [0, 0]
-    assert allocator.block_hashes[first_handoff[0]].item() == 101
+    assert allocator.pc_state.block_ref_counts[first_handoff].tolist() == [0, 0]
+    assert allocator.pc_state.block_hashes[first_handoff[0]].item() == 101
     assert first_handoff[1] in allocator.block_bag[: allocator.pool_avail].tolist()
 
     engine.release_handoff_blocks(11)
@@ -1120,8 +1134,8 @@ def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
 
     engine.release_handoff_blocks(12)
     assert allocator.get_allocatable_count() == baseline_capacity
-    assert allocator.block_ref_counts[blocks].tolist() == [0, 0, 0, 0]
-    assert allocator.block_hashes[registered_blocks].tolist() == [101, 201]
+    assert allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0, 0, 0]
+    assert allocator.pc_state.block_hashes[registered_blocks].tolist() == [101, 201]
     free_blocks = allocator.block_bag[: allocator.pool_avail].tolist()
     assert all(block in free_blocks for block in partial_tail_blocks)
 
@@ -1267,8 +1281,10 @@ def test_handoff_finishes_without_an_extra_decode_step(
     request.stop_word_ids = stop_word_ids
     engine.stop_word_being_finished_ids = set()
     engine.finished_request_count = 0
+    engine.context.remove_vlm_request_data = lambda request_id: None
     engine._set_finish_reason = DynamicInferenceEngine._set_finish_reason.__get__(engine)
-    engine._complete_request = DynamicInferenceEngine._complete_request
+    engine._finalize_request = DynamicInferenceEngine._finalize_request.__get__(engine)
+    engine._complete_request = DynamicInferenceEngine._complete_request.__get__(engine)
 
     def complete_request(request_id):
         engine.requests[request_id] = RequestEntry(
@@ -1313,13 +1329,16 @@ def test_handoff_finishes_without_an_extra_decode_step(
     assert request.generated_tokens == expected_tokens
     assert request_future.result().finish_reason == expected_reason
     assert request.sampling_params.num_tokens_to_generate == num_tokens_to_generate
-    assert engine.context.kv_block_allocator.block_ref_counts[blocks].tolist() == [0, 0]
+    assert engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0]
     assert pending.local_blocks == []
     assert pending.continuation_blocks == []
 
 
-def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
-    engine = object.__new__(DynamicInferenceEngine)
+@pytest.mark.parametrize("use_coordinator", [False, True])
+def test_immediate_handoff_completion_resolves_request_future(handoff_loop, use_coordinator):
+    # The real class, so the mixin's completion resolves through the engine's reply path.
+    engine = object.__new__(StateHandoffDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
     engine.stop_word_being_finished_ids = set()
     engine.controller = SimpleNamespace(
         terminating_token_ids=lambda _, stop_token_ids=None: frozenset(stop_token_ids or ())
@@ -1333,20 +1352,18 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     request.add_event_add_engine()
     record = DynamicInferenceRequestRecord.from_request(request)
     request_future = handoff_loop.create_future()
-    engine.requests = {7: SimpleNamespace(record=record, future=request_future)}
+    engine.requests = {7: RequestEntry(record=record, future=request_future)}
     engine.finished_request_count = 0
-    engine.use_coordinator = False
-    engine.is_mp_coordinator = False
+    engine.use_coordinator = use_coordinator
+    engine.is_mp_coordinator = use_coordinator
+    engine.local_metadata_ledger_enabled = False
+    engine.payload_stager = None
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine._partial_emit_lengths = {7: 1}
+    engine.context = mock.Mock()
     tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
 
-    def complete_request(request_entry):
-        finished_request = request_entry.record.merge()
-        request_entry.future.set_result(finished_request)
-        return finished_request
-
-    engine._complete_request = complete_request
-
-    InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, 7)
+    engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
@@ -1357,6 +1374,9 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
+    # No step follows this completion, so the coordinator reply leaves now.
+    assert engine.socket_for_receiving_requests.send_multipart.call_count == int(use_coordinator)
+    assert (7 not in engine._partial_emit_lengths) == use_coordinator
 
 
 def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
@@ -1402,7 +1422,7 @@ def test_cancel_waits_for_staggered_mp_reports(handoff_loop, late_failed):
         assert engine.abort_kv_handoff(7)
         assert pending.cancel_requested and not pending.future.done()
         assert list(engine._pending_kv_imports) == [pending]
-        assert allocator.block_ref_counts[block] == 1
+        assert allocator.pc_state.block_ref_counts[block] == 1
         assert engine._admit_pending_kv_imports() == 0
         assert not allocator.releases
         dist.barrier(group=group)
@@ -1430,7 +1450,7 @@ def test_cancel_waits_for_staggered_mp_reports(handoff_loop, late_failed):
         assert not engine._pending_kv_imports and not engine._quarantined_kv_imports
         assert not engine._handoff_completion_notifications
         assert not engine.requests and not engine.waiting_request_ids
-        assert allocator.block_ref_counts[block] == 0
+        assert allocator.pc_state.block_ref_counts[block] == 0
         assert allocator.releases == [[block]]
         assert engine._drain_handoff_completion_notifications() == []
     finally:
@@ -1591,7 +1611,9 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(2)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id.update(
+        zip(hashes[:2], cached.tolist())
+    )
 
     kv_meta = {"request_id": 5, "resume_tokens": [99], "resume_log_probs": [-0.25]}
     engine.add_request_with_kv_handoff(
@@ -1718,7 +1740,7 @@ def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = int(cached[0])
     kv_meta = {
         "resume_tokens": [99],
         "pp_metas": [
@@ -1744,7 +1766,7 @@ def test_nixl_handoff_trims_per_rank_block_lists(handoff_loop):
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = int(cached[0])
     kv_meta = {
         "resume_tokens": [99],
         "tp_metas": [{"rank": 0, "block_ids": [100, 101]}, {"rank": 1, "block_ids": [200, 201]}],
@@ -1781,7 +1803,7 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine._notify_kv_transfer_ready = lambda *_: events.append("ready")
     prompt = [3] * 8
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
-    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = 4
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = 4
 
     kv_meta = {"request_id": 9, "resume_tokens": [99]}
     engine.add_request_with_kv_handoff(
@@ -1801,7 +1823,7 @@ def test_fully_cached_handoff_skips_kv_but_imports_ssm(handoff_loop, is_push, hy
     engine._notify_kv_transfer_ready = mock.Mock()
     prompt = [4] * 8
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
-    engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes, [4, 5]))
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id.update(zip(hashes, [4, 5]))
 
     meta = {
         "request_id": 10,
@@ -2022,3 +2044,96 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         is not requests[1].disaggregated_params["kv_meta"]
     )
     assert all("ssm" not in meta for meta in engine._kv_peer_metas)
+
+
+class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
+    """Prefill engine shell that drives the real coordinator loop on scripted work."""
+
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward) -> None:
+        self._initialize_disaggregation_state()
+        self._kv_transfer_role = "prefill"
+        self.state = EngineState.RUNNING
+        self.rank = 0
+        self.tp_ep_world_size = ep_world_size
+        self.ep_consensus_interval = 20
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus = (0, False)
+        self.use_synchronous_zmq_collectives = False
+        self.waiting_request_ids = deque([7])
+        self.context = SimpleNamespace(
+            step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
+        )
+        self.controller = SimpleNamespace(dummy_forward=dummy_forward)
+        self.step_start_event = mock.Mock()
+        self.step_end_event = mock.Mock()
+        self.step_calls = 0
+        self.all_reduce_inputs = []
+        self._peer_work = peer_work
+        self._iterations_left = iterations
+        if ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = SimpleNamespace(
+                all_reduce_max=self._all_reduce_max
+            )
+
+    async def _all_reduce_max(self, local_work, consensus, async_op):
+        self.all_reduce_inputs.append(local_work)
+        return max(local_work, self._peer_work), consensus
+
+    def schedule_requests(self):
+        self._iterations_left -= 1
+        if self._iterations_left < 0:
+            self.state = EngineState.STOPPING
+        return 0
+
+    async def async_step(self, *, verbose=False):
+        # The prompt finishes prefill in one step and leaves the batch; its detached
+        # recurrent-state slot stays pinned until decode releases the handoff.
+        self.step_calls += 1
+        self.waiting_request_ids.clear()
+        await asyncio.sleep(0)
+
+    async def shutdown(self):
+        return None
+
+
+def _run_coordinator_loop(engine, loop):
+    run = DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__
+    loop.run_until_complete(asyncio.wait_for(run(engine, loop=loop), timeout=30))
+
+
+def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loop):
+    """A drained EP=1 engine must not act on a cached EP consensus.
+
+    Pending handoffs may hold every request-owned recurrent-state slot, and EP=1 reserves no
+    dummy slot, so a dummy forward here fails to allocate a slot and kills the engine.
+    """
+    dummy_forward = mock.Mock(
+        side_effect=AssertionError(
+            "No free recurrent-state slots for 1 expert-parallel dummy request(s)"
+        )
+    )
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=1, peer_work=0, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.step_calls == 1
+    dummy_forward.assert_not_called()
+    assert engine.context.step_count == 0
+    assert engine._last_ep_consensus == (0, False)
+
+
+def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
+    """EP>1 ranks still reuse consensus within the interval and join busy peers."""
+    dummy_forward = mock.Mock()
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.all_reduce_inputs == [1]
+    assert engine.step_calls == 1
+    assert dummy_forward.call_count == 3
+    assert engine.context.step_count == 3
