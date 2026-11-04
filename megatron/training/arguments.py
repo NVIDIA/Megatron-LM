@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -1292,9 +1292,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:

@@ -1145,10 +1145,12 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
+def test_get_batch_caches_config_until_args_replaced(script, monkeypatch, run_config):
     args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
     configs = [
         SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
             virtual_pipeline_model_parallel_size=None,
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
