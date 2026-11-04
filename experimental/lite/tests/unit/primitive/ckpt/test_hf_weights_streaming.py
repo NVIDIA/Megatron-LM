@@ -8,9 +8,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 if importlib.util.find_spec("safetensors") is None:
     safetensors = types.ModuleType("safetensors")
@@ -28,6 +28,48 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     stream_export_to_shards,
 )
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_export_stages_cpu_parameters_on_cuda() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+    class Spec:
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    exported = dict(
+        export_hf_weights(Model(), Spec(), ps, staging_device="cuda")
+    )
+
+    assert exported["weight"].is_cuda
+    torch.testing.assert_close(exported["weight"].cpu(), torch.arange(4.0))
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(

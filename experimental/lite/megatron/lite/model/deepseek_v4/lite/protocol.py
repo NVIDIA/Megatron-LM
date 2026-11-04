@@ -16,11 +16,13 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import (
+    add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
     router_replay_roots as router_replay_roots,
+    set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -59,6 +61,7 @@ class ImplConfig:
     offload: list[str] = field(default_factory=list)
     use_thd: bool = False
     use_deepep: bool = False
+    cross_entropy_fusion: bool = False
     attention_backend_override: str | None = None
     deterministic: bool = True
     mtp_enable: bool = True
@@ -255,7 +258,9 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    return model(**_prepare_model_forward_kwargs(model, batch))
+    kwargs = _prepare_model_forward_kwargs(model, batch)
+    add_cross_entropy_fusion(kwargs, model)
+    return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -409,6 +414,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:

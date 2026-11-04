@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,52 @@ def _engine_config(**kwargs):
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
+
+
+def test_compile_cache_isolation_prefers_global_rank_and_preserves_roots(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from verl_mlite.engine.mlite_engine import _isolate_compile_cache_per_rank
+
+    roots = {
+        "TORCHINDUCTOR_CACHE_DIR": tmp_path / "torchinductor",
+        "TRITON_CACHE_DIR": tmp_path / "triton",
+    }
+    monkeypatch.setenv("RANK", "7")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    for name, root in roots.items():
+        monkeypatch.setenv(name, str(root))
+        monkeypatch.delenv(f"VERL_MLITE_BASE_{name}", raising=False)
+
+    _isolate_compile_cache_per_rank()
+    _isolate_compile_cache_per_rank()
+    for name, root in roots.items():
+        assert Path(os.environ[name]) == root / "rank_7"
+
+    monkeypatch.setenv("RANK", "8")
+    _isolate_compile_cache_per_rank()
+    for name, root in roots.items():
+        assert Path(os.environ[name]) == root / "rank_8"
+
+    output = capsys.readouterr().out
+    assert "[compile-cache] rank=7" in output
+    assert "[compile-cache] rank=8" in output
+
+
+def test_compile_cache_isolation_ignores_unconfigured_cache_vars(monkeypatch, capsys) -> None:
+    from verl_mlite.engine.mlite_engine import _isolate_compile_cache_per_rank
+
+    monkeypatch.setenv("RANK", "3")
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(f"VERL_MLITE_BASE_{name}", raising=False)
+
+    _isolate_compile_cache_per_rank()
+
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        assert name not in os.environ
+        assert f"VERL_MLITE_BASE_{name}" not in os.environ
+    assert "TORCHINDUCTOR_CACHE_DIR: None -> None" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 4])
@@ -181,6 +228,51 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
             "target": "vllm",
         },
     }
+
+
+def test_cpu_resident_weight_export_stages_only_export_tensors(monkeypatch) -> None:
+    engine = _engine(
+        engine_config=_engine_config(param_offload=True, export_dtype="bfloat16")
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda *args, **kwargs: to_calls.append((args, kwargs)))
+
+    weights, _ = engine.get_per_tensor_param()
+
+    assert list(weights) == []
+    assert to_calls == [(("cuda",), {"model": True, "optimizer": False, "grad": False})]
+    assert "staging_device" not in captured["kwargs"]
+
+    monkeypatch.setattr(engine, "to", lambda *args, **kwargs: pytest.fail("loaded full model"))
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_name", lambda: "cuda")
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_id", lambda: 3)
+    engine.handle = SimpleNamespace(_extras={"optimizer_backend": "fsdp2"})
+
+    weights, metadata = engine.get_per_tensor_param(cpu_resident=True)
+
+    assert list(weights) == []
+    assert metadata is None
+    assert captured["kwargs"]["cpu"] is False
+    assert captured["kwargs"]["buffer_max_size_bytes"] == 2 * 1024**3
+    assert captured["kwargs"]["staging_device"] == torch.device("cuda", 3)
+
+    for optimizer_backend in ("dist_opt", None):
+        engine.handle = SimpleNamespace(
+            _extras={"optimizer_backend": optimizer_backend}
+        )
+        with pytest.raises(NotImplementedError, match="yet"):
+            engine.get_per_tensor_param(cpu_resident=True)
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
