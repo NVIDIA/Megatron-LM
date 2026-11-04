@@ -423,6 +423,9 @@ class ShortcutMoEBlock(MegatronModule):
         sequence_len_offset,
         packed_seq_params,
         padding_mask,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        rotary_pos_cos_sin=None,
     ):
         """Run the paired layer's ordinary forward, which updates its KV cache or recurrent state.
 
@@ -440,6 +443,9 @@ class ShortcutMoEBlock(MegatronModule):
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
             sequence_len_offset=sequence_len_offset,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
@@ -461,6 +467,9 @@ class ShortcutMoEBlock(MegatronModule):
         attn_recompute_context: ResidualStreamRecomputeContext | None = None,
         moe_recompute_context: ResidualStreamRecomputeContext | None = None,
         padding_mask_by_layout=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        rotary_pos_cos_sin=None,
     ):
         """Run the eager schedule with each physical layer's quantization context.
 
@@ -536,6 +545,9 @@ class ShortcutMoEBlock(MegatronModule):
                     sequence_len_offset=sequence_len_offset,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
                 )
             elif attn_recompute_context is None:
                 paired_state = self.compute_layer.forward_pre_attn_and_core_attn(

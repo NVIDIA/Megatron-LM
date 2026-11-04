@@ -331,6 +331,120 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("no_rope", [False, True], ids=["rope-layer", "no-rope-layer"])
+def test_dynamic_fused_rope_dispatch_replays(no_rope):
+    """Dynamic-inference attention applies FlashInfer's fused RoPE from rotary_pos_cos_sin.
+
+    A prefill replays bit-exactly under side-stream contention. A layer in no_rope_freq takes no
+    RoPE: given rotary_pos_cos_sin it matches running without it bit for bit, while a RoPE layer
+    differs. A rotary_pos_emb passed next to the cache is not applied on top of it.
+    """
+    from megatron.core.inference.config import InferenceConfig
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.inference_request import DynamicInferenceRequest
+    from megatron.core.inference.sampling_params import SamplingParams
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        model_parallel_cuda_manual_seed(123)
+        heads, head_dim, max_positions = 4, 64, 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            no_rope_freq=[int(no_rope)],
+            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        module = SelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        module.eval()
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=max_positions,
+                buffer_size_gb=0.05,
+                block_size_tokens=256,
+                unified_memory_level=0,
+                use_flashinfer_fused_rope=True,
+            ),
+        )
+        for request_id, length in enumerate((40, 24)):
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(length),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                )
+            )
+        context.initialize_attention_state()
+        inv_freq = 10000 ** -(torch.arange(0, head_dim, 2, device="cuda") / head_dim)
+        freqs = torch.outer(torch.arange(max_positions, device="cuda").float(), inv_freq)
+        inputs = dict(
+            hidden_states=torch.randn(
+                context.padded_active_token_count,
+                1,
+                config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            rotary_pos_cos_sin=torch.cat((freqs.cos(), freqs.sin()), dim=-1),
+            rotary_pos_emb=None,
+        )
+
+        def fn(hidden_states, rotary_pos_cos_sin, rotary_pos_emb):
+            with torch.no_grad(), InferenceMode.active():
+                output, _ = module(
+                    hidden_states,
+                    attention_mask=None,
+                    inference_context=context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                )
+            return output
+
+        layer = "no-RoPE" if no_rope else "RoPE"
+        fused = assert_replays_bit_exact(
+            fn, inputs, backward=False, contention=True, what=f"fused RoPE dispatch, {layer} layer"
+        )[0]["out"]
+        unrotated = assert_replays_bit_exact(
+            fn,
+            dict(inputs, rotary_pos_cos_sin=None),
+            backward=False,
+            what=f"attention without RoPE, {layer} layer",
+        )[0]["out"]
+        assert bytes_equal(fused, unrotated) == no_rope, (
+            "the no-RoPE layer was rotated" if no_rope else "the RoPE layer was not rotated"
+        )
+        both = assert_replays_bit_exact(
+            fn,
+            dict(inputs, rotary_pos_emb=torch.cat((freqs, freqs), dim=-1)[:, None, None, :]),
+            backward=False,
+            what=f"fused RoPE dispatch with rotary_pos_emb too, {layer} layer",
+        )[0]["out"]
+        assert bytes_equal(both, fused), "rotary_pos_emb was applied on top of fused RoPE"
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
 @pytest.mark.parametrize("path", ["prefill", "decode"])
 def test_flash_decode_dispatch_config_softmax_scale_replays(path):

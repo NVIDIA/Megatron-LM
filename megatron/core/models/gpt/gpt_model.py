@@ -408,86 +408,19 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
-        rotary_pos_emb = None
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
-        rotary_pos_cos_sin = None
-
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            use_flash_infer_fused_rope = (
-                hasattr(inference_context, 'use_flashinfer_fused_rope')
-                and inference_context.use_flashinfer_fused_rope
+        # Rotary positional embeddings (embedding is None for PP intermediate devices).
+        # rotary_pos_cos_sin is used exclusively for FlashInfer's fused RoPE, which has not been
+        # validated with MTP: models with MTP layers take the unfused RoPE instead.
+        rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin = (
+            self._rotary_pos_emb_inputs(
+                inference_context,
+                decoder_input,
+                packed_seq_params,
+                position_ids,
+                decoder_uses_mla=self.config.multi_latent_attention,
+                allow_fused_rope=not self.mtp_process,
             )
-            if (
-                in_inference_mode
-                and inference_context is not None
-                and (self.config.flash_decode or use_flash_infer_fused_rope)
-            ):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
-                    "Flash decode is only applicable to static batching."
-                )
-                # Flash decoding uses precomputed cos and sin for RoPE
-                if self.config.flash_decode:
-                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length_for_model,
-                        self.rotary_pos_emb.get_cos_sin(
-                            inference_context.max_sequence_length_for_model
-                        ),
-                    )
-                elif use_flash_infer_fused_rope:
-                    assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
-                    rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length_for_model,
-                        torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(
-                                inference_context.max_sequence_length_for_model
-                            ),
-                            -1,
-                        ),
-                    )
-            else:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-        elif self.position_embedding_type == 'yarn':
-            if not InferenceMode.is_active() or not self.config.flash_decode:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-            else:
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "YarnRotaryEmbedding yet."
-                )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if not InferenceMode.is_active() or not self.config.flash_decode:
-                rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids,
-                    self.mrope_section,
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
-            else:
-                # Flash decoding uses precomputed cos and sin for RoPE
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "MultimodalRotaryEmbedding yet."
-                )
+        )
 
         if (
             in_inference_mode

@@ -1653,3 +1653,151 @@ class TestHybridModelWithYarn:
                 # StaticInferenceContext always sets materialize_only_last_token_logits=True.
                 assert logits.shape[1] == 1
                 assert logits.shape[2] == self.model.vocab_size
+
+
+class TestHybridModelFlashDecodeRope:
+    """flash_decode selects a decode kernel that applies RoPE from precomputed cos and sin.
+
+    HybridModel must supply them as GPTModel does, so a RoPE hybrid gives the same logits with
+    and without flash_decode, and reject what flash decoding cannot run, as GPTModel does.
+    """
+
+    vocab_size = 128
+    max_sequence_length = 64
+    batch_size = 2
+    prompt_length = 12
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _model(self, config, position_embedding_type="rope"):
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=self.vocab_size,
+            max_sequence_length=self.max_sequence_length,
+            hybrid_layer_pattern="*" + "-" * (config.num_layers - 1),  # attention, then MLPs
+            position_embedding_type=position_embedding_type,
+        )
+        return model.cuda().eval()
+
+    def _rope_model(self, flash_decode, position_embedding_type="rope"):
+        # Each hybrid layer gets its own copy of the config, so flash_decode is set at build.
+        # flash-attn's decode kernel needs fp16 or bf16; fp16 keeps the rounding of the two RoPE
+        # paths small. A larger init makes attention, and so RoPE, move the logits.
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            add_bias_linear=False,
+            init_method_std=0.1,
+            params_dtype=torch.float16,
+            fp16=True,
+            flash_decode=flash_decode,
+        )
+        return self._model(config, position_embedding_type)
+
+    def _prompt(self):
+        generator = torch.Generator().manual_seed(7)
+        return torch.randint(
+            0, self.vocab_size, (self.batch_size, self.prompt_length + 1), generator=generator
+        ).cuda()
+
+    def _forward(self, model, inference_context, input_ids, position_ids):
+        with torch.no_grad(), InferenceMode.active():
+            return model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+            )
+
+    def _static_generation(self, model):
+        """Logits of a static prefill and of the decode step that follows it."""
+        context = StaticInferenceContext(self.batch_size, self.max_sequence_length)
+        tokens = self._prompt()
+        positions = torch.arange(self.prompt_length + 1, device="cuda").repeat(self.batch_size, 1)
+        prefill = self._forward(
+            model, context, tokens[:, :-1], positions[:, :-1].contiguous()
+        ).float()
+        context.increment_sequence_len_offset(self.prompt_length)
+        context.enable_decode_mode()
+        decode = self._forward(
+            model, context, tokens[:, -1:], positions[:, -1:].contiguous()
+        ).float()
+        return prefill, decode
+
+    def test_static_generation_matches_without_flash_decode(self):
+        from megatron.core.models.common.embeddings import rope_utils
+        from megatron.core.transformer import attention
+
+        assert (
+            rope_utils.apply_rotary_emb_flash is not None
+            and attention.flash_attn_with_kvcache is not None
+        ), "flash decoding applies RoPE with flash-attn's rotary and decode kernels"
+        reference_model = self._rope_model(flash_decode=False)
+        model = self._rope_model(flash_decode=True)
+        model.load_state_dict(reference_model.state_dict())
+        # The same weights without RoPE give the error a missing RoPE would cause.
+        nope_model = self._rope_model(flash_decode=False, position_embedding_type="none")
+        nope_model.load_state_dict(reference_model.state_dict(), strict=False)
+
+        reference = self._static_generation(reference_model)
+        nope = self._static_generation(nope_model)
+        with (
+            patch.object(
+                attention,
+                "apply_rotary_pos_emb_with_cos_sin",
+                wraps=rope_utils.apply_rotary_pos_emb_with_cos_sin,
+            ) as prefill_rope,
+            patch.object(
+                attention, "flash_attn_with_kvcache", wraps=attention.flash_attn_with_kvcache
+            ) as decode_kernel,
+        ):
+            generation = self._static_generation(model)
+
+        assert prefill_rope.call_count > 0, "flash_decode prefill applied no RoPE"
+        assert decode_kernel.call_count > 0
+        for call in decode_kernel.call_args_list:
+            assert call.kwargs["rotary_cos"] is not None, "flash_decode decode applied no RoPE"
+        for step, logits, expected, without_rope in zip(
+            ("prefill", "decode"), generation, reference, nope
+        ):
+            error = ((logits - expected).norm() / expected.norm()).item()
+            rope_effect = ((without_rope - expected).norm() / expected.norm()).item()
+            # The two RoPE implementations differ only in rounding, far below RoPE's own effect.
+            assert error <= 0.1 * rope_effect, (
+                f"flash_decode {step} differs from the reference by rel {error:.3g}; "
+                f"dropping RoPE moves it by rel {rope_effect:.3g}"
+            )
+
+    @pytest.mark.parametrize("position_embedding_type", ["rope", "none"])
+    def test_dynamic_context_is_rejected(self, position_embedding_type):
+        model = self._rope_model(flash_decode=True, position_embedding_type=position_embedding_type)
+        with pytest.raises(ValueError, match="Flash decode is only applicable to static batching"):
+            DynamicInferenceContext(
+                model_config=model.config,
+                inference_config=InferenceConfig(
+                    max_sequence_length=self.max_sequence_length,
+                    buffer_size_gb=0.05,
+                    block_size_tokens=256,
+                    mamba_inference_state_config=MambaInferenceStateConfig.from_model(model),
+                    unified_memory_level=0,
+                ),
+            )
+
+    def test_yarn_is_rejected(self):
+        model = self._model(_make_yarn_config(flash_decode=True), position_embedding_type="yarn")
+        context = StaticInferenceContext(self.batch_size, self.max_sequence_length)
+        input_ids = self._prompt()[:, :-1]
+        position_ids = torch.arange(self.prompt_length, device="cuda").repeat(self.batch_size, 1)
+        with pytest.raises(NotImplementedError, match="YarnRotaryEmbedding"):
+            self._forward(model, context, input_ids, position_ids)

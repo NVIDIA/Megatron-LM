@@ -496,6 +496,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
@@ -504,9 +505,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         elif self.position_embedding_type == 'yarn' and (
             self.hybrid_layer_config_list is None or list_section_needs_standard_rope
         ):
+            # YaRN rejects rotary_interleaved, which it does not implement.
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
@@ -523,6 +526,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+
+        # Cache for RoPE tensors which do not change between iterations.
+        self.rotary_pos_emb_cache = {}
+
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -804,24 +811,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+        rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin = (
+            self._rotary_pos_emb_inputs(
+                inference_context,
+                decoder_input,
+                packed_seq_params,
+                decoder_uses_mla=self._decoder_uses_mla,
             )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
-        elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
+        )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
@@ -879,6 +876,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=decoder_rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 padding_mask_by_layout=padding_mask_by_layout,
