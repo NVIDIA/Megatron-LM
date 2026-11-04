@@ -246,14 +246,29 @@ def _saved_checkpoint_policy(checkpoint_config: Optional[dict], ckpt_args) -> ty
     )
 
 
+def _resolve_load_iteration(load_dir: Optional[str]) -> tuple[int, bool, str]:
+    """The iteration and release flag a load directory points at: ``latest_train_state.pt`` when
+    present (the authoritative tracker since the train state owns the resume facts), the legacy
+    ``latest_checkpointed_iteration.txt`` otherwise; ``(-1, False, ...)`` when neither exists. The
+    third item names the legacy tracker, for the message of a missing checkpoint."""
+    iteration, release = -1, False
+    tracker_filename = 'because load directory is not defined'
+    if load_dir is not None:
+        latest_state_filename = get_checkpoint_train_state_filename(load_dir, prefix="latest")
+        if file_exists(latest_state_filename):
+            latest_ckpt_state = read_train_state(latest_state_filename)
+            iteration, release = latest_ckpt_state.iteration, latest_ckpt_state.release
+        else:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if maybe_msc.os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+    return iteration, release, tracker_filename
+
+
 def _get_load_checkpoint_path(load_dir: Optional[str], checkpoint: CheckpointConfig) -> str:
     """The base directory a load reads: the tracked iteration of ``load_dir`` (the directory the
     load resolved, after a pretrained-checkpoint fallback), or ``checkpoint.ckpt_step``."""
-    iteration, release = -1, False
-    if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if maybe_msc.os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
+    iteration, release, _ = _resolve_load_iteration(load_dir)
     if checkpoint.ckpt_step:
         iteration = checkpoint.ckpt_step
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
@@ -2303,18 +2318,7 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, checkpoint, checkpointing_context
     )
-    iteration, release = -1, False
-    tracker_filename = 'because load directory is not defined'
-    if load_dir is not None:
-        latest_state_filename = get_checkpoint_train_state_filename(load_dir, prefix="latest")
-        if file_exists(latest_state_filename):
-            latest_ckpt_state = read_train_state(latest_state_filename)
-            iteration = latest_ckpt_state.iteration
-            release = latest_ckpt_state.release
-        else:
-            tracker_filename = get_checkpoint_tracker_filename(load_dir)
-            if maybe_msc.os.path.isfile(tracker_filename):
-                iteration, release = read_metadata(tracker_filename)
+    iteration, release, tracker_filename = _resolve_load_iteration(load_dir)
 
     # Allow user to specify the loaded iteration.
     if checkpoint.ckpt_step:
@@ -3535,11 +3539,11 @@ def load_checkpoint(
                 and not is_torch_dist
                 and ckpt_format not in ['torch_dcp', 'fsdp_dtensor']
             ):
-                # NOTE: this is a manual read of the tracker file.
+                # NOTE: this is a manual read of the trackers (the train-state file first, the
+                # legacy text tracker otherwise).
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
-                tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
+                iteration, release, _ = _resolve_load_iteration(load_dir)
                 model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
                 optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
                     model_checkpoint_name

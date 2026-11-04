@@ -49,7 +49,10 @@ from megatron.training.config import (
 )
 from megatron.training.global_vars import get_args, get_run_config, set_args
 from megatron.training.state import TrainState
-from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+from megatron.training.utils.checkpoint_utils import (
+    get_checkpoint_run_config_filename,
+    get_checkpoint_train_state_filename,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
@@ -1815,3 +1818,88 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     assert train_state.effective_finetune is True
     assert not hasattr(args, "override_ckpt_iteration") and args.finetune is False
     assert run_config.checkpoint.override_ckpt_iteration is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["both", "train_state_only", "tracker_only", "ckpt_step", "release", "pretrained_fallback"],
+)
+def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
+    init_model_parallel, monkeypatch, run_config, tmp_path, case
+):
+    """The directory handed to the fsdp_dtensor reader comes from the same resolution as the base
+    load: latest_train_state.pt when present, the legacy text tracker otherwise, --ckpt-step over
+    both, the release flag honoured, and the pretrained fallback's directory when --load has no
+    checkpoint."""
+
+    def tracked(directory, tracker=None, train_state=None, release=False):
+        directory.mkdir(parents=True, exist_ok=True)
+        if tracker is not None:
+            with open(get_checkpoint_tracker_filename(str(directory)), "w") as f:
+                f.write("release" if release and train_state is None else str(tracker))
+        if train_state is not None:
+            torch.save(
+                TrainState(iteration=train_state, release=release).state_dict(),
+                get_checkpoint_train_state_filename(str(directory), prefix="latest"),
+            )
+
+    load_dir, pretrained_dir = tmp_path / "load", tmp_path / "pretrained"
+    expected = {
+        "both": (dict(tracker=10, train_state=20), "iter_0000020"),
+        "train_state_only": (dict(train_state=20), "iter_0000020"),
+        "tracker_only": (dict(tracker=10), "iter_0000010"),
+        "ckpt_step": (dict(tracker=10, train_state=20), "iter_0000030"),
+        "release": (dict(tracker=10, train_state=20, release=True), "release"),
+        "pretrained_fallback": (None, "iter_0000020"),
+    }
+    files, leaf = expected[case]
+    if files is not None:
+        tracked(load_dir, **files)
+        wanted = str(load_dir / leaf)
+    else:
+        load_dir.mkdir()  # no checkpoint under --load: the pretrained directory is read
+        tracked(pretrained_dir, tracker=10, train_state=20)
+        wanted = str(pretrained_dir / leaf)
+        run_config.checkpoint.pretrained_checkpoint = str(pretrained_dir)
+    run_config.checkpoint.load = str(load_dir)
+    run_config.checkpoint.ckpt_format = "fsdp_dtensor"
+    if case == "ckpt_step":
+        run_config.checkpoint.ckpt_step = 30
+
+    args = _loader_args(use_megatron_fsdp=True)
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, wanted, False, CheckpointType.FSDP_DTENSOR),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: None)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", mock.Mock())
+    readers = []
+
+    class StopAtTheReader(Exception):
+        pass
+
+    def reader(path):
+        readers.append(path)
+        raise StopAtTheReader  # Before any metadata is read from storage.
+
+    monkeypatch.setattr(checkpointing, "FileSystemReader", reader)
+    with pytest.raises(StopAtTheReader):
+        load_checkpoint([object()], None, None, restore_training_state=True)
+    assert readers == [wanted]
