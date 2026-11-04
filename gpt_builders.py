@@ -29,6 +29,9 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+    # The block specs keep only the layers of this pipeline stage. Without a collection,
+    # the model and the specs both use the global pipeline rank.
+    pp_rank = pg_collection.pp.rank() if pg_collection is not None else None
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
@@ -36,7 +39,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
         if args.experimental_attention_variant is not None:
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
-                config=config, vp_stage=vp_stage
+                config=config, vp_stage=vp_stage, pp_rank=pp_rank
             )
         elif args.num_experts:
             # Define the decoder block spec
@@ -46,10 +49,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
                 vp_stage=vp_stage,
+                pp_rank=pp_rank,
             )
         elif args.heterogeneous_layers_config_path is not None:
             assert not (config.transformer_impl == "inference_optimized")
-            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
+            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                config, use_te, vp_stage=vp_stage, pp_rank=pp_rank
+            )
         else:
             # Define the decoder layer spec
             transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
@@ -84,7 +90,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec_for_mtp,
             use_transformer_engine=use_te,
             vp_stage=vp_stage,
-            pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
+            pp_rank=pp_rank,
         )
 
     model = GPTModel(
