@@ -34,7 +34,8 @@ TMEM_RANGES = (
     ("slot_a", 320, 384, "seed", "inv_out"),
     # Token-major slot B: dv_new, D, then dAqk.
     ("slot_b", 384, 448, "seed", "inv_mid"),
-    # Intra-chunk partial ring (two channel-major slots).
+    # Intra-chunk partial ring (two channel-major slots; with a dS tape, which
+    # leaves "dh" unused, two more slots at columns 0 and 64).
     ("ring", 320, 448, "intra", "intra"),
     # Channel-major gate column (lane = key channel, column = token).
     ("gate", 448, 512, "seed", "epilogue"),
@@ -67,9 +68,10 @@ class SharedStorage:
 
     # One-shot role edges, indexed by the kernel's _EDGE_* constants.
     edges: cute.struct.MemRange[cutlass.Int64, 32]
-    # Two-slot intra ring: full (MMA commit) and empty (one arrival per consumer warp) barriers per slot.
-    ring_full: cute.struct.MemRange[cutlass.Int64, 2]
-    ring_empty: cute.struct.MemRange[cutlass.Int64, 2]
+    # Intra ring (two slots, four with a dS tape): full (MMA commit) and empty
+    # (one arrival per consumer warp) barriers per slot.
+    ring_full: cute.struct.MemRange[cutlass.Int64, 4]
+    ring_empty: cute.struct.MemRange[cutlass.Int64, 4]
     # Two-CTA split: the other CTA arrives once dS for this CTA's next chunk is ready.
     ds_ready: cute.struct.MemRange[cutlass.Int64, 1]
     tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]

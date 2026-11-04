@@ -470,6 +470,17 @@ class FusedKdaBwdKernel:
         self.io_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
 
+    @property
+    def ring_slots(self):
+        """Intra ring depth: with a dS tape the unused "dh" columns add two slots."""
+        return 4 if self.tape else 2
+
+    def _ring_column(self, slot):
+        """First TMEM column of ring slot ``slot`` (a compile-time index)."""
+        if slot < 2:
+            return tmem_offset("ring") + slot * 64
+        return tmem_offset("dh") + (slot - 2) * 64
+
     def _ctas(self, ways):
         """CTAs per (sequence, head): runtime with a dS tape, else the compiled ``split``."""
         if cutlass.const_expr(self.tape):
@@ -688,9 +699,17 @@ class FusedKdaBwdKernel:
         self._plan = build_kda_layout_plan(self.io_dtype, self.acc_dtype)
         canonical = self._plan.canonical
         self._ways = self._ctas(ways)
-        part = block % self._ways
-        sequence = block // self._ways // self.heads
-        head = block // self._ways % self.heads
+        if cutlass.const_expr(self.tape):
+            # Part-major: the first wave holds part 0 of every (sequence, head),
+            # whose chunks the recurrence writes first.
+            pairs = (cute.size(cu_seqlens, mode=[0]) - 1) * self.heads
+            part = block // pairs
+            sequence = block % pairs // self.heads
+            head = block % self.heads
+        else:
+            part = block % self._ways
+            sequence = block // self._ways // self.heads
+            head = block // self._ways % self.heads
         storage = cutlass.utils.SmemAllocator().allocate(SharedStorage)
 
         edges = storage.edges.data_ptr()
@@ -728,7 +747,7 @@ class FusedKdaBwdKernel:
         if tidx == 0:
             for e in cutlass.range_constexpr(len(_EDGE_COUNTS)):
                 cute.arch.mbarrier_init(edges + e, _EDGE_COUNTS[e])
-            for s in cutlass.range_constexpr(2):
+            for s in cutlass.range_constexpr(self.ring_slots):
                 cute.arch.mbarrier_init(ring_full + s, 1)
                 cute.arch.mbarrier_init(ring_empty + s, 8)
             # One arrival per consumer warpgroup of the other CTA.
@@ -749,6 +768,17 @@ class FusedKdaBwdKernel:
         seq_len = cu_seqlens[sequence + 1] - seq_start
         chunk_base = chunk_offsets[sequence]
         num_chunks = chunk_offsets[sequence + 1] - chunk_base
+        # This CTA's chunks, as reverse indices it = first + j * stride (j < count).
+        if cutlass.const_expr(self.tape):
+            # A contiguous run, so each next chunk is the next one the recurrence writes.
+            per = (num_chunks + self._ways - 1) // self._ways
+            self._chunk_first = part * per
+            self._chunk_count = cutlass.max(cutlass.min(per, num_chunks - part * per), 0)
+            self._chunk_stride = 1
+        else:
+            self._chunk_first = part
+            self._chunk_count = (num_chunks - part + self._ways - 1) // self._ways
+            self._chunk_stride = self._ways
 
         if warp < 8:
             cute.arch.setmaxregister_increase(_CM_REGISTERS)
@@ -935,8 +965,8 @@ class FusedKdaBwdKernel:
         s_aqk, s_akk = _view(smem.aqk, l_square), _view(smem.akk, l_square)
         s_h = _view(smem.h, l_state)
         group = (cutlass.Int32(0), head)
-        for j in cutlass.range((num_chunks - part + self._ways - 1) // self._ways):
-            it = part + j * self._ways
+        for j in cutlass.range(self._chunk_count):
+            it = self._chunk_first + j * self._chunk_stride
             chunk = num_chunks - 1 - it
             row = seq_start + chunk * _BT
             if j > 0:
@@ -1095,18 +1125,18 @@ class FusedKdaBwdKernel:
         acc_dq = self._acc(tmem, tmem_offset("dq"), mma_ch128, (_DK, _BT))
         acc_dkp = self._acc(tmem, tmem_offset("dk_plus"), mma_ch128, (_DK, _BT))
         acc_dkm = self._acc(tmem, tmem_offset("dk_minus"), mma_ch128, (_DK, _BT))
-        ring = (
-            self._acc(tmem, tmem_offset("ring"), mma_lower, (_DK, _BT)),
-            self._acc(tmem, tmem_offset("ring") + 64, mma_lower, (_DK, _BT)),
-        )
+        ring = [
+            self._acc(tmem, self._ring_column(s), mma_lower, (_DK, _BT))
+            for s in range(self.ring_slots)
+        ]
 
-        for j in cutlass.range((num_chunks - part + self._ways - 1) // self._ways):
+        for j in cutlass.range(self._chunk_count):
             # This CTA's chunks; j indexes them for the one-shot edges.
-            it = part + j * self._ways
+            it = self._chunk_first + j * self._chunk_stride
             # Every CTA of a (sequence, head) runs the dS recursion; only the
             # chunk's owner runs the intra-chunk and dq/dk work (phases C-E).
             owned = True
-            ring_base = j * 6
+            ring_base = j * (12 // self.ring_slots)
             # Phase A: X = kG S; dvn = kgL dS + Aqk^T dO; dH += (q G scale)^T dO.
             self._wait(edges, _E_READY_A, j)
             self._stamp(trace, 2, 0, j)
@@ -1234,8 +1264,8 @@ class FusedKdaBwdKernel:
             self._stamp(trace, 2, 8, j)
             if owned:
                 for r in cutlass.range_constexpr(12):
-                    slot = r % 2
-                    use = ring_base + r // 2
+                    slot = r % self.ring_slots
+                    use = ring_base + r // self.ring_slots
                     if use > 0:
                         cute.arch.mbarrier_wait(ring_empty + slot, (use - 1) & 1)
                     block = r % 4
@@ -1368,9 +1398,9 @@ class FusedKdaBwdKernel:
                 # An empty sequence passes its final-state gradient through.
                 for c in cutlass.range_constexpr(_DV):
                     dh0[sequence, head, ttidx, c] = dht[sequence, head, ttidx, c]
-        for j in cutlass.range((num_chunks - part + self._ways - 1) // self._ways):
+        for j in cutlass.range(self._chunk_count):
             # This CTA's chunks; j indexes them for the one-shot edges.
-            it = part + j * self._ways
+            it = self._chunk_first + j * self._chunk_stride
             chunk = num_chunks - 1 - it
             tok0 = seq_start + chunk * _BT
             valid = cutlass.min(_BT, seq_len - chunk * _BT)
@@ -1557,7 +1587,7 @@ class FusedKdaBwdKernel:
                 debug_out,
                 gchunk,
             )
-            self._stamp(trace, half, 9, j)
+            self._stamp(trace, half, 15, j)
             self._cm_epilogue(
                 half,
                 ttidx,
@@ -1583,7 +1613,6 @@ class FusedKdaBwdKernel:
                 if ttidx < valid:
                     dbeta[0, tok0 + ttidx, head] = s_dbeta[ttidx]
             self._arrive(edges, _E_FREE, bar, ttidx)
-            self._stamp(trace, half, 10, j)
 
     @cute.jit
     def _tk_value_b(self, ttidx, gchunk, head, valid, smem, edges, tmem, debug_out, l_token, mma_x):
@@ -1847,7 +1876,8 @@ class FusedKdaBwdKernel:
     ):
         """Gate-scaled operand tiles in a token-row mapping (8 channels per vector).
 
-        kind 0: k*G -> sKA, k*2^(G_L-G) -> sKB, scale*q*G -> sQA (phase A).
+        kind 0: k*G -> sKA, k*2^(G_L-G) -> sKB, scale*q*G -> sQA (phase A); with a
+                tape only k*G (the other two feed the dS recurrence).
         kind 1: -(k*beta*G) -> sKA (phase B, after x_state consumed k*G).
         kind 2: anchored BF16 hi/lo pairs for the intra MMAs: k_low -> sDS halves,
                 q_up -> sKA/sKB, (beta k)_up -> sQA/sT21.
@@ -1875,34 +1905,41 @@ class FusedKdaBwdKernel:
         base_t21 = cutlass.Int32(smem.t21.toint())
         base_ds = cutlass.Int32(smem.ds.toint())
         c0 = (u % 16) * 8
+        g_row = g_base + head_offset + c0 * 4
+        # Gate rows of the next row, loaded one iteration ahead.
+        g_next = cute.make_rmem_tensor((8,), cutlass.Float32)
+        a_next = cute.make_rmem_tensor((8,), cutlass.Float32)
+        b_next = cute.make_rmem_tensor((8,), cutlass.Float32)
+        self._row_gates(
+            kind, half * 32 + u // 16, g_row, row_stride, tok0, valid, g_next, a_next, b_next
+        )
         # Rolled: the four rows share one copy of the code (instruction cache).
         for i in cutlass.range(4, unroll=1):
             row = half * 32 + u // 16 + 8 * i
             live = row < valid
-            _load_shared_bf16x8(_swz_token(base_k, row, c0), kv)
-            if cutlass.const_expr(kind != 1):
-                _load_shared_bf16x8(_swz_token(base_q, row, c0), qv)
-            g_row = g_base + head_offset + c0 * 4
-            _ldg_f32x8(g_row + (tok0 + cutlass.min(row, valid - 1)) * row_stride, g8)
-            if cutlass.const_expr(kind == 0):
-                _ldg_f32x8(g_row + (tok0 + valid - 1) * row_stride, a8)
-            if cutlass.const_expr(kind == 2):
-                first = (row // _BC) * _BC
-                _ldg_f32x8(
-                    g_row + (tok0 + cutlass.min(first + _BC - 1, valid - 1)) * row_stride, a8
+            for e in cutlass.range_constexpr(8):
+                g8[e] = g_next[e]
+                a8[e] = a_next[e]
+                b8[e] = b_next[e]
+            if i < 3:
+                self._row_gates(
+                    kind, row + 8, g_row, row_stride, tok0, valid, g_next, a_next, b_next
                 )
-                _ldg_f32x8(g_row + (tok0 + cutlass.min(first, valid - 1)) * row_stride, b8)
+            _load_shared_bf16x8(_swz_token(base_k, row, c0), kv)
+            if cutlass.const_expr(kind == 2 or (kind == 0 and not self.tape)):
+                _load_shared_bf16x8(_swz_token(base_q, row, c0), qv)
             beta = s_beta[row]
             for e in cutlass.range_constexpr(8):
                 k_value = kv[e].to(self.acc_dtype) if live else cutlass.Float32(0.0)
                 if cutlass.const_expr(kind == 0):
-                    q_value = qv[e].to(self.acc_dtype) if live else cutlass.Float32(0.0)
                     gamma = cute.math.exp2(g8[e], fastmath=True)
                     o0[e] = (k_value * gamma).to(self.io_dtype)
-                    o1[e] = (k_value * cute.math.exp2(a8[e] - g8[e], fastmath=True)).to(
-                        self.io_dtype
-                    )
-                    o2[e] = (scale * q_value * gamma).to(self.io_dtype)
+                    if cutlass.const_expr(not self.tape):
+                        q_value = qv[e].to(self.acc_dtype) if live else cutlass.Float32(0.0)
+                        o1[e] = (k_value * cute.math.exp2(a8[e] - g8[e], fastmath=True)).to(
+                            self.io_dtype
+                        )
+                        o2[e] = (scale * q_value * gamma).to(self.io_dtype)
                 if cutlass.const_expr(kind == 1):
                     o0[e] = (-(k_value * beta) * cute.math.exp2(g8[e], fastmath=True)).to(
                         self.io_dtype
@@ -1924,8 +1961,9 @@ class FusedKdaBwdKernel:
                     o5[e] = (upper_k - hi.to(self.acc_dtype)).to(self.io_dtype)
             if cutlass.const_expr(kind == 0):
                 _store_shared_bf16x8(_swz_token(base_ka, row, c0), o0)
-                _store_shared_bf16x8(_swz_token(base_kb, row, c0), o1)
-                _store_shared_bf16x8(_swz_token(base_qa, row, c0), o2)
+                if cutlass.const_expr(not self.tape):
+                    _store_shared_bf16x8(_swz_token(base_kb, row, c0), o1)
+                    _store_shared_bf16x8(_swz_token(base_qa, row, c0), o2)
             if cutlass.const_expr(kind == 1):
                 _store_shared_bf16x8(_swz_token(base_ka, row, c0), o0)
             if cutlass.const_expr(kind == 2):
@@ -1935,6 +1973,18 @@ class FusedKdaBwdKernel:
                 _store_shared_bf16x8(_swz_token(base_kb, row, c0), o3)
                 _store_shared_bf16x8(_swz_token(base_qa, row, c0), o4)
                 _store_shared_bf16x8(_swz_token(base_t21, row, c0), o5)
+
+    @cute.jit
+    def _row_gates(self, kind: cutlass.Constexpr, row, g_row, row_stride, tok0, valid, g8, a8, b8):
+        """Issue the gate loads of one ``_row_tiles`` row: its own gate row and the
+        anchors the kind needs (rows clamped to the chunk tail)."""
+        _ldg_f32x8(g_row + (tok0 + cutlass.min(row, valid - 1)) * row_stride, g8)
+        if cutlass.const_expr(kind == 0 and not self.tape):
+            _ldg_f32x8(g_row + (tok0 + valid - 1) * row_stride, a8)
+        if cutlass.const_expr(kind == 2):
+            first = (row // _BC) * _BC
+            _ldg_f32x8(g_row + (tok0 + cutlass.min(first + _BC - 1, valid - 1)) * row_stride, a8)
+            _ldg_f32x8(g_row + (tok0 + cutlass.min(first, valid - 1)) * row_stride, b8)
 
     @cute.jit
     def _cm_phase_a(
@@ -2080,8 +2130,10 @@ class FusedKdaBwdKernel:
 
     @cute.jit
     def _cm_phase_b(self, half, d, head, tok0, valid, smem, gc, s_beta):
-        """kG -> -(k beta G) for dh_k once x_state has consumed kG."""
-        self._row_tiles(1, half, d, head, tok0, valid, smem, gc, s_beta, cutlass.Float32(0.0))
+        """kG -> -(k beta G) for dh_k once x_state has consumed kG (the dS
+        recurrence; nothing to do with a tape)."""
+        if cutlass.const_expr(not self.tape):
+            self._row_tiles(1, half, d, head, tok0, valid, smem, gc, s_beta, cutlass.Float32(0.0))
 
     @cute.jit
     def _cm_phase_c(
@@ -2157,8 +2209,8 @@ class FusedKdaBwdKernel:
         lo_t0 = lo[2] if half == 1 else lo[0]
         lo_t1 = lo[3] if half == 1 else lo[1]
         for r in cutlass.range_constexpr(12):
-            slot = r % 2
-            use = j * 6 + r // 2
+            slot = r % self.ring_slots
+            use = j * (12 // self.ring_slots) + r // self.ring_slots
             block = r % 4
             lower = r < 8
             if cutlass.const_expr(block == 0):
@@ -2168,7 +2220,7 @@ class FusedKdaBwdKernel:
             # Blocks this half's tokens do not see contribute zero factors.
             touches = (half * 2 + 1 >= block) if lower else (half * 2 <= block)
             if touches:
-                _tmem_ld32_async(lane_base + tmem_offset("ring") + slot * 64 + col, buf)
+                _tmem_ld32_async(lane_base + self._ring_column(slot) + col, buf)
                 # Per-slot scalars for the two token blocks of this half.
                 exact = up[block] - lo[block] >= DIAG_SPAN_LIMIT
                 if cutlass.const_expr(lower):
