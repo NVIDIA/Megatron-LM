@@ -36,7 +36,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
-from tests.unit_tests.distributed.mfsdp_v2.training_utils import train_with_mse
+from tests.unit_tests.distributed.mfsdp_v2.training_utils import MSETrainer
 
 logger = logging.getLogger(__name__)
 
@@ -460,12 +460,9 @@ def test_losses_match_baseline(
     target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    baseline_losses = train_with_mse(
-        baseline, baseline_optimizer, microbatches, context=context, set_to_none=set_to_none
-    )
-    sharded_losses = train_with_mse(
-        model, optimizer, microbatches, context=context, set_to_none=set_to_none
-    )
+    trainer = MSETrainer(set_to_none=set_to_none)
+    baseline_losses = trainer.train(baseline, baseline_optimizer, microbatches, context=context)
+    sharded_losses = trainer.train(model, optimizer, microbatches, context=context)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
@@ -896,8 +893,9 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
     target = torch.randn(num_microbatches, 2, 4, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    baseline_losses = train_with_mse(baseline, baseline_optimizer, microbatches, context=context)
-    sharded_losses = train_with_mse(model, optimizer, microbatches, context=context)
+    trainer = MSETrainer()
+    baseline_losses = trainer.train(baseline, baseline_optimizer, microbatches, context=context)
+    sharded_losses = trainer.train(model, optimizer, microbatches, context=context)
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
