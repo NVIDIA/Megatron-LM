@@ -1838,7 +1838,8 @@ class FusedKdaBwdKernel:
         base_t21 = cutlass.Int32(smem.t21.toint())
         base_ds = cutlass.Int32(smem.ds.toint())
         c0 = (u % 16) * 8
-        for i in cutlass.range_constexpr(4):
+        # Rolled: the four rows share one copy of the code (instruction cache).
+        for i in cutlass.range(4, unroll=1):
             row = half * 32 + u // 16 + 8 * i
             live = row < valid
             _load_shared_bf16x8(_swz_token(base_k, row, c0), kv)
@@ -2433,7 +2434,8 @@ class FusedKdaBwdKernel:
         dg_last = s_xchg[d] + s_xchg[_DK + d]
         self._stamp(trace, half, 12, it)
         running = cutlass.Float32(0.0)
-        for grp in cutlass.range_constexpr(4):
+        # Rolled like _row_tiles.
+        for grp in cutlass.range(4, unroll=1):
             g0 = col + (3 - grp) * 8
             _tmem_ldn_async(lane_base + tmem_offset("dk_plus") + g0, dkp, 8)
             _tmem_ldn_async(lane_base + tmem_offset("dk_minus") + g0, dkm, 8)
@@ -2462,7 +2464,7 @@ class FusedKdaBwdKernel:
         cute.arch.barrier(barrier_id=_BAR_CH_TK, number_of_threads=256)
         self._stamp(trace, half, 14, it)
         carry = s_suffix[d] if half == 0 else cutlass.Float32(0.0)
-        for grp in cutlass.range_constexpr(4):
+        for grp in cutlass.range(4, unroll=1):
             g0 = col + grp * 8
             _tmem_ldn_async(lane_base + tmem_offset("dq") + g0, dqv, 8)
             _tmem_wait_ld()
