@@ -347,7 +347,7 @@ def combined_forward_backward_step(
         checkpoint_activations_microbatch is None
     ), "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
 
-    from .schedules import set_current_microbatch
+    from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 
     if fsdp_wrapper is not None and b_model is not None:
         fsdp_wrapper.pre_backward()
@@ -366,8 +366,11 @@ def combined_forward_backward_step(
     if f_model is not None:
         if is_first_microbatch and hasattr(f_model, 'set_is_first_microbatch'):
             f_model.set_is_first_microbatch()
-        if current_microbatch is not None:
-            set_current_microbatch(f_model, current_microbatch)
+        if (
+            getattr(config, 'cuda_graph_impl', None) == "transformer_engine"
+            and current_microbatch is not None
+        ):
+            set_te_cuda_graph_current_microbatch(f_model, current_microbatch)
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
             unwrap_output_tensor = True

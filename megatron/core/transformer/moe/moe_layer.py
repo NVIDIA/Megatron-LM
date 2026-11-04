@@ -27,10 +27,10 @@ from megatron.core.transformer.moe.megakernel import (
     prepare_megakernel_shared_expert_config,
 )
 from megatron.core.transformer.moe.moe_utils import (
-    MoECudaGraphPartialCaptureSignal,
-    MoECudaGraphTensorStore,
+    TEMoECudaGraphPartialCaptureSignal,
+    TEMoECudaGraphTensorStore,
     get_default_pg_collection,
-    maybe_skip_or_early_return_by_cudagraph,
+    maybe_skip_or_early_return_by_te_cuda_graph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -221,13 +221,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
         # MoonEP starts its planner in preprocess, then overlaps it with shared-expert compute.
-        self.run_shared_experts_after_router = self.config.moe_virtual_expert_load_balance and not (
-            self.config.cuda_graph_impl == "transformer_engine"
-            and bool(
-                {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
-                & set(self.config.cuda_graph_modules)
-            )
-        )
+        self.run_shared_experts_after_router = self.config.moe_virtual_expert_load_balance
 
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
@@ -250,7 +244,96 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayer(BaseMoELayer):
+class MoELayerTECudaGraphMixin:
+    """Resume MoE work after a parent graph captured the router or preprocessing.
+
+    The parent retains graph ownership; this mixin restores the MoE intermediates
+    and resumes its eager operations without registering a second graph.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.config.cuda_graph_impl == "transformer_engine":
+            # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
+            self.te_cuda_graph_tensor_store = TEMoECudaGraphTensorStore()
+            if {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess} & set(
+                self.config.cuda_graph_modules
+            ):
+                self.run_shared_experts_after_router = False
+
+    def _te_cuda_graph_resume(self, cuda_graph_output, padding_mask, packed_seq_params=None):
+        """Restore captured intermediates and resume the eager MoE steps.
+
+        The parent retains the residual. With EP overlap, the schedule owns the
+        remaining work and receives (hidden_states, probs, shared_expert_output).
+        """
+        shared_expert_output, routing_map = None, None
+        if (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+        ):
+            # The shared expert output is the last second element in the CUDA graph output.
+            shared_expert_output = cuda_graph_output.pop()
+
+        if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
+            # CUDA graph output is [hidden_states, probs] + attributes outputs.
+            (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
+            valid_cudagraph_attrs = self.token_dispatcher.valid_cudagraph_attrs
+            assert len(attr_outputs) == len(
+                valid_cudagraph_attrs
+            ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+            for i, attr_name in enumerate(valid_cudagraph_attrs):
+                hier_attr_name = attr_name.split('.')
+                attr = self.token_dispatcher
+                for name in hier_attr_name[:-1]:
+                    attr = getattr(attr, name)
+                setattr(attr, hier_attr_name[-1], attr_outputs[i])
+        else:
+            # CUDA graph output is [hidden_states, probs, routing_map].
+            assert len(cuda_graph_output) == 3, (
+                "CUDA graph output should be [hidden_states, probs, routing_map], "
+                f"but got {len(cuda_graph_output)} elements"
+            )
+            hidden_states, probs, routing_map = cuda_graph_output
+
+        # Resume the MoELayer forward pass from the end of the CUDA graph scope.
+        # The MoE layer will skip redundant computations when we pass in the calculated values
+        # through the keyword arguments. See MoELayer.forward docstring for more details.
+        nvtx_range_push(suffix="mlp")
+        self.te_cuda_graph_tensor_store.set(
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+            shared_expert_output=shared_expert_output,
+        )
+        # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
+        # and should be skipped here.
+        if self.config.overlap_moe_expert_parallel_comm:
+            probs, routing_map = self.route(hidden_states, padding_mask)
+            hidden_states, probs = self.preprocess(
+                hidden_states, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+            )
+            nvtx_range_pop(suffix="mlp")
+            return hidden_states, probs, shared_expert_output
+        # The cached router outputs are unmasked; eager preprocess needs the replay mask
+        # so the dispatcher can exclude padded rows.
+        mlp_output_with_bias = apply_module(self)(hidden_states, padding_mask=padding_mask)
+        self.te_cuda_graph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+
+        return mlp_output_with_bias
+
+    def _te_cuda_graph_pre_dispatch(self, hidden_states, padding_mask, packed_seq_params=None):
+        """Run the eager MoE prefix after an attention-only graph for EP overlap."""
+        shared_expert_output = self.shared_experts_compute(hidden_states)
+        probs, routing_map = self.route(hidden_states, padding_mask)
+        hidden_states, probs = self.preprocess(
+            hidden_states, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+        )
+        return hidden_states, probs, shared_expert_output
+
+
+class MoELayer(MoELayerTECudaGraphMixin, BaseMoELayer):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
@@ -483,8 +566,6 @@ class MoELayer(BaseMoELayer):
                 )
             self._setup_inference_mode(pg_collection)
 
-        # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
-        self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
         # Setup events and streams for delayed wgrad computation.
@@ -553,7 +634,7 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
-    @maybe_skip_or_early_return_by_cudagraph("route")
+    @maybe_skip_or_early_return_by_te_cuda_graph("route")
     def route(
         self,
         hidden_states: torch.Tensor,
@@ -584,7 +665,7 @@ class MoELayer(BaseMoELayer):
             )
         return probs, routing_map
 
-    @maybe_skip_or_early_return_by_cudagraph("preprocess")
+    @maybe_skip_or_early_return_by_te_cuda_graph("preprocess")
     def preprocess(
         self,
         hidden_states: torch.Tensor,
@@ -655,7 +736,7 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
-    @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
+    @maybe_skip_or_early_return_by_te_cuda_graph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -849,8 +930,8 @@ class MoELayer(BaseMoELayer):
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
 
-            except MoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
+            except TEMoECudaGraphPartialCaptureSignal as e:
+                # This signal is raised from the maybe_skip_or_early_return_by_te_cuda_graph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].
