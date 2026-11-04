@@ -213,7 +213,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
         return symm_mem_buffer
 
-    def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> None:
+    def _all_gather(self, x: torch.Tensor, symm_mem_buffer: dict) -> torch.Tensor:
         """
         Attempt an NVLS all-gather into symmetric memory. If not possible,
         revert to torch dist (NCCL) all-gather.
@@ -242,6 +242,20 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             # revert to torch dist (NCCL) all gather
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
+
+    def forward_normalized(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """Project an already normalized input, preserving the TP all-gather.
+
+        The caller supplies the normalized BF16 tensor separately from its
+        residual stream. This does not use ``skip_norm_and_all_gather``: the
+        fused residual norm does not perform communication.
+        """
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("forward_normalized is an inference-only entry point")
+        if self.tp_size > 1:
+            buffer = self._maybe_allocate_symmetric_buffer(x)
+            x = self._all_gather(x, buffer)
+        return _apply_linear(x, self.weight, self.config), None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """
