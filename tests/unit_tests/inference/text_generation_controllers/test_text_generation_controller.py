@@ -301,6 +301,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         ),
         prepare_requests=mock.Mock(),
         commit_sampled_tokens=mock.Mock(),
+        capture_prompt_logprob_writes=mock.Mock(return_value=[]),
+        commit_prompt_logprob_writes=mock.Mock(),
         update_requests=mock.Mock(return_value={}),
         resolve_requests=mock.Mock(
             return_value=(torch.empty(0, dtype=torch.int32), torch.arange(metadata_len))
@@ -325,6 +327,9 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
     context.get_committed_kv_block_counts = lambda rows: (
         DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
+    )
+    context.get_committed_kv_block_ids = lambda row: (
+        DynamicInferenceContext.get_committed_kv_block_ids(context, row)
     )
     # Bind the real flags so the fake exercises the production no-op-filter gate.
     context.active_sampling_filter_flags = lambda count=None: (

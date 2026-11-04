@@ -44,6 +44,9 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
+from megatron.core.transformer.moe.training_matches_inference import (
+    training_matches_inference_forward,
+)
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -579,13 +582,14 @@ class MoELayer(BaseMoELayer):
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
         passed through untouched and the dispatcher decides whether its backend excludes padded
-        rows.
+        rows. ``packed_seq_params`` tells the dispatcher whether the input is packed (THD).
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -616,9 +620,14 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
+            # padded rows) and the packed-sequence metadata.
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, padding_mask=padding_mask
+                hidden_states,
+                routing_map,
+                probs,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
             )
         else:
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -806,7 +815,11 @@ class MoELayer(BaseMoELayer):
                         layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
                     )
                     hidden_states, probs = self.preprocess(
-                        layer_input, probs, routing_map, padding_mask
+                        layer_input,
+                        probs,
+                        routing_map,
+                        padding_mask,
+                        packed_seq_params=packed_seq_params,
                     )
 
                     if self.run_shared_experts_after_router:
@@ -826,8 +839,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
@@ -846,6 +858,11 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
+            return training_matches_inference_forward(
+                self, custom_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
+            )
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
