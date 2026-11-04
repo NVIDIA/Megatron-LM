@@ -174,7 +174,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
