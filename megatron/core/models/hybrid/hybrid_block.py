@@ -1027,6 +1027,7 @@ class HybridStack(MegatronModule):
                                     padding_mask=padding_mask,
                                     input_ids=input_ids,
                                     attn_res_sources=layer_attn_res_sources,
+                                    strict_runtime_validation=strict_runtime_validation,
                                 )
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata

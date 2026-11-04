@@ -1312,6 +1312,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     rotary_pos_emb=kwargs.get("rotary_pos_emb"),
                     sequence_len_offset=kwargs.get("sequence_len_offset"),
                     packed_seq_params=kwargs.get("packed_seq_params"),
+                    strict_runtime_validation=kwargs.get("strict_runtime_validation"),
                     input_is_normalized=input_is_normalized,
                 )
             )
@@ -2995,6 +2996,7 @@ class AttnResTransformerLayer(TransformerLayer):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        strict_runtime_validation: Optional[bool] = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
         inference_params: Optional[Any] = None,
@@ -3033,6 +3035,7 @@ class AttnResTransformerLayer(TransformerLayer):
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                strict_runtime_validation=strict_runtime_validation,
                 input_is_normalized=self._fuse_input_norm,
             )
         )

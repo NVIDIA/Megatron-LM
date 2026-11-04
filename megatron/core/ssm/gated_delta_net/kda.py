@@ -647,6 +647,7 @@ class KimiDeltaAttention(_GDNBase):
                     cu_seqlens_q,
                     packed_seq_params,
                     chunkwise_cp_context,
+                    strict_runtime_validation,
                 )
 
             # Quantized recompute must restore TE's FP8/FP4 state, matching the
@@ -678,6 +679,7 @@ class KimiDeltaAttention(_GDNBase):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+                strict_runtime_validation,
             )
 
         if back_to_input_converter is not None:
@@ -699,6 +701,7 @@ class KimiDeltaAttention(_GDNBase):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        strict_runtime_validation,
     ):
         """Core KDA computation (projections -> conv1d -> KDA -> norm -> out_proj)."""
 
@@ -807,6 +810,7 @@ class KimiDeltaAttention(_GDNBase):
                 cp_size_headwise=cp_size_headwise,
                 raw_g=raw_g,
                 gate=gate,
+                strict_runtime_validation=strict_runtime_validation,
             )
             nvtx_range_pop(suffix="fused_streamed_pre_kda")
         else:
