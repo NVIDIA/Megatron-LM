@@ -804,6 +804,112 @@ def _worker_dummy_wgrad_not_leaked(rank, world_size, port, repeated_layer=False)
         )
 
 
+def _worker_vocab_wgrad_chunks_match(
+    rank, world_size, port, repeated_layer=False, moe=False, symm=False, chunks=4, microbatches=2
+):
+    """Chunking the output layer's wgrad reduce-scatter must not change the gradients.
+
+    Phase "whole" runs the default path (one full-vocabulary send buffer per backward); phase
+    "chunked" sets ``_wgrad_chunks`` on output_layer.weight so each backward runs K row-block
+    GEMM + reduce-scatter pairs through two small send buffers. Same bytes, same sums in a
+    different order; the gathered gradients must agree to fp32 GEMM tolerance, and the chunked
+    phase must still issue exactly one reduce-scatter call per backward.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+        deregister_and_clear_gtp_symm_pools,
+        register_gtp_symm_pool,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    saved_pad = GTP_CONFIG.pad_for_alignment
+    orig_rs = GTPShardedParam._reduce_scatter
+    grads, losses, rs_counts, chunked_seen = {}, {}, {}, {}
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        for phase, k in (("whole", 1), ("chunked", chunks)):
+            counts = {}
+
+            def _counting_rs(self, wgrads, *a, _counts=counts, **kw):
+                _counts[self._debug_name] = _counts.get(self._debug_name, 0) + 1
+                return orig_rs(self, wgrads, *a, **kw)
+
+            GTPShardedParam._reduce_scatter = _counting_rs
+            ps.destroy_model_parallel()
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                gtp_remat_size=world_size,
+                **_expert_parallel_kwargs(moe, world_size),
+            )
+            model_parallel_cuda_manual_seed(42)
+            torch.manual_seed(42)
+            if symm:
+                register_gtp_symm_pool(ps.get_gtp_weight_remat_group())
+            model = _build_mtp_gpt_model(repeated_layer, moe)
+            classify_gtp_remat_chains([model])
+            seen = {}
+            for name, p in model.named_parameters():
+                if isinstance(p, GTPShardedParam):
+                    p._wgrad_accum_enabled = False
+                    if name.endswith(("output_layer.weight", "word_embeddings.weight")):
+                        assert p._sharded_padded_shape[0] % k == 0, (name, p._sharded_padded_shape)
+                        p._wgrad_chunks = k
+                        seen[name] = k
+            assert seen, "no output_layer GTPShardedParam found"
+            chunked_seen[phase] = seen
+            losses[phase] = _forward_backward(
+                model,
+                main_grad_dtype=torch.bfloat16 if symm else torch.float32,
+                microbatches=microbatches,
+            )
+            wait_for_gtp_grad_reduction_on_current_stream()
+            grads[phase] = _gathered_main_grads(model)
+            rs_counts[phase] = dict(counts)
+            del model
+            ps.destroy_model_parallel()
+            if symm:
+                deregister_and_clear_gtp_symm_pools()
+            GTPShardedParam._chain_state = {}
+            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._link_tables_flushed = False
+    finally:
+        GTPShardedParam._reduce_scatter = orig_rs
+        GTP_CONFIG.pad_for_alignment = saved_pad
+        if symm:
+            deregister_and_clear_gtp_symm_pools()
+
+    if rank != 0:
+        return
+    for name in chunked_seen["chunked"]:
+        assert rs_counts["chunked"].get(name) == rs_counts["whole"].get(name), (
+            name,
+            rs_counts["chunked"].get(name),
+            rs_counts["whole"].get(name),
+        )
+    torch.testing.assert_close(
+        torch.tensor(losses["chunked"]), torch.tensor(losses["whole"]), atol=1e-6, rtol=1e-6
+    )
+    ref, test = grads["whole"], grads["chunked"]
+    assert set(ref) == set(test)
+    worst = (0.0, None)
+    for n, g in ref.items():
+        denom = g.abs().max().item()
+        if denom < 1e-30:
+            continue
+        rel = (g - test[n]).abs().max().item() / denom
+        if rel > worst[0]:
+            worst = (rel, n)
+    assert (
+        worst[0] <= 2e-3
+    ), f"chunked wgrad reduce-scatter changed gradients (max rel {worst[0]:.3e} on {worst[1]})"
+
+
 class TestGTPMTP:
     def test_wgrad_accum_steady_state(self):
         # Iterations 2+ take the early flush; a single-iteration test never reaches it.
@@ -827,6 +933,15 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_wgrad_accum_matches_per_backward_rs, 4, repeated_layer, moe, symm)
+
+    @pytest.mark.parametrize("symm", [False, True], ids=["widen", "zerocopy"])
+    @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_vocab_wgrad_chunks_match_whole(self, repeated_layer, moe, symm):
+        """Chunked output-layer wgrad reduce-scatter == whole-buffer reduce-scatter."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_vocab_wgrad_chunks_match, 4, repeated_layer, moe, symm)
 
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])

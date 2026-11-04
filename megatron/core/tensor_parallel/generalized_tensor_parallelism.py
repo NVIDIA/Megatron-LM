@@ -51,6 +51,7 @@ from megatron.core.tensor_parallel.gtp_eager_wgrad import (
     clear_eager_wgrad_rings,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
     symmetric_wgrad_pool,
 )
@@ -521,6 +522,16 @@ class GTPRematConfig:
     # is added into main_grad unrounded (one BF16 rounding per microbatch). Bypassed at axis
     # size <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
+    # Reduce-scatter a vocabulary weight's wgrad in this many row-block chunks pipelined through
+    # a few small send buffers instead of one full-table send buffer (262k x 10k fp32 = 10 GB
+    # registered for the output layer). Same bytes and FLOPs; 1 = off. Applies to the output
+    # layer and the word embeddings when their padded shard rows divide evenly.
+    vocab_wgrad_chunks: int = 16
+    # Persistent chunk send buffers per chunked weight (each 1/chunks of the full send buffer):
+    # chunk k's GEMM waits for the reduce-scatter of chunk k-buffers, so more buffers hide more
+    # collective latency at proportionally more memory. Two measured the same step time as four
+    # at 64 GPUs with 16 chunks, and 1.9 GiB less resident memory.
+    vocab_wgrad_chunk_buffers: int = 2
     # Persistent slots per scheduling/shape domain. Two slots cover the usual case of one same-key
     # writer per graph. A graph containing multiple same-key writers may need more slots to keep
     # all in-flight RS inputs distinct.
@@ -565,6 +576,31 @@ def tag_gtp_params_with_names(model):
             # output_layer ONLY: the one GTP weight taking several backwards that also runs
             # mcore's linear backward. TE-backed weights never consume the flag.
             param._wgrad_accum_enabled = accum_ok and name.endswith("output_layer.weight")
+            # Chunked vocab wgrad reduce-scatter (see _reduce_scatter_chunked).
+            chunks = GTP_CONFIG.vocab_wgrad_chunks
+            vocab_weight = name.endswith(("output_layer.weight", "word_embeddings.weight"))
+            shard_rows = getattr(param, "_sharded_padded_shape", (0,))[0]
+            param._wgrad_chunks = (
+                chunks
+                if chunks > 1 and vocab_weight and shard_rows and shard_rows % chunks == 0
+                else 1
+            )
+            if param._wgrad_chunks > 1:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[GTP] {name}: wgrad reduce-scatter in {chunks} chunks of "
+                    f"{shard_rows // chunks} rows per rank (send buffer "
+                    f"{param.group.size() * shard_rows // chunks} x {param._unsharded_shape[1]} "
+                    f"instead of {tuple(param._unsharded_shape_padded)})",
+                )
+            elif chunks > 1 and vocab_weight:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"[GTP] {name}: vocab wgrad chunking requested ({chunks}) but the shard rows "
+                    f"({shard_rows}) are not divisible; left unchunked",
+                )
 
 
 def configure_gtp_remat_from_recipe(
@@ -989,6 +1025,89 @@ def wrap_module_params_gtp(
         allweights[0].weight_list = allweights
 
 
+def fill_wgrad_chunk(buf, go, x, N, S, k, valid_cols, wgrad_gemm, cols_buf=None):
+    """Chunk ``k`` of a vocabulary wgrad: ``buf`` [N*b, H] (b = S // K rows per rank) receives,
+    for every rank r, the wgrad rows of global (padded) vocabulary rows
+    [r*S + k*b, r*S + (k+1)*b); rows at or beyond ``valid_cols`` (GTP padding) are zero. A
+    reduce-scatter of ``buf`` over the N ranks then yields rows [k*b, (k+1)*b) of each rank's
+    shard. With ``x`` given, ``wgrad_gemm(out, grad_output, total_input)`` writes
+    grad_output^T @ total_input for the block's columns of ``go`` [T, V]; with ``x`` None,
+    ``go`` is the dense [V, H] gradient and the block's rows are copied. ``cols_buf`` is the
+    reusable [T, N*b] gather operand of the GEMM path (allocated when missing); returns
+    ``(buf, cols_buf)`` so the caller can keep it across chunks and backwards."""
+    b = buf.shape[0] // N
+    H = buf.shape[1]
+    blocks = buf.view(N, b, H)
+    # Padding sits at the tail of the table, so a chunk's blocks are fully valid for the leading
+    # ``full`` ranks, partially valid (``partial`` rows) for the next one and all padding after
+    # it: one strided copy plus at most two fills per chunk. A per-rank loop instead issued
+    # N tiny copies per chunk (12k launches per step at N=64, K=16, three heads) and made the
+    # host the bottleneck at 256 GPUs.
+    full, partial = _chunk_block_extent(N, S, b, k, valid_cols)
+    if x is None:  # ``go`` is the dense [V, H] gradient: copy its rows
+        if full:
+            if go.is_contiguous():
+                blocks[:full].copy_(
+                    go.as_strided((full, b, H), (S * H, H, 1), go.storage_offset() + k * b * H)
+                )
+            else:
+                for r in range(full):
+                    blocks[r].copy_(go[r * S + k * b : r * S + (k + 1) * b])
+        if full < N:
+            c0 = full * S + k * b
+            if partial:
+                blocks[full, :partial].copy_(go[c0 : c0 + partial])
+            blocks[full, partial:].zero_()
+            blocks[full + 1 :].zero_()
+        return buf, None
+    # GEMM path: gather the N column blocks of grad_output into one [T, N*b] operand and run a
+    # single GEMM per chunk (N small GEMMs per chunk were 16x the launches and a 20% step-time
+    # regression at 16 GPUs).
+    T = go.shape[0]
+    if cols_buf is None or cols_buf.shape != (T, N * b) or cols_buf.dtype != go.dtype:
+        cols_buf = torch.empty(T, N * b, dtype=go.dtype, device=go.device)
+    cols = cols_buf
+    cols3 = cols.view(T, N, b)
+    if full:
+        if go.stride(1) == 1:
+            cols3[:, :full].copy_(
+                go.as_strided((T, full, b), (go.stride(0), S, 1), go.storage_offset() + k * b)
+            )
+        else:
+            for r in range(full):
+                cols3[:, r].copy_(go[:, r * S + k * b : r * S + (k + 1) * b])
+    if full < N:
+        c0 = full * S + k * b
+        if partial:
+            cols3[:, full, :partial].copy_(go[:, c0 : c0 + partial])
+        cols3[:, full, partial:].zero_()
+        cols3[:, full + 1 :].zero_()
+    wgrad_gemm(buf, cols, x)
+    return buf, cols_buf
+
+
+def _chunk_block_extent(N, S, b, k, valid_cols):
+    """Chunk ``k`` of a padded ``N*S``-row table whose rows at or beyond ``valid_cols`` are
+    padding: the number of leading ranks whose block [r*S + k*b, r*S + (k+1)*b) is entirely
+    valid, and the valid row count of the next rank's block (0 when none). Blocks after that
+    are all padding."""
+    full = min(N, max(0, (valid_cols - (k + 1) * b) // S + 1))
+    partial = min(max(valid_cols - (full * S + k * b), 0), b) if full < N else 0
+    return full, partial
+
+
+@dataclass
+class _ChunkedWgrad:
+    """A vocabulary wgrad fed to the reduce-scatter pipeline chunk by chunk: either computed
+    on the fly (``grad_output^T @ total_input`` per chunk) or copied from an already dense
+    ``dense`` [V, H] gradient (the embedding's autograd output)."""
+
+    grad_output: Optional[torch.Tensor] = None  # [T, V] (2-D)
+    total_input: Optional[torch.Tensor] = None  # [T, H] (2-D)
+    wgrad_gemm: Optional[Callable] = None
+    dense: Optional[torch.Tensor] = None  # [V, H]
+
+
 class GTPShardHandle:
     """Wrapper around a ``dist`` async-work handle for a GTP AG / RS.
 
@@ -1076,6 +1195,10 @@ def _init_gtp_runtime_attrs(obj):
     obj._recompute_buf_parity = None
     # Pre-RS wgrad accumulation (output_layer under MTP).
     obj._wgrad_accum_enabled = False  # static per-weight opt-in
+    obj._wgrad_chunks = 1  # >1: chunked vocab wgrad reduce-scatter (tag_gtp_params_with_names)
+    obj._vocab_chunk_bufs = None  # persistent chunk send buffers and their last reduce-scatter
+    obj._vocab_chunk_works = None
+    obj._vocab_chunk_cols = None  # persistent [T, N*b] gather operand of the chunk GEMMs
     obj._wgrad_accum_buf = None  # the buffer being summed into; non-None == a flush is owed
     obj._wgrad_accum_expected = 0  # consume count learned last iteration
     obj._wgrad_accum_consumes = 0  # consumes so far this iteration
@@ -2235,6 +2358,10 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
+        if isinstance(wgrads[0], _ChunkedWgrad):
+            # Vocabulary-sized weight: GEMM + reduce-scatter in row-block chunks.
+            return self._reduce_scatter_chunked(wgrads[0], async_op, nvtx_label)
+
         # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
         self._prescale_wgrads_for_mean_rs(wgrads)
 
@@ -2402,6 +2529,142 @@ class GTPShardedParam(torch.nn.Parameter):
             release_bufs.append(wgrad)
 
         return send_bufs, release_bufs
+
+    def wgrad_is_chunked(self) -> bool:
+        """True when this backward should run the chunked vocab wgrad GEMM + reduce-scatter."""
+        if self._wgrad_chunks <= 1 or len(self._weights) != 1:
+            return False
+        if _chain_is_graphed(self.chain_id) or torch.cuda.is_current_stream_capturing():
+            return False
+        if self._can_accumulate_wgrad() or self._wgrad_accum_buf is not None:
+            return False
+        if getattr(self, "_gtp_graph_wgrad_ring_slot", None) is not None:
+            return False
+        # The fp32-accumulation all-to-all path has its own scratch protocol; keep it whole.
+        if (
+            GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+            and self.group.size() > 2
+            and not is_gtp_symm_pool_registered(self.group)
+        ):
+            return False
+        return True
+
+    def chunked_wgrad(self, grad_output, total_input, wgrad_gemm) -> "_ChunkedWgrad":
+        """Descriptor handed to ``wgrad_reduce_scatter`` instead of a materialized wgrad: the
+        GEMM runs chunk by chunk inside the reduce-scatter pipeline (see
+        ``_reduce_scatter_chunked``)."""
+        return _ChunkedWgrad(
+            grad_output.reshape(-1, grad_output.shape[-1]),
+            total_input.reshape(-1, total_input.shape[-1]),
+            wgrad_gemm,
+        )
+
+    def _vocab_chunk_buffers(self, shape, dtype):
+        """The weight's persistent chunk send buffers (allocated once): in the group's registered
+        pool when symmetric memory is on (so the reduce-scatter sends from the NCCL window), else
+        plain allocations. Persistent, so no per-backward allocation or registration happens."""
+        bufs = self._vocab_chunk_bufs
+        if bufs is not None and bufs[0].shape == torch.Size(shape) and bufs[0].dtype == dtype:
+            return bufs
+        count = max(1, GTP_CONFIG.vocab_wgrad_chunk_buffers)
+        nbytes = int(math.prod(shape)) * torch.empty((), dtype=dtype).element_size()
+        bufs = []
+        for _ in range(count):
+            ctx = (
+                gtp_symm_pool_ctx(self.group)
+                if is_gtp_symm_pool_registered(self.group)
+                else nullcontext()
+            )
+            with ctx:
+                buf = torch.empty(shape, dtype=dtype, device=self.device)
+            bufs.append(buf)
+        self._vocab_chunk_bufs = bufs
+        self._vocab_chunk_works = [None] * count
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[GTP] {self._debug_name}: {count} persistent vocab wgrad chunk buffers of "
+            f"{nbytes / 2**20:.0f} MB ({dtype})",
+        )
+        return bufs
+
+    def _reduce_scatter_chunked(self, desc: "_ChunkedWgrad", async_op, nvtx_label):
+        """Reduce-scatter of a vocabulary-sized wgrad in K row-block chunks -> (outputs,
+        handle, release_bufs), the ``_reduce_scatter`` contract.
+
+        The full wgrad of a vocabulary weight is [Vp, H] (10 GB fp32 for the output layer at
+        V=262k, 5 GB bf16 for the embedding): one send buffer of that size otherwise lives
+        permanently in the registered pool. Chunk k instead holds, for every rank r, rows
+        [r*S + k*b, r*S + (k+1)*b) of the padded table (S = rows per shard, b = S / K), i.e.
+        the k-th sub-block of every shard, so its reduce-scatter lands in rows [k*b, (k+1)*b)
+        of this rank's shard. The weight owns B persistent chunk buffers; chunk k's GEMM (or row
+        copy) waits, on the compute stream, for the reduce-scatter that last read its buffer
+        (Work.wait: NCCL runs collectives on its own stream, so no stream event would do). Same
+        bytes on the wire and the same FLOPs as the single send, K collectives instead of one;
+        the returned handle is the last chunk's (one communicator completes its collectives in
+        order, so the earlier chunks' outputs are complete when it is).
+        """
+        K = self._wgrad_chunks
+        N = self.group.size()
+        S = self._sharded_padded_shape[0]
+        b = S // K
+        H = self._unsharded_shape[1]
+        if desc.dense is not None:
+            go, x, wgrad_gemm = desc.dense, None, None
+            dtype = desc.dense.dtype  # a foreign wgrad reduce-scatters in its own dtype
+            valid_cols = go.shape[0]
+        else:
+            go, x, wgrad_gemm = desc.grad_output, desc.total_input, desc.wgrad_gemm
+            dtype = self.main_grad.dtype
+            valid_cols = go.shape[1]  # unpadded vocab: padded rows of a block get zeros
+        if GTP_CONFIG.check_param_states:
+            new_rs_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
+            self._set_rs_state(new_rs_state)
+        cache = get_global_GTP_cache()
+        compute = torch.cuda.current_stream()
+        # The chunks are always pipelined on rs_stream so chunk k's GEMM overlaps chunk k-1's
+        # collective; a synchronous caller (the chain head) just waits for the last chunk at the
+        # end. Issuing the chunks synchronously would alternate GEMM and collective with no
+        # overlap (16 exposed collectives per backward: +20% step time at 16 GPUs).
+        rs_stream = get_rs_stream(self.chain_id, self.group)
+        if self._rs_ticket is None:
+            self._rs_ticket = cache.reserve(self, dtype, fwd=False, reduce_scatter=True)
+        out = cache.get(self._rs_ticket)
+        scale = 1.0 / N if (N > 1 and not GTP_CONFIG.calculate_per_token_loss) else None
+        # The previous backward's finalize (main_grad.add_ of this ticket's output) may still be
+        # queued on rs_stream; order this backward's writes into the same output after it.
+        compute.wait_event(self.rs_event)
+        send = self._vocab_chunk_buffers((N * b, H), dtype)
+        works = self._vocab_chunk_works
+        handle = None
+        nvtx_range_push(f"{nvtx_label}.gtp_wgrad_chunks")
+        for k in range(K):
+            slot = k % len(send)
+            buf = send[slot]
+            if works[slot] is not None:
+                works[slot].wait()  # orders the compute stream after the RS that read ``buf``
+                works[slot] = None
+            _, self._vocab_chunk_cols = fill_wgrad_chunk(
+                buf, go, x, N, S, k, valid_cols, wgrad_gemm, cols_buf=self._vocab_chunk_cols
+            )
+            if scale is not None:
+                buf.mul_(scale)
+            out_chunk = out[k * b : (k + 1) * b]
+            ready = torch.cuda.Event()
+            ready.record(compute)
+            rs_stream.wait_event(ready)
+            with torch.cuda.stream(rs_stream):
+                _, handle = reduce_scatter_along_first_dim(
+                    buf, self.group, async_op=True, output=out_chunk
+                )
+            works[slot] = handle
+        if not async_op and handle is not None:
+            # Synchronous contract: the shard is complete on the caller's stream on return.
+            handle.wait()
+            handle = None
+        nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_chunks")
+        # Persistent buffers: nothing to release; the per-slot Works guard their reuse.
+        return [out], handle, []
 
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None, async_op=None):
         """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
@@ -2974,6 +3237,9 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
+        if weight.wgrad_is_chunked():
+            # Dense [V, H] gradient: sent in row-block chunks instead of one full-table buffer.
+            return weight.wgrad_reduce_scatter(_ChunkedWgrad(dense=grad_output))
         return weight.wgrad_reduce_scatter(grad_output)
 
 
