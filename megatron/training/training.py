@@ -3677,13 +3677,23 @@ def train_step(
                 pg_collection=pg_collection,
             )
         if save_activations_in_this_iteration:
-            save_activations(iteration + 1)
+            save_activations(
+                iteration + 1,
+                pg_collection=_get_model_pg_collection(
+                    model[0], pg_collection, owner="train_step"
+                ),
+            )
             disable_activation_logging()
         if save_tpe_in_this_iteration:
             save_tokens_per_expert(iteration + 1)
             disable_tokens_per_expert_logging()
         if save_dgrads_in_this_iteration:
-            save_dgrads(iteration + 1)
+            save_dgrads(
+                iteration + 1,
+                pg_collection=_get_model_pg_collection(
+                    model[0], pg_collection, owner="train_step"
+                ),
+            )
             disable_dgrad_logging()
 
         # Advance the router tracer step if active.
@@ -3706,8 +3716,17 @@ def train_step(
                     tensor_on_cpu = getattr(param, attr_name).cpu()
                     state_dict[model_chunk_name][param_name] = tensor_on_cpu
 
-        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(args.save, state_dict, iteration + 1, label)
+        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging. The files
+        # are named by the ranks of the model's process groups.
+        save_grads(
+            args.save,
+            state_dict,
+            iteration + 1,
+            label,
+            pg_collection=_get_model_pg_collection(
+                model[0], pg_collection, owner="train_step"
+            ),
+        )
 
     # Checkpoint wgrads with parameter names.
     if save_wgrads_in_this_iteration:
