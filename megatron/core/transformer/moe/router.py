@@ -497,6 +497,9 @@ class TopKRouter(Router):
 
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        # Megakernels adapt the boolean routing map independently of native dispatchers.
+        if self.config.moe_megakernel_backend is not None:
+            return None
         if not self.config.moe_router_fusion:
             return None
         if self.config.moe_token_dispatcher_type != "flex":

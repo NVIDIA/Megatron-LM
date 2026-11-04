@@ -84,11 +84,16 @@ def test_dense_route_indices_dtype(
             moe_flex_dispatcher_backend=backend,
             moe_hybridep_routing_map_mode=routing_map_mode,
             num_moe_experts=num_experts,
+            moe_megakernel_backend=None,
         ),
         expt_tp_group=SimpleNamespace(size=lambda: 1),
     )
 
     assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype
+
+    # MOK always consumes the boolean map, independent of the native dispatcher selection.
+    router.config.moe_megakernel_backend = "mok"
+    assert TopKRouter._dense_route_indices_dtype(router) is None
 
 
 @pytest.mark.parametrize("supports_topk_indices", [False, True])

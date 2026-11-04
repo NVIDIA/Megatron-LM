@@ -71,3 +71,21 @@ def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+
+
+@pytest.mark.parametrize("use_varlen_dataset,micro_batch_size", [(False, 1), (True, 2)])
+def test_static_packed_graph_prerequisites_are_preserved(
+    monkeypatch, use_varlen_dataset, micro_batch_size
+):
+    """Scoping the graph guard must not relax static packing's input requirements."""
+    args = _hybrid_cp_args(
+        monkeypatch,
+        hybrid_context_parallel=False,
+        sequence_packing_scheduler="dp_balanced",
+        cuda_graph_impl="transformer_engine",
+        use_varlen_dataset=use_varlen_dataset,
+        micro_batch_size=micro_batch_size,
+        global_batch_size=4,
+    )
+    with pytest.raises(AssertionError, match="Scheduler CUDA graphs require one"):
+        validate_args(args)

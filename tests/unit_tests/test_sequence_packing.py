@@ -14,6 +14,7 @@ from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -45,6 +46,296 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_packed_graph_tail_preserves_document_offsets():
+    from megatron.core.datasets.data_schedule_utils import pad_packed_batch_before_cp_slice
+
+    for owns_tokens in (False, True):
+        physical = torch.tensor([0, 4, 12], dtype=torch.int32)
+        logical = torch.tensor([0, 3, 8], dtype=torch.int32)
+        mask = _build_thd_padding_mask(logical, physical)
+        batch = dict(
+            cu_seqlens=logical,
+            cu_seqlens_padded=physical,
+            max_seqlen=torch.tensor(8),
+            padding_mask=mask,
+            loss_mask=(~mask).float(),
+        )
+        if owns_tokens:
+            batch["tokens"] = torch.arange(12)
+        config = SimpleNamespace(
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=8,
+            cuda_graph_thd_max_packed_sequences=4,
+        )
+        pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
+        assert ("tokens" in batch) == owns_tokens
+        assert batch["cu_seqlens"].tolist() == [0, 3, 8, 8, 8]
+        assert batch["cu_seqlens_padded"].tolist() == [0, 4, 12, 16, 16]
+        assert batch["padding_mask"][12:].all()
+        assert batch["loss_mask"].sum() == 8
+        assert batch["max_seqlen"] == 16
+        previous = {key: value.clone() for key, value in batch.items()}
+        pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
+        for key in previous:
+            torch.testing.assert_close(batch[key], previous[key])
+        config.cuda_graph_thd_max_packed_sequences = 2
+        with pytest.raises(ValueError, match="documents exceed"):
+            pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
+
+
+def test_packed_graph_scheduler_reserves_dummy_document():
+    from megatron.core.datasets.data_schedule import DpBalancedScheduler
+
+    scheduler = DpBalancedScheduler(16, 2, 1, None, max_num_seqs=2)
+    groups = scheduler.get_groups_and_subsamples([(i, 4) for i in range(5)])
+    assert [len(group[0]) for group in groups] == [2, 2, 1]
+
+
+@pytest.mark.parametrize(
+    "alignment,fp8,expected",
+    [(None, None, [3, 2]), ("max", None, [2, 2, 1]), (None, "hybrid", [2, 2, 1])],
+)
+def test_graph_scheduler_accounts_for_main_padding(monkeypatch, alignment, fp8, expected):
+    from megatron.core.datasets.data_schedule import DpBalancedScheduler
+
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    groups = ProcessGroupCollection(tp=group, pp=group, cp=group, dp=group, dp_cp=group)
+    config = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment=alignment,
+        fp8=fp8,
+        fp8_recipe="mxfp8",
+        max_seqlen_per_dp_cp_rank=128,
+        cuda_graph_thd_max_packed_sequences=3,
+        virtual_pipeline_model_parallel_size=None,
+    )
+    observed = []
+
+    def run(scheduler, *args):
+        groups = scheduler.get_groups_and_subsamples([(i, 3) for i in range(5)])
+        observed.extend(len(group[0]) for group in groups)
+        return None, len(groups), 15, 45
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(DpBalancedScheduler, "run", run)
+    wrap_data_iterator(None, config, 5, groups)
+    assert observed == expected
+
+
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("layout", ["tuple", "zigzag", "contiguous"])
+@pytest.mark.parametrize("pp_rank", [0, 1, 2])
+@pytest.mark.parametrize("alignment,metadata_capacity", [("max", 4), (None, 4), (None, None)])
+def test_scheduler_loader_preserves_graph_logical_offsets(
+    monkeypatch, alignment, metadata_capacity, cp_size, cp_rank, layout, pp_rank
+):
+    from megatron.core.datasets import data_schedule
+
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    groups = ProcessGroupCollection(
+        tp=group,
+        pp=SimpleNamespace(rank=lambda: pp_rank, size=lambda: 3),
+        cp=SimpleNamespace(rank=lambda: cp_rank, size=lambda: cp_size),
+    )
+    if cp_size == 1:
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: group.size())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: group.rank())
+    monkeypatch.setattr(data_schedule, "broadcast_scalars", lambda values, *args, **kwargs: values)
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *args, **kwargs: None)
+    batch = {
+        "tokens": torch.arange(12, dtype=torch.int64),
+        "labels": torch.arange(12, dtype=torch.int64) + 100,
+        "position_ids": torch.arange(12, dtype=torch.int64) + 200,
+        "loss_mask": torch.ones(12),
+        "cu_seqlens": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4, 12], dtype=torch.int32),
+        "max_seqlen": 8,
+    }
+    if cp_size > 1:
+        batch = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
+    config = SimpleNamespace(
+        pad_packed_seq_alignment=alignment,
+        cuda_graph_thd_max_packed_sequences=metadata_capacity,
+        max_seqlen_per_dp_cp_rank=16,
+        linear_cp_layout="zigzag" if layout == "tuple" else layout,
+        attention_cp_layout="zigzag" if layout == "tuple" else layout,
+        sequence_parallel=False,
+    )
+    result = get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]),
+        pg_collection=groups,
+        config=config,
+        return_context_parallel_batch=layout != "tuple",
+    )
+    if layout == "tuple":
+        tokens, labels, loss_mask, _, positions, params, padding_mask = result
+    else:
+        assert result.boundary_layout == layout
+        values = result.get_batch()
+        tokens, labels, loss_mask, positions, padding_mask = (
+            values[key] for key in ("tokens", "labels", "loss_mask", "position_ids", "padding_mask")
+        )
+        params = result.get_packed_seq_params()
+
+    # Hand-build the expected source indices; do not call the sharder under test.
+    end = 16 * cp_size if alignment == "max" else 12
+    physical_offsets = [0, 4, 12, end, end] if metadata_capacity is not None else [0, 4, 12]
+    if cp_size == 1 or layout == "contiguous":
+        indices = list(range(cp_rank * (end // cp_size), (cp_rank + 1) * (end // cp_size)))
+    else:
+        indices = []
+        for begin, stop in zip(physical_offsets[:-1], physical_offsets[1:]):
+            width = (stop - begin) // (2 * cp_size)
+            for chunk in (cp_rank, 2 * cp_size - cp_rank - 1):
+                indices.extend(range(begin + chunk * width, begin + (chunk + 1) * width))
+    expected_ids = torch.tensor(indices, device=padding_mask.device)
+    valid = (expected_ids < 3) | ((expected_ids >= 4) & (expected_ids < 9))
+    torch.testing.assert_close(padding_mask, (~valid).view(1, -1), rtol=0, atol=0)
+    if pp_rank == 0:
+        torch.testing.assert_close(
+            tokens, expected_ids.masked_fill(~valid, 0).view(1, -1), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            positions, (expected_ids + 200).masked_fill(~valid, 0).view(1, -1), rtol=0, atol=0
+        )
+    else:
+        assert tokens is None and positions is None
+    if pp_rank == 2:
+        torch.testing.assert_close(
+            labels, (expected_ids + 100).masked_fill(~valid, 0).view(1, -1), rtol=0, atol=0
+        )
+        torch.testing.assert_close(loss_mask, valid.float().view(1, -1), rtol=0, atol=0)
+    else:
+        assert labels is None and loss_mask is None
+    assert padding_mask.shape == (1, end // cp_size)
+    if metadata_capacity is not None:
+        assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == [0, 3, 8, 8, 8]
+        assert params.cu_seqlens_q_padded.tolist() == physical_offsets
+        assert torch.equal(params.cu_seqlens_q_padded, params.cu_seqlens_kv_padded)
+        assert params.max_seqlen_q == params.max_seqlen_kv == end
+        assert params.pad_between_seqs
+    else:
+        expected = [0, 3, 8] if layout == "contiguous" and cp_size > 1 else [0, 4, 12]
+        assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == expected
+
+
+def test_hybrid_scheduler_requests_layout_aware_batch(monkeypatch):
+    import pretrain_hybrid
+
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_args",
+        lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced"),
+    )
+    monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", lambda _: config)
+    monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **_: False)
+    result = object()
+    calls = []
+
+    def get_batch(iterator, **kwargs):
+        calls.append(kwargs)
+        return result
+
+    monkeypatch.setattr(pretrain_hybrid, "get_batch_on_this_rank_for_sequence_packing", get_batch)
+    assert pretrain_hybrid.get_batch(iter([])) is result
+    assert calls[0]["return_context_parallel_batch"] is True
+    assert calls[0]["config"] is config
+
+
+@pytest.mark.parametrize("scheduler", [None, "dp_balanced"])
+def test_hybrid_packed_stats_respect_scheduler_totals(monkeypatch, scheduler):
+    from unittest.mock import MagicMock
+
+    import pretrain_hybrid
+    from megatron.core.context_parallel import ContextParallelBatch
+
+    offsets = torch.tensor([[0, 3, 8]], dtype=torch.int32)
+    cp_batch = ContextParallelBatch.from_single_layout("contiguous", {"cu_seqlens": offsets}, None)
+    monkeypatch.setattr(
+        pretrain_hybrid, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler=scheduler)
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", lambda *args: None)
+    monkeypatch.setattr(pretrain_hybrid, "get_batch", lambda *args: cp_batch)
+    update = MagicMock()
+    monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", update)
+    model = MagicMock()
+
+    output, _ = pretrain_hybrid.forward_step(None, model)
+
+    assert output is model.return_value
+    assert model.call_args.kwargs["cp_batch"] is cp_batch
+    if scheduler is None:
+        update.assert_called_once()
+        torch.testing.assert_close(update.call_args.args[0], offsets.squeeze(0))
+    else:
+        update.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("tp,cp", [(1, 2), (2, 1)])
+def test_scheduler_layout_batch_with_real_process_groups(layout, tp, cp):
+    if Utils.world_size < tp * cp:
+        pytest.skip("requires at least two distributed ranks")
+    Utils.initialize_model_parallel(tp, 1, context_parallel_size=cp)
+    try:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        config = SimpleNamespace(
+            pad_packed_seq_alignment="max",
+            cuda_graph_thd_max_packed_sequences=4,
+            max_seqlen_per_dp_cp_rank=8,
+            linear_cp_layout=layout,
+            attention_cp_layout=layout,
+            sequence_parallel=False,
+        )
+        batch = {
+            "tokens": torch.arange(8, dtype=torch.int64, device="cuda"),
+            "labels": torch.arange(8, dtype=torch.int64, device="cuda") + 100,
+            "position_ids": torch.arange(8, dtype=torch.int64, device="cuda") + 200,
+            "loss_mask": torch.ones(8, device="cuda"),
+            "cu_seqlens": torch.tensor([0, 6], dtype=torch.int32, device="cuda"),
+            "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32, device="cuda"),
+            "max_seqlen": 8,
+        }
+        result = get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]) if tp_rank == 0 else None,
+            config=config,
+            return_context_parallel_batch=True,
+        )
+        values = result.get_batch()
+        if cp == 1 or layout == "contiguous":
+            indices = list(range(cp_rank * 8, (cp_rank + 1) * 8))
+        else:
+            indices = [0, 1, 6, 7, 8, 9, 14, 15] if cp_rank == 0 else [2, 3, 4, 5, 10, 11, 12, 13]
+        ids = torch.tensor(indices, device="cuda").view(1, -1)
+        valid = ids < 6
+        for key, offset in (("tokens", 0), ("labels", 100), ("position_ids", 200)):
+            torch.testing.assert_close(
+                values[key], (ids + offset).masked_fill(~valid, 0), rtol=0, atol=0
+            )
+        torch.testing.assert_close(values["loss_mask"], valid.float(), rtol=0, atol=0)
+        torch.testing.assert_close(values["padding_mask"], ~valid, rtol=0, atol=0)
+        params = result.get_packed_seq_params()
+        assert params.cu_seqlens_q.tolist() == [0, 6, 6, 6, 6]
+        assert params.cu_seqlens_q_padded.tolist() == [0, 8, 8 * cp, 8 * cp, 8 * cp]
+        assert params.max_seqlen_q == params.max_seqlen_kv == 8 * cp
+        assert params.pad_between_seqs
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class MockVariableLengthSequencePackingDataIterator:
