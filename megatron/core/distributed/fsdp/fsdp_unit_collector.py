@@ -22,6 +22,19 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
+def _recomputed(module: nn.Module, wrapper: nn.Module | None) -> bool:
+    """Whether mHC recomputation replays this module of the wrapped layer."""
+    if not isinstance(wrapper, HyperConnectionHybridLayer):
+        return False
+    config = wrapper.config
+    if config.recompute_granularity != "selective" or "mhc" not in (config.recompute_modules or []):
+        return False
+    return module in (
+        getattr(wrapper.inner_layer, "input_layernorm", None),
+        getattr(wrapper.inner_layer, "pre_mlp_layernorm", None),
+    )
+
+
 class FsdpUnitCollector:
     """Collect selected FSDP units in wrapping order, children before parents."""
 
@@ -46,22 +59,10 @@ class FsdpUnitCollector:
 
     def _should_shard(self, module: nn.Module, wrapper: nn.Module | None) -> bool:
         """Whether this module should be an independent FSDP unit."""
-        if isinstance(wrapper, HyperConnectionHybridLayer):
-            config = wrapper.config
-            if config.recompute_granularity == "selective" and "mhc" in (
-                config.recompute_modules or []
-            ):
-                # mHC replays these modules before the wrapper's pre_backward().
-                # Their own hooks must gather parameters and reduce replay gradients.
-                if (
-                    module
-                    in (
-                        getattr(wrapper.inner_layer, "input_layernorm", None),
-                        getattr(wrapper.inner_layer, "pre_mlp_layernorm", None),
-                    )
-                    and next(module.parameters(), None) is not None
-                ):
-                    return True
+        # mHC replays these modules before the wrapper's pre_backward().
+        # Their own hooks must gather parameters and reduce replay gradients.
+        if _recomputed(module, wrapper) and next(module.parameters(), None) is not None:
+            return True
 
         if not isinstance(module, self._fsdp_unit_module_types):
             return False
