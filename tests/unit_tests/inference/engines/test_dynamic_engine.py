@@ -6324,9 +6324,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     break
                 for request in engine.step_modern()["finished_requests"]:
                     finished[request.request_id] = request
-                waited |= context.chunked_prefill_request_id == 1 and (
-                    context.paused_request_count > 0
-                )
+                # Async scheduling can admit request 1's last chunk in the step that
+                # pauses request 0, so check request 1's progress, not its chunk.
+                waited |= context.paused_request_count > 0 and 1 not in finished
             assert not engine.has_unfinished_requests(), (offset, list(engine.waiting_request_ids))
             assert {i: len(r.generated_tokens) for i, r in finished.items()} == {0: 20, 1: 1}
             return waited
