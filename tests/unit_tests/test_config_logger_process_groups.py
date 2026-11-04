@@ -113,3 +113,24 @@ class TestConfigLoggerRankString:
 
         log_config.assert_called_once()
         assert log_config.call_args.kwargs["pg_collection"] is pg_collection
+
+    @pytest.mark.parametrize("float16", [False, True])
+    def test_optimizers_pass_their_collection(self, float16):
+        """The FP32 and mixed-precision optimizers name their dumps by their collection."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer import optimizer as optimizer_module
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = OptimizerConfig(bf16=float16, config_logger_dir="unused")
+
+        # A stub optimizer (None) is enough: the dump is logged before any parameter is touched.
+        with mock.patch.object(optimizer_module, "log_config_to_disk") as log_config:
+            if float16:
+                optimizer_module.Float16OptimizerWithFloat16Params(
+                    None, config, None, None, pg_collection=pg_collection
+                )
+            else:
+                optimizer_module.FP32Optimizer(None, config, None, pg_collection=pg_collection)
+
+        log_config.assert_called_once()
+        assert log_config.call_args.kwargs["pg_collection"] is pg_collection
