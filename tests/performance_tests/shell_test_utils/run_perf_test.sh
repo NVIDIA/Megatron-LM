@@ -15,7 +15,8 @@
 #   SKIP_COMPARE=1      (skip the comparison step entirely)
 #   PLATFORM=<name>     (override the platform key used to look up / write the baseline.
 #                        Defaults to auto-detection via `nvidia-smi -L` —
-#                        recognizes "h100", "gb200", "b200", "a100".)
+#                        recognizes "gb300", "gb200", "b300", "b200", "gh200", "h200",
+#                        "h100", "a100".)
 #
 # Expects /usr/local/bin/yq (present in mcore_ci_dev image, NOT in bare NGC PyTorch).
 
@@ -44,14 +45,20 @@ export NVTE_FLASH_ATTN_V4=0
 # value picks which subtree to read / write.
 if [[ -z "${PLATFORM:-}" ]]; then
     GPU_NAME=$(nvidia-smi -L 2>/dev/null | head -1 || true)
+    # Superchip names contain the discrete part's name (GB300 ⊃ B300, GH200 ⊃ H200),
+    # so the superchip patterns must come first.
     case "$GPU_NAME" in
+        *GB300*)                     PLATFORM=gb300 ;;
         *GB200*|*"Grace Blackwell"*) PLATFORM=gb200 ;;
+        *B300*)                      PLATFORM=b300  ;;
         *B200*)                      PLATFORM=b200  ;;
+        *GH200*)                     PLATFORM=gh200 ;;
+        *H200*)                      PLATFORM=h200  ;;
         *H100*)                      PLATFORM=h100  ;;
         *A100*)                      PLATFORM=a100  ;;
         *)
             echo "[run_perf_test] error: could not auto-detect PLATFORM from nvidia-smi (\"$GPU_NAME\")." >&2
-            echo "                  Pass PLATFORM=<h100|gb200|b200|a100> explicitly." >&2
+            echo "                  Pass PLATFORM=<h100|h200|gh200|b200|b300|gb200|gb300|a100> explicitly." >&2
             exit 2
             ;;
     esac
@@ -63,6 +70,20 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PERF_DIR="$ROOT_DIR/tests/performance_tests"
 YQ=/usr/local/bin/yq
+
+CASE_DIR="$(dirname "$CONFIG_PATH")"
+BASELINE_PATH="$CASE_DIR/baseline_values.json"
+
+# Check for a baseline before the benchmark runs, not after: a platform without one
+# (only some platforms are recorded per case) would otherwise spend the whole run and then fail.
+if [[ "${RECORD_BASELINE:-0}" != "1" && "${SKIP_COMPARE:-0}" != "1" ]]; then
+    if [[ ! -f "$BASELINE_PATH" ]] || \
+       ! PLATFORM="$PLATFORM" "$YQ" -e 'has(strenv(PLATFORM))' "$BASELINE_PATH" > /dev/null 2>&1; then
+        echo "[run_perf_test] error: no '$PLATFORM' baseline in $BASELINE_PATH." >&2
+        echo "                  Run with RECORD_BASELINE=1 to record one, or SKIP_COMPARE=1 to measure only." >&2
+        exit 3
+    fi
+fi
 
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
@@ -302,9 +323,6 @@ echo "[run_perf_test] benchmark complete. Results written to $RESULTS_JSON"
 
 # ── Baseline comparison or recording ──────────────────────────────────────────
 
-CASE_DIR="$(dirname "$CONFIG_PATH")"
-BASELINE_PATH="$CASE_DIR/baseline_values.json"
-
 if [[ "${RECORD_BASELINE:-0}" == "1" ]]; then
     echo "[run_perf_test] RECORD_BASELINE=1 → merging results.json into $BASELINE_PATH under key '$PLATFORM'"
     uv run --no-sync python - "$RESULTS_JSON" "$BASELINE_PATH" "$PLATFORM" <<'PY'
@@ -329,12 +347,6 @@ fi
 if [[ "${SKIP_COMPARE:-0}" == "1" ]]; then
     echo "[run_perf_test] SKIP_COMPARE=1 → not running baseline comparison"
     exit 0
-fi
-
-if [[ ! -f "$BASELINE_PATH" ]]; then
-    echo "[run_perf_test] error: no baseline_values.json at $BASELINE_PATH." >&2
-    echo "                  Run once with RECORD_BASELINE=1 to bootstrap." >&2
-    exit 3
 fi
 
 uv run --no-sync python "$PERF_DIR/shell_test_utils/compare_to_baseline.py" \
