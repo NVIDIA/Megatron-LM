@@ -12,7 +12,7 @@ Contract (written from the Mamba-2 recurrence, the launcher's documented API and
   into pseudo-chunks by `cu_chunk_seqlens` (nchunks + 1): each request is cut every `chunk_size` tokens from
   its own start, a chunk never spans two requests, `seq_idx` (nchunks,) maps a chunk to its request and
   `last_chunk_indices` (nrequests,) gives each request's last chunk. These come from the production rule,
-  `MambaMetadata.compute_cpu_metadata` (mamba_metadata.py:675), including padding: zero-length padded
+  `MambaMetadata.compute_cpu_metadata` (mamba_metadata.py:471), including padding: zero-length padded
   requests (one empty chunk each), and padded tail tokens that belong to no chunk.
 * Request r starts from initial_states[r] (nrequests, nheads, headdim, dstate) (the gathered slot state,
   `ssm_state[batch_indices]`; zeros when None). For its tokens t in order, with g(h) = h // (nheads / ngroups):
@@ -91,7 +91,6 @@ def production_metadata(lengths, padded_requests, padded_tail_tokens, chunk_size
     metadata = MambaMetadata(
         max_requests=padded_count,
         max_tokens=padded_tokens,
-        max_intermediate_count=1,
         mamba_chunk_size=chunk_size,
     )
     max_chunks = padded_tokens // chunk_size + padded_count
