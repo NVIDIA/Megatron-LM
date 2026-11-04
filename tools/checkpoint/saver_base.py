@@ -6,7 +6,13 @@ from importlib.metadata import version
 
 import torch
 from packaging.version import Version as PkgVersion
-from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
+from utils import (
+    build_checkpoint_converter_process_groups,
+    chunk_bias,
+    chunk_weight,
+    install_checkpoint_converter_process_groups,
+    set_checkpoint_converter_pipeline_rank,
+)
 
 
 class MegatronCheckpointSaverBase:
@@ -28,6 +34,7 @@ class MegatronCheckpointSaverBase:
 
         self.models = None
         self.model_provider = None   # model_provider function either from pretrain_gpt or pretrain_bert
+        self.pg_collection = None    # Fake process groups the models are built on
 
     def _maybe_parse_additional_megatron_args(self, margs):
         """
@@ -177,20 +184,14 @@ class MegatronCheckpointSaverBase:
             os.environ.setdefault('MASTER_PORT', '12356')
             torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1)
 
-        # fake initializing distributed
-        mpu.set_tensor_model_parallel_world_size(self.args.target_tensor_parallel_size)
-        mpu.set_pipeline_model_parallel_world_size(self.args.target_pipeline_parallel_size)
-        mpu.set_expert_model_parallel_world_size(self.args.target_expert_parallel_size)
-        mpu.set_tensor_model_parallel_rank(0)
-        mpu.set_pipeline_model_parallel_rank(0)
-        mpu.set_expert_model_parallel_rank(0)
-        
-        initialize_checkpoint_converter_fake_process_groups(
-            mpu,
+        self.pg_collection = build_checkpoint_converter_process_groups(
             self.args.target_tensor_parallel_size,
             self.args.target_pipeline_parallel_size,
             self.args.target_expert_parallel_size,
         )
+        # save_checkpoint() and model builders without a collection read the global groups.
+        install_checkpoint_converter_process_groups(mpu, self.pg_collection)
+        set_checkpoint_converter_pipeline_rank(mpu, self.pg_collection, 0)
         
         try:
             import torch_llm_debug_tools
@@ -319,7 +320,9 @@ class MegatronCheckpointSaverBase:
         if self.models[pp_rank][ep_rank][tp_rank] is None:
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
-            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype)
+            self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(
+                pre_process, post_process, pg_collection=self.pg_collection
+            ).to(self.md.params_dtype)
         return self.models[pp_rank][ep_rank][tp_rank]
 
     def save(self):
@@ -355,9 +358,9 @@ class MegatronCheckpointSaverBase:
             sys.exit(1)
 
         train_state = get_train_state()
+        pg_collection = self.pg_collection
         for pp_rank in range(self.args.target_pipeline_parallel_size):
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
-            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
+            set_checkpoint_converter_pipeline_rank(mpu, pg_collection, pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
@@ -365,7 +368,14 @@ class MegatronCheckpointSaverBase:
                     save_checkpoint(train_state.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank)
+                        tensor_rank=tp_rank,
+                        tp_group=pg_collection.tp,
+                        pp_group=pg_collection.pp,
+                        dp_cp_group=pg_collection.dp_cp_gtp_remat,
+                        dp_group=pg_collection.dp,
+                        dp_gtp_remat_group=pg_collection.dp_gtp_remat,
+                        expt_dp_group=pg_collection.expt_dp,
+                        cp_group=pg_collection.cp)
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 
@@ -439,8 +449,7 @@ class MegatronCheckpointSaverBase:
         # ------------------
         total_layer_num = 0
         for pp_rank in range(self.args.target_pipeline_parallel_size):
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
-            mpu.get_pipeline_model_parallel_group().set_rank(pp_rank)
+            set_checkpoint_converter_pipeline_rank(mpu, self.pg_collection, pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for layer_id in range(schema.get_num_layers(self.models[pp_rank][0][0])):
