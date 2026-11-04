@@ -476,10 +476,18 @@ def prepare_ordered_reduce(group, num_parts: int = 1) -> None:
     Any other user allocates it on its first eager call.
     """
     if group is not None and group.size() >= 2:
-        _allocate_push_staging(group, num_parts)
+        _push_staging(group, num_parts)
 
 
-def _allocate_push_staging(group, num_parts: int) -> str:
+def _push_staging(group, num_parts: int = 1):
+    """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
+
+    The staging is fixed-size: 2 x max_num_blocks x TP x num_parts x 32 KiB per rank (32 MiB
+    at TP 4 with one partial, 64 MiB at TP 8), independent of the message size. It is
+    allocated (collectively) by :func:`prepare_ordered_reduce` or on the first eager call.
+    None (no symmetric memory for the group, e.g. TP across NVLink domains) makes
+    :func:`ordered_reduce_scatter_shards` take the all-to-all path.
+    """
     key = _push_staging_key(group, num_parts)
     if not SymmetricMemoryManager.is_initialized(key):
         assert not torch.cuda.is_current_stream_capturing(), (
@@ -488,21 +496,7 @@ def _allocate_push_staging(group, num_parts: int) -> str:
         )
         size_mb = -(-_push_staging_bytes(group.size(), num_parts) // (1 << 20))
         SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=size_mb)
-    return key
-
-
-def _push_staging(group, num_parts: int = 1):
-    """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
-
-    The staging is fixed-size: 2 x max_num_blocks x TP x num_parts x 32 KiB per rank (32 MiB
-    at TP 4 with one partial, 64 MiB at TP 8), independent of the message size (see
-    :func:`prepare_ordered_reduce`). None (no symmetric memory for the group, e.g. TP across
-    NVLink domains) makes :func:`ordered_reduce_scatter_shards` take the all-to-all path.
-    """
-    hdl = SymmetricMemoryManager.get_buffer(_allocate_push_staging(group, num_parts)).symm_mem_hdl
-    if hdl is None or hdl.world_size != group.size():
-        return None
-    return hdl
+    return SymmetricMemoryManager.get_buffer(key).symm_mem_hdl
 
 
 def _launch_push_fold(
