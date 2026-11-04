@@ -137,6 +137,9 @@ reads storage; it maps targets for every CP rank and scatters them.
 
 - Non-packed samples keep their prefix up to the student sequence length (prefix
   shortening) and pad the tail; the student length cannot exceed the teacher's.
+  Shortening requires a `prefix_stable` cache (see the contract below). A sample whose
+  supervised tokens all lie beyond the student length trains on nothing; the first one is
+  reported and the rest are counted.
 - Packed samples (`isolated_segments`) pad each segment to the student's own SFT divisor
   (`2·CP` when CP > 1, times TP with sequence parallelism) and extend the last segment to
   the student sequence length, as Megatron SFT does. The student divisor must divide the
@@ -201,6 +204,7 @@ identically in every implementation.
 | `padding_divisor` | Per-segment padding granularity the writer used (1 when segments were not padded) |
 | `padding_policy` | Always `"strip"` (see [Stored records](#stored-records)) |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)) |
+| `prefix_stable` | True when a row depends only on the tokens up to it, not on the sequence's total length; false for length-dependent position scaling (dynamic NTK RoPE, LongRoPE's short/long switch) or non-causal models. Megatron always writes true; students may shorten non-packed samples only when it is true |
 | `tokenizer` | `{"sha256", "size", "special_ids", "eod_id"}` (see [Tokenizer fingerprint](#tokenizer-fingerprint)) |
 | `logprob_vocab_size` | Size of the vocabulary the teacher normalized over; every valid index is below it |
 | `temperature` | Always `1.0` |
@@ -359,6 +363,9 @@ row, but its final label is then the sampled token rather than a data label.
   students to CP 1 without sequence parallelism.
 - Set `logprob_vocab_size` to the model's `config.vocab_size` and fingerprint the
   tokenizer with `hf_tokenizer_identity`.
+- Set `prefix_stable` to false when the model's `rope_scaling` depends on the sequence
+  length (`"dynamic"`, or `"longrope"` when sequences may exceed
+  `original_max_position_embeddings`), true otherwise.
 
 ### Size
 

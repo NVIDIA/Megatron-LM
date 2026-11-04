@@ -244,6 +244,9 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
                 reset_attention_mask=args.reset_attention_mask,
                 create_attention_mask=args.create_attention_mask_in_dataloader,
             ),
+            # Megatron's position embeddings (learned, rope, yarn, mrope) depend only on
+            # the position, so a causal teacher's row t never depends on later tokens.
+            "prefix_stable": True,
             "tokenizer": tokenizer_identity(),
             "logprob_vocab_size": args.padded_vocab_size,
             "temperature": 1.0,
@@ -364,6 +367,12 @@ def _check_student_compatibility(args: Any, metadata: dict) -> None:
             )
     elif args.seq_length > contract["seq_length"]:
         raise ValueError("Only non-packed prefix shortening is supported by v3 replay")
+    elif args.seq_length < contract["seq_length"] and not contract["prefix_stable"]:
+        raise ValueError(
+            "Offline KD v3 cache is not prefix-stable (its teacher's outputs depend on the "
+            "sequence length, e.g. dynamic RoPE scaling); the student sequence length must "
+            f"equal the teacher's ({contract['seq_length']})"
+        )
     if args.context_parallel_size > 1 and args.seq_length % (2 * args.context_parallel_size):
         raise ValueError("Student sequence length must be divisible by 2 * CP")
 

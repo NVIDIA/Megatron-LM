@@ -670,6 +670,7 @@ class ReplayIterator:
         self.divisor = divisor
         self._microbatch = 0
         self._count = 0
+        self.unsupervised_samples = 0
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if prefetch else None
         self._prefetched = None
 
@@ -678,6 +679,8 @@ class ReplayIterator:
 
     def _load(self, start: int, end: int) -> dict[str, Any]:
         samples = self.reader.samples(list(range(start, start + self.mbs)), end)
+        if not self.reader.isolated:
+            self._note_shortening(samples)
         return collate_samples(
             samples,
             self.seq_length,
@@ -686,6 +689,22 @@ class ReplayIterator:
             cp_size=self.cp_size,
             layout=self.layout,
         )
+
+    def _note_shortening(self, samples: list[dict]) -> None:
+        """Report samples whose supervised tokens all lie beyond the student length."""
+        for sample in samples:
+            weights = sample["loss_mask"]
+            if weights[: self.seq_length].any() or not weights[self.seq_length :].any():
+                continue
+            self.unsupervised_samples += 1
+            if self.unsupervised_samples == 1:
+                print(
+                    f"WARNING: offline KD v3 sample {sample['sample_id']} has no supervised "
+                    f"tokens within the student sequence length ({self.seq_length}); prefix "
+                    "shortening leaves such samples without loss. Further cases are counted "
+                    "in ReplayIterator.unsupervised_samples",
+                    flush=True,
+                )
 
     def __next__(self) -> dict[str, Any]:
         if self._microbatch == 0:

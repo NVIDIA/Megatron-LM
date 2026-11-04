@@ -37,6 +37,7 @@ CONTRACT_KEYS = (
     "padding_divisor",
     "padding_policy",
     "attention_mode",
+    "prefix_stable",
     "tokenizer",
     "logprob_vocab_size",
     "temperature",
@@ -90,6 +91,8 @@ def validate_metadata(meta: dict[str, Any]) -> None:
         raise ValueError("Offline KD v3 targets must be temperature-1 log probabilities")
     if contract["attention_mode"] not in ATTENTION_MODES:
         raise ValueError("Unsupported offline KD attention_mode")
+    if type(contract["prefix_stable"]) is not bool:
+        raise ValueError("Offline KD v3 contract prefix_stable must be a boolean")
     if contract["padding_policy"] != PADDING_POLICY:
         raise ValueError(f"Offline KD v3 requires padding_policy={PADDING_POLICY}")
     for key in ("padding_divisor", "seq_length", "dp_size_save", "mbs_save", "gbs_save"):

@@ -58,6 +58,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, provenance=None, producer="me
         "padding_divisor": 1,
         "padding_policy": "strip",
         "attention_mode": "causal",
+        "prefix_stable": True,
         "tokenizer": {"sha256": "test", "size": 3, "special_ids": {}, "eod_id": 2},
         "logprob_vocab_size": 1 << 17,
         "temperature": 1.0,
@@ -422,6 +423,7 @@ def test_target_encoder_rejects_invalid_ids(index, value):
         {"padding_policy": "preserve"},
         {"temperature": 0.7},
         {"padding_divisor": 0},
+        {"prefix_stable": "yes"},
         {"targets": {"k": 1, "p": None, "min_k": 1, "save_dtype": "fp32", "index_encoding": "u16"}},
     ],
 )
@@ -649,6 +651,32 @@ def test_resharding_and_prefix_shortening(
         finally:
             iterator.close()
     assert sorted(all_ids) == list(range(24))
+
+
+def test_shortening_that_removes_all_supervision_is_reported(tmp_path, capsys):
+    def late_supervision(ids, packed=False):
+        batch = inputs(ids, packed=packed)
+        batch["loss_mask"][:, :5] = 0
+        return batch
+
+    storage, metadata = write_cache(tmp_path, iterations=2, source=late_supervision)
+    for seq_length, expected in ((4, 8), (8, 0)):
+        iterator = replay.ReplayIterator(
+            reader(storage, metadata),
+            consumed=0,
+            dp_rank=0,
+            dp_size=1,
+            micro_batch_size=2,
+            seq_length=seq_length,
+            num_microbatches=lambda: 4,
+        )
+        try:
+            for _ in range(4):
+                next(iterator)
+        finally:
+            iterator.close()
+        assert iterator.unsupervised_samples == expected
+        assert capsys.readouterr().out.count("no supervised tokens") == min(expected, 1)
 
 
 def test_rampup_changes_iteration_size_without_skips(tmp_path):
@@ -1506,12 +1534,31 @@ def test_teacher_and_student_use_effective_attention_mode(
     contract = metadata["contract"]
     assert contract["attention_mode"] == expected
     assert (contract["padding_policy"], contract["temperature"]) == ("strip", 1.0)
+    assert contract["prefix_stable"] is True
     assert contract["targets"]["index_encoding"] == "u16+u8"
     assert metadata["producer"] == "megatron" and metadata["provenance"]["reset_attention_mask"]
     runtime._check_student_compatibility(args, metadata)
     args.create_attention_mask_in_dataloader = not create_attention_mask
     with pytest.raises(ValueError, match="attention_mode"):
         runtime._check_student_compatibility(args, metadata)
+
+
+@pytest.mark.parametrize(
+    "seq_length,prefix_stable,ok", [(4, True, True), (4, False, False), (8, False, True)]
+)
+def test_prefix_shortening_requires_a_prefix_stable_cache(
+    runtime_environment, seq_length, prefix_stable, ok
+):
+    args, runtime, _ = runtime_environment
+    args.seq_length = seq_length
+    metadata = settings(
+        contract={"prefix_stable": prefix_stable, "tokenizer": runtime.tokenizer_identity()}
+    )
+    if ok:
+        runtime._check_student_compatibility(args, metadata)
+    else:
+        with pytest.raises(ValueError, match="prefix-stable"):
+            runtime._check_student_compatibility(args, metadata)
 
 
 def test_isolated_records_require_segments(tmp_path):
