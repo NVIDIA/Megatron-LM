@@ -746,8 +746,12 @@ class HybridStack(MegatronModule):
                     input_ids=input_ids,
                     input_ids_by_layout=input_ids_by_layout,
                     padding_mask_by_layout=padding_mask_by_layout,
+                    strict_runtime_validation_frequency=(
+                        self.config.strict_runtime_validation_frequency
+                    ),
                 )
             else:
+                strictly_validated_layer_types = set()
                 grouped_tail_to_skip = None
                 observe_residuals = is_observing_tensor(
                     "residual_accumulator"
@@ -817,6 +821,17 @@ class HybridStack(MegatronModule):
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
+                        # Strict runtime validation is gated per layer-config type so that
+                        # ``once_per_microbatch`` validates the first G/K/attention/... layer
+                        # of every microbatch only. ``layer_type_list`` is a derived property,
+                        # so key on the per-layer config type from the execution tuple.
+                        layer_type = type(layer_config)
+                        frequency = self.config.strict_runtime_validation_frequency
+                        strict_runtime_validation = frequency == "always" or (
+                            frequency == "once_per_microbatch"
+                            and layer_type not in strictly_validated_layer_types
+                        )
+                        strictly_validated_layer_types.add(layer_type)
                         with inner_quant_context:
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -858,6 +873,9 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                layer_kwargs["strict_runtime_validation"] = (
+                                    strict_runtime_validation
+                                )
                                 if observe_residuals and isinstance(
                                     layer, HyperConnectionHybridLayer
                                 ):
@@ -884,6 +902,10 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
                                     )
+                                if getattr(layer, "supports_strict_runtime_validation", False):
+                                    layer_kwargs["strict_runtime_validation"] = (
+                                        strict_runtime_validation
+                                    )
                                 hidden_states = layer(**layer_kwargs)
                             else:  # Expert or MLP
                                 if residual_stream_recompute_context is not None:
@@ -891,12 +913,17 @@ class HybridStack(MegatronModule):
                                         "Residual-stream recomputation in HybridStack supports "
                                         "TransformerLayer and MambaLayer modules only."
                                     )
-                                hidden_states = layer(
+                                layer_kwargs = dict(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
                                 )
+                                if getattr(layer, "supports_strict_runtime_validation", False):
+                                    layer_kwargs["strict_runtime_validation"] = (
+                                        strict_runtime_validation
+                                    )
+                                hidden_states = layer(**layer_kwargs)
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
