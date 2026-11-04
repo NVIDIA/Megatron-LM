@@ -16,6 +16,9 @@ from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -310,15 +313,14 @@ class GatedDeltaNet2(_GDNBase):
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
+        if self.offload_core_attention and self.training:
+            # Sigmoid backward retains these unexpanded gates outside the recurrence.
+            if kernel_inputs["w"].requires_grad:
+                off_interface.mark_not_offload(kernel_inputs["w"])
+            if self.num_value_heads == self.num_key_heads and kernel_inputs["b"].requires_grad:
+                off_interface.mark_not_offload(kernel_inputs["b"])
+
+        core_attn_out = self._run_gated_delta_rule(kernel_inputs, cu_seqlens_q)
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()

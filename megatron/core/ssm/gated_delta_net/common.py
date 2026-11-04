@@ -21,6 +21,9 @@ from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
@@ -229,6 +232,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Attributes from config
         self.config = config
+        self.offload_core_attention = config.fine_grained_activation_offloading and (
+            "gdn_core_attn" in config.offload_modules
+        )
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
@@ -363,6 +369,34 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     def supports_two_stage_attention(self) -> bool:
         """Recomputation requires the original atomic forward path."""
         return not (self.recompute_norm_out or self.recompute_gdn)
+
+    def _run_gated_delta_rule(
+        self, kernel_inputs: dict[str, torch.Tensor], cu_seqlens: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Run the family recurrence with a differentiable anchor for offload prefetch."""
+        offload_input_name = None
+        if self.offload_core_attention and self.training and torch.is_grad_enabled():
+            offload_input_name = next(
+                (name for name, tensor in kernel_inputs.items() if tensor.requires_grad), None
+            )
+        input_name = offload_input_name or "q"
+        manager = off_interface(
+            offload_input_name is not None, kernel_inputs[input_name], "gdn_core_attn"
+        )
+        nvtx_range_push(suffix="gated_delta_rule")
+        with manager as offload_input:
+            core_attn_out, _ = self.gated_delta_rule(
+                **{**kernel_inputs, input_name: offload_input},
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens,
+            )
+        nvtx_range_pop(suffix="gated_delta_rule")
+        # Commit before output normalization; its saves can alias recurrence inputs.
+        return manager.group_offload(
+            core_attn_out, delay_offload=self.config.delay_offload_until_cuda_graph
+        )
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
