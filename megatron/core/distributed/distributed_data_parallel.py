@@ -119,8 +119,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
             if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 raise ValueError(
-                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
-                    "(--reuse-grad-buf-for-mxfp8-param-ag)."
+                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True, which "
+                    "the training CLI sets for --fp8-recipe mxfp8 with --fp8-param-gather."
                 )
 
     def __init__(

@@ -1211,8 +1211,6 @@ def validate_args(args, defaults={}):
                     args.rank,
                 )
             args.use_distributed_optimizer = True
-        # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
-        args.reuse_grad_buf_for_mxfp8_param_ag = False
         if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
             # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
             # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
@@ -1303,6 +1301,22 @@ def validate_args(args, defaults={}):
             args.use_megatron_fsdp
         ), "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
+
+    # MXFP8 params cannot be mapped into DDP's param buffer (TE has no replace_raw_data for
+    # MXFP8Tensor), so their all-gather always goes through the grad buffer; FSDP keeps its own
+    # buffers. The flag is therefore derived rather than chosen.
+    if args.reuse_grad_buf_for_mxfp8_param_ag:
+        warn_rank_0(
+            '--reuse-grad-buf-for-mxfp8-param-ag is deprecated and ignored: the grad buffer is '
+            'reused for the MXFP8 parameter all-gather whenever --fp8-param-gather is set.',
+            args.rank,
+        )
+    args.reuse_grad_buf_for_mxfp8_param_ag = (
+        args.fp8 is not None
+        and args.fp8_recipe == 'mxfp8'
+        and args.fp8_param_gather
+        and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
+    )
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1730,14 +1744,6 @@ def validate_args(args, defaults={}):
             assert getattr(args, 'fp8_param_gather', False), (
                 "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
                 "GTP does not keep or re-quantize a bf16 weight)."
-            )
-            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
-            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
-            # all-gather must reuse the grad buffer instead.
-            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
-                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
-                "(MXFP8 params keep their own quantized storage; mapping them into the param "
-                "buffer via replace_raw_data is unsupported)."
             )
 
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
@@ -4117,7 +4123,8 @@ def _add_mixed_precision_args(parser):
     group.add_argument(
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
-        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+        help='Deprecated and ignored: the grad buffer is reused for the MXFP8 '
+        'parameter all-gather whenever --fp8-param-gather is set.',
     )
     group.add_argument(
         '--mamba-training-ssm-states-dtype',

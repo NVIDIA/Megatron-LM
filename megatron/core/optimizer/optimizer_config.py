@@ -211,7 +211,8 @@ class OptimizerConfig:
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True. The training
+       CLI sets it for every MXFP8 run with --fp8-param-gather outside FSDP."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -587,19 +588,16 @@ class OptimizerConfig:
             )
         )
 
-        if self.fp8_recipe == "mxfp8":
-            if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                warnings.warn(
-                    "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
-                    "will use significant amount additional GPU memory."
-                    "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
-                    "recommended for mxfp8 training."
-                )
+        if self.fp8_recipe == "mxfp8" and not self.reuse_grad_buf_for_mxfp8_param_ag:
+            warnings.warn(
+                "mxfp8 without reuse_grad_buf_for_mxfp8_param_ag uses significantly more GPU "
+                "memory; the training CLI enables it with --fp8-param-gather."
+            )
 
         if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
             raise ValueError(
-                "overlap_param_gather_with_optimizer_step is not supported with "
-                "reuse_grad_buf_for_mxfp8_param_ag."
+                "overlap_param_gather_with_optimizer_step is not supported with the MXFP8 "
+                "parameter all-gather through the grad buffer (--fp8-param-gather with mxfp8)."
             )
 
         if self.optimizer_cuda_graph:

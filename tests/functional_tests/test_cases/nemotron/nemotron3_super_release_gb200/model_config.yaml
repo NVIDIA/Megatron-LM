@@ -115,7 +115,6 @@ MODEL_ARGS:
   --fp8-format: e4m3
   --fp8-recipe: mxfp8
   --fp8-param-gather: true
-  --reuse-grad-buf-for-mxfp8-param-ag: true
 
   # Regularization args
   --attention-dropout: 0.0

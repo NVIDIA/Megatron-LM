@@ -247,8 +247,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-opt-in-modules` | **Optional** | MoE models with large `--moe-latent-size` | `[]` | Space-separated list of module tokens to opt in to GTP_remat sharding. Currently supported: `moe_latent_proj` (shards `fc1_latent_proj` / `fc2_latent_proj`; only beneficial when the latent size is large enough to amortize the all-gather). [§1.5](#15-opt-in-minimally-invasive-integration) |
-| `--fp8-param-gather` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Gathers native MXFP8 shard directly; without it the grad-buffer reuse path is unavailable and `arguments.py` asserts. Always paired with `--reuse-grad-buf-for-mxfp8-param-ag`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
-| `--reuse-grad-buf-for-mxfp8-param-ag` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Reuses the grad buffer for the MXFP8 all-gather (MXFP8 cannot map into the contiguous param buffer). Must accompany `--fp8-param-gather`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
+| `--fp8-param-gather` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Gathers native MXFP8 shard directly; without it the grad-buffer reuse path is unavailable and `arguments.py` asserts. The MXFP8 all-gather then reuses the grad buffer automatically (MXFP8 cannot map into the contiguous param buffer). [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
 | `--fp4-param-gather` | **Required** | GTP + `--fp4-format` | off | Gathers native NVFP4 shard directly; without it NVFP4 weights fall back to a BF16 gather that fails the backward GEMM. [§1.3 → GTP + NVFP4](#gtp--nvfp4-native-nvfp4-param) |
 | `--high-priority-stream-groups ep gtp_remat expt_gtp_remat tp` | **Recommended** | Blackwell (GB200/GB300) and later | — | Gives GTP_remat comm streams the SM priority needed for AG/RS overlap with compute. Also export `CUDA_GRAPHS_USE_NODE_PRIORITY=1` when using CUDA graphs. [§2.3](#23-high-priority-streams-blackwell-and-later) |
 
@@ -284,10 +283,10 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 > `gtp_weight_remat_size` / `expert_gtp_weight_remat_size` config fields are derived from them and
 > have no CLI flag.
 
-**Low precision (MXFP8).** GTP_remat + `--fp8-recipe mxfp8` **requires** both `--fp8-param-gather`
-and `--reuse-grad-buf-for-mxfp8-param-ag` (`arguments.py` asserts this) — the weight is a native FP8
-param, and since MXFP8 cannot map into the contiguous param buffer (`replace_raw_data` unsupported)
-the all-gather reuses the grad buffer. Mechanism: §1.3, §3.1.
+**Low precision (MXFP8).** GTP_remat + `--fp8-recipe mxfp8` **requires** `--fp8-param-gather`
+(`arguments.py` asserts this) — the weight is a native FP8 param, and since MXFP8 cannot map into
+the contiguous param buffer (`replace_raw_data` unsupported) the all-gather reuses the grad buffer,
+which `arguments.py` enables automatically. Mechanism: §1.3, §3.1.
 
 **Low precision (NVFP4).** GTP_remat + `--fp4-format` **requires** `--fp4-param-gather`
 (`arguments.py` asserts this) — without it NVFP4 weights fall back to a BF16 gather that fails the
@@ -624,7 +623,7 @@ The request goes through a **backend-agnostic** hook:
 
 - **Contract** (`megatron/core/utils.py`): a backend attaches a zero-argument callable under `PARAM_READY_CALLBACK_ATTR`; a consumer reading `param.data` outside the owning module's pre-hook calls `ensure_params_ready(params)` first. Unmarked params no-op, so the contract is open to FSDP or any other backend.
 - **Neither side names the other**: DDP registers one `_BucketParamReadyCallback` per bucket group (weakly held), knowing nothing of GTP_remat; GTP_remat calls `ensure_params_ready`, knowing nothing of DDP.
-- **Forward only**: backward re-reads what forward published, and recompute runs *inside* backward, where publishing could gather into the buffer that aliases grads under `--reuse-grad-buf-for-mxfp8-param-ag`.
+- **Forward only**: backward re-reads what forward published, and recompute runs *inside* backward, where publishing could gather into the buffer that aliases grads under the MXFP8 grad-buffer all-gather.
 - **Cost**: publishing early can *start* an undispatched gather and chain-dispatch the next bucket, draining it about one block earlier than the pre-hook would — so that bucket loses some gather/compute overlap. Negligible when the gather was already dispatched early, as `--align-param-gather` and `--overlap-param-gather-with-optimizer-step` do.
 - **Not covered — CUDA-graph capture**: no collective may be issued during capture, so the callback no-ops and the captured gather carries no dependency on DDP's. A consumer that captures its reads must publish before launching.
 
@@ -697,7 +696,7 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
-**Pre-save forced param-sync.** Before a save (and around any `disable_forward_pre_hook(param_sync=True)`, e.g. pre-eval), the training loop force-syncs DDP params. `force_param_sync` / `disable_forward_pre_hook` first call `optimizer.prepare_model_params_for_param_sync()`, which copies the FP32 masters into the DDP param buffer, so the sync's `_post_param_sync` copy-back re-quantizes each native-FP8 weight — GTP_remat shards included — from up-to-date masters instead of stale grad scratch under `--reuse-grad-buf-for-mxfp8-param-ag`. The copy-back therefore writes the correct MXFP8 shard, so the forced sync leaves GTP_remat's self-gathered weight intact and does not perturb the next iteration's loss — no GTP-specific preservation is needed.
+**Pre-save forced param-sync.** Before a save (and around any `disable_forward_pre_hook(param_sync=True)`, e.g. pre-eval), the training loop force-syncs DDP params. `force_param_sync` / `disable_forward_pre_hook` first call `optimizer.prepare_model_params_for_param_sync()`, which copies the FP32 masters into the DDP param buffer, so the sync's `_post_param_sync` copy-back re-quantizes each native-FP8 weight — GTP_remat shards included — from up-to-date masters instead of stale grad scratch under the MXFP8 grad-buffer all-gather. The copy-back therefore writes the correct MXFP8 shard, so the forced sync leaves GTP_remat's self-gathered weight intact and does not perturb the next iteration's loss — no GTP-specific preservation is needed.
 
 ### 3.4 Prefetch-chain construction and its design assumptions
 

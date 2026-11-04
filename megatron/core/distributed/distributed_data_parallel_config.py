@@ -89,7 +89,8 @@ class DistributedDataParallelConfig:
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True: MXFP8 params
+       cannot be mapped into the param buffer. The training CLI sets it automatically."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -395,8 +396,8 @@ class DistributedDataParallelConfig:
 
         if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                "Gradient-buffer offload is incompatible with the MXFP8 parameter all-gather "
+                "(--fp8-param-gather with mxfp8), which stages parameters in gradient storage."
             )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
