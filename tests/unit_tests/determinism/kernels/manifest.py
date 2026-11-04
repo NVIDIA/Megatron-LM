@@ -1016,16 +1016,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_topk.py",
-        ),
-        tests=(
-            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py",
         ),
         kind="triton",
         training_path=False,
-        notes="Paged Triton prefill and Gluon/Triton decode with CuTe DSL top-k and a PyTorch "
-        "fallback replay bit-exactly; compares training/decode forward kernels and covers "
-        "empty/ragged requests, causal masks, and graph page-table refresh.",
+        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
+        "Native DSA decode does not support deterministic mode and rejects it before top-k "
+        "execution; this path has no bit-exact replay guarantee.",
+        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
+        "numerical parity coverage in "
+        "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
+        "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

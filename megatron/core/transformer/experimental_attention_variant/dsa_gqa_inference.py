@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts.attention_context.dsa_metadata import DSARowPlan
+from megatron.core.tuning import use_deterministic_mode
 
 SCORE_BUFFER_BYTES = 1 << 30
 
@@ -19,8 +21,7 @@ def _sparse_attention_rows(
     value_cache: torch.Tensor,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    row_metadata: tuple,
+    plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
     softmax_scale: float,
@@ -28,15 +29,14 @@ def _sparse_attention_rows(
     """Route prefill rows to their causal top-k keys and attend over the paged cache."""
     from . import dsa_gqa_inference_kernels
 
-    row_requests, row_lengths, block_starts, block_rows, block_requests, _ = row_metadata
     num_rows, num_query_heads, _ = query.shape
-    block_table = block_table.to(torch.int32).contiguous()
+    block_table = plan.block_table.to(torch.int32).contiguous()
+    plan = plan._replace(block_table=block_table)
     index_query = index_query.contiguous()
     topk_indices = _materialized_topk(
         index_query=index_query,
         index_key_cache=index_key_cache,
-        block_table=block_table,
-        row_metadata=row_metadata,
+        plan=plan,
         max_context_length=max_context_length,
         index_topk=index_topk,
     )
@@ -46,8 +46,8 @@ def _sparse_attention_rows(
         key_cache,
         value_cache,
         block_table,
-        row_requests,
-        row_lengths,
+        plan.row_requests,
+        plan.row_lengths,
         topk_indices,
         softmax_scale,
         out=output,
@@ -59,16 +59,14 @@ def _materialized_topk(
     *,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    row_metadata: tuple,
+    plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
 ) -> torch.Tensor:
     """Each row's top-k by scoring its keys into a buffer and selecting from it."""
     from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference_kernels
 
-    row_requests, row_lengths, block_starts, block_rows, block_requests, _ = row_metadata
-    num_rows = row_requests.numel()
+    num_rows = plan.row_requests.numel()
     width = max_context_length
     # Score and select in windows of rows so the score buffer stays bounded at long context;
     # the window count depends only on the padded rows and the width (CUDA-graph safe).
@@ -81,11 +79,11 @@ def _materialized_topk(
         dsa_gqa_inference_kernels.dsa_gqa_indexer_scores(
             index_query,
             index_key_cache,
-            block_table,
-            row_lengths,
-            block_starts,
-            block_rows,
-            block_requests,
+            plan.block_table,
+            plan.row_lengths,
+            plan.block_starts,
+            plan.block_rows,
+            plan.block_requests,
             out=window_scores,
             fill_invalid=True,
             row_offset=start,
@@ -103,7 +101,6 @@ def dynamic_sparse_attention(
     value_cache: torch.Tensor,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    block_table: torch.Tensor,
     inference_context: BaseInferenceContext,
     index_topk: int,
     softmax_scale: float,
@@ -111,7 +108,7 @@ def dynamic_sparse_attention(
     """Simplified-DSA attention over paged caches for a decode, prefill, or mixed batch.
 
     Every token is a row that routes to the top-k of its causal prefix
-    (``DSAMetadata.row_metadata``), so all step types share one path with
+    (``DSAMetadata.plan``), so all step types share one path with
     launch sizes fixed by the padded batch and can run as CUDA graphs. The caches already
     hold this step's keys, values, and indexer keys.
 
@@ -121,7 +118,6 @@ def dynamic_sparse_attention(
         value_cache: Paged values ``[blocks,block_size,G,Dv]``.
         index_query: Indexer queries ``[T,1,1,Di]``.
         index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``.
-        block_table: Per-request physical block ids ``[requests,max_blocks]``.
         inference_context: Dynamic inference context for this step.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
@@ -137,25 +133,27 @@ def dynamic_sparse_attention(
     if query.dim() == 3:
         query = query.unsqueeze(1)
     num_tokens, _, num_query_heads, _ = query.shape
-    row_metadata = inference_context.dsa_metadata.row_metadata()
-    if row_metadata[0].numel() != num_tokens:
+    metadata = inference_context.dsa_metadata
+    plan = metadata.plan()
+    if plan.row_requests.numel() != num_tokens:
         raise RuntimeError(
-            f"DSA row metadata covers {row_metadata[0].numel()} tokens, but the step has "
+            f"DSA row metadata covers {plan.row_requests.numel()} tokens, but the step has "
             f"{num_tokens}."
         )
     # Graphed steps use the graph's static bound; eager steps the batch's longest context.
-    max_context_length = inference_context.active_attn_metadata["mha_metadata"].state_data[
-        "max_seqlen_k"
-    ]
+    max_context_length = (
+        inference_context.max_sequence_length
+        if inference_context.using_cuda_graph_this_step()
+        else max(1, metadata.step().max_kv_length)
+    )
     output = _native_sparse_attention(
         query=query[:, 0],
         key_cache=key_cache,
         value_cache=value_cache,
         index_query=index_query.reshape(num_tokens, -1),
         index_key_cache=index_key_cache,
-        block_table=block_table,
         inference_context=inference_context,
-        row_metadata=row_metadata,
+        plan=plan,
         max_context_length=max_context_length,
         index_topk=index_topk,
         softmax_scale=softmax_scale,
@@ -171,14 +169,13 @@ def _native_sparse_attention(
     value_cache: torch.Tensor,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    block_table: torch.Tensor,
     inference_context: BaseInferenceContext,
-    row_metadata: tuple,
+    plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    rows = min(query.shape[0], inference_context.padded_active_request_count)
+    rows = plan.decode_lengths.numel()
     max_context = inference_context.max_sequence_length
     cache_key = (
         index_key_cache.data_ptr(),
@@ -207,40 +204,67 @@ def _native_sparse_attention(
         cache[cache_key] = workspace, stable_query
     workspace, stable_query = cache[cache_key]
     stable_query.copy_(index_query[:rows])
-    lengths = inference_context.dsa_metadata.decode_lengths[:rows]
+    lengths = plan.decode_lengths
     native = workspace(
         query=query[:rows],
         index_query=stable_query,
         index_key_cache=index_key_cache,
         key_cache=key_cache,
         value_cache=value_cache,
-        block_table=block_table,
+        block_table=plan.block_table,
         context_lengths=lengths,
-        request_indices=row_metadata[0][:rows],
+        request_indices=plan.row_requests[:rows],
         softmax_scale=softmax_scale,
     )
-    if inference_context.is_decode_only():
+    if plan.decode_only:
         return native
 
     # Mixed steps retain the prefill implementation; decode rows are computed only
     # by the native workspace, with zero lengths in the prefill score/attention path.
-    prefill_lengths = row_metadata[1].clone()
+    prefill_lengths = plan.row_lengths.clone()
     prefill_lengths[:rows] = torch.where(lengths > 0, 0, prefill_lengths[:rows])
-    prefill_metadata = (row_metadata[0], prefill_lengths, *row_metadata[2:])
     output = _sparse_attention_rows(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
         index_query=index_query,
         index_key_cache=index_key_cache,
-        block_table=block_table,
-        row_metadata=prefill_metadata,
+        plan=plan._replace(row_lengths=prefill_lengths),
         max_context_length=max_context_length,
         index_topk=index_topk,
         softmax_scale=softmax_scale,
     )
     output[:rows] = torch.where((lengths > 0)[:, None, None], native, output[:rows])
     return output
+
+
+class _FlashInferTopKWorkspace:
+    """Hint-free GVR2 top-k with scratch owned by this decode workspace."""
+
+    def __init__(self, scores: torch.Tensor, lengths: torch.Tensor, indices: torch.Tensor) -> None:
+        from flashinfer import top_k_varlen
+        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
+
+        self.topk = top_k_varlen
+        self.workspace = {
+            "gvr2_workspace": torch.zeros(
+                workspace_bytes(), dtype=torch.uint8, device=scores.device
+            )
+        }
+        self.scores, self.lengths, self.indices = scores, lengths, indices
+
+    def __call__(self) -> None:
+        if use_deterministic_mode():
+            raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
+
+        self.topk(
+            self.scores,
+            self.lengths,
+            self.indices.shape[1],
+            backend="gvr_2",
+            out_indices=self.indices,
+            workspace=self.workspace,
+        )
 
 
 class TritonDSADecodeWorkspace:
@@ -255,7 +279,8 @@ class TritonDSADecodeWorkspace:
     page sizes must be multiples of 128. Every positive context length must fit
     max_context and reference valid allocated pages in block_table. Active request
     indices must address valid rows of block_table. Score inputs must be NaN-free.
-    CuTe DSL selects exact top-k with a PyTorch fallback for rejected rows.
+    FlashInfer GVR2 selects exact top-k; tied indices and output ordering can vary.
+    Deterministic mode is not supported and is rejected before top-k execution.
 
     Args:
         batch_size: Number of padded decode rows.
@@ -283,9 +308,6 @@ class TritonDSADecodeWorkspace:
         from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
         from . import dsa_gqa_inference_kernels as kernels
-        from .dsa_gqa_topk import CuteTopKWorkspace
-
-        self._topk_workspace_type = CuteTopKWorkspace
 
         device = torch.device(device)
         if device.type != "cuda" or torch.cuda.get_device_capability(device) not in (
@@ -314,9 +336,7 @@ class TritonDSADecodeWorkspace:
         self.max_context = max_context
         self.page_size = page_size
         width = max(max_context, index_topk)
-        self.score_width = (
-            triton.cdiv(width, 65536) * 65536 if width > 65536 else triton.cdiv(width, 4) * 4
-        )
+        self.score_width = triton.cdiv(width, 4) * 4
         self._topk_selectors = {}
         self.scores = torch.empty(batch_size, self.score_width, dtype=torch.float32, device=device)
         self.indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device=device)
@@ -451,8 +471,8 @@ class TritonDSADecodeWorkspace:
             selector_key = context_lengths.data_ptr()
             if selector_key not in self._topk_selectors:
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("CuTe top-k selector must be warmed before capture")
-                self._topk_selectors[selector_key] = self._topk_workspace_type(
+                    raise RuntimeError("Decode top-k selector must be warmed before capture")
+                self._topk_selectors[selector_key] = _FlashInferTopKWorkspace(
                     self.scores, context_lengths, self.indices
                 )
             self._topk_selectors[selector_key]()

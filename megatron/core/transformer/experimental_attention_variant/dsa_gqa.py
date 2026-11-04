@@ -765,7 +765,6 @@ class DSGQACoreAttention(MegatronModule):
             value_cache=value_cache,
             index_query=index_q,
             index_key_cache=index_key_cache,
-            block_table=block_table,
             inference_context=inference_context,
             index_topk=self.indexer.index_topk,
             softmax_scale=self.softmax_scale,

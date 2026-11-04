@@ -2,12 +2,51 @@
 
 """Per-token metadata shared by DSA inference backends."""
 
+from dataclasses import dataclass
+from typing import NamedTuple, Sequence
+
 import torch
+
+from .metadata_base import MetadataBase
 
 SCORE_ROW_BLOCK = 32
 
 
-class DSAMetadata:
+@dataclass(frozen=True)
+class DSAPrefillSpan:
+    """Query-row interval and causal KV length of one prefill request."""
+
+    request: int
+    query_start: int
+    query_end: int
+    kv_length: int
+
+
+@dataclass(frozen=True)
+class DSAStepInfo:
+    """CPU request facts shared by DSA backends, independent of their GPU plans."""
+
+    num_decode_requests: int
+    max_decode_query_length: int
+    max_decode_kv_length: int
+    max_kv_length: int
+    prefill_spans: tuple[DSAPrefillSpan, ...]
+
+
+class DSARowPlan(NamedTuple):
+    """GPU views for the Triton row kernels, sized only by the padded batch."""
+
+    row_requests: torch.Tensor
+    row_lengths: torch.Tensor
+    block_starts: torch.Tensor
+    block_rows: torch.Tensor
+    block_requests: torch.Tensor
+    decode_lengths: torch.Tensor
+    block_table: torch.Tensor
+    decode_only: bool
+
+
+class DSAMetadata(MetadataBase):
     """Own DSA row metadata in pinned CPU and fixed-address GPU buffers.
 
     Row ``t`` belongs to request ``row_requests[t]`` and attends to its causal
@@ -21,6 +60,7 @@ class DSAMetadata:
     """
 
     def __init__(self, *, max_requests: int, max_tokens: int) -> None:
+        super().__init__()
         # A request with q query tokens takes ceil(q / block) <= q / block + 1 blocks.
         self._max_score_blocks = max_requests + -(-max_tokens // SCORE_ROW_BLOCK)
         sizes = [max_tokens, max_tokens, max_requests] + [self._max_score_blocks] * 3
@@ -44,39 +84,61 @@ class DSAMetadata:
             self.block_rows,
             self.block_requests,
         ) = self._gpu_buffer.split(sizes)
-        self.num_rows = 0
-        self.num_score_blocks = 0
         self.decode_workspaces = {}
+        self.reset()
 
     def update(
         self,
-        query_lengths: torch.Tensor,
-        kv_lengths: torch.Tensor,
+        query_lengths: Sequence[int],
+        kv_lengths: Sequence[int],
         *,
-        padded_request_count: int,
-        padded_token_count: int,
+        num_decode_requests: int,
+        padded_tokens: int,
+        padded_requests: int,
+        decode_only: bool,
     ) -> None:
-        """Stage real requests' CPU lengths and clear padding for the next step."""
+        """Record CPU step facts and stage a row plan; decode requests precede prefill."""
+        if len(query_lengths) != len(kv_lengths):
+            raise ValueError("query_lengths and kv_lengths must have one entry per request.")
+        if not 0 <= num_decode_requests <= len(query_lengths):
+            raise ValueError("num_decode_requests must be within the real request count.")
+        if any(length != 1 for length in query_lengths[:num_decode_requests]):
+            raise NotImplementedError("DSA inference decodes one token per request.")
+
+        spans = []
+        query_start = 0
+        for request, (query_length, kv_length) in enumerate(zip(query_lengths, kv_lengths)):
+            query_end = query_start + query_length
+            if request >= num_decode_requests:
+                spans.append(DSAPrefillSpan(request, query_start, query_end, kv_length))
+            query_start = query_end
+        self._step = DSAStepInfo(
+            num_decode_requests=num_decode_requests,
+            max_decode_query_length=max(query_lengths[:num_decode_requests], default=0),
+            max_decode_kv_length=max(kv_lengths[:num_decode_requests], default=0),
+            max_kv_length=max(kv_lengths, default=0),
+            prefill_spans=tuple(spans),
+        )
+
+        query_lengths_cpu = torch.tensor(query_lengths, dtype=torch.int64)
+        kv_lengths_cpu = torch.tensor(kv_lengths, dtype=torch.int64)
         row_requests, row_lengths, block_starts, block_rows, block_requests = build_row_metadata(
-            query_lengths, kv_lengths
+            query_lengths_cpu, kv_lengths_cpu
         )
         real_tokens, num_blocks = row_requests.numel(), block_starts.numel()
-        self.num_rows = padded_token_count
+        self.num_rows = padded_tokens
+        self._decode_rows = min(padded_tokens, padded_requests)
+        self._decode_only = decode_only
         self._cpu_row_requests[:real_tokens] = row_requests
         self._cpu_row_lengths[:real_tokens] = row_lengths
-        self._cpu_row_requests[real_tokens:padded_token_count] = -1
-        self._cpu_row_lengths[real_tokens:padded_token_count] = 0
+        self._cpu_row_requests[real_tokens:padded_tokens] = -1
+        self._cpu_row_lengths[real_tokens:padded_tokens] = 0
         self._cpu_decode_lengths.zero_()
-        leading_decode = 0
-        for length in query_lengths.tolist():
-            if length != 1:
-                break
-            leading_decode += 1
-        self._cpu_decode_lengths[:leading_decode] = kv_lengths[:leading_decode]
+        self._cpu_decode_lengths[:num_decode_requests] = kv_lengths_cpu[:num_decode_requests]
 
         # Launch dimensions depend only on padding, so a captured graph covers
         # every batch that fits the same padded dimensions.
-        self.num_score_blocks = padded_request_count + -(-padded_token_count // SCORE_ROW_BLOCK)
+        self.num_score_blocks = padded_requests + -(-padded_tokens // SCORE_ROW_BLOCK)
         assert num_blocks <= self.num_score_blocks <= self._max_score_blocks
         self._cpu_block_starts[:num_blocks] = block_starts
         self._cpu_block_rows[:num_blocks] = block_rows
@@ -85,22 +147,40 @@ class DSAMetadata:
         self._cpu_block_rows[num_blocks : self.num_score_blocks] = 0
         self._cpu_block_requests[num_blocks : self.num_score_blocks] = 0
 
-    def transfer_to_gpu(self, *, non_blocking: bool = False) -> None:
-        """Copy staged metadata; callers must wait before reusing an in-flight CPU buffer."""
+    def transfer(self, block_table: torch.Tensor, non_blocking: bool) -> None:
+        """Bind the native page table and copy the plan alongside context bookkeeping.
+
+        Callers must wait before reusing an in-flight CPU staging buffer.
+        """
+        self._block_table = block_table
         self._gpu_buffer.copy_(self._cpu_buffer, non_blocking=non_blocking)
 
-    def row_metadata(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Return GPU row/request and score-block views for this step's padded dimensions."""
-        return (
-            self.row_requests[: self.num_rows],
-            self.row_lengths[: self.num_rows],
-            self.block_starts[: self.num_score_blocks],
-            self.block_rows[: self.num_score_blocks],
-            self.block_requests[: self.num_score_blocks],
-            self.num_score_blocks,
+    def step(self) -> DSAStepInfo:
+        """Return the host-side facts recorded by the latest update."""
+        return self._step
+
+    def plan(self) -> DSARowPlan:
+        """Return the row backend's GPU plan for the padded step."""
+        assert self._block_table is not None, "transfer() must bind the step's block table first."
+        return DSARowPlan(
+            row_requests=self.row_requests[: self.num_rows],
+            row_lengths=self.row_lengths[: self.num_rows],
+            block_starts=self.block_starts[: self.num_score_blocks],
+            block_rows=self.block_rows[: self.num_score_blocks],
+            block_requests=self.block_requests[: self.num_score_blocks],
+            decode_lengths=self.decode_lengths[: self._decode_rows],
+            block_table=self._block_table,
+            decode_only=self._decode_only,
         )
+
+    def reset(self) -> None:
+        """Forget the step while preserving graph-owned buffers and decode workspaces."""
+        self._step = DSAStepInfo(0, 0, 0, 0, ())
+        self.num_rows = 0
+        self.num_score_blocks = 0
+        self._decode_rows = 0
+        self._decode_only = True
+        self._block_table = None
 
 
 def build_row_metadata(

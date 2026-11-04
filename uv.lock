@@ -2639,6 +2639,7 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
+    { name = "flashinfer-python" },
     { name = "torch-memory-saver" },
 ]
 mlm = [
@@ -2745,6 +2746,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
+    { name = "flashinfer-python", marker = "extra == 'inference'", specifier = ">=0.7.2,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
     { name = "gigatoken", marker = "extra == 'mlm'" },

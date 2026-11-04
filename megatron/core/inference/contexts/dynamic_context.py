@@ -2459,6 +2459,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         for attn_metadata in self.graph_attn_metadata.values():
             attn_metadata.reset()
         self.active_attn_metadata = None
+        dsa_metadata = getattr(self, "dsa_metadata", None)
+        if dsa_metadata is not None:
+            dsa_metadata.reset()
 
         if self.is_hybrid_model:
             self.mamba_metadata.reset_varlen_metadata()
@@ -2993,10 +2996,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if self.cache_dsa_indexer_keys:
             self.dsa_metadata.update(
-                self._cpu_mha_query_lengths[:real_bs],
-                self._cpu_mha_kv_seq_lengths[:real_bs],
-                padded_request_count=padded_bs,
-                padded_token_count=self.padded_active_token_count,
+                self._cpu_mha_query_lengths[:real_bs].tolist(),
+                self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
+                num_decode_requests=attn_dimensions.decode_req_count,
+                padded_tokens=self.padded_active_token_count,
+                padded_requests=padded_bs,
+                decode_only=self.is_decode_only(),
             )
 
         if self.is_hybrid_model:
@@ -3176,7 +3181,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # bytes. Nothing else to do here for MHA.
 
         if self.cache_dsa_indexer_keys:
-            self.dsa_metadata.transfer_to_gpu(non_blocking=record_done_event)
+            self.dsa_metadata.transfer(
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+                non_blocking=record_done_event,
+            )
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
