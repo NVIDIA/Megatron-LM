@@ -238,10 +238,19 @@ def _call_fused_kda_bwd(
     """Run the fused KDA backward on FLA's residuals; returns ``dq, dk, dv, dg, dbeta``.
 
     ``g`` is FLA's chunk-local log2 gate cumsum and ``h`` the chunk-start states.
-    The returned ``dg`` already includes FLA's chunk-local reverse cumsum.
+    With few (sequence, head) pairs the dS recurrence runs first (``kda_dhu``)
+    and writes every chunk's dS and dv_new, and the gradient kernel then
+    processes all chunks in parallel; otherwise one fused kernel runs the
+    recurrence and the gradients per (sequence, head). The returned ``dg``
+    already includes FLA's chunk-local reverse cumsum.
     """
     global _fused_kda_bwd_launches
-    from .kernels.fused_kda_bwd_cute.launcher import fused_kda_bwd
+    from .kernels.fused_kda_bwd_cute.launcher import (
+        chunk_offsets_for,
+        fused_kda_bwd,
+        kda_dhu,
+        prefer_tape,
+    )
 
     batch, seq_len, heads, dim = q.shape
     tokens = batch * seq_len
@@ -255,27 +264,60 @@ def _call_fused_kda_bwd(
     def tokens_of(x, dtype, width=dim):
         return x.detach().reshape(1, tokens, heads, width).to(dtype).contiguous()
 
-    dq, dk, dv, dg, db, _dh0 = fused_kda_bwd(
+    q, k, v, g, Aqk, Akk, do = (
         tokens_of(q, torch.bfloat16),
         tokens_of(k, torch.bfloat16),
         tokens_of(v, torch.bfloat16),
         tokens_of(g, torch.float32),
-        beta.detach().reshape(1, tokens, heads).to(torch.float32).contiguous(),
         tokens_of(Aqk, torch.bfloat16, _CHUNK_SIZE),
         tokens_of(Akk, torch.bfloat16, _CHUNK_SIZE),
-        h.detach().reshape(1, -1, heads, dim, dim).to(torch.bfloat16).contiguous(),
         tokens_of(do, torch.bfloat16),
-        dht.detach().reshape(num_sequences, heads, dim, dim).to(torch.float32).contiguous(),
+    )
+    beta = beta.detach().reshape(1, tokens, heads).to(torch.float32).contiguous()
+    h = h.detach().reshape(1, -1, heads, dim, dim).to(torch.bfloat16).contiguous()
+    dht = dht.detach().reshape(num_sequences, heads, dim, dim).to(torch.float32).contiguous()
+    chunk_offsets = chunk_offsets_for(cu_seqlens)
+    tape = None
+    if prefer_tape(num_sequences, heads, q.device):
+        dh, _dh0, dv_new = kda_dhu(
+            q,
+            k,
+            g,
+            beta,
+            Aqk,
+            Akk,
+            do,
+            dht,
+            cu_seqlens,
+            scale,
+            chunk_offsets=chunk_offsets,
+            num_chunks=h.shape[1],
+        )
+        tape = (dh, dv_new)
+    dq, dk, dv, dg, db, _ = fused_kda_bwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        Aqk,
+        Akk,
+        h,
+        do,
+        dht,
         cu_seqlens,
         scale,
+        chunk_offsets=chunk_offsets,
+        tape=tape,
     )
     _fused_kda_bwd_launches += 1
+    shape = (batch, seq_len, heads, dim)
     return (
-        dq.reshape_as(q),
-        dk.reshape_as(k),
-        dv.reshape_as(v),
-        dg.reshape(batch, seq_len, heads, dim),
-        db.reshape_as(beta),
+        dq.reshape(shape),
+        dk.reshape(shape),
+        dv.reshape(shape),
+        dg.reshape(shape),
+        db.reshape(shape[:3]),
     )
 
 
