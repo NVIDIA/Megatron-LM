@@ -23,10 +23,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import Mix
 
 @pytest.mark.parametrize("sharding", ["replicated", "hsdp", "hfsdp"])
 @pytest.mark.parametrize("set_to_none", [False, True])
-def test_accumulated_gradients_and_updates_match_reference(
-    distributed_setup, sharding, set_to_none
-):
-    """Two microbatches per step produce the same gradients and weights as dense training."""
+def test_local_accumulation_matches_reference(distributed_setup, sharding, set_to_none):
+    """Singleton-inner DP matches dense training, with replicated DP as a reduction control."""
     setup = distributed_setup
     if setup.world_size < 2:
         pytest.skip("Requires different contributions from at least two ranks.")
