@@ -1478,7 +1478,7 @@ class _ParamAndGradBuffer:
                         elif is_grouped_mxfp8tensor(param):
                             raise RuntimeError(
                                 "Single grouped MXFP8 params require "
-                                "--reuse-grad-buf-for-mxfp8-param-ag."
+                                "reuse_grad_buf_for_mxfp8_param_ag=True."
                             )
                         elif is_grouped_tensor_with_quantized_storage(param):
                             raise RuntimeError(
