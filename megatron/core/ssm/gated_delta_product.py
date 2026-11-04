@@ -17,7 +17,11 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ReplicaId,
+    ShardedTensorFactory,
+)
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -36,14 +40,18 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import deprecate_inference_params, get_pg_rank, get_pg_size
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -417,18 +425,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         with get_cuda_rng_tracker().fork():
             # MCore Mamba2 initialization
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+            # Compute and retain the decay parameter in FP32.
             dt = torch.exp(
                 torch.rand(
-                    self.nheads_local_tp,
-                    device=torch.cuda.current_device(),
-                    dtype=config.params_dtype,
+                    self.nheads_local_tp, device=torch.cuda.current_device(), dtype=torch.float32
                 )
                 * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
             ).clamp(min=dt_init_floor)
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
-            self.dt_bias = nn.Parameter(inv_dt)
+            # Kept in FP32 for the same reason as A_log below.
+            self.dt_bias = mark_keep_in_fp32(nn.Parameter(inv_dt))
 
             # Our initialization would set all Linear.bias to zero,
             # need to mark this one as _no_reinit
@@ -445,7 +453,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
-            self.A_log = nn.Parameter(A_log)
+            # Float16Module casts every floating-point parameter to BF16 unless it is marked.
+            # A_log and dt_bias set each head's decay, exp(-exp(A_log) * softplus(x + dt_bias)),
+            # and BF16 rounding of these per-head scalars shifts the decay rate of the whole
+            # head. Every consumer already upcasts them to FP32, so keeping them in FP32 only
+            # removes that rounding.
+            self.A_log = mark_keep_in_fp32(nn.Parameter(A_log))
             self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
 
@@ -462,6 +475,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.weight.is_rmsnorm_weight = True
             self.norm.tp_group = self.pg_collection.tp
             setattr(self.norm.weight, 'tensor_model_parallel', True)
 
@@ -1013,14 +1027,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             precomputed_seq_start=seq_start,
         ).unsqueeze(0)
 
-    def _compute_gating(self, ba):
+    def _compute_gating(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the beta and g gating tensors from the ba slice."""
         b, a = torch.split(
             ba, [self.nheads_local_cp * self.num_householder, self.nheads_local_cp], dim=-1
         )
 
         b, a = b.contiguous(), a.contiguous()
-        beta = b.sigmoid()
+        # Save FP32 sigmoid values for backward, retaining the kernel's input dtype.
+        beta = b.float().sigmoid().to(b.dtype)
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         if self.chunkwise_context_parallel:
@@ -1048,7 +1063,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
+            z = rearrange(z, "b l d -> l b d")
+            # CP1 and chunkwise CP leave z in projection storage. At batch size one,
+            # the gated norm's flattening preserves this unit-column-stride view,
+            # so in_proj recompute can discard and restore the norm's saved gate.
+            # Headwise CP and larger batches keep their existing materialization.
+            keep_gate_view = (
+                self.recompute_in_proj
+                and (self.pg_collection.cp.size() == 1 or self.chunkwise_context_parallel)
+                and z.shape[1] == 1
+            )
+            if not keep_gate_view:
+                z = z.contiguous()
             if not self.chunkwise_context_parallel:
                 z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
@@ -1192,20 +1218,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             use_qk_l2norm_in_kernel=True,
             intermediate_states=intermediate_ssm_state,
             steps_per_token=self.num_householder,
+            compact_output=True,
         )
-        core_attn_out = rearrange(
-            core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
-        )[
-            ..., -1, :, :
-        ].contiguous()  # [n, 1, h, d]
+        # The recurrent kernel stores just the final Householder result per token,
+        # directly in the contiguous [request, token, head, dim] decode layout.
 
         # No scatter: the kernel above already wrote each request's final state into
         # its cache slot in place.
         #
-        # ``_postprocess`` returns the sequence-first layout, so transpose back to the
-        # batch-first [n, seq_len, d_inner] this method contracts to return; the
-        # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
-        # only runs at cp_size == 1.
+        # Decode has no CP exchange. Keep speculative output batch-first so the
+        # shared dynamic path can flatten it without copying a transposed result.
+        if zVKQba.shape[1] > 1:
+            y = rearrange(core_attn_out, "n t h d -> n t (h d)")
+            return self.norm(y, z.contiguous()) if self.rmsnorm else y
+
+        # ``_postprocess`` returns sequence-first; the transpose is free at l == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
 
     def ssm_prefill(
@@ -1502,45 +1529,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             + (1 + self.num_householder) * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp * (1 + self.num_householder)
         )
-        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|V*|K*|Q|b*|a] split
-        # boundaries don't line up with GTP slice boundaries, so gather the shards back to
-        # TP-local size (strip the trailing pad rows from the gathered tail) and fall through
-        # to the same split path the non-GTP run uses — saved ckpt matches a non-GTP run.
+        # Under GTP, in_proj.weight is GTP-sliced along axis 0 and padded at the tail, so its
+        # shard boundaries don't line up with the [z|V*|K*|Q|b*|a] split boundaries. Each rank
+        # saves the pieces of the split sections that its own rows cover (see
+        # _gtp_split_tensor_factory), so the checkpoint matches a non-GTP run without gathering.
         in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
         in_proj_is_gtp = (
             in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
         )
-        if in_proj_is_gtp:
-            gtp_remat_group = self.in_proj.weight.group
-            # in_proj.weight was already built at the sharded size by the submodule
-            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
-            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
-            # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
-            gathered = torch.empty(
-                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
-                dtype=local.dtype,
-                device=local.device,
+        if not in_proj_is_gtp:
+            assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
+                in_proj_dim,
+                sharded_state_dict[f"{prefix}in_proj.weight"],
             )
-            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
-            if gathered.shape[0] != in_proj_dim:
-                gathered = gathered[:in_proj_dim].contiguous()
-            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
-            dp_cp_rank = torch.distributed.get_rank(metadata["dp_cp_group"])
-            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
-                gathered,
-                f"{prefix}in_proj.weight",
-                tp_axis=0,
-                replica_id=(0, 0, dp_cp_rank),
-                prepend_offsets=sharded_offsets,
-                tp_group=self.pg_collection.tp,
-                dp_cp_group=metadata["dp_cp_group"],
-            )
-
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
-            in_proj_dim,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
 
         # V, K, and b are laid out householder-major on every TP rank:
         #
@@ -1563,44 +1564,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
         for in_proj_param in ["in_proj.weight", "in_proj.bias"]:
             key = f"{prefix}{in_proj_param}"
-            if key in sharded_state_dict:
+            if key not in sharded_state_dict:
+                continue
+            if in_proj_is_gtp and in_proj_param == "in_proj.weight":
+                sharded_state_dict[key] = _gtp_split_tensor_factory(
+                    sharded_state_dict[key],
+                    in_proj_split_sections,
+                    in_proj_split_names,
+                    gtp_remat_rank=torch.distributed.get_rank(self.in_proj.weight.group),
+                    tp_rank=get_pg_rank(self.pg_collection.tp),
+                    tp_size=get_pg_size(self.pg_collection.tp),
+                )
+            else:
                 sharded_state_dict[key] = _split_tensor_factory(
                     sharded_state_dict[key], in_proj_split_sections, in_proj_split_names, 0
                 )
-
-        # GTP load-side inverse of the save-time all-gather (see
-        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note): the checkpoint
-        # stores the FULL TP-local in_proj.weight (pad stripped) under the per-householder split
-        # keys, so the default merge_fn cats them back to ``in_proj_dim`` rows with no
-        # padding. To reload into the live GTP param we must mirror init
-        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
-        # ``gtp_remat_local_size * gtp_remat_size``, then slice by ``gtp_remat_local_rank``.
-        # gtp_remat_size=1 has no pad/slice.
-        if in_proj_is_gtp:
-            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
-            gtp_remat_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
-            gtp_remat_local_size = self.in_proj.weight.data.size(0)
-            original_merge_fn = factory.merge_fn
-
-            @torch.no_grad()
-            def _gtp_slice_after_cat(
-                sub_state_dict,
-                _orig=original_merge_fn,
-                _rank=gtp_remat_local_rank,
-                _size=gtp_remat_local_size,
-                _gtp_remat_size=in_proj_gtp_remat_size,
-            ):
-                full = _orig(sub_state_dict)
-                aligned_total = _size * _gtp_remat_size
-                pad_rows = aligned_total - full.shape[0]
-                if pad_rows > 0:
-                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
-                start = _rank * _size
-                return full[start : start + _size].contiguous()
-
-            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
-                factory, merge_fn=_gtp_slice_after_cat
-            )
 
         conv_dim = (
             self.d_inner_local_tp * self.num_householder
@@ -1721,4 +1699,101 @@ def _split_tensor_factory(
 
     return ShardedTensorFactory(
         orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
+    )
+
+
+def _gtp_split_tensor_factory(
+    orig_sh_ten: ShardedTensor,
+    split_sections: List[int],
+    split_names: List[str],
+    gtp_remat_rank: int,
+    tp_rank: int,
+    tp_size: int,
+) -> ShardedTensorFactory:
+    """Split a GTP shard of a TP-local tensor along dim 0 without gathering it.
+
+    ``orig_sh_ten.data`` holds rows ``[gtp_remat_rank * R, (gtp_remat_rank + 1) * R)`` of the
+    TP-local tensor (R = local rows), zero-padded past ``sum(split_sections)``. Each split section
+    is a contiguous block of TP-local rows, so this rank saves, as views of its shard, the parts of
+    every section its rows cover, at their offsets within the section. The keys and global shapes
+    match ``_split_tensor_factory`` in a non-GTP run, so the checkpoint is the same either way;
+    shard boundaries are uneven, which DCP stores as-is. Pad rows are not saved.
+    """
+    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
+    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
+    prepend_axis_num = orig_sh_ten_no_data.prepend_axis_num
+    prepend_shape = orig_sh_ten_no_data.global_shape[:prepend_axis_num]
+    prepend_offset = orig_sh_ten_no_data.global_offset[:prepend_axis_num]
+    local_rows, *trailing_shape = orig_sh_ten_no_data.local_shape
+    trailing_shape = tuple(trailing_shape)
+    shard_start = gtp_remat_rank * local_rows
+    shard_end = min(shard_start + local_rows, sum(split_sections))
+    valid_rows = max(0, shard_end - shard_start)
+    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
+
+    # (name, rows of this shard, offset in the section's global dim 0, section's global dim 0).
+    pieces = []
+    section_start = 0
+    for section_size, section_name in zip(split_sections, split_names):
+        piece_start = max(section_start, shard_start)
+        piece_end = min(section_start + section_size, shard_end)
+        if piece_start < piece_end:
+            pieces.append(
+                (
+                    section_name,
+                    slice(piece_start - shard_start, piece_end - shard_start),
+                    tp_rank * section_size + piece_start - section_start,
+                    tp_size * section_size,
+                )
+            )
+        section_start += section_size
+
+    @torch.no_grad()
+    def sh_ten_build_fn(
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+    ):
+        assert flattened_range is None, "flattened_range is not supported"
+        if not pieces:
+            # An empty list is dropped by checkpoint preprocessing, leaving the factory
+            # without a value to merge on load. Keep a local-only, zero-element tensor
+            # so the key and device survive without saving padding or retaining shard data.
+            return [LocalNonpersistentObject(t.new_empty((0,) + trailing_shape))]
+        chunk_sh_tens = []
+        for section_name, rows, section_offset, section_global_rows in pieces:
+            chunk = t[rows]
+            chunk_sh_tens.append(
+                ShardedTensor(
+                    key=f"{key}.{section_name}",
+                    data=chunk,
+                    dtype=chunk.dtype,
+                    local_shape=tuple(chunk.shape),
+                    global_shape=prepend_shape + (section_global_rows,) + trailing_shape,
+                    global_offset=prepend_offset + (section_offset,) + (0,) * len(trailing_shape),
+                    axis_fragmentations=None,
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                )
+            )
+        return chunk_sh_tens
+
+    @torch.no_grad()
+    def sh_ten_merge_fn(sub_state_dict):
+        # Rebuild the live shard: the loaded pieces, then zeros for the pad rows, as at init.
+        # Pad rows share MXFP8 scaling blocks with real rows, so they must not hold garbage.
+        merged = torch.empty(
+            (local_rows,) + trailing_shape,
+            dtype=orig_sh_ten_no_data.dtype,
+            device=sub_state_dict[0].device,
+        )
+        if valid_rows:
+            torch.cat(sub_state_dict, out=merged[:valid_rows])
+        merged[valid_rows:].zero_()
+        return merged
+
+    # A fresh view, so the optimizer's identity match against the live param (or against the
+    # ``_gtp_dequant_src`` backlink of a dequantized copy) does not pick up this factory; the
+    # optimizer keeps saving its per-shard GTP state (see _backfill_gtp_sharded_param_map).
+    data = orig_sh_ten.data.view_as(orig_sh_ten.data)
+    return ShardedTensorFactory(
+        orig_sh_ten.key, data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
     )
