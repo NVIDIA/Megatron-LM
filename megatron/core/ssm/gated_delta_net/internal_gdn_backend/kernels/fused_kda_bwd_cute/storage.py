@@ -70,6 +70,8 @@ class SharedStorage:
     # Two-slot intra ring: full (MMA commit) and empty (one arrival per consumer warp) barriers per slot.
     ring_full: cute.struct.MemRange[cutlass.Int64, 2]
     ring_empty: cute.struct.MemRange[cutlass.Int64, 2]
+    # Two-CTA split: the other CTA arrives once dS for this CTA's next chunk is ready.
+    ds_ready: cute.struct.MemRange[cutlass.Int64, 1]
     tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]
 
     beta: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, _BT], 16]
