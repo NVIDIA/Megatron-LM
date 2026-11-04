@@ -29,7 +29,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    warn_global_process_group_fallback,
+    global_process_group_fallback,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
@@ -135,12 +135,12 @@ def get_batch(
 
     if pg_collection is None:
         # Compatibility for direct entrypoint callers; forward_step passes the model's groups.
-        warn_global_process_group_fallback(
+        with global_process_group_fallback(
             "pretrain_gpt.get_batch", deprecated_in="0.21", removed_in="0.23"
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
-        )
+        ):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
 
     if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
