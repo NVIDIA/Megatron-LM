@@ -9,7 +9,7 @@ from .utils import is_hybrid_model, print_rank_0
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
-def compute_weight_and_optimizer_memory(args, verbose=False):
+def compute_weight_and_optimizer_memory(cfg, args, verbose=False):
     # Attention projection size.
     query_projection_size = args.kv_channels * args.num_attention_heads
     query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
@@ -92,7 +92,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             )
         )
 
-    embedding_size = args.hidden_size * args.padded_vocab_size
+    embedding_size = args.hidden_size * cfg.tokenizer.padded_vocab_size
     final_layernorm = norm_size * args.hidden_size
     if args.untie_embeddings_and_output_weights:
         num_parameters_in_embedding_layers = 2 * embedding_size
@@ -305,7 +305,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     return weight_and_optimizer_memory
 
 
-def compute_activation_memory(args, num_microbatches, verbose=False, *, micro_batch_size):
+def compute_activation_memory(cfg, args, num_microbatches, verbose=False, *, micro_batch_size):
     # Using formula in Table 2 of https://arxiv.org/pdf/2205.05198.pdf.
     # We are trying to compute the maximum activation footprint, so all calculations in this
     # function are for the first pipeline stage.
@@ -372,14 +372,14 @@ def compute_activation_memory(args, num_microbatches, verbose=False, *, micro_ba
             * micro_batch_size
             * args.hidden_size
             * 4
-            * (1 + (args.padded_vocab_size / args.hidden_size))
+            * (1 + (cfg.tokenizer.padded_vocab_size / args.hidden_size))
         )
 
     # Activation memory is partitioned by TP size due to tensor and sequence model parallelism.
     return activation_memory / args.tensor_model_parallel_size
 
 
-def compute_activation_memory_without_sp(args, num_microbatches, verbose=False, *, micro_batch_size):
+def compute_activation_memory_without_sp(cfg, args, num_microbatches, verbose=False, *, micro_batch_size):
     """Compute activation memory without sequence parallelism"""
 
     # 4. Compute per-layer memory
@@ -437,7 +437,7 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False, 
     # 8. Add output layer memory if needed
     if args.pipeline_model_parallel_size == 1:
         # Logits calculation
-        logits_size = args.seq_length * micro_batch_size * args.padded_vocab_size
+        logits_size = args.seq_length * micro_batch_size * cfg.tokenizer.padded_vocab_size
         # The output projection is partitioned across TP
         logits_size /= args.tensor_model_parallel_size
 
@@ -453,26 +453,26 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False, 
     return total_activation_memory
 
 
-def report_theoretical_memory(args, num_microbatches=None, verbose=False, *, micro_batch_size):
+def report_theoretical_memory(cfg, args, num_microbatches=None, verbose=False, *, micro_batch_size):
     if is_hybrid_model(args):
         print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
         return
 
     weight_and_optimizer_memory = (
-        compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
+        compute_weight_and_optimizer_memory(cfg, args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
     )
 
     # Choose the appropriate activation memory calculation based on parallelism strategy
     if args.sequence_parallel and args.recompute_granularity == 'selective':
         print_rank_0("compute_activation_memory with SP")
         activation_memory = (
-            compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose, micro_batch_size=micro_batch_size)
+            compute_activation_memory(cfg, args, num_microbatches=num_microbatches, verbose=verbose, micro_batch_size=micro_batch_size)
             / NUM_BYTES_IN_MEGABYTE
         )
     else:
         print_rank_0("compute_activation_memory_without_sp")
         activation_memory = (
-            compute_activation_memory_without_sp(args, num_microbatches=num_microbatches, verbose=verbose, micro_batch_size=micro_batch_size)
+            compute_activation_memory_without_sp(cfg, args, num_microbatches=num_microbatches, verbose=verbose, micro_batch_size=micro_batch_size)
             / NUM_BYTES_IN_MEGABYTE
         )
 

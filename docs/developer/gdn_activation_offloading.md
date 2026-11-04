@@ -25,8 +25,8 @@ supported. Configuration rejects GDN2, FP8/FP4, non-BF16 execution, other recurr
 backends, full-layer recomputation and CUDA graphs.
 
 The manager's minimum tensor size, offload fraction and last-group margin apply.
-After warmup, fraction zero selects no transfers. Warmup can still copy eligible
-tensors to collect size statistics. The default minimum is 1,048,576 elements;
+Fraction zero selects no transfers, including during warmup. Eligible sizes are
+collected even when a group stays resident. The default minimum is 1,048,576 elements;
 short correctness tests use 1024 elements to exercise copies. This integration
 covers fixed-length runs beginning with training. Evaluation before the first
 training iteration and changes to tensor sizes after warmup are outside this
