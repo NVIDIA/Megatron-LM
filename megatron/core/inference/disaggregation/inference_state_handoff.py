@@ -74,14 +74,11 @@ class InferenceStateHandoffMixin:
 
     requires_recurrent_state_dummy_slot = True
 
-    def _complete_request(
-        self, request_entry: RequestEntry, finished_request: DynamicInferenceRequest | None = None
-    ) -> DynamicInferenceRequest:
+    def _finalize_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
         """Attach merged RL history before the completion is consumed or sent."""
-        request = super()._complete_request(request_entry, finished_request)
+        request = super()._finalize_request(request_entry)
         if request.disaggregated_params:
             # The merged record includes evictions from all prefill checkpoints.
-            # No await intervenes before the completion future's consumers resume.
             request.disaggregated_params["kv_meta"]["request_metadata"] = asdict(
                 HandoffRequestMetadata.from_request(request)
             )
@@ -1361,12 +1358,9 @@ class InferenceStateHandoffMixin:
         self._set_finish_reason(request)
         request.generated_length = len(request.generated_tokens)
         request.status = Status.COMPLETED
-        request.add_event_finish()
-        self.finished_request_count += 1
-        finished_request = self._complete_request(request_entry)
+        self._complete_request(request_entry, reply_now=True)
 
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_requests_to_coordinator([finished_request])
             self._partial_emit_lengths.pop(request_id, None)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
