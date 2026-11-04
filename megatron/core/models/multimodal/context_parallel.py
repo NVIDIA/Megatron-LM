@@ -13,7 +13,10 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.process_groups_config import warn_global_process_group_fallback
+from megatron.core.process_groups_config import (
+    resolve_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 logger = logging.getLogger(__name__)
@@ -159,9 +162,7 @@ def split_to_context_parallel_ranks(global_t, pad_value=0, cp_group=None):
     return local_t, global_pad
 
 
-def _gather_along_second_dim(local_t, cp_group=None):
-    if cp_group is None:
-        cp_group = get_context_parallel_group()
+def _gather_along_second_dim(local_t, cp_group):
     cp_size = get_pg_size(cp_group)
     if cp_size == 1:
         return local_t
@@ -174,9 +175,7 @@ def _gather_along_second_dim(local_t, cp_group=None):
     return torch.cat(tensor_list, dim=1)
 
 
-def _reduce_scatter_along_second_dim(global_t, cp_group=None):
-    if cp_group is None:
-        cp_group = get_context_parallel_group()
+def _reduce_scatter_along_second_dim(global_t, cp_group):
     cp_size = get_pg_size(cp_group)
     if cp_size == 1:
         return global_t
@@ -201,21 +200,36 @@ def _reduce_scatter_along_second_dim(global_t, cp_group=None):
     return local_t
 
 
+def _gather_cp_group(cp_group):
+    """Return ``cp_group``, or warn and fall back to the global context-parallel group."""
+    if cp_group is None:
+        cp_group = resolve_process_groups(
+            None, owner="GatherFromContextParallelRanks", required=("cp",), argument="cp_group"
+        ).cp
+        if cp_group is None:
+            raise ValueError(
+                "GatherFromContextParallelRanks needs cp_group, and parallel_state has no "
+                "context-parallel group. Pass the model's context-parallel group."
+            )
+    return cp_group
+
+
 class GatherFromContextParallelRanks(torch.autograd.Function):
     """Gather the input from context parallel ranks."""
 
     @staticmethod
     def symbolic(graph, input_, cp_group=None):
         """Symbolic forward used during ``torch.jit`` tracing."""
-        return _gather_along_second_dim(input_, cp_group)
+        return _gather_along_second_dim(input_, _gather_cp_group(cp_group))
 
     @staticmethod
     def forward(ctx, input_, cp_group=None):
-        """All-gather ``input_`` along its second dimension across CP ranks."""
-        if cp_group is None:
-            warn_global_process_group_fallback("GatherFromContextParallelRanks", "cp_group")
-        ctx.cp_group = cp_group
-        return _gather_along_second_dim(input_, cp_group)
+        """All-gather ``input_`` along its second dimension across CP ranks.
+
+        The backward reduce-scatters the gradient over the same group.
+        """
+        ctx.cp_group = _gather_cp_group(cp_group)
+        return _gather_along_second_dim(input_, ctx.cp_group)
 
     @staticmethod
     def backward(ctx, grad_output):
