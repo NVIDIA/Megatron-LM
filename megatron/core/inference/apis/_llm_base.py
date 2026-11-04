@@ -131,6 +131,34 @@ class _EventLoopManager:
         self._stopped = True
         self._started = False
 
+    def stop_when_complete(self, future: concurrent.futures.Future) -> concurrent.futures.Future:
+        """Return a future that completes after ``future`` and the thread join.
+
+        A dedicated waiter makes cleanup independent of the event loop and
+        cancellation state of whichever public async caller initiated it.
+        """
+        complete: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _wait_and_stop() -> None:
+            result = None
+            error: Optional[BaseException] = None
+            try:
+                result = future.result()
+            except BaseException as exc:  # Preserve the teardown failure.
+                error = exc
+            try:
+                self.stop()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            if error is not None:
+                complete.set_exception(error)
+            else:
+                complete.set_result(result)
+
+        threading.Thread(target=_wait_and_stop, name="megatron-llm-shutdown", daemon=True).start()
+        return complete
+
 
 class _CoordinatorRuntime:
     """Owns the dynamic-inference coordinator and ``InferenceClient`` lifecycle.
@@ -203,16 +231,31 @@ class _CoordinatorRuntime:
         :meth:`_MegatronLLMBase._shutdown_impl` after the primary has issued
         the STOP signal.
         """
+        self.teardown_now()
+
+    def teardown_now(self) -> None:
+        """Release coordinator resources when the runtime loop cannot accept work."""
         if not self._is_primary:
             return
 
         # Happy path: client open -> graceful protocol shutdown.
         if self._client is not None:
+            client = self._client
+            first_error: Optional[BaseException] = None
             try:
-                self._client.shutdown_coordinator()
-                self._client.stop()
-            finally:
-                self._client = None
+                client.shutdown_coordinator()
+            except BaseException as exc:
+                first_error = exc
+            try:
+                # Closing local resources is mandatory even when the
+                # coordinator has already disappeared.
+                client.stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            self._client = None
+            if first_error is not None:
+                raise first_error
             return
 
         # Partial-setup path: client never opened. If the coordinator
@@ -315,6 +358,9 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
+        self._async_shutdown_lock = threading.Lock()
+        self._shutdown_future: "Optional[concurrent.futures.Future]" = None
+        self._shutdown_complete_future: "Optional[concurrent.futures.Future]" = None
         self._serve_started: bool = False
 
         if use_coordinator:
@@ -378,6 +424,7 @@ class _MegatronLLMBase:
             RuntimeError: in direct mode (``use_coordinator=False``), which
                 has no background runtime loop.
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         return self._loop_manager.submit(coro)
@@ -394,6 +441,7 @@ class _MegatronLLMBase:
             RuntimeError: in direct mode (``use_coordinator=False``), or when
                 called from a coroutine running on the runtime loop itself.
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         return self._loop_manager.run_sync(coro)
@@ -417,11 +465,58 @@ class _MegatronLLMBase:
         stop_text_gen_server()
         self._serve_started = False
 
+    def _begin_shutdown(self) -> concurrent.futures.Future:
+        """Start teardown once and publish a stable outcome before releasing the caller lock."""
+        if self._shutdown_complete_future is not None:
+            return self._shutdown_complete_future
+        self._shutdown_called = True
+        first_error: Optional[BaseException] = None
+        try:
+            self._stop_frontend_if_started()
+        except BaseException as exc:  # Teardown must continue after a frontend failure.
+            first_error = exc
+
+        complete: concurrent.futures.Future = concurrent.futures.Future()
+        if not self._use_coordinator:
+            if first_error is None:
+                complete.set_result(None)
+            else:
+                complete.set_exception(first_error)
+        else:
+            assert self._loop_manager is not None
+            shutdown_coro = self._shutdown_impl(first_error)
+            try:
+                self._shutdown_future = self._loop_manager.submit(shutdown_coro)
+            except BaseException as exc:
+                shutdown_coro.close()
+                if first_error is None:
+                    first_error = exc
+                # Submission failed, so the loop cannot own cleanup. The runtime's
+                # emergency path is synchronous and idempotent.
+                try:
+                    if self._coord_runtime is not None:
+                        self._coord_runtime.teardown_now()
+                except BaseException:
+                    pass
+                try:
+                    self._loop_manager.stop()
+                except BaseException:
+                    pass
+                complete.set_exception(first_error)
+            else:
+                complete = self._loop_manager.stop_when_complete(self._shutdown_future)
+        self._shutdown_complete_future = complete
+        return complete
+
     def _assert_primary(self) -> None:
         if not self._is_primary_rank:
             raise RuntimeError(
                 "generate(...) is only valid on the primary rank in coordinator mode"
             )
+
+    def _assert_not_shutdown(self) -> None:
+        if self._shutdown_called:
+            raise RuntimeError("This Megatron LLM instance has been shut down")
 
     def _assert_coordinator(self) -> None:
         if not self._use_coordinator:
@@ -560,18 +655,29 @@ class _MegatronLLMBase:
             self._coord_runtime.client.resume_engines()
         await self._engine.wait_until(EngineState.RESUMED)
 
-    async def _shutdown_impl(self) -> None:
+    async def _shutdown_impl(self, first_error: Optional[BaseException] = None) -> None:
         if self._is_primary_rank:
-            assert self._coord_runtime is not None and self._coord_runtime.client is not None
-            # The coordinator only honors STOP from PAUSED or SUSPENDED. If
-            # the engine is RUNNING (the typical state at shutdown), pause
-            # first so the STOP isn't ignored.
-            if self._engine.state == EngineState.RUNNING:
-                self._coord_runtime.client.pause_engines()
-                await self._engine.wait_until(EngineState.PAUSED)
-            self._coord_runtime.client.stop_engines()
-            await self._engine.wait_until(EngineState.STOPPED)
-            await self._coord_runtime.teardown()
+            assert self._coord_runtime is not None
+            try:
+                client = self._coord_runtime.client
+                if client is None:
+                    raise RuntimeError("Inference client is unavailable during shutdown")
+                # The coordinator only honors STOP from PAUSED or SUSPENDED.
+                if self._engine.state == EngineState.RUNNING:
+                    client.pause_engines()
+                    await self._engine.wait_until(EngineState.PAUSED)
+                client.stop_engines()
+                await self._engine.wait_until(EngineState.STOPPED)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            try:
+                await self._coord_runtime.teardown()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            if first_error is not None:
+                raise first_error
         else:
             await self._engine.engine_loop_task
 
