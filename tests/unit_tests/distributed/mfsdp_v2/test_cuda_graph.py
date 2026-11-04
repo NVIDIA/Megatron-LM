@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -143,3 +143,53 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         f"first={loss_values[0]:.6f}, "
         f"last={loss_values[-1]:.6f}, trace={loss_values}"
     )
+
+
+def test_local_accumulation_captures_full_iteration(distributed_setup):
+    """Replay training with singleton-inner accumulation and a separate outer-reduction stream."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires a nontrivial outer data-parallel axis.")
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size, 1))
+    placements = Placements(
+        [0, 1], [Replicate(), Shard(0)], [Partial("avg"), Shard(0)], [Replicate(), Shard(0)]
+    )
+    torch.manual_seed(1234)
+    model = NestedModel(dim=16, num_children=2).to(device)
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=True))
+    ):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    static_input = torch.eye(16, device=device)
+    static_target = torch.zeros_like(static_input)
+
+    def train_iteration() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=False)
+        loss = torch.nn.functional.mse_loss(model(static_input), static_target)
+        loss.backward()
+        optimizer.step()
+        return loss.detach()
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    # Warm up on the capture stream to establish reusable gradient storage.
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            train_iteration()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        static_loss = train_iteration()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    losses = []
+    for _ in range(5):
+        graph.replay()
+        # Preserve each replay's loss before the next replay overwrites it.
+        losses.append(static_loss.clone())
+    loss_values = torch.stack(losses).tolist()
+    assert loss_values[-1] < loss_values[0], loss_values
