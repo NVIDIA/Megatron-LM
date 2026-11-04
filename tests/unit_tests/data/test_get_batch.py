@@ -1105,7 +1105,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
         patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
-        patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
+        patch.object(
+            pretrain_hybrid, "mtp_on_this_rank_func", return_value=True
+        ) as mtp_on_this_rank,
         patch.object(
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
@@ -1118,6 +1120,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert cp_batch is scheduler_batch
     assert fetch_batch.call_args.kwargs["return_context_parallel_batch"]
     assert fetch_batch.call_args.kwargs["pg_collection"] is pg_collection
+    # get_batch passes the collection's pipeline group, so mtp_on_this_rank does not fall back
+    # to the global grid.
+    assert mtp_on_this_rank.call_args.kwargs["pp_group"] is pg_collection.pp
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
