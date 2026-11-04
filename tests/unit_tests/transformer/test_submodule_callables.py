@@ -103,9 +103,11 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     return capture
 
 
-def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
-    """Covers the HybridModel empty-decoder MTP pre-dispatch final_norm path."""
+@pytest.mark.parametrize("mtp_offset", [0, 1])
+def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch, mtp_offset):
+    """MTP slot boundaries preserve final-norm values and gradients."""
 
+    from megatron.core.models.common.utils import TransformerLayerNode
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
     def inner_pre_dispatch(_node, hidden_states):
@@ -149,35 +151,59 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
     monkeypatch.setattr(common_callables, "build_layer_callables", fake_build_layer_callables)
     monkeypatch.setattr(common_callables, "get_layer_moe_metadata", lambda _layer: (True, 1))
     monkeypatch.setattr(
-        common_callables, "get_mtp_layer_offset", lambda _config, _vp_stage, pp_rank=None: 0
+        common_callables,
+        "get_mtp_layer_offset",
+        lambda _config, _vp_stage, pp_rank=None: mtp_offset,
     )
 
     model = HybridModel.__new__(HybridModel)
     torch.nn.Module.__init__(model)
     model.decoder = DummyState()
     model.decoder.layers = []
-    model.decoder.final_norm = lambda hidden_states: hidden_states + 4.0
+    model.decoder.final_norm = torch.nn.LayerNorm(3)
+    reference_norm = torch.nn.LayerNorm(3)
+    reference_norm.load_state_dict(model.decoder.final_norm.state_dict())
     model.embedding = object()
     model.vp_stage = None
     model.pg_collection = DummyState()
     model.pg_collection.pp = DummyState()
     model.pg_collection.pp.rank = lambda: 0
 
-    node = DummyNode()
+    node = TransformerLayerNode.__new__(TransformerLayerNode)
+    node.before_detached = ()
+    node.detached = ()
+    node.default_backward_func = torch.autograd.backward
     node.chunk_state = DummyState()
     node.chunk_state.model = model
     node.chunk_state.context = None
     node.chunk_state.packed_seq_params = None
     node.is_first_layer = True
 
-    hidden_states = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2).requires_grad_()
-    expected = hidden_states + 4.0
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 1, 3).requires_grad_()
+    reference_input = hidden_states.detach().clone().requires_grad_()
+    reference_chunks = list(torch.chunk(reference_norm(reference_input), 1 + mtp_offset, dim=0))
     forward_funcs, _ = common_callables.build_mtp_layer_callables(FakeMTPLayer())
 
     output = forward_funcs[0](node, hidden_states)
+    torch.testing.assert_close(output, reference_chunks[mtp_offset])
+    for actual, expected in zip(node.chunk_state.mtp_hidden_states, reference_chunks):
+        torch.testing.assert_close(actual, expected)
+        assert actual.is_leaf
 
-    torch.testing.assert_close(output, expected)
-    torch.testing.assert_close(node.chunk_state.mtp_hidden_states[0], expected)
+    # MTP post-process runs its backward before pre-dispatch. Its copy of the
+    # pre-dispatch output is detached by ScheduleNode at the slot boundary.
+    scheduled_output = output.detach().requires_grad_()
+    node.is_last_layer = True
+    combined = forward_funcs[4](node, scheduled_output)
+    coefficients = torch.arange(1, combined.numel() + 1, dtype=combined.dtype).reshape_as(combined)
+    (combined * coefficients).square().sum().backward()
+    node.backward_impl((output,), (scheduled_output.grad,))
+
+    reference_combined = torch.cat(reference_chunks + [reference_chunks[mtp_offset]], dim=0)
+    (reference_combined * coefficients).square().sum().backward()
+    torch.testing.assert_close(hidden_states.grad, reference_input.grad)
+    torch.testing.assert_close(model.decoder.final_norm.weight.grad, reference_norm.weight.grad)
+    torch.testing.assert_close(model.decoder.final_norm.bias.grad, reference_norm.bias.grad)
 
 
 class TestTransformerLayerSubmoduleCallables:
