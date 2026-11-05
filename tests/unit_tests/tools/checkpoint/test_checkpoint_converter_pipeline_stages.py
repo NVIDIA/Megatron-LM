@@ -99,6 +99,10 @@ def _saver_stage_layer_numbers(split):
         queue=None,
     )
     saver.md = SimpleNamespace(iteration=1, params_dtype=torch.float32)
+    # initialize_megatron_env sets these; saving copies the run's padded vocabulary size into
+    # the arguments.
+    saver.margs = SimpleNamespace()
+    saver.cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=128))
     saver.model_provider = _decoder_provider(split)
     saver.models = saver.initialize_models()
     saved_models = {}

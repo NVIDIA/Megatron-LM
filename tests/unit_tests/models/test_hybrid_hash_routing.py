@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -547,6 +547,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
         is_moe_layer=True,
         recompute_mlp=False,
     )
+    layer._run_mlp_in_chunks = MethodType(TransformerLayer._run_mlp_in_chunks, layer)
     hidden_states = torch.randn(4, 2, 8)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor(
