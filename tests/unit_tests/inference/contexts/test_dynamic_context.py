@@ -3249,9 +3249,8 @@ class TestDynamicContext:
 
         # Run update_requests natively. It will automatically:
         # 1. Detect the boundary crossing and pause the request.
-        # 2. Clone the prev_last_block_ids internally.
-        # 3. Resume the request, allocating the new block.
-        # 4. Map the 3 new tokens across the boundary.
+        # 2. Resume the request, allocating the new block.
+        # 3. Map the 3 new tokens across the boundary.
         ctx.update_requests(
             active_requests_mask=active_requests_mask,
             new_tokens=new_tokens,
@@ -4187,6 +4186,68 @@ class TestDynamicContext:
         assert ctx.paused_request_count == 0
         assert ctx.active_token_count == 0
         assert alloc.pool_avail == 1
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    def test_speculative_boundary_crossing_after_eviction_swap(self):
+        """A request that eviction moves to another row keeps its own pre-boundary block.
+
+        Requests A, B and C each need a new block for their next speculative step, so all
+        three pause. One free block resumes C, the right-most. The paused budget keeps A
+        and evicts B, which swaps C into B's row, and B's released blocks resume A. C's
+        base token still belongs in C's own last block, not in B's released one.
+        """
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            paused_buffer_size_gb=0.0,
+            max_requests=8,
+            num_speculative_tokens=2,
+        )
+        ctx.kv_block_allocator = type(ctx.kv_block_allocator)(
+            context=ctx, pool_size=7, paused_limit=1
+        )
+        alloc = ctx.kv_block_allocator
+        blocks = alloc.allocate_memory_blocks(5)
+        assert blocks is not None and alloc.pool_avail == 1
+        owned_blocks = (blocks[:1], blocks[1:4], blocks[4:])
+
+        # Each request's newest token is at slot 14 of its last block, so the next step's
+        # base token goes to slot 15 and its two drafts to a new block.
+        ctx.total_request_count = 3
+        ctx.active_token_count = 3
+        for row, (request_id, owned) in enumerate(zip((10, 11, 12), owned_blocks)):
+            count = owned.numel()
+            ctx.request_ids[row] = request_id
+            ctx.request_query_lengths[row] = 1
+            ctx.request_kv_length_offsets[row] = count * ctx.block_size_tokens - 2
+            ctx.request_output_lengths[row] = 100
+            ctx.request_kv_block_counts[row] = count
+            ctx.request_to_kv_block_ids[row, :count] = owned
+            ctx.request_last_kv_block_id[row] = owned[-1]
+            ctx.request_last_kv_block_offset[row] = ctx.block_size_tokens - 2
+
+        result = ctx.update_requests(
+            active_requests_mask=torch.ones(3, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([20, 21, 22], dtype=torch.int64, device='cpu'),
+            new_speculative_tokens=torch.tensor(
+                [[30, 31, 32], [40, 41, 42]], dtype=torch.int64, device='cpu'
+            ),
+        )
+
+        assert result["evict_request_ids"].tolist() == [11]
+        assert ctx.request_ids[: ctx.total_request_count].tolist() == [10, 12]
+        assert ctx.paused_request_count == 0
+        a_new, c_new = (int(ctx.request_to_kv_block_ids[row, 1]) for row in range(2))
+        a_last, c_last = int(owned_blocks[0][0]), int(owned_blocks[2][0])
+        assert ctx.token_to_block_idx[:6].tolist() == [a_last, a_new, a_new, c_last, c_new, c_new]
+        assert ctx.token_to_local_position_within_kv_block[:6].tolist() == [15, 0, 1] * 2
 
     @pytest.mark.internal
     @rounder_override(64)

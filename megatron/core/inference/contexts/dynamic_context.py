@@ -4916,17 +4916,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
 
-        # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
-        # This allows us to know which block tokens should go to if they don't cross the boundary.
-        # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
-        # for resumed requests, but we need the OLD block for tokens that don't cross.
-        prev_last_block_ids = None
-        if self.num_speculative_tokens > 0 and not self.enable_mtp_kv_cache:
-            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
-            # (assigns new block IDs), but we need the old values later to determine
-            # which block tokens should go to when they don't cross a block boundary.
-            prev_last_block_ids = self.request_last_kv_block_id.clone()
-
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
             active_request_count, newly_paused_request_ids
@@ -5117,12 +5106,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             #
             # For non-resumed requests (no boundary crossing): all go to current block
             #
-            # We use prev_last_block_ids which was stored BEFORE resume_paused_requests
-            # was called, so it contains the OLD block IDs before new blocks were allocated.
-
-            # Get previous block IDs (stored before resume_paused_requests)
-            prev_block_ids = prev_last_block_ids[
-                self.paused_request_count : self.total_request_count
+            # The previous block is the one holding the request's last cached token, read
+            # from the request's own row: eviction can swap rows after resume allocates.
+            active_rows = torch.arange(
+                self.paused_request_count, self.total_request_count, device='cpu'
+            )
+            last_cached_positions = (self.request_kv_length_offsets[active_rows] - 1).clamp(min=0)
+            prev_block_ids = self.request_to_kv_block_ids[
+                active_rows, last_cached_positions // self.block_size_tokens
             ]  # [active_count]
 
             # For each request, check if ANY token crosses (i.e., request was resumed)
