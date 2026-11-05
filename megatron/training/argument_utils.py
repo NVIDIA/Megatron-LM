@@ -723,9 +723,6 @@ def hybrid_config_from_args(
 
     kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if transformer_cfg.transformer_impl == "inference_optimized":
-        assert (
-            not transformer_cfg.inference_fuse_tp_communication
-        ), "inference_fuse_tp_communication is not supported for HybridModel"
         if args.spec is not None:
             hybrid_stack_spec = _hybrid_inference_stack_spec(
                 args.spec, wide_residual=transformer_cfg.wide_residual is not None

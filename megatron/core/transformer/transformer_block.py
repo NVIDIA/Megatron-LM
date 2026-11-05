@@ -36,6 +36,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
+    configure_fused_tp_inference_for_layers,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -458,21 +459,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         successive column parallel linear layer.
         This function is used to pass those weights to the respective layers.
         """
-
-        for i in range(len(self.layers)):
-            current_layer = self.layers[i]
-
-            # Get next layer's QKV norm weights (None for last layer)
-            if i < len(self.layers) - 1:
-                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
-            else:
-                next_qkv_norm_weights = None
-
-            # Configure all fused TP communication settings in one call
-            current_layer.configure_fused_tp_inference(
-                skip_qkv_norm_and_all_gather=(i > 0),
-                fc2_next_layer_norm_weights=next_qkv_norm_weights,
-            )
+        configure_fused_tp_inference_for_layers(self.layers)
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
