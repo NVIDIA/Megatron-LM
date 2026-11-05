@@ -9,6 +9,12 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from examples.multimodal.data_loading.binidx_token_mask import (
+    BinIdxTokenMaskDecoder,
+    IndexedTokenMaskReference,
+    PreparedTokenMaskStore,
+    token_mask_key,
+)
 from examples.multimodal.data_loading.conversation_sample import ImageMedia
 from examples.multimodal.data_loading.cookers.multimodal_interleaved_binidx import (
     cook_multimodal_interleaved_binidx,
@@ -22,6 +28,7 @@ from megatron.energon import (
     WorkerConfig,
     get_loader,
     get_train_dataset,
+    register_aux_filestore_protocol,
 )
 from megatron.energon.cache.file_store import SystemFileStore
 from megatron.energon.decoders.sample_decoder import SampleDecoder
@@ -224,3 +231,124 @@ def test_native_recipe_loads_original_subset_record_with_lazy_image(
         assert image_reads == ["screen.png"]
     finally:
         loader.close()
+
+
+def _write_mask(path, records):
+    runs = bytearray()
+    offsets = [0]
+    for record in records:
+        for count, flag in record:
+            runs.extend(struct.pack("<iB3s", count, flag, b"\0\0\0"))
+        offsets.append(len(runs) // 8)
+    path.write_bytes(
+        runs
+        + struct.pack(f"<{len(offsets)}q", *offsets)
+        + struct.pack("<8sQQQQ", b"MASKID\0\1", 0, len(records), len(runs) // 8, len(runs))
+    )
+
+
+@pytest.mark.parametrize("drop_bos", [False, True])
+def test_masked_ids_remain_inputs_and_ownership_follows_original_text(sample, drop_bos):
+    sample["__tags__"] = {"drop_bos_token_id": 3} if drop_bos else {}
+    rows = b"".join(
+        struct.pack("<iB3s", count, flag, b"\0\0\0") for count, flag in [(1, 1), (2, 0), (1, 1)]
+    )
+    key = token_mask_key(sample["__sources__"][0].dataset_path, 7)
+    masks = _MemoryStore({key: rows})
+    images = _MemoryStore({})
+    kwargs = dict(metadata=_metadata((0, 1, 1, 3)), images=images)
+    unmasked = cook_multimodal_interleaved_binidx(sample, NoCachePool(), **kwargs)
+    masked = cook_multimodal_interleaved_binidx(
+        sample, NoCachePool(), token_loss_mask=masks, **kwargs
+    )
+    assert _text_ids(masked) == _text_ids(unmasked)
+    assert _text_ids(masked) == ([11, 12, 1] if drop_bos else [3, 11, 12, 1])
+    actual = [
+        flag
+        for part in masked.parts
+        if isinstance(part, TokenizedText)
+        for flag in part.token_loss_mask
+    ]
+    assert actual == ([False, False, True] if drop_bos else [True, False, False, True])
+    assert all(p.token_loss_mask is None for p in unmasked.parts if isinstance(p, TokenizedText))
+    assert masks.read_keys == [key]
+    assert images.read_keys == []
+
+
+def test_mask_token_count_must_match_original_ids(sample):
+    key = token_mask_key(sample["__sources__"][0].dataset_path, 7)
+    masks = _MemoryStore({key: struct.pack("<iB3s", 3, 1, b"\0\0\0")})
+    with pytest.raises(ValueError, match="source_token_count"):
+        cook_multimodal_interleaved_binidx(
+            sample, NoCachePool(), metadata=_metadata(), token_loss_mask=masks
+        )
+
+
+@pytest.mark.parametrize("drop_bos", [False, True])
+def test_native_masked_recipe_uses_primary_index_and_preserves_image_decode(
+    tmp_path, monkeypatch, drop_bos
+):
+    from megatron.energon.recipe import recipe as native_recipe
+
+    # Isolate registration while exercising the public registration/load APIs.
+    monkeypatch.setattr(
+        native_recipe,
+        "_AUX_FILESTORE_PROTOCOL_FACTORIES",
+        dict(native_recipe._AUX_FILESTORE_PROTOCOL_FACTORIES),
+    )
+    register_aux_filestore_protocol(
+        "indexed-token-mask", lambda path: IndexedTokenMaskReference(fs_path=path), override=True
+    )
+    recipe, _ = _write_native_recipe(tmp_path, drop_bos=drop_bos)
+    _write_mask(
+        tmp_path / "tokens.mask", [[(3, 0)], [(1, 1), (1, 0), (1, 1), (1, 0), (1, 1)], [(3, 1)]]
+    )
+    recipe.write_text(
+        recipe.read_text() + "      token_loss_mask: indexed-token-mask://tokens.mask\n"
+    )
+
+    class MaskedEncoder(_PreparedEncoder):
+        decoder = BinIdxTokenMaskDecoder(image_decode="pil")
+
+    dataset = get_train_dataset(
+        recipe,
+        worker_config=WorkerConfig(rank=0, world_size=1, num_workers=0),
+        task_encoder=MaskedEncoder(),
+        batch_size=None,
+        packing_buffer_size=None,
+        shuffle_buffer_size=None,
+        max_samples_per_sequence=None,
+        repeat=False,
+    )
+    loader = get_loader(dataset, cache_pool=NoCachePool())
+    try:
+        documents = list(loader)
+        assert len(documents) == 1
+        document = documents[0]
+        assert document.__sources__[0].index == 1
+        assert _text_ids(document) == ([20, 21, 22, 1] if drop_bos else [3, 20, 21, 22, 1])
+        actual = [
+            flag
+            for p in document.parts
+            if isinstance(p, TokenizedText)
+            for flag in p.token_loss_mask
+        ]
+        assert actual == (
+            [False, True, False, True] if drop_bos else [True, False, True, False, True]
+        )
+        image = next(p for p in document.parts if isinstance(p, ImageMedia))
+        assert image.value.get().getpixel((0, 0)) == (0, 0, 255)
+    finally:
+        loader.close()
+
+
+def test_mask_binding_rejects_wrong_primary_and_record_count(tmp_path):
+    _write_native_recipe(tmp_path)
+    path = tmp_path / "tokens.mask"
+    _write_mask(path, [[(3, 1)]])
+    with pytest.raises(ValueError, match="document count"):
+        PreparedTokenMaskStore(path)
+    _write_mask(path, [[(3, 1)], [(5, 1)], [(3, 1)]])
+    store = PreparedTokenMaskStore(path)
+    with pytest.raises(ValueError, match="bound to primary"):
+        store[token_mask_key(tmp_path / "other.bin", 0)]

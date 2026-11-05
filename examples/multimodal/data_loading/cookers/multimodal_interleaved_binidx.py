@@ -6,8 +6,10 @@ import numpy as np
 
 from megatron.energon import CachePool, FileStore, basic_sample_keys, cooker, stateless
 
+from ..binidx_token_mask import token_mask_key
 from ..conversation_sample import ImageMedia
 from ..prepared_sample import InterleavedDocument, TokenizedText
+from ..token_mask import expand_token_mask
 
 
 @stateless
@@ -17,6 +19,7 @@ def cook_multimodal_interleaved_binidx(
     cache: CachePool,
     metadata: FileStore | None = None,
     images: FileStore | None = None,
+    token_loss_mask: FileStore | None = None,
 ) -> InterleavedDocument:
     """Insert lazy images at original text-token boundaries without consuming text.
 
@@ -31,6 +34,11 @@ def cook_multimodal_interleaved_binidx(
     By default all source IDs are retained. ``drop_bos_token_id`` explicitly
     verifies and removes one source BOS; images before it stay at the start.
     Tokenization, resizing, label shifting and packing belong to the consumer.
+
+    Optional ``token_loss_mask`` supplies one eligibility flag per original token.
+    It is selected by the primary source path and original record index, before
+    BOS removal or image insertion. Flags are sliced with text IDs; masked IDs
+    remain visible as inputs. No roles or loss policy are inferred here.
     """
     if "tokens" not in sample:
         raise ValueError(
@@ -59,6 +67,10 @@ def cook_multimodal_interleaved_binidx(
     row = {"images": []} if text_only else cache.get(metadata, f"{sources[0].index}.json")
     if not isinstance(row, dict) or not isinstance(row.get("images"), list):
         raise ValueError("BinIdx companion metadata requires an images list")
+    ownership = None
+    if token_loss_mask is not None:
+        data = cache.get(token_loss_mask, token_mask_key(sources[0].dataset_path, sources[0].index))
+        ownership = expand_token_mask(data, len(tokens))
     drop_bos = tags.get("drop_bos_token_id")
     cursor = 0
     if drop_bos is not None:
@@ -83,7 +95,12 @@ def cook_multimodal_interleaved_binidx(
             raise ValueError("image key must be a nonempty string")
         end = max(cursor, position)
         if end > cursor:
-            parts.append(TokenizedText(tokens=tokens[cursor:end].tolist()))
+            parts.append(
+                TokenizedText(
+                    tokens=tokens[cursor:end].tolist(),
+                    token_loss_mask=None if ownership is None else ownership[cursor:end],
+                )
+            )
         parts.append(
             ImageMedia(
                 value=cache.get_lazy(images, key), metadata={"width": width, "height": height}
@@ -91,5 +108,10 @@ def cook_multimodal_interleaved_binidx(
         )
         cursor = end
     if cursor < len(tokens):
-        parts.append(TokenizedText(tokens=tokens[cursor:].tolist()))
+        parts.append(
+            TokenizedText(
+                tokens=tokens[cursor:].tolist(),
+                token_loss_mask=None if ownership is None else ownership[cursor:],
+            )
+        )
     return InterleavedDocument(**basic_sample_keys(sample), parts=parts)

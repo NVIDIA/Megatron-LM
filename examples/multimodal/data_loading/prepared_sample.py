@@ -10,9 +10,10 @@ from .conversation_sample import ImageMedia
 
 @edataclass
 class TokenizedText:
-    """Token IDs already encoded in the consumer's vocabulary."""
+    """Prepared IDs and optional eligibility for each original target token."""
 
     tokens: list[int]
+    token_loss_mask: list[bool] | None = None
 
 
 @edataclass
