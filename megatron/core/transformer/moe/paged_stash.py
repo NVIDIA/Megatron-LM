@@ -1190,21 +1190,28 @@ class PagedStashRunner:
         )
 
         # Second all_reduce only on the failure path, which has already synced: the happy path
-        # keeps its single collective. Backends that do not report a required capacity (HybridEP)
-        # leave this None.
+        # keeps its single collective. Every rank enters it once the vote reports an over-budget
+        # rank, including ranks with no MoE layer that reports a required capacity (a pipeline
+        # stage of dense layers, or HybridEP): they contribute 0, so the other ranks do not wait
+        # in it alone. Backends that do not report a required capacity (HybridEP) leave this None.
         self._required_recv_capacity = None
         self._required_capacity_factor = None
         if overbudget_ranks > 0:
             per_layer = [mlp.token_dispatcher.check_required_capacity() for mlp in self.moe_layers]
             per_layer = [r for r in per_layer if r is not None]
+            # [peak receive capacity needed, max_tokens_per_rank * router_topk]
+            required = torch.zeros(2, dtype=torch.int64, device=flags.device)
             if per_layer:
-                required = torch.cat(per_layer).max().reshape(1)
-                torch.distributed.all_reduce(required, op=torch.distributed.ReduceOp.MAX)
-                self._required_recv_capacity = int(required.item())
-                comm_manager = self.moe_layers[0].token_dispatcher._comm_manager
-                denominator = getattr(comm_manager, '_max_tokens_per_rank', 0) * getattr(
+                required[0] = torch.cat(per_layer).max()
+            if self.moe_layers:
+                comm_manager = getattr(self.moe_layers[0].token_dispatcher, '_comm_manager', None)
+                required[1] = getattr(comm_manager, '_max_tokens_per_rank', 0) * getattr(
                     comm_manager, 'router_topk', 0
                 )
+            torch.distributed.all_reduce(required, op=torch.distributed.ReduceOp.MAX)
+            if required[0].item() > 0:
+                self._required_recv_capacity = int(required[0].item())
+                denominator = int(required[1].item())
                 # Track the updated cap factor to log for user
                 if denominator:
                     self._required_capacity_factor = self._required_recv_capacity / denominator

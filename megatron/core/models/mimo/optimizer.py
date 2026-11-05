@@ -15,7 +15,7 @@ from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, require_process_groups
 from megatron.core.utils import unwrap_model
 
 if TYPE_CHECKING:
@@ -355,22 +355,28 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     Returns (tp_gtp_rank, pp_rank, dp_cp_rank) so only (0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
+
+    Raises:
+        ValueError: ``pg_collection`` is None, or does not set ``tp``, ``pp`` and ``dp_cp`` to
+            process groups.
     """
-    assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
-    assert (
-        hasattr(pg_collection, 'tp') and pg_collection.tp is not None
-    ), "pg_collection.tp must be set for checkpoint deduplication"
-    assert (
-        hasattr(pg_collection, 'pp') and pg_collection.pp is not None
-    ), "pg_collection.pp must be set for checkpoint deduplication"
-    assert (
-        hasattr(pg_collection, 'dp_cp') and pg_collection.dp_cp is not None
-    ), "pg_collection.dp_cp must be set for checkpoint deduplication"
-    gtp_group = getattr(pg_collection, 'gtp_remat', None)
+    owner = "MimoOptimizer.sharded_state_dict"
+    names = ('tp', 'pp', 'dp_cp')
+    groups = require_process_groups(pg_collection, names, owner=owner)
+    unset = [name for name, group in zip(names, groups) if group is None]
+    if unset:
+        raise ValueError(
+            f"{owner} requires pg_collection to set {', '.join(unset)} to a process group, "
+            "not None."
+        )
+    tp_group, pp_group, dp_cp_group = groups
+    # GTP weight rematerialization is optional: a collection that does not set gtp_remat, or
+    # sets it to None, has no GTP axis.
+    gtp_group = vars(pg_collection).get('gtp_remat')
     gtp_rank = gtp_group.rank() if gtp_group is not None else 0
     gtp_size = gtp_group.size() if gtp_group is not None else 1
-    tp_gtp_rank = pg_collection.tp.rank() * gtp_size + gtp_rank
-    return (tp_gtp_rank, pg_collection.pp.rank(), pg_collection.dp_cp.rank())
+    tp_gtp_rank = tp_group.rank() * gtp_size + gtp_rank
+    return (tp_gtp_rank, pp_group.rank(), dp_cp_group.rank())
 
 
 def _optimizer_config_for_module(

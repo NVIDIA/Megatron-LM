@@ -2,6 +2,7 @@
 
 from typing import Any, Optional
 
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.rl import rl_utils
 from megatron.rl.rl_profiling import (
     RL_LOGGABLE_TIMER_NAMES,
@@ -23,6 +24,11 @@ from megatron.training.global_vars import (
     get_wandb_writer,
 )
 from megatron.training.utils import print_rank_0
+
+
+def _data_parallel_group(model):
+    """Data-parallel group of the model being trained, over which the packed bins are spread."""
+    return get_attr_wrapped_model(model[0], "pg_collection").dp_gtp_remat
 
 
 class RLLoggingCallback(Callback):
@@ -57,7 +63,7 @@ class RLLoggingCallback(Callback):
         if self._rl_config.rl_use_sequence_packing:
             # Bins consumed by this step; the sequences inside them are counted by the loop.
             rl_utils.get_rl_runtime_state().consumed_train_bins += bin_batch_size(
-                self._micro_batch_size
+                self._micro_batch_size, _data_parallel_group(context.model)
             )
 
     def on_tensorboard_log(self, context: CallbackContext) -> None:
@@ -66,7 +72,9 @@ class RLLoggingCallback(Callback):
         iteration = get_train_state().iteration
         if self._rl_config.rl_use_sequence_packing:
             metrics = get_sequence_packing_tensorboard_metrics(
-                rl_utils.get_rl_runtime_state().consumed_train_bins, self._micro_batch_size
+                rl_utils.get_rl_runtime_state().consumed_train_bins,
+                self._micro_batch_size,
+                _data_parallel_group(context.model),
             )
             for name, value in metrics.items():
                 writer.add_scalar(name, value, iteration)
