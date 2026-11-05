@@ -777,7 +777,7 @@ class TestWideResidualLayerIntegration:
         )
         hidden_states = torch.randn(2, 3, config.hidden_size, requires_grad=True)
 
-        output, context = layer(hidden_states=hidden_states, attention_mask=None)
+        output, context = layer(hidden_states, attention_mask=None)
 
         assert context is None
         assert type(layer) is TransformerLayer
@@ -864,7 +864,7 @@ class TestWideResidualLayerIntegration:
         base = torch.randn(2, 3, config.hidden_size, requires_grad=True)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        output, context = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(residual_stream, attention_mask=None)
 
         expected = expand_wide_residual_stream(12.0 * base + 4.0, 3)
         assert context is None
@@ -946,7 +946,7 @@ class TestWideResidualLayerIntegration:
                 )
         base = torch.randn(2, 3, config.hidden_size)
 
-        layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)
+        layer(expand_wide_residual_stream(base, 3), attention_mask=None)
 
         assert operations == [
             ("self_attention", "read"),
