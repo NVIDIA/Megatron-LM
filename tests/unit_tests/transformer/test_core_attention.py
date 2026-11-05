@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import CrossAttention
@@ -107,6 +108,7 @@ class TestDotProductAttentionSoftcap:
             layer_number=self._LAYER_NUMBER,
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp']),
         ).cuda()
 
     def _qkv(self, seed=7):

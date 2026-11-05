@@ -450,7 +450,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
                 pp_group=self.pg_collection.pp,
-                vp_size=self.config.virtual_pipeline_model_parallel_size,
+                vp_size=self.config.virtual_pipeline_model_parallel_size or 1,
             )
         )
         list_section_needs_standard_rope = not self._decoder_uses_mla or (
