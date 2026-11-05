@@ -94,13 +94,20 @@ def _warn_fallback_once(
     """
     if key in _warned_global_process_group_fallbacks:
         return
-    warnings.warn(
-        f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and will be "
-        f"removed in {removed_in}; pass the owning model's process groups explicitly.",
-        ProcessGroupFallbackWarning,
-        skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
-    )
+    # Record the key before warning: a warning hook that reaches the same fallback while the
+    # warning is shown then returns here instead of warning again without end.
     _warned_global_process_group_fallbacks.add(key)
+    try:
+        warnings.warn(
+            f"{fallback} This fallback is deprecated since Megatron Core {deprecated_in} and "
+            f"will be removed in {removed_in}; pass the owning model's process groups explicitly.",
+            ProcessGroupFallbackWarning,
+            skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
+        )
+    except BaseException:
+        # A warning that a filter turned into an error stays unrecorded, so the next one raises.
+        _warned_global_process_group_fallbacks.discard(key)
+        raise
 
 
 def enable_strict_process_group_fallbacks() -> None:
@@ -1183,8 +1190,10 @@ def require_process_groups(
         ValueError: ``pg_collection`` is None, a field is absent, or a field holds
             ``torch.distributed.GroupMember.NON_GROUP_MEMBER``.
         TypeError: ``pg_collection`` is a ``MultiModuleProcessGroupCollection``. Its modules
-            have different groups, so the caller selects the module's collection.
+            have different groups, so the caller selects the module's collection. Also when
+            ``names`` is a single string rather than a sequence of names.
     """
+    _reject_name_string(names, owner)
     if pg_collection is None:
         raise ValueError(f"{owner} requires a ProcessGroupCollection, got None.")
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -1210,6 +1219,15 @@ def require_process_groups(
             "not a usable group. Use None on ranks that are not members of the group."
         )
     return tuple(groups[name] for name in names)
+
+
+def _reject_name_string(names: Sequence[str], owner: str) -> None:
+    """Raise if ``names`` is one string, which is a sequence of its characters."""
+    if isinstance(names, str):
+        raise TypeError(
+            f"{owner}: pass the process-group field names as a sequence, for example "
+            f"({names!r},), not the string {names!r}."
+        )
 
 
 def resolve_process_groups(
@@ -1257,6 +1275,7 @@ def resolve_process_groups(
             the accessor of a field in ``required`` needs an initialized grid, such as the one
             for ``dp``.
     """
+    _reject_name_string(required, owner)
     if pg_collection is None:
         grid_initialized = parallel_state.model_parallel_is_initialized()
         if grid_initialized:
