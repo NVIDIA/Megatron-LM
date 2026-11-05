@@ -29,6 +29,12 @@ SEQUENCE_LENGTH = 32
 STAGE_LAYERS = [[(1, True)], [(2, True), (3, False)]]
 
 
+@pytest.fixture(autouse=True)
+def padded_vocab_size(run_config):
+    """The builders read the padded vocabulary size from the run's tokenizer settings."""
+    run_config.tokenizer.padded_vocab_size = VOCAB_SIZE
+
+
 def _heterogeneous_config():
     attention = {"no_op": False, "replace_with_linear": False, "num_query_groups": 4}
     mlp = {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 128}
@@ -63,7 +69,6 @@ def _model_args(**overrides):
         # Any path selects the heterogeneous spec; the config carries the block configs.
         heterogeneous_layers_config_path="block_configs.json",
         mtp_num_layers=None,
-        padded_vocab_size=VOCAB_SIZE,
         max_position_embeddings=SEQUENCE_LENGTH,
         fp16_lm_cross_entropy=False,
         untie_embeddings_and_output_weights=True,
