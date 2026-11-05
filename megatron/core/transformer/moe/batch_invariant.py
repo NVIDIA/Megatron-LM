@@ -70,15 +70,22 @@ def _rank_tree_unpermute_kernel(
     rows_ptr,
     inverse_rows_ptr,
     inverse_experts_ptr,
+    probs_ptr,
     out_ptr,
     hidden,
     EP_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     TOPK: tl.constexpr,
     CROSS_RANK_FP64: tl.constexpr,
+    BF16_RANK_PARTIALS: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """One program per (token, hidden block): the rank-ordered combine tree of ``unpermute``."""
+    """One program per (token, hidden block): the rank-ordered combine tree of ``unpermute``.
+
+    With BF16_RANK_PARTIALS, each rank's partial is the FlashInfer routed kernels'
+    finalize instead: FP32 fused multiply-adds of probability and row in slot order,
+    from zero, quantized to BF16.
+    """
     token = tl.program_id(0)
     offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     in_hidden = offsets < hidden
@@ -87,7 +94,10 @@ def _rank_tree_unpermute_kernel(
     else:
         acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for ep_rank in tl.static_range(EP_SIZE):
-        rank_partial = tl.zeros([BLOCK_H], dtype=tl.float64)
+        if BF16_RANK_PARTIALS:
+            rank_partial = tl.zeros([BLOCK_H], dtype=tl.float32)
+        else:
+            rank_partial = tl.zeros([BLOCK_H], dtype=tl.float64)
         for k in tl.static_range(TOPK):
             row = tl.load(inverse_rows_ptr + token * TOPK + k)
             expert = tl.load(inverse_experts_ptr + token * TOPK + k)
@@ -100,7 +110,15 @@ def _rank_tree_unpermute_kernel(
             values = tl.load(
                 rows_ptr + safe_row * hidden + offsets, mask=in_hidden & valid, other=0.0
             )
-            rank_partial += values.to(tl.float64)
+            if BF16_RANK_PARTIALS:
+                prob = tl.broadcast_to(tl.load(probs_ptr + token * TOPK + k), [BLOCK_H])
+                rank_partial = tl.where(
+                    valid, tl.fma(values.to(tl.float32), prob, rank_partial), rank_partial
+                )
+            else:
+                rank_partial += values.to(tl.float64)
+        if BF16_RANK_PARTIALS:
+            rank_partial = rank_partial.to(tl.bfloat16).to(tl.float32)
         if CROSS_RANK_FP64:
             acc += rank_partial.to(tl.float32).to(tl.float64)
         else:
@@ -164,12 +182,14 @@ class _RankTreeUnpermute(torch.autograd.Function):
                 rows,
                 inverse_rows,
                 inverse_experts,
+                rows,
                 out,
                 hidden,
                 EP_SIZE=ep_size,
                 EXPERTS_PER_RANK=num_experts // ep_size,
                 TOPK=topk,
                 CROSS_RANK_FP64=get_batch_invariant_collective() == "multimem",
+                BF16_RANK_PARTIALS=False,
                 BLOCK_H=block_h,
                 num_warps=4,
             )
@@ -202,6 +222,46 @@ class _RankTreeUnpermute(torch.autograd.Function):
                 num_warps=4,
             )
         return grad_rows, None, None, None, None
+
+
+def unpermute_with_bf16_rank_partials(
+    permuted_tokens: torch.Tensor,
+    route_rows: torch.Tensor,
+    route_experts: torch.Tensor,
+    probs: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+) -> torch.Tensor:
+    """Forward-only ``unpermute`` with the FlashInfer routed kernels' per-rank finalize.
+
+    Each EP rank's partial adds the token's routes on that rank in the order of
+    ``route_rows``, as FP32 fused multiply-adds of ``probs`` and row, from zero, and
+    quantizes the sum to BF16. The ranks are then added as ``unpermute`` adds them.
+    ``route_rows``, ``route_experts`` and ``probs`` (FP32) are [tokens, topk].
+    """
+    assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
+    num_tokens, topk = route_rows.shape
+    hidden = permuted_tokens.shape[-1]
+    rows = permuted_tokens.contiguous()
+    out = torch.empty(num_tokens, hidden, dtype=rows.dtype, device=rows.device)
+    if num_tokens > 0:
+        block_h = min(triton.next_power_of_2(hidden), 512)
+        _rank_tree_unpermute_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+            rows,
+            route_rows.contiguous(),
+            route_experts.contiguous(),
+            probs.contiguous(),
+            out,
+            hidden,
+            EP_SIZE=ep_size,
+            EXPERTS_PER_RANK=num_experts // ep_size,
+            TOPK=topk,
+            CROSS_RANK_FP64=get_batch_invariant_collective() == "multimem",
+            BF16_RANK_PARTIALS=True,
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
+    return out
 
 
 def _unpermute_loop(

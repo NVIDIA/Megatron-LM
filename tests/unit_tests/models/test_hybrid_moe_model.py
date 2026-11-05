@@ -22,6 +22,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -274,6 +275,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shortcut_connection": False,
+    "moe_shortcut_disable_mtp": False,
     "moe_shortcut_parallel": False,
     "moe_shortcut_post_norm": False,
     "moe_shared_expert_gate": False,
@@ -284,6 +286,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
     "moe_token_dropping": False,
+    "moe_training_matches_inference": False,
     "moe_virtual_expert_load_balance": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
@@ -321,6 +324,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
     "overlap_p2p_comm_warmup_flush": False,
+    "pad_packed_seq_alignment": None,
     "param_sync_func": None,
     "params_dtype": "torch.bfloat16",
     "perform_initialization": True,
@@ -349,6 +353,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tensor_parallel_num_weight_shards": 2,
     "tensor_parallel_num_sequence_shards": 2,
     "test_mode": False,
+    "cuda_graph_thd_max_packed_sequences": None,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -618,6 +623,7 @@ class TestHybridMoEModel:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         destroy_moe_metrics_tracker()
         args = self.create_test_args()
+        cfg = get_run_config()
         set_args(args)
 
         Utils.initialize_model_parallel(
@@ -633,7 +639,7 @@ class TestHybridMoEModel:
         self.model = HybridModel(
             config=model_config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg.tokenizer.vocab_size,
             max_sequence_length=args.seq_length,
             hybrid_layer_pattern=args.hybrid_layer_pattern,
             position_embedding_type=args.position_embedding_type,

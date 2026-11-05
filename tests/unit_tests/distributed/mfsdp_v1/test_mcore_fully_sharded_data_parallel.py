@@ -1360,15 +1360,15 @@ class TestFsdpNonUnitBucketPreservation:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
         # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
-        # matches the production default in mcore_fsdp_adapter.py.
+        # matches the production default in mcore_adapter_v1.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -1466,8 +1466,8 @@ class TestFsdpMambaConvParamGather:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1568,8 +1568,8 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(hidden_states, attention_mask=None)
+                return self.mamba_layer(h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
