@@ -1,10 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
+"""Script for quantizing a Megatron-LM checkpoint using ModelOpt."""
 
 import functools
 import gc
-import inspect
 import json
 import math
 import os
@@ -22,7 +21,6 @@ sys.path.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "../../../")))
 
 import modelopt.torch.quantization as mtq
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
-from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
@@ -62,9 +60,9 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
@@ -146,9 +144,6 @@ def add_text_generate_ptq_args(parser):
         type=str,
         default="",
         help="Reference texts. Please use | to separate different batches.",
-    )
-    group.add_argument(
-        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
     )
     group.add_argument("--compress", action="store_true", help="Enable real low-bit quantization.")
     group.add_argument(
@@ -512,25 +507,6 @@ if __name__ == "__main__":
     if args.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
-
-    if args.pretrained_model_path is not None:
-        from modelopt.torch.export import import_mcore_gpt_from_hf
-
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
-        unwrapped_model = unwrap_model(model)[0]
-        workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-
-        import_kwargs = {"dtype": import_dtype}
-        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
-            import_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
-        if (
-            "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters
-            and getattr(args, "moe_router_dtype", None)
-        ):
-            import_kwargs.update({"moe_router_dtype": args.moe_router_dtype})
-        import_mcore_gpt_from_hf(
-            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
-        )
 
     def _custom_prompt_forward_loop_func(model):
         all_prompts = args.prompts.split("|")

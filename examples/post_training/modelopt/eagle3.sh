@@ -71,16 +71,20 @@ if [ -z ${MLM_EVAL_ARGS} ]; then
     "
 fi
 
-# Convert HF checkpoint to Megatron EAGLE3 model if not exist
+# Attach an EAGLE3 draft module to the Megatron-Core checkpoint if not done yet
 if [[ ! -d ${MLM_MODEL_SAVE} ]]; then
-    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_model.py \
+    if [ -z ${MLM_MODEL_CKPT} ]; then
+        printf "${MLM_ERROR} Variable ${PURPLE}MLM_MODEL_CKPT${WHITE} is not set! Import the Hugging Face checkpoint with Megatron-Bridge first (see README.md).\n"
+        exit 1
+    fi
+    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_speculative.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
         --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
         --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
-        --pretrained-model-path ${HF_MODEL_CKPT} \
+        --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
         ${MLM_DEFAULT_ARGS} ${EAGLE3_CONVERT_ARGS}
 fi
