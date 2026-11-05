@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -22,6 +24,13 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.skipif(
     Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
     reason="Skip layer-wise optimizer for LTS test",
+)
+
+# reduce-scatter selects the padded LayerWise layout, all-reduce the compact one.
+GRAD_COLLECTIVES = ['reduce-scatter', 'all-reduce']
+
+multi_rank = pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
 
 
@@ -59,6 +68,38 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+class MuonExcludedMatrixModel(nn.Module):
+    """Model with a 2D matrix explicitly routed to the scalar optimizer."""
+
+    def __init__(self):
+        super().__init__()
+        self.scalar = nn.Linear(10, 8)
+        self.muon = nn.Linear(8, 5)
+        self.scalar.weight.use_muon = False
+
+    def forward(self, x):
+        return self.muon(F.relu(self.scalar(x)))
+
+
+class ExpertModel(nn.Module):
+    """Dense and expert matrices (Muon) with biases (Adam); the experts are expert-parallel."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(80, 48)
+        # Named "experts" so the Muon factory tags them for the expert TP group.
+        self.experts = nn.ModuleList([nn.Linear(48, 48) for _ in range(3)])
+        for param in self.experts.parameters():
+            param.allreduce = False
+        self.out = nn.Linear(48, 10)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        for expert in self.experts:
+            x = x + 0.5 * torch.tanh(expert(x))
+        return self.out(x)
+
+
 class _FakeLayerwiseBucket:
     def __init__(self, params):
         self.params_list = params
@@ -71,17 +112,6 @@ class _FakeLayerwiseBucket:
         self.layerwise_param_flat_sizes = [
             sum(param.numel() for param in param_list) for param_list in layerwise_params_list
         ]
-
-
-class _FakeBucketGroup:
-    def __init__(self, buckets):
-        self.buckets = buckets
-
-
-class _FakeModelChunk:
-    def __init__(self, bucket):
-        self.bucket_groups = [_FakeBucketGroup([bucket])]
-        self.expert_parallel_bucket_groups = []
 
 
 def test_set_bucket_layerwise_params_list_single_dp_rank():
@@ -101,23 +131,13 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     optimizer.dp_cp_params_list = None
     optimizer.expt_dp_params_list = None
 
-    optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
+    model_chunk = SimpleNamespace(
+        bucket_groups=[SimpleNamespace(buckets=[bucket])], expert_parallel_bucket_groups=[]
+    )
+    optimizer.set_bucket_layerwise_params_list([model_chunk])
 
     assert bucket.layerwise_params_list == [params]
     assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
-
-
-class MuonExcludedMatrixModel(nn.Module):
-    """Model with a 2D matrix explicitly routed to the scalar optimizer."""
-
-    def __init__(self):
-        super().__init__()
-        self.scalar = nn.Linear(10, 8)
-        self.muon = nn.Linear(8, 5)
-        self.scalar.weight.use_muon = False
-
-    def forward(self, x):
-        return self.muon(F.relu(self.scalar(x)))
 
 
 def _layer_wise(optimizer):
@@ -131,375 +151,210 @@ def _layer_wise(optimizer):
     )
 
 
-@pytest.mark.skipif(
-    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
-)
+def _create(
+    model_class=SimpleModel,
+    *,
+    grad_collective='reduce-scatter',
+    use_layer_wise=True,
+    overlap_param_gather=False,
+    optimizer_overlap_param_gather=None,
+    grad_reduce_in_fp32=False,
+    bucket_size=None,
+    copy_from=None,
+    frozen=False,
+    seed=1234,
+):
+    """Return ``(ddp_model, optimizer, pg_collection)``.
+
+    ``use_layer_wise=False`` builds the reference: non-distributed Muon on plain DDP.
+    ``optimizer_overlap_param_gather`` sets a conflicting OptimizerConfig value, to check that
+    the DDP config stays authoritative.
+    """
+    torch.manual_seed(seed)
+    model = model_class().bfloat16().cuda()
+    model.requires_grad_(not frozen)
+    # overlap_param_gather needs bucketing, which DDP only keeps with overlap_grad_reduce.
+    ddp_config = DistributedDataParallelConfig(
+        overlap_param_gather=overlap_param_gather,
+        overlap_grad_reduce=overlap_param_gather,
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+        bucket_size=bucket_size,
+    )
+    transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+    if use_layer_wise:
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            transformer_config,
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            emerging_optimizer_grad_collective=grad_collective,
+        )[0]
+    else:
+        model = DistributedDataParallel(transformer_config, ddp_config, model)
+    if copy_from is not None:
+        model.module.load_state_dict(copy_from.module.state_dict())
+    else:
+        model.broadcast_params()
+
+    if optimizer_overlap_param_gather is None:
+        optimizer_overlap_param_gather = overlap_param_gather
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            clip_grad=1.0,
+            overlap_param_gather=optimizer_overlap_param_gather,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=use_layer_wise,
+            emerging_optimizer_grad_collective=(
+                grad_collective if use_layer_wise else 'reduce-scatter'
+            ),
+        ),
+        [model],
+        pg_collection=pg_collection,
+        use_gloo_process_groups=False,
+    )
+    return model, optimizer, pg_collection
+
+
+def _set_same_main_grads(seed, *models):
+    """Give the models the same main_grad, equal on every rank."""
+    generator = torch.Generator(device='cuda').manual_seed(seed)
+    for params in zip(*(model.parameters() for model in models)):
+        grad = torch.randn(params[0].shape, generator=generator, device='cuda')
+        for param in params:
+            param.main_grad = grad.clone()
+
+
+def _train_step(model, optimizer, step):
+    """One step with per-DP-rank data; returns the grad norm after params are published."""
+    in_features = next(model.module.parameters()).shape[1]
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    generator = torch.Generator(device='cuda').manual_seed(100 * step + dp_rank)
+    x = torch.randn(8, in_features, generator=generator, device='cuda', dtype=torch.bfloat16)
+    model.zero_grad_buffer()
+    model(x).float().pow(2).mean().backward()
+    model.finish_grad_sync()
+    success, grad_norm, _ = optimizer.step()
+    assert success
+    if model.ddp_config.overlap_param_gather:
+        # The next forward pre-hook would gather; publish now to compare parameters.
+        model.start_param_sync(force_sync=True)
+    return float(grad_norm)
+
+
+def _assert_params_equal(model, reference, msg=''):
+    for (name, param), ref_param in zip(model.named_parameters(), reference.parameters()):
+        torch.testing.assert_close(param, ref_param, rtol=0, atol=0, msg=f"{msg} {name}")
+
+
+def _assert_replicas_equal(model):
+    """Every rank of a parameter's data-parallel group holds the same value."""
+    for name, param in model.module.named_parameters():
+        expert = not getattr(param, 'allreduce', True)
+        group = (
+            parallel_state.get_expert_data_parallel_group()
+            if expert
+            else parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
+        replicas = [torch.empty_like(param) for _ in range(get_pg_size(group))]
+        torch.distributed.all_gather(replicas, param.data.contiguous(), group=group)
+        for replica in replicas[1:]:
+            torch.testing.assert_close(replica, replicas[0], rtol=0, atol=0, msg=name)
+
+
+def _assert_trains_like_reference(model, optimizer, steps):
+    """Train next to the non-distributed reference and compare grad norms and parameters."""
+    reference, reference_optimizer, _ = _create(
+        type(model.module),
+        use_layer_wise=False,
+        grad_reduce_in_fp32=model.ddp_config.grad_reduce_in_fp32,
+        copy_from=model,
+    )
+    for step in range(steps):
+        grad_norm = _train_step(model, optimizer, step)
+        reference_grad_norm = _train_step(reference, reference_optimizer, step)
+        assert grad_norm == pytest.approx(reference_grad_norm, rel=1e-4, abs=1e-5)
+        _assert_replicas_equal(model)
+    for (name, param), ref_param in zip(
+        model.module.named_parameters(), reference.module.parameters()
+    ):
+        # Reductions differ in order across layouts; one BF16 ulp of slack.
+        torch.testing.assert_close(param, ref_param, rtol=8e-3, atol=1e-4, msg=name)
+
+
+@multi_rank
 class TestLayerWiseOptimizer:
     """Test class for LayerWiseDistributedOptimizer with common setup code."""
 
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
         """Setup and teardown for each test."""
-        world = int(os.getenv('WORLD_SIZE', '1'))
-        rank = int(os.getenv('RANK', '0'))
         Utils.initialize_model_parallel()
         yield
         Utils.destroy_model_parallel()
 
-    def create_model_and_optimizer(
-        self,
-        model_class=SimpleModel,
-        clip_grad=1.0,
-        model_kwargs=None,
-        use_layer_wise=True,
-        copy_from=None,
-        use_param_layout=True,
-    ):
-        """Create model, DDP wrapper, and optimizer.
-
-        Args:
-            model_class: Model class to instantiate
-            clip_grad: Optional gradient clipping value
-            model_kwargs: Optional kwargs for model initialization
-            use_layer_wise: If True, use LayerWiseDistributedOptimizer via dist_muon;
-                          if False, use standard muon ChainedOptimizer (for reference)
-            use_param_layout: LayerWise layout of the DDP wrapper. True (default) selects the
-                padded layout: a precomputed shard-aligned ``full_param_layout`` synced through
-                ``start_param_sync``. ``'compact'`` selects unsharded LayerWise buffers next to
-                the sibling DistOpt buffers, synced through ``allgather_params()``. Ignored for
-                the non-layer-wise reference, which uses plain DDP.
-
-        Returns:
-            tuple: (model, optimizer, pg_collection)
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        model = model_class(**model_kwargs).bfloat16().cuda()
-        model.requires_grad_(True)
-        grad_collective = (
-            'all-reduce' if use_layer_wise and use_param_layout == 'compact' else 'reduce-scatter'
-        )
-
-        if use_layer_wise:
-            from megatron.training.training import wrap_model_chunks_with_ddp
-
-            ddp_config = DistributedDataParallelConfig()
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=use_layer_wise,
-                emerging_optimizer_grad_collective=grad_collective,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
-        if copy_from:
-            model.module.load_state_dict(copy_from.module.state_dict())
-        else:
-            model.broadcast_params()
-
-        optimizer_config = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            weight_decay=0.01,
-            bf16=True,
-            use_distributed_optimizer=False,
-            clip_grad=clip_grad,
-            muon_tp_mode="duplicated",
-            use_layer_wise_distributed_optimizer=use_layer_wise,
-            emerging_optimizer_grad_collective=grad_collective,
-        )
-
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
-
-        optimizer = get_megatron_optimizer(
-            optimizer_config, [model], pg_collection=pg_collection, use_gloo_process_groups=False
-        )
-        return model, optimizer, pg_collection
-
-    def create_model_and_optimizer_with_overlap_param_gather(
-        self,
-        model_class=SimpleModel,
-        clip_grad=1.0,
-        model_kwargs=None,
-        copy_from=None,
-        overlap_param_gather=True,
-        optimizer_overlap_param_gather=None,
-        grad_reduce_in_fp32=False,
-        bucket_size=None,
-        use_param_layout=True,
-    ):
-        """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
-
-        This variant sets overlap_param_gather=True in DDP config and uses
-        get_megatron_optimizer with layer_wise_distributed_optimizer=True,
-        enabling the bucket-based async param gather path.
-
-        Args:
-            model_class: Model class to instantiate
-            clip_grad: Optional gradient clipping value
-            model_kwargs: Optional kwargs for model initialization
-            copy_from: Optional DDP model to copy weights from
-            overlap_param_gather: If True, defer param all-gather to bucket infrastructure
-            optimizer_overlap_param_gather: Optional conflicting OptimizerConfig value used to
-                verify that the DDP config remains authoritative. Defaults to the DDP value.
-            grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
-            bucket_size: Maximum number of parameters per bucket (None = single bucket)
-            use_param_layout: LayerWise layout of the DDP wrapper: True (default) for the
-                padded layout, ``'compact'`` for the compact layout.
-
-        Returns:
-            tuple: (model, optimizer, pg_collection)
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        model = model_class(**model_kwargs).bfloat16().cuda()
-        model.requires_grad_(True)
-
-        # overlap_param_gather=True requires bucketing, which only happens when
-        # overlap_grad_reduce=True (otherwise DDP forces bucket_size=None). Couple
-        # the two so a caller only has to flip one.
-        overlap_grad_reduce = overlap_param_gather
-
-        from megatron.training.training import wrap_model_chunks_with_ddp
-
-        grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
-        ddp_config = DistributedDataParallelConfig(
-            overlap_param_gather=overlap_param_gather,
-            overlap_grad_reduce=overlap_grad_reduce,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            bucket_size=bucket_size,
-        )
-        model = wrap_model_chunks_with_ddp(
-            [model],
-            TransformerConfig(num_attention_heads=1, num_layers=1),
-            ddp_config,
-            use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective=grad_collective,
-        )[0]
-        if copy_from:
-            model.module.load_state_dict(copy_from.module.state_dict())
-        else:
-            model.broadcast_params()
-
-        if optimizer_overlap_param_gather is None:
-            optimizer_overlap_param_gather = overlap_param_gather
-
-        optimizer_config = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            weight_decay=0.01,
-            bf16=True,
-            use_distributed_optimizer=False,
-            clip_grad=clip_grad,
-            overlap_param_gather=optimizer_overlap_param_gather,
-            muon_tp_mode="duplicated",
-            use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective=grad_collective,
-        )
-
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
-
-        optimizer = get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=False,
-            pg_collection=pg_collection,
-        )
-        return model, optimizer, pg_collection
-
-    def create_reference_model(self, model):
-        """Create a reference model by cloning the current model."""
-        reference_model = type(model.module)().bfloat16().cuda()
-        reference_model.load_state_dict(model.module.state_dict())
-        return reference_model
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_basic(self, use_param_layout):
-        """Test basic LayerWiseDistributedOptimizer initialization and step with bf16."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer(
-            use_param_layout=use_param_layout
-        )
-
-        # Verify basic properties
-        assert optimizer is not None, "Optimizer should not be None"
-        assert hasattr(optimizer, 'chained_optimizers'), "Should be a ChainedOptimizer"
-        layer_wise_optimizer = (
-            optimizer
-            if isinstance(optimizer, LayerWiseDistributedOptimizer)
-            else next(
-                sub_optimizer
-                for sub_optimizer in optimizer.chained_optimizers
-                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
-            )
-        )
-        assert layer_wise_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
-        for sub_optimizer in layer_wise_optimizer.chained_optimizers:
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_basic(self, grad_collective):
+        """Construction, bf16 wrapping and one training step; every rank ends equal."""
+        model, optimizer, pg_collection = _create(grad_collective=grad_collective)
+        layer_wise = _layer_wise(optimizer)
+        assert isinstance(layer_wise.chained_optimizers[0], Float16OptimizerWithFloat16Params)
+        assert layer_wise.grad_stats_parallel_group is pg_collection.intra_dist_opt
+        for sub_optimizer in layer_wise.chained_optimizers:
             assert sub_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
 
-        reference_model = self.create_reference_model(model)
+        before = [param.detach().clone() for param in model.parameters()]
+        _train_step(model, optimizer, step=0)
+        assert any(not torch.equal(p, b) for p, b in zip(model.parameters(), before))
+        _assert_replicas_equal(model)
 
-        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
-        output = model(input_tensor)
-        loss = output.sum()
-        loss.backward()
-
-        update_successful, grad_norm, num_zeros = optimizer.step()
-
-        assert update_successful, "Optimizer step should be successful"
-
-        # Verify parameters were updated
-        params_updated = 0
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            if not torch.equal(param.data, ref_param.data):
-                params_updated += 1
-
-        assert params_updated > 0, "At least some parameters should be updated"
-
-        # Verify all ranks have the same updated parameters (test allgather)
-        dp_size = get_pg_size(pg_collection.dp_cp)
-
-        if dp_size > 1:
-            for name, param in model.named_parameters():
-                # Gather parameters from all ranks
-                param_list = [torch.zeros_like(param.data) for _ in range(dp_size)]
-                torch.distributed.all_gather(param_list, param.data, group=pg_collection.dp_cp)
-
-                # Verify all ranks have the same parameter values
-                for i in range(1, dp_size):
-                    try:
-                        torch.testing.assert_close(param_list[0], param_list[i])
-                    except AssertionError as e:
-                        # Append additional context without overwriting the default message
-                        raise AssertionError(
-                            f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
-                        ) from None
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_frozen_stage_builds_an_optimizer(self, use_param_layout):
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_frozen_stage_builds_an_optimizer(self, grad_collective):
         """A pipeline stage whose params are all frozen has no routing tags; building the
         layer-wise optimizer must not mistake it for a model wrapped without a layout."""
-        from megatron.training.training import wrap_model_chunks_with_ddp
-
-        model = SimpleModel().bfloat16().cuda()
-        model.requires_grad_(False)
-        grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
-        model = wrap_model_chunks_with_ddp(
-            [model],
-            TransformerConfig(num_attention_heads=1, num_layers=1),
-            DistributedDataParallelConfig(),
-            use_layer_wise_distributed_optimizer=True,
-            emerging_optimizer_grad_collective=grad_collective,
-        )[0]
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                optimizer='muon',
-                lr=0.01,
-                bf16=True,
-                muon_tp_mode="duplicated",
-                use_layer_wise_distributed_optimizer=True,
-                emerging_optimizer_grad_collective=grad_collective,
-            ),
-            [model],
-            pg_collection=pg_collection,
-            use_gloo_process_groups=False,
-        )
-        layer_wise = _layer_wise(optimizer)
-        assert not any(group['params'] for group in layer_wise.param_groups)
+        _, optimizer, _ = _create(grad_collective=grad_collective, frozen=True)
+        assert not any(group['params'] for group in _layer_wise(optimizer).param_groups)
 
     def test_explicit_muon_exclusion_updates_with_param_layout(self):
         """An excluded 2D matrix is updated and synchronized by the scalar DistOpt."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer(
-            model_class=MuonExcludedMatrixModel, use_param_layout=True
-        )
-        excluded_weight = model.module.scalar.weight
-        initial_weight = excluded_weight.detach().clone()
-
-        output = model(torch.randn(16, 10, dtype=torch.bfloat16, device='cuda'))
-        output.sum().backward()
-        update_successful, _, _ = optimizer.step()
-
-        assert update_successful
-        assert not torch.equal(excluded_weight, initial_weight)
-
-        dp_size = get_pg_size(pg_collection.dp_cp)
-        gathered = [torch.empty_like(excluded_weight) for _ in range(dp_size)]
-        torch.distributed.all_gather(gathered, excluded_weight, group=pg_collection.dp_cp)
-        for replica in gathered[1:]:
-            torch.testing.assert_close(gathered[0], replica, rtol=0, atol=0)
+        model, optimizer, _ = _create(MuonExcludedMatrixModel)
+        initial_weight = model.module.scalar.weight.detach().clone()
+        _train_step(model, optimizer, step=0)
+        assert not torch.equal(model.module.scalar.weight, initial_weight)
+        _assert_replicas_equal(model)
 
     def test_get_grad_norm(self):
-        """Test LayerWiseDistributedOptimizer gradient norm computation."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
-        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            use_layer_wise=False
-        )
-
-        # Set same gradients on both models
-        # note that model is different at this point but we're only testing grad norm here
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.float().detach()
-            ref_param.main_grad = grad_value.float().detach()
-
-        # Test get_grad_norm on both optimizers
+        """The grad norm matches the non-distributed reference."""
+        model, optimizer, _ = _create()
+        reference, reference_optimizer, _ = _create(use_layer_wise=False)
+        _set_same_main_grads(0, model, reference)
         optimizer.prepare_grads()
-        grad_norm = optimizer.get_grad_norm()
-
         reference_optimizer.prepare_grads()
-        reference_grad_norm = reference_optimizer.get_grad_norm()
-
-        assert grad_norm is not None, "Grad norm should not be None"
-        assert grad_norm >= 0, "Grad norm should be non-negative"
-
-        # Compare with reference optimizer grad norm
-        torch.testing.assert_close(grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-5)
-
-    def test_state_dict(self):
-        """Test LayerWiseDistributedOptimizer state dict save and load."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
-
-        for param in model.parameters():
-            param.grad = torch.randn_like(param)
-        optimizer.step()
-
-        # Test state_dict
-        state_dict = optimizer.state_dict()
-
-        # Test load_state_dict
-        # TODO(deyuf): fix this. not going through get() will cause missing keys like wd_mult
-        # optimizer.load_state_dict(state_dict)
+        torch.testing.assert_close(
+            optimizer.get_grad_norm(), reference_optimizer.get_grad_norm(), rtol=1e-5, atol=1e-5
+        )
 
     def test_sharded_state_dict(self):
         """Test LayerWiseDistributedOptimizer sharded_state_dict method."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
+        model, optimizer, _ = _create()
 
         for param in model.parameters():
             param.grad = torch.randn_like(param)
         optimizer.step()
 
-        # Get model sharded state dict
-        model_sharded_state_dict = model.sharded_state_dict()
-
         # Test sharded_state_dict, with the sibling DistOpt in its default checkpoint format.
         sharded_state_dict = optimizer.sharded_state_dict(
-            model_sharded_state_dict, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
+            model.sharded_state_dict(), metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
         )
 
-        # Verify the sharded_state_dict is not None and has expected structure.
-        # With multiple chained optimizers (muon + adam), the top-level keys are
-        # integer indices; each sub-dict should contain an 'optimizer' key.
+        # The chain (muon + adam) has integer top-level keys, each sub-dict an 'optimizer' key.
         assert sharded_state_dict is not None, "Sharded state dict should not be None"
         if isinstance(sharded_state_dict, dict) and all(
             isinstance(k, int) for k in sharded_state_dict.keys()
@@ -524,69 +379,24 @@ class TestLayerWiseOptimizer:
                     sh_base.replica_id[2] == 0
                 ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
 
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_multiple_optimizers(self, use_param_layout):
-        """Test LayerWiseDistributedOptimizer with multiple chained optimizers.
-
-        Uses get_megatron_muon_optimizer which produces multiple chained optimizers
-        (muon for 2D weights + adam for 1D biases). Tests allgather with multiple ranks.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer(
-            use_param_layout=use_param_layout
-        )
-
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    def test_multiple_optimizers(self):
+        """LayerWise over two base optimizers built directly, without DDP-wrapped chunks."""
         model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(use_distributed_optimizer=False),
+            SimpleModel().bfloat16().cuda(),
         )
-
-        optimizer_config = OptimizerConfig(
-            optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=False
-        )
-
-        # Split parameters into two groups for testing multiple optimizers
         params = list(model.parameters())
-        mid_point = len(params) // 2
-        param_groups_1 = [{'params': params[:mid_point]}]
-        param_groups_2 = [{'params': params[mid_point:]}]
-
-        # Create two separate plain base optimizers (LayerWise wraps them itself)
-        base_optimizer_1 = torch.optim.Adam(param_groups_1, lr=optimizer_config.lr)
-        base_optimizer_2 = torch.optim.Adam(param_groups_2, lr=optimizer_config.lr)
-
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
-
+        half = len(params) // 2
         optimizer = LayerWiseDistributedOptimizer(
-            [base_optimizer_1, base_optimizer_2], optimizer_config, pg_collection
+            [torch.optim.Adam(params[:half], lr=0.01), torch.optim.Adam(params[half:], lr=0.01)],
+            OptimizerConfig(optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=False),
+            ProcessGroupCollection.use_mpu_process_groups(),
         )
-
-        assert len(optimizer.chained_optimizers) == 2, "Should have two chained optimizers"
-
-        # Set gradients and test optimizer step - this will trigger allgather
-        for param in model.parameters():
+        assert len(optimizer.chained_optimizers) == 2
+        for param in params:
             param.grad = torch.randn_like(param)
-
-        update_successful, grad_norm, num_zeros = optimizer.step()
-
-        assert update_successful, "Optimizer step should be successful"
-
-    def test_bf16_wrapping(self):
-        """Test LayerWiseDistributedOptimizer automatically wraps optimizer with bf16."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer()
-
-        # Verify bf16 wrapping happened
-        assert isinstance(
-            _layer_wise(optimizer).chained_optimizers[0], Float16OptimizerWithFloat16Params
-        ), "Optimizer should be wrapped in Float16OptimizerWithFloat16Params"
-
-        for param in model.parameters():
-            param.grad = torch.randn_like(param)
-
-        update_successful, grad_norm, num_zeros = optimizer.step()
-
-        assert update_successful, "Optimizer step should be successful"
+        assert optimizer.step()[0]
 
     def test_bf16_wrapper_uses_preserved_high_precision_initializer(self):
         """FP32 masters must not be initialized from an already-quantized model weight."""
@@ -612,877 +422,294 @@ class TestLayerWiseOptimizer:
         assert model_param.main_param is main_param
 
     def test_bf16_error(self):
-        """Test LayerWiseDistributedOptimizer raises error when receiving pre-wrapped Float16 optimizer."""
-        model = SimpleModel().bfloat16().cuda()
-        model.requires_grad_(True)
-
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-        model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-        )
-
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
-
-        # Create optimizer (non-layer-wise) — produces Float16-wrapped chained optimizers
-        optimizer_config = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            bf16=True,
-            use_distributed_optimizer=False,
-            muon_tp_mode="duplicated",
-        )
-        muon_optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
-        )
-
-        # Extract a Float16-wrapped chained optimizer
+        """LayerWiseDistributedOptimizer rejects an already Float16-wrapped optimizer."""
+        _, muon_optimizer, pg_collection = _create(use_layer_wise=False)
         wrapped_optimizer = muon_optimizer.chained_optimizers[0]
         assert isinstance(wrapped_optimizer, Float16OptimizerWithFloat16Params)
-
-        # Should raise TypeError when receiving already-wrapped Float16 optimizer
-        lw_config = OptimizerConfig(
-            optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=False
-        )
+        config = OptimizerConfig(optimizer='muon', lr=0.01, bf16=True)
         with pytest.raises(
             TypeError, match='LayerWiseDistributedOptimizer expects base torch optimizers'
         ):
-            LayerWiseDistributedOptimizer([wrapped_optimizer], lw_config, pg_collection)
+            LayerWiseDistributedOptimizer([wrapped_optimizer], config, pg_collection)
 
-    def _run_parameter_update_test(self, use_param_layout, model_class=SimpleModel):
-        """Helper method to test parameter updates with a given model class.
-
-        Args:
-            use_param_layout: forwarded to create_model_and_optimizer.
-            model_class: Model class to use for testing.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer(
-            model_class=model_class, use_param_layout=use_param_layout
+    @pytest.mark.parametrize('model_class', [SimpleModel, TinyModel])
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_parameter_updates(self, grad_collective, model_class):
+        """Updates match the non-distributed reference; TinyModel leaves ranks without params."""
+        model, optimizer, _ = _create(model_class, grad_collective=grad_collective)
+        reference, reference_optimizer, _ = _create(
+            model_class, use_layer_wise=False, copy_from=model
         )
-
-        # Create reference model and optimizer using the same function
-        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            model_class=model_class,
-            use_layer_wise=False,
-            copy_from=model,
-            use_param_layout=use_param_layout,
-        )
-
-        # Set same gradients on both models
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            assert torch.equal(param.data, ref_param.data)
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
+        before = [param.detach().clone() for param in model.parameters()]
+        _set_same_main_grads(0, model, reference)
         optimizer.step()
-
-        # Verify at least some parameters were updated
-        params_updated = 0
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            if not torch.equal(param.data, ref_param.data):
-                params_updated += 1
-
-        assert params_updated > 0, "At least some parameters should be updated"
-
         reference_optimizer.step()
-
-        # Verify updated values match reference optimizer
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_parameter_updates(self, use_param_layout):
-        """Test LayerWiseDistributedOptimizer actually updates model parameters."""
-        self._run_parameter_update_test(use_param_layout=use_param_layout)
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_parameter_updates_insufficient_parameters(self, use_param_layout):
-        """Test LayerWiseDistributedOptimizer when there are insufficient parameters for all ranks.
-
-        Uses a tiny model with only 1 layer (2 parameters: weight and bias).
-        This will be insufficient when world size > 2.
-        """
-        self._run_parameter_update_test(use_param_layout=use_param_layout, model_class=TinyModel)
+        assert any(not torch.equal(p, b) for p, b in zip(model.parameters(), before))
+        for param, ref_param in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(param, ref_param, rtol=1e-5, atol=1e-5)
 
     def test_broadcast_vs_allgather(self):
-        """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer(
-            model_class=SimpleModel, use_param_layout='compact'
-        )
-
-        # Create reference model and optimizer using the same function
-        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            model_class=SimpleModel, copy_from=model, use_param_layout='compact'
-        )
-
-        # Set same gradients on both models
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            assert torch.equal(param.data, ref_param.data)
-            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        optimizer.step()
-
-        # Verify at least some parameters were updated
-        params_updated = 0
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            if not torch.equal(param.data, ref_param.data):
-                params_updated += 1
-
-        assert params_updated > 0, "At least some parameters should be updated"
-
-        # step() internal call allgather_params. replace reference object with bcast
+        """The whole-param all-gather matches the broadcast fallback bit for bit."""
+        model, optimizer, _ = _create(grad_collective='all-reduce')
+        reference, reference_optimizer, _ = _create(grad_collective='all-reduce', copy_from=model)
         reference_layer_wise = _layer_wise(reference_optimizer)
         reference_layer_wise.allgather_params = reference_layer_wise.broadcast_params
+        _set_same_main_grads(0, model, reference)
+        optimizer.step()
         reference_optimizer.step()
+        _assert_params_equal(model, reference)
 
-        # Verify updated values match reference optimizer
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
+    @pytest.mark.parametrize('overlap', [False, True])
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_training_matches_reference(self, grad_collective, overlap):
+        """Real gradient collectives: LayerWise buckets next to the sibling DistOpt buckets."""
+        # FP32 gradient reduction keeps the collectives' rounding below the tolerance.
+        model, optimizer, _ = _create(
+            grad_collective=grad_collective,
+            overlap_param_gather=overlap,
+            grad_reduce_in_fp32=True,
+            bucket_size=4096 if overlap else None,
+        )
+        layer_wise = _layer_wise(optimizer)
+        # The model-level config keeps DistOpt for the sibling optimizer.
+        assert model.ddp_config.use_distributed_optimizer
+        if grad_collective == 'all-reduce':
+            assert layer_wise.param_layout == 'compact'
+            assert layer_wise.layerwise_param_sync_via_bucket_group == overlap
+            for buffer in model.buffers + model.expert_parallel_buffers:
+                is_layer_wise = getattr(
+                    buffer.params[0], 'is_managed_by_layer_wise_optimizer', False
+                )
+                # LayerWise buffers are unsharded and unpadded; only DistOpt has a param buffer.
+                assert buffer.ddp_config.use_distributed_optimizer != is_layer_wise
+                assert (buffer.param_data is None) == is_layer_wise
+            for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
+                owners = {
+                    getattr(param, 'is_managed_by_layer_wise_optimizer', False)
+                    for bucket in bucket_group.buckets
+                    for param in bucket.params_list
+                }
+                assert len(owners) == 1, "A bucket group mixes LayerWise and DistOpt buckets"
+                if owners.pop():
+                    # Without overlap the optimizer gathers the LayerWise params after its step.
+                    assert bucket_group.ddp_config.param_sync_via_bucket_group == overlap
+        _assert_trains_like_reference(model, optimizer, steps=3)
+
+    def test_all_reduce_training_replays_bit_exact(self):
+        """Gradient all-reduce next to the sibling DistOpt reduce-scatter, rank-consistent owners
+        and uneven whole-param gathers replay bit for bit."""
+        from tests.unit_tests.determinism.kernels.harness import bytes_equal
+
+        runs = []
+        for _ in range(2):
+            model, optimizer, _ = _create(
+                grad_collective='all-reduce',
+                overlap_param_gather=True,
+                grad_reduce_in_fp32=True,
+                bucket_size=4096,
+            )
+            norms = [_train_step(model, optimizer, step) for step in range(3)]
+            runs.append((norms, [param.detach().clone() for param in model.parameters()]))
+        assert runs[0][0] == runs[1][0], "grad norms differ between replays"
+        for (name, _), a, b in zip(model.named_parameters(), runs[0][1], runs[1][1]):
+            assert bytes_equal(a, b), f"{name} differs between replays"
 
     # ---- Overlap-param-gather tests ----
 
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
     @pytest.mark.parametrize(
         ('ddp_overlap_param_gather', 'optimizer_overlap_param_gather'),
         [(False, True), (True, False)],
     )
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
     def test_overlap_param_gather_follows_ddp_config(
-        self, use_param_layout, ddp_overlap_param_gather, optimizer_overlap_param_gather
+        self, grad_collective, ddp_overlap_param_gather, optimizer_overlap_param_gather
     ):
         """DDP's per-model overlap policy must override the global optimizer value."""
-        model, optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+        model, optimizer, _ = _create(
+            grad_collective=grad_collective,
             overlap_param_gather=ddp_overlap_param_gather,
             optimizer_overlap_param_gather=optimizer_overlap_param_gather,
-            use_param_layout=use_param_layout,
         )
-
-        layer_wise_optimizer = next(
-            (
-                sub_optimizer
-                for sub_optimizer in getattr(optimizer, 'chained_optimizers', [optimizer])
-                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
-            ),
-            optimizer,
-        )
-
-        assert layer_wise_optimizer.ddp_config is model.ddp_config
-        assert layer_wise_optimizer.overlap_param_gather == ddp_overlap_param_gather
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_basic(self, use_param_layout):
-        """Test overlap-param-gather path: init, forward/backward/step, bucket-based param sync."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            use_param_layout=use_param_layout
-        )
-
-        assert optimizer is not None, "Optimizer should not be None"
-        # ``optimizer`` may be a ChainedOptimizer wrapping the LayerWise +
-        # DistOpt pair when non-Muon params are routed to DistOpt. Find the
-        # LayerWise instance to check its ``overlap_param_gather`` flag.
-        layer_wise_optimizer = next(
-            (
-                sub_optimizer
-                for sub_optimizer in getattr(optimizer, 'chained_optimizers', [optimizer])
-                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
-            ),
-            optimizer,
-        )
-        assert layer_wise_optimizer.overlap_param_gather, "overlap_param_gather should be True"
-
-        reference_model = self.create_reference_model(model)
-
-        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
-        output = model(input_tensor)
-        loss = output.sum()
-        loss.backward()
-
-        # step() updates local params but skips allgather (overlap_param_gather=True)
-        update_successful, grad_norm, num_zeros = optimizer.step()
-
-        assert update_successful, "Optimizer step should be successful"
-
-        # Manually sync params through the bucket-based param sync path
-        # force_sync=True does synchronous allgather via bucket infrastructure
-        model.start_param_sync(force_sync=True)
-
-        # Verify parameters were updated
-        params_updated = 0
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            if not torch.equal(param.data, ref_param.data):
-                params_updated += 1
-
-        assert params_updated > 0, "At least some parameters should be updated"
-
-        # Verify all ranks have the same updated parameters
-        dp_size = get_pg_size(pg_collection.dp_cp)
-
-        if dp_size > 1:
-            for name, param in model.named_parameters():
-                param_list = [torch.zeros_like(param.data) for _ in range(dp_size)]
-                torch.distributed.all_gather(param_list, param.data, group=pg_collection.dp_cp)
-
-                for i in range(1, dp_size):
-                    torch.testing.assert_close(
-                        param_list[0],
-                        param_list[i],
-                        msg=f"Parameter {name} differs between rank 0 and rank {i}",
-                    )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_parameter_updates(self, use_param_layout):
-        """Test overlap-param-gather produces same parameter updates as standard optimizer."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            use_param_layout=use_param_layout
-        )
-
-        # Create reference model with standard (non-layer-wise) optimizer
-        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            use_layer_wise=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        # Set same gradients on both models
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            assert torch.equal(param.data, ref_param.data)
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        # step() with overlap_param_gather=True: updates but no allgather
-        optimizer.step()
-        # Manually sync params via bucket infrastructure
-        model.start_param_sync(force_sync=True)
-
-        reference_optimizer.step()
-
-        # Verify updated values match reference optimizer
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_vs_sync_allgather(self, use_param_layout):
-        """Key correctness test: overlap path and sync allgather produce identical updates.
-
-        Compares:
-        - Overlap path: overlap_param_gather=True, bucket-based param sync
-        - Sync path: overlap_param_gather=False, optimizer.allgather_params() in step()
-        """
-        # Create overlap model
-        overlap_model, overlap_optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                overlap_param_gather=True, use_param_layout=use_param_layout
-            )
-        )
-
-        # Create sync model with same weights (overlap_param_gather=True but sync allgather)
-        sync_model, sync_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=overlap_model, use_param_layout=use_param_layout
-        )
-
-        # Verify initial parameters match
-        for op, sp in zip(overlap_model.parameters(), sync_model.parameters()):
-            assert torch.equal(op.data, sp.data)
-
-        # Set identical gradients on both
-        for op, sp in zip(overlap_model.parameters(), sync_model.parameters()):
-            grad_value = torch.randn_like(op)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            op.main_grad = grad_value.clone().detach()
-            sp.main_grad = grad_value.clone().detach()
-
-        # Overlap path: step + manual sync
-        overlap_optimizer.step()
-        overlap_model.start_param_sync(force_sync=True)
-
-        # Sync path: step (includes allgather_params)
-        sync_optimizer.step()
-
-        # Both paths should produce identical parameter values
-        for op, sp in zip(overlap_model.parameters(), sync_model.parameters()):
-            torch.testing.assert_close(
-                op.data,
-                sp.data,
-                rtol=0,
-                atol=0,
-                msg="Overlap and sync allgather paths produced different parameter updates",
-            )
+        layer_wise = _layer_wise(optimizer)
+        assert layer_wise.ddp_config is model.ddp_config
+        assert layer_wise.overlap_param_gather == ddp_overlap_param_gather
 
     def test_overlap_param_gather_bucket_lw_params(self):
-        """Verify bucket.layerwise_params_list is populated when overlap_param_gather is enabled."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            use_param_layout='compact'
-        )
-
+        """Every all-reduce LayerWise bucket lists each rank's whole params and their sizes."""
+        model, _, pg_collection = _create(grad_collective='all-reduce', overlap_param_gather=True)
         dp_size = get_pg_size(pg_collection.dp_cp)
+        layer_wise_buckets = [
+            bucket
+            for bucket_group in model.bucket_groups
+            for bucket in bucket_group.buckets
+            if getattr(bucket.params_list[0], 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        assert layer_wise_buckets
+        for bucket in layer_wise_buckets:
+            assert len(bucket.layerwise_params_list) == dp_size
+            assert {p for params in bucket.layerwise_params_list for p in params} == bucket.params
+            assert bucket.layerwise_param_flat_sizes == [
+                sum(p.numel() for p in params) for params in bucket.layerwise_params_list
+            ]
 
-        for bucket_group in model.bucket_groups:
-            for bucket in bucket_group.buckets:
-                if not getattr(bucket.params_list[0], 'is_managed_by_layer_wise_optimizer', False):
-                    continue
-                # layerwise_params_list should be populated by set_bucket_layerwise_params_list
-                assert (
-                    bucket.layerwise_params_list is not None
-                ), "bucket.layerwise_params_list should be populated"
-                assert (
-                    len(bucket.layerwise_params_list) == dp_size
-                ), f"Expected {dp_size} per-rank lists, got {len(bucket.layerwise_params_list)}"
+    @pytest.mark.parametrize(
+        ('model_class', 'grad_reduce_in_fp32'),
+        [(SimpleModel, False), (SimpleModel, True), (TinyModel, False)],
+        ids=['simple', 'fp32-grad-reduce', 'tiny'],
+    )
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_overlap_param_gather_matches_sync(
+        self, grad_collective, model_class, grad_reduce_in_fp32
+    ):
+        """Deferred gathers publish exactly what the synchronous gather does, however they
+        complete, and leave the grad buffer they staged in zeroed.
 
-                # The union of all per-rank param lists should cover all bucket params
-                all_lw_params = set()
-                for rank_params in bucket.layerwise_params_list:
-                    for p in rank_params:
-                        all_lw_params.add(p)
-                assert (
-                    all_lw_params == bucket.params
-                ), "Union of per-rank layerwise_params should equal bucket params"
-
-                # layerwise_param_flat_sizes should be populated and have correct length
-                assert bucket.layerwise_param_flat_sizes is not None
-                assert len(bucket.layerwise_param_flat_sizes) == dp_size
-
-                # Each flat size should equal the sum of param numels for that rank
-                for rank_idx in range(dp_size):
-                    expected_size = sum(p.numel() for p in bucket.layerwise_params_list[rank_idx])
-                    assert bucket.layerwise_param_flat_sizes[rank_idx] == expected_size, (
-                        f"Rank {rank_idx}: expected flat_size {expected_size}, "
-                        f"got {bucket.layerwise_param_flat_sizes[rank_idx]}"
-                    )
-
-    def test_overlap_param_gather_vs_standard_ddp(self):
-        """Verify DDP with overlap_param_gather=True produces same results as standard DDP.
-
-        Both use LayerWiseDistributedOptimizer but with different DDP configs:
-        - Overlap path: overlap_param_gather=True (padded buffers)
-        - Standard path: overlap_param_gather=False (unpadded buffers)
+        TinyModel leaves ranks without params; with grad_reduce_in_fp32 the grad buffer has a
+        different dtype than the params staged in it.
         """
-        # Create overlap-param-gather model (sync allgather for simpler comparison)
-        opg_model, opg_optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(overlap_param_gather=False)
-        )
+        kwargs = dict(grad_collective=grad_collective, grad_reduce_in_fp32=grad_reduce_in_fp32)
+        model, optimizer, _ = _create(model_class, overlap_param_gather=True, **kwargs)
+        reference, reference_optimizer, _ = _create(model_class, copy_from=model, **kwargs)
+        in_features = next(model.module.parameters()).shape[1]
+        x = torch.randn(16, in_features, dtype=torch.bfloat16, device='cuda')
 
-        # Create standard model with same weights
-        std_model, std_optimizer, _ = self.create_model_and_optimizer(copy_from=opg_model)
+        def hooks_disabled_force_sync():
+            # The training loop's first iteration; the gather also runs with autograd enabled.
+            model.disable_forward_pre_hook(param_sync=False)
+            model.start_param_sync(force_sync=True)
+            model.enable_forward_pre_hook()
 
-        # Set identical gradients
-        for op, sp in zip(opg_model.parameters(), std_model.parameters()):
-            assert torch.equal(op.data, sp.data)
-            grad_value = torch.randn_like(op)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            op.main_grad = grad_value.clone().detach()
-            sp.main_grad = grad_value.clone().detach()
+        def finish():
+            model.start_param_sync()
+            for bucket_group in model.bucket_groups:
+                bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
 
-        opg_optimizer.step()
-        std_optimizer.step()
+        def forward_pre_hooks():
+            model.start_param_sync()
+            model(x)
 
-        # Both should produce identical parameter values
-        for op, sp in zip(opg_model.parameters(), std_model.parameters()):
-            torch.testing.assert_close(
-                op.data,
-                sp.data,
-                rtol=1e-5,
-                atol=1e-5,
-                msg="Overlap-param-gather and standard paths produced different updates",
-            )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_insufficient_parameters(self, use_param_layout):
-        """Test overlap-param-gather with TinyModel (only 2 params).
-
-        Many ranks will have no assigned params when world_size > 2.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            model_class=TinyModel, use_param_layout=use_param_layout
-        )
-
-        # Create reference model with standard (non-layer-wise) optimizer
-        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            model_class=TinyModel,
-            use_layer_wise=False,
-            copy_from=model,
-            use_param_layout=use_param_layout,
-        )
-
-        # Set same gradients on both models
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            assert torch.equal(param.data, ref_param.data)
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        optimizer.step()
-        model.start_param_sync(force_sync=True)
-
-        reference_optimizer.step()
-
-        # Verify updated values match reference optimizer
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
-
-    def test_overlap_param_gather_broadcast_vs_allgather(self):
-        """Test overlap-param-gather: allgather vs broadcast produce same results."""
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            model_class=SimpleModel, overlap_param_gather=False, use_param_layout='compact'
-        )
-
-        # Create reference model with overlap-param-gather path too
-        reference_model, reference_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                model_class=SimpleModel,
-                overlap_param_gather=False,
-                copy_from=model,
-                use_param_layout='compact',
-            )
-        )
-
-        # Set same gradients on both models
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            assert torch.equal(param.data, ref_param.data)
-            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        optimizer.step()
-
-        # Verify at least some parameters were updated
-        params_updated = 0
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            if not torch.equal(param.data, ref_param.data):
-                params_updated += 1
-
-        assert params_updated > 0, "At least some parameters should be updated"
-
-        # step() internally calls allgather_params. Replace reference with broadcast.
-        reference_layer_wise = _layer_wise(reference_optimizer)
-        reference_layer_wise.allgather_params = reference_layer_wise.broadcast_params
-        reference_optimizer.step()
-
-        # Verify updated values match reference optimizer
-        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_multi_iteration(self, use_param_layout):
-        """Test overlap-param-gather correctness over multiple training iterations.
-
-        Runs multiple forward/backward/step iterations using the async allgather path.
-        After each iteration, manually syncs params and verifies they match a reference
-        model using the sync path.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
-        )
-
-        # Create reference model with sync allgather for comparison
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        for iteration in range(3):
-            # Set identical gradients on both models
-            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-                grad_value = torch.randn_like(param)
-                torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-                param.main_grad = grad_value.clone().detach()
-                ref_param.main_grad = grad_value.clone().detach()
-
-            # Async path: step (no allgather) + manual sync
-            optimizer.step()
+        def force_sync_in_flight():
+            model.start_param_sync()
             model.start_param_sync(force_sync=True)
 
-            # Verify grad_data is zeroed after synchronous param_sync.
+        def free_overlap_buffers():
+            # Before async checkpoint saves.
+            model.start_param_sync()
+            model.free_overlap_buffers()
+
+        completions = [
+            hooks_disabled_force_sync,
+            finish,
+            forward_pre_hooks,
+            force_sync_in_flight,
+            free_overlap_buffers,
+        ]
+        for step, complete in enumerate(completions):
+            _set_same_main_grads(step, model, reference)
+            optimizer.step()
+            complete()
+            reference_optimizer.step()
             for bucket_group in model.bucket_groups:
+                assert bucket_group.param_gather_handle is None
                 for bucket in bucket_group.buckets:
-                    assert torch.all(
-                        bucket.grad_data == 0
-                    ), f"grad_data not zeroed after param sync at iteration {iteration}"
+                    assert bucket.layerwise_gather_list is None
+                    assert torch.count_nonzero(bucket.grad_data) == 0, complete.__name__
+            _assert_params_equal(model, reference, msg=complete.__name__)
 
-            # Sync path: step (includes allgather)
-            ref_optimizer.step()
-
-            # Verify parameters match after each iteration
-            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-                torch.testing.assert_close(
-                    param.data,
-                    ref_param.data,
-                    rtol=0,
-                    atol=0,
-                    msg=f"Parameters diverged at iteration {iteration}",
-                )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_async_dispatch_and_finish(self, use_param_layout):
-        """Test async dispatch + finish_param_sync cycle (the actual runtime path).
-
-        start_param_sync() (no force_sync) dispatches async all-gathers, then
-        finish_param_sync() waits on the handle and unflattens gathered params.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_overlap_param_gather_finish_chains_next_bucket(self, grad_collective):
+        """finish_param_sync() dispatches next_param_gather_bucket_group."""
+        model, optimizer, _ = _create(
+            grad_collective=grad_collective, overlap_param_gather=True, bucket_size=2000
         )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        # Set identical gradients on both models
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        # Async path: step (no allgather) + async dispatch + explicit finish
-        optimizer.step()
-        model.start_param_sync()  # async dispatch to all bucket groups
-        for bucket_group in model.bucket_groups:
-            bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
-
-        # Verify grad_data is zeroed after asynchronous param_sync.
-        for bucket_group in model.bucket_groups:
-            for bucket in bucket_group.buckets:
-                assert torch.all(
-                    bucket.grad_data == 0
-                ), "grad_data not zeroed after finish_param_sync"
-
-        # Sync path: step (includes allgather)
-        ref_optimizer.step()
-
-        # Verify params match sync path
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Async dispatch + finish path produced different params than sync path",
-            )
-
-        # Verify all ranks have identical parameters
-        dp_size = get_pg_size(pg_collection.dp_cp)
-        if dp_size > 1:
-            for name, param in model.named_parameters():
-                param_list = [torch.zeros_like(param.data) for _ in range(dp_size)]
-                torch.distributed.all_gather(param_list, param.data, group=pg_collection.dp_cp)
-                for i in range(1, dp_size):
-                    torch.testing.assert_close(
-                        param_list[0],
-                        param_list[i],
-                        msg=f"Parameter {name} differs between rank 0 and rank {i}",
-                    )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_finish_chains_next_bucket(self, use_param_layout):
-        """Test that finish_param_sync() dispatches next_param_gather_bucket_group.
-
-        Uses a small bucket_size to force multiple bucket groups, then dispatches
-        only the last bucket group and verifies that finishing it chains to the next.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, bucket_size=2000, use_param_layout=use_param_layout
-        )
-
         bucket_groups = model.bucket_groups
         if len(bucket_groups) <= 1:
             pytest.skip("Need multiple bucket groups to test chaining")
-
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False,
-            copy_from=model,
-            bucket_size=2000,
-            use_param_layout=use_param_layout,
+        reference, reference_optimizer, _ = _create(
+            grad_collective=grad_collective, bucket_size=2000, copy_from=model
         )
-
-        # Set identical gradients on both models
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
+        _set_same_main_grads(0, model, reference)
         optimizer.step()
 
-        # Dispatch ONLY the last bucket group (which has next_param_gather_bucket_group set)
-        last_bg = bucket_groups[-1]
-        last_bg.start_param_sync()
+        # Dispatch only the last bucket group; finishing it must chain-dispatch the next one.
+        last_bucket_group = bucket_groups[-1]
+        last_bucket_group.start_param_sync()
+        next_bucket_group = last_bucket_group.next_param_gather_bucket_group
+        assert next_bucket_group is not None, "Last bucket group should have a next"
+        assert not next_bucket_group.param_gather_dispatched
+        last_bucket_group.finish_param_sync()
+        assert next_bucket_group.param_gather_dispatched
+        for bucket_group in reversed(bucket_groups[:-1]):
+            bucket_group.finish_param_sync()
 
-        # Verify: next bucket group has NOT been dispatched yet
-        next_bg = last_bg.next_param_gather_bucket_group
-        assert next_bg is not None, "Last bucket group should have a next"
-        assert not next_bg.param_gather_dispatched, "Next bucket should not be dispatched yet"
+        reference_optimizer.step()
+        _assert_params_equal(model, reference)
 
-        # Finish the last bucket group — should chain-dispatch the next one
-        last_bg.finish_param_sync()
 
-        # Verify: next bucket group IS now dispatched via chaining
-        assert (
-            next_bg.param_gather_dispatched
-        ), "finish_param_sync should have dispatched next bucket group"
+@multi_rank
+class TestLayerWiseExperts:
+    """LayerWise owns the expert matrices over expert DP; a second sibling DistOpt shards the
+    expert biases over expert DP."""
 
-        # Finish remaining bucket groups through the chain
-        for bg in reversed(bucket_groups[:-1]):
-            bg.finish_param_sync()
+    @pytest.fixture(autouse=True)
+    def model_parallel(self):
+        if int(os.getenv('WORLD_SIZE', '1')) % 2:
+            pytest.skip("Needs an even number of ranks for expert parallelism")
+        Utils.initialize_model_parallel(expert_model_parallel_size=2)
+        yield
+        Utils.destroy_model_parallel()
 
-        # Reference: sync step
-        ref_optimizer.step()
-
-        # Verify params match
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Chained bucket finish produced different params than sync path",
-            )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_forward_pre_hook(self, use_param_layout):
-        """Test forward pre-hooks trigger finish_param_sync during model(input).
-
-        After async dispatch, running model(input) fires forward pre-hooks that
-        call finish_param_sync() on each bucket group, completing the param sync.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_expert_params_shard_over_expert_dp(self, grad_collective):
+        model, optimizer, _ = _create(
+            ExpertModel, grad_collective=grad_collective, grad_reduce_in_fp32=True
         )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
+        expt_dp_size = get_pg_size(parallel_state.get_expert_data_parallel_group())
+        if expt_dp_size > 1:
+            owned = {p for params in _layer_wise(optimizer).expt_dp_params_list for p in params}
+            assert owned == {expert.weight for expert in model.module.experts}
+
+        distopts = [o for o in optimizer.chained_optimizers if isinstance(o, DistributedOptimizer)]
+        assert len(distopts) == 2
+        expert_distopt = next(
+            d
+            for d in distopts
+            if any(not getattr(p, 'allreduce', True) for b in d.buffers for p in b.params)
         )
+        assert get_pg_size(expert_distopt.data_parallel_group) == expt_dp_size
+        assert {p for b in expert_distopt.buffers for p in b.params} == {
+            expert.bias for expert in model.module.experts
+        }
+        _assert_trains_like_reference(model, optimizer, steps=3)
 
-        # Set identical gradients on both models
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
 
-        # Async path: step (no allgather) + async dispatch
-        optimizer.step()
-        model.start_param_sync()  # dispatch async broadcasts
+@multi_rank
+class TestSingleRankDenseGroup:
+    """TP spans all ranks, so dp_cp has one rank while expert DP spans all of them."""
 
-        # Forward pass triggers hooks that call finish_param_sync()
-        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
-        output = model(input_tensor)
-
-        # Sync path: step (includes allgather)
-        ref_optimizer.step()
-
-        # Verify params match
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Forward pre-hook path produced different params than sync path",
-            )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_grad_reduce_in_fp32(self, use_param_layout):
-        """Regression test: grad_reduce_in_fp32 must not cause dtype mismatch in broadcasts.
-
-        When grad_reduce_in_fp32=True, the grad buffer dtype is fp32 but broadcast
-        buffers must use param dtype (bf16). Without the fix (commit cbed167fc), this
-        would cause a dtype mismatch error in the per-rank broadcast calls.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, grad_reduce_in_fp32=True, use_param_layout=use_param_layout
+    @pytest.fixture(autouse=True)
+    def model_parallel(self):
+        world = int(os.getenv('WORLD_SIZE', '1'))
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=world, expert_tensor_parallel_size=1
         )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False,
-            copy_from=model,
-            grad_reduce_in_fp32=True,
-            use_param_layout=use_param_layout,
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('grad_collective', GRAD_COLLECTIVES)
+    def test_experts_are_owned_once(self, grad_collective):
+        expt_dp = parallel_state.get_expert_data_parallel_group()
+        assert get_pg_size(parallel_state.get_data_parallel_group(with_context_parallel=True)) == 1
+        assert get_pg_size(expt_dp) > 1
+        model, optimizer, _ = _create(
+            ExpertModel, grad_collective=grad_collective, grad_reduce_in_fp32=True
         )
-
-        # Set identical gradients on both models
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        # Async path: step + force_sync
-        optimizer.step()
-        model.start_param_sync(force_sync=True)
-
-        # Sync path: step (includes allgather)
-        ref_optimizer.step()
-
-        # Verify params match
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=1e-5,
-                atol=1e-5,
-                msg="grad_reduce_in_fp32 path produced different params than reference",
-            )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_hook_enable_disable_cycle(self, use_param_layout):
-        """Test the training loop's hook lifecycle: disable → manual sync → enable → forward.
-
-        The training loop disables hooks before iteration 1 (for initialization),
-        then enables them for subsequent iterations. This test exercises that cycle.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
-        )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
-
-        # Iteration 1: hooks disabled, manual sync
-        model.disable_forward_pre_hook(param_sync=False)
-
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        optimizer.step()
-        model.start_param_sync(force_sync=True)  # manual sync
-
-        ref_optimizer.step()
-
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Params diverged after iteration 1 (hooks disabled)",
-            )
-
-        # Iteration 2: hooks re-enabled, forward pass triggers sync
-        model.enable_forward_pre_hook()
-
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        optimizer.step()
-        model.start_param_sync()  # async dispatch
-        output = model(input_tensor)  # hooks finish sync
-
-        ref_optimizer.step()
-
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Params diverged after iteration 2 (hooks re-enabled)",
-            )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_multi_iteration_with_hooks(self, use_param_layout):
-        """Test multiple iterations using forward pre-hooks (not manual force_sync).
-
-        Runs 3 iterations where each iteration uses: set grads → step → async dispatch →
-        forward pass (hooks wait+unflatten). Compares against reference model using sync
-        allgather after each iteration.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
-        )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
-
-        for iteration in range(3):
-            # Set identical gradients on both models
-            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-                grad_value = torch.randn_like(param)
-                torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-                param.main_grad = grad_value.clone().detach()
-                ref_param.main_grad = grad_value.clone().detach()
-
-            # Async path: step + dispatch + forward (hooks wait+unflatten)
-            optimizer.step()
-            model.start_param_sync()  # async dispatch
-            output = model(input_tensor)  # hooks trigger finish_param_sync
-
-            # Sync path: step (includes allgather)
-            ref_optimizer.step()
-
-            # Verify parameters match after each iteration
-            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-                torch.testing.assert_close(
-                    param.data,
-                    ref_param.data,
-                    rtol=0,
-                    atol=0,
-                    msg=f"Parameters diverged at iteration {iteration}",
-                )
-
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_overlap_param_gather_start_sync_with_autograd(self, use_param_layout):
-        """Regression test: start_param_sync must work when autograd is active.
-
-        _flatten_dense_tensors on params with requires_grad=True produces a tensor
-        that also requires grad.  Since all_gather writes into gather_list entries
-        in-place and the local rank's slot reuses src, this triggers:
-            RuntimeError: a view of a leaf Variable that requires grad is being
-            used in an in-place operation.
-        The fix is to .detach() the flattened tensor before using it as src.
-
-        This test calls start_param_sync (synchronous via force_sync) WITHOUT
-        torch.no_grad() to reproduce the exact scenario that occurs during the
-        forward pass when finish_param_sync chains to start_param_sync for the
-        next bucket group.
-        """
-        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=True, use_param_layout=use_param_layout
-        )
-        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            overlap_param_gather=False, copy_from=model, use_param_layout=use_param_layout
-        )
-
-        # Confirm params require grad (the precondition for this bug).
-        for param in model.parameters():
-            assert param.requires_grad, "Test requires params with requires_grad=True"
-
-        # Set identical gradients on both models.
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            grad_value = torch.randn_like(param)
-            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
-            param.main_grad = grad_value.clone().detach()
-            ref_param.main_grad = grad_value.clone().detach()
-
-        # Step both optimizers (async path skips allgather, ref path includes it).
-        optimizer.step()
-        ref_optimizer.step()
-
-        # Call start_param_sync with autograd ENABLED (no torch.no_grad()).
-        # Before the .detach() fix, this would raise RuntimeError.
-        model.start_param_sync(force_sync=True)
-
-        # Verify gathered params match the reference.
-        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
-            torch.testing.assert_close(
-                param.data,
-                ref_param.data,
-                rtol=0,
-                atol=0,
-                msg="Params incorrect after start_param_sync with autograd enabled",
-            )
+        layer_wise = _layer_wise(optimizer)
+        assert layer_wise.dp_cp_params_list is None
+        owned_here = layer_wise.expt_dp_params_list[get_pg_rank(expt_dp)]
+        for expert in model.module.experts:
+            owners = [None] * get_pg_size(expt_dp)
+            owned = any(expert.weight is p for p in owned_here)
+            torch.distributed.all_gather_object(owners, owned, group=expt_dp)
+            assert sum(owners) == 1, "Each expert matrix must have exactly one owner"
+        _assert_trains_like_reference(model, optimizer, steps=2)

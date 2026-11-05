@@ -112,8 +112,8 @@ class TestGTPMuonDCP:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_gtp_muon_moe_save_load(self, tmp_path_dist_ckpt, use_param_layout):
+    @pytest.mark.parametrize('grad_collective', ['reduce-scatter', 'all-reduce'])
+    def test_gtp_muon_moe_save_load(self, tmp_path_dist_ckpt, grad_collective):
         """GTP + Muon (LayerWise) optimizer-state checkpoint roundtrip.
 
         GTP-REPLICATED, Muon-managed matrix params (e.g. the MoE router, held identically on every
@@ -168,7 +168,7 @@ class TestGTPMuonDCP:
                     pp=1,
                     bf16=True,
                     dist_opt=True,
-                    use_param_layout=use_param_layout,
+                    grad_collective=grad_collective,
                     initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
                     optimizer='dist_muon',
                 )
@@ -190,7 +190,7 @@ class TestGTPMuonDCP:
                     pp=1,
                     bf16=True,
                     dist_opt=True,
-                    use_param_layout=use_param_layout,
+                    grad_collective=grad_collective,
                     initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
                     optimizer='dist_muon',
                 )
@@ -285,7 +285,6 @@ class TestGTPMuonDCP:
                 pp=1,
                 bf16=True,
                 dist_opt=True,
-                use_param_layout=True,
                 initialize_fn=init_fn,
                 optimizer='dist_muon',
             )
@@ -306,7 +305,6 @@ class TestGTPMuonDCP:
                 pp=1,
                 bf16=True,
                 dist_opt=True,
-                use_param_layout=True,
                 initialize_fn=init_fn,
                 optimizer='dist_muon',
             )

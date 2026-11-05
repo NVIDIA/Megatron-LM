@@ -269,7 +269,7 @@ def setup_model_and_optimizer(
     bf16=True,
     dist_opt=True,
     optimizer='adam',
-    use_param_layout=True,
+    grad_collective='reduce-scatter',
     muon_scalar_optimizer='adam',
     cp=1,
     ep=1,
@@ -290,9 +290,6 @@ def setup_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # use_param_layout='compact' selects the all-reduce grad collective (the compact LayerWise
-    # layout); anything else the reduce-scatter one (the padded layout).
-    grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
     ddp_use_dist_opt = dist_opt
     ddp_use_layer_wise = use_layer_wise
 
@@ -451,7 +448,7 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
     optimizer='adam',
-    use_param_layout=True,
+    grad_collective='reduce-scatter',
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -461,8 +458,6 @@ def setup_moe_model_and_optimizer(
     if optimizer_type in ('muon', 'dist_muon') and dist_opt:
         use_layer_wise = True
 
-    # See setup_model_and_optimizer for the use_param_layout semantics.
-    grad_collective = 'all-reduce' if use_param_layout == 'compact' else 'reduce-scatter'
     ddp_use_dist_opt = dist_opt
     ddp_use_layer_wise = use_layer_wise
 

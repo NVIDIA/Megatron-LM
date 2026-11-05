@@ -136,8 +136,8 @@ class TestLayerWiseOptimizerCommonStateDict:
 
     @pytest.mark.parametrize('tp', [1, 2])
     @pytest.mark.parametrize('pp', [1, 2])
-    @pytest.mark.parametrize('use_param_layout', [True, 'compact'])
-    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp, use_param_layout):
+    @pytest.mark.parametrize('grad_collective', ['reduce-scatter', 'all-reduce'])
+    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp, grad_collective):
         """End-to-end ``save_checkpoint``/``load_checkpoint`` roundtrip on the
         hybrid LayerWise + DistributedOptimizer path.
 
@@ -175,7 +175,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=use_param_layout,
+                    grad_collective=grad_collective,
                 )
 
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
@@ -199,7 +199,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=use_param_layout,
+                    grad_collective=grad_collective,
                 )
 
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)

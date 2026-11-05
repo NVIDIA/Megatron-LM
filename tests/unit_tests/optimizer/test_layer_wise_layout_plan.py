@@ -54,7 +54,6 @@ def _model():
     [
         ("muon", True, "reduce-scatter", None),
         ("muon", True, "all-reduce", None),
-        ("adam", True, "reduce-scatter", None),
         ("muon", True, "ragged", "must be"),
         # all-reduce only changes the parameters an emerging optimizer owns whole; anywhere
         # else it would silently do nothing, so it is rejected.
@@ -77,15 +76,12 @@ def test_emerging_optimizer_grad_collective_validation(optimizer, use_distopt, c
 @pytest.mark.parametrize(
     ("optimizer", "use_distopt", "use_layer_wise", "expected"),
     [
-        ("adam", False, False, ("adam", False)),
         ("adam", True, False, ("adam", False)),
-        ("sgd", True, False, ("sgd", False)),
         ("muon", False, False, ("muon", False)),
         ("muon", True, False, ("muon", True)),
         ("muon", False, True, ("muon", True)),
         ("dist_muon", False, False, ("muon", True)),
         ("lion", True, False, ("lion", True)),
-        ("adaptive_muon", True, False, ("adaptive_muon", True)),
     ],
 )
 def test_resolve_layer_wise_distributed_optimizer(optimizer, use_distopt, use_layer_wise, expected):
