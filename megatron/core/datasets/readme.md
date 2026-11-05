@@ -16,7 +16,9 @@ with no sequences is rejected on all ranks.
 Dynamic CP does not currently support `--deterministic-mode`, CUDA graphs, or
 router z-loss. Configuration validation rejects these combinations before training.
 Static sequence packing without dynamic CP retains its existing deterministic-mode
-support. Dynamic CP for Hybrid models follows in PR #7048.
+support. GPT and Hybrid models support dynamic CP. The batch fetch records each
+microbatch's selected CP group, size, and (under TP sequence parallelism) TP×CP
+group on `PackedSeqParams`; backend attention calls filter out these MCore-only fields.
 
 Batch helpers use `dynamic_cp` and `dynamic_cp_group_func`. The old `is_hybrid_cp`
 and `hybrid_cp_group_func` keyword arguments remain accepted with a deprecation

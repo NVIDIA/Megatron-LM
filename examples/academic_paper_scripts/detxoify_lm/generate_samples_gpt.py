@@ -26,7 +26,7 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -42,6 +42,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         GPTModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
@@ -70,7 +71,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
