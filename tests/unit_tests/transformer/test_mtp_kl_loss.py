@@ -177,7 +177,12 @@ def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token,
         torch.testing.assert_close(weight.grad, rw.grad, rtol=1e-4, atol=4e-6)
         assert torch.count_nonzero(hidden.grad[:seq]) == 0
     else:
-        assert hidden.grad is None and weight.grad is None
+        if training:
+            assert hidden.grad is not None
+            assert torch.count_nonzero(hidden.grad) == 0
+        else:
+            assert hidden.grad is None
+        assert weight.grad is None
     assert torch.count_nonzero(main.grad) == 0
     assert ("loss_values" in MTPLossLoggingHelper.tracker) == (training and enabled)
     assert ("kd_loss_values" in MTPLossLoggingHelper.tracker) == kd_enabled
@@ -236,7 +241,6 @@ def test_kd_logging_without_ce_and_after_cleanup():
         {"mtp_ce_loss_weight": float("nan")},
         {"mtp_kd_logit_temperature": 0},
         {"mtp_kd_logit_temperature": float("inf")},
-        {"mtp_kl_loss_weight": 1, "mtp_num_layers": 0},
     ],
 )
 def test_invalid_configuration(changes):
@@ -466,3 +470,81 @@ def test_combined_logging_without_acceptance_counters():
     metrics = {}
     MTPLossLoggingHelper.track_mtp_metrics(0.5, 1, None, total_loss_dict=metrics)
     assert metrics["mtp_1 loss"].item() == 1.5
+
+
+@pytest.mark.parametrize("separate_main", [False, True])
+def test_disabled_losses_keep_mtp_gradient_hooks(separate_main):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        mtp_num_layers=2,
+        mtp_ce_loss_weight=0.0,
+        mtp_kl_loss_weight=0.0,
+    )
+    heads = torch.nn.ModuleList(
+        [torch.nn.Linear(8, 8, bias=False, device="cuda") for _ in range(3)]
+    )
+    hook_calls = []
+    handles = [
+        parameter.register_hook(lambda grad, i=i: hook_calls.append(i))
+        for i, parameter in enumerate(heads.parameters())
+    ]
+    try:
+        for _ in range(2):
+            heads.zero_grad(set_to_none=True)
+            hook_calls.clear()
+            inputs = torch.randn(4, 1, 8, device="cuda")
+            states = [head(inputs) for head in heads]
+            main = states[0]
+
+            def unexpected_projection(*args, **kwargs):
+                pytest.fail("Disabled MTP losses must not project logits")
+
+            result = process_mtp_loss(
+                torch.cat(states),
+                torch.zeros(1, 4, device="cuda", dtype=torch.long),
+                None,
+                unexpected_projection,
+                None,
+                True,
+                unexpected_projection,
+                config,
+                main_hidden_states=main if separate_main else None,
+            )
+            torch.testing.assert_close(result, main, rtol=0, atol=0)
+            result.sum().backward()
+            assert sorted(hook_calls) == [0, 1, 2]
+            assert heads[0].weight.grad.count_nonzero() > 0
+            for head in heads[1:]:
+                assert head.weight.grad is not None
+                assert head.weight.grad.count_nonzero() == 0
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@pytest.mark.parametrize("ce_weight,kd_weight", [(1.0, 0.0), (0.0, 1.0), (0.3, 0.7)])
+def test_per_token_combined_and_component_logging(ce_weight, kd_weight):
+    scalar = lambda value: torch.tensor(value, device="cuda")
+    for iteration in (1, 2):
+        for ce, kd, count in ((2.0, 4.0, 2.0), (6.0, 2.0, 4.0), (0.0, 0.0, 0.0)):
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                scalar((ce_weight * ce + kd_weight * kd) * count),
+                scalar(0.0),
+                scalar(count),
+                0,
+                1,
+                ce_loss=scalar(ce * count) if ce_weight else None,
+                num_tokens=scalar(count),
+            )
+        metrics = {}
+        MTPLossLoggingHelper.track_mtp_metrics(0.125, iteration, None, total_loss_dict=metrics)
+        assert metrics["mtp_1 loss"].item() == pytest.approx(
+            (ce_weight * 28.0 + kd_weight * 16.0) / 6.0
+        )
+        if ce_weight:
+            assert metrics["mtp_1 ce_loss"].item() == pytest.approx(28.0 / 6.0)
+        for key in ("loss_sums", "loss_token_counts", "ce_loss_sums"):
+            if key in MTPLossLoggingHelper.tracker:
+                assert MTPLossLoggingHelper.tracker[key].count_nonzero() == 0

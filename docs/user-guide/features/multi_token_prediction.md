@@ -55,7 +55,11 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 ## Unsupported Combinations
 
-Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported
+with MTP. Static and dynamic context parallelism are supported with packed data;
+dynamic CP requires per-token loss. See [dynamic context parallelism](context_parallel.md#dynamic-context-parallelism)
+for runtime group requirements and the per-token gradient and logging behavior.
+
 
 ## Knowledge distillation from the main model
 
@@ -100,8 +104,9 @@ retains teacher logits in addition to the current student's logits.
 `mtp_N loss` reports the weighted CE + KL objective before overall MTP scaling,
 including in KD-only training. `mtp_N ce_loss` reports unweighted CE when enabled;
 `mtp_N kd_logit_loss` reports unweighted temperature-scaled KL when enabled.
-The combined loss and CE metric retain upstream microbatch/rank mean averaging;
-KL retains its token-count-weighted aggregation. With uneven token counts these
+The combined loss and CE metric retain upstream microbatch/rank mean averaging
+by default; with per-token loss enabled they use globally reduced token sums and
+counts. KL retains its token-count-weighted aggregation. With uneven token counts these
 aggregations differ, so the logged combined loss need not equal a weighted sum
 of the two logged component metrics.
 Acceptance metrics remain available for KD-only training. KL logging divides
@@ -114,4 +119,3 @@ by default. Set `MTP_KD_DISABLE_COMPILE=1` before
 starting Python to use eager PyTorch instead. Compilation adds first-use latency;
 steady-state performance depends on the shapes and runtime. Distributed
 collectives remain outside the compiled helpers.
-
