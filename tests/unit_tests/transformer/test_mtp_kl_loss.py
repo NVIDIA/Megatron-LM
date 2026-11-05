@@ -37,17 +37,22 @@ def reset_mtp_state():
 @pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("cached", [False, True])
-def test_kl_loss_and_student_gradient(temperature, dtype, cached):
+@pytest.mark.parametrize("loss_scale", [None, 0.0, 1.0, 3.5])
+def test_kl_loss_and_student_gradient(temperature, dtype, cached, loss_scale):
     torch.manual_seed(125)
     student = torch.randn(7, 2, 32, device="cuda", dtype=dtype, requires_grad=True)
     teacher = torch.randn_like(student, requires_grad=True)
     weights = torch.rand(7, 2, device="cuda")
     with torch.no_grad():
         normalizer = vocab_parallel_log_normalizer(teacher, temperature) if cached else None
-    actual = vocab_parallel_kl_div(student, teacher, temperature, teacher_log_normalizer=normalizer)
+    actual = vocab_parallel_kl_div(
+        student, teacher, temperature, teacher_log_normalizer=normalizer, loss_scale=loss_scale
+    )
     (actual * weights).sum().backward()
     ref = student.detach().clone().requires_grad_()
     expected = reference_kl(ref, teacher.detach(), temperature)
+    if loss_scale is not None:
+        expected = expected * (loss_scale / temperature**2)
     (expected * weights).sum().backward()
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(student.grad, ref.grad, rtol=0.02, atol=2e-6)
@@ -55,7 +60,8 @@ def test_kl_loss_and_student_gradient(temperature, dtype, cached):
 
 
 @pytest.mark.parametrize("tp", [2, 4])
-def test_vocab_shards_match_full_vocabulary(tp):
+@pytest.mark.parametrize("loss_scale", [None, 1.5])
+def test_vocab_shards_match_full_vocabulary(tp, loss_scale):
     if torch.distributed.get_world_size() < tp:
         pytest.skip(f"Requires {tp} ranks")
     Utils.destroy_model_parallel()
@@ -65,8 +71,12 @@ def test_vocab_shards_match_full_vocabulary(tp):
     full = torch.randn(5, 2, 32, device="cuda", requires_grad=True)
     teacher = torch.randn_like(full)
     local = full.detach().chunk(tp, dim=-1)[group.rank()].contiguous().requires_grad_()
-    actual = vocab_parallel_kl_div(local, teacher.chunk(tp, dim=-1)[group.rank()], 2.0, group)
+    actual = vocab_parallel_kl_div(
+        local, teacher.chunk(tp, dim=-1)[group.rank()], 2.0, group, loss_scale=loss_scale
+    )
     expected = reference_kl(full, teacher, 2.0)
+    if loss_scale is not None:
+        expected = expected * (loss_scale / 4.0)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
     actual.sum().backward()
     expected.sum().backward()
@@ -79,7 +89,10 @@ def test_vocab_shards_match_full_vocabulary(tp):
 @pytest.mark.parametrize("early_backward", [False, True])
 @pytest.mark.parametrize("per_token", [False, True])
 @pytest.mark.parametrize("training", [False, True])
-def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token, training):
+@pytest.mark.parametrize("loss_scale", [None, 1.5])
+def test_weighted_mtp_gradients(
+    ce_weight, kl_weight, early_backward, per_token, training, loss_scale
+):
     torch.manual_seed(178)
     config = TransformerConfig(
         num_layers=2,
@@ -89,6 +102,7 @@ def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token,
         mtp_ce_loss_weight=ce_weight,
         mtp_kl_loss_weight=kl_weight,
         mtp_kd_logit_temperature=2.0,
+        mtp_kd_loss_scale=loss_scale,
         mtp_loss_early_backward=early_backward,
         calculate_per_token_loss=per_token,
     )
@@ -159,7 +173,10 @@ def test_weighted_mtp_gradients(ce_weight, kl_weight, early_backward, per_token,
                 .t()
             )
         if kd_enabled:
-            loss = loss + kl_weight * reference_kl(student, teacher[depth:], 2.0).t()
+            kd = reference_kl(student, teacher[depth:], 2.0).t()
+            if loss_scale is not None:
+                kd = kd * (loss_scale / 4.0)
+            loss = loss + kl_weight * kd
         if training and enabled:
             torch.testing.assert_close(
                 MTPLossLoggingHelper.tracker["loss_values"][depth - 1],
@@ -241,6 +258,9 @@ def test_kd_logging_without_ce_and_after_cleanup():
         {"mtp_ce_loss_weight": float("nan")},
         {"mtp_kd_logit_temperature": 0},
         {"mtp_kd_logit_temperature": float("inf")},
+        {"mtp_kd_loss_scale": -1.0},
+        {"mtp_kd_loss_scale": float("nan")},
+        {"mtp_kd_loss_scale": float("inf")},
     ],
 )
 def test_invalid_configuration(changes):
@@ -255,6 +275,7 @@ def test_cli_defaults_and_weights(monkeypatch):
 
     monkeypatch.setattr("sys.argv", ["test"])
     args = parse_args()
+    assert args.mtp_kd_loss_scale is None
     assert (args.mtp_ce_loss_weight, args.mtp_kl_loss_weight, args.mtp_kd_logit_temperature) == (
         1,
         0,
@@ -270,9 +291,12 @@ def test_cli_defaults_and_weights(monkeypatch):
             "0.7",
             "--mtp-kd-logit-temperature",
             "2",
+            "--mtp-kd-loss-scale",
+            "3.5",
         ],
     )
     args = parse_args()
+    assert args.mtp_kd_loss_scale == 3.5
     assert (args.mtp_ce_loss_weight, args.mtp_kl_loss_weight, args.mtp_kd_logit_temperature) == (
         0.3,
         0.7,
@@ -548,3 +572,10 @@ def test_per_token_combined_and_component_logging(ce_weight, kd_weight):
         for key in ("loss_sums", "loss_token_counts", "ce_loss_sums"):
             if key in MTPLossLoggingHelper.tracker:
                 assert MTPLossLoggingHelper.tracker[key].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("loss_scale", [-1.0, float("nan"), float("inf")])
+def test_invalid_kd_loss_scale(loss_scale):
+    logits = torch.zeros(2, 1, 4, device="cuda")
+    with pytest.raises(ValueError, match="MTP KD loss scale must be finite and nonnegative"):
+        vocab_parallel_kl_div(logits, logits, loss_scale=loss_scale)

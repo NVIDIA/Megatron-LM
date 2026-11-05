@@ -13,7 +13,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("cached_normalizer", [False, True])
-def test_mtp_kl_loss_replay(dtype, cached_normalizer):
+@pytest.mark.parametrize("loss_scale", [None, 1.5])
+def test_mtp_kl_loss_replay(dtype, cached_normalizer, loss_scale):
     seeded()
     student = torch.randn(128, 2, 8192, device="cuda", dtype=dtype, requires_grad=True)
     teacher = torch.randn_like(student)
@@ -21,7 +22,9 @@ def test_mtp_kl_loss_replay(dtype, cached_normalizer):
     normalizer = vocab_parallel_log_normalizer(teacher, 2.0, None) if cached_normalizer else None
 
     def loss(student, teacher):
-        return vocab_parallel_kl_div(student, teacher, 2.0, teacher_log_normalizer=normalizer)
+        return vocab_parallel_kl_div(
+            student, teacher, 2.0, teacher_log_normalizer=normalizer, loss_scale=loss_scale
+        )
 
     _, grads = assert_replays_bit_exact(
         loss, (student, teacher), grad_outputs={"out": weight}, contention=True, what="MTP KD"

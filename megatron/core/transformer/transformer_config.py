@@ -93,7 +93,10 @@ class TransformerConfig(ModelParallelConfig):
     """Nonnegative weight of training-only KL(main-model teacher || MTP student)."""
 
     mtp_kd_logit_temperature: float = 1.0
-    """Positive temperature for MTP distillation; KL is multiplied by temperature squared."""
+    """Positive temperature for the teacher and student MTP distillation distributions."""
+
+    mtp_kd_loss_scale: Optional[float] = None
+    """KL multiplier before mtp_kl_loss_weight. None uses mtp_kd_logit_temperature squared."""
 
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
@@ -1850,6 +1853,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(f"{name} must be finite and nonnegative")
         if not math.isfinite(self.mtp_kd_logit_temperature) or self.mtp_kd_logit_temperature <= 0:
             raise ValueError("MTP KD temperature must be finite and positive")
+        if self.mtp_kd_loss_scale is not None and (
+            not math.isfinite(self.mtp_kd_loss_scale) or self.mtp_kd_loss_scale < 0
+        ):
+            raise ValueError("MTP KD loss scale must be finite and nonnegative")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0

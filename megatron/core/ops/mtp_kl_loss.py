@@ -63,14 +63,16 @@ def vocab_parallel_log_normalizer(
 
 class _VocabParallelKL(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, student, teacher, teacher_norm, temperature, tp_group):
+    def forward(ctx, student, teacher, teacher_norm, temperature, tp_group, loss_scale):
         student_norm = vocab_parallel_log_normalizer(student, temperature, tp_group)
         loss = _local_kl(student, teacher, student_norm, teacher_norm, 1.0 / temperature)
         if tp_group is not None and tp_group.size() > 1:
             torch.distributed.all_reduce(loss, group=tp_group)
         ctx.save_for_backward(student, teacher, student_norm, teacher_norm)
         ctx.temperature = temperature
-        return loss * temperature**2
+        # Preserve the original arithmetic when the caller uses the T² default.
+        ctx.grad_scale = temperature if loss_scale is None else loss_scale / temperature
+        return loss * (temperature**2 if loss_scale is None else loss_scale)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -81,9 +83,9 @@ class _VocabParallelKL(torch.autograd.Function):
             student_norm,
             teacher_norm,
             1.0 / ctx.temperature,
-            (grad_output * ctx.temperature).unsqueeze(-1),
+            (grad_output * ctx.grad_scale).unsqueeze(-1),
         )
-        return grad, None, None, None, None
+        return grad, None, None, None, None, None
 
 
 def vocab_parallel_kl_div(
@@ -92,8 +94,12 @@ def vocab_parallel_kl_div(
     temperature: float = 1.0,
     tp_group: torch.distributed.ProcessGroup | None = None,
     teacher_log_normalizer: Tensor | None = None,
+    loss_scale: float | None = None,
 ) -> Tensor:
-    """Return per-token T² KL(teacher || student), with no teacher gradients.
+    """Return per-token scaled KL(teacher || student), with no teacher gradients.
+
+    ``loss_scale`` replaces the default temperature-squared multiplier. It must
+    be finite and nonnegative; ``None`` preserves the default T² scaling.
 
     Logits have shape [sequence, batch, vocabulary shard]; both inputs must use
     the same shard. The FP32 result has shape [sequence, batch]. Backward
@@ -101,6 +107,8 @@ def vocab_parallel_kl_div(
     """
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("MTP KD temperature must be finite and positive")
+    if loss_scale is not None and (not math.isfinite(loss_scale) or loss_scale < 0):
+        raise ValueError("MTP KD loss scale must be finite and nonnegative")
     if student_logits.shape != teacher_logits.shape:
         raise ValueError("Student and teacher logits must have matching shapes")
     teacher_logits = teacher_logits.detach()
@@ -110,5 +118,10 @@ def vocab_parallel_kl_div(
                 teacher_logits, temperature, tp_group
             )
     return _VocabParallelKL.apply(
-        student_logits, teacher_logits, teacher_log_normalizer.detach(), temperature, tp_group
+        student_logits,
+        teacher_logits,
+        teacher_log_normalizer.detach(),
+        temperature,
+        tp_group,
+        loss_scale,
     )

@@ -1351,6 +1351,7 @@ def process_mtp_loss(
                     config.mtp_kd_logit_temperature,
                     tp_group,
                     teacher_normalizer,
+                    loss_scale=config.mtp_kd_loss_scale,
                 ).transpose(0, 1)
                 * layer_loss_mask
             )

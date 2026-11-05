@@ -69,10 +69,15 @@ projection; the student is the corresponding MTP head. The per-token objective i
 
 ```text
 mtp_ce_loss_weight * CE(labels, student)
-  + mtp_kl_loss_weight * T^2 * KL(softmax(teacher / T) || softmax(student / T))
+  + mtp_kl_loss_weight * S * KL(softmax(teacher / T) || softmax(student / T))
 ```
 
-Here `T` is `mtp_kd_logit_temperature`. The existing
+Here `T` is `mtp_kd_logit_temperature`, and `S` is `mtp_kd_loss_scale`.
+Leaving `--mtp-kd-loss-scale` unset uses `S = T^2`, preserving the default
+loss and gradients. Set it to a finite nonnegative value to replace that
+multiplier; for example, `--mtp-kd-loss-scale 1` uses unscaled KL. This scale
+applies only to KD, before `mtp_kl_loss_weight`; CE is unaffected.
+The existing
 `mtp_loss_scaling_factor / mtp_num_layers`, loss masks, and token normalization
 apply to the combined objective. Weights must be finite and nonnegative; they
 need not sum to one. Temperature must be finite and positive.
@@ -103,7 +108,8 @@ retains teacher logits in addition to the current student's logits.
 
 `mtp_N loss` reports the weighted CE + KL objective before overall MTP scaling,
 including in KD-only training. `mtp_N ce_loss` reports unweighted CE when enabled;
-`mtp_N kd_logit_loss` reports unweighted temperature-scaled KL when enabled.
+`mtp_N kd_logit_loss` reports KL with `S` applied, before `mtp_kl_loss_weight`,
+when enabled.
 The combined loss and CE metric retain upstream microbatch/rank mean averaging
 by default; with per-token loss enabled they use globally reduced token sums and
 counts. KL retains its token-count-weighted aggregation. With uneven token counts these
