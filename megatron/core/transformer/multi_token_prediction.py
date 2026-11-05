@@ -2682,8 +2682,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                     hybrid_submodules=self.hybrid_submodules,
                     mtp_layer_config_list=self.mtp_layer_config_list,
                     hash_moe_layer_threshold=self.hash_moe_layer_threshold,
+                    # layer_number is 1-based; self.layers is indexed from 0, and the name
+                    # has to match the path named_modules() reports for the same layer.
                     name=(
-                        self.name + f".layers.{layer_number - 1}" if self.name is not None else None
+                        (self.name + f".layers.{layer_number - 1}")
+                        if self.name is not None
+                        else None
                     ),
                 )
             return module

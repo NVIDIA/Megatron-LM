@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import re
 from typing import Optional, Union
 
@@ -20,8 +21,15 @@ def get_quant_config_or_none(
     return recipe.match(MatchContext(module_path=module_path, layer_number=layer_number))
 
 
+@functools.lru_cache(maxsize=None)
 def load_quantization_recipe(recipe_path: str) -> RecipeConfig:
-    """Loads a quantization recipe from a path."""
+    """Loads a quantization recipe from a path.
+
+    Cached on the path. A run builds its TransformerConfig more than once, for the
+    language model and for each modality, and every rebuild would otherwise reread and
+    relog the same file. The result is shared, which is safe: matching only reads the
+    recipe, and QuantizationConfig copies the dictionary it hands to a module.
+    """
     recipe = RecipeConfig.from_yaml_file(recipe_path)
     return recipe
 
