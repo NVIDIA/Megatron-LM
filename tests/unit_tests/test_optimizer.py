@@ -1879,6 +1879,27 @@ def test_optimizer_gloo_group_must_mirror_a_replaced_dp_cp_group():
         )
 
 
+def test_optimizer_gloo_group_cannot_mirror_a_missing_dp_cp_group():
+    """A None data-parallel group is rejected instead of being compared as WORLD."""
+    Utils.initialize_model_parallel()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_chunks = [
+        SimpleNamespace(
+            ddp_config=SimpleNamespace(
+                use_distributed_optimizer=True, num_distributed_optimizer_instances=1
+            )
+        )
+    ]
+    # Here the Gloo mirror spans every rank, and torch resolves a None group to WORLD, so the
+    # rank comparison alone would accept it.
+    pg_collection.dp_cp = None
+
+    with pytest.raises(ValueError, match="pg_collection.intra_dp_cp_gloo mirrors, but it is None"):
+        ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection, model_chunks, use_gloo_process_groups=True
+        )
+
+
 class DenseAndExpertLinear(nn.Module):
     """One dense and one expert-parallel weight, as the optimizer factory sees an MoE layer."""
 
