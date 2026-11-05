@@ -71,9 +71,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
+          MAX_CONCURRENCY_DEV: ${{ vars.MAX_CONCURRENCY_DEV }}
+          MAX_CONCURRENCY_OTHERS: ${{ vars.MAX_CONCURRENCY_OTHERS }}
           MAX_CONCURRENCY_EXTERNAL: ${{ vars.MAX_CONCURRENCY_EXTERNAL || 1 }}
           ALLOW_PR_RUN_ALL_TESTS: ${{ vars.ALLOW_PR_RUN_ALL_TESTS }}
           CONTRIBUTOR_TYPE: ${{ matrix.contributor_type }}
+          TARGET_BRANCH: ${{ matrix.branch }}
           SSO_USERS_FILE: users_sso.json
           PYTHONUNBUFFERED: 1
         shell: python
@@ -100,7 +103,14 @@ jobs:
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
           else:
-              MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
+              # Overrides are direct caps; zero pauses approvals, unset keeps the shared limit.
+              override = {
+                  "dev": os.environ.get("MAX_CONCURRENCY_DEV", "").strip(),
+                  "others": os.environ.get("MAX_CONCURRENCY_OTHERS", "").strip(),
+              }.get(os.environ["TARGET_BRANCH"], "")
+              MAX_CONCURRENCY = int(override) if override else int(os.environ["MAX_CONCURRENCY"]) // 2
+              if override and MAX_CONCURRENCY < 0:
+                  raise ValueError("Branch concurrency overrides must be non-negative")
           API_BASE = f"https://api.github.com/repos/NVIDIA/Megatron-LM"
 
           # Load SSO users for internal/external classification
