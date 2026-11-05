@@ -55,13 +55,14 @@ class _FsdpGroupAssignment:
 # require more overrides or workarounds in FsdpMuon.
 # See https://media.pragprog.com/titles/tpp20/inheritance-tax.pdf.
 class FsdpMuon(Muon):
-    """Muon for 2-D parameters with sharded optimizer buffers on a one-dimensional DP mesh.
+    """Muon for 2-D parameters with sharded optimizer buffers.
 
     Momentum remains sharded. Owner assignments balance orthogonalization across a
     fixed set of buffers and are computed during initialization. Each step
     gathers, orthogonalizes, scatters, and applies one buffer's updates at a time on
     the caller's CUDA stream. Full matrices exist only on their assigned owners.
-    The FSDP groups may use different meshes; owners are planned separately for each mesh.
+    The FSDP groups may use different meshes; owners are planned jointly across all ranks, so
+    every rank must construct FsdpMuon.
     Parameters and optimizer groups must have the same order on every DP rank, and
     ranks must agree on which parameters have gradients. Parameter membership and
     optimizer-group order must remain fixed after construction.
@@ -120,8 +121,6 @@ class FsdpMuon(Muon):
         """Validate optimizer parameters and the FSDP buffers that contain them."""
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
-            if fsdp_group.mesh.ndim != 1:
-                raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
                 if not isinstance(buffer, DBuffer):
                     raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")

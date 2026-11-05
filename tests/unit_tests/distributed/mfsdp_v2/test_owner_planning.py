@@ -46,6 +46,10 @@ def _layout(
         ([(8, 8), (2, 2)], [8, 0], 80, [1, 3], {0: 3, 1: 1}),
         # The eligibility rule excludes vectors.
         ([(4,)], [0], 8, [1, 3], {}),
+        # A 3D tensor's cost uses its full shape, so it is assigned before the matrix.
+        ([(1, 1), (3, 3), (2, 3, 4)], [0, 10, 20], 48, [0, 1, 2], {0: 0, 1: 0, 2: 1}),
+        # Equal-cost boundary tensors follow tensor index.
+        ([(1, 1), (2, 2), (2, 2)], [0, 14, 30], 48, [0, 1, 2], {0: 0, 1: 1, 2: 2}),
     ],
 )
 def test_assign_owner_work(shapes, offsets, size, ranks, expected, distributed_setup):
@@ -54,6 +58,7 @@ def test_assign_owner_work(shapes, offsets, size, ranks, expected, distributed_s
         pytest.skip(f"Mesh {ranks} requires at least {max(ranks) + 1} ranks.")
     mesh = DeviceMesh(distributed_setup.device.type, ranks)
     if mesh.get_coordinate() is None:
+        assert assign_owner_work([]) == []  # Planning is collective over all ranks.
         pytest.skip("Rank is outside the test mesh.")
     layout = _layout(shapes, offsets, size, mesh.size())
     buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
@@ -61,25 +66,18 @@ def test_assign_owner_work(shapes, offsets, size, ranks, expected, distributed_s
 
 
 def test_assign_owner_work_requires_a_nonempty_shard(distributed_setup):
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer(
-        mesh,
-        [RowAtomic()],
-        _layout([(0, 2)], [0], 4 * mesh.size(), mesh.size()),
-        torch.float32,
-        distributed_setup.device,
-    )
+    """Every rank raises, including ranks that do not hold the buffer."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    mesh = DeviceMesh(distributed_setup.device.type, [0, 1])
+    buffers = []
+    if mesh.get_coordinate() is not None:
+        layout = _layout([(0, 2)], [0], 4 * mesh.size(), mesh.size())
+        buffers.append(
+            DBuffer(mesh, [RowAtomic()], layout, torch.float32, distributed_setup.device)
+        )
     with pytest.raises(RuntimeError, match="No eligible owner for tensor 0"):
-        assign_owner_work([buffer])
-
-
-def test_assign_owner_work_cost_uses_full_shape(distributed_setup):
-    """The full 3D tensor costs more than the matrix, so it is assigned first."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer.empty(
-        mesh, [Replicate()], [(3, 3), (2, 3, 4)], torch.float32, distributed_setup.device
-    )
-    assert assign_owner_work([buffer]) == [{0: 1, 1: 0}]
+        assign_owner_work(buffers)
 
 
 def test_assign_owner_work_uses_buffer_placements(distributed_setup):
@@ -89,8 +87,9 @@ def test_assign_owner_work_uses_buffer_placements(distributed_setup):
     buffer = DBuffer(
         mesh, [Replicate(), RowAtomic()], layout, torch.float32, distributed_setup.device
     )
-    # Every rank holds the tensor; a hard-coded all-RowAtomic layout picks the last rank.
-    assert assign_owner_work([buffer]) == [{0: 0}]
+    # Every rank holds the tensor and plans for its own replica; a hard-coded
+    # all-RowAtomic layout picks the last rank.
+    assert assign_owner_work([buffer]) == [{0: mesh.get_rank()}]
 
 
 @pytest.mark.parametrize("ranks", [[0, 1], [1, 3]])
@@ -113,6 +112,8 @@ def test_assign_owner_work_across_groups(
         pytest.skip(f"Mesh {ranks} requires at least {max(ranks) + 1} ranks.")
     mesh = DeviceMesh(distributed_setup.device.type, ranks)
     if mesh.get_coordinate() is None:
+        # Join both collective planning calls below.
+        assert assign_owner_work([]) == assign_owner_work([]) == []
         pytest.skip("Rank is outside the test mesh.")
     buffers = [
         DBuffer(
@@ -142,31 +143,20 @@ def test_assign_owner_work_empty_groups(distributed_setup):
     )
     assert assign_owner_work([]) == []
     assert assign_owner_work([empty_buffer]) == [{}]
-    assert assign_owner_work([empty_buffer, buffer, vector_buffer]) == [{}, {1: 0}, {}]
+    # Each replicated rank owns the tensors it plans for.
+    owners = assign_owner_work([empty_buffer, buffer, vector_buffer])
+    assert owners == [{}, {1: mesh.get_rank()}, {}]
 
 
-def test_assign_owner_work_tie_breaks_by_tensor_index(distributed_setup):
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer.empty(
-        mesh, [Replicate()], [(8, 8), (8, 8)], torch.float32, distributed_setup.device
-    )
-    assert assign_owner_work([buffer]) == [{0: 0, 1: 1}]
-
-
-@pytest.mark.parametrize("other_ranks", [[0], [0, 2]])
-def test_assign_owner_work_plans_each_mesh_independently(other_ranks, distributed_setup):
-    """Buffers on other meshes, of any size or rank set, do not change a mesh's owners."""
-    if distributed_setup.world_size <= max(1, *other_ranks):
-        pytest.skip(f"Test meshes require at least {max(1, *other_ranks) + 1} ranks.")
-    meshes = [DeviceMesh(distributed_setup.device.type, ranks) for ranks in [[0, 1], other_ranks]]
-    if any(mesh.get_coordinate() is None for mesh in meshes):
-        pytest.skip("Rank is outside one of the test meshes.")
-    first, second = meshes
+def test_assign_owner_work_balances_across_meshes(distributed_setup):
+    """Work on another mesh counts toward a shared rank's load."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Needs at least two ranks.")
+    device = distributed_setup.device
     buffers = [
-        DBuffer.empty(mesh, [RowAtomic()], [(8, 8)], torch.float32, distributed_setup.device)
-        for mesh in (first, second, first)
+        DBuffer.empty(mesh, [RowAtomic()], [(8, 8)], torch.float32, device)
+        for mesh in (DeviceMesh(device.type, [0, 1]), DeviceMesh(device.type, [0]))
+        if mesh.get_coordinate() is not None
     ]
-    first_alone = assign_owner_work([buffers[0], buffers[2]])
-    second_alone = assign_owner_work([buffers[1]])
-    # Results keep the input order even though the meshes interleave.
-    assert assign_owner_work(buffers) == [first_alone[0], second_alone[0], first_alone[1]]
+    # Rank 0's matrix on the single-rank mesh moves the pair's shared matrix to rank 1.
+    assert assign_owner_work(buffers) == [{0: 1}, {0: 0}][: len(buffers)]
