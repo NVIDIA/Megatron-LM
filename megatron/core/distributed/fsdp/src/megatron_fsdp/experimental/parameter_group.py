@@ -14,7 +14,6 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
-import math
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -660,27 +659,13 @@ class FsdpParameterGroup:
 
         has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
-        # A lossless cast and power-of-two scale avoid intermediate rounding, except
-        # at underflow/overflow boundaries. Fuse them with the accumulation in one pass.
-        fused = (
-            has_sharded_grads
-            and math.frexp(self.grad_scale)[0] == 0.5
-            and all(
-                torch.promote_types(p.unsharded.grad.dtype, self.main_grad.dtype)
-                == self.main_grad.dtype
-                for p in self.fsdp_parameters
-            )
-        )
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
             destination = self.main_grad.get_tensor_view(index)
-            if fused:
+            if has_sharded_grads:
+                # Scale and accumulate in one pass, rounding once in the accumulation dtype,
+                # independently of grad_comm_dtype.
                 destination.add_(grad, alpha=self.grad_scale)
-            elif has_sharded_grads:
-                if self.grad_scale != 1:
-                    # Scale in the accumulation dtype, independently of grad_comm_dtype.
-                    grad = grad.to(destination.dtype) * self.grad_scale
-                destination.add_(grad)
             else:
                 destination.copy_(grad)
                 if self.grad_scale != 1:

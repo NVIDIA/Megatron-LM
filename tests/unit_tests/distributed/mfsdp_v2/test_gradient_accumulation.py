@@ -314,9 +314,13 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
 
 
 @pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("scale", [1.0, 0.5, 1 / 64, 4.0, 1 / 3])
+@pytest.mark.parametrize("scale", [1.0, 0.5, 1 / 64, 4.0])
 def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_comm_dtype, scale):
-    """Local accumulation matches separate FP32 scaling and addition, regardless of comm dtype."""
+    """Local accumulation matches separate FP32 scaling and addition, regardless of comm dtype.
+
+    Power-of-two scales are exact, so averaging identical contributions on every rank is too.
+    test_local_accumulation_matches_reference covers other scales with a tolerance.
+    """
     setup = distributed_setup
     if setup.world_size < 2 or setup.world_size & (setup.world_size - 1):
         pytest.skip(
