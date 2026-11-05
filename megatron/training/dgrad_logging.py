@@ -3,9 +3,12 @@
 """dgrad logging using backward hooks."""
 
 from collections import defaultdict
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
 from megatron.core.utils import unwrap_model
@@ -73,11 +76,24 @@ class DataGradLogger:
                     self._dgrads_state_dict[model_chunk_name][key] = grad.detach().cpu()
         return hook
 
-    def save(self, iteration: int):
-        """Save captured gradients to disk and clear the buffer."""
+    def save(self, iteration: int, *, pg_collection: Optional[ProcessGroupCollection] = None):
+        """Save captured gradients to disk and clear the buffer.
+
+        Args:
+            iteration: Iteration the gradients were captured in.
+            pg_collection: Process groups of the model the hooks are registered on. Their ranks
+                name the files and select the ranks that write them (see ``save_grads``).
+                Omitting it reads the global parallel grid, which is deprecated and warns.
+        """
         if not self._dgrads_state_dict:
             return
-        save_grads(self._save_dir, self._dgrads_state_dict, iteration, "dgrads")
+        save_grads(
+            self._save_dir,
+            self._dgrads_state_dict,
+            iteration,
+            "dgrads",
+            pg_collection=pg_collection,
+        )
         self._dgrads_state_dict.clear()
 
     def register_hooks(self, model: torch.nn.Module):
@@ -118,8 +134,8 @@ def disable_dgrad_logging():
     _LOGGER.remove_hooks()
 
 
-def save_dgrads(iteration: int):
-    """Save dgrads to disk."""
+def save_dgrads(iteration: int, *, pg_collection: Optional[ProcessGroupCollection] = None):
+    """Save dgrads to disk, named by the ranks of ``pg_collection`` (see DataGradLogger.save)."""
     global _LOGGER
     assert _LOGGER is not None
-    _LOGGER.save(iteration)
+    _LOGGER.save(iteration, pg_collection=pg_collection)

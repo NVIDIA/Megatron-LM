@@ -162,8 +162,6 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         """
         Using self.all_models, extract model parameters and send them over the queue.
         """
-        from megatron.core import mpu
-
         vp_size = self.margs.virtual_pipeline_model_parallel_size or 1
         encoder_tp_size = self.md.previous_encoder_tensor_parallel_size
 
@@ -201,7 +199,6 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         #TODO: Do I need this vp loop for vision model?
         #TODO: CHECK THAT PARAMS ARE THE SAME WITH OTHER ENCODERS, THSI SHOULD WORK FOR INTERNVIT BUT I SUSPECT WILL FAIL FOR SIGLIP
         for vp_rank in range(vp_size):
-            mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
             # ViT will only ever be on first pp rank
             models = self.all_models[0][vp_rank]
             for layer_num in range(schema.get_num_layers(models[0])):

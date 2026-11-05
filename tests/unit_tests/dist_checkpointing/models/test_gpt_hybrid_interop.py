@@ -46,6 +46,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -349,8 +350,11 @@ def initialize_gpt_model(seed, num_gpt_layers, parallel, moe, glu=False):
     model_parallel_cuda_manual_seed(seed)
 
     config = TransformerConfig(num_layers=num_gpt_layers, **_base_config_kwargs(parallel, moe, glu))
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     if moe:
-        layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        layer_spec = get_gpt_decoder_block_spec(
+            config, use_transformer_engine=True, pp_rank=pg_collection.pp.rank()
+        )
     else:
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
     model = GPTModel(
@@ -362,6 +366,7 @@ def initialize_gpt_model(seed, num_gpt_layers, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=pg_collection,
     )
     with torch.no_grad():
         for param in model.parameters():
@@ -385,6 +390,7 @@ def initialize_hybrid_model(seed, pattern, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 
@@ -545,8 +551,11 @@ def gpt_provider_for_opt(
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     config = _opt_provider_config(num_gpt_layers, moe=moe, **kw)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     layer_spec = (
-        get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        get_gpt_decoder_block_spec(
+            config, use_transformer_engine=True, pp_rank=pg_collection.pp.rank()
+        )
         if moe
         else get_gpt_layer_with_transformer_engine_spec()
     )
@@ -559,6 +568,7 @@ def gpt_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=pg_collection,
     )
 
 
@@ -578,6 +588,7 @@ def hybrid_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 
