@@ -177,7 +177,7 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
                 resolved = future.cancelled()
                 retired = not engine._deferred_kv_handoffs and not engine._pending_kv_imports
                 assert not witness.steps
-                assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
+                assert torch.equal(allocator.pc_state.block_ref_counts[held], torch.ones_like(held))
                 assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
                 assert retired, "Aborted handoff remained eligible for a later real transfer"
                 assert not (
@@ -255,7 +255,7 @@ def test_abort_inflight_handoff_retains_storage_until_real_nccl_settles(transpor
             assert list(engine._pending_kv_imports) == [pending]
             assert not engine._quarantined_kv_imports
             assert torch.equal(
-                engine.context.kv_block_allocator.block_ref_counts[owned_blocks],
+                engine.context.kv_block_allocator.pc_state.block_ref_counts[owned_blocks],
                 torch.ones_like(owned_blocks, dtype=torch.int32),
             )
             assert reply is None
@@ -265,7 +265,7 @@ def test_abort_inflight_handoff_retains_storage_until_real_nccl_settles(transpor
             engine.push_handoff_kv(101, [peer_meta])
             handles = engine._pending_kv_pushes[0][1]
             blocks = engine._pinned_handoff_blocks[101]
-            assert (engine.context.kv_block_allocator.block_ref_counts[blocks] > 0).all()
+            assert (engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks] > 0).all()
         else:
             assert receive_post.result(timeout=30) is pending.handle.real_handle
             receive_poster.shutdown()
@@ -291,7 +291,9 @@ def test_abort_inflight_handoff_retains_storage_until_real_nccl_settles(transpor
                 True,
             ]
             assert send_abort(engine, sender, 101) is None
-            assert (engine.context.kv_block_allocator.block_ref_counts[owned_blocks] == 0).all()
+            assert (
+                engine.context.kv_block_allocator.pc_state.block_ref_counts[owned_blocks] == 0
+            ).all()
             assert engine._poll_pending_kv_imports() == 0
             assert not witness.steps and not engine._handoff_completion_notifications
         assert_released(engine)
@@ -309,13 +311,13 @@ def test_prefill_handoff_pin_survives_persist_suspend_until_release(transport_wo
             state["kv"] = state["kv"].view(torch.uint8)
             blocks = metadata["block_ids"]
             allocator = engine.context.kv_block_allocator
-            refs = allocator.block_ref_counts[blocks].clone()
+            refs = allocator.pc_state.block_ref_counts[blocks].clone()
             assert engine.context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
 
             engine.suspend()
             assert engine.state == EngineState.SUSPENDED
             assert engine._pinned_handoff_blocks[101] == blocks
-            assert torch.equal(allocator.block_ref_counts[blocks], refs)
+            assert torch.equal(allocator.pc_state.block_ref_counts[blocks], refs)
             assert torch.equal(
                 engine.context.memory_buffer[:, :, blocks].cpu().view(torch.uint8), state["kv"]
             )
@@ -323,12 +325,12 @@ def test_prefill_handoff_pin_survives_persist_suspend_until_release(transport_wo
             engine.resume()
             assert engine.state == EngineState.RUNNING
             assert engine._pinned_handoff_blocks[101] == blocks
-            assert torch.equal(allocator.block_ref_counts[blocks], refs)
+            assert torch.equal(allocator.pc_state.block_ref_counts[blocks], refs)
             assert torch.equal(
                 engine.context.memory_buffer[:, :, blocks].cpu().view(torch.uint8), state["kv"]
             )
             engine.release_handoff_blocks(101)
             engine.release_handoff_blocks(101)
-            assert (allocator.block_ref_counts[blocks] == 0).all()
+            assert (allocator.pc_state.block_ref_counts[blocks] == 0).all()
         dist.barrier(group=transport_world)
         assert_released(engine)
