@@ -14,6 +14,8 @@ import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.core.packed_seq_params import resolve_cp_group
+from megatron.core.tensor_parallel.mappings import _native_cp_transport
 
 from . import thd_layout_kernels
 from .fused_sparse_attention import (
@@ -23,6 +25,24 @@ from .fused_sparse_attention import (
     indexer_topk,
     pack_thd_compact_k,
 )
+
+
+def initialize_native_dsv4_cp_transport(config, parent):
+    """Reserve fixed halo/counter staging, including PP stages with only MoE layers."""
+    from transformer_engine.pytorch.attention.native_cp_transport import (
+        initialize_native_cp_transport,
+    )
+
+    if parent is None:
+        raise ValueError("Native DSv4 DCP requires pg_collection.dp_cp.")
+    halo = max(128, config.csa_window_size, *(config.csa_compress_ratios or []))
+    halo_bytes = (
+        halo * config.hidden_size * torch.empty((), dtype=config.params_dtype).element_size()
+    )
+    aux_bytes = (config.num_moe_experts or 1) * ((config.thd_max_packed_sequences or 64) + 1) * 8
+    size = max(256, halo_bytes, aux_bytes)
+    return initialize_native_cp_transport(parent, 2 * ((size + 255) // 256 * 256))
+
 
 CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -149,6 +169,16 @@ class _LeftBoundaryExchange(torch.autograd.Function):
             )
         boundary = tensor.new_zeros((d_window,) + tuple(tensor.shape[1:]))
 
+        transport = _native_cp_transport(cp_group)
+        if transport is not None:
+            transport.exchange(
+                tensor[-d_window:],
+                cp_group.ranks[cp_rank + 1] if cp_rank + 1 < cp_size else None,
+                boundary,
+                cp_group.ranks[cp_rank - 1] if cp_rank > 0 else None,
+            )
+            return boundary
+
         ops = []
         if cp_rank > 0:
             ops.append(
@@ -175,6 +205,16 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         cp_rank = cp_group.rank()
         d_window = ctx.d_window
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
+
+        transport = _native_cp_transport(cp_group)
+        if transport is not None:
+            transport.exchange(
+                grad_boundary,
+                cp_group.ranks[cp_rank - 1] if cp_rank > 0 else None,
+                grad_input[-d_window:],
+                cp_group.ranks[cp_rank + 1] if cp_rank + 1 < cp_size else None,
+            )
+            return grad_input, None, None
 
         ops = []
         if cp_rank > 0:
@@ -544,13 +584,7 @@ def compute_cp_indexer_topk(
 
 
 def validate_packed_inputs(packed_seq_params, config, cp_group):
-    """Validate the static packed contract without modifying any process group.
-
-    CP1 metadata may use None or the explicit singleton group required by the
-    main runtime-CP contract. Dynamic CP transitions remain unsupported; reject them
-    instead of accidentally
-    using a stale build-time group during forward or recompute.
-    """
+    """Validate packed metadata against this microbatch's CP group, without mutation."""
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
     if config.deterministic_mode:
@@ -560,8 +594,9 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
         )
     if packed_seq_params.qkv_format != "thd":
         raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
+    cp_group = resolve_cp_group(cp_group, packed_seq_params)
     if cp_group is None:
-        raise ValueError("DSv4 requires an explicit build-time CP process group, including CP1.")
+        raise ValueError("DSv4 requires an explicit CP group, including CP1.")
     runtime_size = packed_seq_params.local_cp_size
     runtime_group = packed_seq_params.cp_group
     if runtime_size is not None:
@@ -569,10 +604,6 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
             raise ValueError("Runtime CP1 metadata requires None or a singleton cp_group.")
         if runtime_size > 1 and (runtime_group is None or runtime_group.size() != runtime_size):
             raise ValueError("Runtime CP metadata must provide the matching process group.")
-        if runtime_size != cp_group.size() or (runtime_size > 1 and runtime_group is not cp_group):
-            raise ValueError(
-                "DSv4 currently supports static CP; runtime group transitions are unsupported."
-            )
     if cp_group.size() > 1 and config.attention_cp_layout != "contiguous":
         raise ValueError("DSv4 packed CP requires attention_cp_layout='contiguous'.")
     if packed_seq_params.max_seqlen_q is None or packed_seq_params.max_seqlen_kv is None:

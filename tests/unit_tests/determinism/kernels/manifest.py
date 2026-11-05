@@ -105,11 +105,16 @@ C = "tests/unit_tests/determinism/correctness/"
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="mtp_packed_cp1_roll",
-        sources=("megatron/core/transformer/multi_token_prediction.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
+        sources=(
+            "megatron/core/transformer/multi_token_prediction.py",
+            "megatron/core/context_parallel/sequence_roll.py",
+        ),
+        tests=(K + "test_dev_sync_kernels.py", K + "test_native_cp_replay.py"),
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
-        "and physical padding not represented by logical documents.",
+        "and physical padding not represented by logical documents; native CP3/CP5 boundary "
+        "exchange and differentiable contiguous rolls use one parent arena. Precomputed MTP "
+        "mask dispatch replays both full and already sequence-sharded metadata.",
     ),
     KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
@@ -305,6 +310,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_dynamic_cp.py",
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
@@ -418,6 +424,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
+            K + "test_native_cp_replay.py",
         ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
@@ -436,6 +443,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            K + "test_native_cp_replay.py",
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
@@ -1003,6 +1011,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
@@ -1010,7 +1019,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_csa_packed_kernels.py",
+            K + "test_native_cp_replay.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_dynamic_cp.py",
         ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "

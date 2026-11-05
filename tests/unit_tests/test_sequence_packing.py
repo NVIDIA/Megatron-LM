@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
 from types import SimpleNamespace
@@ -12,12 +12,17 @@ from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
+    _build_thd_sequence_indices,
     _get_scheduler_max_real_num_seqs,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    _pack_sequences,
+    align_sample_id_groups,
+    build_packed_microbatches,
+    dcp_gpus_needed,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -63,6 +68,10 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     assert torch.equal(
         padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
     )
+    assert torch.equal(
+        _build_thd_sequence_indices(cu_seqlens_padded),
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
+    )
 
 
 def test_scheduler_sanitizes_thd_padding_values():
@@ -80,6 +89,92 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_pack_sequences_aligns_each_sequence_to_local_cp_size():
+    samples = [{'tokens': torch.arange(1, 6)}, {'tokens': torch.arange(6, 10)}]
+
+    packed = _pack_sequences(
+        samples,
+        padded_lengths=torch.tensor([5, 4]),
+        original_lengths=torch.tensor([5, 4]),
+        local_cp_size=torch.tensor(3),
+        local_cp_group_start=torch.tensor(2),
+        dev=torch.device('cpu'),
+    )
+
+    assert torch.equal(packed['tokens'], torch.tensor([1, 2, 3, 4, 5, 0, 6, 7, 8, 9, 0, 0]))
+    assert torch.equal(packed['cu_seqlens'], torch.tensor([0, 5, 9], dtype=torch.int32))
+    assert torch.equal(packed['cu_seqlens_padded'], torch.tensor([0, 6, 12], dtype=torch.int32))
+    assert packed['local_cp_group_start'].item() == 2
+
+
+@pytest.mark.parametrize('sequence_parallel_size', [1, 2, 4, 8])
+def test_arbitrary_cp_packing_preserves_sequence_parallel_alignment(sequence_parallel_size):
+    samples = {
+        sid: {
+            'tokens': torch.arange(length),
+            'padded_seq_len': torch.tensor(length),
+            'original_seq_len': torch.tensor(length),
+        }
+        for sid, length in enumerate([1408, 128])
+    }
+    microbatches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1408), (1, 128)],
+        total_gpus=4,
+        max_seq_len_per_rank=512,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=sequence_parallel_size,
+    )
+    assert not leftovers
+    assert sample_ids == [[0]] * 3 + [[1]]
+    for rank in range(4):
+        packed = build_packed_microbatches(
+            samples,
+            [sample_ids],
+            rank,
+            torch.device('cpu'),
+            is_dynamic_cp=True,
+            sequence_parallel_size=sequence_parallel_size,
+        )[0]
+        cp_size = packed['local_cp_size'].item()
+        local_rows = packed['tokens'].numel() // cp_size
+        assert local_rows % sequence_parallel_size == 0
+        assert local_rows <= 512
+        assert exec_times[rank] == local_rows**2 * cp_size
+        assert packed['cu_seqlens'][-1].item() == sum(microbatches[rank])
+
+
+def test_arbitrary_cp_scheduler_accounts_for_sp_padding_at_capacity_boundary():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1536)],
+        total_gpus=3,
+        max_seq_len_per_rank=515,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=8,
+    )
+    # CP3 fits (512 local rows); 1540 would require 520 aligned rows on CP3.
+    assert not leftovers
+    assert sample_ids == [[0]] * 3
+    with pytest.raises(AssertionError, match='requires CP size 4'):
+        next_hdp_group_packing_aware(
+            [(0, 1540)],
+            total_gpus=3,
+            max_seq_len_per_rank=515,
+            allow_arbitrary_group_starts=True,
+            sequence_parallel_size=8,
+        )
+
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 2040), (1, 128)],
+        total_gpus=6,
+        max_seq_len_per_rank=510,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=8,
+    )
+    # Raw CP4 would exceed capacity after SP padding (512 > 510), so use CP5.
+    assert not leftovers
+    assert sample_ids == [[0]] * 5 + [[1]]
 
 
 def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
@@ -699,6 +794,103 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert micro_batches == [[6144, 2048], [6144, 2048]]
     assert sample_ids == [[0, 1], [0, 1]]
     assert exec_times[0] == exec_times[1]
+
+
+def test_next_hdp_group_packing_aware_keeps_legacy_tie_break():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 128), (1, 5504), (2, 3840)], total_gpus=8, max_seq_len_per_rank=2048, min_cp_size=2
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[1]] * 4 + [[2, 0]] * 4
+
+
+def test_next_hdp_group_packing_aware_uses_topology_compatible_nonpower_cp_size():
+    assert dcp_gpus_needed(257, 128) == 4
+    assert dcp_gpus_needed(257, 128, round_to_power_of_two=False) == 3
+
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1280), (1, 512), (2, 256)],
+        total_gpus=16,
+        max_seq_len_per_rank=128,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0]] * 10 + [[1]] * 4 + [[2]] * 2
+
+
+def test_next_hdp_group_packing_aware_uses_exact_cp3():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 384), (1, 128)],
+        total_gpus=4,
+        max_seq_len_per_rank=128,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0], [0], [0], [1]]
+
+
+def test_next_hdp_group_packing_aware_allows_cp5_plus_tail_cp3():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 2304), (1, 1408)],
+        total_gpus=8,
+        max_seq_len_per_rank=512,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0]] * 5 + [[1]] * 3
+
+
+def test_native_dcp_vpp_alignment_handles_cp5_plus_cp3():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=512,
+        cp_size=8,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=2,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=4,
+    )
+
+    groups = scheduler.get_groups_and_subsamples([(0, 2304), (1, 1408)])
+
+    assert groups == [[[1]] * 8, [[0]] * 8]
+
+
+def test_vpp_alignment_rejects_layout_that_cannot_expand():
+    with pytest.raises(RuntimeError, match='Cannot fill VPP ranks'):
+        align_sample_id_groups([[[0]] * 5 + [[1]] * 3], 2)
+
+
+@pytest.mark.parametrize('group_sizes', [[5, 3], [1, 7], [3, 5], [3, 3, 1, 1], [5, 4, 3, 2, 1, 1]])
+def test_native_dcp_vpp_alignment_preserves_each_sample_once(group_sizes):
+    parent_size = sum(group_sizes)
+    initial_group = [[sid] for sid, size in enumerate(group_sizes) for _ in range(size)]
+    groups = align_sample_id_groups(
+        [initial_group], len(group_sizes), allow_arbitrary_group_starts=True
+    )
+
+    assert len(groups) == len(group_sizes)
+    sample_ids = []
+    for group in groups:
+        assert len(group) == parent_size
+        assert all(rank_samples == group[0] for rank_samples in group)
+        sample_ids.extend(group[0])
+    assert sorted(sample_ids) == list(range(len(group_sizes)))
+
+
+def test_next_hdp_group_packing_aware_supports_every_cp_size_through_16():
+    for cp_size in range(1, 17):
+        _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+            [(0, cp_size * 128)],
+            total_gpus=cp_size,
+            max_seq_len_per_rank=128,
+            allow_arbitrary_group_starts=True,
+        )
+        assert leftovers == []
+        assert sample_ids == [[0]] * cp_size
 
 
 def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():

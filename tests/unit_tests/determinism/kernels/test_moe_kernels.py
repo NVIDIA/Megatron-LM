@@ -722,24 +722,10 @@ def test_group_limited_topk_replays():
     )
 
 
-@pytest.mark.parametrize(
-    "fused",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=[
-                pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed"),
-                pytest.mark.xfail(
-                    strict=False,
-                    reason="TE fused_moe_aux_loss reduces with atomicAdd (open gap, recorded not gated)",
-                ),
-            ],
-        ),
-    ],
-)
+@pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("all_padding", [False, True])
 def test_switch_load_balancing_loss_replays(fused, all_padding):
+    """Deterministic mode must bypass TE's atomic scalar reduction, even if requested."""
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
     if all_padding:
@@ -754,9 +740,14 @@ def test_switch_load_balancing_loss_replays(fused, all_padding):
             probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
         )
 
-    assert_replays_bit_exact(
-        fn, (probs,), replays=4, what=f"aux loss[fused={fused}, all_padding={all_padding}]"
-    )
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            fn,
+            (probs,),
+            replays=4,
+            contention=True,
+            what=f"aux loss[fused={fused}, all_padding={all_padding}]",
+        )
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
@@ -862,7 +853,12 @@ class TestMoEModules:
         cp1_reference = None
         for cp_size in (1, 2, 4, 1):
             cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp_size)
-            packed = PackedSeqParams(qkv_format="thd", local_cp_size=cp_size, cp_group=cp_group)
+            packed = PackedSeqParams(
+                qkv_format="thd",
+                local_cp_size=cp_size,
+                cp_group=cp_group if cp_size > 1 else None,
+                cp_singleton_group=cp_group if cp_size == 1 else None,
+            )
             valid_tokens = 1537 if cp_size == 1 else cp_group.rank() * 511
             padding_mask = torch.arange(2048, device="cuda").unsqueeze(0) >= valid_tokens
 

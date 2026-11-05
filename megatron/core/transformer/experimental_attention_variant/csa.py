@@ -8,6 +8,7 @@ from typing import Optional, Protocol, Tuple, Union
 import torch
 import torch.nn as nn
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_inplace,
@@ -17,6 +18,7 @@ from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
+    _native_cp_transport,
     async_gather_from_sequence_parallel_region,
     gather_from_sequence_parallel_region,
 )
@@ -2888,104 +2890,109 @@ class CompressedSparseAttention(MegatronModule):
                 "CompressedSparseAttention query head count must match the unsharded "
                 f"attention sink ({self.n_local_heads}), got {query.size(-2)}."
             )
-        nvtx_range_push("compressed_sparse_attn")
-
         _orig_cp_group = self.pg_collection.cp
-        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
+        cp_group = resolve_cp_group(_orig_cp_group, packed_seq_params)
+        if isinstance(cp_group, LogicalCPGroup):
+            if self.config.dsa_cp_balance_indexer:
+                raise ValueError("Native DSv4 DCP does not support balanced indexer communication.")
+            if self.config.cuda_graph_impl != "none":
+                raise ValueError("Native DSv4 DCP currently requires cuda_graph_impl='none'.")
+            _native_cp_transport(cp_group, self.pg_collection.dp_cp)
+        nvtx_range_push("compressed_sparse_attn")
+        self.pg_collection.cp = cp_group
+        try:
+            cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
+            qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+            if cp_size > 1 and qkv_format != 'thd':
+                raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
+            if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
+                raise ValueError(
+                    "CompressedSparseAttention requires cp_partition_mode='contiguous'. "
+                    "CP partition conversion must be handled before entering CSA."
+                )
 
-        cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
-        qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
-        if cp_size > 1 and qkv_format != 'thd':
-            raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
-        if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
-            raise ValueError(
-                "CompressedSparseAttention requires cp_partition_mode='contiguous'. "
-                "CP partition conversion must be handled before entering CSA."
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
+                    output = self._forward_thd_cp(
+                        query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
+                    )
+                else:
+                    output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                return output
+
+            sq, b, np, hn = query.size()
+
+            kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
+            kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
+            offset = sq  # compressed indices start after original positions
+            window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
+
+            has_indexer_compressed = (
+                self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None
             )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
-                output = self._forward_thd_cp(
-                    query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
+            indexer_loss = None
+            out_rope = _OutputInverseRope(
+                self, x.dtype, rope_seqlen=sq, packed_seq=False, sbhd_batch_size=b
+            )
+            # Every fused path rotates in place inside its Function, which owns the
+            # output buffer and un-rotates what it needs in its own backward. Only
+            # the unfused reference path leaves its output owned by autograd, so
+            # that one rotates out of place below.
+            fused_out_rope = out_rope.fused_params if self.use_fused_kernels else None
+
+            if not self.use_fused_kernels:
+                output, indexer_loss = self._forward_unfused_csa(
+                    query,
+                    x,
+                    qr,
+                    kv_full,
+                    compressed_kv,
+                    n_compressed,
+                    offset,
+                    window_idxs,
+                    packed_seq_params,
+                )
+            elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+                output, indexer_loss = self._forward_fused_indexer_training(
+                    query,
+                    x,
+                    qr,
+                    kv_full,
+                    n_compressed,
+                    offset,
+                    window_idxs,
+                    packed_seq_params,
+                    out_rope=fused_out_rope,
+                )
+            elif has_indexer_compressed:
+                output = self._forward_fused_indexer_inference(
+                    query,
+                    x,
+                    qr,
+                    kv_full,
+                    n_compressed,
+                    offset,
+                    window_idxs,
+                    packed_seq_params,
+                    out_rope=fused_out_rope,
                 )
             else:
-                output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                output = self._forward_fused_no_indexer(
+                    query, kv_full, n_compressed, offset, window_idxs, out_rope=fused_out_rope
+                )
+
+            if fused_out_rope is None:
+                flat_shape = output.shape
+                output = out_rope.apply(output.reshape(sq, b, np, -1)).reshape(flat_shape)
+
+            if indexer_loss is not None:
+                output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
+            return output
+        finally:
             self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
-            return output
-
-        sq, b, np, hn = query.size()
-
-        kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
-        kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
-        offset = sq  # compressed indices start after original positions
-        window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
-
-        has_indexer_compressed = (
-            self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None
-        )
-
-        indexer_loss = None
-        out_rope = _OutputInverseRope(
-            self, x.dtype, rope_seqlen=sq, packed_seq=False, sbhd_batch_size=b
-        )
-        # Every fused path rotates in place inside its Function, which owns the
-        # output buffer and un-rotates what it needs in its own backward. Only
-        # the unfused reference path leaves its output owned by autograd, so
-        # that one rotates out of place below.
-        fused_out_rope = out_rope.fused_params if self.use_fused_kernels else None
-
-        if not self.use_fused_kernels:
-            output, indexer_loss = self._forward_unfused_csa(
-                query,
-                x,
-                qr,
-                kv_full,
-                compressed_kv,
-                n_compressed,
-                offset,
-                window_idxs,
-                packed_seq_params,
-            )
-        elif has_indexer_compressed and self.training and torch.is_grad_enabled():
-            output, indexer_loss = self._forward_fused_indexer_training(
-                query,
-                x,
-                qr,
-                kv_full,
-                n_compressed,
-                offset,
-                window_idxs,
-                packed_seq_params,
-                out_rope=fused_out_rope,
-            )
-        elif has_indexer_compressed:
-            output = self._forward_fused_indexer_inference(
-                query,
-                x,
-                qr,
-                kv_full,
-                n_compressed,
-                offset,
-                window_idxs,
-                packed_seq_params,
-                out_rope=fused_out_rope,
-            )
-        else:
-            output = self._forward_fused_no_indexer(
-                query, kv_full, n_compressed, offset, window_idxs, out_rope=fused_out_rope
-            )
-
-        if fused_out_rope is None:
-            flat_shape = output.shape
-            output = out_rope.apply(output.reshape(sq, b, np, -1)).reshape(flat_shape)
-
-        if indexer_loss is not None:
-            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
-
-        self.pg_collection.cp = _orig_cp_group
-        nvtx_range_pop("compressed_sparse_attn")
-        return output
 
     # ------------------------------------------------------------------
     # THD per-path helpers (called from _forward_thd)

@@ -7,6 +7,7 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import (
@@ -19,6 +20,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import _native_cp_transport
 from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
@@ -146,6 +148,8 @@ class DSv4HybridAttention(Attention):
         use_compressed_yarn = compress_ratio > 1
         self._dsv4_compress_ratio = compress_ratio
         self._dsv4_uses_yarn_rope = use_compressed_yarn
+        if self.config.use_native_cp_transport:
+            cp_utils.initialize_native_dsv4_cp_transport(self.config, self.pg_collection.dp_cp)
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -293,103 +297,112 @@ class DSv4HybridAttention(Attention):
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
         if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+        if isinstance(cp_group, LogicalCPGroup):
+            if self.config.dsa_cp_balance_indexer:
+                raise ValueError("Native DSv4 DCP does not support balanced indexer communication.")
+            if self.config.cuda_graph_impl != "none":
+                raise ValueError("Native DSv4 DCP currently requires cuda_graph_impl='none'.")
+            _native_cp_transport(cp_group, self.pg_collection.dp_cp)
         self.pg_collection.cp = cp_group
+        try:
+            boundary_hidden = None
+            if use_thd_cp:
+                boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                    hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    self.pg_collection.cp,
+                )
 
-        boundary_hidden = None
-        if use_thd_cp:
-            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+            # =====================
+            # Query, Key, and Value
+            # =====================
+            # Get the query, key and value tensors based on the type of attention -
+            # self or cross attn.
+            qkv = self.get_query_key_value_tensors(
                 hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
-
-        # =====================
-        # Query, Key, and Value
-        # =====================
-        # Get the query, key and value tensors based on the type of attention -
-        # self or cross attn.
-        qkv = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-            boundary_hidden=boundary_hidden,
-        )
-        if use_thd_cp:
-            query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
-        else:
-            query, key, value, q_compressed, kv_compressed = qkv
-            boundary_kv = None
-
-        # TODO: Currently, TE can only accept contiguous tensors for MLA
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-
-        # ==================================
-        # core attention computation
-        # ==================================
-        # Need corresponding TE change
-        core_attn_manager = off_interface(
-            self.offload_core_attention and self.training, query, "core_attn"
-        )
-        with core_attn_manager as query:
-            core_attn_out = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                packed_seq_params=packed_seq_params,
-                x=hidden_states,
-                qr=q_compressed,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
                 boundary_hidden=boundary_hidden,
-                boundary_kv=boundary_kv,
             )
-        forced_released_tensors = [query, key, value]
-        if boundary_kv is not None:
-            forced_released_tensors.append(boundary_kv)
-        core_attn_out = core_attn_manager.group_offload(
-            core_attn_out, forced_released_tensors=forced_released_tensors
-        )
+            if use_thd_cp:
+                query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
+            else:
+                query, key, value, q_compressed, kv_compressed = qkv
+                boundary_kv = None
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            # TODO: Currently, TE can only accept contiguous tensors for MLA
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
-            self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_up_checkpoint = None
+            # ==================================
+            # core attention computation
+            # ==================================
+            # Need corresponding TE change
+            core_attn_manager = off_interface(
+                self.offload_core_attention and self.training, query, "core_attn"
+            )
+            with core_attn_manager as query:
+                core_attn_out = self.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    packed_seq_params=packed_seq_params,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    boundary_hidden=boundary_hidden,
+                    boundary_kv=boundary_kv,
+                )
+            forced_released_tensors = [query, key, value]
+            if boundary_kv is not None:
+                forced_released_tensors.append(boundary_kv)
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=forced_released_tensors
+            )
 
-        # ``core_attention`` already applied the inverse RoPE to the last
-        # qk_pos_emb_head_dim of each head, fusing it into the sparse-attention
-        # Function where that path allows it.
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                # reshape to same output shape as unpacked case
+                # (t, np, hn) -> (t, b=1, h=np*hn)
+                # t is the pack size = sum (sq_i)
+                # note that batch is a dummy dimension in the packed case
+                core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
-        # Grouped output
-        core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
-        )
-        wo_a_weight = self.linear_o_group_proj.view(
-            self.o_local_groups, self.config.o_lora_rank, -1
-        )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            if self.recompute_up_proj:
+                assert self.qkv_up_checkpoint is not None
+                self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
+                self.qkv_up_checkpoint = None
 
-        # =================
-        # Output. [sq, b, h]
-        # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
-        with attn_proj_manager as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+            # ``core_attention`` already applied the inverse RoPE to the last
+            # qk_pos_emb_head_dim of each head, fusing it into the sparse-attention
+            # Function where that path allows it.
 
-        self.pg_collection.cp = _orig_cp_group
-        return output, bias
+            # Grouped output
+            core_attn_out = core_attn_out.view(
+                core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            )
+            wo_a_weight = self.linear_o_group_proj.view(
+                self.o_local_groups, self.config.o_lora_rank, -1
+            )
+            core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+            # =================
+            # Output. [sq, b, h]
+            # =================
+            attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+            with attn_proj_manager as core_attn_out:
+                output, bias = self.linear_proj(core_attn_out)
+            output = attn_proj_manager.group_offload(
+                output, forced_released_tensors=[core_attn_out]
+            )
+
+            return output, bias
+        finally:
+            self.pg_collection.cp = _orig_cp_group
 
 
 class DSv4HybridSelfAttention(DSv4HybridAttention):

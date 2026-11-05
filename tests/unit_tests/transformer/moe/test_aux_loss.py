@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 
@@ -37,6 +37,40 @@ try:
     )
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.parametrize('fused', [False, True])
+@pytest.mark.parametrize('deterministic', [False, True])
+def test_deterministic_aux_loss_uses_ordered_reduction(monkeypatch, fused, deterministic):
+    """Deterministic execution must not dispatch TE's atomic scalar reduction."""
+    from megatron.core.transformer.moe import moe_utils
+
+    calls = []
+
+    def fused_loss(**kwargs):
+        calls.append(kwargs)
+        return kwargs['probs'].sum() * 0.25
+
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: deterministic)
+    monkeypatch.setattr(moe_utils, 'HAVE_TE', True)
+    monkeypatch.setattr(moe_utils, 'fused_moe_aux_loss', fused_loss)
+    probs = torch.tensor([[0.2, 0.8], [0.7, 0.3]], requires_grad=True)
+    counts = torch.tensor([1.0, 1.0])
+    value = moe_utils.switch_load_balancing_loss_func(
+        probs,
+        counts,
+        total_num_tokens=2,
+        topk=1,
+        num_experts=2,
+        moe_aux_loss_coeff=0.1,
+        fused=fused,
+    )
+    assert len(calls) == int(fused and not deterministic)
+    reference = probs.sum() * 0.25 if calls else (probs.sum(0) * counts).sum() * 0.05
+    torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    value.backward()
+    expected_grad = 0.25 if calls else 0.05
+    torch.testing.assert_close(probs.grad, torch.full_like(probs, expected_grad), rtol=0, atol=0)
 
 
 class AuxlossTestContainer(MoEModelTestContainer):
@@ -460,6 +494,157 @@ class TestRouterAuxLoss:
         grad_mbsN = router.weight.grad.clone()
 
         torch.testing.assert_close(grad_mbs1, grad_mbsN)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_varlen_packed_seq_aux_loss_is_pack_invariant(self):
+        """Flattening variable-length sequences must not change seq-aux gradients."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            calculate_per_token_loss=True,
+            params_dtype=torch.float32,
+            bf16=False,
+        ).cuda()
+        lengths = (7, 11, 5)
+        hidden_states = torch.randn(
+            (sum(lengths), 1, router.config.hidden_size), device="cuda", dtype=torch.float32
+        )
+
+        def params_for(seq_lengths):
+            cu = torch.tensor(
+                [0, *torch.tensor(seq_lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+            )
+            seq_idx = torch.repeat_interleave(
+                torch.arange(len(seq_lengths), device="cuda", dtype=torch.int32),
+                torch.tensor(seq_lengths, device="cuda"),
+            ).unsqueeze(0)
+            return PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_q_padded=cu, seq_idx=seq_idx
+            )
+
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        scores, _ = router(hidden_states, packed_seq_params=params_for(lengths))
+        scores.backward(torch.zeros_like(scores))
+        packed_grad = router.weight.grad.clone()
+        packed_metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ].clone()
+
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        offset = 0
+        for length in lengths:
+            sequence = hidden_states[offset : offset + length].contiguous()
+            scores, _ = router(sequence, packed_seq_params=params_for((length,)))
+            scores.backward(torch.zeros_like(scores))
+            offset += length
+        separate_grad = router.weight.grad.clone()
+        separate_metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ].clone()
+
+        torch.testing.assert_close(packed_grad, separate_grad)
+        torch.testing.assert_close(packed_metric, separate_metric)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("mask_tail", [False, True])
+    @pytest.mark.parametrize("pad_metadata", [False, True])
+    def test_packed_seq_aux_loss_implicit_tail(self, cp_size, mask_tail, pad_metadata):
+        """An implicit tail must match an explicit sequence on every CP shard."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            calculate_per_token_loss=True,
+            params_dtype=torch.float32,
+            bf16=False,
+            context_parallel_size=cp_size,
+        ).cuda()
+        local_rows = 8 // cp_size
+        start = router.cp_group.rank() * local_rows
+        hidden_states = torch.randn(
+            (local_rows, 1, router.config.hidden_size), device="cuda", dtype=torch.float32
+        )
+        padding_mask = (torch.arange(start, start + local_rows, device="cuda") >= 4).view(-1, 1)
+        if not mask_tail:
+            padding_mask.zero_()
+
+        def run(boundaries):
+            cu = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+            params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_q_padded=torch.cat((cu, cu[-1:].repeat(2))) if pad_metadata else None,
+                total_tokens=8,
+            )
+            # At CP2 only rank 1 owns the implicit tail; reduction shapes must still agree.
+            params.seq_idx = params.seq_idx[:, start : start + local_rows].contiguous()
+            clear_aux_losses_tracker()
+            router.weight.grad = None
+            scores, _ = router(hidden_states, padding_mask=padding_mask, packed_seq_params=params)
+            scores.backward(torch.zeros_like(scores))
+            metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+                "values"
+            ].clone()
+            return router.weight.grad.clone(), metric
+
+        explicit_grad, explicit_metric = run([0, 2, 4, 8])
+        implicit_grad, implicit_metric = run([0, 2, 4])
+        torch.testing.assert_close(implicit_grad, explicit_grad)
+        torch.testing.assert_close(implicit_metric, explicit_metric)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_seq_aux_loss_repeated_mtp_scales_metric_and_gradient(self, monkeypatch):
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.moe import moe_logging
+
+        # Earlier cases use one metric slot; this model needs main + MTP slots.
+        monkeypatch.setattr(moe_logging, "_MOE_METRICS_TRACKER", moe_logging.MoEMetricsTracker())
+
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            calculate_per_token_loss=True,
+            params_dtype=torch.float32,
+            bf16=False,
+            mtp_num_layers=2,
+        ).cuda()
+        router.is_mtp_layer = True
+        router.mtp_layer_number = 1
+        hidden_states = torch.randn((4, 1, router.config.hidden_size), device="cuda")
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
+            total_tokens=4,
+        )
+
+        def run(repeated):
+            router.config.mtp_use_repeated_layer = repeated
+            clear_aux_losses_tracker()
+            router.weight.grad = None
+            scores, _ = router(hidden_states, packed_seq_params=params)
+            scores.backward(torch.zeros_like(scores))
+            metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+                "values"
+            ].clone()
+            return router.weight.grad.clone(), metric
+
+        baseline_grad, baseline_metric = run(False)
+        repeated_grad, repeated_metric = run(True)
+        torch.testing.assert_close(repeated_grad * 2, baseline_grad)
+        torch.testing.assert_close(repeated_metric * 2, baseline_metric)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

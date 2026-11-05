@@ -708,10 +708,10 @@ class TestTEWrappers:
             assert torch.equal(module.weight0, expected)
 
     @pytest.mark.parametrize("return_argmax", [False, True])
-    def test_te_fused_cross_entropy_replays(self, return_argmax):
+    @pytest.mark.parametrize("tokens", [257, TOKENS // 2])
+    def test_te_fused_cross_entropy_replays(self, return_argmax, tokens):
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        tokens = TOKENS // 2
         logits = torch.randn(
             tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )

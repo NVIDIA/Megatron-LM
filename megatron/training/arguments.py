@@ -1552,6 +1552,9 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
+    # Runtime selection must be resolved again, including when loading old checkpoint args.
+    args.use_native_cp_transport = False
+
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
             args.pad_packed_seq_alignment
@@ -2992,6 +2995,7 @@ def _add_network_size_args(parser):
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
+        "use_native_cp_transport",
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
         "enable_autocast",

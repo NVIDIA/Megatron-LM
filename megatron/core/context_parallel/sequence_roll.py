@@ -1,8 +1,27 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Contiguous packed sequence rolls with explicit groups and differentiable boundary exchange."""
 
 import torch
 import torch.distributed as dist
+
+from megatron.core.dynamic_cp_group import LogicalCPGroup
+
+
+def _native_boundary_exchange(group, send, recv, reverse=False):
+    """Return whether the boundary was exchanged through the existing native arena."""
+    if not isinstance(group, LogicalCPGroup):
+        return False
+    from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+    transport = get_native_cp_transport(group)
+    if transport is None:
+        raise RuntimeError("Logical CP sequence roll has no native parent transport")
+    rank, size = group.rank(), group.size()
+    previous = group.ranks[rank - 1] if rank else None
+    following = group.ranks[rank + 1] if rank + 1 < size else None
+    send_rank, recv_rank = (following, previous) if reverse else (previous, following)
+    transport.exchange(send, send_rank, recv, recv_rank, channel=3)
+    return True
 
 
 def _continuation_mask(tensor, packed_seq_params, cp_group, dims):
@@ -38,6 +57,10 @@ class _RollLeft(torch.autograd.Function):
             rank, size = group.rank(), group.size()
             send = tensor.select(dims, 0).contiguous()
             recv = torch.empty_like(send)
+            if _native_boundary_exchange(group, send, recv):
+                if rank + 1 < size:
+                    result.select(dims, -1).copy_(recv)
+                return result
             ops = []
             if rank > 0:
                 ops.append(
@@ -63,6 +86,10 @@ class _RollLeft(torch.autograd.Function):
             rank, size = group.rank(), group.size()
             send = grad.select(dims, -1).contiguous()
             recv = torch.empty_like(send)
+            if _native_boundary_exchange(group, send, recv, reverse=True):
+                if rank > 0:
+                    result.select(dims, 0).copy_(recv)
+                return result, None, None
             ops = []
             if rank + 1 < size:
                 ops.append(
@@ -121,6 +148,12 @@ def roll_contiguous_fields(tensors, cp_group, packed_seq_params=None, fill_value
         result = torch.roll(tensor, -1, -1)
         result[..., -1].fill_(fill)
         outputs.append(result)
+        if isinstance(cp_group, LogicalCPGroup) and size > 1:
+            recv = torch.empty_like(tensor[..., 0])
+            _native_boundary_exchange(cp_group, tensor[..., 0].contiguous(), recv)
+            if rank + 1 < size:
+                result[..., -1].copy_(recv)
+            continue
         if rank > 0:
             send = tensor[..., 0].contiguous()
             sends.append(send)  # Retain temporary send storage until all work completes.

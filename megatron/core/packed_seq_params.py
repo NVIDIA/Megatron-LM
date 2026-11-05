@@ -7,6 +7,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
+
 if TYPE_CHECKING:
     from megatron.core.context_parallel_layout import ThdCpRoute
 
@@ -30,13 +32,12 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
-    # When local_cp_size is set, cp_group is the matching runtime group,
-    # including a singleton group when CP is disabled for this microbatch.
+    # CP-off uses cp_group=None for TE and retains its layout group separately.
     local_cp_size: int = None
-    cp_group: dist.ProcessGroup = None
+    cp_group: Union[dist.ProcessGroup, LogicalCPGroup] = None
     # TE represents CP-off as cp_group=None, while layout/RoPE helpers still need
     # the actual singleton group when the build-time CP group is larger.
-    cp_singleton_group: Optional[dist.ProcessGroup] = None
+    cp_singleton_group: Optional[Union[dist.ProcessGroup, LogicalCPGroup]] = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
@@ -61,7 +62,11 @@ class PackedSeqParams:
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
-        if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
+        if (
+            self.seq_idx is None
+            and isinstance(cu_seqlens, Tensor)
+            and self.total_tokens is not None
+        ):
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
@@ -87,13 +92,14 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
-) -> Optional[dist.ProcessGroup]:
+    static_cp_group: Optional[Union[dist.ProcessGroup, LogicalCPGroup]],
+    packed_seq_params: PackedSeqParams = None,
+) -> Optional[Union[dist.ProcessGroup, LogicalCPGroup]]:
     """Resolve the runtime CP group without mutating packed metadata."""
     if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
         runtime_group = packed_seq_params.cp_group
-        # Compatibility for the previous dev CP-off metadata representation.
-        # Main's TE adapter now translates the singleton to None only inside TE.
+        # Layout and auxiliary-loss code need the actual singleton even though
+        # the TE-facing cp_group field represents CP-off as None.
         if runtime_group is None and packed_seq_params.local_cp_size == 1:
             runtime_group = packed_seq_params.cp_singleton_group
         assert (
@@ -460,7 +466,7 @@ def _resolve_thd_cp_geometry(
     Falling back to ``parallel_state`` preserves legacy call sites.
     """
     if cp_group is not None:
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is not None:
         cp_size = int(cp_size)
@@ -471,7 +477,7 @@ def _resolve_thd_cp_geometry(
 
     if packed_seq_params.cp_group is not None:
         cp_group = packed_seq_params.cp_group
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is None and packed_seq_params.local_cp_size is not None:
         cp_size = int(packed_seq_params.local_cp_size)
@@ -742,6 +748,7 @@ def pad_sequence_for_thd(
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
+        seq_idx=_pad_seq_tensor(packed_seq_params.seq_idx, local_target_len),
         cp_singleton_group=packed_seq_params.cp_singleton_group,
         cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,

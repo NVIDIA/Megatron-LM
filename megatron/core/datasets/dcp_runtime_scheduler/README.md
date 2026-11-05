@@ -57,11 +57,13 @@ Available in-tree models:
   are unchanged, not refitted for Qwen or native P2P. `allow_provisional=true`
   is required. The model does not enable Ulysses or all-to-all communication.
 
-The training adapter uses the existing classic CP ProcessGroups and TE path.
-It restricts candidate widths to power-of-two divisors of DPxCP and group starts
-to multiples of their width. Both solvers still optimize over these candidates;
-the baseline-only control is disabled by default. Generic planner geometry can
-also describe arbitrary widths and unaligned starts for other runtime adapters.
+The training adapter uses the existing classic CP ProcessGroups and TE path
+unless automatic native transport selection succeeds. Classic groups restrict
+candidate widths to power-of-two divisors of DPxCP and starts to multiples of
+their width. Native transport relaxes those constraints for the lightweight
+solver; DynamicUSP retains its original aligned power-of-two allocation policy.
+Both solvers optimize over legal candidates; the baseline-only control is
+disabled by default.
 
 The primary example adds runtime flags to a matching **full Qwen3-30B-A3B**
 training configuration: BF16, 48 layers, hidden size 2048, 32 query heads,

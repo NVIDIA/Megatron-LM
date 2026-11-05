@@ -272,19 +272,34 @@ def _pack_sequences(
     padded_lengths: torch.Tensor,
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
+    local_cp_group_start: Optional[torch.Tensor],
     dev: torch.device,
+    sequence_parallel_size: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
+    padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
+    if local_cp_size is not None:
+        alignment = _cp_sequence_alignment(int(local_cp_size.item()), sequence_parallel_size)
+        padded_lengths = ((padded_lengths + alignment - 1) // alignment) * alignment
+    padded_lengths_cpu = padded_lengths.cpu().tolist()
+
     def _pack_tensors(tensors):
-        return torch.cat([t.reshape(-1) for t in tensors], dim=0)
+        chunks = []
+        for tensor, length in zip(tensors, padded_lengths_cpu):
+            tensor = tensor.reshape(-1)
+            pad = length - tensor.numel()
+            assert (
+                pad >= 0
+            ), f"Packed length {length} is shorter than tensor length {tensor.numel()}"
+            chunks.append(torch.nn.functional.pad(tensor, (0, pad)))
+        return torch.cat(chunks, dim=0)
 
     new_sample = {}
     for key in ['tokens', 'labels', 'loss_mask', 'position_ids']:
         if key in samples[0]:
             new_sample[key] = _pack_tensors([sample[key] for sample in samples])
 
-    padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
     cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)
     cu_seqlens_padded[0] = 0
     cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
@@ -303,6 +318,8 @@ def _pack_sequences(
 
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if local_cp_group_start is not None:
+        new_sample["local_cp_group_start"] = local_cp_group_start
 
     return new_sample
 
@@ -506,6 +523,8 @@ def create_data_iterator(
             metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
+                if getattr(config, "use_native_cp_transport", False):
+                    metadata_keys.append("local_cp_group_start")
             new_data_iterator = []
             for i in range(vpp_size):
                 if vpp_needs_data is not None and vpp_needs_data[i]:
@@ -651,6 +670,7 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    sequence_parallel_size: int = 1,
 ) -> List[Dict[str, torch.Tensor]]:
     """Build packed samples for each microbatch.
 
@@ -661,6 +681,7 @@ def build_packed_microbatches(
         dcp_rank: This rank's index within the DP×CP group.
         dev: Target device.
         is_dynamic_cp: Whether dynamic context parallel is enabled.
+        sequence_parallel_size: Tensor parallel size when sequence parallelism is enabled.
     """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
@@ -676,20 +697,26 @@ def build_packed_microbatches(
     ]
 
     local_cp_sizes_gpu = None
+    local_cp_group_starts_gpu = None
     if is_dynamic_cp:
         local_cp_sizes_cpu: List[int] = []
+        local_cp_group_starts_cpu: List[int] = []
         for i in range(num_micro_batches):
             sample_ids_this_group = sample_id_groups[i][dcp_rank]
-            local_cp_sizes_cpu.append(
-                len(
-                    [
-                        1
-                        for sample_ids in sample_id_groups[i]
-                        if sample_ids_this_group[0] in sample_ids
-                    ]
-                )
-            )
+            member_ranks = [
+                rank
+                for rank, sample_ids in enumerate(sample_id_groups[i])
+                if sample_ids_this_group[0] in sample_ids
+            ]
+            assert member_ranks == list(
+                range(member_ranks[0], member_ranks[-1] + 1)
+            ), f"Dynamic CP group must be contiguous, got ranks {member_ranks}"
+            local_cp_sizes_cpu.append(len(member_ranks))
+            local_cp_group_starts_cpu.append(member_ranks[0])
         local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
+        local_cp_group_starts_gpu = torch.tensor(
+            local_cp_group_starts_cpu, dtype=torch.int32, device=dev
+        )
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -706,7 +733,16 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        local_cp_group_start = local_cp_group_starts_gpu[i] if is_dynamic_cp else None
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            local_cp_group_start,
+            dev,
+            sequence_parallel_size=sequence_parallel_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples

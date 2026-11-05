@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron initialization."""
 
@@ -7,7 +7,9 @@ import os
 import random
 import time
 import warnings
+from dataclasses import fields, is_dataclass
 from datetime import timedelta
+from functools import partial
 from typing import Optional
 
 import numpy as np
@@ -58,6 +60,162 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 logger = logging.getLogger(__name__)
 
 
+def _same_native_cp_spec(actual, expected):
+    """Compare a resolved spec, including partial builders, to the known factory."""
+    if actual is expected:
+        return True
+    if type(actual) is not type(expected) or isinstance(expected, type):
+        return False
+    if is_dataclass(expected):
+        return all(
+            _same_native_cp_spec(getattr(actual, f.name), getattr(expected, f.name))
+            for f in fields(expected)
+        )
+    if isinstance(expected, partial):
+        return all(
+            _same_native_cp_spec(getattr(actual, name), getattr(expected, name))
+            for name in ("func", "args", "keywords")
+        )
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_native_cp_spec(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, (tuple, list)):
+        return len(actual) == len(expected) and all(
+            _same_native_cp_spec(a, b) for a, b in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def _native_cp_model_unavailable_reason(model_config, args):
+    """Recognize known full-attention GPT and DSv4 builders before CP groups exist.
+
+    Unknown specs/builders are deliberately left on ProcessGroups: identifying one
+    TE layer does not prove that every PP/VPP/MTP stage supports logical CP.
+    """
+    if model_config is None:
+        return "model metadata is unavailable"
+
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+    from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
+
+    config = getattr(model_config, "transformer", None)
+    dsv4 = (
+        type(config) is MLATransformerConfig
+        and config.experimental_attention_variant == "dsv4_hybrid"
+        and config.multi_latent_attention
+    )
+    if type(model_config) is GPTModelConfig:
+        known_builder = (
+            model_config.builder == "megatron.training.models.gpt.GPTModelBuilder"
+            and model_config.get_builder_cls() is GPTModelBuilder
+            and model_config.transformer_layer_spec is None
+        )
+    else:
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+
+        known_builder = (
+            type(model_config) is HybridModelConfig
+            and dsv4
+            and config.transformer_impl == "transformer_engine"
+            and not config.use_kitchen
+            and model_config.builder == "megatron.training.models.hybrid.HybridModelBuilder"
+            and model_config.get_builder_cls() is HybridModelBuilder
+            and type(model_config.hybrid_stack_spec) is ModuleSpec
+            and _same_native_cp_spec(model_config.hybrid_stack_spec, hybrid_dsv4_stack_spec(config))
+            and bool(model_config.hybrid_layer_pattern)
+            and set(model_config.hybrid_layer_pattern) <= set("WCHDE/|")
+        )
+    if not known_builder:
+        return "the model is not a known full-attention GPT or DSv4 configuration"
+    if (
+        model_config.restore_modelopt_state
+        or model_config.pre_wrap_hooks
+        or model_config.post_wrap_hooks
+    ):
+        return "custom builders/specs/hooks and ModelOpt need explicit CP support"
+    if type(config) is not TransformerConfig and not dsv4:
+        return "only the standard full-attention TransformerConfig is recognized"
+    if not config.dynamic_context_parallel or not args.dynamic_context_parallel:
+        return "dynamic CP is disabled"
+    if args.distributed_backend != "nccl" or getattr(args, "fake_process_group", False):
+        return "native CP requires a real NCCL parent"
+    if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
+        return "GTP weight-rematerialization axes need explicit native CP support"
+    if config.transformer_impl != "transformer_engine":
+        return "attention is not implemented by Transformer Engine"
+    if config.use_kitchen or config.use_kitchen_attention or config.fallback_to_eager_attn:
+        return "custom attention backends are not auto-enabled"
+    if dsv4:
+        if config.params_dtype != torch.bfloat16 or config.dsa_indexer_precision != "bf16":
+            return "native DSv4 DCP currently requires BF16 attention and indexer"
+        if config.dsa_kernel_backend != "cudnn" or config.cp_partition_mode != "contiguous":
+            return "native DSv4 DCP requires cuDNN attention and contiguous CP partitioning"
+        if config.dsa_cp_balance_indexer:
+            return "native DSv4 DCP does not support balanced indexer communication"
+        if config.tensor_model_parallel_size != 1:
+            return "native DSv4 DCP currently requires TP1"
+    elif any(
+        getattr(config, name, None)
+        for name in ("is_hybrid_model", "multi_latent_attention", "experimental_attention_variant")
+    ):
+        return "hybrid, experimental and custom attention are not auto-enabled"
+    if config.attention_backend not in (AttnBackend.auto, AttnBackend.flash, AttnBackend.fused):
+        return "native CP requires fused or flash TE attention"
+    cp_types = config.cp_comm_type
+    if not isinstance(cp_types, list):
+        cp_types = [cp_types]
+    if not cp_types or any(cp_type not in (None, "p2p") for cp_type in cp_types):
+        return "every attention layer must use P2P CP"
+    if (
+        config.params_dtype not in (torch.float16, torch.bfloat16)
+        or config.fp8
+        or config.fp4
+        or config.fp8_dot_product_attention
+        or config.quant_recipe is not None
+    ):
+        return "automatic native CP requires FP16/BF16 attention without FP8"
+    if config.softmax_type != "vanilla" or config.qk_clip or config.log_max_attention_logit:
+        return "native CP requires vanilla softmax without max-logit output"
+    if config.cuda_graph_impl != "none":
+        return "automatic native CP currently supports eager execution only"
+    if config.max_seqlen_per_dp_cp_rank is None:
+        return "native CP requires max_seqlen_per_dp_cp_rank to size its arena"
+    return None
+
+
+def _native_cp_transport_checker(model_config, args):
+    """Build a non-allocating startup probe; parallel_state agrees on its result."""
+    model_reason = _native_cp_model_unavailable_reason(model_config, args)
+
+    def check(parent_group):
+        if model_reason is not None:
+            return model_reason
+        try:
+            from transformer_engine.pytorch.attention.native_cp_transport import (
+                get_native_cp_transport_unavailable_reason,
+            )
+
+            if model_config.transformer.experimental_attention_variant == "dsv4_hybrid":
+                from transformer_engine.pytorch.attention.native_cp_transport import (
+                    NativeCPTransport,
+                )
+
+                if any(
+                    not callable(getattr(NativeCPTransport, name, None))
+                    for name in ("all_gather", "reduce_scatter", "exchange")
+                ):
+                    return "Transformer Engine native CP needs DSv4 AG/RS/halo support; rebuild TE"
+        except ImportError:
+            return "Transformer Engine does not provide the required native CP interfaces"
+        return get_native_cp_transport_unavailable_reason(parent_group)
+
+    return check
+
+
 def initialize_megatron(
     allow_no_cuda=False,
     skip_mpu_initialization=False,
@@ -75,6 +233,7 @@ def initialize_megatron(
     *,
     training: bool = False,
     build_tokenizer: bool = True,
+    model_config=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -163,6 +322,7 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            model_config=model_config,
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -348,7 +508,11 @@ def _initialize_tp_communicators(
 
 
 def _initialize_distributed(
-    get_embedding_ranks, get_position_embedding_ranks, store, skip_model_parallel_init=False
+    get_embedding_ranks,
+    get_position_embedding_ranks,
+    store,
+    skip_model_parallel_init=False,
+    model_config=None,
 ):
     """Initialize torch.distributed and core model parallel."""
     cfg = get_run_config()
@@ -403,7 +567,9 @@ def _initialize_distributed(
                 'TORCH_NCCL_DUMP_ON_TIMEOUT': str(int(cfg.dist.flight_recorder_dump_on_timeout)),
                 'TORCH_INCLUDE_STACK_TRACE': str(int(cfg.dist.flight_recorder_include_stack_trace)),
                 'TORCH_INCLUDE_ONLY_ACTIVE': str(int(cfg.dist.flight_recorder_include_only_active)),
-                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(int(cfg.dist.flight_recorder_extra_dump_on_exec)),
+                'TORCH_NCCL_EXTRA_DUMP_ON_EXEC': str(
+                    int(cfg.dist.flight_recorder_extra_dump_on_exec)
+                ),
             }
             for _var, _default in _fr_env_defaults.items():
                 if _var in os.environ:
@@ -474,6 +640,11 @@ def _initialize_distributed(
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 dynamic_context_parallel=args.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
+                native_cp_transport_checker=(
+                    _native_cp_transport_checker(model_config, args)
+                    if args.dynamic_context_parallel and not args.fake_process_group
+                    else None
+                ),
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -498,6 +669,32 @@ def _initialize_distributed(
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+
+    # The same resolved state must reach model construction, MTP and the scheduler.
+    args.use_native_cp_transport = mpu.is_native_cp_transport_enabled()
+    if args.use_native_cp_transport:
+        reason = _native_cp_model_unavailable_reason(model_config, args)
+        if reason is not None:
+            raise ValueError(
+                f"Existing native CP groups are incompatible with this model: {reason}"
+            )
+    config = getattr(model_config, "transformer", None)
+    if config is not None:
+        config.use_native_cp_transport = args.use_native_cp_transport
+        if args.use_native_cp_transport and config.experimental_attention_variant == "dsv4_hybrid":
+            from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+                initialize_native_dsv4_cp_transport,
+            )
+
+            # Every PP stage participates, including stages with no attention layer.
+            initialize_native_dsv4_cp_transport(
+                config, mpu.get_data_parallel_group(with_context_parallel=True)
+            )
+    if args.dynamic_context_parallel:
+        print_rank_0(
+            "> dynamic CP transport: "
+            + ("native (automatic)" if args.use_native_cp_transport else "legacy ProcessGroups")
+        )
 
 
 def _init_autoresume():
