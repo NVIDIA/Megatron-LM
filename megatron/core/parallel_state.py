@@ -986,6 +986,40 @@ def _grid_extras_from_collection(pg_collection: "ProcessGroupCollection") -> Sta
     )
 
 
+def _assert_process_groups_not_initialized() -> None:
+    """Raise if process groups are registered that destroy_model_parallel() has not cleared."""
+    for group, description in (
+        (_DATA_PARALLEL_GROUP, "data parallel group"),
+        (_GTP_WEIGHT_REMAT_GROUP, "generalized tensor parallel group"),
+        (_CONTEXT_PARALLEL_GROUP, "context parallel group"),
+        (_MODEL_PARALLEL_GROUP, "model parallel group"),
+        (_TENSOR_MODEL_PARALLEL_GROUP, "tensor model parallel group"),
+        (_PIPELINE_MODEL_PARALLEL_GROUP, "pipeline model parallel group"),
+        (_EMBEDDING_GROUP, "embedding group"),
+        (_POSITION_EMBEDDING_GROUP, "position embedding group"),
+        (_TENSOR_AND_DATA_PARALLEL_GROUP, "Tensor + data parallel group"),
+        (_TENSOR_AND_CONTEXT_PARALLEL_GROUP, "Tensor + context parallel group"),
+        (_EXPERT_GTP_WEIGHT_REMAT_GROUP, "Expert generalized tensor parallel group"),
+        (_EXPERT_MODEL_PARALLEL_GROUP, "Expert parallel group"),
+        (_EXPERT_TENSOR_PARALLEL_GROUP, "Expert tensor model parallel group"),
+        (_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP, "Expert tensor + model parallel group"),
+        (
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP,
+            "The expert_tensor_model_pipeline parallel group",
+        ),
+        (_EXPERT_DATA_PARALLEL_GROUP, "Expert data group"),
+        (_EXPERT_DATA_PARALLEL_GROUP_GLOO, "Expert data group-gloo"),
+        (_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Intra partial expert data group"),
+        (_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, "Intra partial expert data group-gloo"),
+        (_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Inter partial expert data group"),
+        (_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP, "Intra distributed optimizer instance group"),
+    ):
+        if group is not None:
+            raise RuntimeError(
+                f"{description} is already initialized. Call destroy_model_parallel() first."
+            )
+
+
 def register_process_groups(
     pg_collection: "ProcessGroupCollection", *, extras: Optional[StandardGridExtras] = None
 ) -> None:
@@ -1056,36 +1090,7 @@ def register_process_groups(
     if extras is not None and not isinstance(extras, StandardGridExtras):
         raise TypeError(f"extras must be a StandardGridExtras, got {type(extras).__name__}")
 
-    for group, description in (
-        (_DATA_PARALLEL_GROUP, "data parallel group"),
-        (_GTP_WEIGHT_REMAT_GROUP, "generalized tensor parallel group"),
-        (_CONTEXT_PARALLEL_GROUP, "context parallel group"),
-        (_MODEL_PARALLEL_GROUP, "model parallel group"),
-        (_TENSOR_MODEL_PARALLEL_GROUP, "tensor model parallel group"),
-        (_PIPELINE_MODEL_PARALLEL_GROUP, "pipeline model parallel group"),
-        (_EMBEDDING_GROUP, "embedding group"),
-        (_POSITION_EMBEDDING_GROUP, "position embedding group"),
-        (_TENSOR_AND_DATA_PARALLEL_GROUP, "Tensor + data parallel group"),
-        (_TENSOR_AND_CONTEXT_PARALLEL_GROUP, "Tensor + context parallel group"),
-        (_EXPERT_GTP_WEIGHT_REMAT_GROUP, "Expert generalized tensor parallel group"),
-        (_EXPERT_MODEL_PARALLEL_GROUP, "Expert parallel group"),
-        (_EXPERT_TENSOR_PARALLEL_GROUP, "Expert tensor model parallel group"),
-        (_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP, "Expert tensor + model parallel group"),
-        (
-            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP,
-            "The expert_tensor_model_pipeline parallel group",
-        ),
-        (_EXPERT_DATA_PARALLEL_GROUP, "Expert data group"),
-        (_EXPERT_DATA_PARALLEL_GROUP_GLOO, "Expert data group-gloo"),
-        (_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Intra partial expert data group"),
-        (_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, "Intra partial expert data group-gloo"),
-        (_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Inter partial expert data group"),
-        (_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP, "Intra distributed optimizer instance group"),
-    ):
-        if group is not None:
-            raise RuntimeError(
-                f"{description} is already initialized. Call destroy_model_parallel() first."
-            )
+    _assert_process_groups_not_initialized()
     if _REGISTERED_PROCESS_GROUPS is not None:
         raise RuntimeError(
             "Process groups are already registered. Call destroy_model_parallel() first."
@@ -1198,9 +1203,15 @@ def build_process_group_collection(
     initialize_model_parallel() calls this function and registers the result. Group creation is
     collective: every rank of the default process group calls this function with the same
     arguments, including ranks outside the [rank_offset, rank_offset + local_world_size) window,
-    which belong to none of the groups. The only process state this function changes is the
-    list of created groups that update_pg_timeout() uses, and the NCCL_COLLNET_ENABLE and UCC
-    environment variables that use_sharp and the "ucc" pipeline backend need.
+    which belong to none of the groups. With use_sharp on the dp group, or with
+    dynamic_context_parallel, this function runs a barrier on the data x context parallel group
+    of each rank, so every rank must then be inside the window.
+
+    Besides creating the groups, this function clears the calling thread's DTensor sharding
+    cache and sets the NCCL_COLLNET_ENABLE, UCC and UCX environment variables that use_sharp and
+    the "ucc" pipeline backend need. It records the groups in the list of created groups that
+    update_pg_timeout() updates and destroy_model_parallel() destroys, so the next
+    destroy_model_parallel() also destroys the groups of a collection that is not registered.
 
     Args:
         tensor_model_parallel_size (int, default = 1):
@@ -1708,9 +1719,7 @@ def build_process_group_collection(
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
             torch.cuda.synchronize()
             if tensor_model_parallel_size > 1:
-                # TP groups are initialized later in this function, so do not
-                # route this eager communicator touch through the public
-                # accessor (which consults TP parallel state).
+                # Also touch the TP x runtime-CP group of this size built above.
                 tp_cp_group = dynamic_tp_dp_cp[group_size]
                 torch.distributed.barrier(
                     group=tp_cp_group, device_ids=[torch.cuda.current_device()]
@@ -2320,10 +2329,6 @@ def initialize_model_parallel(
             raise RuntimeError(
                 "pipeline-model-parallel size should be greater than 1 with interleaved schedule"
             )
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-        _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
-        _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
     if hybrid_context_parallel:
         warnings.warn(
@@ -2334,6 +2339,9 @@ def initialize_model_parallel(
         if dynamic_context_parallel:
             raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
         dynamic_context_parallel = True
+
+    # Fail before creating any group: registering would only fail after the whole grid is built.
+    _assert_process_groups_not_initialized()
 
     pg_collection, extras = build_process_group_collection(
         tensor_model_parallel_size=tensor_model_parallel_size,
@@ -2362,6 +2370,13 @@ def initialize_model_parallel(
         gtp_remat_num_sequence_shards=gtp_remat_num_sequence_shards,
     )
     register_process_groups(pg_collection, extras=extras)
+
+    # Set after registering, so that a call that fails leaves the virtual pipeline state as it was.
+    if virtual_pipeline_model_parallel_size is not None:
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+        _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
+        _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
     return pg_collection
 
