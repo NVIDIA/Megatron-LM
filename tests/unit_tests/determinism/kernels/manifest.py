@@ -1011,8 +1011,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/models/engram/distributed_embedding.py",
             "megatron/core/models/deepseek_v41/engram.py",
+            "megatron/core/ops/engram.py",
         ),
-        tests=("tests/unit_tests/models/test_v41_engram.py", K + "test_te_wrappers.py"),
+        tests=(
+            "tests/unit_tests/models/test_v41_engram.py",
+            "tests/unit_tests/ops/test_engram.py",
+            K + "test_te_wrappers.py",
+        ),
         kind="triton",
         notes="Sorted repeated-row gradients and real Gloo EP lookup parity, including "
         "uneven shards and FP8 values/scales transport. Blackwell tests compare fused "
@@ -1020,7 +1025,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "payloads, scale padding, NCCL/HybridEP lookup, projection gradients and master "
         "copy-back. HybridEP parity includes integer IDs, all BF16 bit patterns, MXFP8 "
         "bytes/scales, interleaved nonblocking chunks, hotspots, empty ranks, independent "
-        "buffers and multiple live lookup plans through backward.",
+        "buffers and multiple live lookup plans through backward. CuTe/NCCL device "
+        "transport replays striped LSA/GIN exchanges with bounded slot reuse under "
+        "side-stream contention.",
     ),
     KernelEntry(
         name="dsa_dispatch",

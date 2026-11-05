@@ -118,11 +118,47 @@ offset from that window so LSA reads handle different suballocations on peers.
 The borrowed window buffer retains the original storage;
 allocation queries and registration are cached until storage changes.
 Workspace is included in `buffer_budget_mb`; NCCL's internal allocations are not.
+Transfers split each peer's rows across up to 32 independent stripes, using
+separate credits and slots within the same workspace budget. Small budgets use
+fewer stripes. Barrier and exchange executables are cached explicitly so steady
+state calls avoid CuTe auto-JIT argument processing; row counts and row widths
+remain dynamic. These changes require no training arguments.
 Use `EngramRuntime.close()` before destroying the row groups when explicitly
 tearing down a model. Single-node LSA exchange, direct reads, storage replacement,
 and MXFP8 prefetch/deferred-gradient/DDP integration have GPU smoke coverage.
-Cross-domain GIN, larger shard groups, and performance still need qualification
-in the target image.
+128-shard training and end-to-end performance still need qualification.
+The striped transport passes four-GPU LSA tests and
+eight-GPU tests across two NVLink domains on GB300 with NCCL4Py 0.6.0,
+NCCL 2.32.3 and CuTe DSL 4.8.1. These cover mixed LSA/GIN reads and transfers,
+empty/skewed requests, slot reuse, storage replacement and byte-exact replay.
+
+`benchmark_engram.py` isolates count exchange, cached registration, barriers,
+FP8 row lookup, gradient transfer and repeated-row accumulation. Its runtime
+mode includes deduplication, FP8 activation repacking, autograd and deferred
+gradient delivery for two embedding modules. It excludes Engram projections,
+DDP and the optimizer, so its results are not training iteration times.
+
+Run inside the training container, with registerable CUDA allocations:
+
+```bash
+export PYTHONPATH=.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  examples/deepseek_v41/benchmark_engram.py --output=/tmp/engram-transport.json
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  examples/deepseek_v41/benchmark_engram.py --mode=runtime \
+  --backend=symmetric --microbatches=32 --output=/tmp/engram-runtime.json
+```
+
+Defaults are 4096 tokens, 24 tables, 256 columns and 125024 rows **per shard**.
+The per-GPU table working set stays fixed when changing world size; smaller jobs
+therefore have fewer global rows. Runtime mode also accepts `nccl` and `hybridep`
+for comparisons. JSON contains warm steady-state samples, the maximum rank's
+wall/submission/CUDA times, rank-0 memory statistics, and the transport's actual
+LSA/GIN topology. Transport mode records cold initialization and lookup separately
+and checks returned bytes against exact references before timing. Use nodes from
+different NVLink domains to qualify GIN; node count alone does not establish the
+communication path.
 
 For PP/VPP, insert `|` at explicit stage/chunk boundaries. The builder creates
 one typed pipeline control group per replica and reuses it for virtual chunks.

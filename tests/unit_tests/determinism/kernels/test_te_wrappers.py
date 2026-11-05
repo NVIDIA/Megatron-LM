@@ -102,6 +102,46 @@ def _config(**overrides):
 
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _IS_BLACKWELL, reason='NCCL device transport needs Blackwell')
+def test_engram_device_exchange_replays():
+    """Striped transfers reuse both slots under competing stream work, byte for byte."""
+    pytest.importorskip('nccl.core.device.cute', exc_type=ImportError)
+    from megatron.core.ops.engram import EngramDeviceTransport
+
+    Utils.initialize_distributed()
+    group = torch.distributed.group.WORLD
+    rank, size = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
+    if size < 2:
+        pytest.skip('Needs at least two row shards')
+    transport = EngramDeviceTransport(group)
+    counts = torch.tensor([[153 + (src + dst) % 7 for dst in range(size)] for src in range(size)])
+    send, recv = counts[rank].tolist(), counts[:, rank].tolist()
+    plan = SimpleNamespace(peer_counts=counts, max_rows=int(counts.sum(1).max()))
+    # Eight stripes with 4 KiB slots force several rounds for 1040-byte packets.
+    workspace = (4096 * 2 * (size + transport.channels) + size * 32) * 8
+    source = torch.randint(256, (sum(send), 1040), device='cuda', dtype=torch.uint8)
+    expected = source.new_empty((sum(recv), 1040))
+    torch.distributed.all_to_all_single(expected, source, recv, send, group=group)
+
+    def exchange(values):
+        return transport.exchange(values, recv, send, plan, workspace)
+
+    try:
+        assert bytes_equal(exchange(source), expected)
+        assert transport.stripes == 8
+        assert_replays_bit_exact(
+            exchange,
+            (source,),
+            backward=False,
+            contention=True,
+            what='Engram striped LSA/GIN row exchange',
+        )
+    finally:
+        transport.close()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not _IS_BLACKWELL, reason='TE MXFP8 needs Blackwell')
 @pytest.mark.parametrize('width', [32, 256])
 @pytest.mark.parametrize('needs_wgrad', [False, True])

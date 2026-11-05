@@ -108,17 +108,18 @@ def _exchange_kernel(
     flags_offset: cutlass.Int64,
     row_words: cutlass.Int64,
     channels: cutlass.Constexpr,
+    stripes: cutlass.Constexpr,
     has_gin: cutlass.Constexpr,
     remote_only: cutlass.Constexpr,
 ):
     """A ring schedule with two receive slots per sender and GPU-side credits.
 
-    Only ``channels`` CTAs are launched, independent of shard count. A sender
-    cannot reuse either slot until its receiver acknowledges consumption. Slots
-    belong to *source ranks*, so skewed peers can advance independently without
-    overwriting another peer's rows. No grid-wide spin barrier is needed.
+    Each peer transfer is split into independent stripes, with one CTA and two
+    credit-controlled slots per stripe. This exposes memory parallelism without
+    increasing the workspace budget or requiring a grid-wide spin barrier.
     """
-    channel, _, _ = cute.arch.block_idx()
+    block, _, _ = cute.arch.block_idx()
+    channel, stripe = block // stripes, block % stripes
     tid, _, _ = cute.arch.thread_idx()
     team, lsa = comm.team_world, comm.team_lsa
     # NCCL's default LSA team has stride one. Translate world ranks using its
@@ -143,6 +144,12 @@ def _exchange_kernel(
                 send_count = cutlass.Int64(0)
             if recv_local:
                 recv_count = cutlass.Int64(0)
+        send_start = send_count * stripe // stripes
+        recv_start = recv_count * stripe // stripes
+        send_begin += send_start
+        recv_begin += recv_start
+        send_count = send_count * (stripe + 1) // stripes - send_start
+        recv_count = recv_count * (stripe + 1) // stripes - recv_start
         if offset == 0:
             _copy_words(
                 cute.make_tensor(source.iterator + send_begin * row_words, source.layout),
@@ -158,7 +165,7 @@ def _exchange_kernel(
             for chunk in range(rounds + 1):
                 slot = chunk % 2
                 if chunk < send_chunks:
-                    ack = send_peer * 4 + 2 + slot
+                    ack = (send_peer * stripes + stripe) * 4 + 2 + slot
                     expected_ack = sequence[ack]
                     cute.arch.sync_threads()
                     if send_local:
@@ -170,8 +177,10 @@ def _exchange_kernel(
                         source.iterator + (send_begin + chunk * capacity) * row_words,
                         cute.make_layout(count),
                     )
-                    recv_offset = (2 * channels + 2 * team.rank + slot) * slot_bytes
-                    ready = team.rank * 4 + slot
+                    recv_offset = (
+                        2 * channels * stripes + 2 * (team.rank * stripes + stripe) + slot
+                    ) * slot_bytes
+                    ready = (team.rank * stripes + stripe) * 4 + slot
                     if send_local:
                         dst = cute.make_tensor(
                             cute.make_ptr(
@@ -185,7 +194,7 @@ def _exchange_kernel(
                         staging = window.tensor(
                             source.element_type,
                             cute.make_layout(count),
-                            offset=(2 * channel + slot) * slot_bytes,
+                            offset=(2 * (channel * stripes + stripe) + slot) * slot_bytes,
                         )
                         _copy_words(src, staging, count)
                         cute.arch.sync_threads()
@@ -210,7 +219,7 @@ def _exchange_kernel(
                 received_chunk = chunk - 1
                 if (received_chunk >= 0) & (received_chunk < recv_chunks):
                     recv_slot = received_chunk % 2
-                    ready = recv_peer * 4 + recv_slot
+                    ready = (recv_peer * stripes + stripe) * 4 + recv_slot
                     expected_ready = sequence[ready] + 1
                     cute.arch.sync_threads()
                     if recv_local:
@@ -221,7 +230,10 @@ def _exchange_kernel(
                     src = window.tensor(
                         source.element_type,
                         cute.make_layout(count),
-                        offset=(2 * channels + 2 * recv_peer + recv_slot) * slot_bytes,
+                        offset=(
+                            2 * channels * stripes + 2 * (recv_peer * stripes + stripe) + recv_slot
+                        )
+                        * slot_bytes,
                     )
                     dst = cute.make_tensor(
                         destination.iterator + (recv_begin + received_chunk * capacity) * row_words,
@@ -229,7 +241,7 @@ def _exchange_kernel(
                     )
                     _copy_words(src, dst, count)
                     cute.arch.sync_threads()
-                    ack = team.rank * 4 + 2 + recv_slot
+                    ack = (team.rank * stripes + stripe) * 4 + 2 + recv_slot
                     if recv_local:
                         _signal_lsa(window, recv_lsa, ack, flags_offset)
                     elif cutlass.const_expr(has_gin):
@@ -241,7 +253,7 @@ def _exchange_kernel(
             # The next exchange may change row width and peer counts.
             for slot in cutlass.range_constexpr(2):
                 if slot < send_chunks:
-                    ack = send_peer * 4 + 2 + slot
+                    ack = (send_peer * stripes + stripe) * 4 + 2 + slot
                     if send_local:
                         _wait_lsa(window, ack, sequence[ack], flags_offset)
                     elif cutlass.const_expr(has_gin):
@@ -262,6 +274,7 @@ def _exchange(
     flags_offset: cutlass.Int64,
     row_words: cutlass.Int64,
     channels: cutlass.Constexpr,
+    stripes: cutlass.Constexpr,
     has_gin: cutlass.Constexpr,
     remote_only: cutlass.Constexpr,
     stream: cuda.CUstream,
@@ -277,9 +290,10 @@ def _exchange(
         flags_offset,
         row_words,
         channels,
+        stripes,
         has_gin,
         remote_only,
-    ).launch(grid=(channels, 1, 1), block=(128, 1, 1), stream=stream)
+    ).launch(grid=(channels * stripes, 1, 1), block=(128, 1, 1), stream=stream)
 
 
 @cute.kernel
@@ -416,12 +430,18 @@ class EngramDeviceTransport:
         self.device_view = None
         self.tables = {}
         self.lookup_kernels = {}
+        self.exchange_kernels = {}
+        self.barrier_kernel = None
 
     def _initialize(self, device, workspace_bytes):
         if self.comm is not None:
             if device != self.buffer.device:
                 raise ValueError("An Engram transport cannot span multiple local CUDA devices")
             return
+        # Up to 128 CTAs with the default four peer channels. Keep at least 4 KiB
+        # per slot, reducing stripes for small budgets without allocating more memory.
+        stripe_bytes = self.size * 32 + 2 * (self.size + self.channels) * 4096
+        self.stripes = 1 << min(5, max(0, (workspace_bytes // stripe_bytes).bit_length() - 1))
         unique_id = [nccl.get_unique_id() if self.rank == 0 else None]
         if self.size > 1:
             torch.distributed.broadcast_object_list(
@@ -448,20 +468,25 @@ class EngramDeviceTransport:
                         if self.has_gin
                         else nccl.NcclGinConnectionType.NONE
                     ),
-                    gin_signal_count=self.size * 4 if self.has_gin else 0,
+                    gin_signal_count=self.size * self.stripes * 4 if self.has_gin else 0,
                     gin_context_count=1 if self.has_gin else 0,
                 )
             )
-            flags_bytes = self.size * 4 * 8
+            flags_bytes = self.size * self.stripes * 4 * 8
             self.slot_bytes = (
-                (workspace_bytes - flags_bytes) // (2 * (self.size + self.channels)) // 256 * 256
+                (workspace_bytes - flags_bytes)
+                // (2 * (self.size + self.channels) * self.stripes)
+                // 256
+                * 256
             )
             if self.slot_bytes <= 0:
                 raise ValueError("Engram workspace cannot hold two receive slots per shard")
-            self.flags_offset = self.slot_bytes * 2 * (self.size + self.channels)
+            self.flags_offset = self.slot_bytes * 2 * (self.size + self.channels) * self.stripes
             self.buffer = nccl_torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
             self.buffer[self.flags_offset : self.flags_offset + flags_bytes].zero_()
-            self.sequence = torch.zeros(self.size * 4, dtype=torch.int64, device=device)
+            self.sequence = torch.zeros(
+                self.size * self.stripes * 4, dtype=torch.int64, device=device
+            )
             self.window = self.comm.register_window(self.buffer)
             if not self.window.is_valid:
                 raise RuntimeError("NCCL did not register the Engram workspace")
@@ -475,7 +500,11 @@ class EngramDeviceTransport:
 
     def barrier(self):
         """Publish parameter updates or finish all remote reads before reuse."""
-        _table_barrier(self.device_view, self.has_gin, self._stream())
+        if self.barrier_kernel is None:
+            self.barrier_kernel = cute.compile(
+                _table_barrier, make_fake_dev_comm(), self.has_gin, make_fake_stream()
+            )
+        self.barrier_kernel(self.device_view, self._stream())
 
     @torch.no_grad()
     def exchange(
@@ -523,7 +552,32 @@ class EngramDeviceTransport:
         counts = torch.tensor([send_splits, recv_splits], dtype=torch.int64)
         starts = counts.cumsum(1) - counts
         splits = torch.stack((starts[0], counts[0], starts[1], counts[1]), dim=1).to(source.device)
-        _exchange(
+        # Keep the executable, bypassing auto-JIT argument processing on every
+        # transfer. Row counts and widths are runtime arguments, not specializations.
+        signature = (word_dtype, self.channels, self.stripes, self.has_gin, remote_only)
+        if signature not in self.exchange_kernels:
+            self.exchange_kernels[signature] = cute.compile(
+                _exchange,
+                make_fake_dev_comm(),
+                make_fake_window(),
+                make_fake_tensor(
+                    cutlass.Int32 if aligned else cutlass.Uint8, (cute.sym_int64(),), (1,)
+                ),
+                make_fake_tensor(
+                    cutlass.Int32 if aligned else cutlass.Uint8, (cute.sym_int64(),), (1,)
+                ),
+                make_fake_tensor(cutlass.Int64, (self.size, 4), (4, 1)),
+                make_fake_tensor(cutlass.Int64, (self.size * self.stripes * 4,), (1,)),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                self.channels,
+                self.stripes,
+                self.has_gin,
+                remote_only,
+                make_fake_stream(),
+            )
+        self.exchange_kernels[signature](
             self.device_view,
             self.window_view,
             _rows_tensor(source.view(word_dtype).reshape(-1)),
@@ -533,9 +587,6 @@ class EngramDeviceTransport:
             cutlass.Int64(self.slot_bytes),
             cutlass.Int64(self.flags_offset),
             cutlass.Int64(row_bytes // word_bytes),
-            self.channels,
-            self.has_gin,
-            remote_only,
             self._stream(),
         )
         return output
@@ -732,3 +783,4 @@ class EngramDeviceTransport:
             self.comm = None
             self.buffer = self.sequence = self.window = self.dev_comm = None
             self.device_view = self.window_view = None
+            self.barrier_kernel = None

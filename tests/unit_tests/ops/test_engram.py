@@ -180,6 +180,7 @@ def test_engram_device_exchange_compiles(has_gin, remote_only, word_bytes):
         cutlass.Int64(65536),
         cutlass.Int64(264 // word_bytes),
         4,
+        1,
         has_gin,
         remote_only,
         make_fake_stream(),
@@ -246,14 +247,15 @@ def device_group():
 
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
-def test_engram_device_exchange_reuses_slots(device_group):
+@pytest.mark.parametrize("stripes", [1, 8])
+def test_engram_device_exchange_reuses_slots(device_group, stripes):
     """Real kernels: skew, empty ranks, changes of dtype/row width, and replay."""
     from megatron.core.ops.engram import EngramDeviceTransport
 
     transport = EngramDeviceTransport(device_group)
     rank, size = dist.get_rank(device_group), dist.get_world_size(device_group)
     # Keep slots deliberately tiny, forcing >2 chunks even for the largest row.
-    workspace = 4096 * 2 * (size + transport.channels) + size * 32
+    workspace = (4096 * 2 * (size + transport.channels) + size * 32) * stripes
     try:
         for dtype, width in (
             (torch.int64, 2),
@@ -264,9 +266,9 @@ def test_engram_device_exchange_reuses_slots(device_group):
             (torch.uint8, 1040),
         ):
             for pattern in ("uneven", "hotspot", "empty_requester", "empty", "uneven"):
-                splits = [19 + (rank + peer) % 7 for peer in range(size)]
+                splits = [(19 + (rank + peer) % 7) * stripes for peer in range(size)]
                 if pattern == "hotspot":
-                    splits = [37 + rank] + [0] * (size - 1)
+                    splits = [(37 + rank) * stripes] + [0] * (size - 1)
                 if pattern == "empty" or (pattern == "empty_requester" and rank == 0):
                     splits = [0] * size
                 gathered = [None] * size
