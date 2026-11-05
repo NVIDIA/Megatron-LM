@@ -166,19 +166,16 @@ def requantize_whole_params_from_high_precision(
         TypeError: For other quantized storage (per-tensor FP8, NVFP4, GroupedTensor), whose
             quantization depends on state this path does not reproduce.
     """
-    if len(params) != len(srcs):
-        raise ValueError(f"Got {len(params)} params and {len(srcs)} source values.")
     for param in params:
-        if not (is_mxfp8tensor(param) or is_blockwise_float8tensor(param)):
+        if is_mxfp8tensor(param):
+            _unwrap_parameter_data(param)._get_quantizer().set_usage(rowwise=True, columnwise=True)
+        elif not is_blockwise_float8tensor(param):
             raise TypeError(
                 "Whole-parameter requantization supports plain MXFP8 and blockwise FP8 "
                 f"parameters only, got {type(_unwrap_parameter_data(param)).__name__}."
             )
-    for param in params:
-        if is_mxfp8tensor(param):
-            _unwrap_parameter_data(param)._get_quantizer().set_usage(rowwise=True, columnwise=True)
     copy_tensors_to_quantized_params(params, srcs)
-    post_all_gather_processing(list(params))
+    post_all_gather_processing(params)
 
 
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:

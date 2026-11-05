@@ -335,7 +335,6 @@ class TestFP8Param:
                     "LayerWise test did not enter the requested parameter-layout path: "
                     f"requested={requested_layout}, actual={current.param_layout}"
                 )
-                assert current.use_buffer_param_sync == (requested_layout == "padded")
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"

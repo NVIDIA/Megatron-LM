@@ -864,11 +864,6 @@ def _get_megatron_emerging_optimizer(
                 "use_layer_wise_distributed_optimizer=True "
                 "(see configure_ddp_for_layer_wise_optimizer)."
             )
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path."
-        )
         trainable_params = [
             param
             for model_chunk in model_chunks
@@ -897,9 +892,7 @@ def _get_megatron_emerging_optimizer(
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        owned_by_layer_wise = (
-            use_layer_wise and opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS
-        )
+        owned_by_layer_wise = use_layer_wise and opt_name == eopt_name
         is_expert = group['is_expert_parallel'] and not owned_by_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
     if use_layer_wise and any(
@@ -977,21 +970,13 @@ def _get_megatron_emerging_optimizer(
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise. Expert
                 # params shard over the expert data-parallel group, as in the standard
-                # (non-layer-wise) optimizer path.
-                if is_expert:
-                    distopt_model_parallel_group = distopt_process_groups[
-                        'expt_tp_pp_with_egtp_remat_group'
-                    ]
-                    distopt_data_parallel_group = distopt_process_groups['intra_expt_dp_group']
-                    distopt_data_parallel_group_gloo = distopt_process_groups[
-                        'intra_expt_dp_group_gloo'
-                    ]
-                else:
-                    distopt_model_parallel_group = distopt_process_groups['mp_group']
-                    distopt_data_parallel_group = distopt_process_groups['intra_dp_cp_group']
-                    distopt_data_parallel_group_gloo = distopt_process_groups[
-                        'intra_dp_cp_group_gloo'
-                    ]
+                # (non-layer-wise) optimizer path. Gloo groups are off on this path.
+                mp_group_name, dp_group_name = (
+                    ('expt_tp_pp_with_egtp_remat_group', 'intra_expt_dp_group')
+                    if is_expert
+                    else ('mp_group', 'intra_dp_cp_group')
+                )
+                distopt_model_parallel_group = distopt_process_groups[mp_group_name]
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -999,11 +984,9 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers[is_expert],
                     model_parallel_group=distopt_model_parallel_group,
-                    data_parallel_group=distopt_data_parallel_group,
-                    data_parallel_group_gloo=distopt_data_parallel_group_gloo,
+                    data_parallel_group=distopt_process_groups[dp_group_name],
                     data_parallel_group_idx=get_pg_rank(distopt_model_parallel_group),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                    distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
                 )
                 # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers

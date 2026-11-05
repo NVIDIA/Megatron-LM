@@ -190,7 +190,6 @@ class TestCompactLayerWiseLayout:
         model, optimizer = _build("compact", overlap=overlap, bucket_size=4096 if overlap else None)
         layer_wise = _layer_wise(optimizer)
         assert layer_wise.param_layout == "compact"
-        assert not layer_wise.use_buffer_param_sync
         assert layer_wise.layerwise_param_sync_via_bucket_group == overlap
         # The model-level config keeps DistOpt for the sibling optimizer.
         assert model.ddp_config.use_distributed_optimizer

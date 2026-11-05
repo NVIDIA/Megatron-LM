@@ -2004,8 +2004,6 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @override
     def _sync_unbuffered_model_params(self) -> None:
-        if self.is_stub_optimizer:
-            return
         for optimizer in self.chained_optimizers:
             optimizer._sync_unbuffered_model_params()
 
@@ -2253,9 +2251,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 for _grad_norm in (opt.get_grad_norm() for opt in self.chained_optimizers)
                 if _grad_norm is not None
             ]
-            if not grad_norms:
-                grad_norm = 0.0
-            elif any(isinstance(x, torch.Tensor) for x in grad_norms):
+            if any(isinstance(x, torch.Tensor) for x in grad_norms):
                 # Same arithmetic as ``math.sqrt(float(sum(x**2)))``, but on the device, so an
                 # optimizer-step CUDA graph capture needs no host synchronization.
                 # clip_grad_by_total_norm_fp32 forms the clip coefficient in float64 and rounds it

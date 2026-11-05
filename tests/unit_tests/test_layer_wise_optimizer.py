@@ -518,7 +518,7 @@ class TestLayerWiseOptimizer:
             assert all(
                 not group.ddp_config.param_sync_via_bucket_group for group in layerwise_groups
             )
-            assert not layer_wise_optimizer.use_buffer_param_sync
+            assert layer_wise_optimizer.param_layout == 'compact'
             assert not layer_wise_optimizer.layerwise_param_sync_via_bucket_group
 
         reference_model = self.create_reference_model(model)

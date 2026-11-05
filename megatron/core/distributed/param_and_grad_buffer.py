@@ -170,12 +170,10 @@ class _ParamAndGradBucket:
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
-        # The variable-size LayerWise gather moves quantized params (plain MXFP8 / blockwise FP8)
-        # as BF16 staged from their FP32 masters and requantizes them on copy-back; it needs a
-        # bucket of a single storage kind (see start_param_sync).
-        quantized = {_param_uses_quantized_storage(param) for param in params}
-        self.layerwise_gather_quantized = quantized == {True}
-        self.layerwise_gather_mixed_storage = len(quantized) > 1
+        # Buffers are split by storage dtype, so a bucket holds either quantized params (plain
+        # MXFP8 / blockwise FP8), which the variable-size LayerWise gather moves as BF16, or
+        # plain ones.
+        self.layerwise_gather_quantized = bool(params) and _param_uses_quantized_storage(params[0])
 
     @torch.no_grad()
     def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
@@ -234,9 +232,32 @@ class _ParamAndGradBucket:
         ]
 
 
+def _layerwise_gather_sources(
+    params: List[torch.nn.Parameter], quantized: bool
+) -> List[torch.Tensor]:
+    """The tensors an owner contributes to a variable-size LayerWise all-gather.
+
+    Quantized params can't be flattened (MXFP8 has no view(-1)), so they travel as BF16 cast
+    from the owner's FP32 master; the copy-back requantizes them on every rank.
+    """
+    if not quantized:
+        return params
+    for param in params:
+        assert getattr(param, 'main_param', None) is not None, (
+            "LayerWise quantized param gather needs the owner's FP32 main_param to stage the "
+            "all-gather source."
+        )
+    return [param.main_param.to(torch.bfloat16) for param in params]
+
+
 @torch.no_grad()
-def _copy_back_layerwise_gather(bucket: '_ParamAndGradBucket', local_rank: int) -> None:
-    """Publish one bucket's variable-size LayerWise all-gather into the model params.
+def _copy_back_layerwise_gather(
+    params_list: List[List[torch.nn.Parameter]],
+    gather_list: List[torch.Tensor],
+    local_rank: int,
+    quantized: bool,
+) -> None:
+    """Publish a variable-size LayerWise all-gather into the model params.
 
     Plain params of the other ranks are copied from their gather slots; the local rank's
     params already hold their update. Quantized params were gathered as BF16 staged from the
@@ -244,17 +265,15 @@ def _copy_back_layerwise_gather(bucket: '_ParamAndGradBucket', local_rank: int) 
     replicas hold identical quantized values.
     """
     quantized_params, quantized_values = [], []
-    for rank, params in enumerate(bucket.layerwise_params_list):
+    for rank, params in enumerate(params_list):
         if not params:
             continue
-        if bucket.layerwise_gather_quantized:
+        if quantized:
             templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
             quantized_params.extend(params)
-            quantized_values.extend(
-                _unflatten_dense_tensors(bucket.layerwise_gather_list[rank], templates)
-            )
+            quantized_values.extend(_unflatten_dense_tensors(gather_list[rank], templates))
         elif rank != local_rank:
-            values = _unflatten_dense_tensors(bucket.layerwise_gather_list[rank], params)
+            values = _unflatten_dense_tensors(gather_list[rank], params)
             for model_param, value in zip(params, values):
                 model_param.data.copy_(value)
     if quantized_params:
@@ -401,30 +420,28 @@ class _ParamAndGradBucketGroup:
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
 
-    def _finalize_layerwise_param_sync(self):
-        """Publish a completed variable-size LayerWise gather and release its receive buffer.
-
-        Every path that completes such a gather runs this before :meth:`_post_param_sync`:
-        the gathered values sit in ``bucket.layerwise_gather_list`` (views into ``grad_data``)
-        until they are copied into the params, and ``grad_data`` must be zeroed afterwards so
-        that the next backward does not accumulate into the gather payload.
-        """
-        if self.ddp_config.use_distributed_optimizer:
-            return
-        for bucket in self.buckets:
-            if bucket.layerwise_gather_list is None:
-                continue
-            _copy_back_layerwise_gather(bucket, self.intra_distributed_optimizer_instance_rank)
-            bucket.layerwise_gather_list = None
-            bucket.grad_data.zero_()
-
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
+        if not self.ddp_config.use_distributed_optimizer:
+            # Compact LayerWise buffers have no param buffer: the variable-size gather landed in
+            # grad_data, which is zeroed after the copy-back so that the next backward does not
+            # accumulate into the gather payload.
+            for bucket in self.buckets:
+                if bucket.layerwise_gather_list is None:
+                    continue
+                _copy_back_layerwise_gather(
+                    bucket.layerwise_params_list,
+                    bucket.layerwise_gather_list,
+                    self.intra_distributed_optimizer_instance_rank,
+                    bucket.layerwise_gather_quantized,
+                )
+                bucket.layerwise_gather_list = None
+                bucket.grad_data.zero_()
+            return
+
         # Inference packing may redirect plain parameters into serving buffers.
         # Copy only after all-gather: each optimizer rank updates just a shard.
         for bucket in self.buckets:
-            if bucket.param_data is None:
-                continue
             for param in bucket.params:
                 if _param_uses_quantized_storage(param) or is_grouped_tensor(param):
                     continue
@@ -435,11 +452,6 @@ class _ParamAndGradBucketGroup:
 
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
-                if bucket.param_data is None:
-                    # LayerWise variable-size gather path: params are already updated via
-                    # unflatten + copy_ in finish_param_sync, and there is no param_data
-                    # buffer to copy back from.
-                    continue
                 has_non_quantized_weight = False
                 quantized_params = []
                 param_slices = []
@@ -469,9 +481,6 @@ class _ParamAndGradBucketGroup:
 
         quantized_params = []
         for bucket in self.buckets:
-            if bucket.param_data is None:
-                # Variable-size LayerWise gathers post-process in their copy-back.
-                continue
             for param in bucket.params:
                 if _param_uses_quantized_storage(param):
                     quantized_params.append(param)
@@ -534,9 +543,8 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
-                # A pending variable-size gather normally lands in finish_param_sync (forward
-                # pre-hook), which force_sync bypasses.
-                self._finalize_layerwise_param_sync()
+                # A pending gather normally lands in finish_param_sync (forward pre-hook),
+                # which force_sync bypasses.
                 self._post_param_sync()
                 return
         else:
@@ -555,19 +563,12 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
-                if force_sync and self.ddp_config.overlap_param_gather:
-                    self._post_param_sync()
                 self.param_gather_dispatched = True
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
             for bucket in self.buckets:
-                if bucket.layerwise_gather_mixed_storage:
-                    raise RuntimeError(
-                        "The variable-size LayerWise parameter gather needs buckets of either "
-                        "quantized or plain parameters, not both."
-                    )
                 # Use param dtype (e.g., bf16), NOT grad dtype (which may be
                 # fp32 when grad_reduce_in_fp32 is enabled). Quantized params travel as
                 # BF16 staged from their FP32 masters.
@@ -602,22 +603,10 @@ class _ParamAndGradBucketGroup:
                 # Detach from autograd since start_param_sync may be called
                 # during the forward pass where autograd is active.
                 if local_size > 0:
-                    # Quantized params can't be flattened (MXFP8 has no view(-1)); gather the
-                    # fp32 master (param.main_param -> bf16), which the copy-back requantizes
-                    # on every rank. Other params flatten as-is.
-                    src_params = []
-                    for p in bucket.layerwise_params_list[local_rank]:
-                        if bucket.layerwise_gather_quantized:
-                            main_param = getattr(p, "main_param", None)
-                            assert main_param is not None, (
-                                "LayerWise quantized param sync needs param.main_param (fp32 "
-                                "master) to stage the all-gather source; got None."
-                            )
-                            src_params.append(main_param.to(param_dtype))
-                        else:
-                            src_params.append(p)
-                    flat_local_params = _flatten_dense_tensors(src_params).detach()
-                    local_slot_view.copy_(flat_local_params)
+                    sources = _layerwise_gather_sources(
+                        bucket.layerwise_params_list[local_rank], bucket.layerwise_gather_quantized
+                    )
+                    local_slot_view.copy_(_flatten_dense_tensors(sources).detach())
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
@@ -630,7 +619,7 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
                 # Synchronous: unflatten and copy gathered params immediately.
-                self._finalize_layerwise_param_sync()
+                self._post_param_sync()
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -707,7 +696,6 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            self._finalize_layerwise_param_sync()
             self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -958,7 +946,6 @@ class _ParamAndGradBucketGroup:
             # Publish the completed gather before dropping its receive views: the next forward
             # pre-hook sees no pending handle and would skip publication, leaving stale params
             # (and, for a LayerWise gather, the payload in grad_data).
-            self._finalize_layerwise_param_sync()
             self._post_param_sync()
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
