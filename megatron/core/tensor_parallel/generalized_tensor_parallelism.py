@@ -183,26 +183,26 @@ def register_prefetch_chain(name: str, weights: Iterable[torch.Tensor]) -> None:
     """
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise ValueError("Prefetch chain name must contain only letters, digits, '_', '.' or '-'")
-    selected = {}
+    chain_members = {}
     for weight in weights:
         if not is_gtp_param(weight):
             raise TypeError("Prefetch chains accept only already GTP-sharded weights")
-        selected[id(weight)] = weight
+        chain_members[id(weight)] = weight
     # A grouped projection is one consumer. Never split its local-expert collective.
-    for weight in tuple(selected.values()):
+    for weight in tuple(chain_members.values()):
         if weight.weight_list is not None:
             for member in weight.weight_list:
-                selected[id(member)] = member
-    leaders = {
+                chain_members[id(member)] = member
+    grouped_member_ids = {
         id(member)
-        for weight in selected.values()
+        for weight in chain_members.values()
         if weight.weight_list is not None
         for member in weight.weight_list
     }
     kinds = set()
     groups = set()
-    for weight in selected.values():
-        if weight.is_routed_expert and id(weight) not in leaders:
+    for weight in chain_members.values():
+        if weight.is_routed_expert and id(weight) not in grouped_member_ids:
             raise ValueError("Register a grouped projection through its leading weight (weight0)")
         if (
             getattr(weight, "_gtp_chain_classified", False)
@@ -218,7 +218,7 @@ def register_prefetch_chain(name: str, weights: Iterable[torch.Tensor]) -> None:
     if len(kinds) > 1 or len(groups) > 1:
         raise ValueError("A prefetch chain must have one weight kind and one process group")
     # Validate the entire request before mutating parameters.
-    for weight in selected.values():
+    for weight in chain_members.values():
         weight._gtp_prefetch_chain_name = name
 
 
@@ -717,7 +717,7 @@ def _register_default_prefetch_chains(models):
     }
     defaults = defaultdict(list)
     for name, weight in weights.values():
-        if hasattr(weight, "_gtp_prefetch_chain_name"):
+        if hasattr(weight, "_gtp_prefetch_chain_name") or weight.prefetch_initialized:
             continue
         role = "dense"
         if weight.is_routed_expert:

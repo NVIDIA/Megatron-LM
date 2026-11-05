@@ -243,6 +243,21 @@ def test_model_initialization_registers_defaults_and_preserves_overrides(monkeyp
     assert gtp._chain_is_graphed(fc1[0].chain_id) == (impl == "full_iteration")
 
 
+def test_default_registration_preserves_chain_free_opt_out():
+    opted_out, peer = _weight(), _weight()
+    opted_out.prefetch_initialized = True
+    opted_out._need_weight_prefetch = False
+
+    gtp.classify_gtp_remat_chains(_model(opted_out=opted_out, peer=peer))
+
+    assert not hasattr(opted_out, "_gtp_prefetch_chain_name")
+    assert opted_out.chain_id == gtp.GTPChain.UNGRAPHED.value
+    assert opted_out.prefetch_initialized
+    assert not opted_out._need_weight_prefetch
+    assert peer._gtp_prefetch_chain_name == "default_dense"
+    assert peer.chain_id != opted_out.chain_id
+
+
 def test_default_registration_keeps_process_groups_separate():
     first, second = _weight(object()), _weight(object())
     gtp.classify_gtp_remat_chains([_model(first=first), _model(second=second)])
