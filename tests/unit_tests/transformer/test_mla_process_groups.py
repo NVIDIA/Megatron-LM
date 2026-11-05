@@ -216,3 +216,29 @@ class TestMLAWithOwnProcessGroups:
         assert "linear_q_down_proj.weight" in sharded_state_dict
         assert "linear_kv_down_proj.weight" in sharded_state_dict
         assert _sharding_metadata(sharded_state_dict) == expected
+
+    def test_fused_sharded_state_dict_without_metadata_uses_own_dp_cp_group(self, monkeypatch):
+        """Called without metadata, the layer computes replica ids over its own DP x CP group."""
+        reference = _build_attention("fused")
+        expected = _sharding_metadata(
+            reference.sharded_state_dict(
+                metadata={
+                    "dp_cp_group": parallel_state.get_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                }
+            )
+        )
+        pg_collection = ProcessGroupCollection(
+            tp=self.pg_collection.tp,
+            cp=self.pg_collection.cp,
+            pp=self.pg_collection.pp,
+            dp_cp_gtp_remat=self.dp_cp_group,
+        )
+
+        with monkeypatch.context() as patch:
+            _forbid_global_grid(patch)
+            attention = _build_attention("fused", pg_collection)
+            sharded_state_dict = attention.sharded_state_dict()
+
+        assert _sharding_metadata(sharded_state_dict) == expected
