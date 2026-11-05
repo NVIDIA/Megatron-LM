@@ -11,10 +11,16 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
-from megatron.training.config import TrainingConfig, ValidationConfig
-from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
+from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
+from megatron.training.global_vars import (
+    _set_train_state,
+    destroy_global_vars,
+    get_train_state,
+    set_args,
+)
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _consume_embedding_min_norm_metrics,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -123,6 +129,24 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp
 
 
+@pytest.mark.parametrize("optimizer", [None, "optimizer"])
+@pytest.mark.parametrize("layer_wise", [False, True])
+def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise, run_config):
+    """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
+    toggles them only when an optimizer was built (not under --skip-train or
+    --rl-rollout-only --no-load-optim)."""
+    args = SimpleNamespace(use_megatron_fsdp=False)
+    run_config.optimizer.use_distributed_optimizer = not layer_wise
+    run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
+    run_config.optimizer.overlap_param_gather = True
+    assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
+    run_config.optimizer.overlap_param_gather = False
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
+    run_config.optimizer.overlap_param_gather = True
+    args.use_megatron_fsdp = True
+    assert not training.should_disable_forward_pre_hook(args, optimizer)
+
+
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
     """Hybrid MTP repeats each inner-pattern indexer once per unshared prediction depth."""
     args = SimpleNamespace(
@@ -178,14 +202,86 @@ class TestTraining:
         set_args(args)
         _set_train_state()
 
-    def test_build_train_valid_test_data_iterators(self, run_config):
-        train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
-            mock_train_valid_test_datasets_provider
+    @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
+    @pytest.mark.parametrize("verify_integrity", [False, True])
+    def test_checkpoint_conversion_preserves_supported_integrity_settings(
+        self, monkeypatch, run_config, ckpt_format, verify_integrity
+    ):
+        """Verify the source before clearing integrity checks for unsupported outputs."""
+        run_config.validation.skip_train = True
+        args = SimpleNamespace(
+            logits_save_dir=None,
+            logits_load_dir=None,
+            moe_use_upcycling=False,
+            load="source-checkpoints",
+            pretrained_checkpoint=None,
+            ckpt_format="torch_dist",
+            ckpt_convert_format=ckpt_format,
+            ckpt_convert_save="converted-checkpoints",
+            verify_integrity=verify_integrity,
         )
-        train_data = next(train_iter)
-        valid_data = next(valid_iter)
-        test_data = next(test_iter)
-        assert (train_data, valid_data, test_data) == (1, 2, 3)
+
+        def load_checkpoint(*unused_args, **unused_kwargs):
+            assert args.ckpt_format == "torch_dist"
+            assert args.verify_integrity is verify_integrity
+            return 123, 456
+
+        def save_checkpoint(*unused_args, **unused_kwargs):
+            assert args.ckpt_format == ckpt_format
+            assert args.save == str(Path("converted-checkpoints") / ckpt_format)
+            assert args.use_dist_ckpt is (ckpt_format != "torch")
+            checkpoint = CheckpointConfig(
+                ckpt_format=args.ckpt_format, verify_integrity=args.verify_integrity
+            )
+            assert checkpoint.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+
+        load = Mock(side_effect=load_checkpoint)
+        save = Mock(side_effect=save_checkpoint)
+        monkeypatch.setattr(training, "get_args", lambda: args)
+        monkeypatch.setattr(training, "get_timers", Mock())
+        monkeypatch.setattr(training, "get_one_logger", lambda: None)
+        monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+        monkeypatch.setattr(training, "get_model", Mock(return_value=[torch.nn.Linear(1, 1)]))
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+        monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+        monkeypatch.setattr(training, "update_num_microbatches", Mock())
+        monkeypatch.setattr(training, "load_checkpoint", load)
+        monkeypatch.setattr(training, "save_checkpoint", save)
+
+        with pytest.raises(SystemExit):
+            training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
+        load.assert_called_once()
+        save.assert_called_once()
+
+    @pytest.mark.parametrize("build_train", [True, False])
+    def test_build_train_valid_test_data_iterators(self, run_config, build_train):
+        """A caller-managed training iterator (build_train_dataloader=False) skips only the
+        training loader; validation and test loaders and the data flags are still built."""
+        train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
+            mock_train_valid_test_datasets_provider, build_train_dataloader=build_train
+        )
+        if build_train:
+            assert next(train_iter) == 1
+        else:
+            assert train_iter is None
+        assert (next(valid_iter), next(test_iter)) == (2, 3)
+        train_state = get_train_state()
+        flags = (train_state.do_train, train_state.do_valid, train_state.do_test)
+        assert flags == (True, True, True)
+
+    def test_build_train_valid_test_data_iterators_resume_without_eval_interval(self, run_config):
+        """Resuming without eval_interval should not count any consumed validation samples."""
+        run_config.train.train_samples = None
+        run_config.validation.eval_interval = None
+        train_state = get_train_state()
+        train_state.iteration = 10
+        train_state.consumed_train_samples = 0
+        train_state.consumed_valid_samples = 0
+
+        build_train_valid_test_data_iterators(mock_train_valid_test_datasets_provider)
+
+        assert train_state.consumed_train_samples == 10
+        assert train_state.consumed_valid_samples == 0
 
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
@@ -203,6 +299,30 @@ class TestTraining:
 
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+
+    def test_embedding_min_norm_metrics_combine_model_shards(self, monkeypatch):
+        local_stats = torch.tensor([2.0, 4.0, 0.5, 1.0], dtype=torch.float64, device='cuda')
+        remote_stats = torch.tensor([2.0, 6.0, 1.75, 2.0], dtype=torch.float64, device='cuda')
+        mimo_optimizer = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(),
+                SimpleNamespace(_consume_embedding_min_norm_stats=lambda: local_stats),
+            ]
+        )
+
+        def fake_all_reduce(stats, op):
+            assert op == torch.distributed.ReduceOp.SUM
+            stats.add_(remote_stats)
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        assert _consume_embedding_min_norm_metrics(mimo_optimizer) == {
+            'embedding-min-norm/row-events-rescaled': 4.0,
+            'embedding-min-norm/fraction-rescaled': 0.4,
+            'embedding-min-norm/projection-delta-rms': 0.75,
+            'embedding-min-norm/zero-row-events': 3.0,
+        }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
@@ -235,18 +355,16 @@ class TestTraining:
         for vocab in range(1, 600000, 1000):
             for mult in [1, 17, 32, 64, 128]:
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
         for vocab in range(1, 10_000, 500):
             for mult in range(1, 1024 + 1):
                 args.make_vocab_size_divisible_by = mult
-                assert old_round_impl(vocab, mult) == vocab_size_with_padding(vocab, args, False), (
-                    vocab,
-                    mult,
-                )
+                assert old_round_impl(vocab, mult) == vocab_size_with_padding(
+                    vocab, args.make_vocab_size_divisible_by, args.tensor_model_parallel_size, False
+                ), (vocab, mult)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -305,14 +423,10 @@ class TestPackedSampleAccounting:
         self, monkeypatch, schedule, expected_iters
     ):
         from megatron.core import num_microbatches_calculator as calculator
-        from megatron.training import training
+        from megatron.training.config import container
 
         monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
 
-        def unexpected_global_config():
-            raise AssertionError("sample horizon must use the supplied TrainingConfig")
-
-        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
         train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
@@ -326,7 +440,7 @@ class TestPackedSampleAccounting:
             data_parallel_size=1,
             step_batch_size_schedule=schedule,
         )
-        training.update_train_iters(train)
+        container.update_train_iters(train)
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 

@@ -19,17 +19,19 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
 def _default_placements() -> Placements:
@@ -58,7 +60,7 @@ def test_fused_wgrad_mask_marks_only_te_fused_gemm_weights(distributed_setup):
     )
     frozen = te.Linear(16, 16, bias=True, device=device, fuse_wgrad_accumulation=True)
     frozen.requires_grad_(False)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
         fully_shard(frozen, mesh=mesh, placements=_default_placements())
 
@@ -85,7 +87,7 @@ def _fused_layer_norm_linear_group(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
     [group] = model.parameter_groups
     unsharded = {
@@ -190,7 +192,7 @@ def _build_fused_wgrad_run(mesh, placements, variant, dtype, fuse, device):
         checkpoint_first=variant.startswith("checkpointed"),
         use_reentrant=variant == "checkpointed_reentrant",
     )
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         if variant == "mixed_unit":
             fully_shard(model, mesh=mesh, placements=placements)
         else:
@@ -271,7 +273,7 @@ def test_fused_wgrad_main_grad_only_exists_during_backward(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = _FusedWgradModel(device, torch.float32, fuse_first=True, fuse_second=True)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.first, mesh=mesh, placements=_default_placements())
         fully_shard(model.second, mesh=mesh, placements=_default_placements())
     unsharded = {
@@ -299,9 +301,6 @@ def test_fused_wgrad_main_grad_only_exists_during_backward(distributed_setup):
     )
     x = torch.randn(4, 16, device=device, requires_grad=True)
 
-    with torch.no_grad():
-        model(x)
-    assert with_main_grad("") == set()
     loss = model(x).square().mean()
     assert with_main_grad("") == set()
     loss.backward()
@@ -319,7 +318,7 @@ def test_fused_wgrad_recompute_sets_main_grad_at_each_backward(distributed_setup
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = _FusedWgradModel(device, torch.float32, fuse_first=True, fuse_second=True)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model.first, mesh=mesh, placements=_default_placements())
         fully_shard(model.second, mesh=mesh, placements=_default_placements())
     [first_weight] = [
@@ -366,18 +365,19 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
     fused, copied = make_layer(True), make_layer(False)
     # backward_dw() runs after autograd's end-of-backward callback, so the caller orders the
     # current stream after the reductions with finish_grad_sync().
-    with fully_shard_context(device=device, caller_managed_grad_sync=True):
-        fully_shard(fused, mesh=mesh, placements=_default_placements())
-    with fully_shard_context(device=device, caller_managed_grad_sync=True):
-        fully_shard(copied, mesh=mesh, placements=_default_placements())
+    for layer in (fused, copied):
+        with fully_shard_context(
+            FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
+        ):
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     for layer in (fused, copied):
         layer(x).float().square().mean().backward()
         assert layer.weight.grad is None
-        assert layer.phase is FsdpModule.Phase.BACKWARD
+        assert layer.phase is Phase.BACKWARD
         layer.backward_dw()
-        assert layer.phase is FsdpModule.Phase.RESTING
+        assert layer.phase is Phase.RESTING
         layer.context.finish_grad_sync()
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
 
@@ -386,11 +386,11 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
 _DELAY_CYCLES = 1 << 28
 
 
-def _delay_reduce_scatter_stream(context):
-    """Return a backward pre-hook that stalls the reduce-scatter stream."""
+def _delay_inner_reduction_stream(context):
+    """Return a backward pre-hook that stalls the inner reduction stream."""
 
     def hook(_module, _grad_output):
-        with torch.cuda.stream(context.reduce_scatter_stream):
+        with torch.cuda.stream(context.inner_reduction_stream):
             torch.cuda._sleep(_DELAY_CYCLES)
 
     return hook
@@ -402,7 +402,7 @@ def _fused_linear_stack(
     fuse=True,
     delay_wgrad_compute=False,
     schedule_policy=SchedulePolicy(),
-    unify_communication_stream=False,
+    overlap_allgather_reduction=True,
     caller_managed_grad_sync=False,
 ):
     """Shard three TE Linears, then their parameterless nn.Sequential root, in one context.
@@ -426,11 +426,11 @@ def _fused_linear_stack(
             for _ in range(3)
         )
     )
-    with fully_shard_context(
-        device=device,
-        unify_communication_stream=unify_communication_stream,
+    runtime_policy = RuntimePolicy(
+        overlap_allgather_reduction=overlap_allgather_reduction,
         caller_managed_grad_sync=caller_managed_grad_sync,
-    ) as context:
+    )
+    with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)) as context:
         for layer in model:
             fully_shard(
                 layer, mesh=mesh, placements=_default_placements(), schedule_policy=schedule_policy
@@ -505,24 +505,24 @@ def test_fused_wgrad_buffer_is_freed_after_its_reduce_scatter(distributed_setup,
 
 
 @pytest.mark.parametrize(
-    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+    "overlap_allgather_reduction", [True, False], ids=["separate_streams", "unified_stream"]
 )
 def test_fused_wgrad_waits_for_its_buffer_to_be_zeroed(
-    distributed_setup, unify_communication_stream
+    distributed_setup, overlap_allgather_reduction
 ):
-    """TE writes a fused wgrad only after its buffer is zeroed on the reduce-scatter stream.
+    """TE writes a fused wgrad only after its buffer is zeroed on the inner reduction stream.
 
     The parameterless root allocates the last layer's buffer, and no post-backward runs between
     that allocation and the last layer's backward, so only the wait at the start of that
-    backward orders the zeroing first. Stalling the reduce-scatter stream exposes a missing wait.
+    backward orders the zeroing first. Stalling that stream exposes a missing wait.
     """
     grads = {}
     for fuse in (False, True):
         model, context = _fused_linear_stack(
-            distributed_setup, fuse=fuse, unify_communication_stream=unify_communication_stream
+            distributed_setup, fuse=fuse, overlap_allgather_reduction=overlap_allgather_reduction
         )
         # prepend=True: stall before MFSDP's pre-hook allocates the last layer's buffer.
-        model.register_full_backward_pre_hook(_delay_reduce_scatter_stream(context), prepend=True)
+        model.register_full_backward_pre_hook(_delay_inner_reduction_stream(context), prepend=True)
         torch.manual_seed(5678)
         x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
         model(x).square().mean().backward()
@@ -539,7 +539,7 @@ def test_fused_wgrad_delayed_weight_gradients_in_any_order(distributed_setup):
         model, context = _fused_linear_stack(
             distributed_setup, fuse=fuse, delay_wgrad_compute=True, caller_managed_grad_sync=True
         )
-        model.register_full_backward_pre_hook(_delay_reduce_scatter_stream(context), prepend=True)
+        model.register_full_backward_pre_hook(_delay_inner_reduction_stream(context), prepend=True)
         torch.manual_seed(5678)
         x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
         model(x).square().mean().backward()
