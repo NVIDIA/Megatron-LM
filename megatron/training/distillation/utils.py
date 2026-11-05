@@ -47,6 +47,10 @@ except ImportError:
 
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    global_process_group_fallback,
+)
 from megatron.training import get_args, get_train_state
 from megatron.training.global_vars import get_run_config
 from megatron.training.utils import get_blend_and_blend_per_split
@@ -101,6 +105,9 @@ LOGPROBS_FORMAT_VERSION = 2
 
 # Cache to not have to re-run the glob operation for the same pattern, which is expensive for MSC.
 _STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
+
+# Process-group fields of the model's collection that the cached-logits saver and KD loss use.
+_DISTILLATION_PROCESS_GROUPS = ('tp', 'cp', 'dp_gtp_remat', 'tp_dp_cp')
 
 
 def is_msc_path(path: str) -> bool:
@@ -183,7 +190,41 @@ def storage_glob(pattern: str) -> List[str]:
     return glob.glob(pattern)
 
 
-def _broadcast_without_pp(factory: Callable[[], Any]) -> Any:
+def resolve_distillation_process_groups(
+    pg_collection: Optional[ProcessGroupCollection], owner: str
+) -> ProcessGroupCollection:
+    """Return the process groups the cached-logits saver and KD loss run on.
+
+    Both use four groups of the model they serve: ``tp`` for the
+    vocab-parallel logits, ``cp`` for the sequence shards, ``dp_gtp_remat``
+    (every rank that owns distinct samples) to name and reshard the cached
+    shards, and ``tp_dp_cp`` (every rank of the pipeline stage) to share
+    remote directory listings.
+
+    Args:
+        pg_collection: Process groups of the model. Omitting it is deprecated:
+            the groups of the global parallel state are then selected, with a
+            ``ProcessGroupFallbackWarning``.
+        owner: Name of the caller, used in the warning and in error messages.
+
+    Raises:
+        ValueError: If *pg_collection* does not set one of the four groups.
+    """
+    if pg_collection is None:
+        with global_process_group_fallback(owner, deprecated_in="0.21", removed_in="0.23"):
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=list(_DISTILLATION_PROCESS_GROUPS)
+            )
+    groups = vars(pg_collection)
+    missing = [name for name in _DISTILLATION_PROCESS_GROUPS if groups.get(name) is None]
+    if missing:
+        raise ValueError(f"{owner} requires the process groups {missing} in pg_collection.")
+    return pg_collection
+
+
+def _broadcast_without_pp(
+    factory: Callable[[], Any], tp_dp_cp_group: Optional[dist.ProcessGroup] = None
+) -> Any:
     """Run *factory* on the TP×DP×CP group src rank and broadcast the result.
 
     Object-store traffic is expensive / rate-limited (e.g. Swiftstack), so only
@@ -192,32 +233,54 @@ def _broadcast_without_pp(factory: Callable[[], Any]) -> Any:
     KD loader only runs on the last PP stage and a world-group broadcast would
     deadlock under PP>1.  All ranks on the calling stage must enter this
     collective.  On a single process, just calls *factory* locally.
+
+    *tp_dp_cp_group* is that group in the model's grid. Omitting it is
+    deprecated: the group of the global parallel state is then used, with a
+    ``ProcessGroupFallbackWarning``.
     """
     if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
         return factory()
-    group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
-    src = dist.get_process_group_ranks(group)[0]
+    if tp_dp_cp_group is None:
+        with global_process_group_fallback(
+            "_broadcast_without_pp", "tp_dp_cp_group", deprecated_in="0.21", removed_in="0.23"
+        ):
+            tp_dp_cp_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+    src = dist.get_process_group_ranks(tp_dp_cp_group)[0]
     payload = [factory() if dist.get_rank() == src else None]
-    dist.broadcast_object_list(payload, src=src, group=group)
+    dist.broadcast_object_list(payload, src=src, group=tp_dp_cp_group)
     return payload[0]
 
 
-def _storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
+def _storage_glob_rank0(
+    pattern: str, cached: bool = False, tp_dp_cp_group: Optional[dist.ProcessGroup] = None
+) -> List[str]:
     """Run ``storage_glob`` once per pipeline stage and broadcast the result."""
     if cached:
         if (paths := _STORAGE_GLOB_CACHE.get(pattern)) is not None:
             return paths
 
-    paths = list(_broadcast_without_pp(lambda: storage_glob(pattern)) or [])
+    paths = list(_broadcast_without_pp(lambda: storage_glob(pattern), tp_dp_cp_group) or [])
     _STORAGE_GLOB_CACHE[pattern] = paths
     return paths
 
 
-def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True) -> List[str]:
-    """Glob under *root* and filter the result by basename."""
+def storage_glob_with_caching(
+    root: str,
+    name_pattern: str,
+    cached: bool = True,
+    *,
+    tp_dp_cp_group: Optional[dist.ProcessGroup] = None,
+) -> List[str]:
+    """Glob under *root* and filter the result by basename.
+
+    A remote listing is a collective over *tp_dp_cp_group*, every rank of the
+    calling pipeline stage (see :func:`_broadcast_without_pp`).
+    """
     if not is_remote_storage_path(root):
         return storage_glob(os.path.join(root, name_pattern))
-    listing = _storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
+    listing = _storage_glob_rank0(
+        os.path.join(root, "*.tar"), cached=cached, tp_dp_cp_group=tp_dp_cp_group
+    )
 
     return [
         str(path) for path in listing if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
@@ -795,24 +858,27 @@ def peek_logprobs_metadata(tar_path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
+def peek_first_logprobs_metadata(
+    logprobs_dir: str, *, tp_dp_cp_group: Optional[dist.ProcessGroup] = None
+) -> Optional[Dict[str, Any]]:
     """Read ``_meta.json`` from any available tar in *logprobs_dir*.
 
     Listing goes through :func:`storage_glob_with_caching` (rank-0 object-store
     list + cache).  For remote storage the metadata peek itself is also rank-0
-    on the TP×DP×CP group and broadcast to the rest of the stage, so only one
-    rank opens the object.  Local paths read directly on every rank -- the
-    collective exists only to limit object-store traffic, and (mirroring
-    :func:`storage_glob_with_caching`) skipping it for local paths keeps this
-    callable without an initialized ``parallel_state`` (e.g. single-process
-    unit tests running under a multi-rank ``torch.distributed`` launcher).
+    on the TP×DP×CP group (*tp_dp_cp_group*) and broadcast to the rest of the
+    stage, so only one rank opens the object.  Local paths read directly on
+    every rank -- the collective exists only to limit object-store traffic,
+    and (mirroring :func:`storage_glob_with_caching`) skipping it for local
+    paths keeps this callable without an initialized ``parallel_state`` (e.g.
+    single-process unit tests running under a multi-rank
+    ``torch.distributed`` launcher).
     Returns ``None`` if no tars are present yet.
     """
-    tars = storage_glob_with_caching(logprobs_dir, "*.tar")
+    tars = storage_glob_with_caching(logprobs_dir, "*.tar", tp_dp_cp_group=tp_dp_cp_group)
     peek = lambda: peek_logprobs_metadata(tars[0]) if tars else None
     if not is_remote_storage_path(logprobs_dir):
         return peek()
-    return _broadcast_without_pp(peek)
+    return _broadcast_without_pp(peek, tp_dp_cp_group)
 
 
 def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tensor]]:
@@ -858,15 +924,18 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tenso
     return tensors["values"], indices_list, None
 
 
-def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
+def detect_saved_dp_size(
+    logprobs_dir: str, *, tp_dp_cp_group: Optional[dist.ProcessGroup] = None
+) -> Optional[int]:
     """Scan *logprobs_dir* for batched tars and return the saved DP world size.
 
     Legacy prefixed shards are only considered compatible when the saved CP
     rank is 0.  Higher CP ranks imply old per-CP-rank payloads that cannot be
-    safely re-sliced under a different CP size.
+    safely re-sliced under a different CP size.  A remote listing is a
+    collective over *tp_dp_cp_group* (see :func:`storage_glob_with_caching`).
     """
     dp_ranks_found: set[int] = set()
-    for path in storage_glob_with_caching(logprobs_dir, "*.tar"):
+    for path in storage_glob_with_caching(logprobs_dir, "*.tar", tp_dp_cp_group=tp_dp_cp_group):
         fname = storage_basename(path)
         if match := BATCHED_TAR_RE.match(fname):
             cp_group = match.group("cp")
