@@ -344,7 +344,9 @@ async def _run_coordinator_handoff(
                         assert not engine.requests
                         assert not engine._pending_kv_imports
                         assert not engine._deferred_kv_handoffs
-                        assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
+                        assert torch.equal(
+                            allocator.pc_state.block_ref_counts[held], torch.ones_like(held)
+                        )
                         allocator.release_memory_blocks(held)
                     await _async_barrier(control)
 
