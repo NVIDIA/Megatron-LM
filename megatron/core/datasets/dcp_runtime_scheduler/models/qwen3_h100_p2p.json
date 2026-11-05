@@ -1,0 +1,364 @@
+{
+  "schema_version": 1,
+  "name": "qwen3_h100_p2p",
+  "unit": "ms_per_layer",
+  "domain": {
+    "hardware": "h100",
+    "nodes": 4,
+    "ranks_per_node": 8,
+    "world_size": 32,
+    "ep_size": 8,
+    "tokens_per_rank": 4096,
+    "dataset_alignment": 64,
+    "cp_sizes": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "min_logical_length": 1,
+    "max_logical_length": 16384,
+    "max_group_seqs": 64,
+    "tail_padding": "extend_last",
+    "partition": "zigzag",
+    "config": {
+      "num_layers": 48,
+      "hidden_size": 2048,
+      "ffn_hidden_size": 6144,
+      "num_attention_heads": 32,
+      "num_query_groups": 4,
+      "kv_channels": 128,
+      "num_moe_experts": 128,
+      "moe_ffn_hidden_size": 768,
+      "moe_router_topk": 8,
+      "bf16": true,
+      "fp16": false,
+      "fp8": null,
+      "fp4": null,
+      "tensor_model_parallel_size": 1,
+      "pipeline_model_parallel_size": 1,
+      "virtual_pipeline_model_parallel_size": null,
+      "expert_model_parallel_size": 8,
+      "expert_tensor_parallel_size": 1,
+      "sequence_parallel": false,
+      "qk_layernorm": true,
+      "normalization": "RMSNorm",
+      "experimental_attention_variant": null,
+      "multi_latent_attention": false,
+      "attention_backend": "fused",
+      "recompute_granularity": null,
+      "recompute_method": null,
+      "recompute_num_layers": null,
+      "recompute_modules": [
+        "core_attn"
+      ],
+      "cuda_graph_impl": "none",
+      "moe_token_dispatcher_type": "flex",
+      "moe_flex_dispatcher_backend": "hybridep",
+      "moe_hybridep_pad_variable_tokens": true,
+      "moe_hybridep_pad_uneven_dispatch_inputs": true,
+      "moe_router_force_load_balancing": true,
+      "moe_router_load_balancing_type": "aux_loss",
+      "moe_grouped_gemm": true,
+      "moe_permute_fusion": true,
+      "moe_router_fusion": true,
+      "moe_router_dtype": "fp32",
+      "moe_router_pre_softmax": false,
+      "moe_router_num_groups": null,
+      "moe_router_group_topk": null,
+      "moe_expert_capacity_factor": null,
+      "moe_pad_expert_input_to_capacity": false,
+      "gated_linear_unit": true,
+      "add_bias_linear": false,
+      "cross_entropy_loss_fusion": true,
+      "cross_entropy_fusion_impl": "native",
+      "layernorm_epsilon": 1e-06,
+      "hidden_dropout": 0.0,
+      "attention_dropout": 0.0,
+      "cp_partition_mode": "zigzag",
+      "max_seqlen_per_dp_cp_rank": 4096,
+      "thd_max_packed_sequences": 64
+    },
+    "step_overhead_global_batch_size": 256
+  },
+  "features": {
+    "names": [
+      "bias",
+      "zigzag_max_causal_work",
+      "padded_s2_per_rank",
+      "sequence_count"
+    ],
+    "token_unit": 4096,
+    "zigzag_max_causal_work": "2 * maximum rank sum of valid causal query-key pairs / token_unit^2; ownership uses each sequence's padded physical interval"
+  },
+  "profiles": {
+    "classic_p2p": {
+      "source": {
+        "mcore_commit": "1bc12aaff511eccd728566fcad47daf4b7043c8d",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "world_size": 32,
+        "transformer_engine_version": "2.14.1+366798ef",
+        "force_balance": true,
+        "learning_rate": 0.0,
+        "initial_context_parallel_size": 8,
+        "input_adaptation": "Initialize CP8/DP4; fetch per-DP sample counts for fixed rows; main train/holdout GA1; overhead controls can have multiple distinct rows",
+        "timing_policy": "World barrier + device synchronize before each wall timer; CUDA events per module and one device synchronize at step end; no per-module synchronize; JSON/byte audit outside wall timer",
+        "raw_records_manifest_sha256": "4d0d757fa592c47bb9fd310db348b840ab901dc99656742aa28ea23ceb49e984",
+        "method": "GPU critical-path attention events, independent per transport and CP tier"
+      },
+      "validation": {
+        "training_case_count": 66,
+        "heldout_case_count": 7,
+        "attention_training_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.02239337075396785,
+            "p95_absolute_relative_error": 0.07946107269741819,
+            "max_absolute_relative_error": 0.11292954697358364
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.012867089400778846,
+            "p95_absolute_relative_error": 0.04647923071947227,
+            "max_absolute_relative_error": 0.086015761063096
+          }
+        },
+        "attention_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.04071147487423889,
+            "p95_absolute_relative_error": 0.11920487654975578,
+            "max_absolute_relative_error": 0.12861551902041848
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.04677785874038117,
+            "p95_absolute_relative_error": 0.07422852690697664,
+            "max_absolute_relative_error": 0.07551542349412399
+          }
+        },
+        "block_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.0225150974228367,
+            "p95_absolute_relative_error": 0.05144221095584911,
+            "max_absolute_relative_error": 0.05668269212982228
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.021328229925807473,
+            "p95_absolute_relative_error": 0.04143759731890842,
+            "max_absolute_relative_error": 0.043255832894559976
+          }
+        },
+        "prediction_sensitivity": {
+          "forward": 0.011195138181352093,
+          "backward": 0.0001612035345279761
+        },
+        "fit_report_content_sha256": "9a381bf668f0deade3504aadbdd9dd70c1f49ae156f8ea287d5ae7bb70e7aa63",
+        "scope": "Fixed-layout anchors and heldout packs; production layouts require separate validation"
+      },
+      "attention": {
+        "1": {
+          "forward": [
+            1.2128584054954015,
+            0.0,
+            0.04435068598925551,
+            0.0
+          ],
+          "backward": [
+            1.3288167583615866,
+            0.8924267540461173,
+            0.0,
+            0.0060845090525743824
+          ]
+        },
+        "2": {
+          "forward": [
+            1.8478452723497636,
+            0.0,
+            0.05318619172076028,
+            0.025876967533776503
+          ],
+          "backward": [
+            1.9760785107257381,
+            0.7601008969669735,
+            0.0,
+            0.02032264471873358
+          ]
+        },
+        "4": {
+          "forward": [
+            2.5043350784561245,
+            0.1218145883505669,
+            0.0773441292283942,
+            0.0
+          ],
+          "backward": [
+            3.0152511934521398,
+            0.7562166546709131,
+            0.0,
+            0.03020736160955443
+          ]
+        },
+        "8": {
+          "forward": [
+            4.446305121974375,
+            0.1540725090895508,
+            0.013952962725541182,
+            0.019340262985673328
+          ],
+          "backward": [
+            5.257617253678826,
+            0.74964651734668,
+            0.0,
+            0.03599996665896381
+          ]
+        }
+      },
+      "remainder_ms": {
+        "forward": [
+          5.035772254870239,
+          0.038776294941261974
+        ],
+        "backward": [
+          3.9595507138740054,
+          0.9236343833017865
+        ]
+      },
+      "microbatch_overhead_ms": {
+        "forward": 0.0,
+        "backward": 28.194657560519136
+      },
+      "iteration_tail_ms": 1855.883808792498
+    },
+    "native_p2p": {
+      "source": {
+        "mcore_commit": "2f59b285a517c5317c394d1c8ad31d92e2285652",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "world_size": 32,
+        "transformer_engine_version": "2.14.1+366798ef",
+        "force_balance": true,
+        "learning_rate": 0.0,
+        "initial_context_parallel_size": 8,
+        "input_adaptation": "Initialize CP8/DP4; fetch per-DP sample counts for fixed rows; main train/holdout GA1; overhead controls can have multiple distinct rows",
+        "timing_policy": "World barrier + device synchronize before each wall timer; CUDA events per module and one device synchronize at step end; no per-module synchronize; JSON/byte audit outside wall timer",
+        "raw_records_manifest_sha256": "d2fb3006725065fb899e0a94d6e930358e9370e39111d0a76b90be6efc7eb84f",
+        "method": "GPU critical-path attention events, independent per transport and CP tier"
+      },
+      "validation": {
+        "training_case_count": 66,
+        "heldout_case_count": 7,
+        "attention_training_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.020666627563931318,
+            "p95_absolute_relative_error": 0.09750010399141039,
+            "max_absolute_relative_error": 0.11963612306516111
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.01325708579689874,
+            "p95_absolute_relative_error": 0.049190564475190046,
+            "max_absolute_relative_error": 0.08439598823725449
+          }
+        },
+        "attention_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.07313910766579004,
+            "p95_absolute_relative_error": 0.23636872364927508,
+            "max_absolute_relative_error": 0.287750585997644
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.04027108744098292,
+            "p95_absolute_relative_error": 0.06468734071662945,
+            "max_absolute_relative_error": 0.06770827784442354
+          }
+        },
+        "block_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.039118207698483363,
+            "p95_absolute_relative_error": 0.07559791005969171,
+            "max_absolute_relative_error": 0.07653161307980405
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.01319609271046507,
+            "p95_absolute_relative_error": 0.032219668397158584,
+            "max_absolute_relative_error": 0.033149601272073746
+          }
+        },
+        "prediction_sensitivity": {
+          "forward": 0.011914826198409667,
+          "backward": 0.0003950360320841284
+        },
+        "fit_report_content_sha256": "c3dce9e15eb521e77c67d8952cd0eae426b3e713cef7be2d878371cf8e13cb69",
+        "scope": "Fixed-layout anchors and heldout packs; production layouts require separate validation"
+      },
+      "attention": {
+        "1": {
+          "forward": [
+            1.2721884988653738,
+            0.0,
+            0.006197951623763322,
+            0.0
+          ],
+          "backward": [
+            1.3313122150835937,
+            0.8879787994579184,
+            0.0,
+            0.005685776481614015
+          ]
+        },
+        "2": {
+          "forward": [
+            1.6025114295226595,
+            0.0,
+            0.11031214676585963,
+            0.09061590113503849
+          ],
+          "backward": [
+            1.975410821780037,
+            0.7673521624573851,
+            0.0,
+            0.02186509654573474
+          ]
+        },
+        "4": {
+          "forward": [
+            2.6077265184052036,
+            0.12704029213374424,
+            0.052907177359745546,
+            0.0
+          ],
+          "backward": [
+            3.006341039034434,
+            0.7647306608235555,
+            0.0,
+            0.032806461917388084
+          ]
+        },
+        "8": {
+          "forward": [
+            4.20728363797868,
+            0.22897876937026235,
+            0.0,
+            0.004930329051772052
+          ],
+          "backward": [
+            5.248286388319165,
+            0.7655862052452082,
+            0.0,
+            0.039289004663647
+          ]
+        }
+      },
+      "remainder_ms": {
+        "forward": [
+          5.0511747273159315,
+          0.0
+        ],
+        "backward": [
+          3.9231838318622305,
+          0.9300856000702744
+        ]
+      },
+      "microbatch_overhead_ms": {
+        "forward": 0.0,
+        "backward": 26.609119476362558
+      },
+      "iteration_tail_ms": 1918.5026854806665
+    }
+  }
+}

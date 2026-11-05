@@ -28,6 +28,10 @@ def make_model(name, geometry, **options):
         from .usp_calib_v1 import USPCalibV1CostModel
 
         return USPCalibV1CostModel(geometry, **options)
+    if name == 'qwen3_h100_p2p':
+        from .qwen3_h100_p2p import Qwen3H100P2PCostModel
+
+        return Qwen3H100P2PCostModel(geometry, **options)
     if name in ('qwen35_gb200', 'dcp_scheduler.adapters:qwen35_new_core_model'):
         return qwen35_new_core_model(**options)
     raise ValueError(f'Unknown in-tree DCP cost model: {name}')

@@ -109,7 +109,7 @@ class LightweightRuntimePlanner(RuntimePlanner):
         if guide is not None and self.timeline.program is not None:
             program = guide(values, cp, ranks=tuple(range(cp)))
             duration = sum(
-                program[payload] if kind == "cp" else payload
+                program[payload] if kind in ("cp", "ep_mean") else payload
                 for phase in self.timeline.program
                 for kind, payload in phase
             )

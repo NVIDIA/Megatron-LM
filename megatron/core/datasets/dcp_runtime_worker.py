@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 
 
 def _runtime_module(name):
@@ -60,6 +60,7 @@ def _initialize_planner(spec):
     elif spec['model'] in (
         'calibrated_attention',
         'usp_calib_v1',
+        'qwen3_h100_p2p',
         'qwen35_gb200',
         'dcp_scheduler.adapters:qwen35_new_core_model',
     ):
@@ -92,6 +93,35 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
     ):
         raise ValueError('Runtime DCP requires lengths matching the dataset padding alignment')
     logical = dict(enumerate(lengths))
+    incumbent_rejection = {}
+    if (
+        spec.get('model') == 'qwen3_h100_p2p'
+        and not spec.get('baseline')
+        and not spec['force_powers']
+        and baseline_rows is not None
+    ):
+        # The default powers heuristic may use legal classic groups whose widths
+        # have no entry in this measured model. Validate every other incumbent
+        # contract before discarding only this unpriceable default comparison.
+        validation_geometry = replace(
+            planner.geometry,
+            allowed_cp_sizes=tuple(sorted(set(planner.geometry.allowed_cp_sizes) | {16, 32})),
+        )
+        groups = validate_rows(
+            baseline_rows,
+            dict(enumerate(padded)),
+            validation_geometry,
+            min(planner.geometry.allowed_cp_sizes),
+        )
+        unsupported = sorted(
+            {cp for row in groups for _, cp, _ in row} - set(planner.geometry.allowed_cp_sizes)
+        )
+        if unsupported:
+            baseline_rows = None
+            incumbent_rejection = {
+                'incumbent_rejection': 'default_incumbent_outside_measured_cp_domain',
+                'incumbent_unsupported_cp_sizes': unsupported,
+            }
     if spec['force_powers']:
         groups = validate_rows(
             baseline_rows,
@@ -106,7 +136,9 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
         plan = planner.plan_padded(
             dict(enumerate(padded)), logical_lengths=logical, incumbent_rows=baseline_rows
         )
-        rows, statistics, predicted_ms = plan.rows, planner.last_statistics, plan.predicted_ms
+        rows = plan.rows
+        statistics = {**planner.last_statistics, **incumbent_rejection}
+        predicted_ms = plan.predicted_ms
     metadata = getattr(planner.model, 'metadata', None)
     model_metadata = metadata() if callable(metadata) else None
     torch = sys.modules.get('torch')

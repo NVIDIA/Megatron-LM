@@ -330,9 +330,17 @@ def runtime_spec(
         if world_size not in (8, 16, 32) or minimum not in (8, 16, 32) or minimum > world_size:
             raise ValueError('usp_calib_v1 requires DPxCP and minimum CP in (8, 16, 32)')
         allowed = tuple(cp for cp in (8, 16, 32) if minimum <= cp <= world_size)
+    if factory == 'qwen3_h100_p2p':
+        allowed = tuple(cp for cp in (1, 2, 4, 8) if minimum <= cp <= world_size)
+        transport = (
+            'native_p2p' if getattr(config, 'use_native_cp_transport', False) else 'classic_p2p'
+        )
+        if 'transport' in options and options['transport'] != transport:
+            raise ValueError('H100 P2P model options do not match the execution transport')
+        options['transport'] = transport
     if minimum not in allowed:
         raise ValueError('Runtime DCP requires a power-of-two minimum CP dividing DPxCP')
-    return dict(
+    spec = dict(
         geometry=dict(
             world_size=world_size,
             tokens_per_rank=config.max_seqlen_per_dp_cp_rank,
@@ -353,3 +361,13 @@ def runtime_spec(
         ),
         force_powers=getattr(config, 'dynamic_cp_runtime_force_powers', False),
     )
+    if factory == 'qwen3_h100_p2p':
+        from .dcp_runtime_scheduler.models.qwen3_h100_p2p import Qwen3H100P2PCostModel
+        from .dcp_runtime_scheduler.runtime.planner import RuntimePlanGeometry
+
+        # The measured powers are canonical groups inside one eight-H100 node.
+        spec['geometry']['align_group_starts'] = True
+        geometry = RuntimePlanGeometry(**spec['geometry'])
+        model = Qwen3H100P2PCostModel(geometry, **options)
+        model.check_domain(geometry, config)
+    return spec

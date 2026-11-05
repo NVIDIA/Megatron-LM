@@ -54,7 +54,7 @@ class DynamicUSPRuntimePlanner(RuntimePlanner):
             )
         else:
             duration = sum(
-                program[payload] if kind == "cp" else payload
+                program[payload] if kind in ("cp", "ep_mean") else payload
                 for phase in self.timeline.program
                 for kind, payload in phase
             )

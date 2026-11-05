@@ -106,6 +106,18 @@ class TimelineModel:
                 for s in range(0, w, e):
                     m = max(t[s : s + e]) + payload
                     t[s : s + e] = [m] * e
+            elif kind == 'ep_mean':
+                # One per-rank contribution comes from its current CP group's pack.
+                # Rank weighting preserves the EP block's valid-token population
+                # when that block contains different CP widths and pack lengths.
+                contributions = [None] * w
+                for g in groups:
+                    start, cp = g[0], g[1]
+                    contributions[start : start + cp] = [g[4][payload]] * cp
+                for s in range(0, w, e):
+                    duration = sum(contributions[s : s + e]) / e
+                    m = max(t[s : s + e]) + duration
+                    t[s : s + e] = [m] * e
             else:  # 'cp' with named cost
                 for g in groups:
                     start, cp = g[0], g[1]
@@ -116,6 +128,10 @@ class TimelineModel:
 
 def _freeze_op(op):
     if "cost" in op:
+        if op.get("sync") == "ep":
+            if op.get("aggregation") != "mean":
+                raise ValueError("Named EP costs require an explicit mean aggregation")
+            return ("ep_mean", op["cost"])
         return ("cp", op["cost"])
     return (op["sync"], float(op["duration_ms"]))
 
