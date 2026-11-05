@@ -17,11 +17,13 @@ import json
 import os
 import re
 from functools import partial
+from typing import Optional
 
 import torch
 
 from megatron.core import dist_checkpointing
 from megatron.core.models.vision.encoder_registry import get_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
@@ -473,24 +475,36 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     return True
 
 
-def get_model(is_vlm: bool) -> MegatronModule:
-    """Build and load the model; dispatches to the right model_provider."""
+def get_model(
+    is_vlm: bool,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> MegatronModule:
+    """Build and load the model; dispatches to the right model_provider.
+
+    Args:
+        is_vlm: Build the vision-language model rather than the GPT backbone.
+        pg_collection: Process groups to build and load the model on, e.g. one
+            disaggregated inference shard's groups. Defaults to the MPU globals.
+        checkpoint_group: Ranks forming this model replica's complete checkpoint view.
+    """
     args = get_args()
 
     is_mimo = getattr(args, 'mimo_checkpoint_prefix_map', None) is not None
     if is_vlm and is_mimo:
         from mimo_checkpoint_model import model_provider  # examples/multimodal
 
-        model = _get_model(model_provider, wrap_with_ddp=False)
+        provider = model_provider
     elif is_vlm:
         from model import model_provider  # examples/multimodal/model.py
 
-        model = _get_model(partial(model_provider), wrap_with_ddp=False)
+        provider = partial(model_provider)
     else:
         from gpt_builders import gpt_builder  # examples/inference/gpt
         from model_provider import model_provider
 
-        model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
+        provider = partial(model_provider, gpt_builder)
+    model = _get_model(provider, wrap_with_ddp=False, pg_collection=pg_collection)
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
@@ -499,6 +513,12 @@ def get_model(is_vlm: bool) -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        tp_group=pg_collection.tp if pg_collection is not None else None,
+        pp_group=pg_collection.pp if pg_collection is not None else None,
+        dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
+        dp_group=pg_collection.dp if pg_collection is not None else None,
+        expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
+        checkpoint_group=checkpoint_group,
     )
     if is_mimo:
         _check_mimo_checkpoint_fully_loaded(args, model[0])

@@ -35,14 +35,13 @@ from megatron.core.inference.config import (  # noqa: E402
     MultimodalPromptConfig,
     VideoProcessingConfig,
 )
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
     VLMInferenceWrapper,
 )
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (  # noqa: E402,E501
-    TextGenerationController,
-)
+from megatron.core.inference.shards import build_inference_pg_collections_for_shards  # noqa: E402
+from megatron.core.inference.shards_spec import spec_declares_disaggregation  # noqa: E402
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (  # noqa: E402
     start_text_gen_server,
     stop_text_gen_server,
@@ -56,12 +55,21 @@ from megatron.core.utils import (  # noqa: E402
 from megatron.inference.utils import (  # noqa: E402
     get_dynamic_inference_engine,
     get_inference_config_from_model_and_args,
+    get_model_for_inference,
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
+from megatron.training.argument_utils import (
+    inference_cfg_container_from_args,
+    tokenizer_config_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
-from megatron.training.argument_utils import inference_cfg_container_from_args, tokenizer_config_from_args
-from megatron.training.global_vars import get_run_config, get_tokenizer, rebuild_tokenizer, set_run_config
+from megatron.training.global_vars import (
+    get_run_config,
+    get_tokenizer,
+    rebuild_tokenizer,
+    set_run_config,
+)
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -202,12 +210,36 @@ def _build_engine_for_vlm_or_gpt(cfg, is_vlm: bool) -> DynamicInferenceEngine:
     """
     args = get_args()
 
+    # Role-tagged --inference-shards: build and load the model on this rank's shard
+    # process groups, then let the core factory select the disaggregated engine.
+    pg_collection = checkpoint_group = None
+    if spec_declares_disaggregation(args.inference_shards):
+        shards = build_inference_pg_collections_for_shards(
+            torch.distributed.get_world_size(), args.inference_shards
+        )
+        local_shard = next(shard for shard in shards if shard.pg_collection is not None)
+        pg_collection = local_shard.pg_collection
+        checkpoint_group = local_shard.process_group
+
     if not is_vlm:
-        return get_dynamic_inference_engine()
+        if pg_collection is None:
+            return get_dynamic_inference_engine()
+        model = get_model_for_inference(
+            pg_collection=pg_collection, checkpoint_group=checkpoint_group
+        )
+        inference_config = get_inference_config_from_model_and_args(model, args)
+        inference_config.pg_collection = pg_collection
+        return build_dynamic_inference_engine(
+            model=model, tokenizer=get_tokenizer(), inference_config=inference_config
+        )
 
     tokenizer = get_tokenizer()
-    model = get_vlm_model(is_vlm=True)
+    model = get_vlm_model(
+        is_vlm=True, pg_collection=pg_collection, checkpoint_group=checkpoint_group
+    )
     inference_config = get_inference_config_from_model_and_args(model, args)
+    if pg_collection is not None:
+        inference_config.pg_collection = pg_collection
 
     # A vision encoder with a native spatial merger (e.g. ViTModel's 2x2 merger) emits one token per
     # merge_size x merge_size patch block and needs patch grids divisible by merge_size.
@@ -295,10 +327,14 @@ def _build_engine_for_vlm_or_gpt(cfg, is_vlm: bool) -> DynamicInferenceEngine:
         if torch.distributed.get_rank() == 0:
             print(f"MIMO image prompt token: {image_token!r} (id {args.image_token_id})")
 
-    context = DynamicInferenceContext(model.config, inference_config)
-    wrapped_model = VLMInferenceWrapper(model, context)
-    controller = TextGenerationController(wrapped_model, tokenizer)
-    return DynamicInferenceEngine(controller, context)
+    # The core factory builds the same context/wrapper/controller/engine stack, and
+    # selects and configures the disaggregated engine for role-tagged shards.
+    return build_dynamic_inference_engine(
+        model=model,
+        tokenizer=tokenizer,
+        inference_config=inference_config,
+        inference_wrapper_cls=VLMInferenceWrapper,
+    )
 
 
 @trace_async_exceptions
