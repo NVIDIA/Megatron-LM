@@ -564,12 +564,21 @@ class TestGroupedExpertChainClassification:
         # Distinct from the general ungraphed chain's stream.
         assert gtp_module._stream_key(c1, group) != gtp_module._stream_key("GTP_ungraphed", group)
 
-    def test_graphed_moe_keeps_grouped_in_plain_graphed_chain(self):
-        # When MoE is captured, grouped weights stay in the plain GRAPHED chain so the
-        # cross-graph drain wait_async_comms(GRAPHED) still targets them by exact chain id.
-        gtp_module.set_cuda_graph_modules({"moe"}, cuda_graph_impl="local")
-        assert gtp_module._classify_param_chain(self.FC1) == "GTP_graphed"
-        assert gtp_module._classify_param_chain(self.FC2) == "GTP_graphed"
+    @pytest.mark.parametrize(
+        "impl,scope", [("local", {"moe"}), ("local", []), ("full_iteration", [])]
+    )
+    def test_graphed_moe_splits_fc1_fc2_into_own_chains(self, impl, scope):
+        gtp_module.set_cuda_graph_modules(scope, cuda_graph_impl=impl)
+        c1 = gtp_module._classify_param_chain(self.FC1)
+        c2 = gtp_module._classify_param_chain(self.FC2)
+        assert c1 == "GTP_remat_grouped_fc1_graphed"
+        assert c2 == "GTP_remat_grouped_fc2_graphed"
+        assert c1 in gtp_module.get_graphed_chain_ids()
+        assert c2 in gtp_module.get_graphed_chain_ids()
+        assert gtp_module._stream_key(c1, None) == gtp_module._stream_key(c2, None)
+        assert gtp_module._stream_key(c1, None) != gtp_module._stream_key(
+            "GTP_remat_grouped_fc1_ungraphed", None
+        )
 
     def test_graphness_helpers(self):
         # "ungraphed" is the eager suffix; everything else is captured.
@@ -1140,7 +1149,6 @@ class TestWaitAsyncCommsFallback:
         p.main_grad = torch.full((8, 4), main_grad_fill, dtype=dtype, device="cuda")
         p._prefetch_handle = None  # _wait_param_gather is no-op
         p._wgrad_rs_handle = None  # _wait_reduce_scatter is no-op → fallback fires
-        p._cached_ag_stream = None
         p._cached_rs_stream = None
         p.ag_event = torch.cuda.Event(external=True)
         p.rs_event = torch.cuda.Event(external=True)
@@ -1920,35 +1928,31 @@ class TestGTPCaptureParamReadiness:
     def test_finalize_hook_plan_groups_streams_and_preserves_occurrences(self, monkeypatch):
         dense_group = object()
         expert_group = object()
-        pg_collection = type(
-            "ProcessGroups", (), {"gtp_remat": dense_group, "expt_gtp_remat": expert_group}
-        )()
-        monkeypatch.setattr(
-            cuda_graphs_module.ProcessGroupCollection,
-            "use_mpu_process_groups",
-            staticmethod(lambda required_pgs: pg_collection),
-        )
         monkeypatch.setattr(
             cuda_graphs_module, "get_rs_stream", lambda chain_id, group: (chain_id, group)
         )
 
         class Param:
-            def __init__(self, chain_id, *, allreduce=True):
+            def __init__(self, chain_id, group):
                 self.chain_id = chain_id
-                self.allreduce = allreduce
+                self.group = group
 
-        dense = Param(GTPChain.GRAPHED.value)
-        expert = Param(GTPChain.GRAPHED.value, allreduce=False)
+        dense = Param(GTPChain.GRAPHED.value, dense_group)
+        fc1_chain = "GTP_remat_grouped_fc1_graphed"
+        fc2_chain = "GTP_remat_grouped_fc2_graphed"
+        expert = Param(fc1_chain, expert_group)
+        expert_fc2 = Param(fc2_chain, expert_group)
         runner = type("Runner", (), {"gtp_remat": True})()
 
         cuda_graphs_module._CudaGraphRunner._set_gtp_finalize_hook_plan(
-            runner, [dense, expert, dense]
+            runner, [dense, expert, dense, expert_fc2]
         )
 
-        assert runner.finalized_during_bwd_capture == [dense, expert, dense]
+        assert runner.finalized_during_bwd_capture == [dense, expert, dense, expert_fc2]
         assert runner._gtp_finalize_hook_plan == [
             ((GTPChain.GRAPHED.value, dense_group), [dense, dense]),
-            ((GTPChain.GRAPHED.value, expert_group), [expert]),
+            ((fc1_chain, expert_group), [expert]),
+            ((fc2_chain, expert_group), [expert_fc2]),
         ]
 
     def test_forward_gather_registers_params_before_ensuring_readiness(self, monkeypatch):
@@ -2137,6 +2141,38 @@ class TestGTPCaptureParamReadiness:
         assert params == [graphed_param]
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
+
+        # Both expert roles share streams but retain separate parameter ownership.
+        expert_params = [
+            type("Param", (), {"chain_id": chain})()
+            for chain in gtp_module.get_graphed_chain_ids()
+            if chain != GTPChain.GRAPHED.value
+        ]
+        for param in expert_params:
+            state.register_comm(param, graphed_ag_stream, reduce_scatter=False)
+            state.register_comm(param, graphed_rs_stream, reduce_scatter=True)
+        params, ag_streams, rs_streams = state.get_comms_for_chains(
+            gtp_module.get_graphed_chain_ids()
+        )
+        assert params == [graphed_param, *expert_params]
+        assert ag_streams == [graphed_ag_stream]
+        assert rs_streams == [graphed_rs_stream]
+
+    def test_capture_comm_predicate_includes_future_graphed_chains(self):
+        state = gtp_cuda_graphs.GTPCaptureCommState()
+        future = type("Param", (), {"chain_id": "GTP_future_role_graphed"})()
+        eager = type("Param", (), {"chain_id": "GTP_future_role_ungraphed"})()
+        ag_stream, rs_stream = object(), object()
+        for param in (future, eager, object()):
+            state.register_comm(param, ag_stream, reduce_scatter=False)
+            state.register_comm(param, rs_stream, reduce_scatter=True)
+        params, ag_streams, rs_streams = state.get_comms_for_chains(gtp_module._chain_is_graphed)
+        assert params == [future]
+        assert ag_streams == [ag_stream]
+        assert rs_streams == [rs_stream]
+
+    def test_graphed_drain_ignores_params_without_chain_id(self):
+        gtp_module.wait_async_comms(graphed_only=True, params=[object()])
 
 
 # ---------------------------------------------------------------------------

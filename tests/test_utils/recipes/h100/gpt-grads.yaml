@@ -45,8 +45,6 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
-
     # Note: This test is very expensive, so we hardcode N_REPEAT=1
 
     ARGUMENTS=(

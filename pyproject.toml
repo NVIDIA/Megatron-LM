@@ -15,6 +15,9 @@ include = [
     "megatron.training.*",
 ]
 
+[tool.setuptools.package-data]
+"megatron.core.allocator" = ["csrc/*.cpp"]
+
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -102,9 +105,9 @@ dev = [
     "nemo-lens",
     "megatron-energon[av_decode]~=7.0",
     "av",
-    "Pillow",
-    "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.29.0",
+    "Pillow>=13.0.0",
+    "flashinfer-python>=0.7.2,<0.8.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.32.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -196,7 +199,7 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 managed = true
 default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
-constraint-dependencies = ["quack-kernels>=0.6.5"]
+constraint-dependencies = ["quack-kernels>=0.6.5", "virtualenv>=21.14.9"]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",

@@ -283,7 +283,7 @@ def _permute_tokens_kernel(
     valid_pairs = valid_tokens * topk
     if pid >= valid_pairs:
         return
-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
         tok = pair // topk
         if tok < valid_tokens:
             k = pair % topk
@@ -324,7 +324,7 @@ def _zero_permutation_padding_kernel(
     n_used = tl.load(n_used_ptr)
     if pid >= n_used:
         return
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
             if tl.load(permutation_map_ptr + row) < 0:
                 for h in tl.range(0, hidden_dim, BLOCK_H):
@@ -642,7 +642,7 @@ def _permute_quantize_mxfp8_kernel(
     if pid >= valid_pairs:
         return
 
-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+    for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
         tok = pair // topk
         if tok < valid_tokens:
             k = pair % topk
@@ -771,14 +771,10 @@ def permute_and_quantize_mxfp8(
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
-    if zero_padding:
-        out_fp8 = torch.zeros(
-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device
-        )
-    else:
-        out_fp8 = torch.empty(
-            output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device
-        )
+    # Only rows [0, n_used) are read by the grouped GEMMs. With zero_padding, the
+    # alignment-padding rows among them are zeroed after the permute (below) instead of
+    # memsetting the whole worst-case buffer every step.
+    out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)
@@ -819,6 +815,18 @@ def permute_and_quantize_mxfp8(
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
+    if zero_padding:
+        # MXFP8 zero is the all-zero byte; padding rows keep their zero scales.
+        zero_blocks = min(output_size, 512)
+        _zero_permutation_padding_kernel[(zero_blocks,)](
+            out_fp8.view(torch.uint8),
+            permutation_map,
+            inclusive_expert_offsets[-1:],
+            K,
+            output_size,
+            BLOCK_H=min(triton.next_power_of_2(K), 1024),
+            NUM_BLOCKS=zero_blocks,
+        )
 
     permuted_mxfp8 = MXFP8Tensor(
         data=out_fp8,
