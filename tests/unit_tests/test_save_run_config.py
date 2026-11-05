@@ -34,12 +34,13 @@ class MockFullConfig:
     """Minimal stand-in for ``PretrainConfigContainer`` exposing ``to_yaml``."""
 
     def __init__(self, data, use_distributed_optimizer=False):
-        from megatron.training.config import LoggerConfig, RNGConfig
+        from megatron.training.config import LoggerConfig, RNGConfig, TokenizerConfig
 
         self._data = data
         self.optimizer = OptimizerConfig(use_distributed_optimizer=use_distributed_optimizer)
         self.logger = LoggerConfig()
         self.rng = RNGConfig()
+        self.tokenizer = TokenizerConfig()
 
     def to_yaml(self, yaml_path):
         with open(yaml_path, "w") as f:
