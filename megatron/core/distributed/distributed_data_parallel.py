@@ -716,21 +716,19 @@ class DistributedDataParallel(_BaseDataParallel):
                 continue
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-    def reset_param_sync_dispatch_state(self, *, skip_layer_wise: bool = False):
+    def reset_param_sync_dispatch_state(self, bucket_groups=None):
         """Mark DDP param all-gathers as not dispatched for the next forward pre-hook.
 
         Args:
-            skip_layer_wise: Leave bucket groups owned by a
-                :class:`LayerWiseDistributedOptimizer` untouched. A sibling
-                :class:`DistributedOptimizer` re-staging its own MXFP8 param buffer must
-                not invalidate a LayerWise gather that has already been force-synced for
-                this iteration: with chunked optimizer-state offload the LayerWise fp32
-                masters are moved to CPU right after that forced sync, so a re-dispatched
-                gather would stage stale weights.
+            bucket_groups (list, optional): the bucket groups to reset; all bucket groups of
+                this model chunk by default. An optimizer that re-stages its own param buffers
+                passes only the bucket groups it owns, so a sibling optimizer's completed
+                gathers (e.g. LayerWise groups force-synced before their fp32 masters were
+                offloaded to CPU) keep their state.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            if skip_layer_wise and self._bucket_group_is_layer_wise(bucket_group):
-                continue
+        if bucket_groups is None:
+            bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        for bucket_group in bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
@@ -741,21 +739,6 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             bucket_group.param_gather_dispatched = False
             bucket_group.param_gather_pinned_before_master_offload = False
-
-    @staticmethod
-    def _bucket_group_is_layer_wise(bucket_group) -> bool:
-        """Whether a bucket group holds LayerWise-managed (Muon) params.
-
-        Buckets are built from params sharing one buffer key, so the first param's
-        ``is_managed_by_layer_wise_optimizer`` tag decides for the whole group. Untagged
-        params (no LayerWise optimizer in the run) are DistOpt-owned.
-        """
-        for bucket in bucket_group.buckets:
-            if bucket.params_list:
-                return bool(
-                    getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False)
-                )
-        return False
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.start')
     def start_grad_sync(self, *unused):

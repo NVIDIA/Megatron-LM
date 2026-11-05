@@ -54,6 +54,17 @@ def _is_quantized(p):
     return hasattr(p, 'dequantize') or hasattr(p.data, 'dequantize')
 
 
+def _is_layer_wise_bucket_group(bucket_group):
+    """Whether a DDP bucket group holds LayerWise-managed (Muon) params.
+
+    Buckets never mix optimizer owners, so the first param's tag decides for the group.
+    """
+    for bucket in bucket_group.buckets:
+        if bucket.params_list:
+            return bool(getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False))
+    return False
+
+
 def _assert_equal(actual, expected, msg):
     if torch.equal(actual, expected):
         return
@@ -401,7 +412,7 @@ class TestMuonDecoupleFP8ParamGather:
             def param_sync(*unused):
                 groups = chunk.bucket_groups + chunk.expert_parallel_bucket_groups
                 if any(
-                    chunk._bucket_group_is_layer_wise(g)
+                    _is_layer_wise_bucket_group(g)
                     and g.param_gather_pinned_before_master_offload
                     and g.param_gather_dispatched
                     and g.param_gather_handle is None
@@ -859,9 +870,14 @@ class TestMuonDecoupleFP8ParamGather:
             optimizer.ensure_master_weights_for_pre_forward_param_sync()
             optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
             groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
-            layerwise_groups = [g for g in groups if ddp._bucket_group_is_layer_wise(g)]
-            distopt_groups = [g for g in groups if not ddp._bucket_group_is_layer_wise(g)]
+            # The DistOpt owns exactly the buckets of its own buffers; every other group on
+            # the chunk is a LayerWise (Muon) group.
+            distopt_buckets = {id(b) for buffer in distopt.buffers for b in buffer.buckets}
+            distopt_groups = [g for g in groups if any(id(b) in distopt_buckets for b in g.buckets)]
+            layerwise_groups = [g for g in groups if g not in distopt_groups]
             assert layerwise_groups and distopt_groups, "test precondition: mixed bucket groups"
+            assert all(_is_layer_wise_bucket_group(g) for g in layerwise_groups)
+            assert not any(_is_layer_wise_bucket_group(g) for g in distopt_groups)
             assert all(g.param_gather_dispatched for g in layerwise_groups)
 
             distopt._copy_main_params_to_param_buffer()

@@ -3269,15 +3269,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
-        # Staging params into the DDP param buffer invalidates any prior "already
-        # dispatched" state of the buckets this optimizer owns. The next forward pre-hook
-        # must run post-sync cleanup, especially when MXFP8 reuses grad_data as the param
-        # AG buffer. Bucket groups of a sibling LayerWiseDistributedOptimizer are left
-        # alone: that optimizer syncs its own buckets (force-synced before this staging
-        # when chunked optimizer-state offload is active), and re-dispatching them here
-        # would stage fp8 weights from fp32 masters that may already be offloaded to CPU.
+        # Staging params into this optimizer's DDP param buffers invalidates their prior
+        # "already dispatched" state. The next forward pre-hook must run post-sync cleanup,
+        # especially when MXFP8 reuses grad_data as the param AG buffer. Bucket groups of other
+        # optimizers on the same model chunk keep theirs: e.g. LayerWise groups published
+        # before their master weights were offloaded must not gather again.
+        own_buckets = {id(bucket) for buffer in self.buffers for bucket in buffer.buckets}
         for model_chunk in self.model_chunks:
-            model_chunk.reset_param_sync_dispatch_state(skip_layer_wise=True)
+            model_chunk.reset_param_sync_dispatch_state(
+                bucket_groups=[
+                    bucket_group
+                    for bucket_group in (
+                        model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                    )
+                    if any(id(bucket) in own_buckets for bucket in bucket_group.buckets)
+                ]
+            )
 
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):

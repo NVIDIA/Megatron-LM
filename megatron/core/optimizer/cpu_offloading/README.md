@@ -93,8 +93,13 @@ validate residency. This makes external reload and param-staging entry points se
 The LayerWise bucket groups force-synced right before master offload are pinned
 (`param_gather_pinned_before_master_offload`) until the next dispatch-state reset, so the ordinary
 DDP dispatch of the aligned virtual-pipeline schedule skips them; any other completed gather is
-re-dispatched as usual, and explicit `force_sync` / `force_dispatch` keep their semantics. Evaluation and
-checkpoint synchronization restore offloaded masters before forcing a new gather.
+re-dispatched as usual, and explicit `force_sync` / `force_dispatch` keep their semantics. A sibling
+`DistributedOptimizer` re-staging its MXFP8 param buffers resets the dispatch state of its own bucket
+groups only (`reset_param_sync_dispatch_state(bucket_groups=...)`), so the pinned LayerWise groups are
+not gathered again from CPU-bound masters. Evaluation and checkpoint synchronization restore offloaded
+masters before forcing a new gather. Muon chunked offload requires the compact LayerWise layout; the
+padded layout (`--use-layer-wise-param-layout`) is rejected by `OptimizerConfig` and by
+`LayerWiseDistributedOptimizer`.
 
 Setting `optimizer_state_offload_fraction` to zero is a full disable even when the feature flag is
 present: no manager, transfer stream, training hook, or checkpoint-format restriction is installed.
