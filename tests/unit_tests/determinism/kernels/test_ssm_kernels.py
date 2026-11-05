@@ -32,6 +32,7 @@ from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    deterministic_algorithms,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -744,6 +745,100 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
 
 
+def test_gdn_pinned_silu_module_replays_fwd_bwd():
+    """GDN's convolution and output gate stay SiLU whatever the FFN activation is.
+
+    The layer is built with a GELU ``activation_func``; ``act_fn`` must still be SiLU, because
+    both the torch causal-conv fallback and the unfused gated norm that ``--deterministic-mode``
+    selects apply it directly. The whole module -- TE fused-norm input projection, torch
+    conv1d, torch L2 norm, ``torch_chunk_gated_delta_rule``, gated RMSNorm and the output
+    projection -- replays bit-exactly in forward and backward.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_experimental_attention_variant_module_spec,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if not HAVE_TE:
+        pytest.skip("needs Transformer Engine")
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=2,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            normalization="RMSNorm",
+            layernorm_zero_centered_gamma=True,
+            activation_func=torch.nn.functional.gelu,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            experimental_attention_variant="gdn",
+            linear_attention_freq=[1],
+            gdn_kernel_backend="torch",
+            transformer_impl="transformer_engine",
+            deterministic_mode=True,
+        )
+        module = GatedDeltaNet(
+            config,
+            submodules=get_experimental_attention_variant_module_spec(config=config).submodules,
+            layer_number=1,
+            conv_init=1.0,
+            pg_collection=ProcessGroupCollection(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                cp=parallel_state.get_context_parallel_group(),
+            ),
+        ).cuda()
+        assert config.activation_func is torch.nn.functional.gelu
+        assert module.act_fn is torch.nn.functional.silu
+        assert module.activation == "silu"
+        assert module.gated_delta_rule is torch_chunk_gated_delta_rule
+        # The base class resolves the projection width through the variant hook.
+        assert module.in_proj_dim == module._get_in_proj_dim()
+        assert (
+            module.in_proj_dim == 2 * module.qk_dim + 2 * module.v_dim + 2 * module.num_value_heads
+        )
+
+        hidden_states = torch.randn(
+            128, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with deterministic_algorithms(True):
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (hidden_states, None),
+                replays=3,
+                contention=True,
+                what="GDN with pinned SiLU conv / output gate",
+            )
+        assert outputs["out[0]"].shape == hidden_states.shape
+        assert "in[0]" in grads
+        for name in (
+            "chunk0.in_proj.weight",
+            "chunk0.conv1d.weight",
+            "chunk0.A_log",
+            "chunk0.dt_bias",
+            "chunk0.out_norm.weight",
+            "chunk0.out_proj.weight",
+        ):
+            assert name in grads, name
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_kda_gate_jit_path_replays_fwd_bwd():
     """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
     from types import SimpleNamespace
@@ -870,5 +965,63 @@ def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
             contention=True,
             what="batch-invariant Mamba mixer (_static_prefill)",
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_kda_pre_gdr_fusion_is_rejected_under_deterministic_mode():
+    """The streamed pre-GDR fusion for KDA never runs under ``--deterministic-mode``.
+
+    ``gdn_pre_gated_delta_rule_fusion`` reuses the pre-GDR module's timing-based autotuned
+    convolution kernels and atomic boundary-gradient reductions, so KimiDeltaAttention
+    refuses to build with both switches on instead of silently replacing the replayed torch
+    conv1d / L2-norm / ``chunk_kda`` path.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net import kda
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if not HAVE_TE:
+        pytest.skip("needs Transformer Engine")
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=4,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            experimental_attention_variant="kda",
+            is_hybrid_model=True,
+            transformer_impl="transformer_engine",
+            gdn_pre_gated_delta_rule_fusion=True,
+            deterministic_mode=True,
+        )
+        spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
+        with pytest.raises(ValueError, match="deterministic_mode"):
+            kda.KimiDeltaAttention(
+                config,
+                submodules=spec.submodules,
+                layer_number=1,
+                conv_init=1.0,
+                pg_collection=ProcessGroupCollection(
+                    tp=parallel_state.get_tensor_model_parallel_group(),
+                    cp=parallel_state.get_context_parallel_group(),
+                ),
+            )
     finally:
         Utils.destroy_model_parallel()

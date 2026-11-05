@@ -390,7 +390,7 @@ def test_kda_gated_norm_preserves_upstream_rounding(dtype, norm_dtype, cuda_devi
         value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm, two_stage_gates=False
     )
     gradients = _assert_output_and_vjp(
-        lambda x, g: KimiDeltaAttention._apply_gated_norm(attention, x, g),
+        lambda x, g: KimiDeltaAttention._apply_gated_norm_unfused(attention, x, g),
         lambda x, g: _upstream_kda_gated_norm(x, g, reference_norm, LING_VALUE_HEAD_DIM),
         values,
         logits,
@@ -429,7 +429,7 @@ def test_kda_gated_norm_preserves_caller_cast_after_norm_downcast(norm_dtype, cu
         value_head_dim=LING_VALUE_HEAD_DIM, out_norm=actual_norm, two_stage_gates=False
     )
     gradients = _assert_output_and_vjp(
-        lambda x, g: KimiDeltaAttention._apply_gated_norm(attention, x, g),
+        lambda x, g: KimiDeltaAttention._apply_gated_norm_unfused(attention, x, g),
         lambda x, g: _upstream_kda_gated_norm(x, g, reference_norm, LING_VALUE_HEAD_DIM),
         values,
         logits,
