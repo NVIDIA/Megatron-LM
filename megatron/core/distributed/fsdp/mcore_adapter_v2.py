@@ -284,9 +284,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
                     schedule_policy=replace(
                         schedule_policy,
-                        unshard_all_planes_in_backward=collector.is_used_by_recomputation(
-                            submodule
-                        ),
+                        unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
                     ),
                     **common_fully_shard_kwargs,
                 )
