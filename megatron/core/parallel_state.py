@@ -879,9 +879,15 @@ def build_process_group_collection(
     initialize_model_parallel() calls this function and registers the result. Group creation is
     collective: every rank of the default process group calls this function with the same
     arguments, including ranks outside the [rank_offset, rank_offset + local_world_size) window,
-    which belong to none of the groups. The only process state this function changes is the
-    list of created groups that update_pg_timeout() uses, and the NCCL_COLLNET_ENABLE and UCC
-    environment variables that use_sharp and the "ucc" pipeline backend need.
+    which belong to none of the groups. With use_sharp on the dp group, or with
+    dynamic_context_parallel, this function runs a barrier on the data x context parallel group
+    of each rank, so every rank must then be inside the window.
+
+    Besides creating the groups, this function clears the calling thread's DTensor sharding
+    cache and sets the NCCL_COLLNET_ENABLE, UCC and UCX environment variables that use_sharp and
+    the "ucc" pipeline backend need. It records the groups in the list of created groups that
+    update_pg_timeout() updates and destroy_model_parallel() destroys, so the next
+    destroy_model_parallel() also destroys the groups of a collection that is not registered.
 
     Args:
         tensor_model_parallel_size (int, default = 1):
@@ -1389,9 +1395,7 @@ def build_process_group_collection(
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
             torch.cuda.synchronize()
             if tensor_model_parallel_size > 1:
-                # TP groups are initialized later in this function, so do not
-                # route this eager communicator touch through the public
-                # accessor (which consults TP parallel state).
+                # Also touch the TP x runtime-CP group of this size built above.
                 tp_cp_group = dynamic_tp_dp_cp[group_size]
                 torch.distributed.barrier(
                     group=tp_cp_group, device_ids=[torch.cuda.current_device()]
