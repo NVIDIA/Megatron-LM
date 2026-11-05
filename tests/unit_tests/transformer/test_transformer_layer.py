@@ -863,8 +863,17 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert torch.isfinite(output).all()
         assert hidden_states.grad is not None
 
-    def test_moe_layer_skips_mlp_cuda_graph(self):
-        """A global MLP graph request must leave the mHC MoE layer eager."""
+    @pytest.mark.parametrize(
+        "stages,cuda_graph_modules",
+        [
+            ("both", [CudaGraphModule.mlp]),
+            ("mlp", [CudaGraphModule.mlp]),
+            ("mlp", [CudaGraphModule.attn]),
+            ("mlp", [CudaGraphModule.attn, CudaGraphModule.mlp]),
+        ],
+    )
+    def test_moe_layer_skips_mlp_cuda_graph(self, stages, cuda_graph_modules):
+        """MLP-scope requests, and attn scopes without attention, leave mHC MoE layers eager."""
         config = _make_mhc_config(
             hidden_size=32,
             num_streams=4,
@@ -877,16 +886,17 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             moe_token_dispatcher_type="allgather",
         )
         config.cuda_graph_impl = "local"
-        config.cuda_graph_modules = [CudaGraphModule.mlp]
+        config.cuda_graph_modules = cuda_graph_modules
 
         layer = HyperConnectionTransformerLayer(
             config,
             _make_mhc_layer_spec(
-                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+                stages=stages, num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
             ).submodules,
         )
 
         assert layer.is_moe_layer
+        assert (layer.self_attention_hyper_connection is None) == (stages == "mlp")
         assert not hasattr(layer, "cudagraph_manager")
         assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
 
