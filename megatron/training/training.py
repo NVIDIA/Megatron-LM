@@ -1680,14 +1680,25 @@ def _reset_dsa_indexer_modules(model, seed: int) -> int:
     cuda_available = torch.cuda.is_available()
     cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
     if cuda_available and cuda_rng_tracker.is_initialized():
-        rng_tracker_states = cuda_rng_tracker.get_states()
+        # get_states() copies the dictionary but keeps pointers to the states themselves, and
+        # a graph-safe tracker holds generators, which seeding mutates in place. Copy each
+        # state so the restore below has something the fork cannot have changed.
+        rng_tracker_states = {
+            name: state.clone_state() if isinstance(state, torch.Generator) else state.clone()
+            for name, state in cuda_rng_tracker.get_states().items()
+        }
         rng_tracker_name = tensor_parallel.get_data_parallel_rng_tracker_name()
         try:
             # The loaded module is normally CUDA-resident, but CPU initialization and
             # offloaded parameters are valid too. Preserve and seed both RNG domains so an
             # out-of-band reset neither perturbs the training RNG nor depends on residency.
+            #
+            # torch.manual_seed would seed every CUDA device as well, and fork_rng(devices=[])
+            # only restores the CPU state, so the default CUDA generator would be left
+            # reseeded and every later backbone draw would shift. Seed the CPU generator
+            # directly and leave CUDA to the tracker fork.
             with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(seed)
+                torch.default_generator.manual_seed(seed)
                 with cuda_rng_tracker.fork(rng_tracker_name):
                     torch.cuda.manual_seed(seed)
                     return _reset_dsa_indexer_modules_with_current_rng(model)
