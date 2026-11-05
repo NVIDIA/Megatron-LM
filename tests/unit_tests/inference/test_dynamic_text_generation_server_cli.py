@@ -50,15 +50,8 @@ def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_
     def initialize_without_tokenizer(*, build_tokenizer):
         assert not build_tokenizer
         global_vars.initialize_runtime_services(args, build_tokenizer=False)
-        if padded_vocab_size is None:
-            cfg = global_vars.get_run_config()
-            with pytest.raises(ValueError, match="Model vocabulary must be resolved"):
-                model_vocab_size(
-                    cfg.model.vocab_size,
-                    should_pad_vocab=cfg.model.should_pad_vocab,
-                    make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
-                    tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
-                )
+        # Model selection is intentionally deferred until checkpoint discovery.
+        assert global_vars.get_run_config().model is None
 
     def detect(args, **kwargs):
         assert global_vars._GLOBAL_TOKENIZER is None

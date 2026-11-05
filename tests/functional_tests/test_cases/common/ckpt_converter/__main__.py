@@ -214,7 +214,7 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        cfg = inference_cfg_container_from_args(args)
         set_global_variables(args, cfg)
 
         # Random seed.
