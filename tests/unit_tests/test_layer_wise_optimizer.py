@@ -179,9 +179,7 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         overlap_param_gather=False,
     )
 
-    optimizer = LayerWiseDistributedOptimizer(
-        [object()], config, pg_collection=SimpleNamespace(tp=None)
-    )
+    optimizer = LayerWiseDistributedOptimizer([object()], config)
 
     assert optimizer._managed_optimizer_state_offload_child_indices() == ()
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
@@ -658,6 +656,29 @@ class TestLayerWiseOptimizer:
         for param in params:
             param.grad = torch.randn_like(param)
         assert optimizer.step()[0]
+
+    @pytest.mark.parametrize('with_pg_collection', [True, False])
+    def test_direct_construction_pg_collection(self, with_pg_collection):
+        """The supplied TP groups are kept; without a collection the optimizer is local, so
+        every rank owns and updates every param."""
+        pg_collection = (
+            ProcessGroupCollection.use_mpu_process_groups() if with_pg_collection else None
+        )
+        param = torch.nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16, device='cuda'))
+        optimizer = LayerWiseDistributedOptimizer(
+            [torch.optim.SGD([param], lr=0.5)],
+            OptimizerConfig(lr=0.5, bf16=True, clip_grad=0.0),
+            pg_collection,
+        )
+        if with_pg_collection:
+            assert optimizer.tp_group is pg_collection.tp
+            assert optimizer.expert_tp_group is pg_collection.expt_tp
+        else:
+            assert optimizer.tp_group is None and optimizer.expert_tp_group is None
+
+        param.grad = torch.ones_like(param)
+        assert optimizer.step()[0]
+        assert torch.equal(param.detach(), torch.full_like(param.detach(), 0.5))
 
     def test_bf16_wrapper_uses_preserved_high_precision_initializer(self):
         """FP32 masters must not be initialized from an already-quantized model weight."""

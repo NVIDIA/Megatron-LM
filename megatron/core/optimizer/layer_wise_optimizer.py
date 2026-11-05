@@ -786,7 +786,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ):
                 self._enable_chunked_optimizer_state_offload(optimizers)
 
-        self.tp_group = self.pg_collection.tp
+        self.tp_group = getattr(self.pg_collection, 'tp', None)
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
         # globals to fall back on there (see param_is_not_gtp_duplicate).
