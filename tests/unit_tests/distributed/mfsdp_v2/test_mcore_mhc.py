@@ -73,6 +73,9 @@ def test_mhc_loss_matches_reference(process_group_collection, recompute_mhc, pat
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            # Without prefetch each mHC layer is gathered only by its own hooks, so replay
+            # must run inside the layer, after its backward-pre hook.
+            suggested_communication_unit_size=0,
         ),
         module=model,
         pg_collection=process_group_collection,
