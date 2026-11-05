@@ -151,6 +151,14 @@ def test_resolve_returns_an_explicit_collection_without_warning(monkeypatch):
     assert resolved is pg_collection
 
 
+def test_resolve_rejects_a_single_name_before_falling_back(monkeypatch):
+    _forbid_global_collection(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(TypeError, match=r"\('tp',\), not the string 'tp'"):
+            resolve_process_groups(None, owner="Owner", required="tp")
+
+
 def test_resolve_requires_every_field_of_an_explicit_collection(monkeypatch):
     _forbid_global_collection(monkeypatch)
     with pytest.raises(ValueError, match="Owner requires pg_collection to set pp, embd"):

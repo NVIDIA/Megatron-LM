@@ -1086,8 +1086,10 @@ def require_process_groups(
         ValueError: ``pg_collection`` is None, a field is absent, or a field holds
             ``torch.distributed.GroupMember.NON_GROUP_MEMBER``.
         TypeError: ``pg_collection`` is a ``MultiModuleProcessGroupCollection``. Its modules
-            have different groups, so the caller selects the module's collection.
+            have different groups, so the caller selects the module's collection. Also when
+            ``names`` is a single string rather than a sequence of names.
     """
+    _reject_name_string(names, owner)
     if pg_collection is None:
         raise ValueError(f"{owner} requires a ProcessGroupCollection, got None.")
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
@@ -1113,6 +1115,15 @@ def require_process_groups(
             "not a usable group. Use None on ranks that are not members of the group."
         )
     return tuple(groups[name] for name in names)
+
+
+def _reject_name_string(names: Sequence[str], owner: str) -> None:
+    """Raise if ``names`` is one string, which is a sequence of its characters."""
+    if isinstance(names, str):
+        raise TypeError(
+            f"{owner}: pass the process-group field names as a sequence, for example "
+            f"({names!r},), not the string {names!r}."
+        )
 
 
 def resolve_process_groups(
@@ -1146,6 +1157,7 @@ def resolve_process_groups(
     Returns:
         ``pg_collection`` itself, or the collection built from the global groups.
     """
+    _reject_name_string(required, owner)
     if pg_collection is None:
         warn_global_process_group_fallback(
             owner, argument, deprecated_in=deprecated_in, removed_in=removed_in
