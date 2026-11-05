@@ -10,7 +10,6 @@ state dict uses the checkpoint's MIMO key names, so it loads with the standard c
 
 from dataclasses import replace
 
-from megatron.training.global_vars import get_run_config
 import torch
 
 from megatron.core.activations import unfused_fast_gelu as _unfused_fast_gelu
@@ -25,6 +24,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import get_args, print_rank_0
 from megatron.training.argument_utils import hybrid_config_from_args
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.hybrid import resolve_hybrid_stack_spec
 
 # Encoder sizes that the --vision-<size> arguments override.
