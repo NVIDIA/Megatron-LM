@@ -100,7 +100,12 @@ def _shard_and_build_optimizer(
         exp_avg_dtype=torch.bfloat16 if precision_aware else torch.float32,
         exp_avg_sq_dtype=torch.bfloat16 if precision_aware else torch.float32,
     )
-    optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
+    optimizer = get_megatron_optimizer(
+        optimizer_config,
+        [model],
+        use_gloo_process_groups=False,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
     assert isinstance(optimizer, FullyShardedOptimizer)
     return model, optimizer
 
