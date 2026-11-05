@@ -20,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import (
+    _FALLBACK_REMOVED_IN,
     _FALLBACK_WARNING_SKIP_PREFIXES,
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -45,7 +46,7 @@ def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollect
         warnings.warn(
             f"{owner} was given a pg_collection without an embd field and treats it as "
             "embd=None. Set embd explicitly, to None when it is unused; a missing embd becomes "
-            "an error in Megatron Core 0.23.",
+            f"an error in Megatron Core {_FALLBACK_REMOVED_IN}.",
             FutureWarning,
             skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
         )
