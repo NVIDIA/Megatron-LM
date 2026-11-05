@@ -54,7 +54,10 @@ from megatron.core.optimizer_param_scheduler import (
     param_group_override_to_tuple,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    get_ep_rank_and_size,
+    get_global_unique_param_name,
+)
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
@@ -76,6 +79,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
     param_group_identifier_keys,
+    set_duplicate_filter_groups,
 )
 
 # Subclass aliases kept for backward compatibility; all are OptimizerConfig.
@@ -778,18 +782,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    tp_group = pg_collection.tp
-    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
-    setattr(optimizer, 'tp_group', tp_group)
-    setattr(optimizer, 'expert_tp_group', expert_tp_group)
-    # The GTP axes this optimizer's params are sharded over. Taken from the collection rather
-    # than MPU because a MIMO module owns its axes through its own grid and leaves the MPU
-    # globals unset, where the duplicate filter would read rank 0 everywhere.
-    setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
-    setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
+    set_duplicate_filter_groups(optimizer, pg_collection)
 
     return optimizer
 
@@ -827,6 +823,7 @@ def _get_megatron_emerging_optimizer(
     config_overrides: Optional[Dict[ParamKey, Any]] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_gloo_process_groups: bool = True,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -873,7 +870,7 @@ def _get_megatron_emerging_optimizer(
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -959,11 +956,8 @@ def _get_megatron_emerging_optimizer(
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
-        # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
-        # an explicit ``pg_collection`` is supplied, so the only legal value
-        # here is False.
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-            pg_collection, model_chunks, use_gloo_process_groups=False
+            pg_collection, model_chunks, use_gloo_process_groups=use_gloo_process_groups
         )
         # DistOpt should only manage non-LayerWise buffers (those holding
         # embeddings, biases, layernorm, etc.). Filter out the LayerWise
@@ -981,6 +975,13 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
+    # Expert parameters reduce gradient statistics over the expert analog of ``mp``: tp_ep_pp
+    # merged across EGTP_remat peers, which hold distinct shards of each expert weight.
+    # tp_ep_pp is the same group when EGTP_remat is off.
+    expert_model_parallel_group = pg_collection.tp_ep_pp_with_egtp_remat
+    if expert_model_parallel_group is None:
+        expert_model_parallel_group = pg_collection.tp_ep_pp
+
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
@@ -992,7 +993,7 @@ def _get_megatron_emerging_optimizer(
         if not groups:
             continue
 
-        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
+        model_parallel_group = expert_model_parallel_group if is_expert else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
         # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
@@ -1011,12 +1012,7 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-            tp_group = pg_collection.tp
-            expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
-            setattr(optimizer, 'tp_group', tp_group)
-            setattr(optimizer, 'expert_tp_group', expert_tp_group)
-            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
-            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
+            set_duplicate_filter_groups(optimizer, pg_collection)
             results.append(optimizer)
             continue
         else:
@@ -1167,6 +1163,12 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    # Compatibility boundary. get_megatron_optimizer is the edge of megatron/core for optimizer
+    # construction, so the global-state fallback lives here and nowhere deeper: every helper below
+    # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
@@ -1177,6 +1179,7 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
+            use_gloo_process_groups=use_gloo_process_groups,
         )
         _clear_high_precision_initializers(model_chunks)
         return optimizer
@@ -1312,6 +1315,8 @@ def get_megatron_optimizer(
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
         param_group_id = 0
+        # Expert names come from the caller's expert-parallel layout when it passes a collection.
+        ep_rank, ep_size = get_ep_rank_and_size(pg_collection)
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
@@ -1331,7 +1336,9 @@ def get_megatron_optimizer(
         if dump_param_to_param_group_map is not None:
             for param_group in param_groups:
                 for param in param_group["params"]:
-                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_name = get_global_unique_param_name(
+                        model_chunks, param, ep_rank=ep_rank, ep_size=ep_size
+                    )
                     param_to_param_group[param_name] = param_group_id
                 param_group_id += 1
 
@@ -1365,7 +1372,9 @@ def get_megatron_optimizer(
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:
-                param_name = get_global_unique_param_name(model_chunks, param)
+                param_name = get_global_unique_param_name(
+                    model_chunks, param, ep_rank=ep_rank, ep_size=ep_size
+                )
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
