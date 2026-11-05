@@ -10,11 +10,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
-WORKFLOW = ".github/workflows/populate-build-cache.yml"
 COMPATIBILITY_INPUTS = (
     "docker",
     ".dockerignore",
@@ -75,23 +73,15 @@ def latest_baseline() -> tuple[str, str]:
         # Retried runs can publish different generations for different buckets.
         if (
             candidate["event"] in {"schedule", "workflow_dispatch"}
-            and candidate["status"] == "completed"
-            and candidate["conclusion"] == "success"
-            and candidate["head_branch"] == "main"
-            and candidate["path"] == WORKFLOW
-            and candidate["repository"]["full_name"] == REPOSITORY
             and candidate["head_repository"]["full_name"] == REPOSITORY
-            and type(candidate["run_attempt"]) is int
             and candidate["run_attempt"] == 1
-            and type(candidate["id"]) is int
-            and candidate["id"] > 0
         ):
             return sha(candidate["head_sha"]), f'{candidate["id"]}-1'
     raise ValueError("No successful first-attempt main Testmon baseline found")
 
 
 def outputs(manifest: dict[str, str]) -> None:
-    """Publish the prepared checkout identity to Actions and its job summary."""
+    """Publish the prepared checkout identity to Actions and its log."""
     result = (
         f'sha={manifest["tested_sha"]}\n'
         f'baseline_sha={manifest["source_sha"]}\n'
@@ -100,21 +90,13 @@ def outputs(manifest: dict[str, str]) -> None:
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
             stream.write(result)
-    if os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
-            stream.write(
-                "### Unit tests on Testmon baseline\n\n"
-                f'- Prepared commit: `{manifest["tested_sha"]}`\n'
-                f'- Baseline commit: `{manifest["source_sha"]}`\n'
-                f'- Cache generation: `{manifest["generation"]}`\n'
-                f'- Original commit: `{manifest["original_sha"]}`\n\n'
-            )
     sys.stdout.write(result)
 
 
 def prepare(args: argparse.Namespace) -> None:
     """Bundle the PR diff on a compatible baseline, preserving the original on failure."""
     output = Path(args.output_dir).resolve()
+    bundle = str(output / "checkout.bundle")
     metadata_path = Path(args.pr_files_dir).resolve() / "metadata.json"
     original_metadata = None
     rewritten = False
@@ -131,55 +113,49 @@ def prepare(args: argparse.Namespace) -> None:
         git("fetch", "--no-tags", "origin", source)
         merge_base = git("merge-base", base, head)
         patch = run("git", "diff", "--binary", "--full-index", "--no-ext-diff", merge_base, head)
-        ref = f"refs/testmon-checkout/{uuid.uuid4().hex}"
         with tempfile.TemporaryDirectory(prefix="testmon-checkout-") as temporary:
-            worktree = Path(temporary) / "checkout"
-            try:
-                git("worktree", "add", "--detach", str(worktree), source)
-                if patch:
-                    git("apply", "--3way", "--index", cwd=worktree, data=patch)
-                tree = git("write-tree", cwd=worktree)
-                if git("diff", "--name-only", original, tree, "--", *COMPATIBILITY_INPUTS):
-                    raise ValueError(
-                        "Prepared checkout differs from the CI image or Testmon inputs"
-                    )
-                date = git("show", "-s", "--format=%cI", original)
-                identity = {
-                    f"GIT_{role}_{field}": value
-                    for role in ("AUTHOR", "COMMITTER")
-                    for field, value in (
-                        ("NAME", "Megatron CI"),
-                        ("EMAIL", "megatron-ci@nvidia.com"),
-                        ("DATE", date),
-                    )
-                }
-                tested = git(
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    source,
-                    data=f"Apply PR {head} to Testmon baseline {source}\n".encode(),
-                    env={**os.environ, **identity},
+            checkout = Path(temporary) / "checkout"
+            git("clone", "--shared", "--no-checkout", str(Path.cwd()), str(checkout))
+            git("checkout", "--detach", source, cwd=checkout)
+            if patch:
+                git("apply", "--3way", "--index", cwd=checkout, data=patch)
+            tree = git("write-tree", cwd=checkout)
+            if git(
+                "diff", "--name-only", original, tree, "--", *COMPATIBILITY_INPUTS, cwd=checkout
+            ):
+                raise ValueError("Prepared checkout differs from the CI image or Testmon inputs")
+            date = git("show", "-s", "--format=%cI", original)
+            identity = {
+                f"GIT_{role}_{field}": value
+                for role in ("AUTHOR", "COMMITTER")
+                for field, value in (
+                    ("NAME", "Megatron CI"),
+                    ("EMAIL", "megatron-ci@nvidia.com"),
+                    ("DATE", date),
                 )
-                output.mkdir(parents=True, exist_ok=True)
-                git("update-ref", ref, tested)
-                git("bundle", "create", str(output / "checkout.bundle"), ref, f"^{source}")
-            finally:
-                git("update-ref", "-d", ref)
-                if worktree.exists():
-                    git("worktree", "remove", "--force", str(worktree))
+            }
+            tested = git(
+                "commit-tree",
+                tree,
+                "-p",
+                source,
+                data=f"Apply PR {head} to Testmon baseline {source}\n".encode(),
+                env={**os.environ, **identity},
+                cwd=checkout,
+            )
+            git("update-ref", "HEAD", tested, cwd=checkout)
+            output.mkdir(parents=True, exist_ok=True)
+            git("bundle", "create", bundle, "HEAD", f"^{source}", cwd=checkout)
         manifest = {
             "source_sha": source,
             "tested_sha": tested,
             "original_sha": original,
             "generation": generation,
-            "ref": ref,
         }
         (output / "manifest.json").write_text(json.dumps(manifest) + "\n")
         metadata["tested_sha"] = tested
         rewritten = True
         metadata_path.write_text(json.dumps(metadata) + "\n")
-        outputs(manifest)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         if rewritten:
             assert original_metadata is not None
@@ -193,6 +169,8 @@ def prepare(args: argparse.Namespace) -> None:
             detail += ": " + error.stderr.decode(errors="replace").strip()
         detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         sys.stdout.write(f"::notice::Using original PR checkout: {detail}\n")
+        return
+    outputs(manifest)
 
 
 def restore(args: argparse.Namespace) -> None:
@@ -206,15 +184,12 @@ def restore(args: argparse.Namespace) -> None:
         raise ValueError("Prepared checkout does not belong to the original tested commit")
     if not re.fullmatch(r"[1-9][0-9]*-1", manifest["generation"]):
         raise ValueError("Invalid Testmon baseline generation")
-    ref = manifest["ref"]
-    if not re.fullmatch(r"refs/testmon-checkout/[0-9a-f]{32}", ref):
-        raise ValueError("Invalid prepared checkout ref")
     bundle = str(directory / "checkout.bundle")
-    if git("bundle", "list-heads", bundle) != f"{tested} {ref}":
+    if git("bundle", "list-heads", bundle) != f"{tested} HEAD":
         raise ValueError("Bundle does not match the prepared checkout")
     git("fetch", "--no-tags", "--depth=1", "origin", source)
     git("bundle", "verify", bundle)
-    git("fetch", "--no-tags", bundle, ref)
+    git("fetch", "--no-tags", bundle, "HEAD")
     if git("rev-list", "--parents", "-n", "1", tested) != f"{tested} {source}":
         raise ValueError("Prepared checkout does not have the expected baseline parent")
     git("checkout", "--detach", tested)

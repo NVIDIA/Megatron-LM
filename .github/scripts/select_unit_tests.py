@@ -69,11 +69,7 @@ def main() -> None:
         matched_key = ""
         key_file = temporary / "unit-testmon-matched-key"
         prefix = identity["cache_prefix"]
-        requested_key = (
-            f"{prefix}{baseline_generation}"
-            if baseline_generation
-            else f"{prefix}lookup-{generation}"
-        )
+        requested_key = prefix + (baseline_generation or f"lookup-{generation}")
         try:
             _actions(
                 "restore",
@@ -83,23 +79,17 @@ def main() -> None:
                 str(key_file),
             )
             matched_key = key_file.read_text()
-            if baseline_generation and matched_key and matched_key != requested_key:
-                logger.warning("Ignoring a different Testmon cache generation for %s", bucket)
-                matched_key = ""
             if baseline_generation and matched_key:
-                try:
-                    manifest = json.loads((cache_dir / "manifest.json").read_text())
-                    if not isinstance(manifest, dict) or manifest.get(
-                        "source_sha"
-                    ) != os.environ.get("TESTMON_BASE_SHA"):
-                        raise ValueError("cache source commit does not match the pinned baseline")
-                except (OSError, ValueError) as error:
-                    logger.warning(
-                        "Ignoring an invalid pinned Testmon baseline for %s: %s", bucket, error
-                    )
-                    matched_key = ""
-        except subprocess.CalledProcessError:
-            logger.warning("Testmon cache restore failed for %s", bucket)
+                manifest = json.loads((cache_dir / "manifest.json").read_text())
+                if (
+                    matched_key != requested_key
+                    or not isinstance(manifest, dict)
+                    or manifest.get("source_sha") != os.environ.get("TESTMON_BASE_SHA")
+                ):
+                    raise ValueError("cache does not match the pinned baseline")
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            logger.warning("Testmon cache restore failed for %s: %s", bucket, error)
+            matched_key = ""
         result = _python(
             "testmon_selector.py",
             [

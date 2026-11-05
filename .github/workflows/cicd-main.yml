@@ -220,7 +220,7 @@ jobs:
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
       unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
-      unit_testmon_checkout_artifact_id: ${{ steps.upload-testmon-checkout.outputs.artifact-id }}
+      unit_testmon_checkout_artifact_id: ${{ steps.prepare-testmon-checkout.outputs.sha != '' && steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
       unit_testmon_sha: ${{ steps.prepare-testmon-checkout.outputs.sha }}
     steps:
       - name: Get PR info
@@ -627,22 +627,14 @@ jobs:
           python .github/scripts/testmon_checkout.py prepare \
             --pr-head "$PR_HEAD" --pr-base "$PR_BASE" --tested-sha "$TESTED_SHA" \
             --pr-files-dir "$RUNNER_TEMP/unit-test-pr-files" \
-            --output-dir "$RUNNER_TEMP/testmon-checkout"
-
-      - name: Upload prepared unit-test checkout
-        id: upload-testmon-checkout
-        if: steps.prepare-testmon-checkout.outputs.sha != ''
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-checkout-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/testmon-checkout/
-          if-no-files-found: error
+            --output-dir "$RUNNER_TEMP/unit-test-pr-files/testmon-checkout"
 
       - name: Upload changed files for mandatory unit tests
         id: upload-unit-test-pr-files
         if: steps.unit-test-pr-files.outputs.ready == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        continue-on-error: true
+        # Once prepared, every consumer must receive the same checkout and metadata.
+        continue-on-error: ${{ steps.prepare-testmon-checkout.outputs.sha == '' }}
         with:
           name: unit-test-pr-files-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-test-pr-files/

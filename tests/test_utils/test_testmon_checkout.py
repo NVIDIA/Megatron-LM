@@ -4,10 +4,12 @@
 import argparse
 import importlib.util
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 SCRIPT = Path(__file__).resolve().parents[2] / ".github/scripts/testmon_checkout.py"
 SPEC = importlib.util.spec_from_file_location("testmon_checkout", SCRIPT)
@@ -44,7 +46,6 @@ def repository(tmp_path, monkeypatch):
     git(repo, "remote", "add", "origin", str(repo))
     monkeypatch.chdir(repo)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     monkeypatch.setattr(checkout, "latest_baseline", lambda: (baseline, "123-1"))
     return repo, baseline
 
@@ -59,7 +60,7 @@ def arguments(repo, base, head):
         pr_base=base,
         tested_sha=head,
         pr_files_dir=str(pr_files),
-        output_dir=str(repo.parent / "output"),
+        output_dir=str(pr_files / "testmon-checkout"),
     )
 
 
@@ -83,18 +84,11 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert manifest["source_sha"] == baseline
     assert manifest["original_sha"] == head
     assert git(repo, "rev-parse", "HEAD") == head
-    assert git(repo, "show", f"{tested}:model.py") == "PR change"
-    assert "unrelated.py" not in git(repo, "ls-tree", "--name-only", tested)
-    assert "removed.py" not in git(repo, "ls-tree", "--name-only", tested)
-    assert subprocess.check_output(["git", "show", f"{tested}:new.bin"], cwd=repo) == (
-        b"\x00\xff\x80complete binary change"
-    )
+    assert git(repo, "status", "--porcelain") == ""
     assert json.loads((Path(args.pr_files_dir) / "metadata.json").read_text()) == {
         **original_metadata,
         "tested_sha": tested,
     }
-    assert git(repo, "for-each-ref", "refs/testmon-checkout") == ""
-    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
     # A separate, shallow consumer has no synthetic commit until bundle restore.
     consumer = tmp_path / "consumer"
@@ -102,20 +96,22 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     monkeypatch.chdir(consumer)
     github_output = tmp_path / "github-output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
-    step_summary = tmp_path / "summary"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
-    checkout.restore(argparse.Namespace(directory=str(output), expected_sha=head))
+    # Exercise the consumer action against the same combined artifact layout as CI.
+    shutil.copytree(args.pr_files_dir, tmp_path / "testmon-pr-files")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("ORIGINAL_SHA", head)
+    action = yaml.safe_load((SCRIPT.parents[1] / "actions/testmon-checkout/action.yml").read_text())
+    restore = action["runs"]["steps"][-1]["run"].replace(
+        str(SCRIPT.relative_to(SCRIPT.parents[2])), str(SCRIPT)
+    )
+    subprocess.run(["bash", "-euo", "pipefail", "-c", restore], check=True)
     assert git(consumer, "rev-parse", "HEAD") == tested
+    assert git(consumer, "rev-parse", "HEAD^") == baseline
+    assert (consumer / "model.py").read_text() == "PR change\n"
     assert not (consumer / "unrelated.py").exists()
+    assert not (consumer / "removed.py").exists()
     assert (consumer / "new.bin").read_bytes() == b"\x00\xff\x80complete binary change"
     assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
-    assert step_summary.read_text() == (
-        "### Unit tests on Testmon baseline\n\n"
-        f"- Prepared commit: `{tested}`\n"
-        f"- Baseline commit: `{baseline}`\n"
-        "- Cache generation: `123-1`\n"
-        f"- Original commit: `{head}`\n\n"
-    )
 
 
 @pytest.mark.parametrize("failure", ["conflict", "image", "controller", "lookup"])
@@ -152,8 +148,6 @@ def test_prepare_fallback_preserves_checkout_and_metadata(repository, monkeypatc
     assert git(repo, "status", "--porcelain") == ""
     assert metadata_path.read_bytes() == original_metadata
     assert not Path(args.output_dir).exists()
-    assert git(repo, "for-each-ref", "refs/testmon-checkout") == ""
-    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
 def test_restore_rejects_original_commit_mismatch(repository):
@@ -170,11 +164,6 @@ def test_restore_rejects_original_commit_mismatch(repository):
 def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):
     candidate = {
         "event": "schedule",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "main",
-        "path": checkout.WORKFLOW,
-        "repository": {"full_name": checkout.REPOSITORY},
         "head_repository": {"full_name": checkout.REPOSITORY},
         "run_attempt": 1,
         "id": 123,

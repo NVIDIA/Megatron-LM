@@ -5,7 +5,7 @@ description: Use the same prepared PR checkout for unit-test planning and execut
 inputs:
   artifact-id:
     required: true
-    description: Prepared checkout artifact from configure.
+    description: PR-files artifact containing the prepared checkout.
   original-sha:
     required: true
     description: Original PR merge commit to which the artifact belongs.
@@ -25,7 +25,7 @@ runs:
     - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
       with:
         artifact-ids: ${{ inputs.artifact-id }}
-        path: ${{ runner.temp }}/testmon-checkout
+        path: ${{ runner.temp }}/testmon-pr-files
         merge-multiple: true
     - id: restore
       shell: bash -e -u -o pipefail {0}
@@ -33,4 +33,4 @@ runs:
         ORIGINAL_SHA: ${{ inputs.original-sha }}
       run: |
         python3 .github/scripts/testmon_checkout.py restore \
-          --directory "$RUNNER_TEMP/testmon-checkout" --expected-sha "$ORIGINAL_SHA"
+          --directory "$RUNNER_TEMP/testmon-pr-files/testmon-checkout" --expected-sha "$ORIGINAL_SHA"

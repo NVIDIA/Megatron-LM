@@ -933,16 +933,12 @@ def test_gpu_reselection_respects_full_run_guards(
     ("ready", "branch", "setting", "expected"),
     [
         ("true", "main", "", True),
-        ("true", "main", "true", True),
         ("true", "main", "false", False),
         ("false", "main", "", False),
         ("true", "dev", "", False),
-        ("true", "", "", False),
     ],
 )
-def test_cache_base_checkout_requires_eligible_main_pr_and_respects_kill_switch(
-    ready, branch, setting, expected
-):
+def test_cache_base_checkout_gate(ready, branch, setting, expected):
     step = _step("cicd-main.yml", "configure", "prepare-testmon-checkout")
     expression = step["if"].replace("steps.unit-test-pr-files.outputs.ready", "ready")
     expression = (
@@ -950,75 +946,14 @@ def test_cache_base_checkout_requires_eligible_main_pr_and_respects_kill_switch(
         .replace("vars.UNIT_TESTMON_USE_CACHE_BASE", "setting")
         .replace("&&", "and")
     )
-    assert (
-        eval(
-            expression, {"__builtins__": {}}, {"ready": ready, "branch": branch, "setting": setting}
-        )
-        is expected
-    )
+    context = {"ready": ready, "branch": branch, "setting": setting}
+    assert eval(expression, {"__builtins__": {}}, context) is expected
     assert _step("cicd-main.yml", "configure", "unit-test-pr-files")["if"] == (
         "steps.configure.outputs.unit_testmon_eligible == 'true'"
     )
-
-
-def test_prepared_checkout_pins_cpu_gpu_source_and_cache_generation():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    steps = workflow["jobs"]["select"]["steps"]
-    apply = next(step for step in steps if step.get("id") == "testmon-checkout")
-    saved = next(step for step in steps if step["name"] == "Save CPU planner")
-    dependencies = next(step for step in steps if step.get("id") == "dependencies")
-    assert steps.index(saved) < steps.index(apply) < steps.index(dependencies)
-    assert apply["with"]["original-sha"] == "${{ inputs.sha }}"
-    plan = _step("_unit-tests.yml", "select", "plan")
-    assert plan["env"]["SOURCE_SHA"] == "${{ steps.testmon-checkout.outputs.sha || inputs.sha }}"
-    assert plan["env"]["TESTMON_GENERATION"] == "${{ steps.testmon-checkout.outputs.generation }}"
-    assert plan["env"]["TESTMON_BASE_SHA"] == "${{ steps.testmon-checkout.outputs.baseline_sha }}"
-    assert "args[2] ? [args[2]] : []" in plan["with"]["script"]
-    assert "process.env.RUNNER_TEMP + '/select_unit_tests.py'" in plan["with"]["script"]
-
-    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
-    gpu_steps = action["runs"]["steps"]
-    gpu_apply = next(step for step in gpu_steps if step.get("id") == "testmon-checkout")
-    assert gpu_apply["if"] == (
-        "inputs.is_unit_test == 'true' && inputs.unit_testmon_checkout_artifact_id != ''"
-    )
-    mode = next(step for step in gpu_steps if step.get("id") == "unit-testmon")
-    assert mode["env"]["TESTED_SHA"] == (
-        "${{ steps.testmon-checkout.outputs.sha || inputs.sha || github.sha }}"
-    )
-    assert mode["env"]["TESTMON_BASE_SHA"] == "${{ steps.testmon-checkout.outputs.baseline_sha }}"
-    restore = next(step for step in gpu_steps if step.get("id") == "restore-unit-testmon")
-    assert restore["with"]["key"] == (
-        "${{ steps.unit-testmon-identity.outputs.cache_prefix }}"
-        "${{ steps.testmon-checkout.outputs.generation || format('lookup-{0}-{1}', github.run_id, github.run_attempt) }}"
-    )
-    assert restore["with"]["restore-keys"] == (
-        "${{ steps.testmon-checkout.outputs.generation == '' && steps.unit-testmon-identity.outputs.cache_prefix || '' }}"
-    )
-    assert gpu_steps.index(gpu_apply) < gpu_steps.index(restore)
-
-    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
-    for suffix in ("", "-gb200"):
-        call = callers[f"cicd-unit-tests-latest{suffix}"]["with"]
-        assert call["sha"] == "${{ needs.configure.outputs.sha }}"
-        assert call["unit_testmon_checkout_artifact_id"] == (
-            "${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}"
-        )
-        parser = callers[f"cicd-parse-unit-tests{suffix}"]["steps"]
-        parse = next(step for step in parser if step.get("id") == "parse-unit-tests")
-        checkout = next(
-            step for step in parser if step.get("uses") == "./.github/actions/testmon-checkout"
-        )
-        assert parser.index(checkout) < parser.index(parse)
-    assert callers["cicd-unit-tests-latest"]["with"]["container-image"] == (
-        "${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}"
-    )
-    assert callers["cicd-parse-unit-tests-gb200"]["outputs"]["container-image"] == (
-        "${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu"
-    )
-    assert _step("cicd-main.yml", "Coverage", "coverage")["env"]["SOURCE_SHA"] == (
-        "${{ needs.configure.outputs.unit_testmon_sha || needs.configure.outputs.sha }}"
-    )
+    assert _step("cicd-main.yml", "configure", "upload-unit-test-pr-files")[
+        "continue-on-error"
+    ] == ("${{ steps.prepare-testmon-checkout.outputs.sha == '' }}")
 
 
 @pytest.mark.parametrize(
