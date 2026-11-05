@@ -4216,6 +4216,8 @@ class TestDynamicContext:
         alloc = ctx.kv_block_allocator
         blocks = alloc.allocate_memory_blocks(5)
         assert blocks is not None and alloc.pool_avail == 1
+        # The returned ids are a view of the allocator's free list, so copy them.
+        blocks = blocks.clone()
         owned_blocks = (blocks[:1], blocks[1:4], blocks[4:])
 
         # Each request's newest token is at slot 14 of its last block, so the next step's
