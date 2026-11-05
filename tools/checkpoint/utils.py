@@ -83,8 +83,14 @@ def initialize_checkpoint_converter_fake_process_groups(
     GTP rematerialization is not active during conversion. Its data-parallel
     groups therefore alias the corresponding non-GTP groups, matching
     ``initialize_model_parallel`` when the GTP axes have size one.
+
+    Context parallelism is not used during conversion either, but the model
+    still needs a size-one context-parallel group: ``LanguageModule`` requires
+    tensor-, context- and pipeline-parallel groups once ``torch.distributed`` is
+    initialized, as it is in the saver.
     """
     fake_tp_group = _ConverterFakeProcessGroup(size=tensor_parallel_size)
+    fake_cp_group = _ConverterFakeProcessGroup(size=1)
     fake_pp_group = _ConverterFakeProcessGroup(size=pipeline_parallel_size)
     fake_ep_group = _ConverterFakeProcessGroup(size=expert_parallel_size)
     fake_dp_group = _ConverterFakeProcessGroup(size=1)
@@ -101,6 +107,7 @@ def initialize_checkpoint_converter_fake_process_groups(
     )
 
     parallel_state._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    parallel_state._CONTEXT_PARALLEL_GROUP = fake_cp_group
     parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
     parallel_state._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
     parallel_state._DATA_PARALLEL_GROUP = fake_dp_group
