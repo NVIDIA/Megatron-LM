@@ -77,7 +77,10 @@ class LanguageModule(MegatronModule):
             ``tp``, ``cp``, and ``pp`` must be participating groups, including singleton
             dimensions. Use ``embd=None`` on nonparticipating embedding stages; PyTorch's
             NON_GROUP_MEMBER sentinel is not a usable group. Explicit None fields are
-            permitted for offline model construction.
+            permitted for offline model construction. Omitting the collection, or its
+            ``embd`` field, is deprecated: an omitted collection falls back to the global
+            groups in ``megatron.core.parallel_state`` without these checks, and an omitted
+            ``embd`` is treated as None. Both warn and become errors in Megatron Core 0.23.
     """
 
     def __init__(
