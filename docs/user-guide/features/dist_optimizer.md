@@ -73,7 +73,7 @@ Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer 
 
 Both store the same optimizer state, so a `torch_dist` checkpoint saved with one collective loads with the other. The other parameters always use reduce-scatter. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
 
-With `--fp8-param-gather`, `reduce-scatter` gathers the FP8 bytes of each shard and supports MXFP8 because its parameters are staged as BF16 through the gradient buffer and requantized on every rank. Use `all-reduce` for blockwise FP8 parameters; it gathers BF16 values and requantizes them on every rank.
+With `--fp8-param-gather`, both collectives gather quantized parameters as BF16 values staged from the FP32 masters and requantize them on every rank. `reduce-scatter` stages them through the gradient buffer for its fixed-size all-gather and supports only MXFP8; use `all-reduce` for blockwise FP8 parameters.
 
 ### Checkpoints of the removed legacy layout
 
