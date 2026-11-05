@@ -1147,7 +1147,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self._stores_param_remainders():
+                                if (
+                                    self._stores_param_remainders()
+                                    and model_param.dtype == torch.bfloat16
+                                ):
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1389,7 +1392,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
-                    if self._stores_param_remainders() and v.dtype != torch.int16:
+                    if (
+                        self._stores_param_remainders()
+                        and sharded_model_param.dtype == torch.bfloat16
+                        and v.dtype != torch.int16
+                    ):
                         v = self._param_remainders_from_fp32(v)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
@@ -2579,6 +2586,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # the result: all ranks must raise together or the others hang in the scatter.
         error = [None]
         if self.data_parallel_group.rank() == 0 and state_dict is not None:
+            # The splitting code expects only buffer entries and buckets_coalesced. Remove the
+            # marker from a local copy so retries still validate the caller's checkpoint.
+            state_dict = state_dict.copy()
             error[0] = self._param_remainders_mismatch(
                 state_dict.pop('param_state_param_remainders', None)
             )

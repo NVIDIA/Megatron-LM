@@ -71,8 +71,17 @@ def model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _ddp_model(ddp_fp8_param_gather=False, use_distributed_optimizer=True):
-    model = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16, device="cuda")
+class _MixedPrecisionLinear(torch.nn.Linear):
+    def forward(self, inputs):
+        return torch.nn.functional.linear(inputs, self.weight).float() + self.bias
+
+
+def _ddp_model(ddp_fp8_param_gather=False, use_distributed_optimizer=True, fp32_bias_value=None):
+    if fp32_bias_value is None:
+        model = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16, device="cuda")
+    else:
+        model = _MixedPrecisionLinear(128, 128, dtype=torch.bfloat16, device="cuda")
+        model.bias.data = model.bias.data.float().fill_(fp32_bias_value)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
         DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer),
@@ -292,11 +301,9 @@ def test_param_remainders_checkpoint_compatibility(
 
 
 def _model_sharded_state_dict(model):
-    weight = model.module.weight
     return {
-        "weight": ShardedTensor.from_rank_offsets(
-            "weight", weight, replica_id=torch.distributed.get_rank()
-        )
+        name: ShardedTensor.from_rank_offsets(name, param, replica_id=torch.distributed.get_rank())
+        for name, param in model.module.named_parameters()
     }
 
 
@@ -350,6 +357,75 @@ def test_param_remainders_through_fp32_buffers(
         )
         (loading,) = optimizer.chained_optimizers
         _load_parameter_state(loading, model, sharding_type, ckpt_dir)
+        if saved_shard is not None:
+            assert torch.equal(loading.get_main_param_shard(model.module.weight), saved_shard)
+
+
+@pytest.mark.parametrize(
+    "sharding_type", ["torch", "dp_zero_gather_scatter", "fully_reshardable", "dp_reshardable"]
+)
+@pytest.mark.parametrize("fp32_bias_value", [0.125, 1.0])
+def test_param_remainders_with_fp32_model_params(
+    model_parallel, tmp_path_dist_ckpt, sharding_type, fp32_bias_value
+):
+    """FP32 model params keep full master weights alongside BF16 params' int16 remainders."""
+    name = f"mixed_dtype_remainders_{sharding_type}_{fp32_bias_value}"
+    with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
+        model = _ddp_model(fp32_bias_value=fp32_bias_value)
+        _, optimizer = _get_optimizer(model, store_param_remainders=True)
+        _train_step(model, optimizer)
+        (saving,) = optimizer.chained_optimizers
+        assert saving._stores_param_remainders()
+        saved_shards = {}
+        for name, param in model.module.named_parameters():
+            shard = saving.get_main_param_shard(param)
+            if shard is None:
+                continue
+            if param.dtype == torch.float32:
+                # Cover fractional weights (which must not be rejected) and integer weights
+                # (which must not be mistaken for remainders).
+                shard.fill_(fp32_bias_value)
+            saved_shards[name] = shard.clone()
+            state = saving._get_main_param_and_optimizer_states(param)
+            expected_dtype = torch.int16 if param.dtype == torch.bfloat16 else torch.float32
+            assert state["param"].dtype == expected_dtype
+        _save_parameter_state(saving, model, sharding_type, ckpt_dir)
+
+        _, optimizer = _get_optimizer(model, store_param_remainders=True)
+        (loading,) = optimizer.chained_optimizers
+        _load_parameter_state(loading, model, sharding_type, ckpt_dir)
+        for name, param in model.module.named_parameters():
+            if name in saved_shards:
+                assert torch.equal(loading.get_main_param_shard(param), saved_shards[name])
+
+
+@pytest.mark.parametrize("save_remainders", [False, True])
+def test_dp_zero_param_remainders_flag_survives_repeated_loads(model_parallel, save_remainders):
+    """Reusing a checkpoint must preserve format checks after both failed and successful loads."""
+    model = _ddp_model()
+    _, optimizer = _get_optimizer(model, None, store_param_remainders=save_remainders)
+    _train_step(model, optimizer)
+    (saving,) = optimizer.chained_optimizers
+    state_dict = saving.get_parameter_state_dp_zero()
+    saved_shard = saving.get_main_param_shard(model.module.weight)
+    if saved_shard is not None:
+        saved_shard = saved_shard.clone()
+
+    _, optimizer = _get_optimizer(model, None, store_param_remainders=not save_remainders)
+    (loading,) = optimizer.chained_optimizers
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="silently corrupt"):
+            loading.load_parameter_state_from_dp_zero(state_dict)
+        if state_dict is not None:
+            assert state_dict["param_state_param_remainders"] == save_remainders
+
+    _, optimizer = _get_optimizer(model, None, store_param_remainders=save_remainders)
+    (loading,) = optimizer.chained_optimizers
+    loading.load_state_dict(loading.state_dict())
+    for _ in range(2):
+        loading.load_parameter_state_from_dp_zero(state_dict)
+        if state_dict is not None:
+            assert state_dict["param_state_param_remainders"] == save_remainders
         if saved_shard is not None:
             assert torch.equal(loading.get_main_param_shard(model.module.weight), saved_shard)
 
