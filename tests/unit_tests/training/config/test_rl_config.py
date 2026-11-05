@@ -33,6 +33,7 @@ from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
+    PosttrainConfigContainer,
     RLConfig,
     RunConfigRecord,
     rl_config,
@@ -296,7 +297,9 @@ def _rl_run(pretrain, inference=None, **rl_kwargs):
     return RunConfigRecord(
         pretrain=pretrain,
         inference=_inference_container() if inference is None else inference,
-        rl=RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs)
+        ),
     )
 
 
@@ -306,7 +309,7 @@ def _record_from_args(args):
     return RunConfigRecord(
         pretrain=pretrain,
         inference=rollout_inference_container_from_args(args, pretrain),
-        rl=_default_config_from_args(RLConfig, args),
+        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
 
 
@@ -363,10 +366,10 @@ def test_validate_run_from_the_container_and_the_entry_point():
     offload_run = _rl_run(pretrain, rl_offload_optimizer_during_inference=True)
     validate_rl_run(offload_run)
     assert not pretrain.ddp.grad_buffer_offload
-    offload_run.rl.rl_offload_optimizer_during_inference = False
+    offload_run.posttrain.rl.rl_offload_optimizer_during_inference = False
     validate_rl_run(offload_run)
     assert not pretrain.ddp.grad_buffer_offload
-    offload_run.rl.rl_offload_optimizer_during_inference = True
+    offload_run.posttrain.rl.rl_offload_optimizer_during_inference = True
     pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
         validate_rl_run(offload_run)
@@ -383,7 +386,9 @@ def test_validate_run_from_the_container_and_the_entry_point():
     pretrain = _pretrain_container()
     pretrain.ddp.grad_buffer_offload = True
     explicit_layout_run = RunConfigRecord(
-        pretrain=pretrain, inference=_inference_container(), rl=RLConfig()
+        pretrain=pretrain,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig()),
     )
     validate_rl_run(explicit_layout_run)
     assert pretrain.ddp.grad_buffer_offload
@@ -405,7 +410,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
             RunConfigRecord(
                 pretrain=_pretrain_container(model=TopologyOnlyModelConfig()),
                 inference=_inference_container(),
-                rl=RLConfig(),
+                posttrain=PosttrainConfigContainer(rl=RLConfig()),
             )
         )
     with pytest.raises(ValueError, match="no CUDA graphs"):
@@ -464,7 +469,7 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
     )
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
-    cfg = _record_from_args(args).rl
+    cfg = _record_from_args(args).posttrain.rl
     # validate_args neither derives nor mirrors RL values; the container does.
     assert not hasattr(args, "grpo_samples_per_iteration")
     assert args.rl_generation_lag is None
@@ -473,7 +478,11 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
 
 def _layout_run(run_config, **rl):
     """An RL run over the `run_config` fixture, with the section's default GRPO sizes."""
-    return RunConfigRecord(pretrain=run_config, inference=_inference_container(), rl=RLConfig(**rl))
+    return RunConfigRecord(
+        pretrain=run_config,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig(**rl)),
+    )
 
 
 @pytest.mark.parametrize("perform_rl_step", [False, True])
@@ -590,7 +599,9 @@ def test_model_setup_uses_owned_ddp_config(
     rl_run = RunConfigRecord(
         pretrain=run_config,
         inference=_inference_container(),
-        rl=RLConfig(perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True),
+        posttrain=PosttrainConfigContainer(
+            rl=RLConfig(perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True)
+        ),
     )
     ddp = run_config.ddp
     monkeypatch.setattr(training, "get_args", lambda: args)
@@ -676,13 +687,15 @@ def test_rl_run_config_is_a_singleton():
     with pytest.raises(AssertionError, match="not initialized"):
         get_rl_run_config()
     record = RunConfigRecord(
-        pretrain=_pretrain_container(), inference=_inference_container(), rl=RLConfig()
+        pretrain=_pretrain_container(),
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig()),
     )
     set_rl_run_config(record)
     assert get_rl_run_config() is record
     with pytest.raises(AssertionError, match="already initialized"):
         set_rl_run_config(record)
-    with pytest.raises(AssertionError, match="inference and rl members"):
+    with pytest.raises(AssertionError, match="inference and posttrain members"):
         set_rl_run_config(RunConfigRecord(pretrain=_pretrain_container()))
 
 
@@ -710,7 +723,9 @@ def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
     assert set(inference_record) == {"_target_", "inference"}
 
     record = RunConfigRecord(
-        pretrain=pretrain, inference=_inference_container(), rl=RLConfig(**GRPO_4x3)
+        pretrain=pretrain,
+        inference=_inference_container(),
+        posttrain=PosttrainConfigContainer(rl=RLConfig(**GRPO_4x3)),
     )
     set_rl_run_config(record)
     assert global_vars.get_run_config() is pretrain  # the loop keeps the pretrain container
@@ -722,17 +737,18 @@ def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
     # The pretrain member's own YAML round trip turns one tuple field into a list (its own
     # serialization); the document and the RL-side members round-trip exactly.
     assert rebuilt.to_dict() == record.to_dict()
-    assert (rebuilt.rl, rebuilt.inference) == (record.rl, record.inference)
+    assert (rebuilt.posttrain, rebuilt.inference) == (record.posttrain, record.inference)
     with open(path) as f:
         document = yaml.safe_load(f)
     assert document["_target_"] == "megatron.training.config.container.RunConfigRecord"
-    assert set(document) == {"_target_", "pretrain", "inference", "rl"}
+    assert set(document) == {"_target_", "pretrain", "inference", "posttrain"}
     assert document["pretrain"]["_target_"].endswith(".PretrainConfigContainer")
-    assert document["rl"]["_target_"] == "megatron.training.config.rl_config.RLConfig"
+    assert document["posttrain"]["_target_"].endswith(".PosttrainConfigContainer")
+    assert document["posttrain"]["rl"]["_target_"] == "megatron.training.config.rl_config.RLConfig"
     # Symmetry: an inference run's record plus the training and RL members is the RL record.
     as_dict = record.to_dict()
     grown = RunConfigRecord.from_dict(
-        {**inference_record, "pretrain": as_dict["pretrain"], "rl": as_dict["rl"]}
+        {**inference_record, "pretrain": as_dict["pretrain"], "posttrain": as_dict["posttrain"]}
     )
     assert grown.to_dict() == as_dict
     # Readers that look sections up by name get the pretrain member of a record, nothing from a

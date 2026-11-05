@@ -42,7 +42,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.config import RLConfig, RunConfigRecord
+from megatron.training.config import PosttrainConfigContainer, RLConfig, RunConfigRecord
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
@@ -210,7 +210,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         model (GPTModel): The GPT Model
     """
     runtime_state = get_rl_runtime_state()
-    cfg = get_rl_run_config()
+    rl_cfg = get_rl_run_config().posttrain.rl
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
@@ -219,7 +219,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    if cfg.rl.rl_use_sequence_packing:
+    if rl_cfg.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
 
@@ -235,7 +235,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, cfg.rl.rl_inference_logprobs_is_correction)
+        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, rl_cfg.rl_inference_logprobs_is_correction)
 
         num_sequences = len(seq_indices)
     else:
@@ -262,7 +262,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         # advantages already on GPU from prepare_data_for_update
         loss_mask = loss_mask[:, 1:].contiguous().cuda()
         inference_logprobs = (
-            inference_logprobs.cuda() if cfg.rl.rl_inference_logprobs_is_correction else None
+            inference_logprobs.cuda() if rl_cfg.rl_inference_logprobs_is_correction else None
         )
 
         num_sequences = tokens.shape[0]
@@ -271,10 +271,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        if cfg.rl.rl_use_sequence_packing:
+        if rl_cfg.rl_use_sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
                 seq_length=tokens.shape[1],
-                max_sequences_per_bin=cfg.rl.rl_sequence_packing_max_sequences_per_bin,
+                max_sequences_per_bin=rl_cfg.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
         else:
@@ -325,12 +325,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     old_logprobs=old_logprobs,
                     ref_logprobs=ref_logprobs,
                     advantages=advantages,
-                    clamp_eps_lower=cfg.rl.grpo_clamp_eps_lower,
-                    clamp_eps_upper=cfg.rl.grpo_clamp_eps_upper,
-                    kl_beta=cfg.rl.grpo_kl_beta,
-                    entropy_weight=cfg.rl.grpo_entropy_term_weight,
+                    clamp_eps_lower=rl_cfg.grpo_clamp_eps_lower,
+                    clamp_eps_upper=rl_cfg.grpo_clamp_eps_upper,
+                    kl_beta=rl_cfg.grpo_kl_beta,
+                    entropy_weight=rl_cfg.grpo_entropy_term_weight,
                     inference_logprobs=inference_logprobs,
-                    is_truncation_coef=cfg.rl.rl_importance_sampling_truncation_coef,
+                    is_truncation_coef=rl_cfg.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
                 )
@@ -451,11 +451,11 @@ if __name__ == "__main__":
     record = RunConfigRecord(
         pretrain=full_config,
         inference=rollout_inference_container_from_args(args, full_config),
-        rl=_default_config_from_args(RLConfig, args),
+        posttrain=PosttrainConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
     finalize_rl_run(record)
     set_rl_run_config(record)
-    rl_cfg = record.rl
+    rl_cfg = record.posttrain.rl
     inference_container = record.inference
     assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
     rl_model_provider = partial(model_provider, _model_builder)

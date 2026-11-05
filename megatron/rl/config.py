@@ -98,7 +98,7 @@ def rollout_inference_container_from_args(
 
 def validate_rl_run(record: RunConfigRecord) -> None:
     """Validate an RL run's record."""
-    pretrain, inference, rl = record.pretrain, record.inference, record.rl
+    pretrain, inference, rl = record.pretrain, record.inference, record.posttrain.rl
     # The offload `finalize_rl_run` will request, checked like the offload the DDP section
     # requests (`PretrainConfigContainer._validate_ddp_config`).
     if (
@@ -139,7 +139,7 @@ def finalize_rl_run(record: RunConfigRecord) -> None:
     """Validate the record, then finalize the deployment."""
     validate_rl_run(record)
     record.inference.finalize()
-    if record.rl.requires_grad_buffer_offload:
+    if record.posttrain.rl.requires_grad_buffer_offload:
         # Applied before the training container finalizes its DDP section.
         record.pretrain.ddp.grad_buffer_offload = True
 
@@ -166,16 +166,19 @@ def add_rollout_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
 def set_rl_run_config(record: RunConfigRecord) -> None:
     """Register an RL run's record."""
-    assert record.inference is not None and record.rl is not None, (
-        "an RL run's record carries its inference and rl members"
+    assert record.inference is not None and record.posttrain is not None, (
+        "an RL run's record carries its inference and posttrain members"
     )
+    assert record.posttrain.rl is not None, "an RL run's posttrain container carries its rl section"
     set_run_config_record(record)
 
 
 def get_rl_run_config() -> RunConfigRecord:
     """Return the registered RL run's record."""
     record = get_run_config_record()
-    assert record is not None and record.rl is not None, "RL run config is not initialized."
+    assert (
+        record is not None and record.posttrain is not None and record.posttrain.rl is not None
+    ), "RL run config is not initialized."
     return record
 
 
