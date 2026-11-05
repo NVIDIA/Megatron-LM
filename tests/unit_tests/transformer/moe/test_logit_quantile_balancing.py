@@ -223,6 +223,36 @@ def test_old_te_rejected_before_logit_dispatch():
             )
 
 
+@pytest.mark.parametrize('requires_grad', [False, True])
+def test_logit_bias_bypasses_batch_invariant_score_kernel(requires_grad):
+    """The score-space kernel cannot handle logit bias, even without a QB histogram."""
+    logits = torch.tensor([[3.0, 2.0, 1.0, -1.0]], requires_grad=requires_grad)
+    bias = torch.tensor([-0.5, -0.4, 0.1, 0.8])
+    with (
+        patch.object(moe_utils, '_use_batch_invariant_sigmoid_topk', return_value=True),
+        patch.object(moe_utils, 'sigmoid_topk_routing') as kernel,
+        patch.object(moe_utils._BatchInvariantSigmoidTopK, 'apply') as autograd_kernel,
+    ):
+        probs, indices = moe_utils.topk_routing_with_score_function(
+            logits,
+            2,
+            score_function='sigmoid',
+            expert_bias=bias,
+            qb_bias_space='logit',
+            dense_output=True,
+        )
+    kernel.assert_not_called()
+    autograd_kernel.assert_not_called()
+    assert torch.equal(indices, torch.tensor([[0, 1]]))
+    selected = logits.sigmoid()[:, :2]
+    expected = selected / selected.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(probs, expected)
+    if requires_grad:
+        actual_grad = torch.autograd.grad(probs[:, 0].sum(), logits)[0]
+        expected_grad = torch.autograd.grad(expected[:, 0].sum(), logits)[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
 def test_fused_logit_dense_output_contract():
     """Adapt TE's full-width probabilities and dense IDs to Core's compact pair."""
     logits = torch.tensor([[0.0, -2.0, 1.0, 2.0]])

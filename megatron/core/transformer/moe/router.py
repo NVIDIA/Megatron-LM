@@ -488,6 +488,9 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 qb_histogram=self.qb_histogram if accumulate_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+                # The histogram is only supplied while accumulating, so every pass must
+                # use the reference router to stay bitwise identical across passes.
+                allow_batch_invariant_sigmoid_topk=False,
                 qb_bias_space=self.qb_bias_space,
                 qb_logit_span=self.qb_logit_span if accumulate_histogram else None,
                 dense_output=dense_output,
@@ -1472,6 +1475,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        allow_batch_invariant_sigmoid_topk=True,
         qb_bias_space="score",
     ):
         return topk_routing_with_score_function(
@@ -1487,6 +1491,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=allow_batch_invariant_sigmoid_topk,
             qb_bias_space=qb_bias_space,
         )
 
@@ -1498,7 +1503,9 @@ class InferenceTopKRouter(TopKRouter):
         It is selected by config.inference_moe_router_backend='triton' and covers sigmoid
         scores with an expert bias, fp32 logits and supported shapes, without
         group-limited routing, router replay, precomputed indices or TE's fused
-        router; batch-invariant mode keeps its uncompiled reference path. forward()
+        router. Batch-invariant mode routes through topk_routing_with_score_function,
+        which runs this kernel with a batch-invariant launch in both training and
+        inference, so it does not take this path. forward()
         only reaches this path while InferenceMode is active, whether or not
         gradients are enabled, and the kernel's outputs carry no autograd graph.
         Expert selection matches the compiled path; for top-k of eight or more a
@@ -1570,6 +1577,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
             qb_bias_space=self.qb_bias_space,
         )
         return probs.squeeze(1), top_indices.squeeze(1)

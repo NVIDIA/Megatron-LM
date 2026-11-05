@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -799,6 +799,9 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    fp8_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP8 recipe."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -839,8 +842,9 @@ class TransformerConfig(ModelParallelConfig):
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
-    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+    """If set, enables the use of FP4 precision through Transformer Engine."""
+    fp4_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
@@ -905,6 +909,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_shortcut_post_norm: bool = False
     """Apply the configured normalization to the combined routed and shared expert output.
     Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_disable_mtp: bool = False
+    """Disable shortcut MoE connections in hybrid MTP stacks while keeping them in the decoder.
+    Each MTP depth runs its compute and MoE layers sequentially, using the ordinary MoE
+    normalization and routing path. Also applies to a shared, repeated MTP layer.
+    Only affects shortcut MoE; other MTP, recomputation, and offloading settings are preserved.
+    Changing this setting requires converting the MTP state when resuming a checkpoint.
+    Defaults to False to preserve existing MTP behavior."""
 
     moe_shortcut_parallel: bool = False
     """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
@@ -1590,8 +1602,10 @@ class TransformerConfig(ModelParallelConfig):
       bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
       outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
       below eight and to within the last fp32 bit otherwise. Other score functions,
-      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
-      use the 'torch' path. Default."""
+      group-limited routing, router replay and moe_router_fusion use the 'torch' path.
+      Default.
+    Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
+    routing with an expert bias in both training and inference."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
