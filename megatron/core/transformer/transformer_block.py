@@ -279,6 +279,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         vp_stage: Optional[int] = None,
         name: str | None = None,
     ):
+        if config.moe_shortcut_wide_residual_norm_fusion:
+            raise ValueError(
+                "wide-residual shortcut kernel fusion requires HybridStack, not TransformerBlock"
+            )
+
         super().__init__(config=config)
 
         if pg_collection is None:

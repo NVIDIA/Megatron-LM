@@ -57,6 +57,54 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _validate_shortcut_fusion_config(config):
+    """Reject incompatible numerical and scheduling features before building layers."""
+    if not config.moe_shortcut_wide_residual_norm_fusion:
+        return
+    prefix = "moe_shortcut_wide_residual_norm_fusion"
+    if not config.moe_shortcut_connection or config.wide_residual is None:
+        raise ValueError(f"{prefix} requires moe_shortcut_connection=True and wide_residual")
+    streams = config.wide_residual.num_streams
+    if type(streams) is not int or not 2 <= streams <= 6:
+        raise ValueError(f"{prefix} requires 2 <= wide_residual.num_streams <= 6")
+    if not 32 <= config.hidden_size <= 10240 or config.hidden_size % 32:
+        raise ValueError(f"{prefix} requires H in [32, 10240], divisible by 32")
+    if config.params_dtype != torch.bfloat16:
+        raise ValueError(f"{prefix} requires BF16 branch parameters")
+    if config.normalization != "RMSNorm" or config.layernorm_zero_centered_gamma:
+        raise ValueError(f"{prefix} requires ordinary RMSNorm")
+    wr = config.wide_residual
+    if wr.learned_retention and wr.retention_max_forget != 0.1:
+        raise ValueError(f"{prefix} requires retention_max_forget=0.1 when retention is learned")
+    # Expert MLP offloading is owned entirely by the existing MoE leaf module.
+    # It does not offload tensors saved by the fused residual boundaries.
+    expert_only_offload = set(config.offload_modules or ()) == {"fused_group_mlp"}
+    recompute_modules = set(config.recompute_modules or ())
+    unsupported = {
+        "hidden_dropout": config.hidden_dropout != 0,
+        "add_bias_linear": config.add_bias_linear,
+        "moe_shortcut_post_norm": config.moe_shortcut_post_norm,
+        "moe_shared_expert_overlap": config.moe_shared_expert_overlap,
+        "recompute_granularity": config.recompute_granularity not in (None, "selective"),
+        # Fused seams own the shortcut norm, the input norms and residual replay.
+        "shortcut_pre_mlp_layernorm recompute": "shortcut_pre_mlp_layernorm" in recompute_modules,
+        "layernorm recompute": "layernorm" in recompute_modules,
+        "residual_stream recompute": "residual_stream" in recompute_modules,
+        "fine_grained_activation_offloading": (
+            config.fine_grained_activation_offloading and not expert_only_offload
+        ),
+        "cpu_offloading": config.cpu_offloading,
+        "context_parallel_size > 1": config.context_parallel_size != 1,
+        # A fused block hands its unwritten MoE output to the next block on the same stage.
+        "pipeline_model_parallel_size > 1": config.pipeline_model_parallel_size != 1,
+    }
+    invalid = [name for name, enabled in unsupported.items() if enabled]
+    if invalid:
+        raise ValueError(f"{prefix} does not support: {', '.join(invalid)}")
+    if not config.moe_shared_expert_intermediate_size:
+        raise ValueError(f"{prefix} requires a shared expert")
+
+
 @dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
@@ -1458,6 +1506,26 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Wide Residual Configuration
     ####################
+    moe_shortcut_wide_residual_norm_fusion: bool = False
+    """Fuse each wide-residual write with the next layer's read/RMSNorm seam(s) in one kernel.
+
+    Covers shortcut-MoE blocks (Mamba/GDN/attention compute layer + MoE) and the lone wide-residual
+    Mamba and MLP-only layers around them; models must use the fusion stack specs
+    (hybrid_layer_specs.shortcut_fusion_stack_spec). The residual stream may be FP32
+    (fp32_residual_connection) or BF16; arithmetic is FP32 either way.
+
+    Requires moe_shortcut_connection=True with a shared expert, 2--6 wide streams (MXFP8 handoffs:
+    3), BF16 parameters, ordinary RMSNorm, no bias or hidden dropout, retention_max_forget=0.1 with
+    learned retention, context and pipeline parallel size 1, and hidden size divisible by 32 and
+    <= 10240. Rejects moe_shortcut_post_norm, moe_shared_expert_overlap, full recompute,
+    layernorm/shortcut_pre_mlp_layernorm/residual_stream recompute (the fused seams own those
+    norms and replay residuals via residual_stream_recompute_num_layers), cpu_offloading, and
+    fine-grained offloading other than fused_group_mlp. Training needs a GB300 and local flattened
+    tokens divisible by 1024; inference accepts any positive count (MXFP8 handoffs: multiples of
+    32) and supports local CUDA graphs at block scope. Local flattened tokens per call are capped at
+    65536 for hidden <= 4096 and 16384 above.
+    """
+
     wide_residual: Optional[WideResidualConfig] = None
     """Optional streamwise wide-residual architecture configuration.
 
@@ -1466,10 +1534,15 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     residual_stream_recompute_num_layers: Optional[int] = None
-    """Number of local layers per ordered residual-stream replay block.
+    """Number of local layers between residual-stream checkpoints.
 
-    ``None`` places all local layers in one block. This setting requires selective
-    recomputation with ``"residual_stream"`` in ``recompute_modules``.
+    With moe_shortcut_wide_residual_norm_fusion, ``None`` or 1 saves every layer's residual;
+    a value N > 1 saves one residual checkpoint every N physical layers and rebuilds the residuals
+    in between in backward by replaying their writes bit for bit (no other recompute flag
+    needed). Complete shortcut pairs stay in one interval. A residual write the replay cannot
+    reproduce (e.g. a shape the native writer rejects) is saved instead and starts a new interval.
+    Without fusion, ``None`` places all local layers in one block and this setting requires
+    selective recomputation with ``"residual_stream"`` in ``recompute_modules``.
     """
 
     ####################
@@ -1851,6 +1924,8 @@ class TransformerConfig(ModelParallelConfig):
         # downstream reads a plain bool.
         if self.moe_router_aux_loss_fusion is None:
             self.moe_router_aux_loss_fusion = self.moe_router_fusion
+
+        _validate_shortcut_fusion_config(self)
 
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
@@ -3239,18 +3314,30 @@ class TransformerConfig(ModelParallelConfig):
                 "'residual_stream' in recompute_modules requires "
                 "recompute_granularity='selective'."
             )
-        if use_residual_stream_recompute:
+        replay_interval = self.residual_stream_recompute_num_layers
+        if replay_interval is not None and (
+            isinstance(replay_interval, bool)
+            or not isinstance(replay_interval, int)
+            or replay_interval < 1
+        ):
+            raise ValueError(
+                "residual_stream_recompute_num_layers must be a positive integer or None."
+            )
+        if self.moe_shortcut_wide_residual_norm_fusion:
+            # The fused seams replay residual checkpoints themselves (residual_replay_scope).
+            if (
+                replay_interval is not None
+                and replay_interval > 1
+                and self.cuda_graph_impl != "none"
+            ):
+                raise ValueError(
+                    "residual_stream_recompute_num_layers > 1 (fused checkpoint replay) requires "
+                    "cuda_graph_impl='none': its Python replay manager runs outside graph capture."
+                )
+        elif use_residual_stream_recompute:
             if self.wide_residual is None:
                 raise ValueError(
                     "'residual_stream' recomputation requires a configured wide residual stream."
-                )
-            if self.residual_stream_recompute_num_layers is not None and (
-                isinstance(self.residual_stream_recompute_num_layers, bool)
-                or not isinstance(self.residual_stream_recompute_num_layers, int)
-                or self.residual_stream_recompute_num_layers < 1
-            ):
-                raise ValueError(
-                    "residual_stream_recompute_num_layers must be a positive integer or None."
                 )
             if self.fine_grained_activation_offloading:
                 replay_owned_norms = {"attn_norm", "mlp_norm"} & set(self.offload_modules or [])
@@ -3265,10 +3352,10 @@ class TransformerConfig(ModelParallelConfig):
                     "'residual_stream' recomputation requires cuda_graph_impl='none' because "
                     "its Python checkpoint manager remains outside CUDA graph capture."
                 )
-        elif self.residual_stream_recompute_num_layers is not None:
+        elif replay_interval is not None:
             raise ValueError(
                 "residual_stream_recompute_num_layers requires selective recomputation with "
-                "'residual_stream' in recompute_modules."
+                "'residual_stream' in recompute_modules, or moe_shortcut_wide_residual_norm_fusion."
             )
 
         if self.enable_mhc_connections and not (

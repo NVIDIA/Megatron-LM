@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -168,6 +168,10 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         self.branch_input_dtype = config.params_dtype
         self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
 
+    def read_logits(self) -> Tensor:
+        """Raw (padded) read-map logits, as the fused kernels consume them."""
+        return self.read_map(return_logits=True)
+
     def forward(self, hidden_states: Tensor) -> Tensor:
         """Read in branch precision; the operator fixes the output shape and dtype."""
 
@@ -222,6 +226,15 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             if operation == "write" and wr.learned_retention
             else None
         )
+
+    def read_logits(self) -> Tensor:
+        """Raw (padded) read-map logits, as the fused kernels consume them."""
+        return self.read_map(return_logits=True)
+
+    def write_logits(self) -> tuple[Tensor, Tensor | None]:
+        """Raw write-map and retention logits; retention is None for fixed identity retention."""
+        retain = None if self.retention is None else self.retention(return_logits=True)
+        return self.write_map(return_logits=True), retain
 
     def _read(
         self,
@@ -430,10 +443,174 @@ def expand_wide_residual_stream(hidden_states: Tensor, num_streams: int) -> Tens
 def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
     """Return whether selective residual-stream replay is active for this forward."""
 
+    if config.moe_shortcut_wide_residual_norm_fusion:
+        # Fused stacks replay residuals through residual_replay_scope, not ordered replay.
+        return False
     return bool(
         training
         and torch.is_grad_enabled()
         and config.recompute_granularity == "selective"
         and config.recompute_modules is not None
         and "residual_stream" in config.recompute_modules
+    )
+
+
+def _is_rmsnorm(norm: nn.Module) -> bool:
+    if isinstance(norm, nn.RMSNorm):
+        return True
+    try:
+        import transformer_engine.pytorch as te
+    except ImportError:
+        return False
+    return isinstance(norm, te.RMSNorm)
+
+
+def fused_norm_weight(norm: nn.Module) -> Tensor:
+    """``norm.weight`` for a fused kernel that applies ``norm`` without calling the module.
+
+    Runs the module's forward pre-hooks first, as calling it would. Distributed data parallel's
+    overlapped parameter all-gather waits for a module's parameters in such a hook.
+    """
+    for hook_id, hook in tuple(norm._forward_pre_hooks.items()):
+        if hook_id in norm._forward_pre_hooks_with_kwargs:
+            hook(norm, (), {})
+        else:
+            hook(norm, ())
+    return norm.weight
+
+
+def is_fusable_rmsnorm(norm: nn.Module) -> bool:
+    """Whether ``norm`` is a standalone, bias-free RMSNorm the fused seam kernels can apply."""
+    return (
+        _is_rmsnorm(norm)
+        and getattr(norm, "eps", None) is not None
+        and getattr(norm, "weight", None) is not None
+        and getattr(norm, "bias", None) is None
+        and not getattr(norm, "zero_centered_gamma", False)
+        and not getattr(norm, "returns_residual", False)
+    )
+
+
+def pending_write(residual: Tensor, branch_output, write, shared: Tensor | None = None):
+    """Return a branch's residual write as a ``PendingShortcutAdd`` instead of applying it.
+
+    Args:
+        residual: Wide residual the write updates.
+        branch_output: ``(update, bias)``; the fused kernels require a bias-free branch.
+        write: The branch's ``StreamwiseSigmoidWideResidualConnection`` write.
+        shared: A shared-expert update summed with ``update`` (a shortcut add), or None.
+    """
+    from megatron.core.fusions.wide_residual_shortcut import PendingShortcutAdd
+
+    update, bias = branch_output
+    if bias is not None:
+        raise ValueError("a deferred residual write requires a bias-free branch projection")
+    return PendingShortcutAdd(residual, update, shared, *write.write_logits())
+
+
+def write_pending_and_read_norm(
+    pending, read: StreamwiseSigmoidWideResidualConnection, norm: nn.Module
+) -> tuple[Tensor, Tensor]:
+    """Apply a deferred residual write and the next layer's read and RMSNorm in one kernel.
+
+    ``pending`` is a ``PendingShortcutAdd``: a fused shortcut block's MoE write (routed + shared)
+    or a lone layer's single update. The fused kernel writes it and emits ``norm(read(...))``
+    for the consuming layer.
+
+    Returns:
+        ``(residual, branch_input)``: the written wide residual and the normalized BF16 input.
+    """
+    from megatron.core.fusions.wide_residual_shortcut import (
+        shortcut_add_wide_residual_write_read_rmsnorm_quant,
+    )
+
+    residual, branch_input = shortcut_add_wide_residual_write_read_rmsnorm_quant(
+        pending,
+        read.read_logits(),
+        fused_norm_weight(norm),
+        num_streams=read.num_streams,
+        epsilon=norm.eps,
+    )
+    return residual, branch_input
+
+
+class ShortcutComputeParts(NamedTuple):
+    """What a fused ShortcutMoEBlock applies around its compute layer's branch.
+
+    Attributes:
+        read: Residual read of the branch input (owned by the block's seam kernels).
+        write: Residual write of the branch output (owned by the block's seam kernels).
+        input_norm: Standalone RMSNorm the seam kernels apply to the read.
+        branch: The mixer or self-attention module.
+        input_projection: The Linear that consumes the normalized input (a direct MXFP8 handoff
+            candidate), or None.
+    """
+
+    read: StreamwiseSigmoidWideResidualConnection
+    write: StreamwiseSigmoidWideResidualConnection
+    input_norm: nn.Module
+    branch: nn.Module
+    input_projection: nn.Module | None
+
+
+def direct_input_consumer(branch: nn.Module, projection, eligible):
+    """``projection`` if a fused seam may hand it a direct MXFP8 input, else None.
+
+    ``eligible(projection)`` is the handoff's own shape/recipe/device check. A checkpointed input
+    projection (``branch.recompute_in_proj``, e.g. GDP) keeps its weight hooks in an inner autograd
+    graph that the boundary's weight edge cannot order: with fine-grained activation offload its
+    weight-ready notifications are lost, so it stays on the BF16 handoff, and in training only GTP's
+    explicit weight finalization follows the deferred weight GEMM.
+    """
+    recompute = getattr(branch, "recompute_in_proj", False)
+    offload = recompute and getattr(branch.config, "fine_grained_activation_offloading", False)
+    if projection is None or offload or not eligible(projection):
+        return None
+    if (
+        torch.is_grad_enabled()
+        and recompute
+        and not getattr(projection.weight, "is_gtp_weight_remat", False)
+    ):
+        raise ValueError(
+            "direct shortcut MXFP8 requires deferred weight gradients; "
+            "GDP input-projection recompute requires GTP weight finalization. "
+            "Disable gdp_in_proj recompute or use a BF16 handoff."
+        )
+    return projection
+
+
+def _seam_connection(connection, num_streams: int):
+    """``connection`` if the fused seam kernels implement it, else None."""
+    if (
+        isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+        and connection.num_streams == num_streams
+    ):
+        return connection
+    return None
+
+
+def lone_seam_reader(layer, read, norm):
+    """``(read, norm)`` when a fused seam kernel can apply a lone layer's input read, else None.
+
+    A layer whose calls run through a CUDA-graph runner keeps its unfused seams: the runner
+    cannot take a PendingShortcutAdd.
+    """
+    if _runs_through_cuda_graph(layer) or not is_fusable_rmsnorm(norm):
+        return None
+    if _seam_connection(read, layer.config.wide_residual.num_streams) is None:
+        return None
+    return read, norm
+
+
+def lone_seam_writer(layer, write):
+    """``write`` when a fused seam kernel can apply a lone layer's residual write, else None."""
+    if _runs_through_cuda_graph(layer):
+        return None
+    return _seam_connection(write, layer.config.wide_residual.num_streams)
+
+
+def _runs_through_cuda_graph(layer) -> bool:
+    return (
+        getattr(layer, "cudagraph_manager", None) is not None
+        or layer.config.cuda_graph_impl == "transformer_engine"
     )

@@ -154,7 +154,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
                 'Triton autotune CLI arguments cannot be combined with --yaml-cfg; '
                 'set triton_autotune in the YAML configuration instead.'
             )
-        if _wide_residual_config_from_args(args) is not None:
+        if (
+            _wide_residual_config_from_args(args) is not None
+            or args.moe_shortcut_wide_residual_norm_fusion
+        ):
             raise ValueError(
                 'Wide-residual CLI arguments cannot be combined with --yaml-cfg because '
                 'YAML model configuration replaces argparse model arguments.'

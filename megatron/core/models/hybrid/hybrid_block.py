@@ -20,6 +20,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import residual_replay_scope
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -37,7 +38,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.tensor_observation import is_observing_tensor, observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -89,6 +90,17 @@ class HybridStackSubmodules:
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
     mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
+
+
+def _warn_fused_residuals_unobserved() -> None:
+    """Warn (once per call site, Python's default filter) that fused seams are not observed."""
+    if is_observing_tensor("residual_accumulator") or is_observing_tensor("residual_contribution"):
+        warnings.warn(
+            "Residual observation covers only lone layers that read and write the residual "
+            "themselves; it skips layers whose input or output residual write is fused into a "
+            "seam kernel (moe_shortcut_wide_residual_norm_fusion).",
+            stacklevel=2,
+        )
 
 
 class HybridStack(MegatronModule):
@@ -718,7 +730,10 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
-        with outer_fp8_context:
+        replay_context = residual_replay_scope(
+            self.config, self.training and self.uses_wide_residual_stream
+        )
+        with outer_fp8_context, replay_context as replay_manager:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -737,6 +752,9 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                # With the fused residual kernels a layer flagged defers_residual_write returns
+                # its unwritten write as a PendingShortcutAdd, which the next layer receives as
+                # hidden_states and applies in its seam kernel.
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -745,6 +763,8 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
+                    if replay_manager is not None:
+                        replay_manager.advance(2 if isinstance(layer, ShortcutMoEBlock) else 1)
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -856,13 +876,20 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                 )
 
-                        if isinstance(hidden_states, tuple):
-                            hidden_states = hidden_states[0]
-                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                        if cp_layout_state is not None:
-                            hidden_states = cp_layout_state.finalize_layer(
-                                physical_layer_idx, hidden_states
-                            )
+                        if getattr(layer, "defers_residual_write", False):
+                            # Unwritten: the next layer's seam kernel applies it.
+                            _warn_fused_residuals_unobserved()
+                        else:
+                            if isinstance(hidden_states, tuple):
+                                hidden_states = hidden_states[0]
+                            if torch.is_tensor(residual_accumulator):
+                                observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                            else:
+                                _warn_fused_residuals_unobserved()
+                            if cp_layout_state is not None:
+                                hidden_states = cp_layout_state.finalize_layer(
+                                    physical_layer_idx, hidden_states
+                                )
 
                     if residual_stream_recompute_context is not None:
                         residual_stream_recompute_context.finalize(hidden_states)

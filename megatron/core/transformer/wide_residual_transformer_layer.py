@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.residual_connection import (
@@ -14,8 +15,14 @@ from megatron.core.transformer.residual_connection import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
+    ShortcutComputeParts,
     StreamwiseSigmoidWideResidualConnection,
+    direct_input_consumer,
     load_residual_state,
+    lone_seam_reader,
+    lone_seam_writer,
+    pending_write,
+    write_pending_and_read_norm,
 )
 
 
@@ -23,6 +30,13 @@ class WideResidualTransformerLayer(TransformerLayer):
     """Transformer layer carrying a wide stream around ordinary-width branches."""
 
     supports_wide_residual_connections: bool = True
+    # Set by ShortcutMoEBlock at init when the fused shortcut kernels own the self-attention
+    # residual read/norm and write: the layer takes a normalized input and returns the raw
+    # attention output with bias.
+    using_shortcut_moe_fused_residual_kernel: bool = False
+    # Set by group_layers_into_shortcut_blocks on an MLP-only layer when the next layer applies
+    # its write: forward returns a PendingShortcutAdd instead of the written residual.
+    defers_residual_write: bool = False
 
     def __init__(
         self,
@@ -148,3 +162,94 @@ class WideResidualTransformerLayer(TransformerLayer):
                 return self.residual_write_mlp
             case _:
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
+
+    def _run_input_layernorm(self, hidden_states, *args, **kwargs):
+        """Skip the read and input norm when the fused shortcut kernel already applied them."""
+
+        if self.using_shortcut_moe_fused_residual_kernel:
+            self._input_layernorm_checkpoint_active = False
+            return hidden_states, None, ()
+        return super()._run_input_layernorm(hidden_states, *args, **kwargs)
+
+    def attention_bda_and_cross_attention(self, attention_output_with_bias, *args, **kwargs):
+        """Return the raw attention output when the fused shortcut kernel owns the write."""
+
+        if self.using_shortcut_moe_fused_residual_kernel:
+            return attention_output_with_bias, kwargs.get("context")
+        return super().attention_bda_and_cross_attention(
+            attention_output_with_bias, *args, **kwargs
+        )
+
+    def shortcut_compute_parts(self) -> ShortcutComputeParts | None:
+        """The read, write, input norm, attention and input projection a fused block applies.
+
+        None when the layer also has an MLP or cross-attention branch.
+        """
+        if not isinstance(self.mlp, IdentityOp) or not isinstance(self.cross_attention, IdentityOp):
+            return None
+        attention = self.self_attention
+        return ShortcutComputeParts(
+            self.residual_read_self_attn,
+            self.residual_write_self_attn,
+            self.input_layernorm,
+            attention,
+            getattr(attention, "in_proj", getattr(attention, "linear_qkv", None)),
+        )
+
+    def direct_input_consumer(self, eligible):
+        """The compute branch's input projection if a fused seam may hand it a direct MXFP8
+        input (``eligible`` is the handoff's own check), else None."""
+        parts = self.shortcut_compute_parts()
+        return direct_input_consumer(parts.branch, parts.input_projection, eligible)
+
+    def _is_lone_mlp(self) -> bool:
+        return (
+            isinstance(self.self_attention, IdentityOp)
+            and not isinstance(self.mlp, IdentityOp)
+            and not self.is_moe_layer
+            and not self.recompute_pre_mlp_layernorm
+        )
+
+    def pending_write_reader(self):
+        """The MLP read and pre-MLP RMSNorm a fused seam kernel can apply, or None.
+
+        Only MLP-only layers qualify; with a reader the layer accepts a PendingShortcutAdd as
+        ``hidden_states``.
+        """
+        if not self._is_lone_mlp():
+            return None
+        return lone_seam_reader(self, self.residual_read_mlp, self.pre_mlp_layernorm)
+
+    def pending_write_writer(self):
+        """The MLP residual write an MLP-only layer can defer to the next seam's kernel, or None."""
+        return lone_seam_writer(self, self.residual_write_mlp) if self._is_lone_mlp() else None
+
+    def _forward_attention(self, hidden_states, *args, **kwargs):
+        """An MLP-only layer passes a deferred write straight to its MLP read."""
+
+        if isinstance(hidden_states, PendingShortcutAdd):
+            if self.pending_write_reader() is None:
+                raise RuntimeError("this layer cannot apply a deferred residual write")
+            return hidden_states, kwargs.get("context")
+        return super()._forward_attention(hidden_states, *args, **kwargs)
+
+    def _pre_mlp_layernorm_and_residual(self, hidden_states, *args, **kwargs):
+        """Apply a deferred write together with the MLP read and pre-MLP RMSNorm."""
+
+        if isinstance(hidden_states, PendingShortcutAdd):
+            if kwargs.get("residual_stream_recompute_context") is not None:
+                raise RuntimeError("a deferred residual write cannot be replayed here")
+            residual, branch_input = write_pending_and_read_norm(
+                hidden_states, *self.pending_write_reader()
+            )
+            return branch_input, residual, (residual,)
+        return super()._pre_mlp_layernorm_and_residual(hidden_states, *args, **kwargs)
+
+    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=(), **kwargs):
+        """Return the MLP write as a PendingShortcutAdd when the next layer applies it."""
+
+        if not self.defers_residual_write:
+            return super()._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state, **kwargs)
+        if not mlp_state:
+            raise RuntimeError("Missing state for the MLP residual connection.")
+        return pending_write(mlp_state[0], mlp_output_with_bias, self.residual_write_mlp)

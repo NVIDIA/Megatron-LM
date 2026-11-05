@@ -688,6 +688,105 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 )
 
 
+def _split_norm_mlp_layer(linear_fc1: type, linear_fc2: type) -> ModuleSpec:
+    """A wide-residual MLP-only layer whose pre-MLP RMSNorm is a standalone module.
+
+    The fused seam kernels apply that norm, so it cannot live inside linear_fc1. Checkpoints keep
+    the fused-projection name (mlp.linear_fc1.layer_norm_weight).
+    """
+    return ModuleSpec(
+        module=WideResidualTransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            pre_mlp_layernorm=TENorm,
+            mlp=partial(
+                MLP.as_mlp_submodule,
+                submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2),
+            ),
+            mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"},
+        ),
+    )
+
+
+def _shortcut_fusion_stack_spec(stack_spec: ModuleSpec, mlp_layer: ModuleSpec) -> ModuleSpec:
+    """Split every input norm the fused seam kernels apply out of its projection.
+
+    Compute layers (Mamba/GDN/attention) and MLP-only layers get standalone RMSNorms; sharded
+    checkpoint names keep the fused-projection keys.
+    """
+    submodules, layers = stack_spec.submodules, {"mlp_layer": mlp_layer}
+    for name, branch_name, norm_name, projection_name in (
+        ("mamba_layer", "mixer", "norm", "in_proj"),
+        ("gdn_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("gdn2_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("attention_layer", "self_attention", "input_layernorm", "linear_qkv"),
+    ):
+        spec = getattr(submodules, name)
+        branch = getattr(spec.submodules, branch_name)
+        projection = getattr(branch.submodules, projection_name)
+        projection = {
+            TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+            InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+        }.get(projection)
+        if projection is None:
+            continue
+        branch = replace(
+            branch, submodules=replace(branch.submodules, **{projection_name: projection})
+        )
+        mapping = dict(spec.submodules.sharded_state_dict_keys_map)
+        mapping[norm_name + "."] = branch_name + "." + projection_name + ".layer_norm_"
+        layers[name] = replace(
+            spec,
+            submodules=replace(
+                spec.submodules,
+                **{branch_name: branch, norm_name: TENorm},
+                sharded_state_dict_keys_map=mapping,
+            ),
+        )
+    return replace(stack_spec, submodules=replace(submodules, **layers))
+
+
+_split_norm_mlp = _split_norm_mlp_layer(TEColumnParallelLinear, TERowParallelLinear)
+_split_norm_inference_mlp = _split_norm_mlp_layer(
+    InferenceColumnParallelLinear, InferenceRowParallelLinear
+)
+# Stacks for --moe-shortcut-wide-residual-norm-fusion (select with shortcut_fusion_stack_spec).
+wide_residual_shortcut_fusion_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_hybrid_stack_spec, _split_norm_mlp
+)
+wide_residual_shortcut_fusion_gdp_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_stack_spec, _split_norm_mlp
+)
+wide_residual_shortcut_fusion_inference_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_hybrid_inference_stack_spec, _split_norm_inference_mlp
+)
+wide_residual_shortcut_fusion_gdp_inference_stack_spec = _shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_inference_stack_spec, _split_norm_inference_mlp
+)
+_SHORTCUT_FUSION_STACK_SPECS = (
+    (wide_residual_hybrid_stack_spec, wide_residual_shortcut_fusion_stack_spec),
+    (wide_residual_gated_delta_product_stack_spec, wide_residual_shortcut_fusion_gdp_stack_spec),
+    (wide_residual_hybrid_inference_stack_spec, wide_residual_shortcut_fusion_inference_stack_spec),
+    (
+        wide_residual_gated_delta_product_inference_stack_spec,
+        wide_residual_shortcut_fusion_gdp_inference_stack_spec,
+    ),
+)
+
+
+def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Return the shortcut-fusion counterpart of a built-in wide-residual stack spec.
+
+    Model builders call this once at construction when moe_shortcut_wide_residual_norm_fusion is
+    set. Fusion specs and custom specs are returned unchanged; ShortcutMoEBlock rejects custom
+    specs whose norms the kernels cannot apply.
+    """
+    for wide, fused in _SHORTCUT_FUSION_STACK_SPECS:
+        if stack_spec is wide:
+            return fused
+    return stack_spec
+
+
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec

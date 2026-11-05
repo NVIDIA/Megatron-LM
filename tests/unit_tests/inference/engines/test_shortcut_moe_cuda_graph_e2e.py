@@ -8,6 +8,7 @@ from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    shortcut_fusion_stack_spec,
     wide_residual_gated_delta_product_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -46,11 +47,17 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
         finally:
             super().teardown_class()
 
+    PATTERN = "ME*"
+    STACK_SPEC = wide_residual_gated_delta_product_inference_stack_spec
+
+    def _config_overrides(self):
+        return {"moe_shortcut_post_norm": True}
+
     def _create_model(self):
         torch.manual_seed(1234)
         config = TransformerConfig(
             params_dtype=torch.bfloat16,
-            num_layers=3,
+            num_layers=len(self.PATTERN),
             hidden_size=256,
             num_attention_heads=16,
             ffn_hidden_size=512,
@@ -67,7 +74,6 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
             moe_token_dispatcher_type="alltoall",
             moe_shortcut_connection=True,
             moe_shared_expert_intermediate_size=512,
-            moe_shortcut_post_norm=True,
             wide_residual=WideResidualConfig(num_streams=3),
             use_cpu_initialization=True,
             transformer_impl="inference_optimized",
@@ -84,14 +90,15 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
             attention_dropout=0.0,
             attention_backend=AttnBackend.flash,
             flash_attention_version=FLASH_ATTENTION_VERSION,
+            **self._config_overrides(),
         )
         model = HybridModel(
             config=config,
-            hybrid_stack_spec=wide_residual_gated_delta_product_inference_stack_spec,
+            hybrid_stack_spec=self.STACK_SPEC,
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
-            hybrid_layer_pattern="ME*",
+            hybrid_layer_pattern=self.PATTERN,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
@@ -102,4 +109,25 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
         for module in model.modules():
             if isinstance(module, Attention):
                 module.batch_invariant_mode = True
+        return model
+
+
+class TestFusedShortcutMoECudaGraphE2E(TestShortcutMoECudaGraphE2E):
+    """The same with the fused residual seams: lone layers -> block -> lone attention."""
+
+    PATTERN = "M-ME*"
+    STACK_SPEC = shortcut_fusion_stack_spec(wide_residual_gated_delta_product_inference_stack_spec)
+
+    def _config_overrides(self):
+        return {"moe_shortcut_wide_residual_norm_fusion": True, "hidden_dropout": 0.0}
+
+    def _create_model(self):
+        model = super()._create_model()
+        layers = model.decoder.layers
+        assert all(
+            layer.using_shortcut_moe_fused_residual_kernel
+            for layer in layers
+            if isinstance(layer, ShortcutMoEBlock)
+        )
+        assert layers[0].defers_residual_write and layers[1].defers_residual_write
         return model
