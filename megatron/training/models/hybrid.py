@@ -59,6 +59,8 @@ class HybridModelConfig(ModelConfig):
     hybrid_mlp_ratio: float = 0.0
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
+    n_loops_distribution: str | None = None
+    """Shared loop-count policy for all colon-delimited recurrent decoder regions."""
     seq_length: int = 8192
     """Position-embedding capacity, passed to the model as max_sequence_length; the launcher
     fills it from --max-position-embeddings. The training sequence length that core modules
@@ -207,6 +209,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
+            n_loops_distribution=self._model_config.n_loops_distribution,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
             logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
@@ -257,6 +260,10 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             List of model stages.
         """
+        if ':' in (self._model_config.hybrid_layer_pattern or '') and (
+            use_megatron_fsdp or use_torch_fsdp2
+        ):
+            raise ValueError("Hybrid recurrence does not yet support FSDP; use Megatron DDP")
         transformer_config = self._model_config.transformer
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(

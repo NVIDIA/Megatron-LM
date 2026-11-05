@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TypeAlias
 import torch
 
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.recurrence import parse_recurrence_pattern
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
@@ -49,7 +50,8 @@ class ParsedHybridPattern:
     A unified pattern encodes both the main decoder pattern and the MTP pattern
     in a single string using "/" as a separator. The main pattern may also
     contain "|" pipe symbols to define pipeline stage boundaries for flexible
-    virtual pipeline parallelism (fVPP).
+    virtual pipeline parallelism (fVPP), or ':' boundaries marking recurrent regions.
+    Loop boundaries are removed from ``main_pattern`` and recorded as physical layer ranges.
 
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
 
@@ -73,6 +75,8 @@ class ParsedHybridPattern:
     main_pattern: Optional[str]
     mtp_pattern: Optional[str]
     mtp_num_depths: int
+    recurrent_layer_ranges: tuple[tuple[int, int], ...] = ()
+    """Half-open unique-layer ranges marked by ':' in the main decoder pattern."""
 
 
 @dataclass(frozen=True)
@@ -275,7 +279,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
     """Returns the total number of main decoder layers in a hybrid layer pattern.
 
     Extracts the main pattern (before the first MTP separator '/'), strips
-    pipeline stage separators '|', and returns the character count.
+    pipeline stage separators '|' and loop boundaries ':', and returns the unique layer count.
 
     Args:
         pattern: Full hybrid layer pattern, possibly including MTP and pipe separators.
@@ -284,6 +288,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
+    main_pattern, _ = parse_recurrence_pattern(main_pattern)
     _validate_pattern(main_pattern, allow_pipe=True)
     return len(main_pattern.replace(Symbols.PIPE, ''))
 
@@ -380,15 +385,19 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
 
     parts = pattern.split(Symbols.MTP_SEPARATOR)
+    main_pattern, recurrent_layer_ranges = parse_recurrence_pattern(parts[0])
 
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
-        main_pattern = parts[0]
         _validate_pattern(main_pattern, allow_pipe=True)
-        return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
+        return ParsedHybridPattern(
+            main_pattern=main_pattern,
+            mtp_pattern=None,
+            mtp_num_depths=0,
+            recurrent_layer_ranges=recurrent_layer_ranges,
+        )
 
     # First part is main decoder pattern
-    main_pattern = parts[0]
     if main_pattern:
         _validate_pattern(main_pattern, allow_pipe=True)
 
@@ -398,7 +407,10 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if not mtp_parts or all(p == "" for p in mtp_parts):
         # No MTP patterns after separator
         return ParsedHybridPattern(
-            main_pattern=main_pattern if main_pattern else None, mtp_pattern=None, mtp_num_depths=0
+            main_pattern=main_pattern if main_pattern else None,
+            mtp_pattern=None,
+            mtp_num_depths=0,
+            recurrent_layer_ranges=recurrent_layer_ranges,
         )
 
     # Validate all MTP patterns are identical
@@ -419,6 +431,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
         main_pattern=main_pattern if main_pattern else None,
         mtp_pattern=mtp_pattern,
         mtp_num_depths=len(mtp_parts),
+        recurrent_layer_ranges=recurrent_layer_ranges,
     )
 
 

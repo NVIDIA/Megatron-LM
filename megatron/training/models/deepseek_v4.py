@@ -21,7 +21,7 @@ def normalize_dsv4_hybrid_csa_compress_ratios(
     fixed_ratio_map = Symbols.DSV4_COMPRESS_RATIO_MAP
     ratio_symbols = set(fixed_ratio_map)
     sections = pattern.split(Symbols.MTP_SEPARATOR)
-    layers = "".join(section.replace(Symbols.PIPE, "") for section in sections)
+    layers = "".join(section.replace(Symbols.PIPE, "").replace(":", "") for section in sections)
     attention_symbols = [symbol for symbol in layers if symbol in ratio_symbols]
     if not attention_symbols:
         return

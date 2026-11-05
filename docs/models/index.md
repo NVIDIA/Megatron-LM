@@ -22,5 +22,6 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 
 llms
 multimodal
+hybrid-recurrence
 ../llama_mistral
 ```

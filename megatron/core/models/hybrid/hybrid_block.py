@@ -28,6 +28,11 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.recurrence import (
+    LoopDistribution,
+    recurrent_layer_indices,
+    validate_recurrence_config,
+)
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
@@ -122,6 +127,8 @@ class HybridStack(MegatronModule):
         mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
+        recurrent_layer_ranges: Half-open physical layer ranges to repeat with tied weights.
+        n_loops_distribution: Training loop-count policy, e.g., "1:0.5,4:0.5".
     """
 
     def __init__(
@@ -142,6 +149,8 @@ class HybridStack(MegatronModule):
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
+        recurrent_layer_ranges: tuple[tuple[int, int], ...] = (),
+        n_loops_distribution: str | None = None,
     ) -> None:
         """
         Args:
@@ -170,6 +179,18 @@ class HybridStack(MegatronModule):
                 has_mtp=is_mtp_layer,
             )
 
+        self.recurrent_layer_ranges = tuple(recurrent_layer_ranges)
+        self.loop_distribution = LoopDistribution.from_string(n_loops_distribution)
+        if self.recurrent_layer_ranges:
+            validate_recurrence_config(config)
+            tuple(recurrent_layer_indices(len(layer_config_list), self.recurrent_layer_ranges, 1))
+            if pp_layer_offset != 0 or is_mtp_layer:
+                raise ValueError("Hybrid recurrence requires a non-pipelined decoder stack")
+            for layer_config in layer_config_list:
+                validate_recurrence_config(layer_config)
+        elif n_loops_distribution is not None:
+            raise ValueError("n_loops_distribution requires recurrent_layer_ranges")
+
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -190,6 +211,13 @@ class HybridStack(MegatronModule):
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
+        if self.recurrent_layer_ranges:
+            if (
+                self.pp_group is not None and self.pp_group.size() != 1
+            ) or self.cp_group.size() != 1:
+                raise ValueError("Hybrid recurrence requires PP=1 and CP=1 process groups")
+            if len(self.loop_distribution.counts) > 1 and pg_collection.tp_dp_cp is None:
+                raise ValueError("Stochastic hybrid recurrence requires pg_collection.tp_dp_cp")
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -586,6 +614,7 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        n_loops: int | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -601,6 +630,7 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            n_loops (int, optional): Positive loop-count override for this forward only.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
         Returns:
@@ -608,8 +638,18 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        recurrent_ranges = getattr(self, "recurrent_layer_ranges", ())
+        if recurrent_ranges:
+            # Configs are mutable; never let a later recompute/graph setting bypass recurrence.
+            validate_recurrence_config(self.config)
+            if inference_context is not None:
+                raise ValueError("Hybrid recurrence does not yet support cached inference")
+        if n_loops is not None and not recurrent_ranges:
+            raise ValueError("n_loops requires recurrent_layer_ranges")
 
         runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
+        if recurrent_ranges and runtime_cp_group.size() != 1:
+            raise ValueError("Hybrid recurrence requires CP=1 for every microbatch")
 
         cp_layout_state = None
         if cp_layout_manager is not None:
@@ -640,6 +680,14 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        execution_indices = range(len(self.layers))
+        if recurrent_ranges:
+            if n_loops is None:
+                n_loops = self.loop_distribution.sample(
+                    self.training, hidden_states.device, self.pg_collection.tp_dp_cp
+                )
+            execution_indices = recurrent_layer_indices(len(self.layers), recurrent_ranges, n_loops)
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
@@ -737,14 +785,10 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
-                for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
-                    zip(
-                        self._execution_layer_indices,
-                        self._execution_layer_config_list,
-                        self.layers,
-                        strict=True,
-                    )
-                ):
+                for layer_idx in execution_indices:
+                    physical_layer_idx = self._execution_layer_indices[layer_idx]
+                    layer_config = self._execution_layer_config_list[layer_idx]
+                    layer = self.layers[layer_idx]
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx

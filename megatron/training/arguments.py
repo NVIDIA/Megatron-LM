@@ -816,6 +816,21 @@ def validate_args(args, defaults={}):
     ):
         args.multi_latent_attention = True
 
+    n_loops_distribution = getattr(args, 'n_loops_distribution', None)
+    if n_loops_distribution is not None:
+        from megatron.core.models.hybrid.recurrence import LoopDistribution
+
+        LoopDistribution.from_string(n_loops_distribution)
+        if not parse_hybrid_pattern(args.hybrid_layer_pattern).recurrent_layer_ranges:
+            raise ValueError('--n-loops-distribution requires : boundaries in --hybrid-layer-pattern')
+    if args.hybrid_layer_pattern and ':' in args.hybrid_layer_pattern:
+        # Parse even without MTP or a loop policy so malformed boundaries fail during validation.
+        parse_hybrid_pattern(args.hybrid_layer_pattern)
+        if args.pipeline_model_parallel_size != 1:
+            raise ValueError('Hybrid recurrence does not yet support pipeline parallelism')
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError('Hybrid recurrence does not yet support FSDP; use Megatron DDP')
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -1292,9 +1307,7 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler default_dynamic_cp"
             )
         dp_cp_size = args.data_parallel_size * args.context_parallel_size
-        from megatron.core.parallel_state import (
-            get_valid_dynamic_context_parallel_group_sizes,
-        )
+        from megatron.core.parallel_state import get_valid_dynamic_context_parallel_group_sizes
 
         valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
         if args.min_dynamic_context_parallel_size not in valid_group_sizes:
@@ -3579,10 +3592,18 @@ def _add_experimental_args(parser):
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
                        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
-                       'Use / to separate MTP patterns. '
+                       'Use / to separate MTP patterns. Use prefix:body1:body2:...:suffix to '
+                       'repeat each body with shared weights and the same loop count '
+                       '(PP=1 only). '
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
+    group.add_argument('--n-loops-distribution', type=str, default=None,
+                       help='Shared loop-count probabilities for all : delimited hybrid '
+                       'regions, '
+                       'e.g. "1:0.25,2:0.25,4:0.25,8:0.25". Defaults to one loop. '
+                       'Evaluation uses the largest count. Supply the desired policy on '
+                       'every restart; it is independent of checkpoint weights.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')
