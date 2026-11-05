@@ -1502,8 +1502,8 @@ class TestHybridWithDynamicInference:
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
-            hybrid_layer_pattern="M*",
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),  # 1 Mamba, 1 attention
+            hybrid_layer_pattern="M*",  # 1 Mamba, 1 attention
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.model = Float16Module(self.model.config, self.model)
 
