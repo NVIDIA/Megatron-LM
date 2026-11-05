@@ -139,6 +139,22 @@ def test_hybridep_reset_releases_buffer_after_last_handle_and_graph(hybrid_ep_bu
     assert buffer_ref() is None
 
 
+def test_hybridep_dispatch_keeps_selected_buffer_if_cache_is_reset(hybrid_ep_buffers, monkeypatch):
+    dispatch = fused_a2a.HybridEPBuffer.dispatch_with_permute
+
+    def dispatch_and_reset(buffer, *args, **kwargs):
+        result = dispatch(buffer, *args, **kwargs)
+        fused_a2a.reset_hybrid_ep_buffer()
+        return result
+
+    monkeypatch.setattr(fused_a2a.HybridEPBuffer, "dispatch_with_permute", dispatch_and_reset)
+    hidden, _, (dispatched, _, _, _, handle) = _dispatch(SimpleNamespace(scale=2))
+    combined = fused_a2a.HybridEPCombine.apply(dispatched, handle, None, None, False)
+    combined.sum().backward()
+    torch.testing.assert_close(combined, hidden * 4)
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 4))
+
+
 def _check_group_sequence(groups):
     """Keep graph/handle locals within a scope that ends before group teardown."""
     pending = []
@@ -165,12 +181,13 @@ def _check_group_sequence(groups):
 
     # Interleave two real communicators, then clear the cache before either combine/backward.
     fused_a2a.reset_hybrid_ep_buffer()
-    losses = []
+    outputs = []
     for hidden, dispatched, handle in pending:
-        combined = fused_a2a.hybrid_ep_combine(dispatched, handle, None, None)
+        combined = fused_a2a.hybrid_ep_combine(dispatched, handle, dispatched.shape[0], None)
         torch.testing.assert_close(combined, hidden, rtol=0, atol=0)
-        losses.append(combined.sum())
-    sum(losses).backward()
+        outputs.append(combined)
+    # HybridEP requires contiguous gradient inputs; sum() would supply a stride-zero view.
+    torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
     for hidden, _, _ in pending:
         torch.testing.assert_close(hidden.grad, torch.ones_like(hidden), rtol=0, atol=0)
 

@@ -666,7 +666,8 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None or _hybrid_ep_buffer.group is not group:
+        buffer = _hybrid_ep_buffer
+        if buffer is None or buffer.group is not group:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
@@ -681,6 +682,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
+            buffer = _hybrid_ep_buffer
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
@@ -700,7 +702,7 @@ class HybridEPDispatch(torch.autograd.Function):
             dispatched_scaling_factor,
             tokens_per_expert,
             handle,
-        ) = _hybrid_ep_buffer.dispatch_with_permute(
+        ) = buffer.dispatch_with_permute(
             hidden=x,
             probs=probs,
             scaling_factor=None,
@@ -712,7 +714,7 @@ class HybridEPDispatch(torch.autograd.Function):
             **dispatch_kwargs,
         )
 
-        handle = _HybridEPHandle(handle, _hybrid_ep_buffer)
+        handle = _HybridEPHandle(handle, buffer)
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
