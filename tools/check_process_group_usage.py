@@ -307,7 +307,11 @@ def main(argv=None) -> int:
     """Check the baseline, or refresh it only after verifying no new calls were introduced."""
     ap = argparse.ArgumentParser(description=__doc__)
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--update", action="store_true", help="remove stale allowlist entries")
+    mode.add_argument(
+        "--update",
+        action="store_true",
+        help="remove stale allowlist entries and record guarded conversions",
+    )
     mode.add_argument(
         "--stats", action="store_true", help="summarize without checking the allowlist"
     )
