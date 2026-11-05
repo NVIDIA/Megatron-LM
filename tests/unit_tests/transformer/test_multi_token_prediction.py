@@ -367,6 +367,33 @@ class TestMultiTokenPredictionLayer:
             torch.testing.assert_close(peer_mixed, gathered[0])
         assert torch.unique(gathered[0][..., 0]).numel() > 1
 
+    def test_hsm_rng_differs_across_gtp_data_lanes(self):
+        """GTP ranks carry distinct microbatches and must draw independent HSM masks."""
+        gtp = 2
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < gtp or world_size % gtp:
+            pytest.skip(f"GTP={gtp} requires a world size divisible by {gtp}")
+        Utils.initialize_model_parallel(gtp_remat_size=gtp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['dp', 'gtp_remat']
+        )
+        rng_tracker_name = _initialize_hidden_state_mixing_rng_tracker(
+            pg_collection.dp, pg_collection.gtp_remat
+        )
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _mix_hidden_state_history(
+            torch.stack(history[:-1]), history[-1], rng_tracker_name=rng_tracker_name
+        )
+        gathered = [torch.empty_like(mixed) for _ in range(gtp)]
+        torch.distributed.all_gather(gathered, mixed, group=pg_collection.gtp_remat)
+
+        assert not torch.equal(gathered[0], gathered[1])
+
     def test_hsm_rng_differs_across_sequence_parallel_owners(self):
         """Disjoint TP+CP token shards receive different tracked RNG slices."""
         tp = 2
@@ -4316,8 +4343,8 @@ class TestMultiTokenPredictionHybrid:
             assert stack.residual_stream_readout is None
             assert len(stack.layers) == 2
             attention, moe = stack.layers
-            assert attention._get_self_attention_residual_connection(operation="read") is None
-            assert moe._get_mlp_residual_connection(operation="read") is None
+            assert attention._get_residual_connection_for_self_attention(operation="read") is None
+            assert moe._get_residual_connection_for_mlp(operation="read") is None
             assert list(moe.pre_mlp_layernorm.parameters()), "MTP must retain its MoE norm"
             calls = {"attention": [], "norm": []}
             recordings.append((moe, calls))

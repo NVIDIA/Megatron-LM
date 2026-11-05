@@ -118,8 +118,6 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks, and the `_samples_seen` count
     """
-    args = get_args()
-
     # Ensure tensors are on cuda and float
     losses = output_tensor.float()
     loss_mask = loss_mask.float()
@@ -152,7 +150,8 @@ def loss_func(
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
-    if args.check_for_nan_in_loss_and_grad:
+    cfg = get_run_config()
+    if cfg.rerun_state_machine.check_for_nan_in_loss:
         rerun_state_machine.validate_result(
             result=loss[0],
             rejection_func=torch.isnan,
@@ -161,7 +160,7 @@ def loss_func(
             fatal=True,
         )
     # Check for spiky loss
-    if args.check_for_spiky_loss:
+    if cfg.rerun_state_machine.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss[0],
             rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
