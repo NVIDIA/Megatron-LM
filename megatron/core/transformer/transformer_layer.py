@@ -926,6 +926,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
+    def _validate_residual_branch_layout(self) -> tuple[bool, bool]:
+        """Validate branch layouts for advanced residual-stream architectures.
+
+        mHC and Wide Residual subclasses opt in after base construction. Return
+        whether attention and MLP are active. Inactive paths still execute at stream
+        width, so their norms and BDA must be identities. Ordinary Transformer layers
+        do not call this helper.
+        """
+        if not isinstance(self.cross_attention, IdentityOp):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support cross-attention branches."
+            )
+        if not isinstance(self.pre_cross_attn_layernorm, IdentityOp) or not isinstance(
+            self.cross_attn_bda, IdentityOp
+        ):
+            raise ValueError("Residual-stream layers require an identity cross-attention path.")
+
+        has_attention = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
+        for active, norm, bda, stage in (
+            (has_attention, self.input_layernorm, self.self_attn_bda, "self-attention"),
+            (has_mlp, self.pre_mlp_layernorm, self.mlp_bda, "MLP"),
+        ):
+            if not active and (not isinstance(norm, IdentityOp) or not isinstance(bda, IdentityOp)):
+                raise ValueError(f"The inactive {stage} branch requires identity norm and BDA.")
+        return has_attention, has_mlp
+
     def _get_residual_connection_for_self_attention(
         self, operation: ResidualConnectionOperation
     ) -> ResidualConnection | None:
@@ -951,6 +978,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 return getattr(self, "residual_write_mlp", None)
             case _:
                 raise ValueError(f"Unsupported residual connection operation: {operation}.")
+
+    def _is_last_residual_write(self, *, is_mlp: bool) -> bool:
+        """Whether an active stage supplies the layer's last configured residual write."""
+        return is_mlp or self._get_residual_connection_for_mlp(operation="write") is None
 
     def _read_residual_connection(
         self,
@@ -1105,7 +1136,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             is_terminal_write = bool(
                 recompute_context is not None
                 and recompute_context.is_block_end
-                and self._get_residual_connection_for_mlp(operation="write") is None
+                and self._is_last_residual_write(is_mlp=False)
             )
             write_recompute_context = None if is_terminal_write else recompute_context
             grad_scope = (

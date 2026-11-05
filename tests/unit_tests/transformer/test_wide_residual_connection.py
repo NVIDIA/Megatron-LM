@@ -9,7 +9,7 @@ from torch import nn
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -619,9 +619,11 @@ class TestWideResidualStaticConstruction:
             module=WideResidualTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=self_attention,
-                self_attn_bda=get_bias_dropout_add,
+                self_attn_bda=(
+                    get_bias_dropout_add if self_attention is not IdentityOp else IdentityFuncOp
+                ),
                 mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
+                mlp_bda=get_bias_dropout_add if mlp is not IdentityOp else IdentityFuncOp,
             ),
         )
 
