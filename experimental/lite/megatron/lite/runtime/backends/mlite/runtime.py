@@ -530,6 +530,15 @@ class MegatronLiteRuntime(RuntimeBase):
             forward_step = replay_driver.wrap(forward_step)
 
         ps = handle._parallel_state
+        per_token_loss = bool(handle._extras.get("per_token_loss", False))
+        if per_token_loss and loss_fn is not None and not forward_only:
+            # The schedules then skip the 1/num_microbatches scaling and finalize_grads divides
+            # by the global token count, which is only right for a token-sum loss.
+            raise NotImplementedError(
+                "per-token loss mode needs the model's token-sum loss; an external loss_fn is "
+                "not supported in this mode"
+            )
+        num_tokens = None
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
@@ -554,7 +563,9 @@ class MegatronLiteRuntime(RuntimeBase):
                     pipeline_forward_step,
                     pipeline_chunks,
                     data_iter,
-                    SimpleNamespace(num_microbatches=num_microbatches),
+                    SimpleNamespace(
+                        num_microbatches=num_microbatches, per_token_loss=per_token_loss
+                    ),
                     ps,
                     tensor_shape=tensor_shape,
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
@@ -564,6 +575,14 @@ class MegatronLiteRuntime(RuntimeBase):
             finally:
                 if replay_driver is not None:
                     replay_driver.end()
+            if per_token_loss:
+                # Only the last stage counts tokens; finalize_grads broadcasts them over PP.
+                counts = [item["num_tokens"] for item in outputs if "num_tokens" in item]
+                num_tokens = (
+                    torch.stack(counts).float().sum()
+                    if counts
+                    else torch.zeros((), device="cuda", dtype=torch.float32)
+                )
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
@@ -590,15 +609,21 @@ class MegatronLiteRuntime(RuntimeBase):
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
+                    per_token_loss=per_token_loss,
                 )
             finally:
                 if replay_driver is not None:
                     replay_driver.end()
+            if per_token_loss and out:
+                num_tokens = out.pop("_num_tokens", None)
 
         if not forward_only:
             finalize_grads = handle._extras.get("finalize_grads")
             if finalize_grads is not None:
-                finalize_grads()
+                if per_token_loss:
+                    finalize_grads(num_tokens=num_tokens)
+                else:
+                    finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
         metric_rows = out.get("_loss_fn_metrics", []) if out else []
