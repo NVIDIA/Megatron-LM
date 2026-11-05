@@ -45,6 +45,12 @@ covered by the replay tests of the kernels they call, named in the entry's
 | Module / model | `tests/unit_tests/determinism/correctness/` | GPT, TransformerBlock, HybridModel and FP8/FP4 recipes across parallelism cells (`BitExactRunner`). |
 | End to end | functional tests with `--deterministic-mode` | Loss and `num-zeros` compared against golden values at their recorded precision; legacy goldens use five decimals. |
 
+Multi-rank replay tests that inspect symmetric-memory workspaces must
+synchronize after copying outputs to the host and checking them, before any
+rank starts the next replay. A barrier before inspection waits for current
+producers but allows faster peers to overwrite the shared workspace during
+inspection. Keep the read-completion barrier outside CUDA graph capture.
+
 The manifest (`tests/unit_tests/determinism/kernels/manifest.py`) is the
 registry that ties kernel source files to the tests that cover them. Each
 `KernelEntry` names the source files, the tests, the kernel kind, and either a
