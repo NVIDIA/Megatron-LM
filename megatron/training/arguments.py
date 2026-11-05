@@ -1671,6 +1671,22 @@ def validate_args(args, defaults={}):
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
+        # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
+        # which builds a separate DistributedOptimizer for their non-matrix parameters unless
+        # --no-use-layer-wise-param-layout is set. Its memory-efficient fully reshardable save
+        # gathers over Gloo as well.
+        if (
+            args.optimizer not in ('sgd', 'adam')
+            and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
+            and getattr(args, 'use_layer_wise_param_layout', True)
+            and args.dist_ckpt_optim_fully_reshardable
+        ):
+            assert not args.distrib_optim_fully_reshardable_mem_efficient, (
+                '--distrib-optim-fully-reshardable-mem-efficient needs Gloo process groups for '
+                'the DistributedOptimizer of the layer-wise optimizer. Drop '
+                '--disable-gloo-process-groups or pass --no-use-layer-wise-param-layout.'
+            )
+
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
         # Disable nan check for fake process group
