@@ -2157,15 +2157,17 @@ def test_float16_optimizer_rejects_unmatchable_main_params():
 
 
 def test_param_group_optimizer_requires_resolved_collection(mocker):
-    """The helpers below get_megatron_optimizer never resolve process groups themselves."""
-    mocker.patch('megatron.core.optimizer.FP32Optimizer')
+    """The helpers below get_megatron_optimizer never resolve process groups themselves, and
+    reject a missing collection before wrapping the optimizer."""
+    distributed_optimizer = mocker.patch('megatron.core.optimizer.DistributedOptimizer')
     param = torch.nn.Parameter(torch.zeros(2, device='cuda'))
     with pytest.raises(ValueError, match='pg_collection must be resolved'):
         _get_megatron_optimizer_based_on_param_groups(
-            OptimizerConfig(optimizer='sgd', lr=0.1),
+            OptimizerConfig(optimizer='sgd', lr=0.1, use_distributed_optimizer=True),
             model_chunks=[nn.Linear(2, 2)],
             param_groups=[{'params': [param]}],
         )
+    distributed_optimizer.assert_not_called()
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed")

@@ -716,6 +716,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
+    # Only the Megatron wrapper reads the collection, so require it before building any wrapper:
+    # a DistributedOptimizer would otherwise be constructed over the model's buffers first.
+    if pg_collection is None:
+        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
+
     # Grad scaler:
     #    if loss-scale is provided, instantiate the constant scaler.
     #    if we are using fp16 and loss-scale is not present, use a
@@ -769,8 +774,6 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None:
-        raise ValueError("pg_collection must be resolved by get_megatron_optimizer")
     tp_group = pg_collection.tp
     expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
