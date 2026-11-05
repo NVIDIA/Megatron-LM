@@ -23,6 +23,8 @@ from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
     num_floating_point_operations,
+    reset_seqlen_stats_in_iteration,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
     update_seqlen_stats_from_padding_mask,
     update_vision_model_flops_stats,
@@ -1057,6 +1059,36 @@ class TestAccumulator:
     def test_update_from_padding_mask_none_is_noop(self):
         update_seqlen_stats_from_padding_mask(None)
         assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_discards_pending_updates(self):
+        # Statistics of a superseded train_step attempt or of evaluation forwards must not
+        # reach the next training consumer.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 5, 8], dtype=torch.int32))
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_then_update_counts_only_the_new_attempt(self):
+        # Evaluation (or a retried attempt) with real lengths [5, 3], then one training
+        # micro-batch with the same lengths: the consumer sees (8, 34), not (16, 68).
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        reset_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+
+    def test_two_microbatches_of_one_attempt_still_add_up(self):
+        cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == (16, 68)
+
+    def test_reset_clears_a_global_seed(self):
+        set_seqlen_stats_in_iteration(100, 10000)
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert training_module._seqlen_stats_are_global is False
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The

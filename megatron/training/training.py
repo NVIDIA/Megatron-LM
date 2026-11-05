@@ -813,6 +813,24 @@ def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
     _seqlen_stats_are_global = True
 
 
+def reset_seqlen_stats_in_iteration():
+    """Discard any per-iteration sequence statistics accumulated so far.
+
+    The producers run inside ``get_batch`` / ``forward_step``, so they also fire during
+    evaluation forwards and in every forward/backward attempt the rerun state machine
+    repeats for one logical iteration, while :func:`consume_seqlen_stats_in_iteration`
+    drains the accumulator only once per training iteration. ``train_step`` calls this at
+    the start of every attempt and ``evaluate`` on entry and exit, so a training
+    iteration's FLOPs only ever see the micro-batches of its own, final attempt. The
+    tensor stays allocated.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
+
+
 def update_seqlen_stats_from_padding_mask(padding_mask):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one right-padded SBHD micro-batch.
 
@@ -4800,6 +4818,10 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        # Sequence statistics are attempt-scoped: a retried forward/backward replaces, not
+        # adds to, the statistics of the superseded attempt, and nothing accumulated outside
+        # train_step (e.g. by evaluation forwards) reaches this iteration's consumer.
+        reset_seqlen_stats_in_iteration()
         # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
         # remain readable until their delayed D2H after the main-param copy below.
         if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
@@ -7308,6 +7330,10 @@ def evaluate(
     args = get_args()
     timers = get_timers()
     train_state = get_train_state()
+    # Evaluation forwards run the same get_batch / forward_step producers as training, but
+    # their sequence statistics must not reach the training FLOPs consumer: start from, and
+    # leave behind, an empty accumulator.
+    reset_seqlen_stats_in_iteration()
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
@@ -7462,6 +7488,7 @@ def evaluate(
                 done = done_cuda.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
+                    reset_seqlen_stats_in_iteration()
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
 
@@ -7495,6 +7522,7 @@ def evaluate(
     timers.log(['evaluate'])
 
     rerun_state_machine.set_mode(rerun_mode)
+    reset_seqlen_stats_in_iteration()
 
     # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
     # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
