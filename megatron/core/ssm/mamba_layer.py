@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from inspect import signature
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -63,15 +64,22 @@ class MambaLayerSubmodules:
 class MambaLayerTECudaGraphMixin(TECudaGraphMixin):
     """Declare the Mamba scope and its TE graph input restrictions."""
 
-    def is_graphable_for_scope(self, modules):
-        return not modules or CudaGraphModule.mamba in modules
-
-    def before_replay_hook(self, args, kwargs):
+    def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
+        """Reject inference contexts and prepare Mamba's tensor inputs for replay."""
+        if args:
+            positional_inputs = signature(self.forward).bind(hidden_states, *args).arguments
+            positional_inputs.pop("hidden_states")
+            kwargs = dict(**positional_inputs, **kwargs)
         assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
-        return super().before_replay_hook(args, kwargs)
+        return super().before_replay_hook(
+            hidden_states, **{k: v for k, v in kwargs.items() if v is not None}
+        )
+
+    def is_graphable_for_scope(self, modules):
+        return not modules or CudaGraphModule.mamba in modules
 
 
 class MambaLayer(MambaLayerTECudaGraphMixin, GraphableMegatronModule, TwoStageAttentionLayer):

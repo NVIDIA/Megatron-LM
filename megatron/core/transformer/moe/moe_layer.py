@@ -251,7 +251,7 @@ class MoELayerTECudaGraphMixin:
     and resumes its eager operations without registering a second graph.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.config.cuda_graph_impl == "transformer_engine":
             # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.

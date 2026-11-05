@@ -2,6 +2,7 @@
 
 """The shared mixin interface; layer behavior is covered by existing TE graph tests."""
 
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +10,10 @@ import pytest
 import torch
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs
-from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
+from megatron.core.extensions.te_cuda_graphs import (
+    TECudaGraphMixin,
+    set_te_cuda_graph_current_microbatch,
+)
 from megatron.core.transformer.module import MegatronModule
 
 
@@ -23,7 +27,7 @@ def _config(backend="transformer_engine"):
 
 
 class _Module(TECudaGraphMixin, MegatronModule):
-    def __init__(self, config):
+    def __init__(self, config) -> None:
         super().__init__(config)
         self.weight = torch.nn.Parameter(torch.tensor(2.0))
 
@@ -38,14 +42,33 @@ class _Module(TECudaGraphMixin, MegatronModule):
 def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
     """A plain MegatronModule opts in only for TE, then dispatches by capture/training state."""
     module = _Module(_config(backend))
+    # The outer model can use eager/local execution while its vision encoder uses TE.
+    vision_layer = _Module(_config())
+    mtp_layer = _Module(_config())
+    model = SimpleNamespace(
+        config=module.config,
+        decoder=SimpleNamespace(layers=[module]),
+        mtp=SimpleNamespace(layers=[SimpleNamespace(mtp_model_layer=mtp_layer)]),
+        vision_model=SimpleNamespace(decoder=SimpleNamespace(layers=[vision_layer])),
+    )
+    vision_layer.te_cuda_graphs = [
+        lambda hidden_states, is_first_microbatch: hidden_states,
+        lambda hidden_states, is_first_microbatch: hidden_states + 1,
+    ]
+    monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", False)
+    x = torch.tensor(3.0)
+    for microbatch in (0, 1):
+        set_te_cuda_graph_current_microbatch(model, microbatch)
+        assert mtp_layer.te_cuda_graph_current_microbatch == microbatch
+        torch.testing.assert_close(vision_layer(x), x + microbatch)
     events = []
     module.register_forward_pre_hook(lambda *_: events.append("eager"))
-    x = torch.tensor(3.0)
     if backend != "transformer_engine":
         monkeypatch.setattr(
             cuda_graphs, "is_graph_capturing", Mock(side_effect=AssertionError("TE path entered"))
         )
         assert not hasattr(module, "te_cuda_graphs")
+        assert not hasattr(module, "te_cuda_graph_current_microbatch")
         with pytest.raises(ValueError, match="registration requires"):
             module.register_te_cuda_graph()
         torch.testing.assert_close(module(x), x * 2)
@@ -68,19 +91,25 @@ def test_te_cuda_graph_mixin_dispatch(monkeypatch, backend):
     monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", False)
 
     def graph(index):
-        def replay(hidden_states, is_first_microbatch, optional="omitted"):
-            assert optional is None
+        def replay(hidden_states, is_first_microbatch, offset):
             events.append((index, is_first_microbatch))
-            return hidden_states + index
+            return hidden_states + index + offset
 
         return replay
 
     module.te_cuda_graphs = [graph(0), graph(1)]
+    offset = torch.tensor(2.0)
     for microbatch in (0, 1, 2):
         events.clear()
-        module.te_cuda_graph_current_microbatch = microbatch
-        torch.testing.assert_close(module(hidden_states=x, optional=None), x + microbatch % 2)
+        set_te_cuda_graph_current_microbatch(model, microbatch)
+        torch.testing.assert_close(
+            module._te_cuda_graph_replay(hidden_states=x, offset=offset),
+            x + microbatch % 2 + offset,
+        )
         assert events == ["manual", (microbatch % 2, microbatch == 0)]
+    for method in (module.__call__, module._te_cuda_graph_capture, module._te_cuda_graph_replay):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            method(hidden_states=x, unknown_input=None)
     other = _Module(_config())
     assert other.te_cuda_graphs == [] and other.te_cuda_graph_manual_hooks == []
 
@@ -113,17 +142,18 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
     )
 
     class Adapter(_Module):
-        def capture_forward_hook(self, *args, **kwargs):
+        def capture_forward_hook(self, hidden_states, offset=1):
             record("capture")
-            return self.forward(*args, **kwargs) + 1
+            return self.forward(hidden_states) + offset
 
-        def before_replay_hook(self, args, kwargs):
+        def before_replay_hook(self, hidden_states):
             record("before")
-            return (args[0] + 1,), kwargs, args[0]
+            replay_graph, _ = super().before_replay_hook(hidden_states + 1)
+            return replay_graph, partial(self.after_replay_hook, residual=hidden_states)
 
-        def after_replay_hook(self, outputs, state):
+        def after_replay_hook(self, outputs, residual):
             record("after")
-            return outputs + state
+            return outputs + residual
 
         def get_offload_interface(self):
             return offload
@@ -132,12 +162,16 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
     module.offload_module_in_cuda_graph = True
     module.config.delay_offload_until_cuda_graph = True
     monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", True)
-    for args, kwargs in [((torch.tensor(3.0),), {}), ((), {"hidden_states": torch.tensor(3.0)})]:
+    for capture in (
+        partial(module, torch.tensor(3.0)),
+        partial(module, hidden_states=torch.tensor(3.0), offset=torch.tensor(1.0)),
+        partial(module, torch.tensor(3.0), torch.tensor(1.0)),
+    ):
         events.clear()
-        torch.testing.assert_close(module(*args, **kwargs), torch.tensor(7.0))
+        torch.testing.assert_close(capture(), torch.tensor(7.0))
         assert events == ["backward", "capture", "forward"]
 
-    def graph(hidden_states, **kwargs):
+    def graph(hidden_states, is_first_microbatch):
         record("graph")
         return hidden_states * module.weight + 1
 

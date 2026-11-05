@@ -62,14 +62,19 @@ class TECudaGraphMixin:
     """Provide TE CUDA graph capture and replay for an opt-in Megatron module.
 
     Place this before the module base in the inheritance list and use cooperative
-    initialization. Registration is gated by cuda_graph_impl='transformer_engine'.
+    initialization. The constructor forwards arguments unchanged, then registers
+    TE graphs when cuda_graph_impl='transformer_engine'. Shared dispatch, capture,
+    and replay forward module inputs to the adapter hooks. Adapters declare their
+    input contracts on those hooks and can use copy_signature on thin wrappers.
+    Graph-input preparation validates tensors and adds TE execution metadata.
     By default, one graph covers forward(). Adapters can override static-input and
     replay-argument preparation, capture_forward_hook, before_replay_hook, and
     after_replay_hook for a smaller scope and run the surrounding eager operations.
-    Replay state is per call.
+    before_replay_hook returns a graph callback and an output callback. Bind any
+    continuation state into the output callback so it remains local to the call.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.config.cuda_graph_impl == "transformer_engine":
             self.register_te_cuda_graph()
@@ -96,7 +101,7 @@ class TECudaGraphMixin:
 
     def __call__(self, *args, **kwargs):
         """Capture or replay the TE graph when this module owns the scope."""
-        if self._should_call_te_cudagraph(*args, **kwargs):
+        if self._should_call_te_cudagraph():
             if not self.te_cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._te_cuda_graph_capture
@@ -198,7 +203,7 @@ class TECudaGraphMixin:
         """
         return [self]
 
-    def _te_cuda_graph_capture(self, *args, **kwargs):
+    def _te_cuda_graph_capture(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Capture the selected computation, including its offload dependencies."""
         off_interface = self.get_offload_interface()
         record_offload = off_interface is not None and self.offload_module_in_cuda_graph
@@ -206,15 +211,8 @@ class TECudaGraphMixin:
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if record_offload:
-            if len(args) > 0:
-                hidden_states = args[0]
-                hidden_states = off_interface.backward_record(hidden_states)
-                args = (hidden_states,) + args[1:]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
-                hidden_states = off_interface.backward_record(hidden_states)
-                kwargs["hidden_states"] = hidden_states
-        cuda_graph_outputs = self.capture_forward_hook(*args, **kwargs)
+            hidden_states = off_interface.backward_record(hidden_states)
+        cuda_graph_outputs = self.capture_forward_hook(hidden_states, *args, **kwargs)
         # Record the forward event on cuda graph stream for cuda graph capture.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the D2H transfer on offloading stream.
@@ -223,15 +221,12 @@ class TECudaGraphMixin:
         return cuda_graph_outputs
 
     def capture_forward_hook(self, *args, **kwargs):
-        """
-        CUDA Graph capture for this layer using TE interface.
-        Normally it's just a forward pass if we're capturing the entire layer.
-        """
+        """Capture the entire module by forwarding its inputs to forward()."""
         return self.forward(*args, **kwargs)
 
-    def _te_cuda_graph_replay(self, *args, **kwargs):
-        """Run the eager prefix, replay the graph, then run the eager continuation."""
-        args, kwargs, state = self.before_replay_hook(args, kwargs)
+    def _te_cuda_graph_replay(self, hidden_states: torch.Tensor, *args, **kwargs):
+        """Replay the graph and run its continuation with shared offload ordering."""
+        replay_graph, after_replay = self.before_replay_hook(hidden_states, *args, **kwargs)
         off_interface = self.get_offload_interface()
         delay_offload_until_cuda_graph = (
             off_interface is not None and self.config.delay_offload_until_cuda_graph
@@ -240,22 +235,25 @@ class TECudaGraphMixin:
             off_interface.enter_replay()
 
         try:
-            cuda_graph_output = self._te_cuda_graph_replay_graph(*args, **kwargs)
+            cuda_graph_output = replay_graph()
             # Flush delayed offload groups from previous layers after graph replay.
             # The CPU is idle during the sync between graph replay and a2a comm,
             # so we use that time to execute the delayed offload operations.
             if delay_offload_until_cuda_graph:
                 off_interface.flush_delayed_groups()
-            return self.after_replay_hook(cuda_graph_output, state)
+            return after_replay(cuda_graph_output)
         finally:
             if delay_offload_until_cuda_graph:
                 off_interface.exit_replay()
 
-    def before_replay_hook(self, args, kwargs):
-        """Return graph inputs and per-call state for the eager continuation."""
-        return args, kwargs, None
+    def before_replay_hook(self, hidden_states: torch.Tensor, **kwargs):
+        """Bind tensor inputs for graph replay and its eager continuation."""
+        return (
+            partial(self._te_cuda_graph_replay_graph, hidden_states, **kwargs),
+            self.after_replay_hook,
+        )
 
-    def after_replay_hook(self, outputs, state):
+    def after_replay_hook(self, outputs):
         """Restore the public forward result; whole-module graphs need no adaptation."""
         return outputs
 
@@ -263,40 +261,26 @@ class TECudaGraphMixin:
         """Return the offload interface for modules that coordinate it with TE graphs."""
         return None
 
-    def _te_cuda_graph_replay_graph(self, *args, **kwargs):
-        """
-        CUDA graph replay for this layer and microbatch `self.te_cuda_graph_current_microbatch`
-        using TE interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
-        However, CUDA graph accepts only Tensor inputs.
-        Hence, check if the arguments are all tensors.
-        """
-        for arg in args:
-            assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
-        for _, v in kwargs.items():
-            assert v is None or isinstance(
-                v, torch.Tensor
-            ), "CUDA graph accepts only Tensor inputs."
-
+    def _te_cuda_graph_replay_graph(self, hidden_states: torch.Tensor, **kwargs):
+        """Prepare tensor inputs and replay this microbatch's graph."""
         microbatch_idx = getattr(self, 'te_cuda_graph_current_microbatch', 0)
         cg_index = self._te_cuda_graph_index(microbatch_idx)
-        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(
+            hidden_states, **kwargs
+        )
 
         for hook, hook_args in self.te_cuda_graph_manual_hooks:
             hook(*hook_args)
         return self.te_cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
-    def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
-        """Helper function to get tensor arguments for TE CUDA graph."""
-        if len(args) == 0:
-            assert 'hidden_states' in kwargs, "hidden_states is required."
-            hidden_states = kwargs.pop('hidden_states')
-            cudagraph_args = (hidden_states,)
-        else:
-            assert (
-                'hidden_states' not in kwargs
-            ), "hidden_states should only be passed as either a positional or keyword argument."
-            cudagraph_args = tuple(args)
-
+    def _get_te_cuda_graph_replay_args(self, hidden_states: torch.Tensor, **kwargs):
+        """Validate the module's tensor inputs and add TE execution metadata."""
+        assert isinstance(hidden_states, torch.Tensor), "CUDA graph accepts only Tensor inputs."
+        for value in kwargs.values():
+            assert value is None or isinstance(
+                value, torch.Tensor
+            ), "CUDA graph accepts only Tensor inputs."
+        cudagraph_args = (hidden_states,)
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = (
             getattr(self, 'te_cuda_graph_current_microbatch', 0) == 0
@@ -315,7 +299,7 @@ class TECudaGraphMixin:
             cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
-    def _should_call_te_cudagraph(self, *args, **kwargs):
+    def _should_call_te_cudagraph(self):
         """
         Check if we should call the TE cudagraph path.
         """
@@ -337,6 +321,9 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
     current_microbatch is read by _te_cuda_graph_replay to select the
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
+
+    Check each layer's backend: a multimodal model can use different backends
+    for its language decoder and vision encoder.
     """
     decoder_exists = True
     model_with_decoder = None
@@ -348,13 +335,15 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
         for layer in model_with_decoder.decoder.layers:
-            layer.te_cuda_graph_current_microbatch = microbatch_id
+            if layer.config.cuda_graph_impl == "transformer_engine":
+                layer.te_cuda_graph_current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.te_cuda_graph_current_microbatch = microbatch_id
+                if layer.mtp_model_layer.config.cuda_graph_impl == "transformer_engine":
+                    layer.mtp_model_layer.te_cuda_graph_current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,
@@ -372,4 +361,5 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
         vision_model = model_with_vision.vision_model
         if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
             for layer in vision_model.decoder.layers:
-                layer.te_cuda_graph_current_microbatch = microbatch_id
+                if layer.config.cuda_graph_impl == "transformer_engine":
+                    layer.te_cuda_graph_current_microbatch = microbatch_id

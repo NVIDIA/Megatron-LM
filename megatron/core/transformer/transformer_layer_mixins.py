@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from inspect import signature
 from typing import Optional
 
@@ -136,16 +137,13 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
 
     def _forward_attention(self, *args, **kwargs):
         """Observe the whole-layer mask for both normal and EP-overlap warmup calls."""
-        forward_attention = super()._forward_attention
-        if self.config.cuda_graph_impl == "transformer_engine":
-            padding_mask = kwargs.get("padding_mask")
-            if len(args) > 1:
-                # Preserve positional callers without hard-coding the mask's argument index.
-                padding_mask = (
-                    signature(forward_attention).bind(*args, **kwargs).arguments.get("padding_mask")
-                )
-            self._te_cuda_graph_record_padding_mask_shape(padding_mask)
-        return forward_attention(*args, **kwargs)
+        if (
+            self.config.cuda_graph_impl == "transformer_engine"
+            and self._te_cuda_graph_padding_mask_shape_seen is None
+        ):
+            inputs = signature(super()._forward_attention).bind(*args, **kwargs)
+            self._te_cuda_graph_record_padding_mask_shape(inputs.arguments.get("padding_mask"))
+        return super()._forward_attention(*args, **kwargs)
 
     def _te_cuda_graph_record_padding_mask_shape(self, padding_mask):
         if padding_mask is not None and self._te_cuda_graph_padding_mask_shape_seen is None:
@@ -235,14 +233,25 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             padding_mask = torch.zeros(graph_mask_shape, dtype=torch.bool, device=device)
         return padding_mask
 
-    def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
-        """Helper function to get tensor arguments for TE CUDA graph."""
-        cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(*args, **kwargs)
-
-        assert (
-            len(cudagraph_args) == 1
-        ), "Exactly one positional argument `hidden_states` is expected."
-        hidden_states = cudagraph_args[0]
+    def _get_te_cuda_graph_replay_args(
+        self, hidden_states: Tensor, *, padding_mask: Optional[Tensor] = None, **kwargs
+    ):
+        """Adapt padding and attention masks, then prepare tensor inputs for TE."""
+        kwargs = {k: v for k, v in kwargs.items() if v is not None or k == "attention_mask"}
+        # Attention inputs are absent when attention ran eagerly before the graph.
+        if (
+            self.config.cuda_graph_modules
+            and CudaGraphModule.attn not in self.config.cuda_graph_modules
+        ):
+            kwargs.pop("attention_mask", None)
+        # The graph only takes padding_mask when it was captured with that input; the eager MoE
+        # steps after the graph keep using the caller's mask.
+        graph_padding_mask = self._te_cuda_graph_padding_mask(padding_mask, hidden_states.device)
+        if graph_padding_mask is not None:
+            kwargs["padding_mask"] = graph_padding_mask
+        cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(
+            hidden_states, **kwargs
+        )
 
         try:
             import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -293,20 +302,6 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         except ImportError:
             raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
         return tuple(cudagraph_args), cudagraph_kwargs
-
-    def _te_cuda_graph_replay_graph(self, *args, **kwargs):
-        # The graph only takes padding_mask when it was captured with that input; the eager MoE
-        # steps after the graph keep using the caller's mask from `kwargs`.
-        graph_kwargs = {
-            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
-        }
-        hidden_states = args[0] if args else kwargs["hidden_states"]
-        graph_padding_mask = self._te_cuda_graph_padding_mask(
-            kwargs.get("padding_mask"), hidden_states.device
-        )
-        if graph_padding_mask is not None:
-            graph_kwargs["padding_mask"] = graph_padding_mask
-        return super()._te_cuda_graph_replay_graph(*args, **graph_kwargs)
 
     def is_graphable_for_scope(self, modules):
         # If cuda_graph_modules is not set, every layer is graphed.
@@ -394,17 +389,21 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    def _reconstruct_packed_graph_inputs(self, kwargs):
+    def _reconstruct_packed_graph_inputs(
+        self,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_kv: Optional[Tensor],
+        cu_seqlens_q_padded: Optional[Tensor],
+        cu_seqlens_kv_padded: Optional[Tensor],
+    ) -> PackedSeqParams:
         """Rebuild THD metadata inside capture using graph-static scalar capacities."""
-        if "cu_seqlens_q" not in kwargs:
-            return
         capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-        kwargs["packed_seq_params"] = PackedSeqParams(
+        return PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
-            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
-            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
-            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             max_seqlen_q=capacity,
             max_seqlen_kv=capacity,
             # Runtime packs can contain valid/physical gaps. A fixed True value
@@ -412,7 +411,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             pad_between_seqs=True,
         )
 
-    def capture_forward_hook(self, *args, **kwargs):
+    def capture_forward_hook(self, hidden_states: Tensor, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
         There are some differences from the normal pass:
@@ -420,19 +419,29 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        self._reconstruct_packed_graph_inputs(kwargs)
+        if args:
+            positional_inputs = signature(super()._forward_attention).bind(
+                hidden_states, *args
+            ).arguments
+            positional_inputs.pop("hidden_states")
+            kwargs = dict(**positional_inputs, **kwargs)
+        kwargs.setdefault("attention_mask", None)
+        cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
+        cu_seqlens_kv = kwargs.pop("cu_seqlens_kv", None)
+        cu_seqlens_q_padded = kwargs.pop("cu_seqlens_q_padded", None)
+        cu_seqlens_kv_padded = kwargs.pop("cu_seqlens_kv_padded", None)
+        kwargs = {k: v for k, v in kwargs.items() if v is not None or k == "attention_mask"}
+        if cu_seqlens_q is not None:
+            kwargs["packed_seq_params"] = self._reconstruct_packed_graph_inputs(
+                cu_seqlens_q, cu_seqlens_kv, cu_seqlens_q_padded, cu_seqlens_kv_padded
+            )
 
         context = None
         if (
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         ):
-            hidden_states, context = self._forward_attention(*args, **kwargs)
-        else:
-            if len(args) > 0:
-                hidden_states = args[0]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
+            hidden_states, context = self._forward_attention(hidden_states, **kwargs)
 
         if (
             not self.config.cuda_graph_modules
@@ -459,15 +468,24 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
 
-    def before_replay_hook(self, args, kwargs):
+    def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
+        """Run the eager prefix and bind this call's graph and continuation inputs."""
+        if args:
+            positional_inputs = signature(super()._forward_attention).bind(
+                hidden_states, *args
+            ).arguments
+            positional_inputs.pop("hidden_states")
+            kwargs = dict(**positional_inputs, **kwargs)
+        kwargs.setdefault("attention_mask", None)
+        kwargs = {k: v for k, v in kwargs.items() if v is not None or k == "attention_mask"}
+
         context = None
         if (
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
             input_ids = kwargs.get("input_ids", None)
-            hidden_states, context = self._forward_attention(*args, **kwargs)
-            args = (hidden_states,)
+            hidden_states, context = self._forward_attention(hidden_states, **kwargs)
             # Attention consumed the other kwargs eagerly; the MoE padding mask is still needed
             # by the graphed router and by the eager MoE steps after the graph, and hash-routing
             # layers still need input_ids.
@@ -503,13 +521,33 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
-        kwargs["packed_seq_params"] = packed
-        return args, kwargs, (kwargs, context)
+        kwargs.pop("inference_context", None)
+        kwargs.pop("packed_seq_params", None)
+        return (
+            partial(self._te_cuda_graph_replay_graph, hidden_states, **kwargs),
+            partial(
+                self.after_replay_hook,
+                context=context,
+                graph_has_context=kwargs.get("context") is not None,
+                padding_mask=kwargs.get("padding_mask"),
+                input_ids=kwargs.get("input_ids"),
+                packed_seq_params=packed,
+            ),
+        )
 
-    def after_replay_hook(self, cuda_graph_output, state):
-        kwargs, context = state
+    def after_replay_hook(
+        self,
+        cuda_graph_output,
+        *,
+        context: Optional[Tensor] = None,
+        graph_has_context: bool = False,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Finish the eager layer stages using this call's continuation inputs."""
         cuda_graph_output = list(cuda_graph_output)
-        if kwargs.get('context') is not None:
+        if graph_has_context:
             context = cuda_graph_output.pop()
 
         if (
@@ -528,9 +566,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             # residual is the last element in the CUDA graph output.
             residual = cuda_graph_output.pop()
             mlp_output_with_bias = self.mlp._te_cuda_graph_resume(
-                cuda_graph_output,
-                kwargs.get("padding_mask"),
-                packed_seq_params=kwargs.get("packed_seq_params"),
+                cuda_graph_output, padding_mask, packed_seq_params=packed_seq_params
             )
             if self.config.overlap_moe_expert_parallel_comm:
                 return (residual, *mlp_output_with_bias)
@@ -555,17 +591,15 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
                 return (
                     residual,
                     *self.mlp._te_cuda_graph_pre_dispatch(
-                        hidden_states,
-                        kwargs.get("padding_mask"),
-                        packed_seq_params=kwargs.get("packed_seq_params"),
+                        hidden_states, padding_mask, packed_seq_params=packed_seq_params
                     ),
                 )
 
             # CUDA Graph does not capture the MLP/MoE part at all.
             output = self._forward_mlp(
                 *cuda_graph_output,
-                padding_mask=kwargs.get("padding_mask"),
-                input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params"),
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
             )
         return output, context
