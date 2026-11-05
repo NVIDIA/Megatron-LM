@@ -7,6 +7,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core import process_groups_config
+from megatron.core.process_groups_config import ProcessGroupFallbackWarning
 from megatron.core.transformer import MLATransformerConfig, ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -88,7 +90,7 @@ class TestDefaultLayerSpecDispatch:
         config = _make_dispatch_config()
         config.restore_modelopt_state = True
 
-        result = default_layer_spec(config, vp_stage=None)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
         mock_get_spec.assert_called_once_with(
             config=config.transformer,
@@ -96,6 +98,8 @@ class TestDefaultLayerSpecDispatch:
             remap_te_layernorm=True,
             real_quant_cfg="None",
             use_arbitrary_attention_mask=True,
+            vp_stage=2,
+            pp_rank=1,
         )
         assert result is spec
 
@@ -123,10 +127,34 @@ class TestDefaultLayerSpecDispatch:
         config.restore_modelopt_state = True
         config.use_arbitrary_attention_mask = None
 
-        default_layer_spec(config, vp_stage=None)
+        # Without the builder's collection, the global grid decides, with a warning.
+        with (
+            patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set()),
+            pytest.warns(ProcessGroupFallbackWarning, match="default_layer_spec"),
+        ):
+            default_layer_spec(config, vp_stage=None)
 
         # cp_world_size=4 → use_arbitrary_attention_mask=False
         assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is False
+
+    @pytest.mark.parametrize("cp_size", [1, 4])
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.core.parallel_state")
+    def test_modelopt_arbitrary_attention_mask_derived_from_collection_cp_size(
+        self, mock_ps, mock_get_spec, cp_size
+    ):
+        # The builder's collection decides, not the global parallel state.
+        mock_ps.get_context_parallel_world_size.side_effect = AssertionError("global read")
+        mock_get_spec.return_value = Mock(spec=ModuleSpec)
+        config = _make_dispatch_config()
+        config.restore_modelopt_state = True
+        config.use_arbitrary_attention_mask = None
+        pg_collection = Mock()
+        pg_collection.cp.size.return_value = cp_size
+
+        default_layer_spec(config, vp_stage=None, pg_collection=pg_collection)
+
+        assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is (cp_size == 1)
 
     @patch(
         "megatron.training.models.gpt.get_transformer_block_with_experimental_attention_variant_spec"
@@ -136,9 +164,9 @@ class TestDefaultLayerSpecDispatch:
         mock_get_spec.return_value = spec
         config = _make_dispatch_config(experimental_attention_variant="variant_x")
 
-        result = default_layer_spec(config, vp_stage=2)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
-        mock_get_spec.assert_called_once_with(config=config.transformer, vp_stage=2)
+        mock_get_spec.assert_called_once_with(config=config.transformer, vp_stage=2, pp_rank=1)
         assert result is spec
 
     @patch("megatron.training.models.gpt.get_gpt_decoder_block_spec")
@@ -150,7 +178,7 @@ class TestDefaultLayerSpecDispatch:
         # use_te flag depends on transformer_impl
         config.transformer.transformer_impl = "transformer_engine"
 
-        result = default_layer_spec(config, vp_stage=1)
+        result = default_layer_spec(config, vp_stage=1, pp_rank=1)
 
         mock_get_spec.assert_called_once_with(
             config.transformer,
@@ -158,6 +186,7 @@ class TestDefaultLayerSpecDispatch:
             normalization=config.transformer.normalization,
             qk_l2_norm=config.transformer.qk_l2_norm,
             vp_stage=1,
+            pp_rank=1,
         )
         assert result is spec
 
@@ -174,9 +203,9 @@ class TestDefaultLayerSpecDispatch:
         config.restore_modelopt_state = False
         config.transformer = transformer
 
-        result = default_layer_spec(config, vp_stage=None)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
-        mock_get_spec.assert_called_once_with(transformer, True)
+        mock_get_spec.assert_called_once_with(transformer, True, vp_stage=2, pp_rank=1)
         assert result is spec
 
     @patch("megatron.training.models.gpt.get_gpt_layer_with_transformer_engine_spec")
@@ -528,10 +557,11 @@ class TestGPTModelBuilderBuildModel:
         default_spec = ModuleSpec(module=object)
         mock_default.return_value = default_spec
         self.config.__dict__["transformer_layer_spec"] = None
+        self.pg.pp.rank.return_value = 1
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=3)
 
-        mock_default.assert_called_once_with(self.config, 3)
+        mock_default.assert_called_once_with(self.config, 3, 1, pg_collection=self.pg)
         assert mock_model.call_args.kwargs["transformer_layer_spec"] is default_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)

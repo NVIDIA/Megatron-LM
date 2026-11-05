@@ -70,6 +70,19 @@ class _ConverterFakeProcessGroup:
         self._size = size
 
 
+def initialize_checkpoint_converter_distributed():
+    """Initialize a single-process gloo group unless torch.distributed is already initialized.
+
+    Model construction reads ranks and sizes from the fake process groups through
+    ``get_pg_rank`` and ``get_pg_size``, which ignore a group until torch.distributed is
+    initialized. The in-process store needs no port, so it does not clash with the saver process.
+    """
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend='gloo', store=torch.distributed.HashStore(), rank=0, world_size=1
+        )
+
+
 def initialize_checkpoint_converter_fake_process_groups(
     parallel_state, tensor_parallel_size, pipeline_parallel_size, expert_parallel_size
 ):
@@ -83,8 +96,14 @@ def initialize_checkpoint_converter_fake_process_groups(
     GTP rematerialization is not active during conversion. Its data-parallel
     groups therefore alias the corresponding non-GTP groups, matching
     ``initialize_model_parallel`` when the GTP axes have size one.
+
+    Context parallelism is not used during conversion either, but the model
+    still needs a size-one context-parallel group: ``LanguageModule`` requires
+    tensor-, context- and pipeline-parallel groups once ``torch.distributed`` is
+    initialized, as it is in the saver.
     """
     fake_tp_group = _ConverterFakeProcessGroup(size=tensor_parallel_size)
+    fake_cp_group = _ConverterFakeProcessGroup(size=1)
     fake_pp_group = _ConverterFakeProcessGroup(size=pipeline_parallel_size)
     fake_ep_group = _ConverterFakeProcessGroup(size=expert_parallel_size)
     fake_dp_group = _ConverterFakeProcessGroup(size=1)
@@ -101,6 +120,7 @@ def initialize_checkpoint_converter_fake_process_groups(
     )
 
     parallel_state._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    parallel_state._CONTEXT_PARALLEL_GROUP = fake_cp_group
     parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
     parallel_state._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
     parallel_state._DATA_PARALLEL_GROUP = fake_dp_group

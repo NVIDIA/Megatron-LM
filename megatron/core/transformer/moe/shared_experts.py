@@ -30,6 +30,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     is_te_min_version,
@@ -216,6 +217,9 @@ class SharedExpertMLP(MLP):
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Gets sharded state dict."""
+        # MLP.sharded_state_dict fills only its own copy when metadata is None. Fill it here so
+        # gate_weight below gets the same DP x CP group as linear_fc1 and linear_fc2.
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.use_shared_expert_gate:
             name = 'gate_weight'
@@ -603,17 +607,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
         if self.config.sequence_parallel:
             fc1_input = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=True
+                hidden_states, tensor_parallel_output_grad=True, group=self.tp_group
             )
         else:
-            fc1_input = copy_to_tensor_model_parallel_region(hidden_states)
+            fc1_input = copy_to_tensor_model_parallel_region(hidden_states, group=self.tp_group)
 
         fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
 
         if self.config.sequence_parallel:
-            output = reduce_scatter_to_sequence_parallel_region(fc2_output)
+            output = reduce_scatter_to_sequence_parallel_region(fc2_output, group=self.tp_group)
         else:
-            output = reduce_from_tensor_model_parallel_region(fc2_output)
+            output = reduce_from_tensor_model_parallel_region(fc2_output, group=self.tp_group)
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
