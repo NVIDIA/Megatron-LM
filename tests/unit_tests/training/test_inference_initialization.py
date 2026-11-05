@@ -93,6 +93,9 @@ def test_resume_updates_microbatches_before_setup_validation(
     monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
     monkeypatch.setattr(training, "get_model", Mock(return_value=model))
     monkeypatch.setattr(training, "unwrap_model", lambda value: value)
+    # Memory reporting resolves real process groups, which this stubbed setup never builds.
+    monkeypatch.setattr(training, "_get_model_pg_collection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
     events = []
 
     def restore(*unused_args, **unused_kwargs):
