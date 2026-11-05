@@ -5,7 +5,6 @@ import gc
 import pytest
 import torch
 
-from megatron.core.enums import Fp8Recipe
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -25,22 +24,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_fp8_flags,
 )
 from tests.unit_tests.test_utilities import Utils
-
-
-def get_schedule_fp8_flags():
-    """Keep each FP8 recipe and format without sweeping every combination here."""
-    return [
-        pytest.param(
-            flag,
-            marks=pytest.mark.skip(
-                reason="Hybrid blockwise is covered by the separate uniform/block recompute buckets; "
-                "this bucket keeps E4M3 blockwise and hybrid tensorwise."
-            ),
-        )
-        if flag == ("hybrid", Fp8Recipe.blockwise)
-        else flag
-        for flag in get_valid_fp8_flags()
-    ]
 
 
 def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):
@@ -587,7 +570,7 @@ class TestA2AOverlap(_A2AOverlapTestBase):
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("fp8_flag", get_schedule_fp8_flags())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize('layers', [[2, 1]])
     @pytest.mark.parametrize("scheduled_release", [False, True])
     def test_1f1b_schedule_model_chunk(
@@ -611,7 +594,7 @@ class TestA2AOverlap(_A2AOverlapTestBase):
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("fp8_flag", get_schedule_fp8_flags())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize(
         "recompute_method,recompute_num_layers", [("uniform", 1), ("block", 1)]
     )
@@ -717,7 +700,7 @@ class TestA2AOverlap(_A2AOverlapTestBase):
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("fp8_flag", get_schedule_fp8_flags())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize(
         "mtp_layers,recompute_method,recompute_num_layers",
         [(0, "uniform", 2), (0, "block", 1), (1, "uniform", 1)],
