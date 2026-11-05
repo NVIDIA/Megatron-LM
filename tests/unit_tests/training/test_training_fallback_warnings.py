@@ -171,7 +171,10 @@ def test_training_log_reports_memory_on_rank_0_of_its_data_parallel_group(
     monkeypatch.setattr(training, "print_rank_last", mock.Mock())
     report_memory = mock.Mock()
     monkeypatch.setattr(training, "report_memory", report_memory)
-    groups = {name: _Group() for name in ("mp", "pp", "dp", "dp_gtp_remat", "dp_cp_gtp_remat")}
+    groups = {
+        name: _Group()
+        for name in ("mp", "pp", "dp", "dp_cp", "gtp_remat", "dp_gtp_remat", "dp_cp_gtp_remat")
+    }
 
     def use_mpu_process_groups(cls, required_pgs=None):
         return ProcessGroupCollection(**{name: groups[name] for name in required_pgs})
