@@ -73,11 +73,20 @@ Matrix optimizers such as Muon need each weight matrix whole. With `--optimizer 
 
 Both store the same optimizer state, so a `torch_dist` checkpoint saved with one collective loads with the other. The other parameters always use reduce-scatter. The layer-wise optimizer supports `--ckpt-format torch_dist` only.
 
-With `--fp8-param-gather`, `reduce-scatter` gathers the FP8 bytes of each shard and supports MXFP8 because its parameters are staged as BF16 through the gradient buffer and requantized on every rank. Use `all-reduce` for blockwise FP8 parameters; it gathers BF16 values and requantizes them on every rank.
+With `--fp8-param-gather`, both collectives gather quantized parameters as BF16 values staged from the FP32 masters and requantize them on every rank. `reduce-scatter` stages them through the gradient buffer for its fixed-size all-gather and supports only MXFP8; use `all-reduce` for blockwise FP8 parameters.
+
+### Migrating from the boolean layout flags
+
+`--emerging-optimizer-grad-collective` replaces the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags:
+
+- Runs on the compact layout pass `--emerging-optimizer-grad-collective all-reduce`. It has been the default since July 2026, and `--no-use-layer-wise-param-layout` has selected it since October 2026.
+- Runs on the padded layout, the default in June 2026 and selected by `--use-layer-wise-param-layout` since July 2026, get it from the new default, `reduce-scatter`.
+
+The `torch_dist` checkpoints of both layouts load, optimizer state included.
 
 ### Checkpoints of the removed legacy layout
 
-The legacy layout, selected with `--no-use-layer-wise-param-layout`, was removed together with the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags. It was also the only layout before the layer-wise optimizer gained its sibling distributed optimizer in May 2026. It kept the Adam-managed parameters inside the layer-wise optimizer, so its checkpoints store their optimizer state in a format that the current layouts do not read. Loading the optimizer state of such a checkpoint fails with a `KeyError` naming a `chained_*.optimizer.distributed.*` key.
+The legacy layout kept the Adam-managed parameters inside the layer-wise optimizer. It was the only layout before the layer-wise optimizer gained its sibling distributed optimizer in June 2026, and `--no-use-layer-wise-param-layout` selected it until July 2026. Its checkpoints store their optimizer state in a format that the current layouts do not read. Loading the optimizer state of such a checkpoint fails with a `KeyError` naming a `chained_*.optimizer.distributed.*` key.
 
 - To start a new run from such a checkpoint, such as fine-tuning, load only the model weights with `--no-load-optim`. The optimizer state starts fresh.
 - To resume an interrupted run, keep using the Megatron-LM version that wrote the checkpoint.
