@@ -292,23 +292,33 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync.assert_called_once_with()
 
 
-def test_nested_prefetch_orders_use_dfs(distributed_setup):
+@pytest.mark.parametrize("recorded", [False, True])
+def test_nested_prefetch_orders_use_dfs(distributed_setup, recorded):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
-    with fully_shard_context(FsdpContext(device=device)):
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED if recorded else PrefetchOrder.REGISTRATION,
+            prefetch_process_group=mesh.get_group(0),
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ):
         fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model.left, mesh=mesh, placements=_default_placements())
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    with torch.no_grad():
-        model(torch.ones(2, 4, device=device))
-
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
     context = model.context
+    context.finish_grad_sync()
+    if recorded:
+        assert set(context._recorded_grad_buffer_positions) == {4, 5, 6, 7}
+        assert len(context._recorded_grad_buffer_positions) == 4
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD)
         for module in [model, model.left, model.left.inner, model.right]

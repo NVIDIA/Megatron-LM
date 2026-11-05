@@ -15,11 +15,16 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
+import hashlib
+from collections import deque
 from collections.abc import Callable
+from typing import NamedTuple
 from weakref import WeakKeyDictionary
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed import ProcessGroup
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
@@ -31,6 +36,15 @@ class PrefetchOrder(enum.Enum):
 
     REGISTRATION = enum.auto()
     RECORDED = enum.auto()
+
+
+class _GradBufferBatch(NamedTuple):
+    """Inputs and their last-consumer event, owned by the allocation stream."""
+
+    buffers: tuple[torch.Tensor, ...]
+    done: torch.cuda.Event
+    allocation_stream: torch.cuda.Stream
+    position: int = -1
 
 
 class FsdpContext:
@@ -63,6 +77,7 @@ class FsdpContext:
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
+        prefetch_process_group: ProcessGroup | None = None,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -78,10 +93,15 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
+                module calls until the first ``post_backward()``. With caller-managed
+                gradient synchronization, recording spans the full schedule until
+                ``finish_grad_sync()`` instead. Subsequent passes must repeat the complete
+                sequence consistently across data-parallel ranks.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
+            prefetch_process_group: Ranks sharing the recorded schedule. Synchronizes
+                recorded gradient-input retirement. Without this explicit group, inputs
+                are retired only in backward or gradient synchronization.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -93,9 +113,15 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = prefetch_order
+        self._prefetch_process_group = prefetch_process_group
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
+        self._pending_grad_buffers: deque[_GradBufferBatch] = deque()
+        # Forward occurrence -> producer occurrences whose gradient inputs can retire.
+        self._grad_buffer_release_plan: dict[int, tuple[int, ...]] = {}
+        self._recorded_grad_buffer_positions: list[int] = []
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -216,11 +242,127 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+        self._release_grad_buffers()
+        if self.caller_managed_grad_sync:
+            self._finish_execution_order()
+
+    def _retain_grad_buffers(
+        self,
+        buffers: list[torch.Tensor],
+        allocation_stream: torch.cuda.Stream,
+        *,
+        position: int | None = None,
+    ) -> None:
+        """Keep module inputs alive through inner reduction and local accumulation."""
+        if buffers:
+            # DP-outer reduction consumes persistent main_grad, not these inputs.
+            done = self.inner_reduction_stream.record_event()
+            if position is None:
+                order = self.execution_order
+                position = (
+                    len(order) - 1
+                    if self._recording_execution_order
+                    else ((order.position - 1) % len(order) if len(order) else -1)
+                )
+            if self._recording_execution_order:
+                self._recorded_grad_buffer_positions.append(position)
+            self._pending_grad_buffers.append(
+                _GradBufferBatch(tuple(buffers), done, allocation_stream, position)
+            )
+
+    def _release_grad_buffers(self, *, keep: int = 0) -> None:
+        """Order storage reuse on its allocation stream before dropping references."""
+        while len(self._pending_grad_buffers) > keep:
+            batch = self._pending_grad_buffers.popleft()
+            batch.allocation_stream.wait_event(batch.done)
+
+    def _release_grad_buffers_in_forward(self) -> None:
+        """Record completed inputs, then replay the group-wide retirement plan."""
+        if self.prefetch_order is not PrefetchOrder.RECORDED or not self._pending_grad_buffers:
+            return
+        if self._recording_execution_order:
+            with torch.cuda.device(self.allgather_stream.device):
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            positions = []
+            while self._pending_grad_buffers and self._pending_grad_buffers[0].done.query():
+                positions.append(self._pending_grad_buffers.popleft().position)
+            if positions:
+                self._grad_buffer_release_plan[len(self.execution_order)] = tuple(positions)
+        else:
+            positions = self._grad_buffer_release_plan.get(self.execution_order.position, ())
+            # Backward's bounded staging may already have retired a planned input.
+            # Match producers instead of applying a count to a different FIFO batch.
+            while (
+                self._pending_grad_buffers and self._pending_grad_buffers[0].position in positions
+            ):
+                self._release_grad_buffers(keep=len(self._pending_grad_buffers) - 1)
+
+    def _compile_grad_buffer_release_plan(self) -> None:
+        """Agree once on each input's latest observed retirement occurrence."""
+        group = self._prefetch_process_group
+        if group is None:
+            self._grad_buffer_release_plan.clear()
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Gradient-input retirement requires one eager recording iteration.")
+        events = list(self.execution_order)
+        indices = {module: index for index, module in enumerate(self._module_names)}
+        signature = repr(
+            (
+                [(indices[event.module], event.module.name, event.phase.name) for event in events],
+                self._recorded_grad_buffer_positions,
+            )
+        )
+        digest = int.from_bytes(hashlib.sha256(signature.encode()).digest()[:8], "little")
+        digest &= (1 << 62) - 1
+        valid = len(set(self._recorded_grad_buffer_positions)) == len(
+            self._recorded_grad_buffer_positions
+        ) and all(0 <= position < len(events) for position in self._recorded_grad_buffer_positions)
+        header = torch.tensor(
+            [len(events), -len(events), digest, -digest, int(valid)],
+            dtype=torch.int64,
+            device=self.allgather_stream.device,
+        )
+        dist.all_reduce(header, op=dist.ReduceOp.MIN, group=group)
+        values = header.tolist()
+        if values[0] != -values[1] or values[2] != -values[3] or not values[4]:
+            raise RuntimeError(
+                "Recorded FSDP events or gradient-input producers differ across ranks."
+            )
+
+        # A missing observation means this rank kept the input until backward/grad sync.
+        # MAX therefore retains it unless every rank observed a forward retirement.
+        release_positions = torch.full(
+            (len(events),), len(events), dtype=torch.int64, device=self.allgather_stream.device
+        )
+        for position, producers in self._grad_buffer_release_plan.items():
+            for producer in producers:
+                release_positions[producer] = position
+        dist.all_reduce(release_positions, op=dist.ReduceOp.MAX, group=group)
+        plan: dict[int, list[int]] = {}
+        for producer, position in enumerate(release_positions.tolist()):
+            if position < len(events):
+                plan.setdefault(position, []).append(producer)
+        self._grad_buffer_release_plan = {
+            position: tuple(producers) for position, producers in plan.items()
+        }
+
+    def _finish_execution_order(self) -> None:
+        """Finish recording or validate replay at the execution-window boundary."""
+        if self._recording_execution_order:
+            # A synchronization before any compute must not end recording.
+            if self.execution_order.peek() is not None:
+                self._compile_grad_buffer_release_plan()
+                self._recording_execution_order = False
+        elif self.prefetch_order is PrefetchOrder.RECORDED and self.execution_order.position != 0:
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
+        if not self.caller_managed_grad_sync:
+            self._finish_execution_order()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself

@@ -79,6 +79,7 @@ class FsdpModule:
         """
         self._context = context
         self._phase = Phase.RESTING
+        self._grad_buffer_position = -1
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_scale <= 0:
@@ -282,6 +283,9 @@ class FsdpModule:
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         if context.is_recording_execution_order and not is_recomputing:
+            if cast(nn.Module, self).training:
+                # Main records here before unshard; replay consumes its cursor below.
+                context._release_grad_buffers_in_forward()
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
@@ -304,6 +308,8 @@ class FsdpModule:
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
+            if prefetch and phase is Phase.FORWARD and cast(nn.Module, self).training:
+                self.context._release_grad_buffers_in_forward()
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -425,6 +431,12 @@ class FsdpModule:
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
+        # Main records pre-hooks, so nested children may advance past this producer.
+        self._grad_buffer_position = (
+            len(context.execution_order)
+            if context.is_recording_execution_order
+            else context.execution_order.position
+        )
         if context.is_recording_execution_order:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
@@ -465,31 +477,37 @@ class FsdpModule:
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
-            for group in self._parameter_groups:
-                if not group.requires_grad:
-                    continue
-
-                with torch.cuda.stream(inner_reduction_stream):
+            groups = [group for group in self._parameter_groups if group.requires_grad]
+            if not groups:
+                return
+            # One retained module plus this module bounds staging to two batches.
+            context._release_grad_buffers(keep=1)
+            buffers = []
+            try:
+                for group in groups:
                     partial_grad = group.allocate_partial_grad_buffer()
+                    buffers.append(partial_grad.local_buffer)
+                    group.copy_gradients_to_partial_buffer(partial_grad)
 
-                current_stream.wait_stream(inner_reduction_stream)
-                group.copy_gradients_to_partial_buffer(partial_grad)
+                    inner_reduction_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(inner_reduction_stream):
+                        group.reduce_inner_gradients(partial_grad)
 
-                inner_reduction_stream.wait_stream(current_stream)
-                with torch.cuda.stream(inner_reduction_stream):
-                    group.reduce_inner_gradients(partial_grad)
-
-                if not context.is_last_microbatch:
-                    continue
-                # Finalize the DP-outer reduction. When overlap is enabled its stream is
-                # distinct, so it overlaps the following group's DP-inner reduce; the
-                # persistent accumulator and its optimizer-layout view stay alive across
-                # the handoff. When disabled the stream aliases inner_reduction_stream and
-                # this stays serialized.
-                if context.outer_reduction_stream is not inner_reduction_stream:
-                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
-                with torch.cuda.stream(context.outer_reduction_stream):
-                    group.reduce_outer_gradients()
+                    if not context.is_last_microbatch:
+                        continue
+                    # Finalize the DP-outer reduction. When overlap is enabled its stream is
+                    # distinct, so it overlaps the following group's DP-inner reduce; the
+                    # persistent accumulator and its optimizer-layout view stay alive across
+                    # the handoff. When disabled the stream aliases inner_reduction_stream and
+                    # this stays serialized.
+                    if context.outer_reduction_stream is not inner_reduction_stream:
+                        context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                    with torch.cuda.stream(context.outer_reduction_stream):
+                        group.reduce_outer_gradients()
+            finally:
+                context._retain_grad_buffers(
+                    buffers, current_stream, position=self._grad_buffer_position
+                )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
