@@ -27,14 +27,20 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
+    register_model_parallel_teardown,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -114,6 +120,38 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
@@ -2375,6 +2413,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
@@ -2387,10 +2426,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert hasattr(
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
-            if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2422,9 +2457,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
+                    # collection built for another grid must set it.
+                    if vars(pg_collection).get("hcp") is None:
+                        raise ValueError(
+                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
+                            "pg_collection.hcp (the hierarchical context-parallel groups)"
+                        )
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -2790,6 +2830,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             if pg_collection is None:
+                warn_global_process_group_fallback(type(self).__name__)
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"

@@ -147,6 +147,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=mpu.get_pipeline_model_parallel_group(),
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not args.dynamic_context_parallel
