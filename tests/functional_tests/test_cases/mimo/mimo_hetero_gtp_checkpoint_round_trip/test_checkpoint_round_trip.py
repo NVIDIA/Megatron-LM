@@ -194,15 +194,15 @@ def _install_checkpoint_resave_hook() -> None:
             checkpointing_context=checkpointing_context,
             **kwargs,
         )
-        args = training.get_args()
+        train_state = training.get_train_state()
         unwrapped_model = unwrap_model(model)
         pg_collection = getattr(unwrapped_model[0], "pg_collection", None)
         save_checkpoint(
-            args.iteration,
+            train_state.iteration,
             model,
             optimizer,
             opt_param_scheduler,
-            args.num_floating_point_operations_so_far,
+            train_state.num_floating_point_operations_so_far,
             checkpointing_context=checkpointing_context,
             preprocess_common_state_dict_fn=training.preprocess_common_state_dict,
             tp_group=pg_collection.tp if pg_collection is not None else None,

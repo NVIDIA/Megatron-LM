@@ -44,7 +44,6 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.global_vars import (
     get_run_config,
-    initialize_runtime_services,
     set_run_config,
 )
 from megatron.training.argument_utils import inference_cfg_container_from_args
@@ -193,7 +192,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.pixel_shuffle,
         args.use_tile_tags,
         args.max_num_tiles,
-        args.tokenizer_prompt_format,
+        cfg.tokenizer.tokenizer_prompt_format,
     )
 
     if args.use_mcore_inference:
@@ -202,7 +201,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
             fp32_residual_connection=args.fp32_residual_connection,
             params_dtype=args.params_dtype,
-            padded_vocab_size=args.padded_vocab_size,
+            padded_vocab_size=cfg.tokenizer.padded_vocab_size,
         )
         inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
         tokenizer = get_tokenizer()
@@ -301,7 +300,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     raise NotImplementedError("no output name defined for", config.task)
 
                 prompt, generated = get_prompt_and_generated(
-                    generation, args.tokenizer_prompt_format
+                    generation, cfg.tokenizer.tokenizer_prompt_format
                 )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
@@ -852,8 +851,7 @@ def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, training=True)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 

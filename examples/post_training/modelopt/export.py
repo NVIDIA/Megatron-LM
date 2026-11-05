@@ -20,7 +20,7 @@ from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from model_provider import model_provider
 
@@ -69,9 +69,9 @@ if __name__ == "__main__":
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, training=True)
-    initialize_megatron(training=True)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    set_run_config(cfg)
+    initialize_megatron(training=False)
 
     args = get_args()
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
 
     if "trust_remote_code" in inspect.signature(export_fn).parameters:
-        export_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        export_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
 
     if "clamp_kv_cache_scales" in inspect.signature(export_fn).parameters:
         export_kwargs["clamp_kv_cache_scales"] = args.clamp_kv_scales

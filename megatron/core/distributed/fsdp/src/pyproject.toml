@@ -57,6 +57,9 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
+[project.optional-dependencies]
+emerging-optimizers = ["emerging-optimizers>=0.2"]
+
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"

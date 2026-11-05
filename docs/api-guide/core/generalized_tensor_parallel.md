@@ -98,7 +98,7 @@ Contrast with FSDP: FSDP gathers at module-group granularity in full precision w
 
 CG compatibility is designed-in from day one, not retrofitted. The entire sync / buffer / chain architecture is shaped around making **captured fwd/bwd replays produce identical bit-for-bit behavior** — without the usual capture-vs-eager pitfalls that force other weight-sharding schemes to either disable CG or require special handling.
 
-- **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the eager-only grouped-expert chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
+- **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the separate grouped-expert FC1 and FC2 chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
 - **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
 - **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `cuda_graph_pool_allocation`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
@@ -196,7 +196,7 @@ GTP_remat runs under both the standard **Adam** `DistributedOptimizer` and **Muo
   - **Split *after* the all-gather**, never before — a row shard cuts q/k/v mid-boundary. The split is therefore reachable on the **`duplicated`** Newton–Schulz mode only (`--muon-tp-mode`, default `duplicated`).
   - **`auto` is pinned to `duplicated`** whenever a split is requested, since its shape-based cost model has no notion of `qkv_split_shapes` and could otherwise drop the split on some shapes and keep it on others.
   - **`blockwise` and `distributed`, chosen explicitly, fall back** to whole-matrix Newton–Schulz and **warn once**, since neither keeps a q/k/v boundary. `duplicated`, the default, is the path that gets the split.
-- **Native-FP8 optimizer-state matching (Muon path).** The save-side dequantize (§3.3) hands DCP a *fresh* BF16 tensor, which breaks the id-based optimizer-param → model-`ShardedTensor` match for every native-FP8 GTP_remat weight. The dequantized copy carries a `_gtp_dequant_src` backlink to the live FP8 param, and `_backfill_gtp_sharded_param_map` reuses the model's **own** entry (backlink first, tagged-name second) — preserving its full offsets (expert axes included) and `replica_id`. Only truly-unmatched params (the SSM `in_proj` weights, gathered+split factories) take the per-shard rebuild, which refuses expert-parallel params rather than emit EP-colliding shards.
+- **Native-FP8 optimizer-state matching (Muon path).** The save-side dequantize (§3.3) hands DCP a *fresh* BF16 tensor, which breaks the id-based optimizer-param → model-`ShardedTensor` match for every native-FP8 GTP_remat weight. The dequantized copy carries a `_gtp_dequant_src` backlink to the live FP8 param, and `_backfill_gtp_sharded_param_map` reuses the model's **own** entry (backlink first, tagged-name second) — preserving its full offsets (expert axes included) and `replica_id`. Only truly-unmatched params (the SSM `in_proj` weights, saved through split factories) take the per-shard rebuild, which refuses expert-parallel params rather than emit EP-colliding shards.
 
 Neither path adds a GTP_remat-specific checkpoint format or call site.
 
@@ -261,6 +261,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
 | `graph_wgrad_ring_size` | `2` | Persistent wgrad ring slots per scheduling domain (§3.6). Increase if capture rejects same-key writers. |
+| `eager_wgrad_ring_size` | `2` | Persistent eager wgrad slots per scheduling/shape domain. Increase to delay buffer reuse at the cost of memory; set before the first backward. |
 
 ### 2.2 Required flags
 
@@ -329,7 +330,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=1, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
+  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2,
+  eager_wgrad_ring_size=2)
 ```
 
 (`pad_for_alignment=1` here because this example is BF16 with no quantization-tile
@@ -347,6 +349,7 @@ update_gtp_config(
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.6)
     graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
+    eager_wgrad_ring_size=2,      # Persistent eager wgrad slots; independent of gather buffers
 )
 ```
 
@@ -368,8 +371,8 @@ GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enable
 |---|---|
 | **Use when** | wgrads are BF16 (the default) **and** the gtp_remat axis is ≥ 4 |
 | **Skip when** | `--accumulate-allreduce-grads-in-fp32` is set, which already makes the wire and the accumulation FP32; or the axis is ≤ 2, where it is auto-bypassed |
-| **Gain** | the `N-1` intermediate roundings disappear, leaving only the final downcast — so the error stops growing with the axis, and the benefit grows with it |
-| **Cost** | one unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter, plus a local FP32 sum and downcast at `wait()` time |
+| **Gain** | the `N-1` intermediate roundings disappear; the output stays FP32 until accumulation into `main_grad`, which rounds once when `main_grad` is BF16 |
+| **Cost** | one unsharded-wgrad-sized scratch buffer and one FP32 output shard per in-flight reduce-scatter, plus a local FP32 sum at `wait()` time |
 
 Implemented in `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py`. This is the
 gtp_remat-axis analogue of `--ddp-reduce-scatter-with-fp32-accumulation` and **independent of
@@ -688,9 +691,39 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
 
-> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: each **all-gathers its GTP_remat shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`. This is required, not just tidier: the split-chunk boundaries do not line up with the GTP_remat slice boundaries, so a raw shard cannot be split at all. The checkpoint therefore matches a non-GTP_remat run byte-for-byte.
+> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: they are saved as split chunks whose boundaries do not line up with the GTP_remat slice boundaries, under the pad-stripped TP-local global shapes a non-GTP_remat run uses, so they need no `allow_shape_mismatch` and the checkpoint matches a non-GTP_remat run byte-for-byte.
 >
-> On **load**, the split factory's `merge_fn` is wrapped to invert this: it cats the chunks back to the unpadded TP-local width, re-pads with zeros up to `gtp_remat_local_size · gtp_remat_size`, and slices by the GTP_remat rank — mirroring `_gtp_slice_one_param` so the tensor lands in the live shard's layout. `gtp_remat_size == 1` skips both the gather and the pad/slice.
+> - **Gated-delta-product** saves, on each GTP_remat rank, the piece of every chunk that the rank's own rows cover, as views of its shard at their offsets within the chunk (uneven shards, which DCP stores as-is); pad rows are not saved, and the load-side merge rebuilds the padded shard. No rank materializes the full tensor.
+> - **Mamba** still **all-gathers its GTP_remat shards** back to the TP-local size and strips the pad before splitting, so every GTP_remat rank briefly holds the full `in_proj` weight of every layer while a save is staged.
+>
+> On **load**, GDP rebuilds only the local shard and zero-fills its padding. Mamba concatenates the
+> TP-local chunks, re-pads, then slices by GTP_remat rank. With `gtp_remat_size == 1`, neither path
+> needs GTP padding or slicing.
+>
+> **GDP padding-only ranks:** a zero-element `LocalNonpersistentObject` preserves the factory key
+> and device through load preprocessing. The merge function restores a zero-filled shard. **Padding
+> and the placeholder are never saved.**
+>
+> ```text
+> Example (TP=1): unsharded in_proj.weight = [61,760 rows, 10,240 columns]
+> 64 GTP ranks (0-63), sharded along rows; alignment = 32 rows per shard
+> Rows per shard = ceil(61,760 / (64 * 32)) * 32 = 992
+> Padded shape: [63,488, 10,240] --> each rank: [992, 10,240]
+>
+> SAVE (tail ranks shown; ranks 0-61 contain only real rows)
+>   Rank 62: [256 real | 736 pad] --> save only 256 real rows
+>   Rank 63: [      992 pad    ] --> local placeholder --> discarded; no rows saved
+>
+> LOAD
+>   Rank 62: checkpoint chunks --> copy 256 real rows + zero-fill 736 pad rows
+>   Rank 63: load-side factory --> [local placeholder] --> preserve key/device
+>                                                              |
+>                                                              v
+>                                                  merge: allocate local shard
+>                                                       [992 zero rows]
+>
+>   The load-side factory creates the placeholder locally; it is not read from disk.
+> ```
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
@@ -731,9 +764,9 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 #### Grouped-expert chains (one-block-ahead)
 
-*Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one per role — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
+*Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one for FC1 and one for FC2 — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
 
-*Design.* When MoE is *not* captured, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_ungraphed` / `GTP_remat_grouped_fc2_ungraphed`) instead of sharing the general `UNGRAPHED` chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
+*Design.* In eager and CUDA-graph modes, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_{graphed,ungraphed}` / `GTP_remat_grouped_fc2_{graphed,ungraphed}`) instead of sharing the general chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
 
 *Result.* The win is **resource overlap**, not faster compute and not a faster network:
 
@@ -742,7 +775,7 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 - **Cost** — one extra buffer per weight role (see *mandatory double buffering* below). No extra collectives, no change to the math.
 - **Bound** — same transfers, same GEMMs, only a different schedule, so the recovered time is exactly the transfer that used to sit on the critical path.
 
-The figure below puts both schedules on one time axis, aligned at *block start* (**top:** shared chain, **bottom:** per-role chains). **Shaded bands** mark which resource is idle — red where one side waits, green where both are busy; **dashed arrows** trace each gather from the GEMM that launches it to the GEMM that consumes it; the **arrow at the right** is the recovered time, equal to the two hatched `STALL` bars above it.
+The figure below puts both schedules on one time axis, aligned at *block start* (**top:** shared chain, **bottom:** separate grouped-expert FC1 and FC2 chains). **Shaded bands** mark which resource is idle — red where one side waits, green where both are busy; **dashed arrows** trace each gather from the GEMM that launches it to the GEMM that consumes it; the **arrow at the right** is the recovered time, equal to the two hatched `STALL` bars above it.
 
 ![GTP grouped-expert AG prefetch — one-step-ahead vs one-block-ahead](../../images/generalized_tensor_parallel/0725_gtp_grouped_oneblock_prefetch.png)
 
@@ -754,11 +787,11 @@ Three consequences:
   - fix: a chain-position **parity (0,1,0,1…)** is folded into the cache key, so consecutive blocks alternate between **exactly two** buffers (counter cleared by `reset_gtp_state()`);
   - without it the prefetch would **overwrite the weight the running GEMM is still reading** — a silent-correctness bug, not a crash;
   - the hazard is not exclusive to grouped chains — *any* chain whose neighbours share a key has it. Grouped chains are same-key throughout, so they take the blanket counter; others take the narrower `_ensure_no_shared_buffer_with` check, which allocates only where the collision is real (see *Buffer / memory management*).
-- **Eager only** — the optimization disables itself under CUDA-graph capture:
-  - `_classify_param_chain` evaluates `graphed = _FULL_ITERATION or ("moe" in cuda_graph_modules)` **before** the split, and returns the plain `GRAPHED` chain when it is true;
-  - so with `--cuda-graph-impl full_iteration` **every** param is `GRAPHED` — expert weights included — and they keep the ordinary one-step-ahead prefetch;
-  - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
-  - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
+- **CUDA-graph integration.** The supplement to #6057 preserves the role split in full-iteration and local graphs:
+  - graph boundaries drain **all captured chains**, while leaving eager chains outside the capture;
+  - the runner registers the shared grouped AG/RS streams and routes gradient-ready hooks to each parameter's actual RS stream;
+  - captured RS outputs retain exclusive ownership, and local-graph wgrad rings keep FC1/FC2 storage separate even when their shapes match;
+  - forward links connect the same role in the next block; backward links reverse that order. The chain heads still gather on demand. The available overlap depends on computation and communication duration; it is not a guarantee that all communication is hidden.
 
 ### 3.5 GTP_remat + Multi-Token Prediction (MTP)
 
@@ -873,6 +906,19 @@ The two modes differ only in release timing and the storage required to make ear
 
 The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
 
+Eager callers that request persistent wgrad storage use a separate ring controlled by
+`eager_wgrad_ring_size` (default 2, minimum 1). On the first persistent-buffer request
+in a domain, all matching registered parameters are bound to fixed slots in registration
+order using the shared allocator and the same round-robin rule as CUDA graphs. Domains keep
+communication, shape, dtype, and expert index separate; grouped FC1 and FC2 have separate
+rings. Each domain allocates the smaller of the configured depth and its writer count.
+Before reuse, the previous owner finalizes any pending reduction and the compute stream
+waits on the slot's completion event. A deeper ring delays reuse and may improve overlap,
+at the cost of additional unsharded gradient buffers. It does not change gather-buffer
+double buffering, and a repeated backward for the same parameter still reuses its bound
+slot. Configure the depth before the first backward; `reset_gtp_state()` clears both the
+slots and their assignments.
+
 ### 3.7 Per-parameter alignment padding
 
 Low-precision tiling formats need each rank's local shard aligned to their tile size (MXFP8: 32, NVFP4: 16) — plain equal-sized AG/RS shards only need `dim0` divisible by `gtp_remat_size`, which padding is not required for (`_gtp_slice_one_param` skips it and just asserts that divisibility when `pad_for_alignment == 0`). BF16 has no tile-size requirement, so `training.py` sets `pad_for_alignment=1` for it — `dim0` still isn't guaranteed divisible by `gtp_remat_size` on its own, so padding stays on, just bounded to `gtp_remat_size - 1` rows instead of a 16/32-row tile margin. A weight's real `dim0` is rarely already a multiple of `pad_for_alignment × gtp_remat_size`, so `_gtp_slice_one_param` pads the *logical* tensor up to the next multiple before slicing it evenly across `gtp_remat_group` (§1.3) — the padding lands as a contiguous suffix of that padded buffer. It is real, allocated storage, but the wgrad GEMM only ever writes the logical prefix (§3.6), so it stays exact `0.0` for the life of the run: a permanent structural zero, not a value that merely happens to be zero.
@@ -964,7 +1010,7 @@ done
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
-| `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` gather+split: the gated-delta-product mixer's factory build/merge at MXFP8 alignment, and a full DCP save→load roundtrip of that mixer. |
+| `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` split: the gated-delta-product mixer's per-shard factory build/merge at MXFP8 alignment (no gather, chunks tiled exactly once), a full DCP save→load roundtrip of that mixer, and loading its `in_proj` across GTP_remat and non-GTP_remat runs in both directions. |
 | `test_gtp_muon.py` | Newton–Schulz per-shard parity for all three GTP_remat modes (§1.6): blockwise/duplicated/distributed at TP1, plus row- and column-parallel cases at `tp_size != gtp_remat_size` in both directions. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_muon_qkv.py` | Layout-invariant split-QKV (§1.6): the decision uses the across-shards row count (with the production shape that a shard-local test rejected), the split runs after the all-gather so the GTP_remat shard equals TP1's result restricted to this rank's rows, and `blockwise`/`distributed` fall back to whole-matrix Newton–Schulz bitwise, warning once. |
@@ -980,4 +1026,7 @@ The parameter-readiness contract itself (§3.2) is likewise covered outside this
 
 The `num_zeros` padding correction (§3.7) has two more layers of coverage outside this suite, both CPU-only: `tests/unit_tests/tensor_parallel/test_layers.py::TestGtpLocalPadZeroCount` unit-tests `gtp_local_pad_zero_count`'s row-offset math directly (no padding, tail-only, DP-fragment overlap variants, and the small-`dim0` spillover case), and `tests/unit_tests/optimizer/test_clip_grads.py::TestCountZerosFp32GtpPadding` checks `count_zeros_fp32`'s subtraction with and without an explicit `.gtp_pad_zeros` stamp.
 
-All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
+The suite targets ≥ 4 GPUs and TransformerEngine >= 2.19.
+
+A green suite run (skips for unmet hardware/config are acceptable) is the minimum bar for any
+GTP_remat change.
