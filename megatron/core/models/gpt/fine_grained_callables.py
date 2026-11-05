@@ -96,7 +96,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 padding_mask: Optional[Tensor] = None,
             ):
                 hidden_states, _ = layer._forward_attention(
-                    hidden_states=hidden_states,
+                    hidden_states,
                     attention_mask=attention_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     rotary_pos_cos=rotary_pos_cos,
