@@ -43,6 +43,9 @@ def _inputs(m, k, n, seed):
 class TestShardReductions:
     def teardown_method(self, method):
         torch.cuda.synchronize()
+        # Peers may still read this rank's buffer until the group syncs.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 

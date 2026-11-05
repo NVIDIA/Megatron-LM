@@ -71,6 +71,9 @@ class TestOrderedReduce:
 
     def teardown_method(self, method):
         torch.cuda.synchronize()
+        # Peers may still read this rank's buffer until the group syncs.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
@@ -354,6 +357,9 @@ def test_tp3_symmetric_memory_paths():
         assert torch.equal(_bits(out), _bits(ref))
     finally:
         torch.cuda.synchronize()
+        # Peers may still read this rank's buffer until the group syncs.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 

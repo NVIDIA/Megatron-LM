@@ -43,6 +43,9 @@ class TestOrderedReduceKernels:
 
     def teardown_method(self, method):
         torch.cuda.synchronize()
+        # Peers may still read this rank's buffer until the group syncs.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         SymmetricMemoryManager.destroy()
         if self._tp is not None:
             Utils.destroy_model_parallel()
@@ -158,9 +161,15 @@ class TestOrderedReduceKernels:
             pytest.skip("no symmetric memory")
         out = torch.empty((x.shape[0] // tp, HIDDEN), dtype=torch.bfloat16, device="cuda")
 
+        gathered = torch.empty((x.shape[0], HIDDEN), dtype=torch.bfloat16, device="cuda")
+
         def pull(x, w):
+            # The engine's sequence: GEMM into the symmetric buffer, pull reduce-scatter, then
+            # an all-gather, which orders the next replay's GEMM after every peer's reads.
             parts = orr.row_parallel_shard_partials(x, w, c, out=symm["tensor"])
-            return orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"], out)
+            orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"], out)
+            torch.distributed.all_gather_into_tensor(gathered, out, group=group)
+            return gathered
 
         assert_replays_bit_exact(
             pull, (x, w), backward=False, contention=True, what=f"symm pull c={c}"

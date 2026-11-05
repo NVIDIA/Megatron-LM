@@ -165,8 +165,10 @@ def _ordered_pull_kernel(
 
     Rank r's slice starts at ``byte_offset`` in its buffer. With C > 1 each peer holds C
     partials, partial j at slice + j * part_stride, and the fold runs over (rank, partial)
-    in that order. The leading barrier makes the peers' writes visible; the trailing one
-    keeps any rank from overwriting its buffer while a peer still reads it.
+    in that order. The barrier waits until every peer has written its partials (a previous
+    kernel). As in ``multimem_reduce_scatter`` there is no trailing barrier: rank r reads only
+    its own rows of each buffer, which only rank r's following all-gather writes, and the
+    next full-buffer write (the next GEMM) comes after that all-gather.
 
     Used by the inference engine, whose GEMM writes its partial straight into the "tp"
     symmetric buffer (launched through ``_launch_pull``):
@@ -183,7 +185,7 @@ def _ordered_pull_kernel(
         RANK,
         WORLD_SIZE,
         hasPreviousMemAccess=False,
-        hasSubsequentMemAccess=True,
+        hasSubsequentMemAccess=False,
     )
     sync_threads()
 
@@ -210,16 +212,6 @@ def _ordered_pull_kernel(
         if ROUND_FP32:
             acc = acc.to(tl.float32)
         tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-
-    sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=False,
-    )
 
 
 @triton.jit
@@ -631,7 +623,8 @@ def symm_ordered_reduce_scatter_shards(
 
     ``parts`` is a contiguous tensor in the symmetric buffer. One pull kernel reads
     the owned rows of every peer's c partials and folds them in global shard order into
-    ``output`` (allocated when None).
+    ``output`` (allocated when None). A rank may rewrite rows other than its own only after
+    a later collective has synchronized the group (in the engine, the next all-gather).
 
     Used by ``InferenceRowParallelLinear._matmul_shards_reduce`` (the engine with several
     ``batch_invariant_tp_shards`` per rank).
