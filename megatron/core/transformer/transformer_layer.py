@@ -768,7 +768,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _forward_attention(
         self,
+        # PyTorch's full-backward hooks only track positional inputs. Pass the
+        # activation positionally so MFSDP can release weights promptly.
+        # Supporting keyword inputs would require a custom autograd hook,
+        # adding complexity to MFSDP.
         hidden_states: Tensor,
+        /,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -1124,7 +1129,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return hidden_states, context
 
     @copy_signature(_forward_attention)
-    def forward(self, *args, **kwargs):
+    def forward(self, hidden_states: Tensor, /, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
 
@@ -1134,7 +1139,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            hidden_states, context = self._forward_attention(*args, **kwargs)
+            hidden_states, context = self._forward_attention(hidden_states, *args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None
@@ -1754,16 +1759,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if getattr(self.config, "sequence_packing_scheduler", None) is not None:
             capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
             offsets = torch.zeros(
-                self.config.thd_max_packed_sequences + 1,
+                self.config.cuda_graph_thd_max_packed_sequences + 1,
                 dtype=torch.int32,
                 device=static_inputs["hidden_states"].device,
             )
             offsets[1:] = capacity
             for name in (
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'cu_seqlens_q_padded',
-                'cu_seqlens_kv_padded',
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
             ):
                 static_inputs[name] = offsets.clone()
         elif not isinstance(self.self_attention, IdentityOp) and (
@@ -1861,15 +1866,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _reconstruct_packed_graph_inputs(self, kwargs):
         """Rebuild THD metadata inside capture using graph-static scalar capacities."""
-        if 'cu_seqlens_q' not in kwargs:
+        if "cu_seqlens_q" not in kwargs:
             return
         capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-        kwargs['packed_seq_params'] = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
-            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
-            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+        kwargs["packed_seq_params"] = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
+            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
+            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
             max_seqlen_q=capacity,
             max_seqlen_kv=capacity,
             # Runtime packs can contain valid/physical gaps. A fixed True value
@@ -1884,19 +1889,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         scheduler-packed metadata, and ``kwargs`` unchanged otherwise. This is the replay
         counterpart of ``_reconstruct_packed_graph_inputs``.
         """
-        packed = kwargs.get('packed_seq_params')
+        packed = kwargs.get("packed_seq_params")
         if packed is None or self.config.sequence_packing_scheduler is None:
             return kwargs
         kwargs = dict(kwargs)
-        kwargs.pop('packed_seq_params')
+        kwargs.pop("packed_seq_params")
         for name in (
-            'cu_seqlens_q',
-            'cu_seqlens_kv',
-            'cu_seqlens_q_padded',
-            'cu_seqlens_kv_padded',
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
         ):
             offsets = getattr(packed, name)
-            if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
+            if (
+                offsets is None
+                or offsets.numel() != self.config.cuda_graph_thd_max_packed_sequences + 1
+            ):
                 raise ValueError(
                     "Packed CUDA graph inputs must use the configured metadata capacity."
                 )
@@ -1917,14 +1925,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
-            if len(args) > 0:
-                hidden_states = args[0]
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                args = (hidden_states,) + args[1:]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
-                hidden_states = self.off_interface.backward_record(hidden_states)
-                kwargs["hidden_states"] = hidden_states
+            hidden_states = self.off_interface.backward_record(args[0])
+            args = (hidden_states, *args[1:])
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1932,10 +1934,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
-            if len(args) > 0:
-                hidden_states = args[0]
-            else:
-                hidden_states = kwargs.pop("hidden_states")
+            hidden_states = args[0]
 
         if (
             not self.config.cuda_graph_modules
@@ -1989,7 +1988,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if input_ids is not None:
                 kwargs["input_ids"] = input_ids
 
-        packed = kwargs.get('packed_seq_params')
+        packed = kwargs.get("packed_seq_params")
         kwargs = self._decompose_packed_graph_inputs(kwargs)
 
         assert (kwargs.get('inference_context') is None) and (
@@ -2080,7 +2079,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         graph_kwargs = {
             k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
         }
-        hidden_states = args[0] if args else kwargs["hidden_states"]
+        hidden_states = args[0]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
             kwargs.get("padding_mask"), hidden_states.device
         )
@@ -2117,7 +2116,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
                 probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                    hidden_states,
+                    probs,
+                    routing_map,
+                    kwargs.get("padding_mask"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
                 )
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
@@ -2145,7 +2148,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(
-                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                    hidden_states,
+                    probs,
+                    routing_map,
+                    kwargs.get("padding_mask"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
                 )
                 return residual, hidden_states, probs, shared_expert_output
 

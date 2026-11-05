@@ -244,7 +244,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         inner = self.inner_layer.forward if is_graph_capturing() else self.inner_layer
         if isinstance(self.inner_layer, TransformerLayer):
             output = inner(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
@@ -259,7 +259,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             if packed_sequence_cp_metadata is not None:
                 extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
             output = inner(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,

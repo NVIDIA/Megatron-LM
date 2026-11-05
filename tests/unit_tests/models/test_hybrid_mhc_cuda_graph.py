@@ -697,7 +697,7 @@ def test_mhc_te_graphs_reject_scheduler_thd_without_the_split():
             sequence_packing_scheduler='dp_balanced',
             max_seqlen_per_dp_cp_rank=16,
             pad_packed_seq_alignment='max',
-            thd_max_packed_sequences=4,
+            cuda_graph_thd_max_packed_sequences=4,
         )
 
 
@@ -729,8 +729,7 @@ def _scheduler_thd_split_models(kind, chunks):
         mhc_sinkhorn_iterations=3,
         cuda_graph_impl='transformer_engine',
         cuda_graph_modules=[CudaGraphModule.attn],
-        thd_max_packed_sequences=4,
-        cuda_graph_dynamic_microbatches=True,
+        cuda_graph_thd_max_packed_sequences=4,
         sequence_packing_scheduler='dp_balanced',
         max_seqlen_per_dp_cp_rank=16,
         pad_packed_seq_alignment='max',

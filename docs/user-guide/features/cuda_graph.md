@@ -101,16 +101,19 @@ but custom training scripts must do the same work themselves.
 
 For scheduler-produced THD batches, use `--use-varlen-dataset`,
 `--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
-`--pad-packed-seq-alignment max`, and an explicit `--thd-max-packed-sequences`. The metadata capacity includes one
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
 reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
 fixed local token capacity; the source global batch size and micro-batch size 1
-must stay fixed. PP/VPP also requires `--cuda-graph-dynamic-microbatches`, which
-keeps graph inputs alive until their corresponding backward even when packing
-reduces the number of microbatches. Dynamic CP, EP communication overlap, delayed
+must stay fixed. PP/VPP automatically keeps graph inputs alive until their
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
+the microbatch calculator. Increasing the source batch would require recapturing
+the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed
 wgrad, and paged stash are outside this path. GDN layers stay eager with these batches
 because they read the packed sequence offsets on the host. For mHC models, scheduler-packed THD
 graphs additionally require the mHC attention graph split described under mHC
-training.
+training; these packing options do not enable mHC capture by themselves.
 
 ### Usage
 

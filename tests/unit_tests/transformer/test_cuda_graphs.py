@@ -104,6 +104,8 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
 @pytest.mark.parametrize("failure_phase", ["before_capture", "capture", "warmup", None])
 def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failure_phase):
     """Propagate capture errors while restoring only the state started by this call."""
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", False)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [object()])
     monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_CAPTURING", False)
     monkeypatch.setattr(cuda_graphs_module, "_IS_GRAPH_WARMUP", False)
     monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
@@ -156,6 +158,82 @@ def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failu
     assert gc_events == []
     assert _CudagraphGlobalRecord._saved_tensors_observer is None
     assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+
+class TestCudaGraphSavedTensorObserver:
+    @pytest.fixture
+    def record(self):
+        # Exercise the real observer without sharing the process-global graph records.
+        class Record(_CudagraphGlobalRecord):
+            cudagraph_created = False
+            cudagraph_record = []
+            _saved_tensors_observer = None
+
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        try:
+            yield Record
+        finally:
+            Record._disable_saved_tensors_observer()
+            assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
+
+    @pytest.mark.parametrize("save_view", [False, True])
+    def test_empty_create_preserves_observer_for_later_training(self, record, save_view):
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+
+        # GRPO computes old/reference logprobs with forward-only schedules before
+        # its first training forward records any CUDA graphs.
+        for _ in range(2):
+            assert record.create_cudagraphs() is None
+            assert record._saved_tensors_observer is not None
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+
+        class SaveInput(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, value):
+                # TE 2.20 saves an input view; TE 2.21 saves the input directly.
+                ctx.save_for_backward(value.view(-1, 3) if save_view else value)
+                return value * 2
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output * 2
+
+        value = torch.ones(2, 3, requires_grad=True)
+        output = SaveInput.apply(value)
+        assert value.cg_buffer_metadata.is_saved_for_backward
+        assert (output.grad_fn.saved_tensors[0] is value) is not save_view
+
+    @pytest.mark.parametrize("capture_fails", [False, True])
+    def test_capture_restores_observer_on_success_or_failure(
+        self, record, monkeypatch, capture_fails
+    ):
+        original_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record._enable_saved_tensors_observer()
+        observing_save = torch.autograd.function.FunctionCtx.save_for_backward
+        record.cudagraph_record = [object()]
+        capture_stats = {"time": 1.0}
+
+        def capture(cls):
+            assert torch.autograd.function.FunctionCtx.save_for_backward is observing_save
+            value = torch.ones(2, 3)
+            torch.autograd.function.FunctionCtx().save_for_backward(value)
+            assert value.cg_buffer_metadata.is_saved_for_backward
+            if capture_fails:
+                raise RuntimeError("capture failed")
+            cls.cudagraph_created = True
+            cls.cudagraph_record = []
+            return capture_stats
+
+        monkeypatch.setattr(record, "_create_cudagraphs", classmethod(capture))
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                record.create_cudagraphs()
+        else:
+            assert record.create_cudagraphs() is capture_stats
+
+        assert record._saved_tensors_observer is None
+        assert torch.autograd.function.FunctionCtx.save_for_backward is original_save
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -678,6 +756,9 @@ class TestPackedSeqCudagraphs:
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
         block.train()
+        # GRPO's forward-only logprob schedules request graph creation before the
+        # first training forward. This must preserve saved-tensor lifetime tracking.
+        create_cudagraphs()
         # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
         for param in block.parameters():
             param.main_grad = torch.zeros_like(param)
@@ -1247,8 +1328,10 @@ _unique_buffer_counts = {}
 
 class TestTECudaGraphHelper:
     @pytest.mark.launch_on_gb200
-    @pytest.mark.parametrize("chunks", [1, 2])
-    def test_scheduler_thd_replay_preserves_pipeline_inputs(self, monkeypatch, chunks):
+    @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
+    def test_scheduler_thd_replay_preserves_pipeline_inputs(
+        self, monkeypatch, pp_size, cp_size, chunks
+    ):
         """Changing packed microbatch counts must preserve outputs and every gradient."""
         from megatron.core.pipeline_parallel.schedules import (
             get_pp_rank_microbatches,
@@ -1258,8 +1341,8 @@ class TestTECudaGraphHelper:
         from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
 
         Utils.initialize_model_parallel(
-            pipeline_model_parallel_size=2,
-            context_parallel_size=2,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
             virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
         )
         # Match training initialization: DDP keeps AccumulateGrad nodes alive,
@@ -1280,24 +1363,23 @@ class TestTECudaGraphHelper:
                 decrease_batch_size_if_needed=False,
             )
             config = TransformerConfig(
-                num_layers=2 * chunks,
+                num_layers=pp_size * chunks,
                 hidden_size=64,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="transformer_engine",
-                thd_max_packed_sequences=4,
+                cuda_graph_thd_max_packed_sequences=4,
                 cuda_graph_modules=[CudaGraphModule.attn],
-                cuda_graph_dynamic_microbatches=True,
                 sequence_packing_scheduler="dp_balanced",
-                max_seqlen_per_dp_cp_rank=16,
+                max_seqlen_per_dp_cp_rank=32 // cp_size,
                 pad_packed_seq_alignment="max",
                 cuda_graph_warmup_steps=1,
                 use_te_rng_tracker=True,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 pipeline_dtype=torch.bfloat16,
-                pipeline_model_parallel_size=2,
-                context_parallel_size=2,
+                pipeline_model_parallel_size=pp_size,
+                context_parallel_size=cp_size,
                 virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
                 microbatch_group_size_per_vp_stage=2,
                 attention_backend=AttnBackend.fused,
@@ -1349,7 +1431,12 @@ class TestTECudaGraphHelper:
                 layer = callables[0]
                 for mb in range(4):
                     hidden = torch.randn(
-                        16, 1, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True
+                        32 // cp_size,
+                        1,
+                        64,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                        requires_grad=True,
                     )
                     inputs[chunk, mb] = hidden.detach().clone()
                     output, _ = layer(
@@ -1359,7 +1446,8 @@ class TestTECudaGraphHelper:
                         packed_seq_params=packed[mb % 2],
                     )
                     value = output.detach().clone()
-                    output[: 12 if mb % 2 else 16].float().sum().backward()
+                    valid_tokens = (24 if mb % 2 else 32) // cp_size
+                    output[:valid_tokens].float().sum().backward()
                     expected[chunk, mb] = value, hidden.grad.detach().clone()
                     if mb in (1, 3):
                         expected_params[chunk, mb + 1] = {
@@ -1372,6 +1460,7 @@ class TestTECudaGraphHelper:
             try:
                 helper.create_cudagraphs()
                 assert helper.graphs_created()
+                assert helper.num_microbatches == (1 if pp_size == 1 else 4)
                 for count in (4, 2, 4):
                     _, _, warmup, _ = get_pp_rank_microbatches(
                         count, chunks, 2, p2p_communicator=helper.p2p_communicator
@@ -1394,9 +1483,10 @@ class TestTECudaGraphHelper:
                                 rotary_pos_emb=rotary,
                                 packed_seq_params=packed[mb % 2],
                             )
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
                             torch.testing.assert_close(
-                                output[: 12 if mb % 2 else 16],
-                                expected[chunk, mb][0][: 12 if mb % 2 else 16],
+                                output[:valid_tokens],
+                                expected[chunk, mb][0][:valid_tokens],
                                 msg=f"output count={count} chunk={chunk} mb={mb}",
                             )
                             pending[chunk, mb] = hidden, output
@@ -1404,7 +1494,8 @@ class TestTECudaGraphHelper:
                             mb = backwards[chunk]
                             backwards[chunk] += 1
                             hidden, output = pending.pop((chunk, mb))
-                            output[: 12 if mb % 2 else 16].float().sum().backward()
+                            valid_tokens = (24 if mb % 2 else 32) // cp_size
+                            output[:valid_tokens].float().sum().backward()
                             torch.testing.assert_close(
                                 hidden.grad,
                                 expected[chunk, mb][1],

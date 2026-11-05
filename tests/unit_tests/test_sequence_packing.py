@@ -70,23 +70,25 @@ def test_packed_graph_tail_preserves_document_offsets():
             loss_mask=(~mask).float(),
         )
         if owns_tokens:
-            batch['tokens'] = torch.arange(12)
+            batch["tokens"] = torch.arange(12)
         config = SimpleNamespace(
-            pad_packed_seq_alignment='max', max_seqlen_per_dp_cp_rank=8, thd_max_packed_sequences=4
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=8,
+            cuda_graph_thd_max_packed_sequences=4,
         )
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
-        assert ('tokens' in batch) == owns_tokens
-        assert batch['cu_seqlens'].tolist() == [0, 3, 8, 8, 8]
-        assert batch['cu_seqlens_padded'].tolist() == [0, 4, 12, 16, 16]
-        assert batch['padding_mask'][12:].all()
-        assert batch['loss_mask'].sum() == 8
-        assert batch['max_seqlen'] == 16
+        assert ("tokens" in batch) == owns_tokens
+        assert batch["cu_seqlens"].tolist() == [0, 3, 8, 8, 8]
+        assert batch["cu_seqlens_padded"].tolist() == [0, 4, 12, 16, 16]
+        assert batch["padding_mask"][12:].all()
+        assert batch["loss_mask"].sum() == 8
+        assert batch["max_seqlen"] == 16
         previous = {key: value.clone() for key, value in batch.items()}
         pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
         for key in previous:
             torch.testing.assert_close(batch[key], previous[key])
-        config.thd_max_packed_sequences = 2
-        with pytest.raises(ValueError, match='documents exceed'):
+        config.cuda_graph_thd_max_packed_sequences = 2
+        with pytest.raises(ValueError, match="documents exceed"):
             pad_packed_batch_before_cp_slice(batch, config, cp_size=2, tp_size=1)
 
 
@@ -113,7 +115,7 @@ def test_graph_scheduler_accounts_for_main_padding(monkeypatch, alignment, fp8, 
         fp8=fp8,
         fp8_recipe="mxfp8",
         max_seqlen_per_dp_cp_rank=128,
-        thd_max_packed_sequences=3,
+        cuda_graph_thd_max_packed_sequences=3,
         virtual_pipeline_model_parallel_size=None,
     )
     observed = []
@@ -157,7 +159,7 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
     }
     config = SimpleNamespace(
         pad_packed_seq_alignment=alignment,
-        thd_max_packed_sequences=metadata_capacity,
+        cuda_graph_thd_max_packed_sequences=metadata_capacity,
         max_seqlen_per_dp_cp_rank=16,
         linear_cp_layout="contiguous",
         attention_cp_layout="contiguous",
@@ -647,8 +649,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             assert (
                 sum(sequence_lengths) == args.seq_length
             ), f"Sequence lengths sum {sum(sequence_lengths)} != total {args.seq_length}"
-            data_iterator = iter(
-                MockVariableLengthSequencePackingDataIterator(
+            # Like the scheduler, hand each PP stage only the fields it consumes.
+            unowned_keys = set()
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                unowned_keys.update(('tokens', 'position_ids'))
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                unowned_keys.update(('labels', 'loss_mask'))
+            data_iterator = (
+                {key: value for key, value in sample.items() if key not in unowned_keys}
+                for sample in MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
                     local_cp_size=local_cp_size,
@@ -666,6 +675,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             vp_stage=None,
             dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
+            config=SimpleNamespace(sequence_parallel=tp > 1),
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
@@ -793,6 +803,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         (2, 1, 4, None, "default_dynamic_cp"),
         (1, 2, 4, None, "default_dynamic_cp"),
         (1, 4, 2, 4, "default_dynamic_cp"),
+        (1, 1, 2, None, "default_dynamic_cp"),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
@@ -915,6 +926,14 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         assert (
             type(sequence_square_sum_this_global_batch) is float
             or type(sequence_square_sum_this_global_batch) is np.float32
+        )
+        # The statistics count every sample of the global batch once, independent of CP.
+        # These pre-packed samples carry no real length, so their padded length is used.
+        # TP ranks other than 0 receive the statistics as float32.
+        padded_lengths = [((num + 15) // 16) * 16 for num in nums]
+        assert num_total_tokens_this_global_batch == pytest.approx(sum(padded_lengths))
+        assert sequence_square_sum_this_global_batch == pytest.approx(
+            sum(length * length for length in padded_lengths)
         )
 
         def _check_batch(batch_all, batch_keys):

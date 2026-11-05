@@ -274,6 +274,11 @@ def mcore_fused_moe(
             activation_out = batch_invariant.swiglu_with_probs(
                 fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_mxfp8
             )
+        elif use_mxfp8 and not disable_fused_quant_kernels:
+            # Same activation and MXFP8 bits as the two kernels below, in one pass.
+            activation_out = batch_invariant.squared_relu_with_probs_quantize_mxfp8(
+                fc1_output, permutation_map, n_used, permuted_probs, activation_clamp_scale
+            )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
                 fc1_output,

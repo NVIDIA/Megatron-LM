@@ -265,11 +265,27 @@ class GraphableMegatronModule(MegatronModule):
             partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
         )
 
+    def _te_cuda_graph_index(self, microbatch_idx):
+        """Select the replay slot shared by forward and deferred weight gradients."""
+        if (
+            self.config.sequence_packing_scheduler == "dp_balanced"
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.pipeline_model_parallel_size > 1
+            and microbatch_idx >= len(self.cuda_graphs)
+        ):
+            raise RuntimeError(
+                "Packed microbatch count exceeds the captured source-batch bound; "
+                "recapture CUDA graphs before increasing the source batch size."
+            )
+        # PP1 captures one slot. Preserve modulo reuse for non-packed TE callers too;
+        # only scheduler-produced packed PP batches guarantee a fixed source-batch bound.
+        return microbatch_idx % len(self.cuda_graphs)
+
     def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
         """
         CUDA Graph backward weight gradient computation for current layer.
         """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
         if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
             return
         self.cuda_graphs[cg_index].backward_dw()
@@ -350,16 +366,7 @@ class GraphableMegatronModule(MegatronModule):
             ), "CUDA graph accepts only Tensor inputs."
 
         microbatch_idx = getattr(self, 'current_microbatch', 0)
-        if (
-            getattr(self.config, "cuda_graph_dynamic_microbatches", False)
-            and self.config.pipeline_model_parallel_size > 1
-        ):
-            if microbatch_idx >= len(self.cuda_graphs):
-                raise RuntimeError(
-                    "Packed microbatch count exceeds the captured source-batch bound; "
-                    "recapture CUDA graphs before increasing the source batch size."
-                )
-        cg_index = microbatch_idx % len(self.cuda_graphs)
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
         for hook, hook_args in self.cuda_graph_manual_hooks:

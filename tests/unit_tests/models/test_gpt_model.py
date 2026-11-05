@@ -935,3 +935,34 @@ def test_tied_embedding_copies_match_across_pipeline_stages(
     assert torch.equal(weight, reference)
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("share_embeddings_and_output_weights", [True, False])
+def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_output_weights):
+    """Input-embedding transforms reach a tied output copy, but not an untied output head."""
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    model_parallel_cuda_manual_seed(123)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=8,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+    )
+
+    if parallel_state.is_pipeline_first_stage():
+        assert model.embedding.word_embeddings.weight.is_word_embedding_parameter
+    if parallel_state.is_pipeline_last_stage():
+        marked = getattr(model.output_layer.weight, "is_word_embedding_parameter", False)
+        assert marked == share_embeddings_and_output_weights
+
+    Utils.destroy_model_parallel()
