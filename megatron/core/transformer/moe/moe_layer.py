@@ -244,7 +244,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayerTECudaGraphMixin:
+class TEPartialCaptureMoEMixin:
     """Resume MoE work after a parent graph captured the router or preprocessing.
 
     The parent retains graph ownership; this mixin restores the MoE intermediates
@@ -333,7 +333,7 @@ class MoELayerTECudaGraphMixin:
         return hidden_states, probs, shared_expert_output
 
 
-class MoELayer(MoELayerTECudaGraphMixin, BaseMoELayer):
+class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
@@ -931,7 +931,8 @@ class MoELayer(MoELayerTECudaGraphMixin, BaseMoELayer):
                         return hidden_states, probs, shared_expert_output
 
             except TEMoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the maybe_skip_or_early_return_by_te_cuda_graph decorator.
+                # This signal is raised from the
+                # maybe_skip_or_early_return_by_te_cuda_graph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].

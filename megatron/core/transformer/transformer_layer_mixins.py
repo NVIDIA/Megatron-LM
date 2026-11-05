@@ -420,9 +420,9 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         2. If context is None, it cannot be returned as output.
         """
         if args:
-            positional_inputs = signature(super()._forward_attention).bind(
-                hidden_states, *args
-            ).arguments
+            positional_inputs = (
+                signature(super()._forward_attention).bind(hidden_states, *args).arguments
+            )
             positional_inputs.pop("hidden_states")
             kwargs = dict(**positional_inputs, **kwargs)
         kwargs.setdefault("attention_mask", None)
@@ -471,9 +471,9 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
     def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
         """Run the eager prefix and bind this call's graph and continuation inputs."""
         if args:
-            positional_inputs = signature(super()._forward_attention).bind(
-                hidden_states, *args
-            ).arguments
+            positional_inputs = (
+                signature(super()._forward_attention).bind(hidden_states, *args).arguments
+            )
             positional_inputs.pop("hidden_states")
             kwargs = dict(**positional_inputs, **kwargs)
         kwargs.setdefault("attention_mask", None)

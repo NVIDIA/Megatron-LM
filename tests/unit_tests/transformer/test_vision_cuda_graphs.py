@@ -383,7 +383,9 @@ class TestVisionTECudaGraphHelper:
 
         # Each vision layer should have TE CUDA graphs attached.
         for layer in helper.callables:
-            assert hasattr(layer, 'te_cuda_graphs'), "Layer should have te_cuda_graphs after capture"
+            assert hasattr(
+                layer, 'te_cuda_graphs'
+            ), "Layer should have te_cuda_graphs after capture"
             assert len(layer.te_cuda_graphs) == 1  # 1 microbatch
 
         # cudagraph_manager should have been removed during capture

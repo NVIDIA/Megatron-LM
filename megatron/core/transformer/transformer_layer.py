@@ -520,10 +520,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     can_recompute_pre_mlp_layernorm
                     and self.config.cuda_graph_impl == "transformer_engine"
                 ):
-                    can_recompute_pre_mlp_layernorm = (
-                        TransformerLayerTECudaGraphMixin.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
-                            self.config, self.is_moe_layer
-                        )
+                    # pylint: disable-next=line-too-long
+                    can_recompute_pre_mlp_layernorm = TransformerLayerTECudaGraphMixin.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
+                        self.config, self.is_moe_layer
                     )
                 if can_recompute_pre_mlp_layernorm:
                     self.recompute_pre_mlp_layernorm = True

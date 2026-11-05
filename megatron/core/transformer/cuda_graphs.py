@@ -2320,8 +2320,11 @@ class TECudaGraphHelper:
             from transformer_engine.pytorch.graph import (
                 make_graphed_callables,  # pylint: disable=unused-import
             )
-        except Exception as exc:
-            raise AssertionError("CUDA Graphs are not supported without TE.") from exc
+        except ImportError as exc:
+            raise RuntimeError(
+                "cuda_graph_impl='transformer_engine' requires Transformer Engine. "
+                "Install TE or use cuda_graph_impl='local'."
+            ) from exc
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -2485,8 +2488,8 @@ class TECudaGraphHelper:
 
         Args:
             order (List[int]): The forward/backward execution order from
-                convert_te_cuda_graph_schedule_table_to_order(). Positive integers represent forward passes
-                (1-indexed chunk ID), negative integers represent backward passes.
+                convert_te_cuda_graph_schedule_table_to_order(). Positive integers represent
+                forward passes (1-indexed chunk ID), negative integers represent backward passes.
             chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
                 order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
                 the order maps each layers' idx to their original chunk id.
@@ -3061,7 +3064,9 @@ class TECudaGraphHelper:
         self._graphs_created = False
 
 
-def convert_te_cuda_graph_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+def convert_te_cuda_graph_schedule_table_to_order(
+    num_warmup_microbatches, num_model_chunks, schedule_table
+):
     """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
     order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
     virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
@@ -3087,7 +3092,9 @@ def convert_te_cuda_graph_schedule_table_to_order(num_warmup_microbatches, num_m
     return order
 
 
-def get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+def get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(
+    order, num_layers_per_chunk, capture_wgrad_graph
+):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that

@@ -59,19 +59,46 @@ def __getattr__(name):
 
 
 class TECudaGraphMixin:
-    """Provide TE CUDA graph capture and replay for an opt-in Megatron module.
+    """Run a Megatron module through Transformer Engine CUDA graphs.
 
-    Place this before the module base in the inheritance list and use cooperative
-    initialization. The constructor forwards arguments unchanged, then registers
-    TE graphs when cuda_graph_impl='transformer_engine'. Shared dispatch, capture,
-    and replay forward module inputs to the adapter hooks. Adapters declare their
-    input contracts on those hooks and can use copy_signature on thin wrappers.
-    Graph-input preparation validates tensors and adds TE execution metadata.
-    By default, one graph covers forward(). Adapters can override static-input and
-    replay-argument preparation, capture_forward_hook, before_replay_hook, and
-    after_replay_hook for a smaller scope and run the surrounding eager operations.
-    before_replay_hook returns a graph callback and an output callback. Bind any
-    continuation state into the output callback so it remains local to the call.
+    When config.cuda_graph_impl == "transformer_engine", a training-mode call to the
+    module is redirected: while graphs are being captured it records a graph, and once
+    te_cuda_graphs is populated it replays the graph for the current microbatch.
+    Eval-mode calls, and calls with any other cuda_graph_impl, run forward() normally.
+
+    How to use:
+        List this mixin before the module's base class, so its __call__ runs first:
+
+            class MambaLayer(TECudaGraphMixin, GraphableMegatronModule, ...):
+
+        Every __init__ in the class chain must call super().__init__(...). This
+        mixin's __init__ passes its arguments through unchanged, then sets up the
+        graph state once the module is built.
+
+    Default behavior:
+        The whole forward() is one graph with a single tensor input, hidden_states.
+        Modules can supply additional tensor inputs, such as masks or rotary embeddings,
+        through their static-input and replay hooks. These inputs pass through the shared
+        methods as **kwargs so this mixin does not need each module's argument list.
+
+    Graphing only part of the module:
+        Subclasses override these methods (see TransformerLayerTECudaGraphMixin):
+
+        before_replay_hook: runs any eager code that comes before the graph, then
+            returns two callables: one that replays the graph, and one that takes
+            the graph outputs and finishes the call.
+        after_replay_hook: the default for that second callable. Runs any eager
+            code after the graph and returns what forward() would have returned.
+        is_graphable_for_scope / _get_submodules_under_cudagraphs: which
+            cuda_graph_modules scopes this module covers and which submodules
+            are inside the graph.
+
+    Rules for subclasses:
+        Graph inputs must be tensors or None; drop anything else (e.g.
+        packed_seq_params, inference_context) before replay.
+        Bind state that the after-graph code needs (masks, context, etc.) into
+        the callable returned by before_replay_hook, not onto self, so one
+        call's state cannot leak into another.
     """
 
     def __init__(self, *args, **kwargs) -> None:
