@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd, _apply_boundary
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -436,4 +440,101 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
         and config.recompute_granularity == "selective"
         and config.recompute_modules is not None
         and "residual_stream" in config.recompute_modules
+    )
+
+
+# Fused residual seams: a layer with ``defers_residual_write`` returns its write as a
+# PendingShortcutAdd, which the next layer applies with its own read and RMSNorm in one kernel.
+
+
+@dataclass(frozen=True)
+class SeamInput:
+    """A layer input whose residual read and RMSNorm a fused seam kernel already applied."""
+
+    residual: Tensor
+    branch_input: Tensor
+
+
+def is_fusable_rmsnorm(norm: nn.Module) -> bool:
+    """Whether ``norm`` is a standalone, bias-free, ordinary RMSNorm the seam kernels can apply."""
+    import transformer_engine.pytorch as te
+
+    return (
+        isinstance(norm, (nn.RMSNorm, te.RMSNorm))
+        and getattr(norm, "eps", None) is not None
+        and getattr(norm, "bias", None) is None
+        and not getattr(norm, "zero_centered_gamma", False)
+    )
+
+
+def fuses_lone_seams(layer: nn.Module, norm: nn.Module) -> bool:
+    """Whether neighbouring seam kernels may apply a lone layer's input read and residual write."""
+    return (
+        layer.config.moe_shortcut_wide_residual_norm_fusion
+        and is_fusable_rmsnorm(norm)
+        # A CUDA-graph runner cannot pass a PendingShortcutAdd, so graphed layers keep their seams.
+        and getattr(layer, "cudagraph_manager", None) is None
+        and layer.config.cuda_graph_impl != "transformer_engine"
+    )
+
+
+def defer_write(residual: Tensor, branch_output, write, shared: Tensor | None = None):
+    """A branch's residual write as a PendingShortcutAdd, plus an optional shared-expert update."""
+    update, bias = branch_output
+    if bias is not None:
+        raise ValueError("fused residual seams require a bias-free branch projection")
+    retain = None if write.retention is None else write.retention(return_logits=True)
+    return PendingShortcutAdd(residual, update, shared, write.write_map(return_logits=True), retain)
+
+
+def _fused_norm_weight(norm: nn.Module) -> Tensor:
+    """``norm.weight`` after the forward pre-hooks calling ``norm`` would run (DDP's overlapped
+    parameter all-gather waits for the weight in such a hook)."""
+    for hook_id, hook in tuple(norm._forward_pre_hooks.items()):
+        if hook_id in norm._forward_pre_hooks_with_kwargs:
+            hook(norm, (), {})
+        else:
+            hook(norm, ())
+    return norm.weight
+
+
+def apply_pending_write(pending, reads, norms, consumer=None):
+    """Write ``pending`` and return ``(residual, *norm(read(residual)))`` from one fused kernel;
+    reader zero goes as MXFP8 to the ``(branch, input projection)`` ``consumer`` if eligible."""
+    # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
+    # gradients enabled.
+    with torch.no_grad() if InferenceMode.is_active() else nullcontext():
+        return _apply_pending_write(pending, reads, norms, consumer)
+
+
+def _apply_pending_write(pending, reads, norms, consumer):
+    from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
+
+    streams = reads[0].num_streams
+    linear = None
+    if consumer is not None:
+        branch, linear = consumer
+        # A checkpointed input projection (GDP's recompute_in_proj) keeps its weight hooks in an
+        # inner autograd graph the deferred weight gradient cannot order: with fine-grained
+        # offloading it stays BF16, and training needs GTP's explicit weight finalization.
+        recompute = getattr(branch, "recompute_in_proj", False)
+        if (
+            linear is None
+            or (recompute and branch.config.fine_grained_activation_offloading)
+            or not mxfp8_handoff.eligible(linear, pending.routed, streams)
+        ):
+            linear = None
+        elif (
+            recompute
+            and torch.is_grad_enabled()
+            and not getattr(linear.weight, "is_gtp_weight_remat", False)
+        ):
+            raise ValueError(
+                "direct shortcut MXFP8 with GDP input-projection recompute requires GTP weight "
+                "finalization; disable gdp_in_proj recompute or use a BF16 handoff"
+            )
+    logits = tuple(read.read_map(return_logits=True) for read in reads)
+    gammas = tuple(_fused_norm_weight(norm) for norm in norms)
+    return _apply_boundary(
+        pending, logits, gammas, mxfp8_consumer=linear, num_streams=streams, epsilon=norms[0].eps
     )

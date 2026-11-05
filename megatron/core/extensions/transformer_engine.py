@@ -1502,6 +1502,10 @@ class TELinear(te.pytorch.Linear):
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+            if hasattr(x, "_rowwise_data"):  # an MXFP8 operand from a fused residual seam
+                from megatron.core.fusions.wide_residual_shortcut import mxfp8_handoff
+
+                mxfp8_handoff.install_linear_hooks(x, out, self)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise

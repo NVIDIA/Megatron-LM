@@ -5,20 +5,39 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 import transformer_engine as te
 
+from megatron.core.fusions.wide_residual_shortcut import (
+    PendingShortcutAdd,
+    forward_kernel,
+    kernel_utils,
+    mxfp8_handoff,
+    replay_kernel,
+)
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid import hybrid_layer_specs as specs
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import wide_residual
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
+from megatron.core.transformer.wide_residual import (
+    StreamwiseSigmoidWideResidualConnection,
+    apply_pending_write,
+    is_fusable_rmsnorm,
+)
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
+from tests.unit_tests.test_utilities import Utils
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -756,3 +775,362 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     assert calls["offload_entered"] and calls["offload_exited"]
     assert calls["forced_released_tensors"][0] is calls["offload_input"]
     assert hidden_states.grad is not None
+
+
+# ------------------------------------------- fused residual seams (moe_shortcut_wide_residual_norm_fusion)
+
+REQUIRES_FUSED_BACKWARD = pytest.mark.skipif(
+    not kernel_utils.qualified_device(torch.cuda.get_device_properties(0)),
+    reason="the fused shortcut backward runs only on a qualified GB300",
+)
+
+
+def _fused_config(**overrides):
+    options = dict(
+        normalization="RMSNorm",
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp32_residual_connection=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        add_bias_linear=False,
+        moe_shortcut_connection=True,
+        moe_shortcut_wide_residual_norm_fusion=True,
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_shared_expert_intermediate_size=128,
+        wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
+    )
+    return TransformerConfig(**(options | overrides))
+
+
+@pytest.fixture
+def model_parallel():
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    yield
+    Utils.destroy_model_parallel()
+
+
+def _hybrid_model(pattern, mixer="mamba", hidden=3072, optimized=False, **overrides):
+    """A small fused HybridModel: M Mamba (GDP with mixer="gdp"), G GDN, * attention, E MoE,
+    - MLP-only."""
+    config = _fused_config(
+        num_layers=len(pattern),
+        hidden_size=hidden,
+        num_attention_heads=hidden // 64,
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        mamba_num_groups=2,
+        mamba_state_dim=32,
+        linear_key_head_dim=32,
+        linear_value_head_dim=64,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        ffn_hidden_size=256,
+        moe_router_topk=2,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        inference_grouped_gemm_backend="torch",
+        moe_shared_expert_intermediate_size=256,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        moe_shortcut_parallel=True,
+        transformer_impl="inference_optimized" if optimized else "transformer_engine",
+        **overrides,
+    )
+    family = "gated_delta_product" if mixer == "gdp" else "hybrid"
+    spec = getattr(specs, f"wide_residual_{family}{'_inference' * optimized}_stack_spec")
+    if config.moe_shortcut_wide_residual_norm_fusion:
+        spec = specs.shortcut_fusion_stack_spec(spec)
+    model = HybridModel(
+        config, spec, vocab_size=128, max_sequence_length=128, hybrid_layer_pattern=pattern
+    )
+    blocks = [b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)]
+    fused = config.moe_shortcut_wide_residual_norm_fusion
+    assert len(blocks) == pattern.count("E") and all(
+        b.fuses_residual_seams == fused for b in blocks
+    )
+    return model.cuda()
+
+
+def _unfuse(model):
+    """Run every seam unfused (ordinary reads, norms and writes) with the same weights."""
+    for module in model.modules():
+        if hasattr(module, "defers_residual_write"):
+            module.defers_residual_write = False
+        if isinstance(module, ShortcutMoEBlock):
+            module.fuses_residual_seams = False
+
+
+def _static_prefill_decode(model):
+    ids = torch.randint(0, 128, (2, 99), device="cuda")
+    positions = torch.arange(99, device="cuda").expand(2, -1)
+    context = StaticInferenceContext(2, 128)
+    outputs = []
+    for start, end in [(0, 96), (96, 97), (97, 98), (98, 99)]:
+        context.sequence_len_offset = start
+        if start:
+            context.enable_decode_mode()
+        outputs.append(
+            model(
+                ids[:, start:end],
+                positions[:, start:end],
+                None,
+                inference_context=context,
+                runtime_gather_output=True,
+            ).clone()
+        )
+    return outputs
+
+
+def _dynamic_prefill_decode(model):
+    from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.inference_request import DynamicInferenceRequest
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    torch.manual_seed(0)
+    prompts = [torch.randint(0, 128, (length,), device="cuda") for length in (64, 96)]
+    context = DynamicInferenceContext(
+        model_config=model.config,
+        inference_config=InferenceConfig(
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=256,
+            max_requests=4,
+            max_tokens=256,
+            materialize_only_last_token_logits=True,
+            mamba_inference_state_config=MambaInferenceStateConfig.from_model(model),
+        ),
+    )
+
+    def request(index, prompt, tokens):
+        sampling = SamplingParams(num_tokens_to_generate=tokens)
+        request = DynamicInferenceRequest(
+            request_id=index, prompt_tokens=prompt, sampling_params=sampling
+        )
+        context.add_request(request)
+
+    for index, prompt in enumerate(prompts):
+        request(index, prompt, 4)
+    outputs = []
+    for step in range(4):
+        context.initialize_attention_state()
+        ids, positions = context.current_input_and_position_ids()
+        outputs.append(
+            model(ids, positions, None, inference_context=context, runtime_gather_output=True)
+        )
+        active = context.get_active_request_count()
+        if step < 3:
+            tokens = torch.tensor([17, 23, 29])[:active]
+            context.update_requests(torch.ones(active, dtype=torch.bool), tokens)
+        if step == 0:  # decode and prefill requests in one step
+            request(2, prompts[0][:32], 3)
+    return outputs
+
+
+# (pattern, mixer, launches per step): a fused block's in-block seam writes one update; a seam
+# into a block applies the previous write with both block inputs (two updates after a block).
+INFERENCE_CASES = [
+    ("MEME", "mamba", [1, 2, 1]),
+    # A first MLP-only layer reads unfused and defers its write into the first block.
+    ("-MEME", "mamba", [1, 1, 2, 1]),
+    ("MEME", "gdp", [1, 2, 1]),
+    ("MMEME", "mamba", [1, 1, 2, 1]),
+    ("M-MMEMEM-M-", "mamba", [1, 1, 1, 1, 2, 1, 2, 1, 1, 1]),
+    ("M-MEMMEM-M-", "mamba", [1, 1, 1, 2, 1, 1, 2, 1, 1, 1]),
+    # A lone attention layer keeps its seams: M -> * and * -> [ME] stay unfused.
+    ("M*MEME", "mamba", [1, 2, 1]),
+    # An attention compute layer inside a block; the lone Mamba write enters its two-reader seam.
+    ("M*EME", "mamba", [1, 1, 2, 1]),
+]
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize(
+    "pattern,mixer,launches,dynamic,optimized,hidden,fp32_residual",
+    [(*case, False, False, 3072, True) for case in INFERENCE_CASES]
+    + [("MEME", "mamba", [1, 2, 1], False, False, 256, True)]
+    + [("M-MMEMEM-M-", "mamba", INFERENCE_CASES[4][2], False, False, 3072, False)]
+    + [
+        (p + "*", mixer, [1, 2, 1], True, optimized, 3072, True)
+        for p, mixer in (("MEME", "mamba"), ("MEME", "gdp"), ("GEGE", "gdn"))
+        for optimized in (False, True)
+    ],
+)
+def test_fused_seams_inference_matches_unfused(
+    monkeypatch, pattern, mixer, launches, dynamic, optimized, hidden, fp32_residual
+):
+    """Prefill/decode (static or dynamic batching) runs one fused kernel per linked seam and
+    matches the same model with every seam unfused within BF16 noise."""
+    model = _hybrid_model(
+        pattern, mixer, hidden, optimized, fp32_residual_connection=fp32_residual
+    ).eval()
+    execute = _dynamic_prefill_decode if dynamic else _static_prefill_decode
+    launch, calls = forward_kernel.forward, []  # each fused launch's update count
+    monkeypatch.setattr(
+        forward_kernel,
+        "forward",
+        lambda r, u, *a, **k: calls.append(len(u)) or launch(r, u, *a, **k),
+    )
+    with torch.inference_mode(), InferenceMode.active():
+        torch.manual_seed(1)
+        fused = execute(model)
+        assert calls == launches * 4
+        _unfuse(model)
+        torch.manual_seed(1)
+        unfused = execute(model)
+    assert len(calls) == len(launches) * 4  # the unfused model launches no fused kernel
+    for a, b in zip(fused, unfused, strict=True):
+        # The fused reader norms the unrounded FP32 mix; the unfused read rounds to BF16 first.
+        torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0.1)
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize(
+    "pattern,mixer,fp32_residual,interval",
+    [
+        ("M-MMEMEM-M-", "mamba", True, 2),
+        ("M-MEMMEM-M-", "mamba", False, 4),
+        ("MEME", "gdp", True, 2),
+        ("GE*E", "gdn", True, 3),
+    ],
+)
+@REQUIRES_FUSED_BACKWARD
+def test_fused_seams_training_matches_unfused(monkeypatch, pattern, mixer, fp32_residual, interval):
+    """Training forward/backward through every fused seam matches the unfused model: outputs and
+    parameter gradients within BF16 noise. The kernels apply each norm's epsilon and run its
+    forward pre-hooks (DDP's overlapped parameter all-gather waits there), and checkpoint replay
+    every ``interval`` layers reproduces outputs and gradients bit for bit."""
+    model = _hybrid_model(
+        pattern, mixer, fp32_residual_connection=fp32_residual, layernorm_epsilon=1e-6
+    ).train()
+    launch, epsilons = forward_kernel.forward, set()
+    monkeypatch.setattr(
+        forward_kernel, "forward", lambda *a, **k: epsilons.add(k["epsilon"]) or launch(*a, **k)
+    )
+    replays, replay = [], replay_kernel.replay_interval
+    monkeypatch.setattr(
+        replay_kernel, "replay_interval", lambda *a, **k: replays.append(1) or replay(*a, **k)
+    )
+    norms = {n: m for n, m in model.decoder.named_modules() if is_fusable_rmsnorm(m)}
+    hooked = set()
+    for name, norm in norms.items():
+        norm.register_forward_pre_hook(lambda m, args, name=name: hooked.add(name))
+    ids = torch.randint(0, 128, (1, 1024), device="cuda")
+    positions = torch.arange(1024, device="cuda")[None]
+
+    def step(replay_interval=None):
+        model.config.residual_stream_recompute_num_layers = replay_interval
+        model.zero_grad(set_to_none=True)
+        logits = model(ids, positions, None)
+        logits.float().square().mean().backward()
+        grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        return logits.detach(), grads
+
+    fused = step()
+    assert epsilons == {1e-6} and hooked == set(norms) and not replays
+    replayed = step(interval)
+    assert replays and torch.equal(replayed[0], fused[0])
+    assert replayed[1].keys() == fused[1].keys()
+    assert all(bytes_equal(g, fused[1][n]) for n, g in replayed[1].items())
+    _unfuse(model)
+    unfused = step()
+    hook = model.embedding.register_forward_hook(lambda module, args, out: out * (1 + 2**-7))
+    perturbed = step()
+    hook.remove()
+
+    def deviation(run):
+        """Max logit difference and median/max relative gradient error against unfused."""
+        (logits, grads), (reference, reference_grads) = run, unfused
+        assert grads.keys() == reference_grads.keys()
+        assert all(torch.isfinite(g).all() for g in grads.values())
+        errors = torch.stack(
+            [
+                (g.float() - reference_grads[name].float()).norm()
+                / reference_grads[name].float().norm().clamp_min(1e-20)
+                for name, g in grads.items()
+                # Controller-logit gradients nearly cancel at init (kernel tests check them).
+                if not name.endswith(("map.logit", "retention_logit"))
+            ]
+        )
+        return (logits.float() - reference.float()).abs().max(), errors.median(), errors.max()
+
+    # The fused seams move outputs and gradients no more than a one-ulp BF16 perturbation of the
+    # embedding output does (the fused reader norms the unrounded FP32 mix).
+    for actual, noise in zip(deviation(fused), deviation(perturbed)):
+        assert actual <= 2 * noise, (actual, noise)
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"recompute_granularity": "selective", "recompute_modules": [m]}, f"{m}'] recompute")
+        for m in ("layernorm", "shortcut_pre_mlp_layernorm", "residual_stream")
+    ]
+    + [
+        ({"moe_shortcut_post_norm": True}, "moe_shortcut_post_norm"),
+        ({"add_bias_linear": True}, "add_bias_linear"),
+        ({"wide_residual": WideResidualConfig(num_streams=7)}, "num_streams"),
+        ({"residual_stream_recompute_num_layers": 2, "cuda_graph_impl": "local"}, "CUDA graphs"),
+    ],
+)
+def test_fusion_rejects_unsupported_config(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _fused_config(**overrides)
+
+
+@pytest.mark.usefixtures("model_parallel")
+def test_fusion_spec_keeps_sharded_checkpoint_keys():
+    """The split input norms keep the unsplit stack's sharded checkpoint keys."""
+
+    def keys(fused):
+        model = _hybrid_model("M-G*EMEM-", hidden=256, moe_shortcut_wide_residual_norm_fusion=fused)
+        return {
+            value.key: tuple(value.local_shape)
+            for value in model.sharded_state_dict().values()
+            if hasattr(value, "local_shape")
+        }
+
+    assert keys(True) == keys(False)
+    fused = specs.shortcut_fusion_stack_spec(specs.wide_residual_hybrid_stack_spec)
+    assert fused is specs.wide_residual_shortcut_fusion_stack_spec
+    assert specs.shortcut_fusion_stack_spec(fused) is fused  # fusion and custom specs unchanged
+
+
+@pytest.mark.parametrize(
+    "recompute,offload,gtp,eligible,expected",
+    [
+        (False, False, False, True, "linear"),
+        (False, False, False, False, None),
+        (True, True, False, True, None),
+        (True, False, True, True, "linear"),
+        (True, False, False, True, "GTP weight finalization"),
+    ],
+)
+def test_direct_mxfp8_consumer_selection(monkeypatch, recompute, offload, gtp, eligible, expected):
+    """Reader zero goes to its projection as MXFP8 only when eligible; a checkpointed (GDP)
+    input projection stays BF16 under fine-grained offloading and needs GTP finalization."""
+    seen = []
+    monkeypatch.setattr(mxfp8_handoff, "eligible", lambda *args: eligible)
+    monkeypatch.setattr(
+        wide_residual, "_apply_boundary", lambda *a, **k: seen.append(k["mxfp8_consumer"])
+    )
+    linear = SimpleNamespace(weight=SimpleNamespace(is_gtp_weight_remat=gtp))
+    branch = SimpleNamespace(
+        recompute_in_proj=recompute,
+        config=SimpleNamespace(fine_grained_activation_offloading=offload),
+    )
+    read = SimpleNamespace(num_streams=3, read_map=lambda return_logits: None)
+    pending = PendingShortcutAdd(None, None, None, None, None)
+    call = lambda: apply_pending_write(pending, (read,), (torch.nn.RMSNorm(8),), (branch, linear))
+    if expected not in ("linear", None):
+        with pytest.raises(ValueError, match=expected):
+            call()
+    else:
+        call()
+        assert seen == [linear if expected else None]

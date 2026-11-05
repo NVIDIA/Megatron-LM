@@ -688,6 +688,82 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 )
 
 
+def _split_input_norms(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Split the input norms the fused seam kernels apply out of their projections; sharded
+    checkpoints keep the fused-projection keys."""
+    unfused = {
+        TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+        InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+    }
+    layers = {}
+    for name, branch_name, norm_name, projection_name in (
+        ("mamba_layer", "mixer", "norm", "in_proj"),
+        ("gdn_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("gdn2_layer", "self_attention", "input_layernorm", "in_proj"),
+        ("attention_layer", "self_attention", "input_layernorm", "linear_qkv"),
+        ("mlp_layer", "mlp", "pre_mlp_layernorm", "linear_fc1"),
+    ):
+        spec = getattr(stack_spec.submodules, name)
+        branch = getattr(getattr(spec, "submodules", None), branch_name, None)
+        # The MLP branch is a partial(MLP.as_mlp_submodule, submodules=...).
+        branch_submodules = (
+            branch.keywords.get("submodules")
+            if isinstance(branch, partial)
+            else getattr(branch, "submodules", None)
+        )
+        projection = unfused.get(getattr(branch_submodules, projection_name, None))
+        if projection is None:
+            continue
+        branch_submodules = replace(branch_submodules, **{projection_name: projection})
+        if isinstance(branch, partial):
+            branch = partial(branch.func, *branch.args, **branch.keywords)
+            branch.keywords["submodules"] = branch_submodules
+        else:
+            branch = replace(branch, submodules=branch_submodules)
+        keys = dict(spec.submodules.sharded_state_dict_keys_map)
+        keys[f"{norm_name}."] = f"{branch_name}.{projection_name}.layer_norm_"
+        layers[name] = replace(
+            spec,
+            submodules=replace(
+                spec.submodules,
+                **{branch_name: branch, norm_name: TENorm},
+                sharded_state_dict_keys_map=keys,
+            ),
+        )
+    return replace(stack_spec, submodules=replace(stack_spec.submodules, **layers))
+
+
+# Stacks for --moe-shortcut-wide-residual-norm-fusion (select with shortcut_fusion_stack_spec).
+wide_residual_shortcut_fusion_stack_spec = _split_input_norms(wide_residual_hybrid_stack_spec)
+wide_residual_shortcut_fusion_gdp_stack_spec = _split_input_norms(
+    wide_residual_gated_delta_product_stack_spec
+)
+wide_residual_shortcut_fusion_inference_stack_spec = _split_input_norms(
+    wide_residual_hybrid_inference_stack_spec
+)
+wide_residual_shortcut_fusion_gdp_inference_stack_spec = _split_input_norms(
+    wide_residual_gated_delta_product_inference_stack_spec
+)
+_SHORTCUT_FUSION_STACK_SPECS = (
+    (wide_residual_hybrid_stack_spec, wide_residual_shortcut_fusion_stack_spec),
+    (wide_residual_gated_delta_product_stack_spec, wide_residual_shortcut_fusion_gdp_stack_spec),
+    (wide_residual_hybrid_inference_stack_spec, wide_residual_shortcut_fusion_inference_stack_spec),
+    (
+        wide_residual_gated_delta_product_inference_stack_spec,
+        wide_residual_shortcut_fusion_gdp_inference_stack_spec,
+    ),
+)
+
+
+def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """The shortcut-fusion counterpart of a built-in wide-residual stack spec, else ``stack_spec``
+    (custom specs must split the fused input norms themselves)."""
+    for wide, fused in _SHORTCUT_FUSION_STACK_SPECS:
+        if stack_spec is wide:
+            return fused
+    return stack_spec
+
+
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec

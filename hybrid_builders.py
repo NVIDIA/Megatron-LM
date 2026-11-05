@@ -1,6 +1,9 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    shortcut_fusion_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
@@ -29,6 +32,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
+    if config.moe_shortcut_wide_residual_norm_fusion:
+        hybrid_stack_spec = shortcut_fusion_stack_spec(hybrid_stack_spec)
 
     model = HybridModel(
         config=config,

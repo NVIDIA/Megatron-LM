@@ -22,6 +22,7 @@ from typing import Sequence
 import torch
 
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fusions.wide_residual_shortcut.api import PendingShortcutAdd
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -32,7 +33,13 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import (
+    SeamInput,
+    StreamwiseSigmoidWideResidualRead,
+    apply_pending_write,
+    defer_write,
+    is_fusable_rmsnorm,
+)
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -126,6 +133,11 @@ def group_layers_into_shortcut_blocks(
         )
         physical_index += 2
 
+    if config.moe_shortcut_wide_residual_norm_fusion:
+        # A layer defers its residual write when its successor applies it in a fused seam kernel.
+        for layer, successor in zip(grouped_layers, grouped_layers[1:]):
+            if all(getattr(x, "fuses_residual_seams", False) for x in (layer, successor)):
+                layer.defers_residual_write = True
     return grouped_layers
 
 
@@ -133,6 +145,8 @@ class ShortcutMoEBlock(MegatronModule):
     """Own and execute one attention-layer/shortcut-MoE pair."""
 
     _parallel_stream: torch.cuda.Stream | None = None
+    # Fused residual seams: set when the next layer applies this block's MoE write.
+    defers_residual_write: bool = False
 
     @classmethod
     def _get_a2a_overlap_stream(cls) -> torch.cuda.Stream:
@@ -234,6 +248,20 @@ class ShortcutMoEBlock(MegatronModule):
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
 
+        # Fused seams: the block applies a pending write with both its input norms in one kernel.
+        self.fuses_residual_seams = bool(
+            self.config.moe_shortcut_wide_residual_norm_fusion and not self.is_mtp_layer
+        )
+        if self.fuses_residual_seams:
+            compute_layer.defers_residual_write = True
+            _, compute_norm, _ = compute_layer.seam_read()
+            norms = (compute_norm, self.shortcut_pre_mlp_layernorm, moe_layer.pre_mlp_layernorm)
+            if not all(map(is_fusable_rmsnorm, norms)) or compute_norm.eps != norms[1].eps:
+                raise ValueError(
+                    "shortcut kernel fusion requires standalone RMSNorm input norms with one "
+                    "epsilon (hybrid_layer_specs.shortcut_fusion_stack_spec)"
+                )
+
     def _read_shortcut_hidden(
         self,
         hidden_states: torch.Tensor,
@@ -256,9 +284,12 @@ class ShortcutMoEBlock(MegatronModule):
         padding_mask=None,
         packed_seq_params=None,
         recompute_context: ResidualStreamRecomputeContext | None = None,
+        normalized: bool = False,
     ):
-        """Run shortcut normalization, routing, and dispatch preprocessing."""
-        if recompute_context is not None:
+        """Run shortcut normalization (unless ``normalized``), routing, dispatch preprocessing."""
+        if normalized:
+            shortcut_input = shortcut_hidden
+        elif recompute_context is not None:
             shortcut_input = recompute_context.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
             )
@@ -319,6 +350,11 @@ class ShortcutMoEBlock(MegatronModule):
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
+        if self.defers_residual_write:
+            # The next layer's seam kernel applies the shortcut add of routed and shared.
+            routed = self.moe_layer.mlp.postprocess(combined_output, None)
+            write = self.moe_layer._get_mlp_residual_connection("write")
+            return defer_write(residual, (routed, None), write, shared=shared_expert_output)
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
@@ -428,14 +464,18 @@ class ShortcutMoEBlock(MegatronModule):
 
         Uses the same per-layer arguments as HybridStack.forward passes to unpaired layers.
         """
+        # Fused seams pass inputs/outputs a per-layer CUDA-graph runner cannot take, so a fused
+        # compute layer runs uncaptured here; the block (or the stack's graph) is the graph unit.
+        fused = self.fuses_residual_seams
         if isinstance(self.compute_layer, MambaLayer):
-            return self.compute_layer(
+            return (self.compute_layer.forward if fused else self.compute_layer)(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             )
-        hidden_states, _ = self.compute_layer(
+        # A fused compute-only layer ends after attention; its MLP phase would get a deferred write.
+        hidden_states, _ = (self.compute_layer._forward_attention if fused else self.compute_layer)(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -467,7 +507,26 @@ class ShortcutMoEBlock(MegatronModule):
         In inference the paired layer runs its ordinary forward instead of the two-stage split,
         which never updates KV-cache or recurrent state, and communication stays on the current
         stream.
+
+        With fused seams ``hidden_states`` may be the previous layer's unwritten PendingShortcutAdd.
         """
+        if self.fuses_residual_seams and (
+            packed_seq_params is not None or padding_mask is not None
+        ):
+            raise ValueError(
+                "shortcut kernel fusion does not support packed sequences or padding masks"
+            )
+        shortcut_add = isinstance(hidden_states, PendingShortcutAdd)
+        if shortcut_add:
+            read, norm, consumer = self.compute_layer.seam_read()
+            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+                residual, compute_input, shortcut_input = apply_pending_write(
+                    hidden_states,
+                    (read, self.shortcut_residual_read),
+                    (norm, self.shortcut_pre_mlp_layernorm),
+                    consumer,
+                )
+            hidden_states = SeamInput(residual, compute_input)
 
         select_token_dispatcher = getattr(self.moe_layer.mlp, "select_token_dispatcher", None)
         if select_token_dispatcher is not None:
@@ -512,14 +571,19 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            moe_hidden_states = self._read_shortcut_hidden(
-                moe_hidden_states, recompute_context=attn_recompute_context
-            )
+            if shortcut_add:
+                moe_hidden_states = shortcut_input
+            else:
+                moe_hidden_states = self._read_shortcut_hidden(
+                    moe_hidden_states, recompute_context=attn_recompute_context
+                )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
                 padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 recompute_context=attn_recompute_context,
+                # The fused shortcut add already normed the shortcut input.
+                **({"normalized": True} if shortcut_add else {}),
             )
             if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
