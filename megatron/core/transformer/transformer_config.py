@@ -1453,6 +1453,9 @@ class TransformerConfig(ModelParallelConfig):
 
     If None, all layers in the transformer block share a single recompute block.
 
+    With 1, each HybridStack mHC layer registers the hook inside its own call, so an FSDP
+    backward-pre hook on that layer gathers its weights before replay. MFSDP v2 requires 1.
+
     Must be a positive integer when set."""
 
     ####################

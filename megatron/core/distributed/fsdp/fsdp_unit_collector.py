@@ -16,6 +16,7 @@
 
 from torch import nn
 
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -31,30 +32,26 @@ class FsdpUnitCollector:
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules in reverse pre-order, including the root last."""
         self._collected_units_in_preorder = {module: None}
-        self._visit(module, under_shortcut=False)
+        self._visit(module, wrapper=None)
         return list(reversed(self._collected_units_in_preorder))
 
-    def _visit(self, module: nn.Module, under_shortcut: bool) -> None:
-        if self._should_shard(module, under_shortcut):
+    def _visit(self, module: nn.Module, wrapper: nn.Module | None) -> None:
+        if self._should_shard(module, wrapper):
             self._collected_units_in_preorder[module] = None
 
-        under_shortcut = under_shortcut or isinstance(module, ShortcutMoEBlock)
+        if isinstance(module, (ShortcutMoEBlock, HyperConnectionHybridLayer)):
+            wrapper = module
         for child in module.children():
-            self._visit(child, under_shortcut)
+            self._visit(child, wrapper)
 
-    def _should_shard(self, module: nn.Module, under_shortcut: bool) -> bool:
+    def _should_shard(self, module: nn.Module, wrapper: nn.Module | None) -> bool:
         """Whether this module should be an independent FSDP unit."""
         if not isinstance(module, self._fsdp_unit_module_types):
             return False
 
-        # ShortcutMoEBlock interleaves stages during training by calling
-        # compute_layer.forward_pre_attn_and_core_attn()/forward_post_core_attn() and
-        # moe_layer._pre_mlp_layernorm_and_residual(). These helper calls bypass the
-        # layers' __call__ hooks. Sharding these modules separately would leave
-        # their weights ungathered. Leave their parameters with the enclosing FSDP unit.
-        # We still visit their children. In particular,
-        # moe_layer.mlp.experts runs through experts(...), which invokes its hooks,
-        # so the expert container can remain a separate FSDP unit.
-        if under_shortcut and isinstance(module, (TransformerLayer, MambaLayer)):
+        # ShortcutMoEBlock and mHC invoke inner-layer helpers that bypass __call__.
+        # Keep those parameters with the enclosing FSDP unit. Still visit children:
+        # routed experts run through experts(...), so they retain their own hooks.
+        if wrapper is not None and isinstance(module, (TransformerLayer, MambaLayer)):
             return False
         return True

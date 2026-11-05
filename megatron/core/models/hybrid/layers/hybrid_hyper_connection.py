@@ -9,7 +9,10 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    finalize_mhc_recompute_layer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
     MegatronModule,
@@ -237,4 +240,8 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
+        if mhc_recompute_manager is not None and self.config.mhc_recompute_layer_num == 1:
+            # Replay inside this call, so an FSDP backward-pre hook on this layer gathers
+            # its weights before replay. HybridStack skips its block-level finalize.
+            finalize_mhc_recompute_layer(mhc_recompute_manager, hidden_states, True)
         return hidden_states, context
