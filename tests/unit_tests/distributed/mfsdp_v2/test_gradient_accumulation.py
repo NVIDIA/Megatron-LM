@@ -300,7 +300,9 @@ def test_local_accumulation_matches_reference(distributed_setup, sharding, set_t
                     losses.append(loss.detach())
                     backward_loss = loss / num_microbatches
                     if reduce_grads:
-                        backward_loss = backward_loss * grad_scale
+                        # Without FSDP, the reference averages gradients across ranks below
+                        # and applies grad_scale through its loss.
+                        backward_loss *= grad_scale
                     backward_loss.backward()
             if reduce_grads:
                 for parameter in model.parameters():
