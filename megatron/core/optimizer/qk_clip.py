@@ -18,7 +18,7 @@ def _iter_qk_clip_modules(model_chunk):
     model_module = model_chunk.module.module
     if isinstance(model_module, HybridModel):
         for module in model_module.modules():
-            if isinstance(module, Attention) and hasattr(module, 'clip_qk'):
+            if isinstance(module, Attention):
                 yield module
         return
     for transformer_layer in model_module.decoder.layers:

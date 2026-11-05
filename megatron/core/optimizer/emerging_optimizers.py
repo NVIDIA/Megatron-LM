@@ -55,9 +55,11 @@ logger = logging.getLogger(__name__)
 # ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
-# Newton-Schulz on a 3D [batch, rows, cols] input (one NS per matrix of the batch), and its
-# SYRK variant.
+# newton_schulz() accepts a batched (3-D) input from this release on (PR #170); 0.2.0 fails
+# inside torch.addmm ("mat1 must be a matrix") on the first step.
 _BATCHED_NS_MIN_EO_VERSION = "0.3.0"
+# newton_schulz() dispatches 3-D inputs to the batched SYRK step (batched_tsyrk_ex, PR #276)
+# from this release on; older releases raise TypeError on a 3-D input with use_syrk.
 _BATCHED_SYRK_MIN_EO_VERSION = "0.5.0a0"
 
 
