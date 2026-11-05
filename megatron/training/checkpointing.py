@@ -239,13 +239,13 @@ def check_checkpoint_args(
                 f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
                 f'the input argument value ({args_value}).'
             )
-    # --dsa-reset-indexer-on-load exists to convert a checkpoint that has no indexer
-    # into a DSA run, re-initialising the indexer from the loaded weights. A dense
-    # checkpoint records experimental_attention_variant=None and no dsa_indexer_*
-    # values, so comparing them against the runtime's would reject exactly the
-    # conversion the flag requests. The indexer is being rebuilt, not resumed, so
-    # its geometry is not required to match. Every non-indexer comparison still runs.
-    if not args.dsa_reset_indexer_on_load:
+    # Only a checkpoint with no indexer may bypass these comparisons, so that
+    # --dsa-reset-indexer-on-load can convert it. A preserved indexer must match the identity
+    # it was saved with.
+    checkpoint_has_indexer = (
+        getattr(checkpoint_args, 'experimental_attention_variant', None) == 'dsa'
+    )
+    if not args.dsa_reset_indexer_on_load or checkpoint_has_indexer:
         for arg_name, default in _DSA_ARG_DEFAULTS:
             if arg_name in skip_args:
                 continue
