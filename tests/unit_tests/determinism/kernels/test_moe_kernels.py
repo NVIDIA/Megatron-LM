@@ -44,6 +44,7 @@ from megatron.core.transformer.moe.experts import (
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.moe.token_dispatcher import (
     _HybridEPManager,
     _NCCLEPManager,
@@ -714,6 +715,45 @@ def test_topk_routing_replays(case, fused, det_algos):
     with deterministic_algorithms(det_algos):
         assert_replays_bit_exact(
             fn, (logits,), replays=3, what=f"topk routing[{case}, fused={fused}]"
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [64, 4096], ids=["decode", "prefill"])
+@pytest.mark.parametrize("topk,scaling_factor", [(4, None), (8, 2.5)])
+def test_batch_invariant_sigmoid_topk_routing_replays(num_tokens, topk, scaling_factor):
+    """Batch-invariant sigmoid routing runs the Triton top-k kernel (training and inference).
+
+    Forward is the kernel with a token-count-independent launch; backward differentiates the
+    reference formula at the kernel's indices. Both must replay bit-exactly.
+    """
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    seeded()
+    logits = torch.randn(num_tokens, 256, device="cuda", dtype=torch.float32, requires_grad=True)
+    expert_bias = torch.randn(256, device="cuda") * 0.01
+    with set_batch_invariant_mode(True):
+        assert moe_utils._use_batch_invariant_sigmoid_topk(
+            logits, topk, "sigmoid", expert_bias, False, None, None
+        ), "the batch-invariant kernel path must be selected"
+
+        def fn(logits):
+            return moe_utils.topk_routing_with_score_function(
+                logits,
+                topk=topk,
+                score_function="sigmoid",
+                expert_bias=expert_bias,
+                scaling_factor=scaling_factor,
+            )
+
+        assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn(num_tokens, 256, device="cuda")},
+            replays=3,
+            contention=True,
+            what=f"batch-invariant sigmoid routing[topk={topk}, tokens={num_tokens}]",
         )
 
 
@@ -1747,6 +1787,65 @@ class TestMoEModules:
             assert bytes_equal(ref_grad["in[0]"], torch.full_like(hidden, 2))
         finally:
             reset_hybrid_ep_buffer()
+
+    @pytest.mark.parametrize("recompute", [False, True], ids=["no_recompute", "moe_recompute"])
+    def test_moe_layer_replay_topk_idx_replays(self, recompute):
+        """Routing replay through ``MoELayer.forward(replay_topk_idx=...)``, which chunked MLPs
+        pass per chunk and a selective ``"moe"`` recompute replays again, replays bit-exactly
+        and matches replaying the same indices as the micro-batch's target."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            moe_token_dispatcher_type="alltoall",
+            moe_enable_routing_replay=True,
+            **(
+                {"recompute_granularity": "selective", "recompute_modules": ["moe"]}
+                if recompute
+                else {}
+            ),
+        )
+        if not HAVE_TE:
+            config.moe_grouped_gemm = False
+            mlp_spec = get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        else:
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=8, moe_grouped_gemm=True
+            ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda().train()
+        layer.set_layer_number(0)
+        assert layer.moe_layer_recompute is recompute
+        replay = layer.router.router_replay
+        hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        # Distinct experts per token, deliberately unlike the router's own choice.
+        topk_idx = torch.rand(4096, 8, device="cuda").argsort(dim=-1)[:, :2]
+        try:
+            # Recompute replays under REPLAY_FORWARD too, so the target path needs no pop.
+            replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            with deterministic_algorithms(True):
+                outputs, grads = assert_module_replays_bit_exact(
+                    layer,
+                    {"hidden_states": hidden, "replay_topk_idx": topk_idx},
+                    replays=3,
+                    contention=True,
+                    what=f"MoELayer[replay_topk_idx, recompute={recompute}]",
+                )
+                assert replay.call_topk_idx is None
+                replay.set_target_indices(topk_idx)
+                ref_outputs, ref_grads = assert_module_replays_bit_exact(
+                    layer,
+                    {"hidden_states": hidden},
+                    replays=2,
+                    what=f"MoELayer[target_topk_idx, recompute={recompute}]",
+                )
+        finally:
+            replay.clear_indices()
+            replay.clear_router_replay_action()
+            RouterReplay.global_router_replay_instances.remove(replay)
+        for reference, current in ((ref_outputs, outputs), (ref_grads, grads)):
+            assert reference.keys() == current.keys()
+            for name in reference:
+                assert bytes_equal(reference[name], current[name]), name
+        moe_utils.get_moe_metrics_tracker().clear()
 
     def test_alltoall_dispatcher_releases_router_probs_after_forward(self):
         """combine_preprocess drops ``self.probs`` so it does not pin the recompute graph.

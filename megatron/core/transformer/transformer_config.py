@@ -906,6 +906,14 @@ class TransformerConfig(ModelParallelConfig):
     """Apply the configured normalization to the combined routed and shared expert output.
     Requires moe_shortcut_connection = True."""
 
+    moe_shortcut_disable_mtp: bool = False
+    """Disable shortcut MoE connections in hybrid MTP stacks while keeping them in the decoder.
+    Each MTP depth runs its compute and MoE layers sequentially, using the ordinary MoE
+    normalization and routing path. Also applies to a shared, repeated MTP layer.
+    Only affects shortcut MoE; other MTP, recomputation, and offloading settings are preserved.
+    Changing this setting requires converting the MTP state when resuming a checkpoint.
+    Defaults to False to preserve existing MTP behavior."""
+
     moe_shortcut_parallel: bool = False
     """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
     Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
@@ -1575,8 +1583,10 @@ class TransformerConfig(ModelParallelConfig):
       bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
       outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
       below eight and to within the last fp32 bit otherwise. Other score functions,
-      group-limited routing, router replay, moe_router_fusion and batch-invariant mode
-      use the 'torch' path. Default."""
+      group-limited routing, router replay and moe_router_fusion use the 'torch' path.
+      Default.
+    Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
+    routing with an expert bias in both training and inference."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
