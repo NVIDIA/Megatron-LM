@@ -788,21 +788,18 @@ class TestRLUtils:
         assert cfg.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_offload_optimizer_during_inference=True,
-            rl_training_cuda_graphs=False,
-            fp8_param_gather=True,
-            use_distributed_optimizer=True,
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
-        )
-        cfg = pretrain_cfg_container_from_args(args)
-        # Global setup validates the config, so introduce the invalid combination afterward.
-        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        # The MXFP8 parameter all-gather stages parameters in the gradient buffer, which the
+        # optimizer offload releases; validate_args derives the flag, so setup already rejects it.
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-            cfg.validate()
-        assert not cfg.ddp.grad_buffer_offload
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_offload_optimizer_during_inference=True,
+                rl_training_cuda_graphs=False,
+                fp8_param_gather=True,
+                use_distributed_optimizer=True,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+            )
 
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
