@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from datetime import timedelta
+
 import pytest
 import torch
 
@@ -590,12 +592,12 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
 
 @pytest.mark.parametrize(
-    "world_size, tp_size, cp_size, dp_size",
-    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
+    "world_size, tp_size, cp_size, dp_size", [(8, 1, 2, 4), (8, 1, 1, 8), (8, 2, 2, 2)]
 )
 def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
-    Test that every valid dynamic DPxCP group, including CP1, is created.
+    Test that every valid dynamic DPxCP group, including CP1, is created with the
+    configured timeout.
     """
     Utils.destroy_model_parallel()
 
@@ -607,6 +609,7 @@ def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
         dynamic_context_parallel=True,
+        distributed_timeout_minutes=45,
     )
 
     dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
@@ -614,6 +617,22 @@ def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     for group_size in group_sizes:
         group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
+        # distributed_timeout_minutes, not torch's default NCCL timeout (10 minutes)
+        assert group._get_backend(torch.device("cuda")).options._timeout == timedelta(minutes=45)
+        tp_dp_cp_group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=group_size)
+        assert tp_dp_cp_group.size() == tp_size * group_size
+
+    Utils.destroy_model_parallel()
+
+
+def test_expert_data_parallel_gloo_group_timeout():
+    """
+    Test that the expert data parallel gloo group is created with the configured timeout.
+    """
+    Utils.initialize_model_parallel(distributed_timeout_minutes=45)
+
+    group = ps.get_expert_data_parallel_group_gloo()
+    assert group._get_backend(torch.device("cpu")).options._timeout == timedelta(minutes=45)
 
     Utils.destroy_model_parallel()
 
