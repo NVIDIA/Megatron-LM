@@ -69,6 +69,7 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
 ):
     repo, baseline = repository
     (repo / "unrelated.py").write_text("new main work\n")
+    (repo / "pyproject.toml").write_text("# newer main dependencies\n")
     base = commit(repo, "Newer main")
     git(repo, "checkout", "-b", "pr")
     (repo / "model.py").write_text("PR change\n")
@@ -108,23 +109,18 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert git(consumer, "rev-parse", "HEAD") == tested
     assert git(consumer, "rev-parse", "HEAD^") == baseline
     assert (consumer / "model.py").read_text() == "PR change\n"
+    assert (consumer / "pyproject.toml").read_text() == "# unchanged image\n"
     assert not (consumer / "unrelated.py").exists()
     assert not (consumer / "removed.py").exists()
     assert (consumer / "new.bin").read_bytes() == b"\x00\xff\x80complete binary change"
     assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
 
 
-@pytest.mark.parametrize("failure", ["conflict", "image", "controller", "lookup"])
+@pytest.mark.parametrize("failure", ["conflict", "lookup"])
 def test_prepare_fallback_preserves_checkout_and_metadata(repository, monkeypatch, failure, capsys):
     repo, baseline = repository
     if failure == "conflict":
         (repo / "model.py").write_text("different main implementation\n")
-    if failure == "image":
-        (repo / "pyproject.toml").write_text("# newer main dependencies\n")
-    if failure == "controller":
-        controller = repo / "tests/unit_tests/run_ci_test.sh"
-        controller.parent.mkdir(parents=True)
-        controller.write_text("# newer main Testmon contract\n")
     base = commit(repo, "New main") if failure != "lookup" else baseline
     (repo / "model.py").write_text("PR implementation\n")
     head = commit(repo, "PR")
@@ -142,8 +138,6 @@ def test_prepare_fallback_preserves_checkout_and_metadata(repository, monkeypatc
     assert "::notice::Using original PR checkout:" in message
     if failure == "conflict":
         assert "Applied patch to 'model.py' with conflicts" in message
-    if failure in {"image", "controller"}:
-        assert "CI image or Testmon inputs" in message
     assert git(repo, "rev-parse", "HEAD") == head
     assert git(repo, "status", "--porcelain") == ""
     assert metadata_path.read_bytes() == original_metadata

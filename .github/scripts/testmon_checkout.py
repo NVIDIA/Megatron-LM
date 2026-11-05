@@ -13,21 +13,6 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = "NVIDIA/Megatron-LM"
-COMPATIBILITY_INPUTS = (
-    "docker",
-    ".dockerignore",
-    "pyproject.toml",
-    "uv.lock",
-    "megatron/core/__init__.py",
-    "megatron/core/package_info.py",
-    "assets",
-    "README.md",
-    ".github/workflows/_build_ci_container.yml",
-    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "tests/unit_tests/testmon*.py",
-    "tests/unit_tests/find_test_cases.py",
-    "tests/unit_tests/run_ci_test.sh",
-)
 
 
 def run(
@@ -94,7 +79,7 @@ def outputs(manifest: dict[str, str]) -> None:
 
 
 def prepare(args: argparse.Namespace) -> None:
-    """Bundle the PR diff on a compatible baseline, preserving the original on failure."""
+    """Bundle the PR diff on the selected baseline, preserving the original on failure."""
     output = Path(args.output_dir).resolve()
     bundle = str(output / "checkout.bundle")
     metadata_path = Path(args.pr_files_dir).resolve() / "metadata.json"
@@ -120,10 +105,6 @@ def prepare(args: argparse.Namespace) -> None:
             if patch:
                 git("apply", "--3way", "--index", cwd=checkout, data=patch)
             tree = git("write-tree", cwd=checkout)
-            if git(
-                "diff", "--name-only", original, tree, "--", *COMPATIBILITY_INPUTS, cwd=checkout
-            ):
-                raise ValueError("Prepared checkout differs from the CI image or Testmon inputs")
             date = git("show", "-s", "--format=%cI", original)
             identity = {
                 f"GIT_{role}_{field}": value
