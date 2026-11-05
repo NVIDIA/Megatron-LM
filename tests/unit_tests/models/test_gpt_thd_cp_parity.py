@@ -337,10 +337,7 @@ def test_pretrain_gpt_thd_cp2_with_mtp_matches_thd_cp1(sequence_lengths):
 
 @pytest.mark.parametrize(
     "pre_process, expected_mask",
-    [
-        (True, [[False, True, False, False, True, True]]),
-        (False, [[False, True, True]]),
-    ],
+    [(True, [[False, True, False, False, True, True]]), (False, [[False, True, True]])],
     ids=["embedding-stage-scatters-in-model", "middle-stage-scatters-in-forward-step"],
 )
 def test_forward_step_shards_padding_mask_once(monkeypatch, pre_process, expected_mask):

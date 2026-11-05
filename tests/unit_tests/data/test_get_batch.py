@@ -1727,10 +1727,7 @@ def test_packed_sequence_dataset_built_on_rank(
 @pytest.mark.parametrize("metadata_only", [False, True], ids=["token-stage", "middle-stage"])
 @pytest.mark.parametrize(
     "cp_rank, expected_padding",
-    [
-        (0, [False, True, False, False, True, True]),
-        (1, [False, False, False, False, False, True]),
-    ],
+    [(0, [False, True, False, False, True, True]), (1, [False, False, False, False, False, True])],
 )
 def test_padded_zigzag_constructs_padding_mask(metadata_only, cp_rank, expected_padding):
     batch = {

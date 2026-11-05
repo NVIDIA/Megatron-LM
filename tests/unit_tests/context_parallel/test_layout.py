@@ -519,10 +519,7 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
 
 def test_zigzag_padding_preserves_cp_alignment_with_odd_tp():
     metadata = _build_thd_zigzag_metadata(
-        torch.tensor([0, 1, 24], dtype=torch.int32),
-        cu_seqlens_padded=None,
-        cp_size=2,
-        tp_size=3,
+        torch.tensor([0, 1, 24], dtype=torch.int32), cu_seqlens_padded=None, cp_size=2, tp_size=3
     )
 
     torch.testing.assert_close(
