@@ -735,8 +735,9 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 #### Explicit chain registration
 
 **One API selects which GTP-sharded weights prefetch one another:**
-`register_prefetch_chain(name, weights)`. See the
-[registration overview (PDF)](figures/gtp_prefetch_chain_api.pdf).
+`register_prefetch_chain(name, weights)`.
+
+[![GTP prefetch-chain registration overview](../../images/generalized_tensor_parallel/gtp_prefetch_chain_api.png)](figures/gtp_prefetch_chain_api.pdf)
 
 **Production defaults require no user calls.** After DDP wrapping,
 `classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
