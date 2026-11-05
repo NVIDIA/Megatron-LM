@@ -776,8 +776,14 @@ class ContextParallelLayoutState:
         default: torch.Tensor | None,
         padding_masks_by_layout: dict[CPLayout, torch.Tensor | None] | None,
     ) -> torch.Tensor | None:
-        """Return the token mask whose ordering matches this layer's input."""
-        if padding_masks_by_layout is None:
+        """Return the token mask whose ordering matches this layer's input.
+
+        Pipeline stages that carry no padding mask may build a batch for the boundary layout
+        only; the boundary ``default`` applies to every layer in that case.
+        """
+        if padding_masks_by_layout is None or all(
+            mask is None for mask in padding_masks_by_layout.values()
+        ):
             return default
         return padding_masks_by_layout[self.manager.layer_layouts[layer_index]]
 

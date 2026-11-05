@@ -171,7 +171,6 @@ def detoxify(monkeypatch):
         transformer_impl="local",
         num_experts=None,
         moe_grouped_gemm=False,
-        padded_vocab_size=8,
         max_position_embeddings=8,
         fp16_lm_cross_entropy=False,
         untie_embeddings_and_output_weights=False,
@@ -179,6 +178,11 @@ def detoxify(monkeypatch):
         rotary_percent=1.0,
     )
     monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(
+        script,
+        "get_run_config",
+        lambda: SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=8)),
+    )
     monkeypatch.setattr(script, "print_rank_0", lambda message: None)
     monkeypatch.setattr(script, "get_gpt_layer_local_spec", lambda **kwargs: "layer spec")
     monkeypatch.setattr(script, "GPTModel", lambda **kwargs: kwargs)
