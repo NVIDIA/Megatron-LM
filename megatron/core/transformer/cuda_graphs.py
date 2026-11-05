@@ -651,6 +651,11 @@ class _CudagraphGlobalRecord:
     @classmethod
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
+        # Forward-only schedules can reach this before training records any graphs.
+        # Keep observing saved tensors until there is a capture to complete.
+        if not cls.cudagraph_created and not cls.cudagraph_record:
+            return
+
         try:
             return cls._create_cudagraphs()
         finally:
@@ -2192,7 +2197,8 @@ class CudaGraphManager(torch.nn.Module):
         if cache_key is None and is_inference_mode:
             inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():
-                batch_size = kwargs['hidden_states'].shape[0]
+                hidden_states = args[0] if args else kwargs['hidden_states']
+                batch_size = hidden_states.shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
             else:
                 cache_key = inference_context.padded_batch_dimensions
@@ -2235,13 +2241,17 @@ class CudaGraphManager(torch.nn.Module):
                                     getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
-                                    and ArgMetadata(r[3]['hidden_states'])
-                                    == ArgMetadata(kwargs['hidden_states'])
+                                    and ArgMetadata(r[2][0] if r[2] else r[3]['hidden_states'])
+                                    == ArgMetadata(args[0] if args else kwargs['hidden_states'])
                                 )
                             )
                             # Replace the hidden states from previous layer's output buffer
-                            local_kwargs = dict(kwargs)
-                            local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                            previous_output = previous_runner[0].fwd_graph_outputs[0]
+                            if args:
+                                local_args = (previous_output, *args[1:])
+                            else:
+                                local_kwargs = dict(kwargs)
+                                local_kwargs['hidden_states'] = previous_output
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass
@@ -2350,9 +2360,16 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            assert micro_batch_size == 1, "Scheduler THD graphs require micro_batch_size=1."
         self.model = model
         self.config = config
-        self.seq_length = seq_length
+        self.seq_length = (
+            config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+            if getattr(config, "sequence_packing_scheduler", None) is not None
+            and config.pad_packed_seq_alignment is not None
+            else seq_length
+        )
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
@@ -2560,7 +2577,9 @@ class TECudaGraphHelper:
                     )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                            rotary_seq_len,
+                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
+                            is not None,
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
@@ -2758,6 +2777,10 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         else:
+            # Keep the source-batch bound when dp_balanced produces fewer packs.
+            # With a fixed source batch and MBS=1, each aligned packed schedule is
+            # a subsequence of this capture order, preserving the existing input
+            # buffer lifetimes without wrapping around the captured graph list.
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(

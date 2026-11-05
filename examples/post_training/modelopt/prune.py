@@ -207,7 +207,7 @@ if __name__ == "__main__":
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_kwargs = {
             "dtype": import_dtype,
-            "trust_remote_code": args.trust_remote_code,
+            "trust_remote_code": cfg.tokenizer.trust_remote_code,
         }
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs

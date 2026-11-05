@@ -824,6 +824,65 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _dsv4_attention_flops(args, layer_counts, total_tokens, seqlen_squared_sum):
+    """Estimate DSv4 W/C/H attention FLOPs, including projections and compressors.
+
+    Uses the model-FLOPs convention: multiply/add counts as two
+    operations and forward plus backward as three passes. Window and capped
+    Top-K work are token-linear; HCA and indexer scoring use the real sequence
+    length squared sum. Packed Top-K saturation uses the token-weighted mean
+    length, since these batch statistics do not retain individual document lengths.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    if total_tokens == 0:
+        return 0
+    window_layers = layer_counts[Symbols.WINDOW]
+    csa_layers = layer_counts[Symbols.CSA]
+    hca_layers = layer_counts[Symbols.HCA]
+    attention_layers = window_layers + csa_layers + hca_layers
+    hidden = args.hidden_size
+    heads = args.num_attention_heads
+    head_dim = args.v_head_dim
+    q_rank = args.q_lora_rank
+    output_rank = args.output_projection_lora_rank
+    output_groups = args.output_projection_groups
+    window = args.csa_window_size
+    sequence_length = seqlen_squared_sum / total_tokens
+
+    # Read v_head_dim directly: DSv4 derives qk_head_dim on the layer config,
+    # so the raw argument namespace may still carry the ordinary MLA default.
+    query_projection = q_rank * (hidden + heads * head_dim + 1)
+    kv_projection = hidden * head_dim + head_dim
+    output_projection = heads * head_dim * output_rank + output_groups * output_rank * hidden
+    token_term = attention_layers * (query_projection + kv_projection + output_projection)
+    token_term += attention_layers * heads * window * head_dim * 2
+
+    # Ratio-4 compression overlaps two windows; ratio-128 uses one.
+    token_term += csa_layers * hidden * (2 * head_dim) * 2
+    token_term += hca_layers * hidden * head_dim * 2
+    core_term = hca_layers * heads * head_dim / 128
+
+    if csa_layers:
+        if getattr(args, "csa_dense_mode", False):
+            # Dense CSA attends to all compressed keys and has no indexer.
+            core_term += csa_layers * heads * head_dim / 4
+        else:
+            indexer_heads = args.dsa_indexer_n_heads
+            indexer_dim = args.dsa_indexer_head_dim
+            topk = min(args.dsa_indexer_topk, sequence_length // 4)
+            average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
+            token_term += csa_layers * heads * average_compressed_keys * head_dim * 2
+            token_term += csa_layers * (
+                hidden * (2 * indexer_dim) * 2
+                + q_rank * indexer_heads * indexer_dim
+                + hidden * indexer_heads
+            )
+            core_term += csa_layers * indexer_heads * indexer_dim / 4
+
+    return 6 * (token_term * total_tokens + core_term * seqlen_squared_sum)
+
+
 def num_floating_point_operations(
     args,
     cfg,
@@ -1453,21 +1512,28 @@ def num_floating_point_operations(
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
+            parse_hybrid_pattern,
         )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
             itemgetter(
                 Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
                 Symbols.DS_ATTENTION,
             )(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+                layer_counts
             )
         )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
+        has_dsv4_attention = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
+        if has_dsv4_attention:
+            # The static C/H/W specs select DSv4 even when the CLI variant is
+            # inferred only on TransformerConfig. The pattern also owns MTP depth.
+            mtp_num_layers = parse_hybrid_pattern(args.hybrid_layer_pattern).mtp_num_depths
         # Compute hybrid model FLOPs.
-        return int(hybrid_flops(
+        flops = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1503,7 +1569,16 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-        ))
+        )
+        if has_dsv4_attention:
+            flops += _dsv4_attention_flops(
+                args, layer_counts, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+            )
+            # MTP normalization and the concatenated embedding/hidden projection.
+            flops += 6 * mtp_num_layers * (
+                3 * args.hidden_size + 2 * args.hidden_size ** 2
+            ) * total_real_tokens_in_batch
+        return int(flops)
     else:
         # Compute standard Transformer model FLOPs.
         return int(transformer_flops())
@@ -1515,8 +1590,21 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
-    assert args.save is not None
-    progress_log_filename = os.path.join(args.save, "progress.txt")
+    return _get_start_time_from_progress_log(args.save, args.world_size)
+
+
+# The start time will not change across multiple calls, so we can cache it.
+@functools.cache
+def _get_start_time_from_progress_log(save_dir: str, world_size: int):
+    """
+    Gets start time of earliest job in the specified save directory with the
+    specified world size. Also returns the number of floating-point operations
+    completed in last saved checkpoint.
+
+    Implementation function cached on save_dir and world_size arguments.
+    """
+    assert save_dir is not None
+    progress_log_filename = os.path.join(save_dir, "progress.txt")
 
     # start_time is time when job with same world size started.
     # start_num_floating_point_operations is the number of floating-point operations
@@ -1550,7 +1638,7 @@ def get_start_time_from_progress_log():
                 if latest_num_floating_point_operations_uncommitted is not None:
                     latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != args.world_size:
+            if world_size_in_line != world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
@@ -2031,6 +2119,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.train_state = train_state
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
@@ -3000,6 +3089,11 @@ def setup_model_and_optimizer(
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
+    # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
+    # iteration has completed, so a run that dies during startup (e.g., an OOM while loading
+    # a checkpoint into a grid that fits fine from scratch) otherwise leaves no memory trace.
+    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
+    report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -3106,6 +3200,18 @@ def setup_model_and_optimizer(
         train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
         train_state.resume_num_floating_point_operations = 0.0
+    # Paired with the report after the model/optimizer build: the delta is what loading the
+    # checkpoint cost. On the from-scratch path, iteration is 0 and this is the baseline.
+    report_memory(
+        f"(after checkpoint load, iteration {train_state.iteration})", process_group=setup_dp_group
+    )
+    # Clear temporary allocations created by load_checkpoint. Run this here to allow for
+    # re-claim from objects created within the scope of load_checkpoint.
+    torch.cuda.empty_cache()
+    report_memory(
+        f"(after empty_cache after checkpoint load, iteration {train_state.iteration})",
+        process_group=setup_dp_group,
+    )
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
@@ -3275,6 +3381,24 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
         # global batch size may be rounded down when batch-size decrease is enabled.
         return get_current_running_global_batch_size()
     return samples_seen_in_iteration
+
+
+def _get_memory_report_dp_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+):
+    """Resolve the DP group that gates report_memory's rank-0 print.
+
+    A MultiModuleProcessGroupCollection carries no axes of its own, so unwrap it to the
+    language model's collection first, or, on a rank that owns only encoders, to that
+    rank's own module. Mirrors the cross-entropy warmup resolution in pretrain().
+    """
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+    return pg_collection.dp if pg_collection is not None else None
 
 
 def _get_model_pg_collection(
@@ -3716,6 +3840,7 @@ def training_log(
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
+    embedding_min_norm_metrics: Dict[str, float] | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -3967,7 +4092,7 @@ def training_log(
 
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
-        indexer_loss_scale = 1 / get_num_microbatches()
+        indexer_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (
                 "DSA indexer logging requires a language-model ProcessGroupCollection"
@@ -3977,7 +4102,7 @@ def training_log(
             # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
             # The core logger still receives explicit groups and does not read MPU globals.
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
+                required_pgs=['pp', 'dp', 'dp_cp', 'gtp_remat']
             )
         assert isinstance(
             pg_collection, ProcessGroupCollection
@@ -4107,6 +4232,18 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
+        if embedding_min_norm_metrics is not None:
+            log_string += (
+                " embedding norm floor row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/row-events-rescaled"])} |'
+                " fraction: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/fraction-rescaled"]:.3E} |'
+                " delta RMS: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/projection-delta-rms"]:.3E} |'
+                " zero-row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/zero-row-events"])} |'
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -4190,6 +4327,37 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
             and iteration % cfg.logger.tensorboard_log_interval == 0
         )
     )
+
+
+@torch.no_grad()
+def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
+    """Globally aggregate and reset embedding norm-floor interval statistics."""
+    # [rows scaled, rows checked, squared norm delta, exact-zero rows].
+    local_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
+    leaf_optimizers = (
+        getattr(optimizer, "chained_optimizers", [optimizer]) if optimizer is not None else ()
+    )
+    for current_optimizer in leaf_optimizers:
+        consume_stats = getattr(current_optimizer, "_consume_embedding_min_norm_stats", None)
+        if consume_stats is not None:
+            stats = consume_stats()
+            if stats is not None:
+                local_stats.add_(stats)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+
+    rows_rescaled, rows_checked, norm_delta_squared, zero_rows = local_stats.tolist()
+    fraction_rescaled = rows_rescaled / rows_checked if rows_checked > 0.0 else 0.0
+    norm_delta_rms = (
+        math.sqrt(norm_delta_squared / rows_rescaled) if rows_rescaled > 0.0 else 0.0
+    )
+    return {
+        "embedding-min-norm/row-events-rescaled": rows_rescaled,
+        "embedding-min-norm/fraction-rescaled": fraction_rescaled,
+        "embedding-min-norm/projection-delta-rms": norm_delta_rms,
+        "embedding-min-norm/zero-row-events": zero_rows,
+    }
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -5018,6 +5186,13 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    # Last report before the loop. Weights, optimizer state, any loaded checkpoint and the
+    # symmetric-memory pools are all resident by now, so a run that OOMs on iteration 1 still
+    # has a number to line up against a healthy run. CUDA graph pools are captured later.
+    report_memory(
+        "(before first iteration)", process_group=_get_memory_report_dp_group(model_pg_collection)
+    )
+
     def _finished_training(iteration):
         return (cfg.train.train_iters and iteration >= cfg.train.train_iters) or (
             cfg.train.train_samples and train_state.consumed_train_samples >= cfg.train.train_samples
@@ -5376,6 +5551,20 @@ def train(
             else:
                 loss_scale = 1.0
             params_norm = None
+            embedding_min_norm_metrics = None
+
+            if (
+                getattr(args, "embedding_min_norm", None) is not None
+                and iteration % cfg.logger.log_interval == 0
+            ):
+                embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
+                writer = get_tensorboard_writer()
+                if writer:
+                    for name, value in embedding_min_norm_metrics.items():
+                        writer.add_scalar(name, value, iteration)
+                wandb_writer = get_wandb_writer()
+                if wandb_writer:
+                    wandb_writer.log(embedding_min_norm_metrics, iteration)
 
             if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
@@ -5411,6 +5600,7 @@ def train(
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                     num_microbatches=scheduled_num_microbatches,
+                    embedding_min_norm_metrics=embedding_min_norm_metrics,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).

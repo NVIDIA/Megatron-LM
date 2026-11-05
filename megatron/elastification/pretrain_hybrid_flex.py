@@ -113,6 +113,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         HybridModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
     if has_nvidia_modelopt:
 
         model = _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection)
@@ -148,7 +149,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         hybrid_layer_pattern=args.hybrid_layer_pattern,

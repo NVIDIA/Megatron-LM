@@ -115,7 +115,7 @@ if __name__ == "__main__":
     export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
 
     if "trust_remote_code" in inspect.signature(export_fn).parameters:
-        export_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        export_kwargs.update({"trust_remote_code": cfg.tokenizer.trust_remote_code})
 
     if "clamp_kv_cache_scales" in inspect.signature(export_fn).parameters:
         export_kwargs["clamp_kv_cache_scales"] = args.clamp_kv_scales

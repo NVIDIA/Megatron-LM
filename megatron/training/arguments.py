@@ -1597,6 +1597,15 @@ def validate_args(args, defaults={}):
                 f'must be >= single sequence max length ({args.seq_length})'
             )
 
+    if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
+        assert args.use_varlen_dataset and args.micro_batch_size == 1, (
+            "Scheduler CUDA graphs require one variable-length sample per dataset item "
+            "and --micro-batch-size 1."
+        )
+        assert args.step_batch_size_schedule is None, (
+            "Scheduler CUDA graphs require a fixed source global batch size."
+        )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -2655,6 +2664,10 @@ def _add_regularization_args(parser):
         'Unset preserves the existing policy. Overrides '
         '--apply-wd-to-qk-layernorm for RMSNorm gamma only.',
     )
+    group.add_argument("--embedding-min-norm", type=float, default=None,
+                       help="After each optimizer update, rescale input word-embedding rows "
+                       "with nonzero L2 norms below this threshold to twice the threshold. "
+                       "Requires the distributed optimizer and is disabled by default.")
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
