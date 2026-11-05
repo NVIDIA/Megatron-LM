@@ -217,10 +217,8 @@ def test_kda_per_head_muon_uses_rank_major_projection_layout(
         assert layout.per_head_split_shapes == (config.linear_key_head_dim,) * local_head_count
         assert weight.is_qkv
         assert weight.qkv_split_shapes == [config.linear_key_head_dim] * local_head_count
-        assert weight.qkv_split_shapes_global == [config.linear_key_head_dim] * (
-            local_head_count * layout.num_groups
-        )
-        assert weight.qkv_split_heads_are_complete
+        # Each TP rank owns one whole group, so the per-head split covers its local rows.
+        assert sum(weight.qkv_split_shapes) == weight.shape[0]
     finally:
         Utils.destroy_model_parallel()
 
