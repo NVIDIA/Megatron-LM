@@ -70,6 +70,49 @@ def test_dsa_train_indexer_only_freezes_moe_router_expert_bias(monkeypatch):
     training._freeze_non_dsa_indexer_parameters([model])
 
     assert model.block.mlp.router.frozen_expert_bias is True
+    assert all(param.requires_grad for param in model.block.indexer.parameters())
+
+
+def test_dsa_train_indexer_only_never_unfreezes_an_already_frozen_indexer(monkeypatch):
+    """The DSA freeze restricts the trainable set; it must not widen it.
+
+    This hook is appended after --freeze-all-layers and --freeze-base-model-for-mtp, so it runs
+    last. Enabling gradients on every indexer here re-armed indexers those passes had frozen --
+    silently, since training proceeds and only the loss curve shows it -- and overrode a model
+    provider that shipped a frozen indexer.
+    """
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Module()
+            self.decoder.indexer = torch.nn.Linear(3, 2)
+            self.mtp = torch.nn.Module()
+            self.mtp.indexer = torch.nn.Linear(3, 2)
+            self.backbone = torch.nn.Linear(3, 2)
+
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda count: count)
+
+    # Stand in for an earlier freeze pass that took the decoder, MTP indexer included or not.
+    model = _Model()
+    for param in model.decoder.parameters():
+        param.requires_grad_(False)
+
+    training._freeze_non_dsa_indexer_parameters([model])
+
+    assert not any(param.requires_grad for param in model.decoder.parameters())
+    assert all(param.requires_grad for param in model.mtp.indexer.parameters())
+    assert not any(param.requires_grad for param in model.backbone.parameters())
+
+    # Everything already frozen stays frozen, and the indexer-existence check still passes
+    # because it counts indexer parameters found rather than indexer parameters trainable.
+    everything_frozen = _Model()
+    for param in everything_frozen.parameters():
+        param.requires_grad_(False)
+
+    training._freeze_non_dsa_indexer_parameters([everything_frozen])
+
+    assert not any(param.requires_grad for param in everything_frozen.parameters())
 
 
 def test_dsa_indexer_optimizer_refresh_copies_only_owned_distributed_shard(monkeypatch):

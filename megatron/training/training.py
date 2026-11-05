@@ -1581,9 +1581,14 @@ def _freeze_non_dsa_indexer_parameters(model):
     indexer_param_count = 0
     for model_module in model:
         for name, param in model_module.named_parameters():
-            trainable = _is_dsa_indexer_param_name(name)
-            param.requires_grad_(trainable)
-            indexer_param_count += trainable
+            # Restrict the trainable set, never widen it. This hook runs after
+            # --freeze-all-layers and --freeze-base-model-for-mtp, so enabling gradients
+            # here would re-arm indexers those passes deliberately froze, and would also
+            # override a model provider that shipped a frozen indexer.
+            if _is_dsa_indexer_param_name(name):
+                indexer_param_count += 1
+            else:
+                param.requires_grad_(False)
         # The MoE router's expert_bias is a buffer, not a parameter: finalize_model_grads
         # rewrites it every step from the observed token counts, for load balancing. Clearing
         # requires_grad does not reach it, so the backbone's routing would keep drifting while
@@ -1600,8 +1605,8 @@ def _freeze_non_dsa_indexer_parameters(model):
         )
 
     print_rank_0(
-        f" > DSA train-indexer-only: {indexer_param_count} trainable indexer tensors "
-        f"({global_indexer_param_count} across ranks)"
+        f" > DSA train-indexer-only: {indexer_param_count} indexer tensors left as they were "
+        f"({global_indexer_param_count} across ranks); every other parameter frozen"
     )
 
 
