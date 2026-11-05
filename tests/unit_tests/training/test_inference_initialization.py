@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
@@ -93,7 +94,7 @@ def test_resume_updates_microbatches_before_setup_validation(
     monkeypatch.setattr(training, "get_model", Mock(return_value=model))
     monkeypatch.setattr(training, "unwrap_model", lambda value: value)
     # Memory reporting resolves real process groups, which this stubbed setup never builds.
-    monkeypatch.setattr(training, "_get_model_pg_collection", lambda model_chunk: None)
+    monkeypatch.setattr(training, "_get_model_pg_collection", lambda *args, **kwargs: None)
     monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
     events = []
 
@@ -119,7 +120,9 @@ def test_resume_updates_microbatches_before_setup_validation(
     monkeypatch.setattr(training, "update_num_microbatches", update)
     monkeypatch.setattr(training, "get_num_microbatches", validate)
     with pytest.raises(ReachedBatchValidation):
-        training.setup_model_and_optimizer(Mock(), model_provider_func=Mock())
+        training.setup_model_and_optimizer(
+            Mock(), model_provider_func=Mock(), pg_collection=ProcessGroupCollection()
+        )
 
 
 @pytest.mark.parametrize("build_tokenizer", [False, True])

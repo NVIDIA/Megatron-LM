@@ -14,7 +14,10 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_sta
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from ..transformer.fsdp_dtensor_checkpoint import (
+    get_global_unique_param_name,
+    get_model_ep_rank_and_size,
+)
 from ..transformer.module import MegatronModule
 from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
@@ -100,8 +103,15 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 for param in model_chunk.parameters():
                     if param.requires_grad:
                         parameters.append(param)
+        # The model's own expert-parallel layout gives its local experts their global names.
+        ep_rank = ep_size = None
+        if self.model_chunks[0].config.num_moe_experts:
+            ep_rank, ep_size = get_model_ep_rank_and_size(self.model_chunks[0])
         self._param_to_fqn: dict[torch.nn.Parameter, str] = {
-            param: get_global_unique_param_name(self.model_chunks, param) for param in parameters
+            param: get_global_unique_param_name(
+                self.model_chunks, param, ep_rank=ep_rank, ep_size=ep_size
+            )
+            for param in parameters
         }
 
     @staticmethod
