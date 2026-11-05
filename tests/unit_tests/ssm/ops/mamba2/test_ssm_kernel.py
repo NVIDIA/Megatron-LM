@@ -154,14 +154,16 @@ class TestMambaDynamicInference(unittest.TestCase):
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
 
-        # Mock the dynamic inference context. Leaving the chunk metadata (and
-        # extraction buffers) unset exercises the non-precomputed fallback path,
-        # which rebuilds chunk boundaries from cu_seqlens; no slot allocator means
-        # intermediate-state extraction (prefix caching) is disabled.
+        # Mock the dynamic inference context. Leaving the chunk metadata unset
+        # exercises the non-precomputed fallback path, which rebuilds chunk
+        # boundaries from cu_seqlens; None extraction buffers (the plain
+        # MambaMetadata contract) disable intermediate-state extraction (prefix caching).
         mamba_metadata = SimpleNamespace(
             seq_idx=seq_idx,
             cu_seqlens=cu_seqlens,
             batch_indices_prefill=batch_indices,
+            intermediate_ssm_out=None,
+            intermediate_conv_out=None,
             intermediate_chunk_indices=None,
             intermediate_abs_positions=None,
             intermediate_real_count=None,
