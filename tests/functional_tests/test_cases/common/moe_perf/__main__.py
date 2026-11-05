@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 from .test_cases import PERFORMANCE_CASES, MoEPerformanceCase
@@ -228,7 +229,11 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         bwd_start = torch.cuda.Event(enable_timing=True)
         bwd_end = torch.cuda.Event(enable_timing=True)
 
-        context = get_fp8_context(layer.config) if case.fp8 else nullcontext()
+        context = (
+            get_fp8_context(layer.config, pg_collection=global_amax_groups())
+            if case.fp8
+            else nullcontext()
+        )
         with context:
             fwd_start.record()
             output, _ = layer(input_tensor)

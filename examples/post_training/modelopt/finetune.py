@@ -13,9 +13,12 @@ import datasets
 import torch
 import transformers
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import resolve_process_groups
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -25,7 +28,6 @@ from megatron.training.utils import print_rank_0
 from megatron.training.global_vars import set_run_config
 from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
-from megatron.core.parallel_state import get_context_parallel_group
 
 
 REMOVE_THINK_CHAT_TEMPLATE = (
@@ -430,12 +432,15 @@ class SFTDataset(torch.utils.data.Dataset):
         return processed_data
 
 
-def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
+def train_valid_test_sft_datasets_provider(train_val_test_num_samples, pg_collection=None):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples
             in train test and validation.
+        pg_collection: Process groups of the run. The SFT datasets are sharded over its expert
+            data-parallel group. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
     """
     print_rank_0("> building train, validation, and test SFT datasets ...")
     args = get_args()
@@ -453,6 +458,14 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
 
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
+        pg_collection = resolve_process_groups(
+            pg_collection,
+            owner="examples.post_training.modelopt.finetune.train_valid_test_sft_datasets_provider",
+            required=("expt_dp_gtp_remat",),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        expt_dp_group = pg_collection.expt_dp_gtp_remat
         kwargs = {
             "hf_dataset": args.finetune_hf_dataset,
             "hf_dataset_split": args.finetune_data_split,
@@ -460,8 +473,8 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
             "tokenizer": hf_tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs
-            "num_shards": mpu.get_expert_data_parallel_world_size(),
-            "shard_index": mpu.get_expert_data_parallel_rank(),
+            "num_shards": expt_dp_group.size(),
+            "shard_index": expt_dp_group.rank(),
         }
 
         train_ds = SFTDataset(train_val_test_num_samples[0], **kwargs)
@@ -473,13 +486,29 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, pg_collection=None):
     """Generate a batch.
 
     For OfflineDataset, the aux_hidden_states and final hidden_states from the
-    base model are loaded for offline speculative model training."""
+    base model are loaded for offline speculative model training.
+
+    Args:
+        data_iterator: Iterator over this rank's micro-batches, or None on ranks that read
+            no data.
+        pg_collection: Process groups of the model. The batch is read on the first rank of
+            its tensor-parallel group, broadcast over that group and sharded over its
+            context-parallel group. None falls back to the global parallel state with a
+            ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="examples.post_training.modelopt.finetune.get_batch",
+        required=("tp", "pp", "cp"),
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+    if (not is_pp_first_stage(pg_collection.pp)) and (not is_pp_last_stage(pg_collection.pp)):
         return None, None, None, None, None
 
     args = get_args()
@@ -492,18 +521,18 @@ def get_batch(data_iterator):
     if not args.export_offline_model:
         keys = ["input_ids", "loss_mask"]
         datatype = torch.int64
-        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype, tp_group=pg_collection.tp)
     else:
         keys = ["input_ids"]
         datatype = torch.int64
-        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype, tp_group=pg_collection.tp)
         data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
         data_b["loss_mask"][data_b["loss_mask"] == get_eos_token_id()] = 0
         data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
 
         keys = ["aux_hidden_states", "hidden_states"]
         datatype = torch.bfloat16
-        feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        feature_b = tensor_parallel.broadcast_data(keys, data, datatype, tp_group=pg_collection.tp)
 
 
     sample_loss_mask = data_b.get("loss_mask")
@@ -515,7 +544,7 @@ def get_batch(data_iterator):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
-        cp_group=get_context_parallel_group(),
+        cp_group=pg_collection.cp,
     )
 
     if args.export_offline_model:
@@ -549,7 +578,7 @@ def forward_step(data_iterator, model: GPTModel):
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
-    batch = get_batch(data_iterator)
+    batch = get_batch(data_iterator, pg_collection=get_attr_wrapped_model(model, "pg_collection"))
     tokens = batch["tokens"]
     labels = batch["labels"]
     loss_mask = batch["loss_mask"]
