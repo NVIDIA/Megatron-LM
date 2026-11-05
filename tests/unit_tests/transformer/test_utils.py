@@ -527,8 +527,19 @@ def _unexpected_checkpoint(*args, **kwargs):
     raise AssertionError("used the checkpoint implementation for the other precision")
 
 
-@pytest.mark.parametrize("precision", [{"fp8": "e4m3"}, {"fp4": "nvfp4"}])
-def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision, monkeypatch):
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        pytest.param({"fp8": "e4m3"}, id="fp8"),
+        pytest.param({"fp4": "nvfp4"}, id="fp4"),
+        pytest.param({"gtp_weight_remat_size": 2}, id="decoder-gtp"),
+        pytest.param({"expert_gtp_weight_remat_size": 2}, id="expert-gtp"),
+        pytest.param(
+            {"gtp_weight_remat_size": 2, "expert_gtp_weight_remat_size": 2}, id="both-gtp"
+        ),
+    ],
+)
+def test_precision_aware_checkpoint_uses_te_checkpoint_when_required(requirements, monkeypatch):
     calls = []
 
     def fake_te_checkpoint(
@@ -541,7 +552,7 @@ def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision
         "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
     )
     monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", _unexpected_checkpoint)
-    config = SimpleNamespace(**{"fp8": None, "fp4": None, **precision})
+    config = SimpleNamespace(**{"fp8": None, "fp4": None, **requirements})
     tp_group = object()
 
     output = transformer_utils.precision_aware_checkpoint(
@@ -560,7 +571,26 @@ def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision
     ]
 
 
-def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(monkeypatch):
+@pytest.mark.parametrize(
+    "parallelism",
+    [
+        pytest.param({}, id="legacy-config-without-gtp-fields"),
+        pytest.param(
+            {"gtp_weight_remat_size": 1, "expert_gtp_weight_remat_size": 1}, id="gtp-disabled"
+        ),
+        pytest.param(
+            {
+                "tensor_model_parallel_size": 2,
+                "gtp_weight_remat_size": 1,
+                "expert_gtp_weight_remat_size": 1,
+            },
+            id="tensor-parallel-without-gtp",
+        ),
+    ],
+)
+def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(
+    parallelism, monkeypatch
+):
     calls = []
 
     def fake_checkpoint(function, distribute_saved_activations, *args):
@@ -571,9 +601,43 @@ def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(
     monkeypatch.setattr(
         "megatron.core.extensions.transformer_engine.te_checkpoint", _unexpected_checkpoint
     )
-    config = SimpleNamespace(fp8=None, fp4=None)
+    config = SimpleNamespace(fp8=None, fp4=None, **parallelism)
 
     output = transformer_utils.precision_aware_checkpoint(_scale, config, object(), 3, factor=2)
 
     assert output == 6
     assert calls == [(False, (3,))]
+
+
+@pytest.mark.parametrize("gtp_size,expert_gtp_size", [(1, 1), (2, 1), (1, 2)])
+def test_precision_aware_checkpoint_bf16_gtp_recompute_phase(gtp_size, expert_gtp_size):
+    """Full BF16 recompute must expose the phase GTP uses for weight prefetching."""
+    pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.pytorch.distributed import in_fp8_activation_recompute_phase
+
+    # Use the public total-shard fields so this also covers the resolved config
+    # fields used by production callers. No model or GTP collectives are needed.
+    config = _attention_config(
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        tensor_parallel_num_weight_shards=gtp_size,
+        expert_tensor_parallel_size=1,
+        expert_tensor_parallel_num_weight_shards=expert_gtp_size,
+        num_moe_experts=4,
+    )
+    assert config.gtp_weight_remat_size == gtp_size
+    assert config.expert_gtp_weight_remat_size == expert_gtp_size
+    observed = []
+
+    def forward(x):
+        observed.append((torch.is_grad_enabled(), in_fp8_activation_recompute_phase()))
+        return x.float().square()
+
+    x = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    output = transformer_utils.precision_aware_checkpoint(forward, config, None, x)
+    output.sum().backward()
+
+    assert observed == [(False, False), (True, gtp_size > 1 or expert_gtp_size > 1)]
+    assert not in_fp8_activation_recompute_phase()
+    torch.testing.assert_close(output, x.float().square(), rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, 2 * x.detach(), rtol=0, atol=0)

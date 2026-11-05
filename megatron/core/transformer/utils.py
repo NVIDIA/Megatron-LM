@@ -613,15 +613,16 @@ def precision_aware_checkpoint(
     distribute_saved_activations: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Activation-checkpoint ``function`` with the implementation its precision requires.
+    """Activation-checkpoint ``function`` with its precision and GTP state preserved.
 
     FP8 and FP4 recompute must go through Transformer Engine's checkpoint, because FP4 is
-    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). Other
-    precisions use ``tensor_parallel.checkpoint``.
+    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). GTP also
+    needs TE's recompute-phase context, including under BF16, to keep recomputed weight
+    gathers on their own prefetch chain. Other cases use ``tensor_parallel.checkpoint``.
 
     Args:
         function: Callable to checkpoint.
-        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        config: Transformer config whose precision and GTP sizes select the implementation.
         tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
         *args: Positional arguments for ``function``.
         distribute_saved_activations: Passed through to the checkpoint implementation.
@@ -630,7 +631,12 @@ def precision_aware_checkpoint(
     Returns:
         The output of ``function``.
     """
-    if config.fp8 or config.fp4:
+    if (
+        config.fp8
+        or config.fp4
+        or getattr(config, 'gtp_weight_remat_size', 1) > 1
+        or getattr(config, 'expert_gtp_weight_remat_size', 1) > 1
+    ):
         # Imported lazily to avoid a circular import.
         from megatron.core.extensions.transformer_engine import te_checkpoint
 
