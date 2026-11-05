@@ -13,7 +13,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.utils import get_model_config
-from megatron.rl.config import rollout_model_is_separate
+from megatron.rl.config import get_rl_run_config, rollout_model_is_separate
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
@@ -49,7 +49,7 @@ def build_rollout_inference_model(
             args,
             model_type,
             config,
-            rl_config=get_run_config().rl,
+            rl_config=get_rl_run_config().rl,
             model_config=inference_container.model,
             model_alloc_ctx=inference_model_alloc_context(),
         )
@@ -196,7 +196,10 @@ class RLSetupCallback(Callback):
         if not cfg.validation.skip_train:
             # GRPO loop state; eval-only runs (--skip-train) evaluate the loaded weights directly.
             self.ref_state_dict = load_reference_state_dict(
-                self.model, context.checkpointing_context, args, rollout_only=cfg.rl.rl_rollout_only
+                self.model,
+                context.checkpointing_context,
+                args,
+                rollout_only=get_rl_run_config().rl.rl_rollout_only,
             )
             # RL runs on the plain MPU groups: the loop's data-parallel size for them.
             reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())

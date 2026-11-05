@@ -859,35 +859,39 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     from megatron.rl import config as rl_config_module
     from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
-    from megatron.rl.config import RLRunConfigContainer
     from megatron.rl.training_setup import RLSetupCallback
     from megatron.training import argument_utils, utils
-    from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, RLConfig
+    from megatron.training.config import (
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+        RLConfig,
+        RunConfigRecord,
+    )
 
     args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
     model = Mock()
-    # The real RL callback derives its rollout interval from these batch values; the RL run
-    # config validates the run against them (rollout-only needs a training horizon) when
-    # initialize_megatron finalizes it, inside the pretrain() this test mocks out.
+    # The real RL callback derives its rollout interval from these batch values, and the RL
+    # container validates the run against them (rollout-only needs a training horizon).
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
     cfg.train.train_iters = 10
-    # The RL run config, which the entrypoint composes from the parsed args: the run config's
-    # sections, the rollout engine's deployment and the RL section.
-    rl_run_config = RLRunConfigContainer.from_pretrain(
-        cfg,
-        inference=InferenceConfigContainer(model=None, inference=InferenceSetupConfig()),
-        rl=RLConfig(perform_rl_step=True, rl_rollout_only=rollout_only),
-    )
+    # The entrypoint composes the run's record from the parsed args: the run config, the rollout
+    # engine's deployment and the RL section; the two builders are stubbed, like the args.
+    deployment = InferenceConfigContainer(model=None, inference=InferenceSetupConfig())
+    rl_section = RLConfig(perform_rl_step=True, rl_rollout_only=rollout_only)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
     monkeypatch.setattr(utils, "is_hybrid_model", lambda args: False)
     monkeypatch.setattr(argument_utils, "gpt_config_from_args", Mock(return_value=model))
+    monkeypatch.setattr(argument_utils, "pretrain_cfg_container_from_args", Mock(return_value=cfg))
     monkeypatch.setattr(
-        rl_config_module, "rl_run_config_container_from_args", Mock(return_value=rl_run_config)
+        rl_config_module, "rollout_inference_container_from_args", Mock(return_value=deployment)
     )
+    monkeypatch.setattr(argument_utils, "_default_config_from_args", Mock(return_value=rl_section))
+    set_rl_run_config = Mock()
+    monkeypatch.setattr(rl_config_module, "set_rl_run_config", set_rl_run_config)
     services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
@@ -899,7 +903,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     runpy.run_path(str(Path(__file__).resolve().parents[3] / "train_rl.py"), run_name="__main__")
 
     pretrain.assert_called_once()
-    assert pretrain.call_args.args[0] is rl_run_config
+    assert pretrain.call_args.args[0] is cfg
     assert pretrain.call_args.args[1] is None  # RL builds no datasets
     kwargs = pretrain.call_args.kwargs
     assert [type(callback) for callback in kwargs["callbacks"]] == [
@@ -910,7 +914,11 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     assert kwargs["run_train_loop_without_updates"] is rollout_only
     assert kwargs["suppress_microbatch_rampup_handling"] is False
     assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
-    assert global_vars.get_run_config() is rl_run_config
-    assert not rl_run_config._finalized  # initialize_megatron finalizes it, inside pretrain()
+    assert global_vars.get_run_config() is cfg
+    set_rl_run_config.assert_called_once()
+    record = set_rl_run_config.call_args.args[0]
+    assert isinstance(record, RunConfigRecord)
+    assert record.pretrain is cfg and record.inference is deployment and record.rl is rl_section
+    assert deployment._finalized  # the entrypoint finalized the record
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()

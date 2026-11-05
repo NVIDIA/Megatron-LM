@@ -832,7 +832,9 @@ def test_save_checkpoint(
         with open(ckpt_dir / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(profiling):
-            assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
+            assert saved_config["pretrain"]["profiling"][field.name] == getattr(
+                profiling, field.name
+            )
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
 
@@ -913,7 +915,7 @@ def test_load_checkpoint(
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
-            assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+            assert saved_config["pretrain"]["rng"][field.name] == getattr(rng_config, field.name)
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)

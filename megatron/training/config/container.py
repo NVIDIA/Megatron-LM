@@ -31,6 +31,7 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -638,3 +639,32 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+
+
+@dataclass(kw_only=True)
+class RunConfigRecord(ConfigContainerBase):
+    """The configuration record of a run (`run_config.yaml`).
+
+    A training run records `pretrain`, an inference run records `inference`,
+    an RL run records `pretrain`, `inference`, and `rl`.
+
+    Records written before this type, a container serialized flat, still load through
+    `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
+    """
+
+    pretrain: PretrainConfigContainer | None = None
+    inference: InferenceConfigContainer | None = None
+    rl: RLConfig | None = None
+
+    @classmethod
+    def wrap(cls, run_config):
+        """The record of a process that registered only its run config."""
+        if isinstance(run_config, PretrainConfigContainer):
+            return cls(pretrain=run_config)
+        if isinstance(run_config, InferenceConfigContainer):
+            return cls(inference=run_config)
+        return run_config
+
+    def to_dict(self) -> dict[str, Any]:
+        """The document holds only the members the run has."""
+        return {key: value for key, value in super().to_dict().items() if value is not None}

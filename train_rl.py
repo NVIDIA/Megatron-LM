@@ -16,7 +16,13 @@ from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
-from megatron.rl.config import add_rl_args, rl_run_config_container_from_args
+from megatron.rl.config import (
+    add_rl_args,
+    finalize_rl_run,
+    get_rl_run_config,
+    rollout_inference_container_from_args,
+    set_rl_run_config,
+)
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     evaluate_rollouts,
@@ -29,8 +35,14 @@ from megatron.rl.rl_utils import (
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.rl.training_setup import RLSetupCallback
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.config import RLConfig, RunConfigRecord
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
@@ -198,7 +210,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         model (GPTModel): The GPT Model
     """
     runtime_state = get_rl_runtime_state()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     timers = get_timers()
 
     timers('batch-generator', log_level=2).start()
@@ -429,15 +441,22 @@ if __name__ == "__main__":
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
-    # The RL run config: the pretrain sections, the rollout engine's deployment (the training
-    # model with the RL inference parallelism when it differs, where its weights come from, their
-    # placement, the engine settings) and the RL section, one pretrain container by inheritance.
-    # initialize_megatron finalizes it: the pretrain derivations, the deployment's, and the RL
-    # gradient-buffer layout on the DDP config, before model construction.
-    full_config = rl_run_config_container_from_args(args, model_cfg)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    rl_cfg = full_config.rl
-    inference_container = full_config.inference
+    # The run's record: the pretrain container (the run config the loop reads), the rollout
+    # engine's deployment and the RL section, under the record type every process writes.
+    # finalize_rl_run validates the RL section against the run, finalizes the deployment and
+    # applies the RL gradient-buffer layout to the run's DDP config before initialize_megatron
+    # finalizes the pretrain container.
+    record = RunConfigRecord(
+        pretrain=full_config,
+        inference=rollout_inference_container_from_args(args, full_config),
+        rl=_default_config_from_args(RLConfig, args),
+    )
+    finalize_rl_run(record)
+    set_rl_run_config(record)
+    rl_cfg = record.rl
+    inference_container = record.inference
     assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
     rl_model_provider = partial(model_provider, _model_builder)
 
