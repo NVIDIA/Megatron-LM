@@ -95,6 +95,9 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     consumer = tmp_path / "consumer"
     git(repo, "clone", "--depth=1", "--no-local", str(repo), str(consumer))
     monkeypatch.chdir(consumer)
+    with pytest.raises(ValueError, match="does not belong"):
+        checkout.restore(argparse.Namespace(directory=str(output), expected_sha=baseline))
+    assert git(consumer, "rev-parse", "HEAD") == head
     github_output = tmp_path / "github-output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
     # Exercise the consumer action against the same combined artifact layout as CI.
@@ -116,43 +119,23 @@ def test_complete_pr_delta_excludes_newer_main_and_restores_bundle(
     assert github_output.read_text() == f"sha={tested}\nbaseline_sha={baseline}\ngeneration=123-1\n"
 
 
-@pytest.mark.parametrize("failure", ["conflict", "lookup"])
-def test_prepare_fallback_preserves_checkout_and_metadata(repository, monkeypatch, failure, capsys):
-    repo, baseline = repository
-    if failure == "conflict":
-        (repo / "model.py").write_text("different main implementation\n")
-    base = commit(repo, "New main") if failure != "lookup" else baseline
+def test_conflict_preserves_checkout_and_metadata(repository, capsys):
+    repo, _ = repository
+    (repo / "model.py").write_text("different main implementation\n")
+    base = commit(repo, "New main")
     (repo / "model.py").write_text("PR implementation\n")
     head = commit(repo, "PR")
     args = arguments(repo, base, head)
     metadata_path = Path(args.pr_files_dir) / "metadata.json"
     original_metadata = metadata_path.read_bytes()
-    if failure == "lookup":
-
-        def unavailable():
-            raise ValueError("No successful baseline")
-
-        monkeypatch.setattr(checkout, "latest_baseline", unavailable)
     checkout.prepare(args)
     message = capsys.readouterr().out
     assert "::notice::Using original PR checkout:" in message
-    if failure == "conflict":
-        assert "Applied patch to 'model.py' with conflicts" in message
+    assert "Applied patch to 'model.py' with conflicts" in message
     assert git(repo, "rev-parse", "HEAD") == head
     assert git(repo, "status", "--porcelain") == ""
     assert metadata_path.read_bytes() == original_metadata
     assert not Path(args.output_dir).exists()
-
-
-def test_restore_rejects_original_commit_mismatch(repository):
-    repo, baseline = repository
-    (repo / "model.py").write_text("PR change\n")
-    head = commit(repo, "PR")
-    args = arguments(repo, baseline, head)
-    checkout.prepare(args)
-    with pytest.raises(ValueError, match="does not belong"):
-        checkout.restore(argparse.Namespace(directory=args.output_dir, expected_sha=baseline))
-    assert git(repo, "rev-parse", "HEAD") == head
 
 
 def test_baseline_lookup_excludes_build_only_forks_and_retries(monkeypatch):

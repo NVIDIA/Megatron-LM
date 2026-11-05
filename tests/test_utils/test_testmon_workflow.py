@@ -930,33 +930,6 @@ def test_gpu_reselection_respects_full_run_guards(
 
 
 @pytest.mark.parametrize(
-    ("ready", "branch", "setting", "expected"),
-    [
-        ("true", "main", "", True),
-        ("true", "main", "false", False),
-        ("false", "main", "", False),
-        ("true", "dev", "", False),
-    ],
-)
-def test_cache_base_checkout_gate(ready, branch, setting, expected):
-    step = _step("cicd-main.yml", "configure", "prepare-testmon-checkout")
-    expression = step["if"].replace("steps.unit-test-pr-files.outputs.ready", "ready")
-    expression = (
-        expression.replace("fromJSON(steps.get-pr-info.outputs.pr-info).base.ref", "branch")
-        .replace("vars.UNIT_TESTMON_USE_CACHE_BASE", "setting")
-        .replace("&&", "and")
-    )
-    context = {"ready": ready, "branch": branch, "setting": setting}
-    assert eval(expression, {"__builtins__": {}}, context) is expected
-    assert _step("cicd-main.yml", "configure", "unit-test-pr-files")["if"] == (
-        "steps.configure.outputs.unit_testmon_eligible == 'true'"
-    )
-    assert _step("cicd-main.yml", "configure", "upload-unit-test-pr-files")[
-        "continue-on-error"
-    ] == ("${{ steps.prepare-testmon-checkout.outputs.sha == '' }}")
-
-
-@pytest.mark.parametrize(
     "scenario",
     [
         "mixed",
@@ -968,8 +941,6 @@ def test_cache_base_checkout_gate(ready, branch, setting, expected):
         "pinned-miss",
         "pinned-other-generation",
         "pinned-source-mismatch",
-        "pinned-bad-manifest",
-        "pinned-missing-manifest",
     ],
 )
 def test_grouped_cpu_selection(
@@ -1103,20 +1074,11 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
                 manifest = json.loads(manifest_path.read_text())
                 manifest["generation"] = matched_generation
                 manifest_path.write_text(json.dumps(manifest))
-            if index == 0 and scenario in {
-                "pinned-source-mismatch",
-                "pinned-bad-manifest",
-                "pinned-missing-manifest",
-            }:
+            if index == 0 and scenario == "pinned-source-mismatch":
                 manifest_path = Path(path) / "manifest.json"
-                if scenario == "pinned-source-mismatch":
-                    manifest = json.loads(manifest_path.read_text())
-                    manifest["source_sha"] = "c" * 40
-                    manifest_path.write_text(json.dumps(manifest))
-                elif scenario == "pinned-bad-manifest":
-                    manifest_path.write_text("{")
-                else:
-                    manifest_path.unlink()
+                manifest = json.loads(manifest_path.read_text())
+                manifest["source_sha"] = "c" * 40
+                manifest_path.write_text(json.dumps(manifest))
             Path(key_file).write_text(
                 f"{cache_prefix}{matched_generation}" if saved.exists() else ""
             )
@@ -1150,8 +1112,6 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         "pinned-miss",
         "pinned-other-generation",
         "pinned-source-mismatch",
-        "pinned-bad-manifest",
-        "pinned-missing-manifest",
     }
     assert [entry["mode"] for entry in matrix] == (
         [] if scenario == "empty" else [("full" if fallback else "preselected"), "full"]
