@@ -131,7 +131,11 @@ def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
 def test_config_rejects_dynamic_context_parallel():
     """DSv4 has no dynamic context parallelism path yet."""
     with pytest.raises(ValueError, match="DSv4 dynamic context parallelism is not supported"):
-        _make_config(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+        _make_config(
+            dynamic_context_parallel=True,
+            deterministic_mode=False,
+            max_seqlen_per_dp_cp_rank=4096,
+        )
 
 
 def test_attention_latent_norm_epsilon_accepts_override():

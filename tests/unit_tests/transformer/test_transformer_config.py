@@ -583,6 +583,7 @@ def test_sequence_packing_dense_config_passes():
 def test_dynamic_cp_accepts_contiguous_linear_layout():
     config = _make_packing_config(
         dynamic_context_parallel=True,
+        deterministic_mode=False,
         calculate_per_token_loss=True,
         sequence_packing_scheduler="default_dynamic_cp",
         context_parallel_size=2,
@@ -711,6 +712,7 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
     with pytest.raises(AssertionError, match=message):
         _make_packing_config(
             dynamic_context_parallel=True,
+            deterministic_mode=False,
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )

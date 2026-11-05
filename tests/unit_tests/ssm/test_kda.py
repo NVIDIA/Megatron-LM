@@ -71,6 +71,8 @@ def _make_config(
         experimental_attention_variant="kda",
         is_hybrid_model=True,
         transformer_impl="transformer_engine",
+        # Packed KDA and chunkwise CP require the non-deterministic FLA kernels.
+        deterministic_mode=False,
     )
     settings.update(overrides)
     return KDALayerConfig(**settings)
@@ -506,6 +508,7 @@ def _make_fp8_stack_config(two_stage_gates, **overrides):
         fp8_param=True,
         use_cpu_initialization=False,
         is_hybrid_model=True,
+        deterministic_mode=False,
     )
     settings.update(overrides)
     config = TransformerConfig(**settings)

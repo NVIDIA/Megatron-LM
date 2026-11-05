@@ -100,6 +100,7 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
+        deterministic_mode: bool = None,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -153,6 +154,8 @@ class TextGenerationControllerTestBase:
                 else {}
             ),
             cuda_graph_impl=cuda_graph_impl,
+            # None keeps the config default (deterministic mode on).
+            **({} if deterministic_mode is None else dict(deterministic_mode=deterministic_mode)),
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -4472,6 +4475,9 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             # Without this, generations will always be random
             # and we don't be able to verify DP disparity.
             use_training_random_init=True,
+            # Deterministic mode disables the per-DP-rank sampling seed offset
+            # that this test verifies.
+            deterministic_mode=False,
         )
         # Ensure only data parallelism is used. This is critical since
         # we expect generation parity across model parallel ranks.

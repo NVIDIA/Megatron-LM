@@ -62,6 +62,9 @@ def initialize_test_environment(
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
     args.hybrid_context_parallel = hybrid_context_parallel
+    if hybrid_context_parallel:
+        # Dynamic (hybrid) context parallelism does not support deterministic mode.
+        args.deterministic_mode = False
     args.max_seqlen_per_dp_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
