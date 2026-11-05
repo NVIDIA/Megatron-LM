@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """
 Fault Tolerance (FT) package integration for Megatron-LM, using the FT section-based API.
@@ -45,6 +45,7 @@ from typing import Any, Optional
 
 import torch
 
+from . import arguments
 from . import global_vars
 from .utils import is_rank0, print_rank_0
 
@@ -85,10 +86,7 @@ def get_rank_monitor_client() -> Optional[Any]:
 
 def setup() -> None:
     """Initialize fault tolerance before initialize_megatron"""
-    # The entry point registered the arguments before pretrain(); re-parsing the command line
-    # here replayed the parser's side effects (the MSC policy among them) on a run that had set
-    # them up itself.
-    args = global_vars.get_args()
+    args = arguments.parse_args(ignore_unknown_args=True)
     if not args.enable_ft_package:
         return
 
@@ -98,10 +96,7 @@ def setup() -> None:
     if os.environ.get("RANK") == "0":
         print("FT: initializing...", flush=True)
 
-    # The checkpoint policy is the registered run config's; pretrain() finalizes it before
-    # calling setup(), so the async mode read below is the one the saver uses.
-    checkpoint = global_vars.get_run_config().checkpoint
-    checkpoint_dir = checkpoint.save
+    checkpoint_dir = args.save
     if not checkpoint_dir:
         raise ValueError("checkpointing save dir must be set to enable fault tolerance")
     if not os.path.exists(checkpoint_dir):
@@ -116,7 +111,7 @@ def setup() -> None:
     _ft_state_path = os.path.join(checkpoint_dir, "ft_state.json")
 
     global _is_async_chkpt_enabled
-    _is_async_chkpt_enabled = checkpoint.async_save
+    _is_async_chkpt_enabled = args.async_save
 
     global _is_calculating_timeouts
     _is_calculating_timeouts = args.calc_ft_timeouts

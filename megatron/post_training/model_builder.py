@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 """ModelOpt GPT model provider."""
 
@@ -490,7 +490,7 @@ def modelopt_gpt_hybrid_builder(
     # too late since Megatron created the optimizer right after calling model_provider before loading
     # the checkpoint. To ensure all trainable parameters are reigistered, we try to resume the
     # modelopt_state (which transforms the model to have additional parameters) before returning.
-    if get_run_config().checkpoint.load is not None:
+    if args.load is not None:
         load_modelopt_state(model=model)
 
     qad_train_target = getattr(args, 'qad_train_target', None)

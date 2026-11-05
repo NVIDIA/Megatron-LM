@@ -177,10 +177,8 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    # Every container is finalized here: the checkpoint derivations apply to inference containers
-    # too, and the checkpoint converters bootstrap through this function without reaching
-    # initialize_megatron. Finalizing constructs no runtime service.
-    cfg_container.finalize()
+    if training:
+        cfg_container.finalize()
     initialize_runtime_services(
         args,
         build_tokenizer=build_tokenizer,
@@ -404,7 +402,7 @@ def _set_wandb_writer(args):
             save_dir = cfg.logger.wandb_save_dir
         else:
             # Defaults to the save dir.
-            save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
+            save_dir = os.path.join(args.save, 'wandb')
         # Private attributes are runtime state rather than configuration and can be large; keep
         # them out of the wandb config. Copy so the kitchen contents added below stay off args.
         wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}

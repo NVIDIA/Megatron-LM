@@ -6,6 +6,8 @@ from argparse import ArgumentParser, Namespace
 from copy import copy
 from typing import Literal, Optional
 
+from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
 import torch
 
 from megatron.core import dist_checkpointing
@@ -23,7 +25,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import get_run_config, get_wandb_writer
+from megatron.training import get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -32,14 +34,7 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
-from megatron.training.config.training_config import TokenizerConfig
-from megatron.training.global_vars import get_run_config, get_tokenizer
-from megatron.training.models import (
-    GPTModelBuilder,
-    GPTModelConfig,
-    HybridModelBuilder,
-    ModelBuilder,
-)
+from megatron.training.models import GPTModelBuilder, GPTModelConfig, HybridModelBuilder, ModelBuilder
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -140,7 +135,6 @@ def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
 
 def _warn_on_unloaded_checkpoint_tensors(
     args: Namespace,
-    checkpoint,
     requested_keys: set,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
@@ -153,16 +147,16 @@ def _warn_on_unloaded_checkpoint_tensors(
     """
     gathered = [None] * torch.distributed.get_world_size(checkpoint_group)
     torch.distributed.all_gather_object(gathered, sorted(requested_keys), group=checkpoint_group)
-    if checkpoint.ckpt_step is not None:
+    if args.ckpt_step is not None:
         release = False
     else:
-        _, release = read_metadata(get_checkpoint_tracker_filename(checkpoint.load))
+        _, release = read_metadata(get_checkpoint_tracker_filename(args.load))
     if torch.distributed.get_rank(checkpoint_group) != 0:
         return
 
     requested = set().union(*gathered)
     checkpoint_dir = get_checkpoint_name(
-        checkpoint.load, get_loaded_iteration(), release, return_base_dir=True
+        args.load, get_loaded_iteration(), release, return_base_dir=True
     )
     unloaded = sorted(
         key
@@ -211,11 +205,10 @@ def get_model_for_inference(
         builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
-    # Load checkpoint. Inference must not start from random weights.
-    checkpoint = get_run_config().checkpoint
-    assert checkpoint.load is not None
-    checkpoint.exit_on_missing_checkpoint = True
+    # Load checkpoint.
+    assert args.load is not None
     requested_keys = set()
+    args.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
@@ -230,7 +223,7 @@ def get_model_for_inference(
         model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
     )
     if requested_keys:
-        _warn_on_unloaded_checkpoint_tensors(args, checkpoint, requested_keys, checkpoint_group)
+        _warn_on_unloaded_checkpoint_tensors(args, requested_keys, checkpoint_group)
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"

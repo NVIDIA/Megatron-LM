@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import shutil
@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from megatron.training.arguments import parse_args
-from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 nvidia_resiliency_ext = pytest.importorskip(
     "nvidia_resiliency_ext",
@@ -96,7 +95,6 @@ class TestLocalCheckpointing:
             expected_rng = torch.get_rng_state().clone()
             manager = context["local_checkpoint_manager"]
             with mock.patch.object(manager, "save", wraps=manager.save) as save:
-                sync_checkpoint_config(args)
                 save_checkpoint(
                     1,
                     model,
@@ -110,7 +108,6 @@ class TestLocalCheckpointing:
             assert saved_config == run_config.to_dict()
             run_config.logger.log_interval += 1
             torch.manual_seed(999)
-            sync_checkpoint_config(args)
             iteration, _ = load_checkpoint(
                 model, optimizer, None, checkpointing_context=context, restore_training_state=True
             )
@@ -238,7 +235,6 @@ class TestLocalCheckpointing:
                 'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
             }
 
-            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 1,
                 model,
@@ -250,7 +246,6 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
-            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model,
                 optimizer,
@@ -265,7 +260,6 @@ class TestLocalCheckpointing:
             )
             backup_path = ckpt_path.with_name('backup_' + ckpt_path.name)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
-            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model,
                 optimizer,
@@ -277,7 +271,6 @@ class TestLocalCheckpointing:
             shutil.move(ckpt_path, backup_path)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             torch.distributed.barrier()
-            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model,
                 optimizer,
@@ -286,7 +279,6 @@ class TestLocalCheckpointing:
                 restore_training_state=True,
             )
             assert iteration == 0
-            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 1,
                 model,
@@ -311,7 +303,6 @@ class TestLocalCheckpointing:
             checkpoint_diffs = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(checkpoint_diffs, checkpoint_diff)
             assert not any(any(rank_diff) for rank_diff in checkpoint_diffs), checkpoint_diffs
-            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 2,
                 model,
@@ -374,7 +365,6 @@ class TestLocalCheckpointing:
                 }
 
                 with pytest.raises(CheckpointingException):
-                    sync_checkpoint_config(mock_args)
                     save_checkpoint(
                         1,
                         model,
@@ -386,7 +376,6 @@ class TestLocalCheckpointing:
                     )
                     if async_save:
                         maybe_finalize_async_save(True)
-                sync_checkpoint_config(mock_args)
                 iteration, _ = load_checkpoint(
                     model,
                     optimizer,

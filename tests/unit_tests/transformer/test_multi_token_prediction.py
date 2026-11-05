@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -82,7 +82,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -2764,7 +2764,6 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
-            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2788,7 +2787,6 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
-            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
@@ -4903,7 +4901,6 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
-            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -4931,7 +4928,6 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
-            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,

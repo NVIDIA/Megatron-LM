@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
 from unittest import mock
@@ -20,7 +20,7 @@ from tests.unit_tests.dist_checkpointing.test_layer_wise_optimizer import (
     initialize_real_model,
     load_checkpoint_no_arg_checks,
 )
-from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestLayerWiseOptimizerCommonStateDict:
@@ -89,7 +89,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=fully_parallel)
                 from megatron.training.training import preprocess_common_state_dict
 
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     10,
                     model,
@@ -124,7 +123,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                     )
 
                 # Load optimizer B from checkpoint
-                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
 
                 # Get optimizer B param state
@@ -178,7 +176,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
                 from megatron.training.training import preprocess_common_state_dict
 
-                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     10,
                     model,
@@ -200,7 +197,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                     use_param_layout=True,
                 )
 
-                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
 
                 optim_param_state_B = optimizer_B.state_dict()

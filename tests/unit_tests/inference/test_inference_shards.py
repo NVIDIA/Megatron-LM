@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Shard spec validation and shard-specific serving/RL model construction."""
 
@@ -49,7 +49,6 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
         args.model_provider = "gpt"
         args.padded_vocab_size = 1024
         args.load = "unused-test-checkpoint"
-        run_config.checkpoint.load = args.load
         args.inference_ckpt_non_strict = False
         args.inference_dynamic_batching_enable_prefix_caching = True
         args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
@@ -189,8 +188,7 @@ def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
     from megatron.inference import utils
 
     group = Mock(name="checkpoint_group")
-    args = SimpleNamespace(checkpoint_model_prefix="model.")
-    checkpoint = SimpleNamespace(ckpt_step=1, load="checkpoint")
+    args = SimpleNamespace(ckpt_step=1, load="checkpoint", checkpoint_model_prefix="model.")
     world_size = Mock(return_value=1)
     rank = Mock(return_value=0)
     gather = Mock(side_effect=lambda output, keys, **kwargs: output.__setitem__(0, keys))
@@ -204,7 +202,7 @@ def test_checkpoint_prefix_warning_uses_replica_group(monkeypatch, caplog):
         lambda path: {"model.weight": None, "model.unused": None},
     )
 
-    utils._warn_on_unloaded_checkpoint_tensors(args, checkpoint, {"model.weight"}, group)
+    utils._warn_on_unloaded_checkpoint_tensors(args, {"model.weight"}, group)
 
     world_size.assert_called_once_with(group)
     rank.assert_called_once_with(group)
