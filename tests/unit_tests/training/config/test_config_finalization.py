@@ -72,7 +72,8 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.train.global_batch_size = 8
     run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
     run_config.ddp.fp8_param_gather = True
-    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    # The optimizer policy must catch the RL conflict even before DDP is finalized.
+    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
     run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     before = copy.deepcopy(run_config.to_dict())
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
