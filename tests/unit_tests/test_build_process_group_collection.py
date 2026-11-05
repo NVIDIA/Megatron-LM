@@ -45,6 +45,30 @@ GRIDS = [
 ]
 GRID_IDS = [grid[0] for grid in GRIDS]
 
+# The parallel_state global that initialize_model_parallel() sets to each StandardGridExtras field.
+EXTRAS_GLOBALS = {
+    "tp_dp": "_TENSOR_AND_DATA_PARALLEL_GROUP",
+    "intra_dp_cp_gtp_remat": "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT",
+    "intra_expt_dp_gtp_remat": "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
+    "dp_gloo": "_DATA_PARALLEL_GROUP_GLOO",
+    "dp_cp_gloo": "_DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+    "intra_dp_cp_gloo": "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+    "expt_dp_gloo": "_EXPERT_DATA_PARALLEL_GROUP_GLOO",
+    "intra_expt_dp_gloo": "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO",
+    "weight_replica_rank_sets": "_WEIGHT_REPLICA_RANK_SETS",
+    "tp_global_ranks": "_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS",
+    "pp_global_ranks": "_PIPELINE_GLOBAL_RANKS",
+    "mp_global_ranks": "_MODEL_PARALLEL_GLOBAL_RANKS",
+    "dp_global_ranks": "_DATA_PARALLEL_GLOBAL_RANKS",
+    "dp_cp_global_ranks": "_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP",
+    "cp_global_ranks": "_CONTEXT_PARALLEL_GLOBAL_RANKS",
+    "embd_global_ranks": "_EMBEDDING_GLOBAL_RANKS",
+    "pos_embd_global_ranks": "_POSITION_EMBEDDING_GLOBAL_RANKS",
+    "ep_global_ranks": "_EXPERT_MODEL_PARALLEL_RANKS",
+    "gtp_remat_global_ranks": "_GTP_WEIGHT_REMAT_GLOBAL_RANKS",
+    "expt_gtp_remat_global_ranks": "_EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS",
+}
+
 
 def _require_divisible(num_ranks):
     if Utils.world_size % num_ranks != 0:
@@ -60,6 +84,11 @@ def _ranks(value):
     if isinstance(value, dict):
         return {key: _ranks(group) for key, group in value.items()}
     return torch.distributed.get_process_group_ranks(value)
+
+
+def _extras_value(name, value):
+    """A StandardGridExtras value as plain data: a rank list as is, or the ranks of a group."""
+    return value if name.endswith(("_ranks", "_rank_sets")) else _ranks(value)
 
 
 def _same_groups(value, expected):
@@ -169,9 +198,9 @@ def test_build_matches_registered_groups_without_parallel_state(grid_id, kwargs,
         # Read the ranks first: initializing again calls destroy_model_parallel(), which also
         # destroys the groups that build_process_group_collection() created.
         built_ranks = {name: _ranks(getattr(pg_collection, name)) for name in FIELDS}
-        extras_ranks = {
-            name: _ranks(getattr(extras, name))
-            for name in ("tp_dp", "intra_dp_cp_gtp_remat", "dp_gloo", "expt_dp_gloo")
+        assert sorted(EXTRAS_GLOBALS) == sorted(field.name for field in dataclasses.fields(extras))
+        extras_values = {
+            name: _extras_value(name, getattr(extras, name)) for name in EXTRAS_GLOBALS
         }
 
         registered = _initialize(**kwargs)
@@ -182,20 +211,12 @@ def test_build_matches_registered_groups_without_parallel_state(grid_id, kwargs,
                 assert all(built[key] is not expected[key] for key in built), name
             else:
                 assert built is None or built is not expected, name
-        assert extras_ranks["tp_dp"] == _ranks(ps.get_tensor_and_data_parallel_group())
-        assert extras_ranks["intra_dp_cp_gtp_remat"] == _ranks(
+        for name, global_name in EXTRAS_GLOBALS.items():
+            assert extras_values[name] == _extras_value(name, getattr(ps, global_name)), name
+        assert extras_values["tp_dp"] == _ranks(ps.get_tensor_and_data_parallel_group())
+        assert extras_values["intra_dp_cp_gtp_remat"] == _ranks(
             ps.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
         )
-        assert extras_ranks["dp_gloo"] == _ranks(ps._DATA_PARALLEL_GROUP_GLOO)
-        assert extras_ranks["expt_dp_gloo"] == _ranks(ps._EXPERT_DATA_PARALLEL_GROUP_GLOO)
-        assert extras.tp_global_ranks == ps._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
-        assert extras.pp_global_ranks == ps._PIPELINE_GLOBAL_RANKS
-        assert extras.dp_global_ranks == ps._DATA_PARALLEL_GLOBAL_RANKS
-        assert extras.dp_cp_global_ranks == ps._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
-        assert extras.cp_global_ranks == ps._CONTEXT_PARALLEL_GLOBAL_RANKS
-        assert extras.embd_global_ranks == ps._EMBEDDING_GLOBAL_RANKS
-        assert extras.ep_global_ranks == ps._EXPERT_MODEL_PARALLEL_RANKS
-        assert extras.weight_replica_rank_sets == ps._WEIGHT_REPLICA_RANK_SETS
     finally:
         Utils.destroy_model_parallel()
         _destroy_groups(pg_collection, extras)
