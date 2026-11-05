@@ -346,18 +346,26 @@ def test_whole_param_requantize_replays(recipe):
             )
             for src in srcs
         ]
+
+        def buffers():
+            return [
+                getattr(param.data, name)
+                for param in params
+                for name in (
+                    "_rowwise_data",
+                    "_rowwise_scale_inv",
+                    "_columnwise_data",
+                    "_columnwise_scale_inv",
+                )
+                if getattr(param.data, name, None) is not None
+            ]
+
+        # make_empty leaves the padding of the scale-inverse tensors unset and the quantize
+        # kernels do not write it; zero it so that only the requantized values are compared.
+        for buffer in buffers():
+            buffer.zero_()
         requantize_whole_params_from_high_precision(params, list(srcs))
-        return [
-            getattr(param.data, name)
-            for param in params
-            for name in (
-                "_rowwise_data",
-                "_rowwise_scale_inv",
-                "_columnwise_data",
-                "_columnwise_scale_inv",
-            )
-            if getattr(param.data, name, None) is not None
-        ]
+        return buffers()
 
     assert_replays_bit_exact(
         requantize,
