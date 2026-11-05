@@ -581,7 +581,7 @@ class TestGroupedExpertChainClassification:
         )
 
     def test_graphness_helpers(self):
-        # "ungraphed" is the eager suffix; everything else is captured.
+        # Built-in chains have metadata even before model classification.
         assert not gtp_module._chain_is_graphed("GTP_remat_grouped_fc1_ungraphed")
         assert not gtp_module._chain_is_graphed("GTP_ungraphed")
         assert gtp_module._chain_is_graphed("GTP_graphed")
@@ -667,7 +667,7 @@ class TestGroupedDoubleBuffer:
 
     def test_non_grouped_key_includes_scheduling_domain(self):
         assert self._key("GTP_ungraphed") == (
-            ("GTP_ungraphed", 0),
+            (("GTP_ungraphed", 0), "GTP_ungraphed"),
             (128, 256),
             torch.bfloat16,
             0,
@@ -746,7 +746,7 @@ class TestSameKeyNeighbourTiebreak:
         assert (
             self._key(0)
             == self._key()
-            == (("GTP_ungraphed", 0), (128, 256), torch.bfloat16, 0, False)
+            == ((("GTP_ungraphed", 0), "GTP_ungraphed"), (128, 256), torch.bfloat16, 0, False)
         )
 
     def test_parity_one_gets_its_own_buffer(self):
@@ -2159,10 +2159,16 @@ class TestGTPCaptureParamReadiness:
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
 
-    def test_capture_comm_predicate_includes_future_graphed_chains(self):
+    def test_capture_comm_predicate_includes_future_graphed_chains(self, monkeypatch):
         state = gtp_cuda_graphs.GTPCaptureCommState()
-        future = type("Param", (), {"chain_id": "GTP_future_role_graphed"})()
-        eager = type("Param", (), {"chain_id": "GTP_future_role_ungraphed"})()
+        future = type("Param", (), {"chain_id": "future_captured"})()
+        eager = type("Param", (), {"chain_id": "future_eager"})()
+        for param, graphed in ((future, True), (eager, False)):
+            monkeypatch.setitem(
+                gtp_module._PREFETCH_CHAIN_METADATA,
+                param.chain_id,
+                gtp_module._PrefetchChainMetadata(grouped=True, graphed=graphed),
+            )
         ag_stream, rs_stream = object(), object()
         for param in (future, eager, object()):
             state.register_comm(param, ag_stream, reduce_scatter=False)

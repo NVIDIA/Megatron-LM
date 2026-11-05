@@ -766,7 +766,8 @@ classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
   replicated weights, mixed dense/grouped weights, and mixed process groups are rejected.
 - **Runtime mapping:** classification splits captured/eager scopes. Chains can share
   communication streams but maintain separate temporary weight buffers; more chains
-  can increase memory use.
+  can increase memory use. Built-in and registered chains use one metadata table for
+  grouped/captured queries; runtime behavior does not infer these properties from chain names.
 
 Use the same registration on every participating rank. The API requires existing
 GTP operator integration; it does not enable sharding or add support to new operators.

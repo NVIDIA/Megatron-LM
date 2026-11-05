@@ -142,15 +142,28 @@ _GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
 
 
 @dataclass(frozen=True)
-class _RegisteredPrefetchChain:
+class _PrefetchChainMetadata:
     """Runtime metadata; a logical chain does not own a communication stream."""
 
     grouped: bool
     graphed: bool
-    group_id: int
+    group_id: Optional[int] = None
 
 
-_REGISTERED_PREFETCH_CHAINS: Dict[str, _RegisteredPrefetchChain] = {}
+_DEFAULT_PREFETCH_CHAIN_METADATA = {
+    GTPChain.GRAPHED.value: _PrefetchChainMetadata(grouped=False, graphed=True),
+    GTPChain.UNGRAPHED.value: _PrefetchChainMetadata(grouped=False, graphed=False),
+    **{
+        f"{role}_{'graphed' if graphed else 'ungraphed'}": _PrefetchChainMetadata(
+            grouped=True, graphed=graphed
+        )
+        for role in (_GTP_REMAT_GROUPED_FC1, _GTP_REMAT_GROUPED_FC2)
+        for graphed in (False, True)
+    },
+}
+_PREFETCH_CHAIN_METADATA: Dict[str, _PrefetchChainMetadata] = (
+    _DEFAULT_PREFETCH_CHAIN_METADATA.copy()
+)
 
 
 def register_prefetch_chain(name: str, weights: Iterable[torch.Tensor]) -> None:
@@ -229,22 +242,17 @@ def _registered_chain_id(param, default_chain: str) -> str:
         return default_chain
     graphed = _chain_is_graphed(default_chain)
     chain_id = f"GTP_registered_{name}_{_graphness_suffix(graphed)}"
-    metadata = _RegisteredPrefetchChain(param.is_routed_expert, graphed, id(param.group))
-    previous = _REGISTERED_PREFETCH_CHAINS.get(chain_id)
+    metadata = _PrefetchChainMetadata(param.is_routed_expert, graphed, id(param.group))
+    previous = _PREFETCH_CHAIN_METADATA.get(chain_id)
     if previous is not None and previous != metadata:
         raise ValueError(f"Prefetch chain {name!r} mixes weight kinds or process groups")
-    _REGISTERED_PREFETCH_CHAINS[chain_id] = metadata
+    _PREFETCH_CHAIN_METADATA[chain_id] = metadata
     return chain_id
 
 
 def get_graphed_chain_ids() -> tuple[str, ...]:
     """Return the currently classified captured chain IDs for diagnostics."""
-    return (
-        GTPChain.GRAPHED.value,
-        f"{_GTP_REMAT_GROUPED_FC1}_{_graphness_suffix(True)}",
-        f"{_GTP_REMAT_GROUPED_FC2}_{_graphness_suffix(True)}",
-        *(name for name, metadata in _REGISTERED_PREFETCH_CHAINS.items() if metadata.graphed),
-    )
+    return tuple(name for name, metadata in _PREFETCH_CHAIN_METADATA.items() if metadata.graphed)
 
 
 def _graphness_suffix(graphed: bool) -> str:
@@ -253,20 +261,13 @@ def _graphness_suffix(graphed: bool) -> str:
 
 
 def _chain_is_grouped(chain_id: str) -> bool:
-    """True for the separate grouped-expert FC1 and FC2 chains."""
-    metadata = _REGISTERED_PREFETCH_CHAINS.get(chain_id)
-    if metadata is not None:
-        return metadata.grouped
-    return chain_id.startswith(_GTP_REMAT_GROUPED_PREFIX)
+    """Read whether a known chain uses grouped-expert scheduling from its metadata."""
+    return _PREFETCH_CHAIN_METADATA[chain_id].grouped
 
 
 def _chain_is_graphed(chain_id: str) -> bool:
-    """True for any CUDA-graph-captured chain, including grouped fc1/fc2 chains.
-
-    Every chain id ends in "graphed" or "ungraphed" (see ``_classify_param_chain``), so testing
-    the eager suffix is exact; a new chain id must keep that convention.
-    """
-    return not chain_id.endswith("ungraphed")
+    """Read whether a known chain is CUDA-graph-captured from its metadata."""
+    return _PREFETCH_CHAIN_METADATA[chain_id].graphed
 
 
 # Active cuda_graph config, set by the integrator via set_cuda_graph_modules() before
@@ -534,12 +535,11 @@ def _stream_key(chain_id: str, group) -> tuple:
     By default, grouped fc1/fc2 chains on the same group share one stream, so their gathers
     serialize instead of splitting bandwidth: drop the role, keep the capture suffix.
     """
-    if _chain_is_grouped(chain_id):
-        chain_id = _GTP_REMAT_GROUPED_PREFIX + _graphness_suffix(_chain_is_graphed(chain_id))
-    elif chain_id in _REGISTERED_PREFETCH_CHAINS:
-        chain_id = (
-            GTPChain.GRAPHED.value if _chain_is_graphed(chain_id) else GTPChain.UNGRAPHED.value
-        )
+    metadata = _PREFETCH_CHAIN_METADATA[chain_id]
+    if metadata.grouped:
+        chain_id = _GTP_REMAT_GROUPED_PREFIX + _graphness_suffix(metadata.graphed)
+    else:
+        chain_id = GTPChain.GRAPHED.value if metadata.graphed else GTPChain.UNGRAPHED.value
     return (chain_id, id(group) if group is not None else 0)
 
 
@@ -1523,12 +1523,11 @@ class GTPShardedParam(torch.nn.Parameter):
         a prefetched layer N+1 weight from overwriting the buffer still consumed by layer N.
         """
 
-        scheduling_domain = _stream_key(self.chain_id, self.group)
-        if self.chain_id in _REGISTERED_PREFETCH_CHAINS:
-            # Sharing a stream does not serialize consumers on independent chains.
-            # Their materialized views can be live simultaneously.
-            scheduling_domain = (scheduling_domain, self.chain_id)
+        # Sharing a stream does not serialize consumers on independent chains.
+        # Their materialized views can be live simultaneously.
+        scheduling_domain = (_stream_key(self.chain_id, self.group), self.chain_id)
 
+        key: tuple
         if not isinstance(dtype, torch.dtype):
             key = (
                 scheduling_domain,
@@ -1548,9 +1547,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 reduce_scatter,
             )
         if _chain_is_grouped(self.chain_id):
-            # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
-            # parity alternates consecutive blocks between two buffers.
-            key = key + (self.chain_id, self._double_buffer_parity())
+            # Chain identity above keeps fc1/fc2 apart; parity alternates consecutive
+            # blocks between two buffers.
+            key = key + (self._double_buffer_parity(),)
         elif getattr(self, "_buf_parity", None):
             # Set by _ensure_no_shared_buffer_with. Parity 0 keeps the shared buffer, so
             # only the second weight of an adjacent same-key pair costs an extra allocation.
@@ -3141,7 +3140,8 @@ def reset_gtp_state():
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
     classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
     """
-    _REGISTERED_PREFETCH_CHAINS.clear()
+    _PREFETCH_CHAIN_METADATA.clear()
+    _PREFETCH_CHAIN_METADATA.update(_DEFAULT_PREFETCH_CHAIN_METADATA)
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
     GTPShardedParam._link_tables_flushed = False

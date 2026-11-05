@@ -156,6 +156,52 @@ def test_same_logical_chain_splits_at_capture_boundary():
     assert not embedding._need_weight_prefetch_bwd
 
 
+@pytest.mark.parametrize(
+    "chain_id,grouped,graphed,stream_id",
+    [
+        ("opaque", True, True, "GTP_remat_grouped_graphed"),
+        ("GTP_remat_grouped_fc1_graphed", False, False, "GTP_ungraphed"),
+        ("GTP_ungraphed", False, True, "GTP_graphed"),
+        ("GTP_graphed", True, False, "GTP_remat_grouped_ungraphed"),
+    ],
+)
+def test_chain_queries_use_metadata_instead_of_names(
+    monkeypatch, chain_id, grouped, graphed, stream_id
+):
+    monkeypatch.setitem(
+        gtp._PREFETCH_CHAIN_METADATA,
+        chain_id,
+        gtp._PrefetchChainMetadata(grouped=grouped, graphed=graphed),
+    )
+    assert gtp._chain_is_grouped(chain_id) == grouped
+    assert gtp._chain_is_graphed(chain_id) == graphed
+    assert (chain_id in gtp.get_graphed_chain_ids()) == graphed
+    assert gtp._stream_key(chain_id, None) == (stream_id, 0)
+
+
+@pytest.mark.parametrize(
+    "query,args",
+    [(gtp._chain_is_grouped, ()), (gtp._chain_is_graphed, ()), (gtp._stream_key, (None,))],
+)
+def test_chain_queries_reject_unknown_ids(query, args):
+    with pytest.raises(KeyError):
+        query("GTP_remat_grouped_unknown_graphed", *args)
+
+
+def test_reset_preserves_builtin_metadata_and_removes_custom_chains():
+    custom = _weight()
+    register_prefetch_chain("custom", [custom])
+    gtp.classify_gtp_remat_chains(_model(custom=custom))
+    custom_id = custom.chain_id
+    gtp.reset_gtp_state()
+
+    assert custom_id not in gtp._PREFETCH_CHAIN_METADATA
+    assert gtp._chain_is_graphed(gtp.GTPChain.GRAPHED.value)
+    assert not gtp._chain_is_grouped(gtp.GTPChain.UNGRAPHED.value)
+    assert gtp._chain_is_grouped("GTP_remat_grouped_fc1_ungraphed")
+    assert gtp._chain_is_graphed("GTP_remat_grouped_fc2_graphed")
+
+
 def test_registered_dense_chains_follow_execution_not_registration_order():
     group = torch.distributed.group.WORLD
     layers = [_make_gtp_linear(32, 32, group) for _ in range(4)]
