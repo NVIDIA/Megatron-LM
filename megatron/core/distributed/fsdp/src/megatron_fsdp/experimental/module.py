@@ -479,7 +479,7 @@ class FsdpModule:
                 with torch.cuda.stream(inner_reduction_stream):
                     group.reduce_inner_gradients(partial_grad)
 
-                if not context.is_last_microbatch:
+                if not context.finalize_gradients:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
