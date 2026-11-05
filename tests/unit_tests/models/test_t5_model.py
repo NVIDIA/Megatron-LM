@@ -129,11 +129,19 @@ class TestT5Model:
         pass
 
 
+@pytest.fixture
+def clean_nvte_env():
+    """Clear the NVTE attention variables that LanguageModule sets, before and after a test."""
+    clear_nvte_env_vars()
+    yield
+    clear_nvte_env_vars()
+
+
+@pytest.mark.usefixtures("clean_nvte_env")
 @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
 @pytest.mark.parametrize("explicit_pg_collection", [False, True])
 def test_constructor_process_groups(mocker, explicit_pg_collection, position_embedding_type):
     """T5 and LanguageModule must agree on the caller's process-group collection."""
-    clear_nvte_env_vars()
     mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
     mocker.patch("torch.distributed.is_initialized", return_value=True)
     pg_collection = ProcessGroupCollection(
@@ -188,6 +196,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection, position_emb
         global_groups.assert_called_once_with()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 @pytest.mark.parametrize(
     'pp_size, pre_process, post_process, tied, embedding_state, valid',
     [
@@ -208,7 +217,6 @@ def test_constructor_embedding_group_contract(
     mocker, pp_size, pre_process, post_process, tied, embedding_state, valid
 ):
     """An explicit collection cannot silently disable tied pipeline embedding synchronization."""
-    clear_nvte_env_vars()
     mocker.patch('torch.distributed.is_initialized', return_value=True)
     mocker.patch('megatron.core.models.T5.t5_model.LanguageModelEmbedding')
     mocker.patch('megatron.core.models.T5.t5_model.T5LMHead')
@@ -262,9 +270,9 @@ def test_constructor_embedding_group_contract(
     global_groups.assert_not_called()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 def test_pipeline_tied_embeddings_use_supplied_group(mocker):
     """Real PP endpoints synchronize nonzero embedding weights through the supplied group."""
-    clear_nvte_env_vars()
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip('requires a world size divisible by two')
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
