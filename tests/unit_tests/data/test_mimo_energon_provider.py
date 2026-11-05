@@ -63,7 +63,7 @@ class ConversationEncoder(DefaultTaskEncoder):
             "input_ids": tokens,
             "labels": labels,
             "loss_mask": (labels != -100).float(),
-            "position_ids": torch.arange(tokens.shape[1]).expand_as(tokens),
+            "position_ids": torch.arange(tokens.shape[1]).expand_as(tokens).contiguous(),
             "cu_seqlens": torch.tensor([[0, tokens.shape[1]]] * len(samples)),
             "attention_mask": torch.ones(len(samples), 1, tokens.shape[1], dtype=torch.bool),
             "modality_token_indices": {"sound": torch.tensor([1])},
@@ -90,7 +90,7 @@ class PreparedTokenEncoder(DefaultTaskEncoder):
             "input_ids": tokens,
             "labels": labels,
             "loss_mask": (labels != -100).float(),
-            "position_ids": torch.arange(tokens.shape[1]).expand_as(tokens),
+            "position_ids": torch.arange(tokens.shape[1]).expand_as(tokens).contiguous(),
             "modality_inputs": {
                 "frames": {"features": tokens[:, :1].float().repeat_interleave(2, dim=0)}
             },
