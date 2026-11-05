@@ -88,7 +88,7 @@ class TestDefaultLayerSpecDispatch:
         config = _make_dispatch_config()
         config.restore_modelopt_state = True
 
-        result = default_layer_spec(config, vp_stage=None)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
         mock_get_spec.assert_called_once_with(
             config=config.transformer,
@@ -96,6 +96,8 @@ class TestDefaultLayerSpecDispatch:
             remap_te_layernorm=True,
             real_quant_cfg="None",
             use_arbitrary_attention_mask=True,
+            vp_stage=2,
+            pp_rank=1,
         )
         assert result is spec
 
@@ -136,9 +138,9 @@ class TestDefaultLayerSpecDispatch:
         mock_get_spec.return_value = spec
         config = _make_dispatch_config(experimental_attention_variant="variant_x")
 
-        result = default_layer_spec(config, vp_stage=2)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
-        mock_get_spec.assert_called_once_with(config=config.transformer, vp_stage=2)
+        mock_get_spec.assert_called_once_with(config=config.transformer, vp_stage=2, pp_rank=1)
         assert result is spec
 
     @patch("megatron.training.models.gpt.get_gpt_decoder_block_spec")
@@ -150,7 +152,7 @@ class TestDefaultLayerSpecDispatch:
         # use_te flag depends on transformer_impl
         config.transformer.transformer_impl = "transformer_engine"
 
-        result = default_layer_spec(config, vp_stage=1)
+        result = default_layer_spec(config, vp_stage=1, pp_rank=1)
 
         mock_get_spec.assert_called_once_with(
             config.transformer,
@@ -158,6 +160,7 @@ class TestDefaultLayerSpecDispatch:
             normalization=config.transformer.normalization,
             qk_l2_norm=config.transformer.qk_l2_norm,
             vp_stage=1,
+            pp_rank=1,
         )
         assert result is spec
 
@@ -174,9 +177,9 @@ class TestDefaultLayerSpecDispatch:
         config.restore_modelopt_state = False
         config.transformer = transformer
 
-        result = default_layer_spec(config, vp_stage=None)
+        result = default_layer_spec(config, vp_stage=2, pp_rank=1)
 
-        mock_get_spec.assert_called_once_with(transformer, True)
+        mock_get_spec.assert_called_once_with(transformer, True, vp_stage=2, pp_rank=1)
         assert result is spec
 
     @patch("megatron.training.models.gpt.get_gpt_layer_with_transformer_engine_spec")
@@ -528,10 +531,11 @@ class TestGPTModelBuilderBuildModel:
         default_spec = ModuleSpec(module=object)
         mock_default.return_value = default_spec
         self.config.__dict__["transformer_layer_spec"] = None
+        self.pg.pp.rank.return_value = 1
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=3)
 
-        mock_default.assert_called_once_with(self.config, 3)
+        mock_default.assert_called_once_with(self.config, 3, 1)
         assert mock_model.call_args.kwargs["transformer_layer_spec"] is default_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
