@@ -2,17 +2,17 @@
 
 import copy
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass, field, fields
 
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
-from megatron.training.argument_utils import (
-    ArgumentGroupFactory,
-    _default_config_from_args,
-    pretrain_cfg_container_from_args,
-)
-from megatron.training.config import CheckpointConfig, RLConfig
+from megatron.training.argument_utils import ArgumentGroupFactory, _default_config_from_args
+from megatron.training.config import CheckpointConfig, RLConfig, RunConfigRecord
 from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
 from megatron.training.config.inference_config import InferenceSetupConfig
+from megatron.training.global_vars import (
+    get_run_config_record,
+    set_run_config_record,
+    unset_run_config_record,
+)
 
 _DEPLOYMENT_ARGS = {
     "tensor_model_parallel_size": "rl_inference_tensor_model_parallel_size",
@@ -96,80 +96,52 @@ def rollout_inference_container_from_args(
     )
 
 
-@dataclass(kw_only=True)
-class RLRunConfigContainer(PretrainConfigContainer):
-    """The RL run's configuration, subclassing `PretrainConfigContainer`."""
-
-    inference: InferenceConfigContainer
-    rl: RLConfig = field(default_factory=RLConfig)
-
-    @classmethod
-    def from_pretrain(
-        cls, pretrain: PretrainConfigContainer, *, inference: InferenceConfigContainer, rl: RLConfig
-    ) -> "RLRunConfigContainer":
-        """Build the RL run config around an existing pretrain container's sections."""
-        sections = {
-            f.name: getattr(pretrain, f.name) for f in fields(PretrainConfigContainer) if f.init
-        }
-        return cls(**sections, inference=inference, rl=rl)
-
-    def validate(self) -> None:
-        """Validate the sections, then the RL section against the run it drives."""
-        # The offload `_finalize` will request, checked like the offload the DDP section
-        # requests (`PretrainConfigContainer._validate_ddp_config`).
-        if (
-            self.rl.requires_grad_buffer_offload
-            and self.optimizer.reuse_grad_buf_for_mxfp8_param_ag
-            and not self.ddp.use_megatron_fsdp
-        ):
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "--reuse-grad-buf-for-mxfp8-param-ag: "
-                "parameters share the gradient-buffer storage that offload releases."
-            )
-        super().validate()
-        transformer = getattr(self.model, "transformer", None)
-        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=self.train.global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
+def validate_rl_run(record: RunConfigRecord) -> None:
+    """Validate an RL run's record."""
+    pretrain, inference, rl = record.pretrain, record.inference, record.rl
+    # The offload `finalize_rl_run` will request, checked like the offload the DDP section
+    # requests (`PretrainConfigContainer._validate_ddp_config`).
+    if (
+        rl.requires_grad_buffer_offload
+        and pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+        and not pretrain.ddp.use_megatron_fsdp
+    ):
+        raise ValueError(
+            "Gradient-buffer offload is incompatible with "
+            "--reuse-grad-buf-for-mxfp8-param-ag: "
+            "parameters share the gradient-buffer storage that offload releases."
         )
-        if self.rl.rl_offload_inference_model_weights and not rollout_model_is_separate(
-            self.inference, self.model
-        ):
-            raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with "
-                "the training model."
-            )
-
-    def _finalize(self) -> None:
-        """The pretrain derivations, then the deployment's, then the RL layout on the DDP config."""
-        super()._finalize()
-        self.inference.finalize()
-        if self.rl.requires_grad_buffer_offload:
-            self.ddp.grad_buffer_offload = True
-
-
-def rl_run_config_container_from_args(
-    args: Namespace, model_cfg=None, *, rollout_model_cfg=None
-) -> RLRunConfigContainer:
-    """Compose the RL run config from the entry point's arguments."""
-    pretrain = pretrain_cfg_container_from_args(args, model_cfg)
-    return RLRunConfigContainer.from_pretrain(
-        pretrain,
-        inference=rollout_inference_container_from_args(
-            args, pretrain, model_cfg=rollout_model_cfg
-        ),
-        rl=_default_config_from_args(RLConfig, args),
+    record.validate()
+    transformer = getattr(pretrain.model, "transformer", None)
+    cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
+    rl.validate_run(
+        cuda_graph_impl=cuda_graph_impl,
+        micro_batch_size=pretrain.train.micro_batch_size,
+        global_batch_size=pretrain.train.global_batch_size,
+        train_iters=pretrain.train.train_iters,
+        train_samples=pretrain.train.train_samples,
+        skip_train=pretrain.validation.skip_train,
+        load_optim=pretrain.checkpoint.load_optim,
+        save_interval=pretrain.checkpoint.save_interval,
+        exit_interval=pretrain.train.exit_interval,
     )
+    if rl.rl_offload_inference_model_weights and not rollout_model_is_separate(
+        inference, pretrain.model
+    ):
+        raise ValueError(
+            "--rl-offload-inference-model-weights requires a separate inference model. "
+            "This flag is only useful when doing refit since the weights are shared with "
+            "the training model."
+        )
+
+
+def finalize_rl_run(record: RunConfigRecord) -> None:
+    """Validate the record, then finalize the deployment."""
+    validate_rl_run(record)
+    record.inference.finalize()
+    if record.rl.requires_grad_buffer_offload:
+        # Applied before the training container finalizes its DDP section.
+        record.pretrain.ddp.grad_buffer_offload = True
 
 
 def add_rl_args(parser: ArgumentParser) -> ArgumentParser:
@@ -191,3 +163,22 @@ def add_rollout_inference_args(parser: ArgumentParser) -> ArgumentParser:
                        help='Expert tensor parallelism of the rollout engine (default: training).')
     return parser
 
+
+def set_rl_run_config(record: RunConfigRecord) -> None:
+    """Register an RL run's record."""
+    assert record.inference is not None and record.rl is not None, (
+        "an RL run's record carries its inference and rl members"
+    )
+    set_run_config_record(record)
+
+
+def get_rl_run_config() -> RunConfigRecord:
+    """Return the registered RL run's record."""
+    record = get_run_config_record()
+    assert record is not None and record.rl is not None, "RL run config is not initialized."
+    return record
+
+
+def unset_rl_run_config() -> None:
+    """Forget the registered record (tests and multi-run processes)."""
+    unset_run_config_record()

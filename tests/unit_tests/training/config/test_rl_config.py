@@ -15,18 +15,26 @@ import pytest
 
 from megatron.core.transformer import TransformerConfig
 from megatron.rl.config import (
-    RLRunConfigContainer,
     add_rl_args,
-    rl_run_config_container_from_args,
+    finalize_rl_run,
+    get_rl_run_config,
+    rollout_inference_container_from_args,
     rollout_model_is_separate,
+    set_rl_run_config,
+    validate_rl_run,
 )
-from megatron.training.argument_utils import _default_config_from_args, gpt_config_from_args
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
+    RunConfigRecord,
     rl_config,
 )
 from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
@@ -285,20 +293,24 @@ def _model_with_layout(**layout):
 
 
 def _rl_run(pretrain, inference=None, **rl_kwargs):
-    """The RL run config built around a pretrain container's sections (shared, not copied)."""
-    return RLRunConfigContainer.from_pretrain(
-        pretrain,
+    return RunConfigRecord(
+        pretrain=pretrain,
         inference=_inference_container() if inference is None else inference,
         rl=RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs),
     )
 
 
-def test_validate_run_from_the_container_and_the_entry_point(monkeypatch):
-    from megatron.training import global_vars
+def _record_from_args(args):
+    """What the RL entry point composes from its parsed arguments."""
+    pretrain = pretrain_cfg_container_from_args(args, gpt_config_from_args(args))
+    return RunConfigRecord(
+        pretrain=pretrain,
+        inference=rollout_inference_container_from_args(args, pretrain),
+        rl=_default_config_from_args(RLConfig, args),
+    )
 
-    # The RL run config's finalize() below runs the pretrain derivations, which read the batch
-    # layout from the global args.
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", types.SimpleNamespace(batch_parallel_size=1))
+
+def test_validate_run_from_the_container_and_the_entry_point():
     # Direct: a consistent run passes, the CUDA-graph rule is skipped without a model config, and
     # nothing is checked unless the run is an RL run.
     cfg = RLConfig(
@@ -349,55 +361,61 @@ def test_validate_run_from_the_container_and_the_entry_point(monkeypatch):
 
     pretrain = _pretrain_container()
     offload_run = _rl_run(pretrain, rl_offload_optimizer_during_inference=True)
-    offload_run.validate()
+    validate_rl_run(offload_run)
     assert not pretrain.ddp.grad_buffer_offload
     offload_run.rl.rl_offload_optimizer_during_inference = False
-    offload_run.validate()
+    validate_rl_run(offload_run)
     assert not pretrain.ddp.grad_buffer_offload
     offload_run.rl.rl_offload_optimizer_during_inference = True
     pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        offload_run.validate()
+        validate_rl_run(offload_run)
 
     pretrain = _pretrain_container()
     cuda_graph_run = _rl_run(
         pretrain, rl_offload_optimizer_during_inference=True, rl_training_cuda_graphs=True
     )
     pretrain.model.transformer.cuda_graph_impl = "local"
-    cuda_graph_run.validate()
+    validate_rl_run(cuda_graph_run)
     assert not pretrain.ddp.grad_buffer_offload
-    cuda_graph_run.finalize()
+    finalize_rl_run(cuda_graph_run)
     assert not pretrain.ddp.grad_buffer_offload
     pretrain = _pretrain_container()
     pretrain.ddp.grad_buffer_offload = True
-    explicit_layout_run = RLRunConfigContainer.from_pretrain(
-        pretrain, inference=_inference_container(), rl=RLConfig()
+    explicit_layout_run = RunConfigRecord(
+        pretrain=pretrain, inference=_inference_container(), rl=RLConfig()
     )
-    explicit_layout_run.validate()
+    validate_rl_run(explicit_layout_run)
     assert pretrain.ddp.grad_buffer_offload
     pretrain.ddp.fp8_param_gather = True
     pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        explicit_layout_run.validate()
+        validate_rl_run(explicit_layout_run)
     accepted = _pretrain_container()
     accepted.model.transformer.cuda_graph_impl = "local"
-    _rl_run(accepted, rl_training_cuda_graphs=True).validate()
+    validate_rl_run(_rl_run(accepted, rl_training_cuda_graphs=True))
     with pytest.raises(ValueError, match="Training requires model.transformer"):
-        _rl_run(
-            _pretrain_container(model=TopologyOnlyModelConfig()), rl_training_cuda_graphs=True
-        ).validate()
+        validate_rl_run(
+            _rl_run(
+                _pretrain_container(model=TopologyOnlyModelConfig()), rl_training_cuda_graphs=True
+            )
+        )
     with pytest.raises(ValueError, match="Training requires model.transformer"):
-        RLRunConfigContainer.from_pretrain(
-            _pretrain_container(model=TopologyOnlyModelConfig()),
-            inference=_inference_container(),
-            rl=RLConfig(),
-        ).validate()
+        validate_rl_run(
+            RunConfigRecord(
+                pretrain=_pretrain_container(model=TopologyOnlyModelConfig()),
+                inference=_inference_container(),
+                rl=RLConfig(),
+            )
+        )
     with pytest.raises(ValueError, match="no CUDA graphs"):
-        _rl_run(
-            _pretrain_container(model=TransformerModelConfig()), rl_training_cuda_graphs=True
-        ).validate()
+        validate_rl_run(
+            _rl_run(
+                _pretrain_container(model=TransformerModelConfig()), rl_training_cuda_graphs=True
+            )
+        )
     with pytest.raises(ValueError, match="must be 1"):
-        _rl_run(_pretrain_container(), rl_use_sequence_packing=True).validate()
+        validate_rl_run(_rl_run(_pretrain_container(), rl_use_sequence_packing=True))
 
     # Through the entry point: parsing with the RL group and validate_args both pass; the
     # containers built from args reject the run.
@@ -412,7 +430,7 @@ def test_validate_run_from_the_container_and_the_entry_point(monkeypatch):
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
     with pytest.raises(ValueError, match="must be 1"):
-        rl_run_config_container_from_args(args, gpt_config_from_args(args)).validate()
+        validate_rl_run(_record_from_args(args))
     # The retired inference-only spelling points at the new flag, which does not combine with
     # --skip-train; the variant without an optimizer is --rl-rollout-only --no-load-optim.
     argv = (
@@ -426,10 +444,10 @@ def test_validate_run_from_the_container_and_the_entry_point(monkeypatch):
             args = validate_args(parse_args(extra_args_provider=add_rl_args))
         assert args.no_load_optim  # --skip-train still coerces --no-load-optim with the RL group
         with pytest.raises(ValueError, match="--rl-rollout-only collects"):
-            rl_run_config_container_from_args(args, gpt_config_from_args(args)).validate()
+            validate_rl_run(_record_from_args(args))
     with patch("sys.argv", argv + ["--rl-rollout-only", "--no-load-optim"]):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
-    rl_run_config_container_from_args(args, gpt_config_from_args(args)).validate()
+    validate_rl_run(_record_from_args(args))
     assert args.rl_rollout_only and args.no_load_optim
 
 
@@ -446,7 +464,7 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
     )
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
-    cfg = rl_run_config_container_from_args(args, gpt_config_from_args(args)).rl
+    cfg = _record_from_args(args).rl
     # validate_args neither derives nor mirrors RL values; the container does.
     assert not hasattr(args, "grpo_samples_per_iteration")
     assert args.rl_generation_lag is None
@@ -454,10 +472,8 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
 
 
 def _layout_run(run_config, **rl):
-    """An RL run over the `run_config` fixture's sections, with the default GRPO sizes."""
-    return RLRunConfigContainer.from_pretrain(
-        run_config, inference=_inference_container(), rl=RLConfig(**rl)
-    )
+    """An RL run over the `run_config` fixture, with the section's default GRPO sizes."""
+    return RunConfigRecord(pretrain=run_config, inference=_inference_container(), rl=RLConfig(**rl))
 
 
 @pytest.mark.parametrize("perform_rl_step", [False, True])
@@ -483,9 +499,10 @@ def test_ddp_layout_validation_and_finalization(
     )
     before = dataclasses.asdict(ddp)
     for _ in range(2):
-        rl_run.validate()
+        validate_rl_run(rl_run)
         assert dataclasses.asdict(ddp) == before
-    rl_run.finalize()
+    finalize_rl_run(rl_run)
+    run_config.finalize()
     assert ddp.grad_buffer_offload == (
         explicit_layout or (perform_rl_step and offload and not cuda_graphs)
     )
@@ -507,7 +524,7 @@ def test_ddp_finalization_rejects_aliasing_before_mutation(run_config):
     )
     before = dataclasses.asdict(ddp)
     with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        rl_run.finalize()
+        finalize_rl_run(rl_run)
     assert dataclasses.asdict(ddp) == before
 
 
@@ -538,9 +555,10 @@ def test_ddp_finalization_preserves_subclass_fields(
     rl_run = _layout_run(
         run_config, perform_rl_step=True, rl_offload_optimizer_during_inference=True
     )
-    rl_run.validate()
-    rl_run.finalize()
-    rl_run.finalize()
+    validate_rl_run(rl_run)
+    finalize_rl_run(rl_run)
+    run_config.finalize()
+    run_config.finalize()
     assert type(ddp) is TorchFullyShardedDataParallelConfig
     assert not ddp.reshard_after_forward
     assert ddp.grad_buffer_offload
@@ -569,8 +587,10 @@ def test_model_setup_uses_owned_ddp_config(
     args.world_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
-    rl_section = RLConfig(
-        perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
+    rl_run = RunConfigRecord(
+        pretrain=run_config,
+        inference=_inference_container(),
+        rl=RLConfig(perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True),
     )
     ddp = run_config.ddp
     monkeypatch.setattr(training, "get_args", lambda: args)
@@ -598,17 +618,15 @@ def test_model_setup_uses_owned_ddp_config(
         monkeypatch.setattr(run_config.model, "get_builder_cls", lambda: lambda cfg: builder)
     else:
         monkeypatch.setattr(training, "get_model", construct)
-    # Runtime initialization finalizes the RL run config, which shares the fixture's sections;
-    # model setup only consumes its result.
+    # The RL entry point finalizes the layout before runtime initialization; model setup only
+    # consumes its result.
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    rl_run = RLRunConfigContainer.from_pretrain(
-        run_config, inference=_inference_container(), rl=rl_section
-    )
-    rl_run.finalize()
+    finalize_rl_run(rl_run)
+    run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=rl_run
+            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )
 
 
@@ -636,9 +654,9 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
     assert not rollout_model_is_separate(shared, pretrain.model)
     if offload:
         with pytest.raises(ValueError, match="requires a separate inference model"):
-            _rl_run(pretrain, inference=shared, **rl).validate()
+            validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
     else:
-        _rl_run(pretrain, inference=shared, **rl).validate()
+        validate_rl_run(_rl_run(pretrain, inference=shared, **rl))
     refit = InferenceConfigContainer(
         model=_model_with_layout(tensor_model_parallel_size=2),
         checkpoint=CheckpointConfig(),
@@ -651,36 +669,75 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
     )
     for deployment in (refit, shards):
         assert rollout_model_is_separate(deployment, pretrain.model)
-        _rl_run(pretrain, inference=deployment, **rl).validate()
+        validate_rl_run(_rl_run(pretrain, inference=deployment, **rl))
 
 
-def test_rl_run_config_is_the_run_config_and_round_trips(monkeypatch, tmp_path):
-    """The RL run config is a pretrain container by inheritance: the loop reads it through
-    get_run_config() unchanged, and its YAML keeps the flat layout with two more sections."""
+def test_rl_run_config_is_a_singleton():
+    with pytest.raises(AssertionError, match="not initialized"):
+        get_rl_run_config()
+    record = RunConfigRecord(
+        pretrain=_pretrain_container(), inference=_inference_container(), rl=RLConfig()
+    )
+    set_rl_run_config(record)
+    assert get_rl_run_config() is record
+    with pytest.raises(AssertionError, match="already initialized"):
+        set_rl_run_config(record)
+    with pytest.raises(AssertionError, match="inference and rl members"):
+        set_rl_run_config(RunConfigRecord(pretrain=_pretrain_container()))
+
+
+def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
+    """Every process writes a RunConfigRecord whose members are its containers: a training run
+    records `pretrain`, an inference run `inference`, an RL run adds `inference` and `rl`; absent
+    members stay out of the document; any record plus the missing members is the larger run's
+    record; and a legacy flat record still yields its sections."""
     import yaml
 
-    from megatron.training import global_vars
-    from megatron.training.config import PretrainConfigContainer
+    from megatron.training import checkpointing, global_vars
+    from megatron.training.utils.checkpoint_utils import run_config_sections
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
-    root = RLRunConfigContainer.from_pretrain(
-        _pretrain_container(), inference=_inference_container(), rl=RLConfig(**GRPO_4x3)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
+    pretrain = _pretrain_container()
+    global_vars.set_run_config(pretrain)
+    assert global_vars.get_run_config_record() is None
+    # A plain training run records its run config under `pretrain`, an inference run under
+    # `inference`; the writer wraps what the process registered.
+    plain = checkpointing._run_config_record()
+    assert isinstance(plain, RunConfigRecord) and plain.pretrain is pretrain
+    assert set(plain.to_dict()) == {"_target_", "pretrain"}
+    inference_record = RunConfigRecord.wrap(_inference_container()).to_dict()
+    assert set(inference_record) == {"_target_", "inference"}
+
+    record = RunConfigRecord(
+        pretrain=pretrain, inference=_inference_container(), rl=RLConfig(**GRPO_4x3)
     )
-    assert isinstance(root, PretrainConfigContainer)
-    global_vars.set_run_config(root)
-    assert global_vars.get_run_config() is root
-    assert global_vars.get_run_config().rl is root.rl
+    set_rl_run_config(record)
+    assert global_vars.get_run_config() is pretrain  # the loop keeps the pretrain container
+    assert checkpointing._run_config_record() is record
 
     path = str(tmp_path / "run_config.yaml")
-    root.to_yaml(path)
-    rebuilt = RLRunConfigContainer.from_yaml(path)
-    # The pretrain sections' own YAML round trip turns one tuple field into a list (their own
-    # serialization); the document and the RL-side sections round-trip exactly.
-    assert rebuilt.to_dict() == root.to_dict()
-    assert (rebuilt.rl, rebuilt.inference) == (root.rl, root.inference)
+    record.to_yaml(path)
+    rebuilt = RunConfigRecord.from_yaml(path)
+    # The pretrain member's own YAML round trip turns one tuple field into a list (its own
+    # serialization); the document and the RL-side members round-trip exactly.
+    assert rebuilt.to_dict() == record.to_dict()
+    assert (rebuilt.rl, rebuilt.inference) == (record.rl, record.inference)
     with open(path) as f:
         document = yaml.safe_load(f)
-    assert document["_target_"] == "megatron.rl.config.RLRunConfigContainer"
-    assert {"train", "model", "checkpoint", "inference", "rl"} <= set(document)
+    assert document["_target_"] == "megatron.training.config.container.RunConfigRecord"
+    assert set(document) == {"_target_", "pretrain", "inference", "rl"}
+    assert document["pretrain"]["_target_"].endswith(".PretrainConfigContainer")
     assert document["rl"]["_target_"] == "megatron.training.config.rl_config.RLConfig"
-    assert document["inference"]["_target_"].endswith(".InferenceConfigContainer")
+    # Symmetry: an inference run's record plus the training and RL members is the RL record.
+    as_dict = record.to_dict()
+    grown = RunConfigRecord.from_dict(
+        {**inference_record, "pretrain": as_dict["pretrain"], "rl": as_dict["rl"]}
+    )
+    assert grown.to_dict() == as_dict
+    # Readers that look sections up by name get the pretrain member of a record, nothing from a
+    # record without one, and a legacy flat record as it is.
+    assert run_config_sections(document) is document["pretrain"]
+    assert run_config_sections(inference_record) is None
+    assert run_config_sections(document["pretrain"]) is document["pretrain"]
+    assert run_config_sections(None) is None

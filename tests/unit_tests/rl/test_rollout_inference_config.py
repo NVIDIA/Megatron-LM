@@ -9,10 +9,10 @@ import pytest
 
 from megatron.inference.utils import add_inference_args
 from megatron.rl.config import (
-    RLRunConfigContainer,
     add_rl_args,
     rollout_inference_container_from_args,
     rollout_model_is_separate,
+    validate_rl_run,
 )
 from megatron.training.argument_utils import (
     _default_config_from_args,
@@ -20,7 +20,12 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.config import InferenceConfigContainer, RLConfig, TokenizerConfig
+from megatron.training.config import (
+    InferenceConfigContainer,
+    RLConfig,
+    RunConfigRecord,
+    TokenizerConfig,
+)
 
 BASE_ARGV = (
     "test_rollout_inference_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
@@ -117,9 +122,9 @@ def test_weight_placement_is_the_rl_sections():
         1,
         True,
     )
-    run = RLRunConfigContainer.from_pretrain(pretrain, inference=deployment, rl=rl)
+    run = RunConfigRecord(pretrain=pretrain, inference=deployment, rl=rl)
     with pytest.raises(ValueError, match="requires a separate inference model"):
-        run.validate()
+        validate_rl_run(run)
     args, pretrain, deployment = _containers(
         "--rl-inference-model-unified-memory-level",
         "1",
@@ -127,9 +132,11 @@ def test_weight_placement_is_the_rl_sections():
         "--rl-inference-tensor-model-parallel-size",
         "1",
     )
-    RLRunConfigContainer.from_pretrain(
-        pretrain, inference=deployment, rl=_default_config_from_args(RLConfig, args)
-    ).validate()
+    validate_rl_run(
+        RunConfigRecord(
+            pretrain=pretrain, inference=deployment, rl=_default_config_from_args(RLConfig, args)
+        )
+    )
 
 
 def test_finalize_applies_the_training_rng_policy_to_the_rollout_model():

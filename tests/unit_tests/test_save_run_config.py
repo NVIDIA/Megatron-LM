@@ -131,8 +131,11 @@ def test_save_checkpoint_without_optimizer(
         assert "opt_param_scheduler" not in saved
         assert (save_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "123"
         saved_config = read_run_config(get_checkpoint_run_config_filename(str(ckpt_dir)))
-        assert saved_config["_target_"].endswith(".InferenceConfigContainer")
-        assert "optimizer" not in saved_config
+        # The record names the run's containers as members: an inference run records only its own.
+        assert saved_config["_target_"].endswith(".RunConfigRecord")
+        assert set(saved_config) == {"_target_", "inference"}
+        assert saved_config["inference"]["_target_"].endswith(".InferenceConfigContainer")
+        assert "optimizer" not in saved_config["inference"]
 
 
 def test_save_checkpoint_writes_run_config_release(

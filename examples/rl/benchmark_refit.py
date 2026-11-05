@@ -19,15 +19,28 @@ from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopySer
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.rl.config import add_rl_args, rl_run_config_container_from_args
+from megatron.rl.config import (
+    add_rl_args,
+    finalize_rl_run,
+    get_rl_run_config,
+    rollout_inference_container_from_args,
+    set_rl_run_config,
+)
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    _default_config_from_args,
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.config import RLConfig, RunConfigRecord
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import is_hybrid_model
+
 
 def add_benchmark_args(parser):
     """Add the RL section and the benchmark arguments."""
@@ -104,7 +117,7 @@ def print_config_summary(cfg, args, src_config, dst_config, world_size, mode):
     print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={cfg.tokenizer.vocab_size}")
     if args.num_experts:
         print_rank_0(f"MoE: {args.num_experts} experts, top-{args.moe_router_topk}")
-    print_rank_0(f"Backend: {get_run_config().rl.refit_method}")
+    print_rank_0(f"Backend: {get_rl_run_config().rl.refit_method}")
     print_rank_0(f"{'='*80}\n")
 
 
@@ -165,7 +178,7 @@ def print_results(timings):
     """Print benchmark results."""
     if torch.distributed.get_rank() == 0:
         args = get_args()
-        cfg = get_run_config()
+        cfg = get_rl_run_config()
         destination = cfg.inference.model.transformer
         mean_time = sum(timings) / len(timings)
         min_time = min(timings)
@@ -210,7 +223,7 @@ def print_results(timings):
 def benchmark_collocated():
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     destination = cfg.inference.model.transformer
     world_size = torch.distributed.get_world_size()
 
@@ -230,7 +243,7 @@ def benchmark_collocated():
     # Print config
     src_config = {'tp': src_tp, 'pp': src_pp, 'ep': src_ep, 'dp': src_dp}
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': dst_dp}
-    print_config_summary(cfg, args, src_config, dst_config, world_size, 'collocated')
+    print_config_summary(get_run_config(), args, src_config, dst_config, world_size, 'collocated')
 
     # Build source model
     print_rank_0("Building source model...")
@@ -250,7 +263,7 @@ def benchmark_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=destination.expert_tensor_parallel_size,
-        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=get_run_config().dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -298,7 +311,7 @@ def benchmark_collocated():
 def benchmark_non_collocated():
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     destination = cfg.inference.model.transformer
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -330,7 +343,7 @@ def benchmark_non_collocated():
     # Print config
     src_config = {'tp': src_tp, 'pp': src_pp, 'ep': src_ep, 'dp': 1}
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': 1}
-    print_config_summary(cfg, args, src_config, dst_config, world_size, 'non-collocated')
+    print_config_summary(get_run_config(), args, src_config, dst_config, world_size, 'non-collocated')
     if world_size > required_size:
         print_rank_0(f"Note: Ranks {required_size}-{world_size-1} are idle\n")
 
@@ -342,7 +355,7 @@ def benchmark_non_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=destination.expert_tensor_parallel_size,
-        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=get_run_config().dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
@@ -424,22 +437,32 @@ def main():
     # The RL run config, composed as train_rl.py composes it:
     # the pretrain sections (the benchmark builds its models so they carry no model config),
     # the destination deployment described like the RL loop's rollout engine, and the RL section.
+    pretrain_container = pretrain_cfg_container_from_args(args)
+    set_run_config(pretrain_container)
     model_cfg = hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
-    rl_run_config = rl_run_config_container_from_args(args, rollout_model_cfg=model_cfg)
-    set_run_config(rl_run_config)
+    record = RunConfigRecord(
+        pretrain=pretrain_container,
+        inference=rollout_inference_container_from_args(
+            args, pretrain_container, model_cfg=model_cfg
+        ),
+        rl=_default_config_from_args(RLConfig, args),
+    )
+    finalize_rl_run(record)
+    set_rl_run_config(record)
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
     initialize_megatron(training=True, skip_dependency_compilation=True)
 
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
 
     if cfg.rl.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
         raise ValueError("NCCL M2N supports only non-collocated refit")
 
-    # Set default vocab size if not provided
-    if cfg.tokenizer.vocab_size is None:
-        cfg.tokenizer.vocab_size = 50257
+    # Set default vocab size if not provided (the tokenizer section is the run config's)
+    tokenizer_cfg = get_run_config().tokenizer
+    if tokenizer_cfg.vocab_size is None:
+        tokenizer_cfg.vocab_size = 50257
         print_rank_0("Using default vocab_size=50257")
 
     try:

@@ -37,6 +37,7 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -893,3 +894,41 @@ class InferenceConfigContainer(ConfigContainerBase):
             # A conversion run (the checkpoint converters bootstrap through this container) exits
             # instead of loading random weights, as validate_args derives it.
             self.checkpoint.exit_on_missing_checkpoint = True
+
+
+@dataclass(kw_only=True)
+class RunConfigRecord(ConfigContainerBase):
+    """The configuration record of a run (`run_config.yaml`).
+
+    A training run records `pretrain`, an inference run records `inference`,
+    an RL run records `pretrain`, `inference`, and `rl`.
+
+    Records written before this type, a container serialized flat, still load through
+    `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
+    """
+
+    pretrain: PretrainConfigContainer | None = None
+    inference: InferenceConfigContainer | None = None
+    rl: RLConfig | None = None
+
+    @classmethod
+    def wrap(cls, run_config):
+        """The record of a process that registered only its run config."""
+        if isinstance(run_config, PretrainConfigContainer):
+            return cls(pretrain=run_config)
+        if isinstance(run_config, InferenceConfigContainer):
+            return cls(inference=run_config)
+        return run_config
+
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """The document holds only the members the run has. Section overrides (a checkpoint save's
+        own directory and format) reach the member that is the run config: `pretrain`, else
+        `inference`."""
+        document = {key: value for key, value in super().to_dict().items() if value is not None}
+        if section_overrides:
+            owner = "pretrain" if self.pretrain is not None else "inference"
+            member = getattr(self, owner)
+            if member is None:
+                raise ValueError("RunConfigRecord has no run config member to apply overrides to")
+            document[owner] = member.to_dict(**section_overrides)
+        return document

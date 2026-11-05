@@ -53,7 +53,13 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
-from megatron.rl.config import RLRunConfigContainer, add_rl_args
+from megatron.rl.config import (
+    add_rl_args,
+    finalize_rl_run,
+    set_rl_run_config,
+    unset_rl_run_config,
+    validate_rl_run,
+)
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.argument_utils import (
@@ -67,6 +73,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
+    RunConfigRecord,
 )
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -80,10 +87,9 @@ VOCAB = 768
 
 
 def _rl_run_config(args, pretrain):
-    """The RL run config of a colocated run whose engine shares the training model, built around
-    the pretrain container's sections."""
-    return RLRunConfigContainer.from_pretrain(
-        pretrain,
+    """The RL run's record for a colocated run whose engine shares the training model."""
+    return RunConfigRecord(
+        pretrain=pretrain,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
@@ -94,7 +100,7 @@ def _rl_run_config(args, pretrain):
 def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
     """Refit uses RLConfig while shard layout remains a launch argument."""
     rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
-    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+    monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
     args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
     model, inference_model = object(), object()
     with (
@@ -138,12 +144,11 @@ def test_setup_callback(monkeypatch, skip_train, rollout_only, optimizer):
     the run eval-only."""
     calls = []
     args = SimpleNamespace()
-    run_config = SimpleNamespace(
-        validation=SimpleNamespace(skip_train=skip_train),
-        rl=SimpleNamespace(rl_rollout_only=rollout_only),
-    )
+    run_config = SimpleNamespace(validation=SimpleNamespace(skip_train=skip_train))
+    rl_run_config = SimpleNamespace(rl=SimpleNamespace(rl_rollout_only=rollout_only))
     monkeypatch.setattr(training_setup, "get_args", lambda: args)
     monkeypatch.setattr(training_setup, "get_run_config", lambda: run_config)
+    monkeypatch.setattr(training_setup, "get_rl_run_config", lambda: rl_run_config)
     monkeypatch.setattr(training_setup, "get_model_config", lambda chunk: f"config({chunk})")
     monkeypatch.setattr(training_setup.mpu, "get_data_parallel_world_size", lambda: 4)
     monkeypatch.setattr(
@@ -553,6 +558,7 @@ class TestRLUtils:
     def create_test_args(self, **kwargs):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        unset_rl_run_config()
 
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8
@@ -571,7 +577,8 @@ class TestRLUtils:
         args = validate_args(args)
         pretrain = pretrain_cfg_container_from_args(args)
         pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-        set_global_variables(args, _rl_run_config(args, pretrain), build_tokenizer=False)
+        set_global_variables(args, pretrain, build_tokenizer=False)
+        set_rl_run_config(_rl_run_config(args, pretrain))
         return args
 
     @pytest.mark.parametrize(
@@ -729,7 +736,7 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
         )
@@ -818,12 +825,12 @@ class TestRLUtils:
         rl_run = _rl_run_config(args, pretrain)
         assert not pretrain.ddp.grad_buffer_offload
         rl_run.rl.rl_offload_optimizer_during_inference = False
-        rl_run.validate()
+        validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
         rl_run.rl.rl_offload_optimizer_during_inference = True
-        rl_run.validate()
+        validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
-        rl_run.finalize()
+        finalize_rl_run(rl_run)
         assert pretrain.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
@@ -841,7 +848,7 @@ class TestRLUtils:
         pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
         rl_run = _rl_run_config(args, pretrain)
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-            rl_run.validate()
+            validate_rl_run(rl_run)
         assert not pretrain.ddp.grad_buffer_offload
 
     @pytest.mark.parametrize(
@@ -861,7 +868,7 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
@@ -1015,7 +1022,7 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )
@@ -1089,7 +1096,7 @@ class TestRLUtils:
         layer_config = config if share_config else SimpleNamespace(flash_decode=True)
         model = DummyLogprobsModel(config, layer_config)
         monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+        monkeypatch.setattr(rl_utils, "get_rl_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
         )
@@ -1420,16 +1427,14 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
-        # The RL root is the run config here; the loss function reads the rerun flags through it.
+        # The loss function reads the rerun flags through the pretrain run config (the fixture);
+        # forward_step reads the RL section through the record.
         run_config.rerun_state_machine.check_for_nan_in_loss = False
         monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         monkeypatch.setattr(
             train_rl,
-            "get_run_config",
-            lambda: SimpleNamespace(
-                rl=RLConfig(rl_use_sequence_packing=packing),
-                rerun_state_machine=run_config.rerun_state_machine,
-            ),
+            "get_rl_run_config",
+            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
         )
         if packing:
             seq_indices = [11, 12, 13, 14, 15]

@@ -97,6 +97,7 @@ from megatron.rl.agent.api import (
 )
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
+from megatron.rl.config import get_rl_run_config
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
@@ -147,7 +148,7 @@ _INFERENCE_MODEL_IS_PAUSED = False
 
 def inference_model_alloc_context():
     """Return the allocation context for a separate RL inference model."""
-    rl_config = get_run_config().rl
+    rl_config = get_rl_run_config().rl
     uvm_level = rl_config.rl_inference_model_unified_memory_level
     if rl_config.rl_offload_inference_model_weights and uvm_level == 0 and HAVE_TORCH_MEMORY_SAVER:
         return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
@@ -159,7 +160,7 @@ def inference_model_alloc_context():
 def refit_inference_model(model, inference_model, args) -> int:
     """Copy training weights and return the number of destination pools."""
 
-    rl_config = get_run_config().rl
+    rl_config = get_rl_run_config().rl
     num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
     prepare_swap_model_weights(
         src_model=model,
@@ -222,7 +223,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     Gated by the run config's RL section; this assumes the separate inference model was allocated
     with UVM or torch_memory_saver when enabled.
     """
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     if not cfg.rl.rl_offload_inference_model_weights:
         return
 
@@ -451,7 +452,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -532,7 +533,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif cfg.logger.log_throughput:
+    elif get_run_config().logger.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string
@@ -715,7 +716,7 @@ _ROLLOUT_BANK = None
 def maybe_get_rollout_bank(args):
     """Return the durable rollout bank singleton, creating it on first use."""
     global _ROLLOUT_BANK
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     if not cfg.rl.rl_durable_rollout_bank:
         logger.debug("Durable rollout bank is disabled; proceeding without it.")
         return None
@@ -726,7 +727,7 @@ def maybe_get_rollout_bank(args):
         from megatron.rl.rollout_bank import RolloutBank
 
         bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(
-            cfg.checkpoint.save or ".", "rollout_bank"
+            get_run_config().checkpoint.save or ".", "rollout_bank"
         )
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
@@ -835,7 +836,7 @@ def colocated_inference(
         Collected rollout groups (on rank 0) and the merged per-request metadata ledger.
     """
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
 
@@ -863,7 +864,7 @@ def colocated_inference(
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,
-                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
+                padded_vocab_size=get_run_config().tokenizer.padded_vocab_size,
                 atol=.1,
                 rtol=5e-4,
             )
@@ -976,7 +977,7 @@ def get_environment_rollouts(
     Returns:
         (GroupedRollouts, per-request metadata ledger)
     """
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     train_state = get_train_state()
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
@@ -1346,7 +1347,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
     # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
     # When sequence_packing is disabled, construct a single-sequence default so the CUDA
@@ -2555,7 +2556,8 @@ def prepare_data_for_update(
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
     """
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
+    train_cfg = get_run_config().train
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
@@ -2589,7 +2591,7 @@ def prepare_data_for_update(
         rollouts = [r for g in rollouts for r in g]
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = cfg.train.global_batch_size / cfg.rl.grpo_samples_per_iteration
+        samples_ratio_per_step = train_cfg.global_batch_size / cfg.rl.grpo_samples_per_iteration
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         # Build training rows. A rollout collapses to one combined row when its turns form a
@@ -2617,7 +2619,7 @@ def prepare_data_for_update(
         # The rollout count is data-dependent (oversampling, group filtering), so it need not
         # divide evenly across ranks and microbatches. Pad to the next multiple of
         # (DP size * micro_batch_size) with inert rows (zero advantage, no loss contribution).
-        pad_to_multiple = data_parallel_world_size * cfg.train.micro_batch_size
+        pad_to_multiple = data_parallel_world_size * train_cfg.micro_batch_size
         if pad_n := -len(rows) % pad_to_multiple:
             rows = rows + [PAD_ROW] * pad_n
             advantages = global_advantages = torch.cat(
@@ -2690,9 +2692,9 @@ def prepare_data_for_update(
                 compute_position_ids = original_position_ids
                 data_loader = DataLoader(
                     TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=cfg.train.micro_batch_size,
+                    batch_size=train_cfg.micro_batch_size,
                 )
-                logprobs_batch_size = cfg.train.micro_batch_size
+                logprobs_batch_size = train_cfg.micro_batch_size
 
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
@@ -2801,11 +2803,11 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=cfg.train.global_batch_size,
-                    micro_batch_size=cfg.train.micro_batch_size,
-                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+                    global_batch_size=train_cfg.global_batch_size,
+                    micro_batch_size=train_cfg.micro_batch_size,
+                    decrease_batch_size_if_needed=train_cfg.decrease_batch_size_if_needed,
                )
-                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), cfg.train.micro_batch_size)
+                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), train_cfg.micro_batch_size)
         else:
             with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
@@ -2828,8 +2830,8 @@ def prepare_data_for_update(
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
                     global_batch_size=math.ceil(samples_ratio_per_step*total_rows),
-                    micro_batch_size=cfg.train.micro_batch_size,
-                    decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+                    micro_batch_size=train_cfg.micro_batch_size,
+                    decrease_batch_size_if_needed=train_cfg.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
 
@@ -2846,7 +2848,7 @@ def prepare_data_for_update(
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
-                loader = DataLoader(data, batch_size=cfg.train.micro_batch_size)
+                loader = DataLoader(data, batch_size=train_cfg.micro_batch_size)
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
@@ -2966,7 +2968,7 @@ def evaluate_and_print_results_rl(
             grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     train_state = get_train_state()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
@@ -3260,7 +3262,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
-    cfg = get_run_config()
+    cfg = get_rl_run_config()
     train_state = get_train_state()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()

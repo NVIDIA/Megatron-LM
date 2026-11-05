@@ -9,13 +9,14 @@ import pytest
 
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.rl.config import RLRunConfigContainer
+from megatron.rl.config import finalize_rl_run, validate_rl_run
 from megatron.training import global_vars
 from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
+    RunConfigRecord,
 )
 from megatron.training.models import (
     BertModelConfig,
@@ -54,13 +55,13 @@ def test_validation_is_read_only_and_finalization_runs_once(
         else run_config
     )
     cfg.model = model
+    rl_run = None
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        # The RL run config shares the fixture's sections; it validates the RL section against
-        # the run and derives its DDP layout within its own lifecycle.
-        cfg = RLRunConfigContainer.from_pretrain(
-            cfg,
+        # The RL run's root validates the RL section against the run and derives its DDP layout.
+        rl_run = RunConfigRecord(
+            pretrain=cfg,
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
@@ -69,6 +70,8 @@ def test_validation_is_read_only_and_finalization_runs_once(
     before = copy.deepcopy(cfg.to_dict())
     for _ in range(2):
         cfg.validate()
+        if rl_run is not None:
+            validate_rl_run(rl_run)
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
@@ -77,9 +80,10 @@ def test_validation_is_read_only_and_finalization_runs_once(
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
     model_finalize = Mock(wraps=model.finalize)
     monkeypatch.setattr(model, "finalize", model_finalize)
-    cfg.finalize()
-    if not inference:
+    if rl_run is not None:
+        finalize_rl_run(rl_run)
         assert cfg.ddp.grad_buffer_offload
+    cfg.finalize()
     assert cfg._finalized
     assert cfg.rng.te_rng_tracker is (transformer_impl == "transformer_engine")
     assert transformer.use_te_rng_tracker is cfg.rng.te_rng_tracker
@@ -202,8 +206,8 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    run_config = RLRunConfigContainer.from_pretrain(
-        run_config,
+    rl_run = RunConfigRecord(
+        pretrain=run_config,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
         ),
@@ -224,7 +228,16 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
         error, message = AssertionError, "Make sure the number of model chunks"
     before = copy.deepcopy(run_config.to_dict())
-    for check in (run_config.validate, run_config.validate, run_config.finalize):
+    if invalid_policy == "ddp_offload":
+        # The RL rule lives on the record, not on the pretrain container.
+        checks = [
+            lambda: validate_rl_run(rl_run),
+            lambda: validate_rl_run(rl_run),
+            lambda: finalize_rl_run(rl_run),
+        ]
+    else:
+        checks = [run_config.validate, run_config.validate, run_config.finalize]
+    for check in checks:
         with pytest.raises(error, match=message):
             check()
         assert run_config.to_dict() == before
@@ -242,6 +255,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     else:
         transformer.virtual_pipeline_model_parallel_size = 2
+    finalize_rl_run(rl_run)
     run_config.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
