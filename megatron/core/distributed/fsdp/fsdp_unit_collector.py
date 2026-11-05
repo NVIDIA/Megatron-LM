@@ -18,6 +18,7 @@ from typing import NamedTuple, Sequence
 
 from torch import nn
 
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -30,10 +31,12 @@ class _SelectiveRecompute(NamedTuple):
     forward hooks of the FSDP unit owning those weights.
     """
 
-    # Attribute a module sets to True at construction when it recomputes.
-    flag: str
-    # Attribute naming the rerun submodule, or None when the module reruns itself.
-    rerun_submodule: str | None
+    # Name of the bool attribute a module sets to True at construction when it recomputes,
+    # e.g. "recompute_mlp" for TransformerLayer.
+    recompute_flag_name: str
+    # Name of the module's attribute holding the child that the recompute reruns, e.g. "mlp"
+    # for TransformerLayer, or None when the module reruns itself.
+    recomputed_submodule_name: str | None
 
 
 _SELECTIVE_RECOMPUTES = (
@@ -66,22 +69,25 @@ class FsdpUnitCollector:
                 SequentialMLP,
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
-        self._collected_units_in_preorder: dict[nn.Module, None] = {}
+        # Maps each collected unit, in pre-order, to the modules it owns: itself and its
+        # descendants outside nested units.
+        self._owned_modules_by_unit: dict[nn.Module, dict[nn.Module, None]] = {}
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules in reverse pre-order, including the root last."""
-        self._collected_units_in_preorder = {module: None}
-        self._visit(module, under_shortcut=False)
-        return list(reversed(self._collected_units_in_preorder))
+        self._owned_modules_by_unit = {}
+        self._visit(module, owner=module, under_shortcut=False)
+        return list(reversed(self._owned_modules_by_unit))
 
-    def is_used_by_recomputation(self, unit: nn.Module) -> bool:
-        """Whether activation recomputation uses this unit's weights without calling the unit.
+    def is_partially_recomputed(self, unit: nn.Module) -> bool:
+        """Whether activation recomputation reruns part of this unit's forward without calling
+        the unit.
 
-        Such a unit needs SchedulePolicy.unshard_all_planes_in_backward. Weights of a nested
-        unit belong to that unit, whose own hooks run during recomputation. Call collect()
-        first.
+        The rerun uses the unit's weights without its hooks, so the unit needs
+        SchedulePolicy.unshard_all_planes_in_backward. Modules inside a nested unit don't
+        count: their own hooks run during recomputation.
         """
-        owned = self._owned_modules(unit)
+        owned = self._owned_modules_by_unit[unit]
         for module in owned:
             for rerun in _rerun_submodules(module):
                 for submodule in rerun.modules():
@@ -93,24 +99,16 @@ class FsdpUnitCollector:
                         return True
         return False
 
-    def _owned_modules(self, unit: nn.Module) -> dict[nn.Module, None]:
-        """Return the unit and its descendants that are not inside a nested unit."""
-        owned = {unit: None}
-        pending = list(unit.children())
-        while pending:
-            submodule = pending.pop()
-            if submodule not in self._collected_units_in_preorder:
-                owned[submodule] = None
-                pending.extend(submodule.children())
-        return owned
-
-    def _visit(self, module: nn.Module, under_shortcut: bool) -> None:
-        if self._should_shard(module, under_shortcut):
-            self._collected_units_in_preorder[module] = None
+    def _visit(self, module: nn.Module, owner: nn.Module, under_shortcut: bool) -> None:
+        # The root is always a unit.
+        if module is owner or self._should_shard(module, under_shortcut):
+            owner = module
+            self._owned_modules_by_unit[owner] = {}
+        self._owned_modules_by_unit[owner][module] = None
 
         under_shortcut = under_shortcut or isinstance(module, ShortcutMoEBlock)
         for child in module.children():
-            self._visit(child, under_shortcut)
+            self._visit(child, owner, under_shortcut)
 
     def _should_shard(self, module: nn.Module, under_shortcut: bool) -> bool:
         """Whether this module should be an independent FSDP unit."""
@@ -132,7 +130,6 @@ class FsdpUnitCollector:
 
 def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
     """Return the parts of this module's forward that its own checkpoints rerun in backward."""
-    from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
     from megatron.core.transformer.transformer_block import TransformerBlock
 
@@ -154,13 +151,13 @@ def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
     # Selective recompute flags are set from each module's own config.
     rerun = []
     for recompute in _SELECTIVE_RECOMPUTES:
-        if getattr(module, recompute.flag, False) is not True:
+        if getattr(module, recompute.recompute_flag_name, False) is not True:
             continue
-        if recompute.rerun_submodule is None:
+        if recompute.recomputed_submodule_name is None:
             rerun.append(module)
             continue
         # The submodule may be absent, e.g. shared_experts is None without shared experts.
-        submodule = getattr(module, recompute.rerun_submodule, None)
+        submodule = getattr(module, recompute.recomputed_submodule_name, None)
         if submodule is not None:
             rerun.append(submodule)
     return rerun

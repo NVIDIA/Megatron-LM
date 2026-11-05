@@ -32,12 +32,9 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 __all__ = ["FullyShardedDataParallelV2"]
@@ -284,9 +281,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
                     schedule_policy=replace(
                         schedule_policy,
-                        unshard_all_planes_in_backward=collector.is_used_by_recomputation(
-                            submodule
-                        ),
+                        unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
                     ),
                     **common_fully_shard_kwargs,
                 )
