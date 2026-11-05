@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Nemotron6-MoE VLM model provider for hetero MIMO examples."""
+"""Nemotron MoE VLM model provider for heterogeneous MIMO examples."""
 
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ def nemotron_language_config(
     expt_tp_size: int,
     cp_size: int = 1,
 ) -> TransformerConfig:
-    """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
+    """Nemotron MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
     gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
@@ -416,7 +416,7 @@ def build_nemotron_communicator(
 
 
 def nemotron_provider() -> MimoProvider:
-    """Provider descriptor for the Nemotron6-MoE + RADIO VLM."""
+    """Provider descriptor for the Nemotron MoE + RADIO VLM."""
     return MimoProvider(
         encoder_module_names=(RADIO_ENCODER_MODULE_NAME,),
         language_spec=language_model_spec,
