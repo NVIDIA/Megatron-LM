@@ -167,6 +167,9 @@ def validate_at_pretrain(monkeypatch, run_config):
     setup = Mock()
     monkeypatch.setattr(training, "initialize_megatron", initialize)
     monkeypatch.setattr(training.ft_integration, "setup", setup)
+    # pretrain() finalizes the container before fault-tolerance setup; that needs the
+    # registered args, which these validation-order checks stop short of.
+    monkeypatch.setattr(run_config, "finalize", Mock())
 
     def validate(config):
         run_config.profiling = config
