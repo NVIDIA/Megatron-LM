@@ -359,8 +359,7 @@ Requirements and limits:
   remain fixed after each layer's first forward.
 - Use per-expert parameters with grouped-tensor GEMM, fused gradient accumulation, FP32 router
   probabilities, and BF16 or native MXFP8 weights. The op fuser is optional. MXFP8 additionally
-  requires `--fp8-param --fp8-param-gather --reuse-grad-buf-for-mxfp8-param-ag` with the
-  `mxfp8` recipe and `e4m3` format.
+  requires `--fp8-param --fp8-param-gather` with the `mxfp8` recipe and `e4m3` format.
 - Use regular DDP or the distributed optimizer with eagerly allocated expert `main_grad` buffers.
   Megatron-FSDP v1/v2 and lazy gradient allocation are unsupported. Expert GTP is supported.
 - Leave `moe_expert_rank_capacity_factor` unset and disable `moe_paged_stash`. MoonEP selects
@@ -567,7 +566,7 @@ FP8 training provides benefits across all three performance walls:
 | Optimization | Description | Config |
 |--------------|-------------|--------|
 | **Routing Map Padding** | Pads routing map (not tokens) to align M dimension to 16/32, avoiding per-tensor padding overhead | `--moe-router-padding-for-fp8` |
-| **FP8 Primary Weights** | Casts FP32 master weights directly to FP8, eliminating BF16 intermediate copy | `--fp8-param-gather` (Need additional `--reuse-grad-buf-for-mxfp8-param-ag` for MXFP8) |
+| **FP8 Primary Weights** | Casts FP32 master weights directly to FP8, eliminating BF16 intermediate copy | `--fp8-param-gather` |
 
 
 #### Example Configuration
@@ -583,8 +582,7 @@ FP8 training provides benefits across all three performance walls:
 --fp8-format e4m3
 --fp8-recipe mxfp8
 --moe-router-padding-for-fp8
---fp8-param-gather 
---reuse-grad-buf-for-mxfp8-param-ag
+--fp8-param-gather
 ```
 
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
@@ -644,9 +642,10 @@ The optional shared output gate aliases the native shared-expert parameter and a
 its FP32 or BF16 `main_grad`. It supports Qwen3.5's gated shared-expert MoE without changing native
 parameter ownership or checkpoint keys; the GDN and attention layers retain their existing paths.
 
-With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
-native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
-require this mode in the current MCore buffer implementation. MOK aliases the native payloads
+With MXFP8 parameter all-gather, which is staged in the gradient buffer, MCore completes the
+all-gather, requantizes into native TE storage, and clears the staging buffer before MOK runs.
+Single-grouped MXFP8 parameters require this mode in the current MCore buffer implementation.
+MOK aliases the native payloads
 and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
 both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
 
