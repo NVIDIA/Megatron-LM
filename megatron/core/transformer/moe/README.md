@@ -314,16 +314,6 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **HybridEP with virtual-expert load balancing** | Balances overloaded experts with runtime virtual-expert slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep --moe-virtual-expert-load-balance` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
-#### HybridEP buffer lifetime
-
-HybridEP reuses its cached communication buffer only for the same process-group
-object. A dispatch on a different group creates a new buffer, even when the two
-groups have identical ranks. Each dispatch handle retains its originating buffer,
-so combine and backward continue to use that buffer if another group dispatches
-or the cache is reset in between. Complete outstanding operations and release
-their handles and autograd graphs before destroying the associated process group.
-Resetting the buffer cache does not destroy process groups.
-
 #### Virtual-expert load balancing
 
 Enable with `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep

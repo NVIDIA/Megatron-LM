@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
@@ -108,6 +108,13 @@ def cleanup():
         except Exception:
             return
         torch.distributed.destroy_process_group()
+
+
+@pytest.fixture(scope="function", autouse=True)
+def destroy_retired_process_groups():
+    """Destroy the model-parallel process groups a test retired once it finishes."""
+    yield
+    Utils.destroy_retired_process_groups()
 
 
 @pytest.fixture(scope="function", autouse=True)
