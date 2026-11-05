@@ -68,9 +68,7 @@ def test_simplified_indexer_uses_fused_main_qkv_normalized_input(normalization):
     hidden = torch.randn(5, 2, 8, requires_grad=True)
     weight = torch.randn(8)
     bias = torch.randn(8) if normalization == "LayerNorm" else None
-    linear_qkv = SimpleNamespace(
-        layer_norm_weight=weight, layer_norm_bias=bias, eps=1.0e-5, skip_norm_and_all_gather=False
-    )
+    linear_qkv = SimpleNamespace(layer_norm_weight=weight, layer_norm_bias=bias, eps=1.0e-5)
     config = SimpleNamespace(
         normalization=normalization, layernorm_epsilon=1.0e-5, layernorm_zero_centered_gamma=False
     )
@@ -93,7 +91,7 @@ def test_simplified_indexer_uses_fused_main_qkv_normalized_input(normalization):
 
 def test_simplified_indexer_recomputes_norm_when_qkv_uses_fused_input_buffer():
     hidden = torch.randn(5, 2, 8, requires_grad=True)
-    linear_qkv = SimpleNamespace(layer_norm_weight=torch.randn(8), skip_norm_and_all_gather=True)
+    linear_qkv = SimpleNamespace(layer_norm_weight=torch.randn(8))
     config = SimpleNamespace(
         normalization="RMSNorm", layernorm_epsilon=1.0e-5, layernorm_zero_centered_gamma=False
     )
@@ -117,9 +115,7 @@ def test_simplified_indexer_input_honors_zero_centered_gamma_without_norm_grads(
     hidden = torch.randn(4, 2, 6, requires_grad=True)
     weight = torch.nn.Parameter(torch.randn(6))
     bias = torch.nn.Parameter(torch.randn(6)) if normalization == "LayerNorm" else None
-    linear_qkv = SimpleNamespace(
-        layer_norm_weight=weight, layer_norm_bias=bias, eps=2.0e-5, skip_norm_and_all_gather=False
-    )
+    linear_qkv = SimpleNamespace(layer_norm_weight=weight, layer_norm_bias=bias, eps=2.0e-5)
     config = SimpleNamespace(
         normalization=normalization, layernorm_epsilon=2.0e-5, layernorm_zero_centered_gamma=True
     )
