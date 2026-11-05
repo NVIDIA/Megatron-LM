@@ -221,8 +221,14 @@ def build_dist_opt_training_optimizer(
     is_expert: ExpertClassifierFn | None = None,
     skip_ddp_wrap: bool = False,
     deterministic: bool | None = None,
+    per_token_loss: bool = False,
 ):
-    """Build the dist_opt DDP+optimizer stack from a Megatron Lite model ImplConfig."""
+    """Build the dist_opt DDP+optimizer stack from a Megatron Lite model ImplConfig.
+
+    ``per_token_loss``: the model's loss is a token sum. DDP then does not pre-scale
+    gradients, and ``finalize_grads(num_tokens=...)`` divides them by the token count
+    summed over DP x CP (Megatron-Core ``calculate_per_token_loss``).
+    """
 
     opt = impl_cfg.optimizer_config
     if opt is None:
@@ -246,6 +252,7 @@ def build_dist_opt_training_optimizer(
         parallel=impl_cfg.parallel,
         optimizer=opt,
         deterministic=bool(deterministic),
+        calculate_per_token_loss=bool(per_token_loss),
     )
     model_chunks[:], optimizer = build_dist_opt_stack(
         model_chunks,
@@ -256,17 +263,21 @@ def build_dist_opt_training_optimizer(
         skip_ddp_wrap=skip_ddp_wrap,
     )
 
-    def finalize_grads() -> None:
-        finalize_dist_opt_grads(model_chunks, optimizer)
+    def finalize_grads(num_tokens: torch.Tensor | None = None) -> None:
+        finalize_dist_opt_grads(model_chunks, optimizer, num_tokens=num_tokens)
 
     return optimizer, finalize_grads
 
 
-def finalize_dist_opt_grads(model_chunks: list[nn.Module], optimizer) -> None:
+def finalize_dist_opt_grads(
+    model_chunks: list[nn.Module], optimizer, num_tokens: torch.Tensor | None = None
+) -> None:
     """Run Megatron-Core gradient finalization to match the optimizer's expected contract."""
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 
-    finalize_model_grads(model_chunks, pg_collection=optimizer._dist_opt_pg_collection)
+    finalize_model_grads(
+        model_chunks, num_tokens=num_tokens, pg_collection=optimizer._dist_opt_pg_collection
+    )
 
 
 def _build_transformer_config(model_cfg, engine_cfg):
@@ -288,6 +299,7 @@ def _build_transformer_config(model_cfg, engine_cfg):
         sequence_parallel=p.tp > 1,
         bf16=True,
         params_dtype=torch.bfloat16,
+        calculate_per_token_loss=bool(getattr(engine_cfg, "calculate_per_token_loss", False)),
     )
     if hasattr(model_cfg, "add_bias_linear"):
         kwargs["add_bias_linear"] = bool(model_cfg.add_bias_linear)
