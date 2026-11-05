@@ -98,8 +98,10 @@ def test_live_model_requires_participating_axes(mocker, explicit_groups, field):
 def test_rejects_nonmember_sentinel(mocker, explicit_groups, initialized, field):
     mocker.patch('torch.distributed.is_initialized', return_value=initialized)
     setattr(explicit_groups, field, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-    with pytest.raises(ValueError, match=f'{field} cannot be NON_GROUP_MEMBER'):
+    with pytest.raises(ValueError, match=f'{field} cannot be NON_GROUP_MEMBER') as exc_info:
         LanguageModule(config(), pg_collection=explicit_groups)
+    # Only a nonparticipating embedding stage may use None; tp, cp and pp need a real group.
+    assert ('use None' in str(exc_info.value)) == (field == 'embd')
 
 
 @pytest.mark.parametrize('initialized', [False, True])

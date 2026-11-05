@@ -38,8 +38,8 @@ def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollect
     for pg_name in ('tp', 'cp', 'pp'):
         if pg_name not in groups:
             raise ValueError(
-                f"LanguageModule pg_collection must explicitly define {pg_name}; "
-                "use None only when that group is not needed."
+                f"{owner} pg_collection must explicitly define {pg_name}: the group this rank "
+                "belongs to, or None when torch.distributed is not initialized."
             )
     if 'embd' not in groups:
         warnings.warn(
@@ -51,16 +51,18 @@ def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollect
         )
     for pg_name in ('tp', 'cp', 'pp', 'embd'):
         if groups.get(pg_name) == torch.distributed.GroupMember.NON_GROUP_MEMBER:
-            raise ValueError(
-                f"LanguageModule {pg_name} cannot be NON_GROUP_MEMBER; "
-                "use None for a nonparticipating embedding group."
+            remedy = (
+                "use None on ranks outside the embedding group"
+                if pg_name == 'embd'
+                else "pass the group this rank belongs to"
             )
+            raise ValueError(f"{owner} {pg_name} cannot be NON_GROUP_MEMBER; {remedy}.")
     if torch.distributed.is_initialized():
         for pg_name in ('tp', 'cp', 'pp'):
             if groups[pg_name] is None:
                 raise ValueError(
-                    f"LanguageModule requires a participating {pg_name} group when "
-                    "distributed is initialized, including for singleton dimensions."
+                    f"{owner} requires a participating {pg_name} group when "
+                    "torch.distributed is initialized, including for singleton dimensions."
                 )
 
 
