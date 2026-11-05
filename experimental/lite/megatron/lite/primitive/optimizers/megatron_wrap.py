@@ -262,6 +262,22 @@ def build_dist_opt_training_optimizer(
     return optimizer, finalize_grads
 
 
+def sync_overlapped_params(model_chunks) -> None:
+    """Complete the parameter all-gather Megatron-Core DDP defers under ``overlap_param_gather``.
+
+    After an optimizer step each data-parallel rank has updated only its own shard; the other
+    shards are gathered lazily by the next forward's pre-hooks. Anything that reads parameters
+    outside a forward (checkpoint save, weight export) must sync first, or it reads the previous
+    step's values for shards this rank does not own (Megatron-LM training does the same before
+    saving).
+    """
+    for chunk in model_chunks:
+        ddp_config = getattr(chunk, "ddp_config", None)
+        if ddp_config is not None and getattr(ddp_config, "overlap_param_gather", False):
+            with torch.no_grad():
+                chunk.start_param_sync(force_sync=True)
+
+
 def finalize_dist_opt_grads(model_chunks: list[nn.Module], optimizer) -> None:
     """Run Megatron-Core gradient finalization to match the optimizer's expected contract."""
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
