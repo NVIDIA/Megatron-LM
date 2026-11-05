@@ -365,6 +365,46 @@ def test_registered_model_runs_inside_the_persistent_cpu_worker(profile_path, pr
         assert "incumbent_rejection" not in result["statistics"]
 
 
+@pytest.mark.parametrize("solver", [None, "dynamic_usp"])
+@pytest.mark.parametrize("count", [128, 255, 257])
+def test_worker_rejects_other_global_batch_sizes_before_complete_step_prediction(
+    profile_path, profile_data, solver, count
+):
+    profile_data["domain"]["step_overhead_global_batch_size"] = 256
+    profile_path.write_text(json.dumps(profile_data))
+    config = _config(profile_data, profile_path)
+    config.dynamic_cp_runtime_solver = solver
+    worker = prefetch._CpuPlanner(prefetch.runtime_spec(config, 32))
+    try:
+        with pytest.raises(RuntimeError, match="requires 256 samples per global batch"):
+            worker.solve([1024] * count, [1024] * count, None)
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("solver", [None, "dynamic_usp"])
+def test_worker_accepts_the_declared_global_batch_with_a_persistent_process(
+    profile_path, profile_data, solver
+):
+    profile_data["domain"]["step_overhead_global_batch_size"] = 256
+    profile_path.write_text(json.dumps(profile_data))
+    config = _config(profile_data, profile_path)
+    config.dynamic_cp_runtime_solver = solver
+    worker = prefetch._CpuPlanner(prefetch.runtime_spec(config, 32))
+    lengths = [1024] * 256
+    try:
+        first = worker.solve(lengths, lengths, None)
+        second = worker.solve(lengths, lengths, None)
+    finally:
+        worker.close()
+    validate_rows(first["rows"], dict(enumerate(lengths)), _geometry(), 1)
+    assert first["predicted_ms"] > 0
+    assert first["worker_pid"] == second["worker_pid"]
+    assert first["rows"] == second["rows"]
+    assert not first["worker_cuda_initialized"]
+    assert not first["worker_distributed_initialized"]
+
+
 def _wide_incumbent(cp, count=64):
     groups = 32 // cp
     assert count % groups == 0

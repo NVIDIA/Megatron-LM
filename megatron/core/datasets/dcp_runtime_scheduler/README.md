@@ -126,6 +126,10 @@ forced-balanced expert work; its accuracy on mixed layouts must be established
 by the profile's validation. Microbatch overhead is charged for every candidate
 microbatch, and iteration-tail overhead is charged once per step.
 
+The CPU worker requires the profile's declared global sample count for a full-step
+plan: this artifact uses 256. Per-pack attention queries remain independent of
+that batch-level check.
+
 The adapter selects the `classic_p2p` or `native_p2p` table from the execution
 transport. Model selection does not enable native transport. A missing table or
 an out-of-domain configuration is rejected; tables are not reused across
