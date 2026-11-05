@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
@@ -526,6 +526,19 @@ except ImportError:
 _hybrid_ep_buffer = None
 
 
+class _HybridEPHandle(tuple):
+    """Keep a dispatch's buffer alive through combine and backward.
+
+    Preserve the backend handle's tuple layout, including the overflow flag at
+    ``handle[-1]`` used by the token dispatcher.
+    """
+
+    def __new__(cls, handle, buffer):
+        instance = super().__new__(cls, handle)
+        instance.buffer = buffer
+        return instance
+
+
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
@@ -601,7 +614,11 @@ def init_hybrid_ep_buffer(
 
 def reset_hybrid_ep_buffer():
     '''
-    Reset the HybridEP buffer
+    Drop the cached HybridEP buffer for future dispatches.
+
+    Outstanding handles retain their original buffer for combine and backward.
+    Complete those operations and release their handles before destroying the
+    corresponding process group.
     '''
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
@@ -649,7 +666,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None:
+        if _hybrid_ep_buffer is None or _hybrid_ep_buffer.group is not group:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
@@ -695,6 +712,7 @@ class HybridEPDispatch(torch.autograd.Function):
             **dispatch_kwargs,
         )
 
+        handle = _HybridEPHandle(handle, _hybrid_ep_buffer)
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
@@ -712,7 +730,7 @@ class HybridEPDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         handle = ctx.handle
-        combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
+        combined_hidden, combined_probs = handle.buffer.combine_with_unpermute(
             hidden=grad_x,
             probs=grad_probs,
             handle=handle,
@@ -749,7 +767,7 @@ class HybridEPCombine(torch.autograd.Function):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
-        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+        combined_hidden, _ = handle.buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
@@ -767,7 +785,7 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
-        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+        dispatched_hidden, _, _, _, _ = handle.buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
             handle=handle,

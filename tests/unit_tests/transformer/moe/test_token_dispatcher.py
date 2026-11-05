@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 import weakref
@@ -1245,6 +1245,7 @@ def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
     class FakeHybridEPBuffer:
         def __init__(self):
             self.kwargs = None
+            self.group = object()
 
         def dispatch_with_permute(self, **kwargs):
             self.kwargs = kwargs
@@ -1264,7 +1265,14 @@ def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
     topk_idx = torch.tensor([[0, 1], [2, 3]], dtype=torch.int16)
 
     fused_a2a.HybridEPDispatch.forward(
-        SimpleNamespace(), hidden, None, probs, object(), 2, topk_idx=topk_idx, num_of_experts=4
+        SimpleNamespace(),
+        hidden,
+        None,
+        probs,
+        fake_buffer.group,
+        2,
+        topk_idx=topk_idx,
+        num_of_experts=4,
     )
 
     assert fake_buffer.kwargs["topk_idx"] is topk_idx
