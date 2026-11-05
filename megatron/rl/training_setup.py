@@ -3,7 +3,6 @@
 import copy
 from typing import Any, Optional
 
-from megatron.core import mpu
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.num_microbatches_calculator import (
@@ -12,7 +11,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     update_num_microbatches,
 )
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
@@ -30,9 +29,20 @@ except ImportError:
 
 
 def build_rl_inference_model(
-    rl_config: Any, args: Any, config: Any, model_provider: Any, model_type: Any
+    rl_config: Any,
+    args: Any,
+    config: Any,
+    model_provider: Any,
+    model_type: Any,
+    *,
+    training_pg_collection: Any = None,
 ) -> Optional[list]:
-    """Build a separate inference model with custom parallelism, if requested."""
+    """Build a separate inference model with custom parallelism, if requested.
+
+    ``training_pg_collection`` holds the process groups of the trained model: each inference
+    parallel size left unset defaults to the size of the matching group in it. Without it,
+    those sizes are read from the global parallel state, a deprecated fallback.
+    """
     if not rl_config.uses_separate_inference_model(
         context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
     ):
@@ -74,6 +84,7 @@ def build_rl_inference_model(
         ep_size=rl_config.rl_inference_expert_model_parallel_size,
         expt_tp_size=rl_config.rl_inference_expert_tensor_model_parallel_size,
         use_tp_pp_dp_mapping=cfg_container.dist.use_tp_pp_dp_mapping,
+        training_pg_collection=training_pg_collection,
     )
 
     # Build an isolated inference config so training config remains unchanged
@@ -195,12 +206,15 @@ class RLSetupCallback(Callback):
         cfg = get_run_config()
         self.model = context.model
         self.optimizer = context.optimizer
+        # The process groups of the model being trained.
+        pg_collection = get_attr_wrapped_model(self.model[0], "pg_collection")
         self.inference_model = build_rl_inference_model(
             self._rl_config,
             args,
             get_model_config(self.model[0]),
             self._model_provider,
             self._model_type,
+            training_pg_collection=pg_collection,
         )
         if not cfg.validation.skip_train:
             # GRPO loop state; eval-only runs (--skip-train) evaluate the loaded weights directly.
@@ -210,5 +224,8 @@ class RLSetupCallback(Callback):
                 args,
                 rollout_only=self._rl_config.rl_rollout_only,
             )
-            # RL runs on the plain MPU groups: the loop's data-parallel size for them.
-            reinitialize_grpo_microbatch_calculator(args, mpu.get_data_parallel_world_size())
+            # The loop's data-parallel size is that of the model's data-parallel group, which
+            # spans the GTP weight-remat axis, as get_data_parallel_world_size() does by default.
+            # Collections that predate the GTP weight-remat fields carry only the replicate group.
+            data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+            reinitialize_grpo_microbatch_calculator(args, data_parallel_group.size())

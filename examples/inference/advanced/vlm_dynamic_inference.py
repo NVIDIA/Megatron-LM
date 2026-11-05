@@ -22,6 +22,7 @@ import torch
 
 from megatron.core import dist_checkpointing
 from megatron.core.models.vision.encoder_registry import get_spec
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
@@ -476,21 +477,27 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
 def get_model(is_vlm: bool) -> MegatronModule:
     """Build and load the model; dispatches to the right model_provider."""
     args = get_args()
+    # The groups of the grid that initialize_megatron() registered.
+    pg_collection = get_registered_process_groups()
 
     is_mimo = getattr(args, 'mimo_checkpoint_prefix_map', None) is not None
     if is_vlm and is_mimo:
         from mimo_checkpoint_model import model_provider  # examples/multimodal
 
-        model = _get_model(model_provider, wrap_with_ddp=False)
+        model = _get_model(model_provider, wrap_with_ddp=False, pg_collection=pg_collection)
     elif is_vlm:
         from model import model_provider  # examples/multimodal/model.py
 
-        model = _get_model(partial(model_provider), wrap_with_ddp=False)
+        model = _get_model(
+            partial(model_provider), wrap_with_ddp=False, pg_collection=pg_collection
+        )
     else:
         from gpt_builders import gpt_builder  # examples/inference/gpt
         from model_provider import model_provider
 
-        model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
+        model = _get_model(
+            partial(model_provider, gpt_builder), wrap_with_ddp=False, pg_collection=pg_collection
+        )
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True

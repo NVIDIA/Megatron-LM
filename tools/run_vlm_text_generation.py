@@ -16,6 +16,7 @@ import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, ToPILImage
 
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
@@ -206,8 +207,11 @@ def main():
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
-    # Set up model and load checkpoint.
-    model = get_model(model_provider, wrap_with_ddp=False)
+    # Set up model and load checkpoint. The model is built on the groups that
+    # initialize_megatron() registered.
+    model = get_model(
+        model_provider, wrap_with_ddp=False, pg_collection=get_registered_process_groups()
+    )
 
     args = get_args()
     if args.load is not None:

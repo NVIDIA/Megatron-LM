@@ -64,6 +64,7 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 2
   --ckpt-format: torch_dist
+  --strict-process-group-fallbacks: true
 TEST_TYPE: regular
 METRICS:
   - lm loss

@@ -210,10 +210,9 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     num_local_experts_egtp = NUM_EXPERTS // 2  # = 4
 
     config = make_config()
-    # Build full pg_collection for MoELayer: default groups + expt_gtp for EGTP_remat sharding.
-    moe_pg = get_default_pg_collection()
-    moe_pg.expt_gtp_remat = egtp_remat_group
-    layer_egtp = make_moe_layer(config, moe_pg)
+    # As in phase 1, MoELayer uses get_default_pg_collection(), which carries the global
+    # expt_gtp_remat group that EGTP_remat sharding keys off.
+    layer_egtp = make_moe_layer(config, None)
     layer_egtp.cuda()
 
     # Verify EGTP_remat is truly active: expert weight params must be GTPShardedParam instances.
@@ -368,7 +367,6 @@ def _worker_egtp_precision_override_backward(
     """
     from megatron.core import parallel_state as ps
     from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
-    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.moe import experts as experts_mod
     from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -420,11 +418,8 @@ def _worker_egtp_precision_override_backward(
         quant_recipe=_bf16_override_recipe("*mtp.layers.*"),
     )
 
-    # MoELayer's default collection has no expt_gtp_remat entry; EGTP_remat sharding keys off it.
+    # MoELayer's default collection carries expt_gtp_remat, which EGTP_remat sharding keys off.
     moe_pg = get_default_pg_collection()
-    moe_pg.expt_gtp_remat = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['expt_gtp_remat']
-    ).expt_gtp_remat
     assert moe_pg.expt_gtp_remat.size() == egtp_remat_size
 
     moe_spec = get_moe_module_spec(use_te=True, num_experts=NUM_EXPERTS, moe_grouped_gemm=True)

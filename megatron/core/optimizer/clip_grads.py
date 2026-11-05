@@ -228,6 +228,8 @@ def count_zeros_fp32(
     expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    use_global_fallback: bool = True,
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
@@ -245,6 +247,10 @@ def count_zeros_fp32(
         use_decoupled_grad (bool, optional): If True, reads from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
+        use_global_fallback (bool, optional): Passed to the duplicate filters
+            ``param_is_not_tensor_parallel_duplicate`` and ``param_is_not_gtp_duplicate``.
+            False when the four groups come from a ``ProcessGroupCollection``, where a
+            ``None`` group marks an axis that is off. Defaults to True.
 
     Returns:
         float: The total number of zeros in the gradients across the process group.
@@ -274,10 +280,16 @@ def count_zeros_fp32(
             continue
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
-            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+            param,
+            tp_group=tp_group,
+            expert_tp_group=expert_tp_group,
+            use_global_fallback=use_global_fallback,
         )
         is_not_gtp_duplicate = param_is_not_gtp_duplicate(
-            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
+            param,
+            gtp_group=gtp_group,
+            expert_gtp_group=expert_gtp_group,
+            use_global_fallback=use_global_fallback,
         )
         if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
