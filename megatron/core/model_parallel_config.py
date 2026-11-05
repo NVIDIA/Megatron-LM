@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Ported from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron
 # Revision: f1856ec3ef887125dc7ad81f312c9ec837a3bb11
+# Private-logits revision: daa90bd2d26fb44f34b769961c1a1f94a53d6c35
 # License: BSD-3-Clause (see the source repository LICENSE).
 
 import warnings
@@ -392,6 +393,14 @@ class ModelParallelConfig:
        without a vocabulary-sized FP32 softmax buffer. Defaults to 'native'.
     """
 
+    cross_entropy_inplace_backward: bool = False
+    """Let Hybrid/MTP transfer private logits to one fused loss backward.
+
+    Requires fused 'auto' cross entropy. Prefer TE's overwrite_input API when
+    supported; otherwise use the TP1 Triton fallback. Tensor observers keep
+    the non-mutating path. Public loss calls never infer ownership.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -664,6 +673,11 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_inplace_backward and not (
+            self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "auto"
+        ):
+            raise ValueError("Private logits backward requires fused auto cross entropy")
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(

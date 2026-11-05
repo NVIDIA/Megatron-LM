@@ -87,12 +87,16 @@ def select_cross_entropy(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
     cuda_graph_impl: Optional[str] = None,
+    *,
+    inplace_backward: bool = False,
 ) -> CrossEntropyTarget:
     """Which cross entropy a config asks for, resolved once rather than on every forward.
 
     Shared by every provider: the choice depends on the config, not on which backend supplies
     the rest of the model, which is how it behaved before this was a provider decision.
     """
+    if inplace_backward and not (cross_entropy_loss_fusion and cross_entropy_fusion_impl == "auto"):
+        raise ValueError("Private logits backward requires fused auto cross entropy")
     if cross_entropy_fusion_impl not in ("native", "te", "auto"):
         raise ValueError(
             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
@@ -108,10 +112,12 @@ def select_cross_entropy(
             return partial(
                 te_cross_entropy,
                 cuda_graph_capturable=cuda_graph_impl == "full_iteration",
-                overwrite_input=False,
+                overwrite_input=inplace_backward,
             )
         from megatron.core.ops.cross_entropy import triton_cross_entropy
 
+        if inplace_backward:
+            return partial(triton_cross_entropy, inplace_backward=True)
         return triton_cross_entropy
 
     # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.

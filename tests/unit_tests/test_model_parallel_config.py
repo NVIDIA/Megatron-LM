@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Ported from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron
 # Revision: f1856ec3ef887125dc7ad81f312c9ec837a3bb11
+# Private-logits revision: daa90bd2d26fb44f34b769961c1a1f94a53d6c35
 # License: BSD-3-Clause (see the source repository LICENSE).
 
 import sys
@@ -165,6 +166,17 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
 def test_auto_cross_entropy_config():
     config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="auto")
     assert config.cross_entropy_fusion_impl == "auto"
+    assert config.cross_entropy_inplace_backward is False
+
+
+@pytest.mark.parametrize("fusion,implementation", [(False, "auto"), (True, "native"), (True, "te")])
+def test_private_logits_requires_fused_auto(fusion, implementation):
+    with pytest.raises(ValueError, match="requires fused auto"):
+        ModelParallelConfig(
+            cross_entropy_loss_fusion=fusion,
+            cross_entropy_fusion_impl=implementation,
+            cross_entropy_inplace_backward=True,
+        )
 
 
 def test_auto_cross_entropy_preserves_unfused_selection():
@@ -180,3 +192,8 @@ def test_auto_cross_entropy_cli(monkeypatch):
     args = parse_args()
     assert args.cross_entropy_loss_fusion
     assert args.cross_entropy_fusion_impl == "auto"
+
+
+def test_private_logits_cli(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test", "--cross-entropy-inplace-backward"])
+    assert parse_args().cross_entropy_inplace_backward is True

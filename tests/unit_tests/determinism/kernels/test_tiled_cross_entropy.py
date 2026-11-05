@@ -55,3 +55,32 @@ def test_auto_te_cross_entropy_replay():
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("implementation", ["fallback", "te"])
+def test_private_cross_entropy_replay(implementation, monkeypatch):
+    from megatron.core import parallel_state
+    from tests.unit_tests.test_utilities import Utils
+
+    if implementation == "te":
+        if not backends._te_has_memory_efficient_cross_entropy():
+            pytest.skip("TE >= 2.19 with overwrite_input API required")
+    else:
+        monkeypatch.setattr(backends, "_te_has_memory_efficient_cross_entropy", lambda: False)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        seeded(4733)
+        group = parallel_state.get_tensor_model_parallel_group()
+        target = backends.select_cross_entropy(True, "auto", inplace_backward=True)
+        logits = torch.randn(33, 1, 4097, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        labels = torch.randint(4097, (33, 1), device="cuda")
+        labels[::5] = -100
+        assert_replays_bit_exact(
+            lambda x: target(x, labels, group),
+            (logits,),
+            replays=3,
+            contention=True,
+            what="private-logits loss",
+        )
+    finally:
+        Utils.destroy_model_parallel()

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Ported from https://github.com/NVIDIA-NeMo/nv-mistralai-megatron
 # Revision: f1856ec3ef887125dc7ad81f312c9ec837a3bb11
+# Private-logits revision: daa90bd2d26fb44f34b769961c1a1f94a53d6c35
 # License: BSD-3-Clause (see the source repository LICENSE).
 
 """Memory-efficient TP1 cross entropy with FP32 normalization and BF16/FP32 logits.
@@ -109,7 +110,7 @@ def _loss_backward(
 
 class _TiledCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, target):
+    def forward(ctx, logits, target, inplace_backward):
         vocab = logits.shape[-1]
         rows = target.numel()
         chunks = triton.cdiv(vocab, 4096)
@@ -140,13 +141,18 @@ class _TiledCrossEntropy(torch.autograd.Function):
         )
         ctx.save_for_backward(flat_logits, flat_target, row_max, inv_sum)
         ctx.input_shape = logits.shape
+        ctx.inplace_backward = inplace_backward
+        ctx.consumed = False
         return loss.view_as(target)
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.inplace_backward and ctx.consumed:
+            raise RuntimeError("In-place cross entropy logits buffer was already consumed")
         logits, target, row_max, inv_sum = ctx.saved_tensors
         rows, vocab = logits.shape
-        grad = torch.empty_like(logits)
+        ctx.consumed = ctx.inplace_backward
+        grad = logits if ctx.inplace_backward else torch.empty_like(logits)
         _loss_backward[(triton.cdiv(rows, 4), triton.cdiv(vocab, 4096))](
             logits,
             target,
@@ -160,11 +166,17 @@ class _TiledCrossEntropy(torch.autograd.Function):
             4096,
             num_warps=8,
         )
-        return grad.view(ctx.input_shape), None
+        if ctx.inplace_backward:
+            torch.autograd.graph.increment_version(logits)
+        return grad.view(ctx.input_shape), None, None
 
 
 def triton_cross_entropy(
-    logits: torch.Tensor, target: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    *,
+    inplace_backward: bool = False,
 ) -> torch.Tensor:
     """Compute unreduced TP1 cross entropy while retaining no FP32 softmax.
 
@@ -173,6 +185,9 @@ def triton_cross_entropy(
         target: Int64 labels with shape equal to ``logits.shape[:-1]``.
             Rows labeled -100 have zero loss/gradient, matching TE's default ignore index.
         tp_group: Explicit tensor-parallel group; must contain one rank.
+        inplace_backward: Explicitly transfer privately owned logits to a single
+            backward, which overwrites their storage with gradients. No other
+            backward consumer or later reader may use them. Forward preserves logits.
 
     Returns:
         FP32 per-token losses with the same shape as ``target``.
@@ -187,4 +202,4 @@ def triton_cross_entropy(
         raise ValueError("Targets must be int64 on the logits device")
     if logits.shape[:-1] != target.shape or not target.numel() or not logits.shape[-1]:
         raise ValueError("Nonempty logits and target shapes must match")
-    return _TiledCrossEntropy.apply(logits, target)
+    return _TiledCrossEntropy.apply(logits, target, inplace_backward)

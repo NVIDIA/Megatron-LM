@@ -23,7 +23,8 @@ from tests.unit_tests.test_utilities import Utils
         ("2.20.0", False, True, False),
     ],
 )
-def test_auto_checks_version_and_api(monkeypatch, version, api, available, prefer_te):
+@pytest.mark.parametrize("private", [False, True])
+def test_auto_checks_version_and_api(monkeypatch, version, api, available, prefer_te, private):
     monkeypatch.setattr(
         backends, "is_te_min_version", lambda minimum: Version(version) >= Version(minimum)
     )
@@ -31,10 +32,13 @@ def test_auto_checks_version_and_api(monkeypatch, version, api, available, prefe
     monkeypatch.setattr(
         te_extensions, "te_parallel_cross_entropy", (lambda: None) if available else None
     )
-    target = backends.select_cross_entropy(True, "auto")
+    target = backends.select_cross_entropy(True, "auto", inplace_backward=private)
     if prefer_te:
         assert target.func is backends.te_cross_entropy
-        assert target.keywords["overwrite_input"] is False
+        assert target.keywords["overwrite_input"] is private
+    elif private:
+        assert target.func is triton_cross_entropy
+        assert target.keywords["inplace_backward"] is True
     else:
         assert target is triton_cross_entropy
 
