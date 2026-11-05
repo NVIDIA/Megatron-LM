@@ -8,11 +8,13 @@ import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.typed_torch import copy_signature
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -129,17 +131,17 @@ class Linear(torch.nn.Linear):
         parallel_mode: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,  # Not used
+        pg_collection: Optional[ProcessGroupCollection] = None,  # Not used
     ):
         if parallel_mode not in (None, "duplicated"):
             raise ValueError(
                 f"{type(self).__name__} only supports parallel_mode='duplicated' or None"
             )
-        if parallel_mode == "duplicated" and tp_group is not None:
-            raise ValueError("duplicated Linear should not have tp_group set")
 
         self.config = config
         self.parallel_mode = parallel_mode
-        self.tp_group = None if parallel_mode == "duplicated" else tp_group
+        # Every rank of tp_group holds the full weight; the group sets its checkpoint replica id.
+        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 
@@ -260,18 +262,23 @@ class RealQuantTransformerLayer(TransformerLayer):
                 self._original_tensor_info[k] = (str(v.dtype), str(v.shape))
 
     def _report_quantize_tensor_info(self):
-        torch.distributed.barrier()
-        if torch.distributed.get_rank() == 0:
-            for k, v in self.state_dict().items():
-                if not isinstance(v, torch.Tensor):
-                    continue
-                original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                logger.info(
-                    "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
-                        k, original_dtype, original_shape, str(v.dtype), str(v.shape)
-                    )
-                )
-        torch.distributed.barrier()
+        """Log each tensor's dtype and shape before and after real quantization.
+
+        Runs once per layer during model construction and issues no collective. Pipeline
+        stages build different numbers of layers, and a model's grid need not span every
+        rank, so a per-layer barrier could hang.
+        """
+        for k, v in self.state_dict().items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
+                    k, original_dtype, original_shape, str(v.dtype), str(v.shape)
+                ),
+            )
 
 
 class FP8WeightTransformerLayer(RealQuantTransformerLayer):
