@@ -116,8 +116,21 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
 
 
 def print_distributed_quant_summary(model, msg=""):
-    from megatron.core import parallel_state
-    from megatron.core.utils import unwrap_model
+    """Print the quantization summary of a quantized model.
+
+    The ranks of the first data-parallel replica whose tensor-parallel rank is 0 or 1 print the
+    summary, labeled with their tensor-, expert- and pipeline-parallel ranks.
+
+    Args:
+        model: The model, or a list of model chunks, possibly wrapped. The ranks come from the
+            ``dp_cp_gtp_remat``, ``tp``, ``ep`` and ``pp`` groups of the ``pg_collection`` of
+            its first chunk. A chunk without a ``ProcessGroupCollection`` that sets all four
+            groups falls back to the global process groups with a deprecation warning.
+        msg: Header printed above the summary.
+    """
+
+    from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
+    from megatron.core.utils import get_pg_rank, unwrap_model
     from megatron.training import print_rank_0
 
     unwrapped_model = unwrap_model(model)
@@ -133,13 +146,29 @@ def print_distributed_quant_summary(model, msg=""):
         mtq.print_quant_summary(unwrapped_model)
         return
 
+    required = ("dp_cp_gtp_remat", "tp", "ep", "pp")
+    # A Megatron Core language model carries the collection it was built with; other models, for
+    # example MimoModel, may have none.
+    pg_collection = getattr(unwrapped_model, "pg_collection", None)
+    if not isinstance(pg_collection, ProcessGroupCollection) or any(
+        name not in vars(pg_collection) for name in required
+    ):
+        # Deprecated fallback: without a collection that sets these groups, this diagnostic
+        # picks its ranks from the global groups.
+        pg_collection = None
+    pg_collection = resolve_process_groups(
+        pg_collection,
+        owner="print_distributed_quant_summary",
+        required=required,
+        argument="model.pg_collection",
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
+    TP_rank = get_pg_rank(pg_collection.tp)
     # Only print from unique TP ranks of [0, 1]
-    if parallel_state.get_data_parallel_rank(
-        with_context_parallel=True
-    ) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
-        TP_rank = parallel_state.get_tensor_model_parallel_rank()
-        EP_rank = parallel_state.get_expert_model_parallel_rank()
-        PP_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if get_pg_rank(pg_collection.dp_cp_gtp_remat) == 0 and TP_rank in [0, 1]:
+        EP_rank = get_pg_rank(pg_collection.ep)
+        PP_rank = get_pg_rank(pg_collection.pp)
         print(f"\nTP rank {TP_rank}, EP rank {EP_rank}, PP rank {PP_rank}")
         print("_" * 80)
         mtq.print_quant_summary(unwrapped_model)

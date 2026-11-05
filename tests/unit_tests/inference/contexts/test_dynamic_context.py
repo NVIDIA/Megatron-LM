@@ -2573,7 +2573,7 @@ class TestDynamicContext:
         expected_local = num_first if pp_rank == 0 else num_last
         wrong_uniform = num_layers // pp_size  # 5 on each rank; true counts are 4 and 6
 
-        assert get_num_layers_to_build(model_config) == expected_local
+        assert get_num_layers_to_build(model_config, pp_rank=pp_rank) == expected_local
         assert wrong_uniform != expected_local
 
         context = DynamicInferenceContext(

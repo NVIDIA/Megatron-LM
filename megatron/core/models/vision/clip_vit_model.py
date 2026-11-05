@@ -65,7 +65,12 @@ class CLIPViTModel(VisionModule):
         super().__init__(config=transformer_config)
 
         if has_config_logger_enabled(transformer_config):
-            log_config_to_disk(transformer_config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                transformer_config,
+                locals(),
+                prefix=type(self).__name__,
+                pg_collection=pg_collection,
+            )
 
         self.class_token_len = class_token_len
         self.visual_hidden_size = transformer_config.hidden_size

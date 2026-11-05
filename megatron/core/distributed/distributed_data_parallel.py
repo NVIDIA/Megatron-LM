@@ -100,7 +100,9 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
-        pg_collection: Optional unified process group for distributed training.
+        pg_collection: Optional unified process group for distributed training. When omitted,
+            the groups come from the global parallel state; that fallback is deprecated and
+            emits a ``ProcessGroupFallbackWarning``.
         full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
             dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
             instead of computing a default one.
@@ -135,7 +137,9 @@ class DistributedDataParallel(_BaseDataParallel):
         self._validate_config(config, ddp_config)
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL

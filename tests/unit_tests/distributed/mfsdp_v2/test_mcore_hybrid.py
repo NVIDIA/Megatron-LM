@@ -84,6 +84,7 @@ def _build_model_and_optimizer(
             clip_grad=0.0,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     return model, optimizer
 
@@ -267,6 +268,7 @@ def test_moe_with_independent_hybrid_placements(
             clip_grad=0.0,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     for name, submodule in model.named_modules():
