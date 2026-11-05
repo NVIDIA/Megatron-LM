@@ -429,6 +429,12 @@ class TestRequireProcessGroups:
         with pytest.raises(ValueError, match="Owner: pg_collection sets embd to NON_GROUP_MEMBER"):
             require_process_groups(pgs, ("embd",), owner="Owner")
 
+    def test_rejects_a_single_name_passed_as_a_string(self, mocker):
+        # A string is a sequence of its characters, which would read as fields "t" and "p".
+        pgs = ProcessGroupCollection(tp=mocker.Mock(spec=dist.ProcessGroup))
+        with pytest.raises(TypeError, match=r"^Owner: pass the process-group field names as a"):
+            require_process_groups(pgs, "tp", owner="Owner")
+
     def test_rejects_a_missing_collection(self):
         with pytest.raises(ValueError, match="Owner requires a ProcessGroupCollection, got None"):
             require_process_groups(None, ("tp",), owner="Owner")
