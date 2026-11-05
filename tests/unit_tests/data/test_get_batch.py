@@ -22,7 +22,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
+    _resolve_dynamic_cp_group_for_batch,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
 from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
