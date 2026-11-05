@@ -20,6 +20,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _consume_embedding_min_norm_metrics,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -130,20 +131,19 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
 
 @pytest.mark.parametrize("optimizer", [None, "optimizer"])
 @pytest.mark.parametrize("layer_wise", [False, True])
-def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise):
+def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer_wise, run_config):
     """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
     toggles them only when an optimizer was built (not under --skip-train or
     --rl-rollout-only --no-load-optim)."""
-    args = SimpleNamespace(
-        use_megatron_fsdp=False,
-        use_distributed_optimizer=not layer_wise,
-        use_layer_wise_distributed_optimizer=layer_wise,
-        overlap_param_gather=True,
-    )
+    args = SimpleNamespace(use_megatron_fsdp=False)
+    run_config.optimizer.use_distributed_optimizer = not layer_wise
+    run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
+    run_config.optimizer.overlap_param_gather = True
     assert training.should_disable_forward_pre_hook(args, optimizer) is (optimizer is not None)
-    args.overlap_param_gather = False
+    run_config.optimizer.overlap_param_gather = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
-    args.overlap_param_gather = args.use_megatron_fsdp = True
+    run_config.optimizer.overlap_param_gather = True
+    args.use_megatron_fsdp = True
     assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 
@@ -269,6 +269,20 @@ class TestTraining:
         flags = (train_state.do_train, train_state.do_valid, train_state.do_test)
         assert flags == (True, True, True)
 
+    def test_build_train_valid_test_data_iterators_resume_without_eval_interval(self, run_config):
+        """Resuming without eval_interval should not count any consumed validation samples."""
+        run_config.train.train_samples = None
+        run_config.validation.eval_interval = None
+        train_state = get_train_state()
+        train_state.iteration = 10
+        train_state.consumed_train_samples = 0
+        train_state.consumed_valid_samples = 0
+
+        build_train_valid_test_data_iterators(mock_train_valid_test_datasets_provider)
+
+        assert train_state.consumed_train_samples == 10
+        assert train_state.consumed_valid_samples == 0
+
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
             log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1
@@ -285,6 +299,30 @@ class TestTraining:
 
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+
+    def test_embedding_min_norm_metrics_combine_model_shards(self, monkeypatch):
+        local_stats = torch.tensor([2.0, 4.0, 0.5, 1.0], dtype=torch.float64, device='cuda')
+        remote_stats = torch.tensor([2.0, 6.0, 1.75, 2.0], dtype=torch.float64, device='cuda')
+        mimo_optimizer = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(),
+                SimpleNamespace(_consume_embedding_min_norm_stats=lambda: local_stats),
+            ]
+        )
+
+        def fake_all_reduce(stats, op):
+            assert op == torch.distributed.ReduceOp.SUM
+            stats.add_(remote_stats)
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        assert _consume_embedding_min_norm_metrics(mimo_optimizer) == {
+            'embedding-min-norm/row-events-rescaled': 4.0,
+            'embedding-min-norm/fraction-rescaled': 0.4,
+            'embedding-min-norm/projection-delta-rms': 0.75,
+            'embedding-min-norm/zero-row-events': 3.0,
+        }
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators

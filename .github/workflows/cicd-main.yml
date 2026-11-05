@@ -192,6 +192,10 @@ jobs:
 
   configure:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     needs: [pre-flight, is-not-external-contributor, ephemeral-runner-routing]
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
@@ -216,6 +220,8 @@ jobs:
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
       unit_test_pr_files_artifact_id: ${{ steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
+      unit_testmon_checkout_artifact_id: ${{ steps.prepare-testmon-checkout.outputs.sha != '' && steps.upload-unit-test-pr-files.outcome == 'success' && steps.upload-unit-test-pr-files.outputs.artifact-id || '' }}
+      unit_testmon_sha: ${{ steps.prepare-testmon-checkout.outputs.sha }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -600,11 +606,35 @@ jobs:
             echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."
           fi
 
+      # Set UNIT_TESTMON_USE_CACHE_BASE=false to keep testing the normal PR merge.
+      # Eligibility excludes merge groups, full-suite requests, and LTS runs.
+      - name: Checkout PR for Testmon baseline preparation
+        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.resolve-sha.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Prepare PR on the Testmon baseline
+        id: prepare-testmon-checkout
+        if: steps.unit-test-pr-files.outputs.ready == 'true' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref == 'main' && vars.UNIT_TESTMON_USE_CACHE_BASE != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
+          PR_BASE: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          TESTED_SHA: ${{ steps.resolve-sha.outputs.sha }}
+        run: |
+          python .github/scripts/testmon_checkout.py prepare \
+            --pr-head "$PR_HEAD" --pr-base "$PR_BASE" --tested-sha "$TESTED_SHA" \
+            --pr-files-dir "$RUNNER_TEMP/unit-test-pr-files" \
+            --output-dir "$RUNNER_TEMP/unit-test-pr-files/testmon-checkout"
+
       - name: Upload changed files for mandatory unit tests
         id: upload-unit-test-pr-files
         if: steps.unit-test-pr-files.outputs.ready == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        continue-on-error: true
+        # Once prepared, every consumer must receive the same checkout and metadata.
+        continue-on-error: ${{ steps.prepare-testmon-checkout.outputs.sha == '' }}
         with:
           name: unit-test-pr-files-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-test-pr-files/
@@ -660,10 +690,8 @@ jobs:
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
-      - name: Test CODEOWNERS approvals and review labels
-        run: >-
-          uv run --no-project --python 3.12 --with codeowners --with pygithub
-          python tests/test_utils/python_scripts/test_codeowners_approval.py
+      - name: Test GitHub-to-Slack team exclusions
+        run: python3 .github/scripts/test_sync_team_usergroups.py
 
       - name: Get PR info
         id: get-pr-info
@@ -968,6 +996,12 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Restore prepared unit-test checkout
+        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -1006,6 +1040,7 @@ jobs:
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
       unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+      unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -1037,6 +1072,12 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Restore prepared unit-test checkout
+        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -1078,6 +1119,7 @@ jobs:
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
       unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+      unit_testmon_checkout_artifact_id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -1532,6 +1574,15 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+
+      - name: Restore prepared unit-test checkout
+        if: needs.configure.outputs.unit_testmon_checkout_artifact_id != ''
+        uses: ./.github/actions/testmon-checkout
+        with:
+          artifact-id: ${{ needs.configure.outputs.unit_testmon_checkout_artifact_id }}
+          original-sha: ${{ needs.configure.outputs.sha }}
 
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -1550,7 +1601,7 @@ jobs:
           SELECTIVE: ${{ needs.configure.outputs.unit_testmon_eligible }}
           H100_BUCKETS: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests || '[]' }}
           GB200_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 || '[]' }}
-          SOURCE_SHA: ${{ needs.configure.outputs.sha }}
+          SOURCE_SHA: ${{ needs.configure.outputs.unit_testmon_sha || needs.configure.outputs.sha }}
         run: |
           python - <<'PY'
           import json

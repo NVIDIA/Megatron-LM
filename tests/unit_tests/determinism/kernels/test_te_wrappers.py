@@ -8,7 +8,9 @@ and backward (cross-row dgamma reduction), grouped GEMMs over uneven expert load
 attention with GQA (dK/dV accumulate across query groups), fused RoPE, and the DSA indexer's
 BF16-input/FP32-output projection. Each wrapper is replayed standalone under side-stream
 contention; the bare TE modules are what the model-level suite composes, so a regression here
-localises to one kernel family.
+localises to one kernel family. Runtime CP head-geometry and MLA projection/RoPE
+replays live in ``context_parallel/runtime/test_te_replay.py`` and
+``context_parallel/runtime/test_mla_replay.py`` so their distributed cases have a dedicated CI bucket.
 """
 
 import inspect
@@ -546,6 +548,11 @@ class TestTEWrappers:
             skip_bias_add=False,
             is_expert=False,
         ).cuda()
+        assert getattr(module.layer_norm_weight, "is_rmsnorm_weight", False) == (
+            normalization == "RMSNorm"
+        )
+        assert not getattr(module.weight, "is_rmsnorm_weight", False)
+        assert not getattr(module.bias, "is_rmsnorm_weight", False)
         # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
@@ -560,6 +567,7 @@ class TestTEWrappers:
     def test_te_norm_replays(self, normalization):
         seeded()
         module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
+        assert getattr(module.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"

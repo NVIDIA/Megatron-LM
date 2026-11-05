@@ -1884,9 +1884,7 @@ class TextGenerationController(MTPControllerMixin):
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
             # Draft-only lookahead has no main-model routing to reconstruct.
-            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
-            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
-            valid_blocks = blocks[blocks >= 0].tolist()
+            valid_blocks = context.get_committed_kv_block_ids(finished_idx)
             if valid_blocks:
                 finished_routing_block_ids[request_id] = valid_blocks
         return finished_routing_block_ids
