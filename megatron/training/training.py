@@ -1746,11 +1746,11 @@ def _broadcast_dsa_indexer_params(model) -> None:
             torch.distributed.broadcast(param.data, src=src_rank, group=data_parallel_group)
 
 
-def _get_dsa_indexer_reset_seed(args) -> int:
-    """Return the reset seed, following normal Megatron model-init seed derivation."""
-    seed = getattr(args, "seed", 1234)
-    seed += 100 * mpu.get_pipeline_model_parallel_rank()
-    if getattr(args, "data_parallel_random_init", False):
+def _get_dsa_indexer_reset_seed() -> int:
+    """Return the reset seed, derived from the run config exactly as _set_random_seed does."""
+    rng = get_run_config().rng
+    seed = rng.seed + 100 * mpu.get_pipeline_model_parallel_rank()
+    if rng.data_parallel_random_init:
         seed += 10 * mpu.get_data_parallel_rank()
     return seed
 
@@ -1861,7 +1861,7 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):
         for child_optimizer in optimizers_to_check
     ):
         raise RuntimeError("DSA indexer reset-on-load does not support optimizer CPU offload.")
-    seed = _get_dsa_indexer_reset_seed(args)
+    seed = _get_dsa_indexer_reset_seed()
     reset_count = _reset_dsa_indexer_modules(model, seed)
     reset_description = f"with seed {seed}"
     global_reset_count = _global_dsa_indexer_reset_count(reset_count)
