@@ -776,6 +776,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ):
                 from .emerging_optimizers import TensorParallelMuon
 
+                # The offload lifecycle (pre-forward master restore, forced LayerWise gather,
+                # master offload) is wired for the compact layout, whose fp8 gather stages from
+                # the fp32 masters. The padded layout all-gathers the DDP param buffer the
+                # step updated in place and has no such staging point, so reject it here as
+                # well as in OptimizerConfig.
+                if not self.decouple_ddp_layout:
+                    raise ValueError(
+                        "Muon chunked optimizer-state offload requires the compact LayerWise "
+                        "layout (use_layer_wise_param_layout=False); got the padded layout."
+                    )
+
                 offload_children = []
                 state_dtypes = (torch.float32,)
                 for optimizer in optimizers:
