@@ -2185,6 +2185,8 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_expert_placement is not None and self.moe_token_dispatcher_type != "alltoall":
             raise ValueError("moe_expert_placement only works with alltoall token dispatcher.")
+        if self.moe_expert_placement is not None and self.transformer_impl == "inference_optimized":
+            raise ValueError("moe_expert_placement does not support inference_optimized MoE.")
 
         if self.moe_token_dedup and self.moe_token_dispatcher_type != "alltoall":
             raise ValueError("moe_token_dedup only works with alltoall token dispatcher.")

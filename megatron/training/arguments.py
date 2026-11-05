@@ -2060,6 +2060,10 @@ def validate_moe_args(args, defaults={}):
                 "--moe-expert-placement currently only supports "
                 "--moe-token-dispatcher-type alltoall, got "
                 f"'{args.moe_token_dispatcher_type}'.")
+        if args.ckpt_format == 'fsdp_dtensor':
+            raise ValueError(
+                "--moe-expert-placement does not support --ckpt-format fsdp_dtensor, "
+                "which keys experts by EP rank and slot.")
     if getattr(args, 'moe_token_dedup', False):
         if args.moe_token_dispatcher_type != 'alltoall':
             raise ValueError(
